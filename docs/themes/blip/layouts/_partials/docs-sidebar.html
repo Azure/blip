@@ -1,0 +1,13 @@
+<aside class="docs-sidebar">
+  <nav class="docs-nav">
+    <div class="docs-nav-section">
+      <span class="docs-nav-heading">DOCUMENTATION</span>
+      {{ $docs := where .Site.RegularPages "Section" "docs" }}
+      {{ range $docs.ByWeight }}
+      <a href="{{ .RelPermalink }}" class="docs-nav-link{{ if eq $.RelPermalink .RelPermalink }} active{{ end }}">
+        {{ .Title }}
+      </a>
+      {{ end }}
+    </div>
+  </nav>
+</aside>

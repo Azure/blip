@@ -1,0 +1,35 @@
+baseURL: https://project-unbounded.github.io/blip/
+title: BLIP
+theme: blip
+
+params:
+  description: "SSH gateway for ephemeral virtual machines on KubeVirt"
+
+menus:
+  main:
+    - name: DOCS
+      url: /docs/
+      weight: 1
+    - name: GITHUB
+      url: https://github.com/project-unbounded/blip
+      weight: 2
+
+markup:
+  highlight:
+    noClasses: false
+    lineNos: false
+    guessSyntax: true
+  goldmark:
+    renderer:
+      unsafe: true
+    extensions:
+      table: true
+
+outputs:
+  home:
+    - HTML
+
+pagination:
+  pagerSize: 20
+
+taxonomies: {}

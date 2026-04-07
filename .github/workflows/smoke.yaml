@@ -1,0 +1,54 @@
+name: Smoke Tests
+
+on:
+  pull_request:
+    branches: ["*"]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install KubeVirt and CDI CRDs
+        run: |
+          set -euo pipefail
+
+          # Create a kind cluster with the default configuration.
+          kind create cluster --wait 60s
+
+          # Deploy KubeVirt operator and CR.
+          KUBEVIRT_VERSION="$(curl -sL https://storage.googleapis.com/kubevirt-prow/release/kubevirt/kubevirt/stable.txt)"
+          kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml"
+          kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml"
+
+          # GitHub Actions runners do not support nested virtualization;
+          # configure KubeVirt to use software emulation.
+          kubectl -n kubevirt patch kubevirt kubevirt --type merge \
+            --patch '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true}}}}'
+
+          # Wait for KubeVirt to become ready.
+          kubectl -n kubevirt wait kv kubevirt --for condition=Available --timeout=300s
+
+      - name: Install cloud-provider-kind
+        run: |
+          # cloud-provider-kind assigns external IPs to LoadBalancer services
+          # inside kind clusters, which the smoke tests need to reach the
+          # ssh-gateway service.
+          go install sigs.k8s.io/cloud-provider-kind@latest
+          nohup cloud-provider-kind &>/tmp/cloud-provider-kind.log &
+
+      - name: Run smoke tests
+        run: python3 hack/smoke.py

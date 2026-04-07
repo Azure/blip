@@ -1,0 +1,510 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: blip
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ssh-gateway
+  namespace: blip
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ssh-gateway
+  namespace: blip
+rules:
+- apiGroups: ["kubevirt.io"]
+  resources: ["virtualmachines"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["kubevirt.io"]
+  resources: ["virtualmachineinstances"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ssh-gateway
+  namespace: blip
+subjects:
+- kind: ServiceAccount
+  name: ssh-gateway
+roleRef:
+  kind: Role
+  name: ssh-gateway
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ssh-gateway-node-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ssh-gateway-node-reader
+subjects:
+- kind: ServiceAccount
+  name: ssh-gateway
+  namespace: blip
+roleRef:
+  kind: ClusterRole
+  name: ssh-gateway-node-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blip-controller
+  namespace: blip
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blip-controller
+  namespace: blip
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blip-controller
+  namespace: blip
+subjects:
+- kind: ServiceAccount
+  name: blip-controller
+roleRef:
+  kind: Role
+  name: blip-controller
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blip-controller-vms
+rules:
+- apiGroups: ["kubevirt.io"]
+  resources: ["virtualmachines", "virtualmachineinstances"]
+  verbs: ["*"]
+- apiGroups: ["pool.kubevirt.io"]
+  resources: ["virtualmachinepools"]
+  verbs: ["*"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["*"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: blip-controller-vms
+subjects:
+- kind: ServiceAccount
+  name: blip-controller
+  namespace: blip
+roleRef:
+  kind: ClusterRole
+  name: blip-controller-vms
+  apiGroup: rbac.authorization.k8s.io
+---
+# RBAC for kubectl-blip plugin: allows users to read the SSH CA secret
+# to sign their local SSH keys via "kubectl blip sign-identity".
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ssh-ca-signer
+  namespace: blip
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["ssh-ca-keypair"]
+  verbs: ["get"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vm-release
+  namespace: blip
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vm-release
+  namespace: blip
+rules:
+- apiGroups: ["kubevirt.io"]
+  resources: ["virtualmachines"]
+  verbs: ["patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["ssh-ca-pubkey"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vm-release
+  namespace: blip
+subjects:
+- kind: ServiceAccount
+  name: vm-release
+roleRef:
+  kind: Role
+  name: vm-release
+  apiGroup: rbac.authorization.k8s.io
+---
+# ValidatingAdmissionPolicy: restrict what the vm-release service account can
+# modify on VirtualMachine objects. VMs use this SA to set annotations on
+# their own VM object:
+#   - blip.io/release: "true"        — signals early session release
+#   - blip.io/host-key: <key>        — stores the SSH host public key for
+#                                       gateway-side host key verification
+#   - blip.io/ephemeral: "false"     — marks VM as retained (via "blip retain")
+#   - blip.io/max-duration: <secs>   — updates TTL (via "blip retain --ttl")
+# Without this policy the SA's RBAC permission to patch any VM in the
+# namespace would allow a compromised VM to tamper with other VMs' metadata or
+# spec. The policy enforces that:
+#   1. The request's bound SA token must originate from the virt-launcher pod
+#      that owns the target VM (via the authentication.kubernetes.io/pod-name
+#      extra field). This prevents a compromised VM from modifying other VMs.
+#   2. blip.io/release may only be set to "true".
+#   3. blip.io/host-key must match SSH public key format.
+#   4. blip.io/ephemeral may only be set to "false".
+#   5. blip.io/max-duration must be a numeric string.
+#   6. No other annotations may be changed, added, or removed.
+#   7. Labels, finalizers, and the spec are not modified.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: vm-release-restrict
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["kubevirt.io"]
+      apiVersions: ["*"]
+      resources: ["virtualmachines"]
+      operations: ["UPDATE"]
+  matchConditions:
+  # Only apply to requests from the vm-release service account.
+  - name: is-vm-release-sa
+    expression: >-
+      request.userInfo.username == 'system:serviceaccount:blip:vm-release'
+  validations:
+  # 1. The request must originate from the virt-launcher pod that owns this VM.
+  #    Kubernetes bound SA tokens carry the pod name in
+  #    request.userInfo.extra["authentication.kubernetes.io/pod-name"].
+  #    KubeVirt names virt-launcher pods "virt-launcher-<vm-name>-<random>",
+  #    so we verify the pod name starts with "virt-launcher-<target VM name>-".
+  - expression: >-
+      has(request.userInfo.extra) &&
+      'authentication.kubernetes.io/pod-name' in request.userInfo.extra &&
+      request.userInfo.extra['authentication.kubernetes.io/pod-name'].size() > 0 &&
+      request.userInfo.extra['authentication.kubernetes.io/pod-name'][0].startsWith('virt-launcher-' + object.metadata.name + '-')
+    message: "vm-release SA may only modify the VM corresponding to its own virt-launcher pod"
+  # 2. If blip.io/release is present it must be exactly "true".
+  - expression: >-
+      !('blip.io/release' in object.metadata.annotations) ||
+      object.metadata.annotations['blip.io/release'] == 'true'
+    message: "vm-release SA may only set blip.io/release to \"true\""
+  # 3. If blip.io/host-key is present it must look like an SSH public key.
+  - expression: >-
+      !('blip.io/host-key' in object.metadata.annotations) ||
+      object.metadata.annotations['blip.io/host-key'].matches('^ssh-[a-z0-9-]+ [A-Za-z0-9+/=]+$')
+    message: "blip.io/host-key must be a valid SSH public key (type + base64)"
+  # 4. If blip.io/ephemeral is present it must be exactly "false".
+  - expression: >-
+      !('blip.io/ephemeral' in object.metadata.annotations) ||
+      object.metadata.annotations['blip.io/ephemeral'] == 'false'
+    message: "vm-release SA may only set blip.io/ephemeral to \"false\""
+  # 5. If blip.io/max-duration is present it must be a numeric string (seconds).
+  - expression: >-
+      !('blip.io/max-duration' in object.metadata.annotations) ||
+      object.metadata.annotations['blip.io/max-duration'].matches('^[0-9]+$')
+    message: "blip.io/max-duration must be a numeric string (seconds)"
+  # 6. No existing annotations may be changed or removed (except the allowed set).
+  - expression: >-
+      oldObject.metadata.annotations.all(k,
+        k == 'blip.io/release' || k == 'blip.io/host-key' || k == 'blip.io/ephemeral' || k == 'blip.io/max-duration' ||
+        (k in object.metadata.annotations && object.metadata.annotations[k] == oldObject.metadata.annotations[k])
+      )
+    message: "vm-release SA may not modify or remove any annotation other than blip.io/release, blip.io/host-key, blip.io/ephemeral, and blip.io/max-duration"
+  # 7. No new annotations may be added (except the allowed set).
+  - expression: >-
+      object.metadata.annotations.all(k,
+        k == 'blip.io/release' || k == 'blip.io/host-key' || k == 'blip.io/ephemeral' || k == 'blip.io/max-duration' || k in oldObject.metadata.annotations
+      )
+    message: "vm-release SA may not add annotations other than blip.io/release, blip.io/host-key, blip.io/ephemeral, and blip.io/max-duration"
+  # 8. Labels must not be changed.
+  - expression: >-
+      object.metadata.labels == oldObject.metadata.labels
+    message: "vm-release SA may not modify labels"
+  # 9. Finalizers must not be changed (prevents blocking VM deletion).
+  - expression: >-
+      (has(object.metadata.finalizers) ? object.metadata.finalizers : []) ==
+      (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])
+    message: "vm-release SA may not modify finalizers"
+  # 10. Spec must not be changed.
+  - expression: >-
+      object.spec == oldObject.spec
+    message: "vm-release SA may not modify the VM spec"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: vm-release-restrict
+spec:
+  policyName: vm-release-restrict
+  validationActions: [Deny]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blip-controller
+  namespace: blip
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: blip-controller
+  template:
+    metadata:
+      labels:
+        app: blip-controller
+    spec:
+      serviceAccountName: blip-controller
+      containers:
+      - name: blip-controller
+        image: ${REGISTRY}/blip:${BLIP_TAG}
+        command: ["/usr/local/bin/blip-controller"]
+        env:
+        - name: VM_NAMESPACE
+          value: "blip"
+        - name: VM_POOL_NAME
+          value: "default"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 5
+---
+# ConfigMap for allowed GitHub Actions repositories. The ssh-gateway watches
+# this ConfigMap in real time — edits take effect without a restart.
+# One owner/repo per line under the "repos" key. Lines starting with # are
+# comments. Remove the ConfigMap (or clear the key) to disable OIDC auth.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: allowed-repos
+  namespace: blip
+data:
+  repos: |
+    my-org/my-repo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssh-gateway
+  namespace: blip
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ssh-gateway
+  template:
+    metadata:
+      labels:
+        app: ssh-gateway
+    spec:
+      terminationGracePeriodSeconds: 35
+      serviceAccountName: ssh-gateway
+      securityContext:
+        fsGroup: 65534
+      containers:
+      - name: ssh-gateway
+        image: ${REGISTRY}/blip:${BLIP_TAG}
+        ports:
+        - containerPort: 2222
+          name: ssh
+        env:
+        - name: MAX_SESSION_DURATION
+          value: "3600"
+        - name: LISTEN_ADDRESS
+          value: ":2222"
+        - name: ALLOWED_REPOS_CONFIGMAP
+          value: "allowed-repos"
+        - name: VM_POOL_NAME
+          value: "default"
+        - name: VM_NAMESPACE
+          value: "blip"
+        - name: CA_KEY_PATH
+          value: "/etc/blip/ca/ca"
+        - name: CA_PUB_KEY_PATH
+          value: "/etc/blip/ca/ca.pub"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MAX_BLIPS_PER_USER
+          value: "20"
+        - name: GATEWAY_HOST_PRINCIPALS
+          value: "ssh-gateway.blip.svc.cluster.local"
+        - name: HOST_KEY_PATH
+          value: "/etc/blip/host-key/host_key"
+        volumeMounts:
+        - name: ca-key
+          mountPath: /etc/blip/ca
+          readOnly: true
+        - name: host-key
+          mountPath: /etc/blip/host-key
+          readOnly: true
+        readinessProbe:
+          tcpSocket:
+            port: 2222
+          initialDelaySeconds: 3
+        livenessProbe:
+          tcpSocket:
+            port: 2222
+          initialDelaySeconds: 5
+        resources:
+          requests:
+            cpu: 200m
+            memory: 128Mi
+          limits:
+            cpu: "1"
+            memory: 512Mi
+      volumes:
+      - name: ca-key
+        projected:
+          defaultMode: 0440
+          sources:
+          - secret:
+              name: ssh-ca-keypair
+              items:
+              - key: ca
+                path: ca
+          - configMap:
+              name: ssh-ca-pubkey
+              items:
+              - key: ca.pub
+                path: ca.pub
+      - name: host-key
+        secret:
+          secretName: ssh-host-key
+          defaultMode: 0440
+          items:
+          - key: host_key
+            path: host_key
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ssh-gateway
+  namespace: blip
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ssh-gateway
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ssh-gateway
+  namespace: blip
+spec:
+  type: LoadBalancer
+  selector:
+    app: ssh-gateway
+  ports:
+  - port: 22
+    targetPort: 2222
+    protocol: TCP
+    name: ssh
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vm-isolation
+  namespace: blip
+spec:
+  podSelector:
+    matchLabels:
+      blip.io/pool: "default"
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: ssh-gateway
+    ports:
+    - protocol: TCP
+      port: 22
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vm-egress
+  namespace: blip
+spec:
+  podSelector:
+    matchLabels:
+      blip.io/pool: "default"
+  policyTypes:
+  - Egress
+  egress:
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
+  # Allow VMs to SSH back to the gateway for recursive blip allocation.
+  - to:
+    - podSelector:
+        matchLabels:
+          app: ssh-gateway
+    ports:
+    - protocol: TCP
+      port: 2222
+    - protocol: TCP
+      port: 22
