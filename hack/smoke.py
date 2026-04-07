@@ -135,33 +135,195 @@ def wait_for_vm_deleted(session_id, timeout=60):
 
 def wait_for_pool_ready(min_ready=1, timeout=300):
     """Wait until at least min_ready unclaimed VMs in the pool are Ready."""
+    start = time.time()
+    last_summary = ""
+
     def check():
+        nonlocal last_summary
         try:
             vms = kubectl_json("get", "vm", "-n", NAMESPACE,
                                "-l", f"blip.io/pool={POOL_NAME}")
-        except Exception:
+        except Exception as e:
+            print(f"    [pool] failed to list VMs: {e}", flush=True)
             return False
+
+        items = vms.get("items", [])
+        if not items:
+            summary = "no VMs exist in pool"
+            if summary != last_summary:
+                print(f"    [pool] {summary}", flush=True)
+                last_summary = summary
+            return False
+
         ready = 0
-        for item in vms.get("items", []):
-            ann = item.get("metadata", {}).get("annotations", {})
-            if "blip.io/session-id" in ann:
-                continue
-            # host-key is written by cloud-init; VM isn't usable without it
-            if not ann.get("blip.io/host-key"):
-                continue
+        vm_states = []
+        for item in items:
             name = item["metadata"]["name"]
+            ann = item.get("metadata", {}).get("annotations", {})
+            phase = item.get("status", {}).get("printableStatus", "Unknown")
+
+            if "blip.io/session-id" in ann:
+                vm_states.append(f"{name}: claimed({ann['blip.io/session-id']})")
+                continue
+
+            has_host_key = bool(ann.get("blip.io/host-key"))
+
+            # Check VMI status
+            vmi_ready = False
+            vmi_phase = "NoVMI"
+            vmi_ip = ""
+            vmi_conditions = []
             try:
                 vmi = kubectl_json("get", "vmi", name, "-n", NAMESPACE)
+                vmi_phase = vmi.get("status", {}).get("phase", "Unknown")
                 for cond in vmi.get("status", {}).get("conditions", []):
-                    if cond.get("type") == "Ready" and cond.get("status") == "True":
-                        ready += 1
-                        break
+                    ctype = cond.get("type", "")
+                    cstatus = cond.get("status", "")
+                    vmi_conditions.append(f"{ctype}={cstatus}")
+                    if ctype == "Ready" and cstatus == "True":
+                        vmi_ready = True
+                interfaces = vmi.get("status", {}).get("interfaces", [])
+                if interfaces:
+                    vmi_ip = interfaces[0].get("ip", "")
             except Exception:
-                continue
+                pass
+
+            if vmi_ready and has_host_key:
+                ready += 1
+                vm_states.append(f"{name}: ready")
+            else:
+                reasons = []
+                if vmi_phase == "NoVMI":
+                    reasons.append("no VMI")
+                elif not vmi_ready:
+                    reasons.append(f"vmi_phase={vmi_phase}")
+                    if vmi_conditions:
+                        reasons.append(f"conditions=[{', '.join(vmi_conditions)}]")
+                if not vmi_ip and vmi_phase != "NoVMI":
+                    reasons.append("no IP")
+                if not has_host_key:
+                    reasons.append("no host-key")
+                vm_states.append(f"{name}: NOT ready ({'; '.join(reasons)})")
+
+        elapsed = int(time.time() - start)
+        summary = f"{ready}/{len(items)} ready ({elapsed}s) | {' | '.join(vm_states)}"
+        if summary != last_summary:
+            print(f"    [pool] {summary}", flush=True)
+            last_summary = summary
         return ready >= min_ready
-    wait_for(check, f"at least {min_ready} VM(s) ready in pool",
-             timeout=timeout, interval=5)
+
+    try:
+        wait_for(check, f"at least {min_ready} VM(s) ready in pool",
+                 timeout=timeout, interval=5)
+    except TimeoutError:
+        dump_vm_diagnostics()
+        raise
     print(f"    Pool has >= {min_ready} ready VM(s)", flush=True)
+
+
+def dump_vm_diagnostics():
+    """Dump detailed diagnostics for all VMs in the pool. Called on timeout."""
+    print("\n=== VM Pool Diagnostics (timeout) ===", flush=True)
+
+    # 1. VirtualMachinePool status
+    try:
+        pool = kubectl_json("get", "virtualmachinepool", POOL_NAME, "-n", NAMESPACE)
+        status = pool.get("status", {})
+        spec_replicas = pool.get("spec", {}).get("replicas", "unset")
+        print(f"  VirtualMachinePool '{POOL_NAME}': "
+              f"spec.replicas={spec_replicas}, "
+              f"status.replicas={status.get('replicas', 'N/A')}, "
+              f"status.readyReplicas={status.get('readyReplicas', 'N/A')}",
+              flush=True)
+    except Exception as e:
+        print(f"  VirtualMachinePool: failed to get: {e}", flush=True)
+
+    # 2. Per-VM and VMI detail
+    try:
+        vms = kubectl_json("get", "vm", "-n", NAMESPACE,
+                           "-l", f"blip.io/pool={POOL_NAME}")
+    except Exception as e:
+        print(f"  VMs: failed to list: {e}", flush=True)
+        vms = {"items": []}
+
+    for item in vms.get("items", []):
+        name = item["metadata"]["name"]
+        ann = item.get("metadata", {}).get("annotations", {})
+        vm_status = item.get("status", {})
+        print(f"\n  --- VM: {name} ---", flush=True)
+        print(f"    printableStatus: {vm_status.get('printableStatus', 'N/A')}", flush=True)
+        print(f"    ready: {vm_status.get('ready', 'N/A')}", flush=True)
+        print(f"    created: {vm_status.get('created', 'N/A')}", flush=True)
+        print(f"    host-key: {'present' if ann.get('blip.io/host-key') else 'MISSING'}", flush=True)
+        print(f"    session-id: {ann.get('blip.io/session-id', 'none')}", flush=True)
+
+        # VMI conditions and phase
+        try:
+            vmi = kubectl_json("get", "vmi", name, "-n", NAMESPACE)
+            vmi_status = vmi.get("status", {})
+            print(f"    VMI phase: {vmi_status.get('phase', 'N/A')}", flush=True)
+            print(f"    VMI nodeName: {vmi_status.get('nodeName', 'N/A')}", flush=True)
+            for cond in vmi_status.get("conditions", []):
+                print(f"    VMI condition: {cond.get('type')}={cond.get('status')}"
+                      f" reason={cond.get('reason', '')} message={cond.get('message', '')}",
+                      flush=True)
+            interfaces = vmi_status.get("interfaces", [])
+            if interfaces:
+                print(f"    VMI IP: {interfaces[0].get('ip', 'N/A')}", flush=True)
+            else:
+                print(f"    VMI IP: no interfaces", flush=True)
+        except Exception as e:
+            print(f"    VMI: not found or error: {e}", flush=True)
+
+        # virt-launcher pod status
+        try:
+            pods = kubectl_json("get", "pods", "-n", NAMESPACE,
+                                "-l", f"kubevirt.io/domain={name}",
+                                "--sort-by=.metadata.creationTimestamp")
+            for pod in pods.get("items", []):
+                pod_name = pod["metadata"]["name"]
+                pod_phase = pod.get("status", {}).get("phase", "Unknown")
+                print(f"    Pod: {pod_name} phase={pod_phase}", flush=True)
+                for cs in pod.get("status", {}).get("containerStatuses", []):
+                    state = cs.get("state", {})
+                    state_desc = "unknown"
+                    for sname, sval in state.items():
+                        reason = sval.get("reason", "")
+                        msg = sval.get("message", "")
+                        state_desc = f"{sname}" + (f" ({reason})" if reason else "") + (f": {msg}" if msg else "")
+                    print(f"      container {cs.get('name')}: ready={cs.get('ready')} "
+                          f"restarts={cs.get('restartCount')} state={state_desc}",
+                          flush=True)
+                # Pod events (scheduling failures, image pull errors, etc.)
+                try:
+                    events = kubectl_json("get", "events", "-n", NAMESPACE,
+                                          "--field-selector", f"involvedObject.name={pod_name}",
+                                          "--sort-by=.lastTimestamp")
+                    recent = events.get("items", [])[-5:]
+                    if recent:
+                        print(f"      Recent events:", flush=True)
+                        for ev in recent:
+                            print(f"        {ev.get('reason', '?')}: {ev.get('message', '?')}", flush=True)
+                except Exception:
+                    pass
+        except Exception:
+            print(f"    Pod: no virt-launcher pods found", flush=True)
+
+    # 3. Cluster-level context: node readiness and resources
+    try:
+        nodes = kubectl_json("get", "nodes")
+        print(f"\n  --- Nodes ({len(nodes.get('items', []))}) ---", flush=True)
+        for node in nodes.get("items", []):
+            node_name = node["metadata"]["name"]
+            conditions = {c["type"]: c["status"] for c in node.get("status", {}).get("conditions", [])}
+            print(f"    {node_name}: Ready={conditions.get('Ready', '?')} "
+                  f"MemoryPressure={conditions.get('MemoryPressure', '?')} "
+                  f"DiskPressure={conditions.get('DiskPressure', '?')}",
+                  flush=True)
+    except Exception as e:
+        print(f"  Nodes: failed: {e}", flush=True)
+
+    print("\n=== End Diagnostics ===\n", flush=True)
 
 
 def resolve_gateway_ip():
@@ -171,6 +333,31 @@ def resolve_gateway_ip():
         if ing.get("ip"):
             return ing["ip"]
     raise RuntimeError("ssh-gateway service has no LoadBalancer IP")
+
+
+def dump_pod_logs():
+    """Dump logs from key pods to aid debugging CI failures."""
+    print("\n=== Pod Logs ===", flush=True)
+    for label, ns in [
+        ("app=blip-controller", NAMESPACE),
+        ("app=ssh-gateway", NAMESPACE),
+        ("kubevirt.io=virt-handler", "kubevirt"),
+    ]:
+        try:
+            pods = kubectl_json("get", "pods", "-n", ns, "-l", label)
+            for pod in pods.get("items", []):
+                pod_name = pod["metadata"]["name"]
+                phase = pod.get("status", {}).get("phase", "Unknown")
+                print(f"\n  --- {pod_name} ({ns}, phase={phase}) ---", flush=True)
+                r = kubectl("logs", pod_name, "-n", ns,
+                            "--tail=80", "--all-containers",
+                            check=False, timeout=15)
+                print(r.stdout or "(no stdout)", flush=True)
+                if r.stderr:
+                    print(r.stderr, flush=True)
+        except Exception as e:
+            print(f"  [{label}] failed to collect logs: {e}", flush=True)
+    print("=== End Pod Logs ===\n", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +749,7 @@ def main():
     except Exception:
         print("=== Setup FAILED ===", flush=True)
         traceback.print_exc()
+        dump_pod_logs()
         teardown()
         return 1
 
@@ -582,6 +770,8 @@ def main():
             except TimeoutError:
                 print("  Warning: pool did not replenish", flush=True)
     finally:
+        if failed > 0:
+            dump_pod_logs()
         teardown()
 
     print(f"\n{'='*40}")

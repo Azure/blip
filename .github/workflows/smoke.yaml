@@ -52,3 +52,25 @@ jobs:
 
       - name: Run smoke tests
         run: python3 hack/smoke.py
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set -x
+          echo "=== KubeVirt status ==="
+          kubectl -n kubevirt get kubevirt kubevirt -o jsonpath='{.status.conditions}' | python3 -m json.tool || true
+          echo ""
+          echo "=== VMs ==="
+          kubectl get vm -n blip -o wide || true
+          echo ""
+          echo "=== VMIs ==="
+          kubectl get vmi -n blip -o wide || true
+          echo ""
+          echo "=== Pods in blip namespace ==="
+          kubectl get pods -n blip -o wide || true
+          echo ""
+          echo "=== Events in blip namespace (last 30) ==="
+          kubectl get events -n blip --sort-by=.lastTimestamp | tail -30 || true
+          echo ""
+          echo "=== Events in kubevirt namespace (last 15) ==="
+          kubectl get events -n kubevirt --sort-by=.lastTimestamp | tail -15 || true
