@@ -407,19 +407,23 @@ def setup():
     print("  Restarting ssh-gateway pods...", flush=True)
     kubectl("rollout", "restart", "deploy/ssh-gateway", "-n", NAMESPACE)
 
-    # 6. Generate VM pool (Secret + VirtualMachinePool) and apply
+    # 6. Apply VM pool manifest and scale to desired replicas
     print("  Creating VM pool...", flush=True)
-    pool_yaml = run(["go", "run", "./cmd/kubectl-blip", "generate-pool",
-                     "-n", NAMESPACE, "--name", POOL_NAME,
-                     "--replicas", str(REPLICAS)], timeout=120).stdout
-    run(["kubectl", "apply", "-f", "-"], input=pool_yaml)
+    kubectl("apply", "-f", "pool.yaml")
+    kubectl("patch", "virtualmachinepool", POOL_NAME, "-n", NAMESPACE,
+            "--type=merge", "-p",
+            f'{{"spec":{{"replicas":{REPLICAS}}}}}')
 
     # 7. Generate SSH keypair and add it to the gateway allow-list
     print("  Generating SSH key...", flush=True)
     run(["ssh-keygen", "-t", "ed25519", "-f", _ssh_key, "-N", "", "-q"])
-    run(["go", "run", "./cmd/kubectl-blip", "allow-key",
-         "-i", f"{_ssh_key}.pub",
-         "-n", NAMESPACE], timeout=120)
+    with open(f"{_ssh_key}.pub") as f:
+        pub_key = f.read().strip()
+    # Use apply so it works whether the ConfigMap already exists or not.
+    cm_yaml = kubectl("create", "configmap", "ssh-gateway-auth", "-n", NAMESPACE,
+                      f"--from-literal=allowed-pubkeys={pub_key}",
+                      "--dry-run=client", "-o", "yaml").stdout
+    run(["kubectl", "apply", "-f", "-"], input=cm_yaml)
 
     # 8. Wait for gateway rollout
     print("  Waiting for ssh-gateway...", flush=True)
