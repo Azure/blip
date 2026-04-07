@@ -14,13 +14,21 @@ ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
 
 ## Add your key
 
+Add your public key to the `ssh-gateway-auth` ConfigMap in the `blip` namespace. One key per line, `authorized_keys` format.
+
 ```shell
-kubectl blip allow-key
+kubectl edit configmap ssh-gateway-auth -n blip
 ```
 
-Reads `~/.ssh/id_ed25519.pub` and adds it to the `ssh-gateway-auth` ConfigMap in the `blip` namespace. The gateway picks up changes in real time — no restart required.
+Or patch it directly:
 
-Requires RBAC write access to the `ssh-gateway-auth` ConfigMap.
+```shell
+KEY=$(cat ~/.ssh/id_ed25519.pub)
+kubectl patch configmap ssh-gateway-auth -n blip \
+  --type merge -p "{\"data\":{\"allowed-pubkeys\":\"$KEY\n\"}}"
+```
+
+The gateway picks up changes in real time — no restart required.
 
 ## Connect
 
