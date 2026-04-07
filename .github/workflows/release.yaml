@@ -98,17 +98,3 @@ jobs:
           export TAG sha_linux_amd64 sha_linux_arm64 sha_darwin_amd64 sha_darwin_arm64
           envsubst '$TAG $sha_linux_amd64 $sha_linux_arm64 $sha_darwin_amd64 $sha_darwin_arm64' < .krew.yaml > dist/blip.yaml
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          gh release create "${{ steps.tag.outputs.version }}"
-          dist/manifest.yaml
-          dist/blip.yaml
-          dist/checksums.txt
-          dist/kubectl-blip_linux_amd64.tar.gz
-          dist/kubectl-blip_linux_arm64.tar.gz
-          dist/kubectl-blip_darwin_amd64.tar.gz
-          dist/kubectl-blip_darwin_arm64.tar.gz
-          --repo "${{ github.repository }}"
-          --generate-notes
