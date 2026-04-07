@@ -213,6 +213,16 @@ func parsePubkeyList(raw string) map[string]bool {
 	return fps
 }
 
+// NewTestAuthWatcher creates an AuthWatcher pre-loaded with the given repos
+// and pubkey fingerprints, without starting an informer cache. Intended for
+// use in tests outside of this package.
+func NewTestAuthWatcher(repos []string, pubkeyFingerprints map[string]bool) *AuthWatcher {
+	if pubkeyFingerprints == nil {
+		pubkeyFingerprints = make(map[string]bool)
+	}
+	return &AuthWatcher{repos: repos, pubkeys: pubkeyFingerprints}
+}
+
 func newCoreRESTMapper() meta.RESTMapper {
 	return restmapper.NewDiscoveryRESTMapper([]*restmapper.APIGroupResources{
 		{

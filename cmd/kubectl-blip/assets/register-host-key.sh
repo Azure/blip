@@ -37,8 +37,8 @@ main() {
 	fi
 
 	# sshd may already be running (Ubuntu 24.04 starts it via socket
-	# activation). Restart so it picks up the TrustedUserCAKeys directive
-	# written by setup-ssh-ca.sh.
+	# activation). Restart to ensure it is running and picks up any
+	# configuration changes.
 	systemctl enable ssh
 	systemctl restart ssh
 }

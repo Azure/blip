@@ -16,7 +16,6 @@ import (
 	"github.com/project-unbounded/blip/internal/gateway/auth"
 	"github.com/project-unbounded/blip/internal/gateway/proxy"
 	"github.com/project-unbounded/blip/internal/gateway/vm"
-	"github.com/project-unbounded/blip/internal/sshca"
 )
 
 func isOIDCIdentity(identity string) bool {
@@ -38,8 +37,6 @@ const (
 // Config holds the dependencies and tunables for the session Manager.
 type Config struct {
 	GatewaySigner      ssh.Signer
-	CASigner           ssh.Signer
-	CAPubKey           string
 	GatewayHost        string
 	VMClient           *vm.Client
 	VMPoolName         string
@@ -83,28 +80,6 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 	}()
 
 	authFingerprint, authIdentity := extractAuthExtensions(serverConn)
-	isBlipVM := serverConn.Permissions != nil &&
-		serverConn.Permissions.Extensions != nil &&
-		serverConn.Permissions.Extensions[auth.ExtBlipVM] == "true"
-
-	// Resolve root identity for recursive blip-vm connections.
-	if isBlipVM {
-		rootIdentity, err := m.cfg.VMClient.ResolveRootIdentity(ctx, authFingerprint)
-		if err != nil {
-			slog.Warn("failed to resolve root identity for blip-vm cert",
-				"fingerprint", authFingerprint,
-				"key_id", authIdentity,
-				"error", err,
-			)
-			// If we can't resolve the root identity, reject the connection.
-			return
-		}
-		slog.Info("resolved blip-vm root identity",
-			"key_id", authIdentity,
-			"root_identity", rootIdentity,
-		)
-		authIdentity = rootIdentity
-	}
 
 	slog.Info("client authenticated",
 		"user", serverConn.User(),
@@ -207,49 +182,23 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 		sess.SetBannerChannel(firstClientChan)
 	}
 
-	// Generate a per-VM SSH identity for recursive blip connections.
-	if m.cfg.CASigner != nil && !reconnecting {
-		vmIdent, err := sshca.GenerateVMIdentity(
-			m.cfg.CASigner,
-			sessionID,
-			[]string{"runner"},
-			m.cfg.MaxSessionDuration+1*time.Hour,
-		)
-		if err != nil {
-			slog.Warn("failed to generate VM identity",
-				"session_id", sessionID,
-				"error", err,
-			)
-		} else {
-			// Store the fingerprint so the gateway can map blip-vm certs
-			// back to the root user. Skip injection if this fails.
-			if err := m.cfg.VMClient.StoreSSHPublicKey(ctx, sessionID, vmIdent.Fingerprint); err != nil {
-				slog.Error("failed to store VM SSH public key, skipping identity injection",
+	// Inject SSH config for recursive blip connections (gateway host + key).
+	if !reconnecting && m.cfg.GatewayHost != "" {
+		go func() {
+			if err := proxy.InjectGatewayConfig(
+				upstreamConn,
+				m.cfg.GatewayHost,
+			); err != nil {
+				slog.Warn("failed to inject gateway config",
 					"session_id", sessionID,
 					"error", err,
 				)
 			} else {
-				go func() {
-					if err := proxy.InjectVMIdentity(
-						upstreamConn,
-						vmIdent.PrivateKeyPEM,
-						vmIdent.CertAuthorizedKey,
-						m.cfg.GatewayHost,
-						m.cfg.CAPubKey,
-					); err != nil {
-						slog.Warn("failed to inject VM identity",
-							"session_id", sessionID,
-							"error", err,
-						)
-					} else {
-						slog.Info("VM identity injected",
-							"session_id", sessionID,
-							"fingerprint", vmIdent.Fingerprint,
-						)
-					}
-				}()
+				slog.Info("gateway config injected",
+					"session_id", sessionID,
+				)
 			}
-		}
+		}()
 	}
 
 	m.register(sessionID, sess)

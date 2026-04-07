@@ -78,6 +78,9 @@ rules:
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["create", "patch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -103,12 +106,6 @@ rules:
 - apiGroups: ["pool.kubevirt.io"]
   resources: ["virtualmachinepools"]
   verbs: ["*"]
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["*"]
-- apiGroups: [""]
-  resources: ["configmaps"]
-  verbs: ["*"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -122,19 +119,6 @@ roleRef:
   kind: ClusterRole
   name: blip-controller-vms
   apiGroup: rbac.authorization.k8s.io
----
-# RBAC for kubectl-blip plugin: allows users to read the SSH CA secret
-# to sign their local SSH keys via "kubectl blip sign-identity".
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: ssh-ca-signer
-  namespace: blip
-rules:
-- apiGroups: [""]
-  resources: ["secrets"]
-  resourceNames: ["ssh-ca-keypair"]
-  verbs: ["get"]
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -151,10 +135,6 @@ rules:
 - apiGroups: ["kubevirt.io"]
   resources: ["virtualmachines"]
   verbs: ["patch"]
-- apiGroups: [""]
-  resources: ["configmaps"]
-  resourceNames: ["ssh-ca-pubkey"]
-  verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -208,10 +188,6 @@ spec:
       request.userInfo.username == 'system:serviceaccount:blip:vm-release'
   validations:
   # 1. The request must originate from the virt-launcher pod that owns this VM.
-  #    Kubernetes bound SA tokens carry the pod name in
-  #    request.userInfo.extra["authentication.kubernetes.io/pod-name"].
-  #    KubeVirt names virt-launcher pods "virt-launcher-<vm-name>-<random>",
-  #    so we verify the pod name starts with "virt-launcher-<target VM name>-".
   - expression: >-
       has(request.userInfo.extra) &&
       'authentication.kubernetes.io/pod-name' in request.userInfo.extra &&
@@ -327,7 +303,7 @@ spec:
 #   allowed-repos:   One owner/repo per line. Lines starting with # are comments.
 #                    Controls which GitHub Actions repos may authenticate via OIDC.
 #   allowed-pubkeys: One SSH public key per line (authorized_keys format).
-#                    Controls which raw public keys are accepted without a CA cert.
+#                    Controls which public keys are accepted.
 #
 # Remove the ConfigMap (or leave keys empty) to disable OIDC and pubkey auth.
 apiVersion: v1
@@ -377,10 +353,6 @@ spec:
           value: "default"
         - name: VM_NAMESPACE
           value: "blip"
-        - name: CA_KEY_PATH
-          value: "/etc/blip/ca/ca"
-        - name: CA_PUB_KEY_PATH
-          value: "/etc/blip/ca/ca.pub"
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -392,9 +364,6 @@ spec:
         - name: HOST_KEY_PATH
           value: "/etc/blip/host-key/host_key"
         volumeMounts:
-        - name: ca-key
-          mountPath: /etc/blip/ca
-          readOnly: true
         - name: host-key
           mountPath: /etc/blip/host-key
           readOnly: true
@@ -414,20 +383,6 @@ spec:
             cpu: "1"
             memory: 512Mi
       volumes:
-      - name: ca-key
-        projected:
-          defaultMode: 0440
-          sources:
-          - secret:
-              name: ssh-ca-keypair
-              items:
-              - key: ca
-                path: ca
-          - configMap:
-              name: ssh-ca-pubkey
-              items:
-              - key: ca.pub
-                path: ca.pub
       - name: host-key
         secret:
           secretName: ssh-host-key

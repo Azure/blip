@@ -46,4 +46,4 @@ sudo install kubectl-blip /usr/local/bin/kubectl-blip
 ## Next steps
 
 - [Create a VM Pool]({{% relref "create-vm-pool" %}})
-- [Sign SSH Keys]({{% relref "sign-ssh-keys" %}})
+- [Add SSH Key]({{% relref "sign-ssh-keys" %}})

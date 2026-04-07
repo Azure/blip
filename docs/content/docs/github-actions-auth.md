@@ -4,7 +4,7 @@ description: "Authenticate from GitHub Actions workflows"
 weight: 4
 ---
 
-Blip supports GitHub Actions authentication as an alternative to SSH certificates. The workflow requests a GitHub Actions token with audience `blip` and passes it as the SSH password. The gateway verifies the signature, audience, and repository against its allow-list.
+Blip supports GitHub Actions OIDC authentication. The workflow requests a GitHub Actions token with audience `blip` and passes it as the SSH password. The gateway verifies the signature, audience, and repository against its allow-list.
 
 ## Configure the gateway
 
@@ -82,7 +82,7 @@ jobs:
 
 ## Session behavior
 
-- **Default TTL:** 30 minutes (vs 8 hours for certificate auth).
+- **Default TTL:** 30 minutes.
 - **Identity:** `github-actions:<repository>:ref:refs/heads/<branch>`.
 - **Ephemeral:** VMs destroyed on disconnect.
 - Per-user quotas apply using the GitHub Actions identity.

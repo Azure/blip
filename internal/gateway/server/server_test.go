@@ -18,34 +18,18 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/project-unbounded/blip/internal/sshca"
+	"github.com/project-unbounded/blip/internal/gateway/auth"
 )
 
-// testCA holds ephemeral CA material written to temp files for a single test.
-type testCA struct {
-	KeyPath     string
-	PubKeyPath  string
+// testHostKey holds ephemeral key material written to temp files for a single test.
+type testHostKey struct {
 	HostKeyPath string
 	Signer      ssh.Signer
 }
 
-// newTestCA generates a fresh CA keypair and a stable host key, writing all
-// key files into dir.
-func newTestCA(t *testing.T, dir string) testCA {
+// newTestHostKey generates a fresh host key and writes it to a temp file.
+func newTestHostKey(t *testing.T, dir string) testHostKey {
 	t.Helper()
-	privPEM, pubAuth, err := sshca.GenerateCAKeypair()
-	require.NoError(t, err)
-
-	keyPath := filepath.Join(dir, "ca")
-	require.NoError(t, os.WriteFile(keyPath, privPEM, 0600))
-
-	pubPath := filepath.Join(dir, "ca.pub")
-	require.NoError(t, os.WriteFile(pubPath, []byte(pubAuth), 0644))
-
-	signer, err := ssh.ParsePrivateKey(privPEM)
-	require.NoError(t, err)
-
-	// Generate a stable host key, same as the keygen controller does.
 	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 	hostPEM, err := ssh.MarshalPrivateKey(hostPriv, "")
@@ -53,46 +37,49 @@ func newTestCA(t *testing.T, dir string) testCA {
 	hostKeyPath := filepath.Join(dir, "host_key")
 	require.NoError(t, os.WriteFile(hostKeyPath, pem.EncodeToMemory(hostPEM), 0600))
 
-	return testCA{KeyPath: keyPath, PubKeyPath: pubPath, HostKeyPath: hostKeyPath, Signer: signer}
+	signer, err := ssh.NewSignerFromKey(hostPriv)
+	require.NoError(t, err)
+
+	return testHostKey{HostKeyPath: hostKeyPath, Signer: signer}
 }
 
-// validConfig returns a Config wired to the given CA with a random listen port.
-func validConfig(ca testCA) Config {
+// newTestAuthWatcher creates an AuthWatcher with the given pubkey fingerprints allowed.
+func newTestAuthWatcher(fingerprints map[string]bool) *auth.AuthWatcher {
+	return auth.NewTestAuthWatcher(nil, fingerprints)
+}
+
+// validConfig returns a Config wired to the given host key with a random listen port.
+func validConfig(hk testHostKey) Config {
 	return Config{
 		ListenAddr:         "127.0.0.1:0",
-		CAKeyPath:          ca.KeyPath,
-		CAPubKeyPath:       ca.PubKeyPath,
-		HostKeyPath:        ca.HostKeyPath,
+		HostKeyPath:        hk.HostKeyPath,
 		PodName:            "test-pod",
-		HostPrincipals:     []string{"localhost", "127.0.0.1"},
 		MaxSessionDuration: 10 * time.Minute,
 		LoginGraceTime:     5 * time.Second,
 		MaxAuthTries:       3,
 	}
 }
 
-// signedClientConfig creates an SSH client config that authenticates with
-// a CA-signed user certificate.
-func signedClientConfig(t *testing.T, ca testCA) *ssh.ClientConfig {
+// allowedPubkeyClientConfig creates an SSH client config with a fresh key pair
+// and returns both the config and the pubkey fingerprint for allowing.
+func allowedPubkeyClientConfig(t *testing.T) (*ssh.ClientConfig, string) {
 	t.Helper()
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 
 	signer, err := ssh.NewSignerFromKey(priv)
 	require.NoError(t, err)
 
-	cert, err := sshca.SignUserKey(ca.Signer, signer.PublicKey(), "test-user", []string{"runner"}, time.Hour)
+	sshPub, err := ssh.NewPublicKey(pub)
 	require.NoError(t, err)
-
-	certSigner, err := ssh.NewCertSigner(cert, signer)
-	require.NoError(t, err)
+	fp := ssh.FingerprintSHA256(sshPub)
 
 	return &ssh.ClientConfig{
 		User:            "runner",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(certSigner)},
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         3 * time.Second,
-	}
+	}, fp
 }
 
 // ---------- Tests ----------
@@ -108,43 +95,11 @@ func TestNew(t *testing.T) {
 			mutate: nil,
 		},
 		{
-			name: "missing CA private key",
-			mutate: func(c *Config, _ string) {
-				c.CAKeyPath = "/nonexistent/ca"
-			},
-			wantErr: "read CA key",
-		},
-		{
-			name: "missing CA public key",
-			mutate: func(c *Config, _ string) {
-				c.CAPubKeyPath = "/nonexistent/ca.pub"
-			},
-			wantErr: "read CA public key",
-		},
-		{
-			name: "corrupt CA private key",
-			mutate: func(c *Config, dir string) {
-				bad := filepath.Join(dir, "bad_ca")
-				require.NoError(t, os.WriteFile(bad, []byte("not-a-pem"), 0600))
-				c.CAKeyPath = bad
-			},
-			wantErr: "parse CA key",
-		},
-		{
-			name: "corrupt CA public key",
-			mutate: func(c *Config, dir string) {
-				bad := filepath.Join(dir, "bad_ca.pub")
-				require.NoError(t, os.WriteFile(bad, []byte("not-a-pubkey"), 0644))
-				c.CAPubKeyPath = bad
-			},
-			wantErr: "parse CA public key",
-		},
-		{
 			name: "missing host key",
 			mutate: func(c *Config, _ string) {
 				c.HostKeyPath = "/nonexistent/host_key"
 			},
-			wantErr: "load host key",
+			wantErr: "read host key",
 		},
 		{
 			name: "corrupt host key",
@@ -153,14 +108,7 @@ func TestNew(t *testing.T) {
 				require.NoError(t, os.WriteFile(bad, []byte("not-a-pem"), 0600))
 				c.HostKeyPath = bad
 			},
-			wantErr: "load host key",
-		},
-		{
-			name: "no host principals fails signing",
-			mutate: func(c *Config, _ string) {
-				c.HostPrincipals = nil
-			},
-			wantErr: "sign host key",
+			wantErr: "parse host key",
 		},
 		{
 			name: "invalid listen address",
@@ -174,8 +122,8 @@ func TestNew(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
-			ca := newTestCA(t, dir)
-			cfg := validConfig(ca)
+			hk := newTestHostKey(t, dir)
+			cfg := validConfig(hk)
 
 			if tt.mutate != nil {
 				tt.mutate(&cfg, dir)
@@ -196,8 +144,11 @@ func TestNew(t *testing.T) {
 
 func TestServe_AuthenticatedClientReceivesCallback(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-	cfg := validConfig(ca)
+	hk := newTestHostKey(t, dir)
+	cfg := validConfig(hk)
+
+	clientCfg, fp := allowedPubkeyClientConfig(t)
+	cfg.AuthWatcher = newTestAuthWatcher(map[string]bool{fp: true})
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
@@ -218,18 +169,15 @@ func TestServe_AuthenticatedClientReceivesCallback(t *testing.T) {
 			handlerCalled.Store(true)
 			assert.Equal(t, "runner", sc.User())
 			assert.NotEmpty(t, sc.Permissions.Extensions["auth-fingerprint"])
-			assert.Equal(t, "test-user", sc.Permissions.Extensions["auth-identity"])
+			assert.Equal(t, "pubkey:"+fp, sc.Permissions.Extensions["auth-identity"])
 			sc.Close()
 		})
 	}()
 
-	// Dial and authenticate
-	clientCfg := signedClientConfig(t, ca)
 	conn, err := ssh.Dial("tcp", srv.Addr().String(), clientCfg)
 	require.NoError(t, err)
 	conn.Close()
 
-	// Wait for handler, then shut down
 	handlerDone.Wait()
 	cancel()
 	require.NoError(t, <-serveErr)
@@ -238,8 +186,11 @@ func TestServe_AuthenticatedClientReceivesCallback(t *testing.T) {
 
 func TestServe_GracefulShutdownDrainsConnections(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-	cfg := validConfig(ca)
+	hk := newTestHostKey(t, dir)
+	cfg := validConfig(hk)
+
+	clientCfg, fp := allowedPubkeyClientConfig(t)
+	cfg.AuthWatcher = newTestAuthWatcher(map[string]bool{fp: true})
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
@@ -258,7 +209,6 @@ func TestServe_GracefulShutdownDrainsConnections(t *testing.T) {
 		})
 	}()
 
-	clientCfg := signedClientConfig(t, ca)
 	conn, err := ssh.Dial("tcp", srv.Addr().String(), clientCfg)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -283,8 +233,11 @@ func TestServe_GracefulShutdownDrainsConnections(t *testing.T) {
 
 func TestServe_UnauthenticatedClientRejected(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-	cfg := validConfig(ca)
+	hk := newTestHostKey(t, dir)
+	cfg := validConfig(hk)
+
+	// Allow a specific key, then connect with a different one.
+	cfg.AuthWatcher = newTestAuthWatcher(map[string]bool{"SHA256:allowed-key": true})
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
@@ -299,7 +252,7 @@ func TestServe_UnauthenticatedClientRejected(t *testing.T) {
 		})
 	}()
 
-	// Try connecting with a random, unsigned key.
+	// Try connecting with a random key not in the allowed list.
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 	signer, err := ssh.NewSignerFromKey(priv)
@@ -320,8 +273,25 @@ func TestServe_UnauthenticatedClientRejected(t *testing.T) {
 
 func TestServe_ConcurrentClients(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-	cfg := validConfig(ca)
+	hk := newTestHostKey(t, dir)
+	cfg := validConfig(hk)
+
+	const numClients = 5
+
+	// Pre-generate client configs and fingerprints.
+	type clientInfo struct {
+		cfg *ssh.ClientConfig
+		fp  string
+	}
+	clients := make([]clientInfo, numClients)
+	fpSet := make(map[string]bool)
+	for i := range numClients {
+		cc, fp := allowedPubkeyClientConfig(t)
+		clients[i] = clientInfo{cfg: cc, fp: fp}
+		fpSet[fp] = true
+		_ = i
+	}
+	cfg.AuthWatcher = newTestAuthWatcher(fpSet)
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
@@ -329,7 +299,6 @@ func TestServe_ConcurrentClients(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	const numClients = 5
 	var counter atomic.Int32
 	var wg sync.WaitGroup
 	wg.Add(numClients)
@@ -344,8 +313,7 @@ func TestServe_ConcurrentClients(t *testing.T) {
 	}()
 
 	for i := 0; i < numClients; i++ {
-		clientCfg := signedClientConfig(t, ca)
-		conn, err := ssh.Dial("tcp", srv.Addr().String(), clientCfg)
+		conn, err := ssh.Dial("tcp", srv.Addr().String(), clients[i].cfg)
 		require.NoError(t, err)
 		conn.Close()
 	}
@@ -358,8 +326,8 @@ func TestServe_ConcurrentClients(t *testing.T) {
 
 func TestServe_HandshakeTimeout(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-	cfg := validConfig(ca)
+	hk := newTestHostKey(t, dir)
+	cfg := validConfig(hk)
 	cfg.LoginGraceTime = 200 * time.Millisecond
 
 	srv, err := New(cfg)
@@ -377,12 +345,9 @@ func TestServe_HandshakeTimeout(t *testing.T) {
 	}()
 
 	// Open a raw TCP connection but never complete the SSH handshake.
-	// Just sit idle — the server should close it after LoginGraceTime.
 	conn, err := net.DialTimeout("tcp", srv.Addr().String(), 2*time.Second)
 	require.NoError(t, err)
 
-	// Read until EOF or error — the server should kill the connection
-	// once the handshake deadline expires.
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 4096)
 	for {
@@ -398,65 +363,16 @@ func TestServe_HandshakeTimeout(t *testing.T) {
 	assert.False(t, handlerCalled.Load(), "handler should not be called for timed-out handshake")
 }
 
-func TestServe_ExpiredCertRejected(t *testing.T) {
-	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-	cfg := validConfig(ca)
-
-	srv, err := New(cfg)
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- srv.Serve(ctx, func(_ context.Context, _ *ssh.ServerConn, _ <-chan ssh.NewChannel, _ <-chan *ssh.Request) {
-			t.Error("handler should not be called for expired certificate")
-		})
-	}()
-
-	// Create a client cert that expired 1 hour ago.
-	_, userPriv, err := ed25519.GenerateKey(rand.Reader)
-	require.NoError(t, err)
-	signer, err := ssh.NewSignerFromKey(userPriv)
-	require.NoError(t, err)
-
-	// Sign with a validity of 1 nanosecond — it will already be expired
-	// by the time we try to use it (the cert's ValidBefore will be in the
-	// past since SignUserKey uses time.Now() + validity, and 1ns is negligible).
-	cert, err := sshca.SignUserKey(ca.Signer, signer.PublicKey(), "expired-user", []string{"runner"}, 1*time.Nanosecond)
-	require.NoError(t, err)
-	// Ensure the cert is actually expired by waiting a moment.
-	time.Sleep(10 * time.Millisecond)
-
-	certSigner, err := ssh.NewCertSigner(cert, signer)
-	require.NoError(t, err)
-
-	clientCfg := &ssh.ClientConfig{
-		User:            "runner",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(certSigner)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         2 * time.Second,
-	}
-	_, err = ssh.Dial("tcp", srv.Addr().String(), clientCfg)
-	assert.Error(t, err)
-
-	cancel()
-	require.NoError(t, <-serveErr)
-}
-
 func TestClose(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-	cfg := validConfig(ca)
+	hk := newTestHostKey(t, dir)
+	cfg := validConfig(hk)
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
 
 	addr := srv.Addr().String()
 
-	// Close the server; new connections should be refused.
 	require.NoError(t, srv.Close())
 
 	_, err = net.DialTimeout("tcp", addr, 500*time.Millisecond)
@@ -465,8 +381,8 @@ func TestClose(t *testing.T) {
 
 func TestAddr(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-	cfg := validConfig(ca)
+	hk := newTestHostKey(t, dir)
+	cfg := validConfig(hk)
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
@@ -533,85 +449,25 @@ func TestLoadSigner(t *testing.T) {
 	}
 }
 
-func TestLoadCAPublicKey(t *testing.T) {
-	tests := []struct {
-		name    string
-		setup   func(string) string
-		wantErr string
-	}{
-		{
-			name: "valid authorized_keys format",
-			setup: func(dir string) string {
-				_, pubAuth, err := sshca.GenerateCAKeypair()
-				require.NoError(t, err)
-				p := filepath.Join(dir, "ca.pub")
-				require.NoError(t, os.WriteFile(p, []byte(pubAuth), 0644))
-				return p
-			},
-		},
-		{
-			name: "nonexistent file",
-			setup: func(_ string) string {
-				return "/no/such/ca.pub"
-			},
-			wantErr: "read CA public key",
-		},
-		{
-			name: "invalid public key data",
-			setup: func(dir string) string {
-				p := filepath.Join(dir, "bad.pub")
-				require.NoError(t, os.WriteFile(p, []byte("not a key"), 0644))
-				return p
-			},
-			wantErr: "parse CA public key",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := tt.setup(dir)
-			pub, err := loadCAPublicKey(path)
-			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
-				return
-			}
-			require.NoError(t, err)
-			assert.NotNil(t, pub)
-		})
-	}
-}
-
-func TestNewHostCertSigner(t *testing.T) {
-	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-
-	cfg := validConfig(ca)
-	cfg.PodName = "my-pod"
-
-	signer, err := newHostCertSigner(ca.Signer, cfg)
-	require.NoError(t, err)
-
-	// The signer should present a host certificate.
-	pubKey := signer.PublicKey()
-	cert, ok := pubKey.(*ssh.Certificate)
-	require.True(t, ok, "public key should be a certificate")
-	assert.Equal(t, uint32(ssh.HostCert), cert.CertType)
-	assert.Equal(t, "gateway-host:my-pod", cert.KeyId)
-	assert.Contains(t, cert.ValidPrincipals, "localhost")
-	assert.Contains(t, cert.ValidPrincipals, "127.0.0.1")
-
-	// Validity window should be approximately MaxSessionDuration + 1 hour.
-	validDuration := time.Unix(int64(cert.ValidBefore), 0).Sub(time.Unix(int64(cert.ValidAfter), 0))
-	expected := cfg.MaxSessionDuration + 1*time.Hour + 5*time.Minute // +5 min clock skew grace
-	assert.InDelta(t, expected.Seconds(), validDuration.Seconds(), 2)
-}
-
 func TestServe_MultipleSequentialSessions(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t, dir)
-	cfg := validConfig(ca)
+	hk := newTestHostKey(t, dir)
+	cfg := validConfig(hk)
+
+	const numClients = 3
+	type clientInfo struct {
+		cfg *ssh.ClientConfig
+		fp  string
+	}
+	clients := make([]clientInfo, numClients)
+	fpSet := make(map[string]bool)
+	for i := range numClients {
+		cc, fp := allowedPubkeyClientConfig(t)
+		clients[i] = clientInfo{cfg: cc, fp: fp}
+		fpSet[fp] = true
+		_ = i
+	}
+	cfg.AuthWatcher = newTestAuthWatcher(fpSet)
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
@@ -634,28 +490,9 @@ func TestServe_MultipleSequentialSessions(t *testing.T) {
 		})
 	}()
 
-	// Connect with 3 differently-signed clients sequentially.
-	for i := 0; i < 3; i++ {
+	for i := 0; i < numClients; i++ {
 		wg.Add(1)
-		_, userPriv, err := ed25519.GenerateKey(rand.Reader)
-		require.NoError(t, err)
-		signer, err := ssh.NewSignerFromKey(userPriv)
-		require.NoError(t, err)
-
-		keyID := fmt.Sprintf("user-%d", i)
-		cert, err := sshca.SignUserKey(ca.Signer, signer.PublicKey(), keyID, []string{"runner"}, time.Hour)
-		require.NoError(t, err)
-		certSigner, err := ssh.NewCertSigner(cert, signer)
-		require.NoError(t, err)
-
-		clientCfg := &ssh.ClientConfig{
-			User:            "runner",
-			Auth:            []ssh.AuthMethod{ssh.PublicKeys(certSigner)},
-			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-			Timeout:         3 * time.Second,
-		}
-
-		conn, err := ssh.Dial("tcp", srv.Addr().String(), clientCfg)
+		conn, err := ssh.Dial("tcp", srv.Addr().String(), clients[i].cfg)
 		require.NoError(t, err)
 		conn.Close()
 		wg.Wait()
@@ -666,5 +503,8 @@ func TestServe_MultipleSequentialSessions(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	assert.Equal(t, []string{"user-0", "user-1", "user-2"}, identities)
+	require.Len(t, identities, numClients)
+	for i, id := range identities {
+		assert.Equal(t, fmt.Sprintf("pubkey:%s", clients[i].fp), id)
+	}
 }

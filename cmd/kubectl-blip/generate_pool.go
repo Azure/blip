@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-//go:embed assets/blip.sh assets/setup-ssh-ca.sh assets/register-host-key.sh
+//go:embed assets/blip.sh assets/register-host-key.sh
 var assets embed.FS
 
 type cloudConfig struct {
@@ -66,7 +66,6 @@ func mustReadAsset(name string) string {
 
 func buildCloudConfig() cloudConfig {
 	blipScript := mustReadAsset("assets/blip.sh")
-	setupSSHCA := mustReadAsset("assets/setup-ssh-ca.sh")
 	registerHostKey := mustReadAsset("assets/register-host-key.sh")
 
 	return cloudConfig{
@@ -104,16 +103,15 @@ func buildCloudConfig() cloudConfig {
 				Content:     blipScript,
 			},
 		},
-		RunCmd: buildRunCmd(setupSSHCA, registerHostKey),
+		RunCmd: buildRunCmd(registerHostKey),
 	}
 }
 
-func buildRunCmd(setupSSHCA, registerHostKey string) []interface{} {
+func buildRunCmd(registerHostKey string) []interface{} {
 	return []interface{}{
 		// KubeVirt's serviceaccount ISO is 0640; copy to a world-readable
 		// path instead of using cloud-init mounts (which would shadow the copy on remount).
 		"mkdir -p /var/run/secrets/kubernetes.io/serviceaccount && mount -t iso9660 -o ro /dev/vdc /var/run/secrets/kubernetes.io/serviceaccount && cp -a /var/run/secrets/kubernetes.io/serviceaccount /var/run/secrets/kubernetes.io/serviceaccount-rw && umount /var/run/secrets/kubernetes.io/serviceaccount && rmdir /var/run/secrets/kubernetes.io/serviceaccount && mv /var/run/secrets/kubernetes.io/serviceaccount-rw /var/run/secrets/kubernetes.io/serviceaccount && chmod -R a+r /var/run/secrets/kubernetes.io/serviceaccount",
-		[]string{"/bin/bash", "-c", setupSSHCA},
 		[]string{"/bin/bash", "-c", registerHostKey},
 		"chmod -x /etc/update-motd.d/*",
 		// Memory optimisation: disable services unnecessary for ephemeral SSH VMs.

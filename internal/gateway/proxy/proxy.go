@@ -339,62 +339,35 @@ func rejectChannel(ch ssh.NewChannel, err error) {
 	}
 }
 
-// InjectVMIdentity writes SSH identity files into the VM so the user can
-// SSH back to the gateway for recursive blip allocation.
-func InjectVMIdentity(upstream *ssh.Client, privateKeyPEM, certAuthorizedKey []byte, gatewayHost, caPubKey string) error {
-	// Validate inputs that are interpolated outside of heredoc blocks to
-	// prevent shell injection.  gatewayHost and caPubKey come from
-	// operator-controlled config, but defence in depth is worthwhile.
+// InjectGatewayConfig writes a minimal SSH config into the VM so the user
+// can SSH back to the gateway for recursive blip allocation.
+func InjectGatewayConfig(upstream *ssh.Client, gatewayHost string) error {
 	if err := validateShellSafe(gatewayHost); err != nil {
 		return fmt.Errorf("invalid gateway host: %w", err)
-	}
-	if err := validateShellSafe(caPubKey); err != nil {
-		return fmt.Errorf("invalid CA public key: %w", err)
 	}
 
 	session, err := upstream.NewSession()
 	if err != nil {
-		return fmt.Errorf("open session for identity injection: %w", err)
+		return fmt.Errorf("open session for gateway config injection: %w", err)
 	}
 	defer session.Close()
 
-	// Build a shell script that writes the files atomically.
-	// Private key and certificate are passed in single-quoted heredocs
-	// so the shell performs no expansion on their contents.
-	// known_hosts and config use single-quoted heredocs as well,
-	// keeping all dynamic values inside the heredoc body (safe).
 	script := fmt.Sprintf(`#!/bin/sh
 set -e
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
-
-cat > ~/.ssh/blip_identity << 'BLIP_KEY_EOF'
-%sBLIP_KEY_EOF
-chmod 600 ~/.ssh/blip_identity
-
-cat > ~/.ssh/blip_identity-cert.pub << 'BLIP_CERT_EOF'
-%sBLIP_CERT_EOF
-chmod 644 ~/.ssh/blip_identity-cert.pub
-
-cat > ~/.ssh/known_hosts << 'BLIP_KNOWN_HOSTS_EOF'
-@cert-authority %s %s
-BLIP_KNOWN_HOSTS_EOF
-chmod 644 ~/.ssh/known_hosts
 
 cat > ~/.ssh/config << 'BLIP_CONFIG_EOF'
 Host blip blip-gateway
     HostName %s
     Port 22
     User runner
-    IdentityFile ~/.ssh/blip_identity
-    CertificateFile ~/.ssh/blip_identity-cert.pub
-    StrictHostKeyChecking yes
 BLIP_CONFIG_EOF
 chmod 644 ~/.ssh/config
-`, string(privateKeyPEM), string(certAuthorizedKey), gatewayHost, caPubKey, gatewayHost)
+`, gatewayHost)
 
 	if err := session.Run(script); err != nil {
-		return fmt.Errorf("inject identity script: %w", err)
+		return fmt.Errorf("inject gateway config script: %w", err)
 	}
 	return nil
 }
