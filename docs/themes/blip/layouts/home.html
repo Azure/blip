@@ -1,0 +1,68 @@
+{{ define "main" }}
+<section class="hero">
+  <div class="hero-content">
+    <div class="radar-container">
+      <svg class="radar" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="100" cy="100" r="90" fill="none" stroke="#222" stroke-width="0.5"/>
+        <circle cx="100" cy="100" r="60" fill="none" stroke="#222" stroke-width="0.5"/>
+        <circle cx="100" cy="100" r="30" fill="none" stroke="#222" stroke-width="0.5"/>
+        <line x1="100" y1="10" x2="100" y2="190" stroke="#222" stroke-width="0.5"/>
+        <line x1="10" y1="100" x2="190" y2="100" stroke="#222" stroke-width="0.5"/>
+        <g class="radar-sweep">
+          <line x1="100" y1="100" x2="100" y2="10" stroke="rgba(255,255,255,0.6)" stroke-width="1"/>
+          <path d="M100,100 L100,10 A90,90 0 0,1 145,18" fill="rgba(255,255,255,0.03)" stroke="none"/>
+        </g>
+        <circle class="radar-blip-1" cx="130" cy="65" r="3" fill="#fff"/>
+        <circle class="radar-blip-2" cx="75" cy="120" r="2" fill="#fff"/>
+        <circle class="radar-blip-3" cx="145" cy="110" r="2.5" fill="#fff"/>
+      </svg>
+    </div>
+    <h1 class="hero-title">BLIP</h1>
+    <p class="hero-tagline">Instant VMs on Kubernetes.</p>
+    <a href="{{ "docs/getting-started/" | relURL }}" class="btn btn-primary">GET STARTED</a>
+  </div>
+</section>
+
+<section class="features">
+  <div class="features-grid">
+    <div class="feature">
+      <h3>INSTANT ACCESS</h3>
+      <p>SSH into fresh virtual machines in milliseconds.</p>
+    </div>
+    <div class="feature">
+      <h3>EPHEMERAL BY DEFAULT</h3>
+      <p>VMs are rebuilt when you disconnect.</p>
+    </div>
+    <div class="feature">
+      <h3>ZERO TRUST AUTH</h3>
+      <p>SSH certificate authentication or GitHub Actions auth.</p>
+    </div>
+  </div>
+</section>
+
+<section class="how-it-works">
+  <h2>HOW IT WORKS</h2>
+  <div class="steps">
+    <div class="step">
+      <span class="step-num">01</span>
+      <h4>CONNECT</h4>
+      <p>SSH to the gateway with your signed certificate. The gateway authenticates you via the cluster CA.</p>
+    </div>
+    <div class="step">
+      <span class="step-num">02</span>
+      <h4>ALLOCATE</h4>
+      <p>A VM is claimed from the pool and booted. The gateway proxies your connection through.</p>
+    </div>
+    <div class="step">
+      <span class="step-num">03</span>
+      <h4>WORK</h4>
+      <p>You have a full Linux environment. Run builds, tests, deployments &mdash; whatever you need.</p>
+    </div>
+    <div class="step">
+      <span class="step-num">04</span>
+      <h4>VANISH</h4>
+      <p>Disconnect and the VM is destroyed. Or retain it for up to 12 hours if you need to come back.</p>
+    </div>
+  </div>
+</section>
+{{ end }}
