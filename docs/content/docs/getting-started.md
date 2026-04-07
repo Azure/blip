@@ -23,7 +23,18 @@ kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEV
 kubectl apply -f https://github.com/project-unbounded/blip/releases/latest/download/manifest.yaml
 ```
 
-## Install the kubectl plugin
+## Create a VM Pool
+
+```shell
+kubectl apply -f https://github.com/project-unbounded/blip/releases/latest/download/pool.yaml
+```
+
+See [Create a VM Pool]({{% relref "create-vm-pool" %}}) for customization options and kustomize usage.
+
+## Install the kubectl plugin (optional)
+
+The kubectl plugin provides the `kubectl blip` command for convenience.
+It is **not** required to deploy or operate Blip.
 
 ### With Krew (recommended)
 
