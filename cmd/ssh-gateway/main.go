@@ -26,17 +26,17 @@ func main() {
 
 func newRootCmd() *cobra.Command {
 	var (
-		listenAddr            string
-		caKeyPath             string
-		caPubKeyPath          string
-		hostKeyPath           string
-		vmNamespace           string
-		vmPoolName            string
-		podName               string
-		maxSessionDuration    int
-		maxBlipsPerUser       int
-		allowedReposConfigMap string
-		hostPrincipals        []string
+		listenAddr         string
+		caKeyPath          string
+		caPubKeyPath       string
+		hostKeyPath        string
+		vmNamespace        string
+		vmPoolName         string
+		podName            string
+		maxSessionDuration int
+		maxBlipsPerUser    int
+		authConfigMap      string
+		hostPrincipals     []string
 	)
 
 	cmd := &cobra.Command{
@@ -55,21 +55,21 @@ func newRootCmd() *cobra.Command {
 			}
 
 			cfg := &sshgw.GatewayConfig{
-				ListenAddr:            listenAddr,
-				CAKeyPath:             caKeyPath,
-				CAPubKeyPath:          caPubKeyPath,
-				HostKeyPath:           hostKeyPath,
-				VMNamespace:           vmNamespace,
-				VMPoolName:            vmPoolName,
-				PodName:               podName,
-				MaxSessionDuration:    time.Duration(maxSessionDuration) * time.Second,
-				MaxBlipsPerUser:       maxBlipsPerUser,
-				AllowedReposConfigMap: allowedReposConfigMap,
-				HostPrincipals:        hostPrincipals,
-				LoginGraceTime:        30 * time.Second,
-				MaxAuthTries:          3,
-				KeepAliveInterval:     60 * time.Second,
-				KeepAliveMax:          3,
+				ListenAddr:         listenAddr,
+				CAKeyPath:          caKeyPath,
+				CAPubKeyPath:       caPubKeyPath,
+				HostKeyPath:        hostKeyPath,
+				VMNamespace:        vmNamespace,
+				VMPoolName:         vmPoolName,
+				PodName:            podName,
+				MaxSessionDuration: time.Duration(maxSessionDuration) * time.Second,
+				MaxBlipsPerUser:    maxBlipsPerUser,
+				AuthConfigMap:      authConfigMap,
+				HostPrincipals:     hostPrincipals,
+				LoginGraceTime:     30 * time.Second,
+				MaxAuthTries:       3,
+				KeepAliveInterval:  60 * time.Second,
+				KeepAliveMax:       3,
 			}
 
 			return sshgw.RunGateway(cfg)
@@ -87,7 +87,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "unknown"), "Pod name for identification (env: POD_NAME)")
 	cmd.Flags().IntVar(&maxSessionDuration, "max-session-duration", envOrDefaultInt("MAX_SESSION_DURATION", 43200), "Maximum session duration in seconds, used for host cert validity (env: MAX_SESSION_DURATION)")
 	cmd.Flags().IntVar(&maxBlipsPerUser, "max-blips-per-user", envOrDefaultInt("MAX_BLIPS_PER_USER", 0), "Per-user blip quota, 0 = unlimited (env: MAX_BLIPS_PER_USER)")
-	cmd.Flags().StringVar(&allowedReposConfigMap, "allowed-repos-configmap", envOrDefault("ALLOWED_REPOS_CONFIGMAP", ""), "ConfigMap name for allowed GitHub repos (one owner/repo per line under the \"repos\" key) (env: ALLOWED_REPOS_CONFIGMAP)")
+	cmd.Flags().StringVar(&authConfigMap, "auth-configmap", envOrDefault("AUTH_CONFIGMAP", ""), "ConfigMap name for auth config: allowed GitHub repos (key: \"allowed-repos\") and allowed SSH pubkeys (key: \"allowed-pubkeys\") (env: AUTH_CONFIGMAP)")
 	cmd.Flags().StringSliceVar(&hostPrincipals, "host-principals", envOrDefaultStringSlice("GATEWAY_HOST_PRINCIPALS"), "Hostnames/IPs for the host certificate, comma-separated (env: GATEWAY_HOST_PRINCIPALS)")
 
 	return cmd
