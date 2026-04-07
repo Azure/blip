@@ -48,4 +48,4 @@ volumes:
 
 ## Next steps
 
-- [Sign SSH Keys]({{% relref "sign-ssh-keys" %}})
+- [Add SSH Key]({{% relref "sign-ssh-keys" %}})

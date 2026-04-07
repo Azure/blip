@@ -13,28 +13,18 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/project-unbounded/blip/internal/gateway/auth"
-	"github.com/project-unbounded/blip/internal/sshca"
 )
 
 // Config holds the parameters needed to run the SSH server.
 type Config struct {
 	ListenAddr string
 
-	// Path to the SSH CA private key (PEM) for signing the host certificate.
-	CAKeyPath string
-
-	// Path to the SSH CA public key for verifying client certificates.
-	CAPubKeyPath string
-
 	// Shared host key (PEM) loaded by all replicas for a stable fingerprint.
 	HostKeyPath string
 
 	PodName string
 
-	// Hostnames/IPs embedded in the CA-signed host certificate.
-	HostPrincipals []string
-
-	// Maximum lifetime of a single session; also drives host cert validity.
+	// Maximum lifetime of a single session.
 	MaxSessionDuration time.Duration
 
 	// Deadline for completing the SSH handshake.
@@ -50,7 +40,7 @@ type Config struct {
 // ConnHandler is called for each successfully authenticated SSH connection.
 type ConnHandler func(ctx context.Context, serverConn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request)
 
-// Server is a TCP-based SSH server with a CA-signed host certificate.
+// Server is a TCP-based SSH server.
 type Server struct {
 	listener       net.Listener
 	sshConfig      *ssh.ServerConfig
@@ -59,23 +49,16 @@ type Server struct {
 
 // New creates a Server ready to accept SSH connections.
 func New(cfg Config) (*Server, error) {
-	caSigner, err := loadSigner(cfg.CAKeyPath, "CA key")
+	hostSigner, err := loadSigner(cfg.HostKeyPath, "host key")
 	if err != nil {
 		return nil, err
 	}
 
-	hostSigner, err := newHostCertSigner(caSigner, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	caPublicKey, err := loadCAPublicKey(cfg.CAPubKeyPath)
-	if err != nil {
-		return nil, err
-	}
+	slog.Info("host key loaded",
+		"fingerprint", ssh.FingerprintSHA256(hostSigner.PublicKey()),
+	)
 
 	sshConfig := auth.NewServerConfig(auth.Config{
-		CAPublicKey:  caPublicKey,
 		HostSigner:   hostSigner,
 		MaxAuthTries: cfg.MaxAuthTries,
 		AuthWatcher:  cfg.AuthWatcher,
@@ -138,41 +121,6 @@ func (s *Server) Serve(ctx context.Context, handler ConnHandler) error {
 // Close immediately closes the listener.
 func (s *Server) Close() error { return s.listener.Close() }
 
-// newHostCertSigner loads the host key, signs it with the CA, and returns a cert signer.
-func newHostCertSigner(caSigner ssh.Signer, cfg Config) (ssh.Signer, error) {
-	baseSigner, err := loadSigner(cfg.HostKeyPath, "host key")
-	if err != nil {
-		return nil, fmt.Errorf("load host key: %w", err)
-	}
-
-	keyID := fmt.Sprintf("gateway-host:%s", cfg.PodName)
-	cert, err := sshca.SignHostKey(
-		caSigner,
-		baseSigner.PublicKey(),
-		keyID,
-		cfg.HostPrincipals,
-		cfg.MaxSessionDuration+1*time.Hour,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("sign host key: %w", err)
-	}
-
-	hostSigner, err := ssh.NewCertSigner(cert, baseSigner)
-	if err != nil {
-		return nil, fmt.Errorf("create host cert signer: %w", err)
-	}
-
-	slog.Info("host certificate generated",
-		"key_id", cert.KeyId,
-		"principals", cfg.HostPrincipals,
-		"serial", cert.Serial,
-		"fingerprint", ssh.FingerprintSHA256(baseSigner.PublicKey()),
-		"valid_before", time.Unix(int64(cert.ValidBefore), 0).UTC().Format(time.RFC3339),
-	)
-
-	return hostSigner, nil
-}
-
 // loadSigner reads a PEM-encoded SSH private key from path.
 func loadSigner(path, label string) (ssh.Signer, error) {
 	data, err := os.ReadFile(path)
@@ -184,20 +132,6 @@ func loadSigner(path, label string) (ssh.Signer, error) {
 		return nil, fmt.Errorf("parse %s: %w", label, err)
 	}
 	return signer, nil
-}
-
-// loadCAPublicKey reads an SSH public key in authorized_keys format.
-func loadCAPublicKey(path string) (ssh.PublicKey, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read CA public key %s: %w", path, err)
-	}
-	pub, _, _, _, err := ssh.ParseAuthorizedKey(data)
-	if err != nil {
-		return nil, fmt.Errorf("parse CA public key: %w", err)
-	}
-	slog.Info("CA public key loaded for client certificate verification")
-	return pub, nil
 }
 
 // handshake performs the SSH handshake, enforcing the login grace time.

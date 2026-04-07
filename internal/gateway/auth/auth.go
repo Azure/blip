@@ -1,9 +1,8 @@
 // Package auth implements SSH server authentication for the gateway,
-// supporting CA certificate auth, explicit pubkey auth, and GitHub Actions OIDC auth.
+// supporting explicit pubkey auth and GitHub Actions OIDC auth.
 package auth
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -23,20 +22,15 @@ const (
 
 	// ExtIdentity is a stable user identity string derived from the auth method.
 	ExtIdentity = "auth-identity"
-
-	// ExtBlipVM is "true" when the certificate was issued to a blip VM.
-	ExtBlipVM = "auth-blip-vm"
 )
 
 // Config holds authentication parameters for building an ssh.ServerConfig.
 type Config struct {
-	CAPublicKey  ssh.PublicKey
 	HostSigner   ssh.Signer
 	MaxAuthTries int
 
 	// AuthWatcher provides the dynamic allowed-repos and allowed-pubkeys
-	// lists from a ConfigMap. When nil, OIDC and explicit pubkey auth are
-	// disabled entirely.
+	// lists from a ConfigMap.
 	AuthWatcher *AuthWatcher
 }
 
@@ -45,86 +39,22 @@ func NewServerConfig(cfg Config) *ssh.ServerConfig {
 	sshCfg := &ssh.ServerConfig{MaxAuthTries: cfg.MaxAuthTries}
 	sshCfg.AddHostKey(cfg.HostSigner)
 
-	sshCfg.PublicKeyCallback = pubkeyCallback(cfg.CAPublicKey, cfg.AuthWatcher)
-
 	if cfg.AuthWatcher != nil {
+		sshCfg.PublicKeyCallback = pubkeyCallback(cfg.AuthWatcher)
 		sshCfg.PasswordCallback = oidcCallback(cfg.AuthWatcher)
 	} else {
-		slog.Info("no auth watcher configured, only CA certificate auth is enabled")
+		slog.Warn("no auth watcher configured, all authentication is disabled")
 	}
 
 	return sshCfg
 }
 
-// BlipVMKeyIDPrefix is the certificate KeyId prefix for blip VM identities.
-const BlipVMKeyIDPrefix = "blip-vm:"
-
-// IsBlipVMIdentity reports whether the identity belongs to a blip VM.
-func IsBlipVMIdentity(identity string) bool {
-	return strings.HasPrefix(identity, BlipVMKeyIDPrefix)
-}
-
-// pubkeyCallback returns a PublicKeyCallback that accepts:
-//  1. Certificates signed by caPublicKey (SSH CA auth).
-//  2. Raw public keys whose fingerprint is in the AuthWatcher's allowed set.
-func pubkeyCallback(caPublicKey ssh.PublicKey, watcher *AuthWatcher) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
-	caBytes := caPublicKey.Marshal()
+// pubkeyCallback returns a PublicKeyCallback that accepts raw public keys
+// whose fingerprint is in the AuthWatcher's allowed set.
+func pubkeyCallback(watcher *AuthWatcher) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-		// Try certificate auth first.
-		if cert, ok := key.(*ssh.Certificate); ok {
-			return verifyCert(conn, cert, caBytes)
-		}
-
-		// Fall back to explicit pubkey auth if a watcher is configured.
-		if watcher == nil {
-			return nil, fmt.Errorf("only certificate authentication is supported")
-		}
 		return verifyExplicitPubkey(conn, key, watcher)
 	}
-}
-
-// verifyCert validates an SSH certificate against the CA.
-func verifyCert(conn ssh.ConnMetadata, cert *ssh.Certificate, caBytes []byte) (*ssh.Permissions, error) {
-	checker := &ssh.CertChecker{
-		IsUserAuthority: func(auth ssh.PublicKey) bool {
-			return bytes.Equal(auth.Marshal(), caBytes)
-		},
-	}
-
-	// Reconnections use a session ID as the SSH user; verify
-	// the cert against its first principal instead.
-	principal := conn.User()
-	if looksLikeSessionID(principal) && len(cert.ValidPrincipals) > 0 {
-		principal = cert.ValidPrincipals[0]
-	}
-	if err := checker.CheckCert(principal, cert); err != nil {
-		return nil, fmt.Errorf("certificate verification failed: %w", err)
-	}
-	if !checker.IsUserAuthority(cert.SignatureKey) {
-		return nil, fmt.Errorf("certificate verification failed: signed by unrecognized authority")
-	}
-
-	fingerprint := ssh.FingerprintSHA256(cert.Key)
-	slog.Info("CA certificate auth succeeded",
-		"user", conn.User(),
-		"remote", conn.RemoteAddr().String(),
-		"key_id", cert.KeyId,
-		"key_fingerprint", fingerprint,
-	)
-	extensions := map[string]string{
-		ExtFingerprint: fingerprint,
-		ExtIdentity:    cert.KeyId,
-	}
-	if IsBlipVMIdentity(cert.KeyId) {
-		extensions[ExtBlipVM] = "true"
-		slog.Info("blip-vm certificate detected, will resolve root identity",
-			"key_id", cert.KeyId,
-			"fingerprint", fingerprint,
-		)
-	}
-	return &ssh.Permissions{
-		Extensions: extensions,
-	}, nil
 }
 
 // verifyExplicitPubkey checks whether a raw public key's fingerprint is in the

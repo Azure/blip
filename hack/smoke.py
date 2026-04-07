@@ -33,7 +33,6 @@ GATEWAY_PORT = 22
 # Paths set up by setup()
 _tmpdir = None
 _ssh_key = None
-_ssh_cert = None
 _known_hosts = None
 
 
@@ -71,7 +70,6 @@ def ssh_cmd(user, *extra_args, batch=True):
         "-o", f"UserKnownHostsFile={_known_hosts}",
         "-o", "LogLevel=ERROR",
         "-i", _ssh_key,
-        "-o", f"CertificateFile={_ssh_cert}",
         "-p", str(GATEWAY_PORT),
     ]
     if batch:
@@ -366,11 +364,10 @@ def dump_pod_logs():
 
 def setup():
     """One-time setup: deploy blip, create pool, sign key."""
-    global _tmpdir, _ssh_key, _ssh_cert, _known_hosts, GATEWAY_HOST
+    global _tmpdir, _ssh_key, _known_hosts, GATEWAY_HOST
 
     _tmpdir = tempfile.mkdtemp(prefix="blip-smoke-")
     _ssh_key = os.path.join(_tmpdir, "id_ed25519")
-    _ssh_cert = os.path.join(_tmpdir, "id_ed25519-cert.pub")
     _known_hosts = os.path.join(_tmpdir, "known_hosts")
 
     print("\n=== Setup ===", flush=True)
@@ -393,18 +390,12 @@ def setup():
     manifest = manifest.replace("${REGISTRY}/blip:${BLIP_TAG}", IMAGE_NAME)
     run(["kubectl", "apply", "-f", "-"], input=manifest)
 
-    # 4. Wait for controller (creates the CA secret + configmap)
+    # 4. Wait for controller (creates the host key secret)
     print("  Waiting for blip-controller...", flush=True)
     kubectl("rollout", "status", "deploy/blip-controller",
             "-n", NAMESPACE, "--timeout=120s", timeout=150)
 
-    # 5. Wait for the SSH CA secret and host key secret
-    print("  Waiting for ssh-ca-keypair secret...", flush=True)
-    wait_for(
-        lambda: kubectl("get", "secret", "ssh-ca-keypair",
-                        "-n", NAMESPACE, check=False).returncode == 0,
-        "ssh-ca-keypair secret", timeout=60,
-    )
+    # 5. Wait for the host key secret
     print("  Waiting for ssh-host-key secret...", flush=True)
     wait_for(
         lambda: kubectl("get", "secret", "ssh-host-key",
@@ -412,7 +403,7 @@ def setup():
         "ssh-host-key secret", timeout=60,
     )
 
-    # Gateway pods may have started before the CA secret existed; restart.
+    # Gateway pods may have started before the host key secret existed; restart.
     print("  Restarting ssh-gateway pods...", flush=True)
     kubectl("rollout", "restart", "deploy/ssh-gateway", "-n", NAMESPACE)
 
@@ -423,11 +414,11 @@ def setup():
                      "--replicas", str(REPLICAS)], timeout=120).stdout
     run(["kubectl", "apply", "-f", "-"], input=pool_yaml)
 
-    # 7. Generate SSH keypair and sign it
+    # 7. Generate SSH keypair and add it to the gateway allow-list
     print("  Generating SSH key...", flush=True)
     run(["ssh-keygen", "-t", "ed25519", "-f", _ssh_key, "-N", "", "-q"])
-    run(["go", "run", "./cmd/kubectl-blip", "sign-identity",
-         "-i", f"{_ssh_key}.pub", "-o", _ssh_cert,
+    run(["go", "run", "./cmd/kubectl-blip", "allow-key",
+         "-i", f"{_ssh_key}.pub",
          "-n", NAMESPACE], timeout=120)
 
     # 8. Wait for gateway rollout
@@ -455,7 +446,6 @@ def setup():
         "-o", "LogLevel=ERROR",
         "-o", "BatchMode=yes",
         "-i", _ssh_key,
-        "-o", f"CertificateFile={_ssh_cert}",
         "-p", str(GATEWAY_PORT),
         f"{SSH_USER}@{GATEWAY_HOST}",
         "true",
@@ -553,7 +543,6 @@ def test_retained_session():
         "-o", "LogLevel=ERROR",
         "-o", "BatchMode=yes",
         "-i", _ssh_key,
-        "-o", f"CertificateFile={_ssh_cert}",
         "-P", str(GATEWAY_PORT),
     ]
     run(scp_base + [test_file, f"{session_id}@{GATEWAY_HOST}:/tmp/scp_test.txt"])

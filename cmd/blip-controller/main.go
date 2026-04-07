@@ -41,7 +41,7 @@ func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "blip-controller",
 		Short: "Kubernetes controller for Blip VM lifecycle management",
-		Long:  "Manages SSH CA keypair generation and VM deallocation for the Blip platform.",
+		Long:  "Manages SSH host key generation and VM deallocation for the Blip platform.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !cmd.Flags().Changed("lease-namespace") {
 				leaseNamespace = namespace

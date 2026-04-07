@@ -5,10 +5,9 @@ metadata:
 spec:
   version: ${TAG}
   homepage: https://github.com/project-unbounded/blip
-  shortDescription: Blip SSH key management
+  shortDescription: Blip VM pool management
   description: |
-    Signs your local SSH public key with the Blip SSH CA and generates
-    VirtualMachinePool manifests for the Blip VM pool.
+    Generates VirtualMachinePool manifests for the Blip VM pool.
   platforms:
     - selector:
         matchLabels:

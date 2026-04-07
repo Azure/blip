@@ -2,11 +2,12 @@ package gateway
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -16,13 +17,10 @@ import (
 	"github.com/project-unbounded/blip/internal/gateway/server"
 	"github.com/project-unbounded/blip/internal/gateway/session"
 	"github.com/project-unbounded/blip/internal/gateway/vm"
-	"github.com/project-unbounded/blip/internal/sshca"
 )
 
 type GatewayConfig struct {
 	ListenAddr         string
-	CAKeyPath          string
-	CAPubKeyPath       string
 	HostKeyPath        string
 	VMNamespace        string
 	VMPoolName         string
@@ -37,7 +35,7 @@ type GatewayConfig struct {
 
 	MaxBlipsPerUser int
 
-	// HostPrincipals are the hostnames/IPs embedded in the host certificate for client verification.
+	// HostPrincipals are the hostnames/IPs used for gateway identification.
 	HostPrincipals []string
 
 	LoginGraceTime    time.Duration
@@ -62,11 +60,8 @@ func RunGateway(cfg *GatewayConfig) error {
 
 	srv, err := server.New(server.Config{
 		ListenAddr:         cfg.ListenAddr,
-		CAKeyPath:          cfg.CAKeyPath,
-		CAPubKeyPath:       cfg.CAPubKeyPath,
 		HostKeyPath:        cfg.HostKeyPath,
 		PodName:            cfg.PodName,
-		HostPrincipals:     cfg.HostPrincipals,
 		MaxSessionDuration: cfg.MaxSessionDuration,
 		LoginGraceTime:     cfg.LoginGraceTime,
 		MaxAuthTries:       cfg.MaxAuthTries,
@@ -76,37 +71,19 @@ func RunGateway(cfg *GatewayConfig) error {
 		return err
 	}
 
-	caSigner, err := loadSigner(cfg.CAKeyPath, "CA key")
+	// Generate an ephemeral key pair for dialing upstream VMs.
+	upstreamSigner, err := generateEphemeralSigner()
 	if err != nil {
-		return err
+		return fmt.Errorf("generate ephemeral upstream key: %w", err)
 	}
-
-	keyID := fmt.Sprintf("gateway:%s", cfg.PodName)
-	upstreamSigner, cert, err := sshca.GenerateAndSignEphemeralKey(
-		caSigner,
-		keyID,
-		[]string{"runner"},
-		cfg.MaxSessionDuration+1*time.Hour,
-	)
-	if err != nil {
-		return fmt.Errorf("generate ephemeral gateway cert: %w", err)
-	}
-	slog.Info("ephemeral gateway certificate generated",
-		"key_id", cert.KeyId,
-		"serial", cert.Serial,
-		"valid_before", time.Unix(int64(cert.ValidBefore), 0).UTC().Format(time.RFC3339),
+	slog.Info("ephemeral upstream key generated",
+		"fingerprint", ssh.FingerprintSHA256(upstreamSigner.PublicKey()),
 	)
 
 	vmcl, err := vm.New(ctx, cfg.VMNamespace)
 	if err != nil {
 		return fmt.Errorf("create k8s client: %w", err)
 	}
-
-	caPubKeyData, err := os.ReadFile(cfg.CAPubKeyPath)
-	if err != nil {
-		return fmt.Errorf("read CA public key for VM injection: %w", err)
-	}
-	caPubKey := strings.TrimSpace(string(caPubKeyData))
 
 	gatewayHost := ""
 	if len(cfg.HostPrincipals) > 0 {
@@ -115,8 +92,6 @@ func RunGateway(cfg *GatewayConfig) error {
 
 	mgr := session.New(session.Config{
 		GatewaySigner:      upstreamSigner,
-		CASigner:           caSigner,
-		CAPubKey:           caPubKey,
 		GatewayHost:        gatewayHost,
 		VMClient:           vmcl,
 		VMPoolName:         cfg.VMPoolName,
@@ -134,7 +109,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		"max_session", cfg.MaxSessionDuration.String(),
 		"github_actions_auth", authWatcher != nil,
 		"auth_configmap", cfg.AuthConfigMap,
-		"ca_cert_enabled", true,
 	)
 
 	// Maximum time to wait for active sessions to drain after a signal.
@@ -170,14 +144,15 @@ func RunGateway(cfg *GatewayConfig) error {
 	return srv.Serve(ctx, mgr.HandleConnection)
 }
 
-func loadSigner(path, label string) (ssh.Signer, error) {
-	data, err := os.ReadFile(path)
+// generateEphemeralSigner creates a fresh Ed25519 key pair for upstream VM connections.
+func generateEphemeralSigner() (ssh.Signer, error) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("read %s %s: %w", label, path, err)
+		return nil, fmt.Errorf("generate ephemeral key: %w", err)
 	}
-	signer, err := ssh.ParsePrivateKey(data)
+	signer, err := ssh.NewSignerFromKey(priv)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", label, err)
+		return nil, fmt.Errorf("create ephemeral signer: %w", err)
 	}
 	return signer, nil
 }

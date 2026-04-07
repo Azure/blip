@@ -1,10 +1,10 @@
 ---
-title: "Sign SSH Keys"
-description: "Sign your SSH public key with the cluster CA"
+title: "Add SSH Key"
+description: "Add your SSH public key to the gateway allow-list"
 weight: 3
 ---
 
-Blip uses SSH certificates, not raw public keys. The `blip-controller` generates a CA keypair on first startup and stores it as a Kubernetes Secret. The gateway trusts any certificate signed by this CA.
+Blip authenticates SSH connections using explicitly allowed public keys. The gateway trusts any key present in its allow-list.
 
 ## Generate an SSH key
 
@@ -12,15 +12,15 @@ Blip uses SSH certificates, not raw public keys. The `blip-controller` generates
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
 ```
 
-## Sign your key
+## Add your key
 
 ```shell
-kubectl blip sign-identity
+kubectl blip allow-key
 ```
 
-Reads `~/.ssh/id_ed25519.pub`, fetches the CA key from the `ssh-ca-keypair` Secret in the `blip` namespace, and writes the certificate to `~/.ssh/id_ed25519-cert.pub`.
+Reads `~/.ssh/id_ed25519.pub` and adds it to the `ssh-gateway-auth` ConfigMap in the `blip` namespace. The gateway picks up changes in real time — no restart required.
 
-Requires RBAC read access to the `ssh-ca-keypair` Secret.
+Requires RBAC write access to the `ssh-gateway-auth` ConfigMap.
 
 ## Connect
 
@@ -41,8 +41,7 @@ VMs are ephemeral by default — destroyed on disconnect.
 
 ## Security
 
-- Certificates have a configurable TTL, defaulting to 30 days.
-- Each certificate embeds the signer's identity (`KeyId`); all connections are logged.
+- Each connection is logged with the key fingerprint and identity.
 - Per-user quotas via `--max-blips-per-user`.
 
 ## Next steps
