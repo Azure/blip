@@ -320,18 +320,26 @@ spec:
             port: 8081
           initialDelaySeconds: 5
 ---
-# ConfigMap for allowed GitHub Actions repositories. The ssh-gateway watches
-# this ConfigMap in real time — edits take effect without a restart.
-# One owner/repo per line under the "repos" key. Lines starting with # are
-# comments. Remove the ConfigMap (or clear the key) to disable OIDC auth.
+# ConfigMap for gateway authentication. The ssh-gateway watches this ConfigMap
+# in real time — edits take effect without a restart.
+#
+# Keys:
+#   allowed-repos:   One owner/repo per line. Lines starting with # are comments.
+#                    Controls which GitHub Actions repos may authenticate via OIDC.
+#   allowed-pubkeys: One SSH public key per line (authorized_keys format).
+#                    Controls which raw public keys are accepted without a CA cert.
+#
+# Remove the ConfigMap (or leave keys empty) to disable OIDC and pubkey auth.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: allowed-repos
+  name: ssh-gateway-auth
   namespace: blip
 data:
-  repos: |
+  allowed-repos: |
     my-org/my-repo
+  allowed-pubkeys: |
+    # ssh-ed25519 AAAAC3... user@host
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -363,8 +371,8 @@ spec:
           value: "3600"
         - name: LISTEN_ADDRESS
           value: ":2222"
-        - name: ALLOWED_REPOS_CONFIGMAP
-          value: "allowed-repos"
+        - name: AUTH_CONFIGMAP
+          value: "ssh-gateway-auth"
         - name: VM_POOL_NAME
           value: "default"
         - name: VM_NAMESPACE

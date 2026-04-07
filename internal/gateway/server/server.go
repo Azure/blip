@@ -42,8 +42,9 @@ type Config struct {
 
 	MaxAuthTries int
 
-	// RepoWatcher provides the dynamic allowed-repos list from a ConfigMap; nil disables OIDC auth.
-	RepoWatcher *auth.RepoWatcher
+	// AuthWatcher provides the dynamic allowed-repos and allowed-pubkeys
+	// lists from a ConfigMap; nil disables OIDC and explicit pubkey auth.
+	AuthWatcher *auth.AuthWatcher
 }
 
 // ConnHandler is called for each successfully authenticated SSH connection.
@@ -77,7 +78,7 @@ func New(cfg Config) (*Server, error) {
 		CAPublicKey:  caPublicKey,
 		HostSigner:   hostSigner,
 		MaxAuthTries: cfg.MaxAuthTries,
-		RepoWatcher:  cfg.RepoWatcher,
+		AuthWatcher:  cfg.AuthWatcher,
 	})
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)

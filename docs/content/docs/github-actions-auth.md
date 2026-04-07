@@ -8,16 +8,16 @@ Blip supports GitHub Actions authentication as an alternative to SSH certificate
 
 ## Configure the gateway
 
-Allowed repositories are stored in a ConfigMap watched by the gateway. Changes take effect in real time — no restart required.
+Allowed repositories are stored in the `ssh-gateway-auth` ConfigMap watched by the gateway. Changes take effect in real time — no restart required.
 
 ```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: allowed-repos
+  name: ssh-gateway-auth
   namespace: blip
 data:
-  repos: |
+  allowed-repos: |
     my-org/my-repo
     my-org/another-repo
 ```

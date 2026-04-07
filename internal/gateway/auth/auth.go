@@ -1,5 +1,5 @@
 // Package auth implements SSH server authentication for the gateway,
-// supporting CA certificate auth and GitHub Actions OIDC auth.
+// supporting CA certificate auth, explicit pubkey auth, and GitHub Actions OIDC auth.
 package auth
 
 import (
@@ -34,9 +34,10 @@ type Config struct {
 	HostSigner   ssh.Signer
 	MaxAuthTries int
 
-	// RepoWatcher provides the dynamic allowed-repos list from a ConfigMap.
-	// When nil, OIDC auth is disabled entirely.
-	RepoWatcher *RepoWatcher
+	// AuthWatcher provides the dynamic allowed-repos and allowed-pubkeys
+	// lists from a ConfigMap. When nil, OIDC and explicit pubkey auth are
+	// disabled entirely.
+	AuthWatcher *AuthWatcher
 }
 
 // NewServerConfig builds an ssh.ServerConfig with auth callbacks from cfg.
@@ -44,12 +45,12 @@ func NewServerConfig(cfg Config) *ssh.ServerConfig {
 	sshCfg := &ssh.ServerConfig{MaxAuthTries: cfg.MaxAuthTries}
 	sshCfg.AddHostKey(cfg.HostSigner)
 
-	sshCfg.PublicKeyCallback = certCallback(cfg.CAPublicKey)
+	sshCfg.PublicKeyCallback = pubkeyCallback(cfg.CAPublicKey, cfg.AuthWatcher)
 
-	if cfg.RepoWatcher != nil {
-		sshCfg.PasswordCallback = oidcCallback(cfg.RepoWatcher)
+	if cfg.AuthWatcher != nil {
+		sshCfg.PasswordCallback = oidcCallback(cfg.AuthWatcher)
 	} else {
-		slog.Info("no repo watcher configured, only CA certificate auth is enabled")
+		slog.Info("no auth watcher configured, only CA certificate auth is enabled")
 	}
 
 	return sshCfg
@@ -63,57 +64,88 @@ func IsBlipVMIdentity(identity string) bool {
 	return strings.HasPrefix(identity, BlipVMKeyIDPrefix)
 }
 
-// certCallback returns a PublicKeyCallback that accepts certificates signed
-// by caPublicKey. Session-ID usernames are matched against the first principal.
-func certCallback(caPublicKey ssh.PublicKey) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
+// pubkeyCallback returns a PublicKeyCallback that accepts:
+//  1. Certificates signed by caPublicKey (SSH CA auth).
+//  2. Raw public keys whose fingerprint is in the AuthWatcher's allowed set.
+func pubkeyCallback(caPublicKey ssh.PublicKey, watcher *AuthWatcher) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 	caBytes := caPublicKey.Marshal()
 	return func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-		cert, ok := key.(*ssh.Certificate)
-		if !ok {
+		// Try certificate auth first.
+		if cert, ok := key.(*ssh.Certificate); ok {
+			return verifyCert(conn, cert, caBytes)
+		}
+
+		// Fall back to explicit pubkey auth if a watcher is configured.
+		if watcher == nil {
 			return nil, fmt.Errorf("only certificate authentication is supported")
 		}
-
-		checker := &ssh.CertChecker{
-			IsUserAuthority: func(auth ssh.PublicKey) bool {
-				return bytes.Equal(auth.Marshal(), caBytes)
-			},
-		}
-
-		// Reconnections use a session ID as the SSH user; verify
-		// the cert against its first principal instead.
-		principal := conn.User()
-		if looksLikeSessionID(principal) && len(cert.ValidPrincipals) > 0 {
-			principal = cert.ValidPrincipals[0]
-		}
-		if err := checker.CheckCert(principal, cert); err != nil {
-			return nil, fmt.Errorf("certificate verification failed: %w", err)
-		}
-		if !checker.IsUserAuthority(cert.SignatureKey) {
-			return nil, fmt.Errorf("certificate verification failed: signed by unrecognized authority")
-		}
-
-		fingerprint := ssh.FingerprintSHA256(cert.Key)
-		slog.Info("CA certificate auth succeeded",
-			"user", conn.User(),
-			"remote", conn.RemoteAddr().String(),
-			"key_id", cert.KeyId,
-			"key_fingerprint", fingerprint,
-		)
-		extensions := map[string]string{
-			ExtFingerprint: fingerprint,
-			ExtIdentity:    cert.KeyId,
-		}
-		if IsBlipVMIdentity(cert.KeyId) {
-			extensions[ExtBlipVM] = "true"
-			slog.Info("blip-vm certificate detected, will resolve root identity",
-				"key_id", cert.KeyId,
-				"fingerprint", fingerprint,
-			)
-		}
-		return &ssh.Permissions{
-			Extensions: extensions,
-		}, nil
+		return verifyExplicitPubkey(conn, key, watcher)
 	}
+}
+
+// verifyCert validates an SSH certificate against the CA.
+func verifyCert(conn ssh.ConnMetadata, cert *ssh.Certificate, caBytes []byte) (*ssh.Permissions, error) {
+	checker := &ssh.CertChecker{
+		IsUserAuthority: func(auth ssh.PublicKey) bool {
+			return bytes.Equal(auth.Marshal(), caBytes)
+		},
+	}
+
+	// Reconnections use a session ID as the SSH user; verify
+	// the cert against its first principal instead.
+	principal := conn.User()
+	if looksLikeSessionID(principal) && len(cert.ValidPrincipals) > 0 {
+		principal = cert.ValidPrincipals[0]
+	}
+	if err := checker.CheckCert(principal, cert); err != nil {
+		return nil, fmt.Errorf("certificate verification failed: %w", err)
+	}
+	if !checker.IsUserAuthority(cert.SignatureKey) {
+		return nil, fmt.Errorf("certificate verification failed: signed by unrecognized authority")
+	}
+
+	fingerprint := ssh.FingerprintSHA256(cert.Key)
+	slog.Info("CA certificate auth succeeded",
+		"user", conn.User(),
+		"remote", conn.RemoteAddr().String(),
+		"key_id", cert.KeyId,
+		"key_fingerprint", fingerprint,
+	)
+	extensions := map[string]string{
+		ExtFingerprint: fingerprint,
+		ExtIdentity:    cert.KeyId,
+	}
+	if IsBlipVMIdentity(cert.KeyId) {
+		extensions[ExtBlipVM] = "true"
+		slog.Info("blip-vm certificate detected, will resolve root identity",
+			"key_id", cert.KeyId,
+			"fingerprint", fingerprint,
+		)
+	}
+	return &ssh.Permissions{
+		Extensions: extensions,
+	}, nil
+}
+
+// verifyExplicitPubkey checks whether a raw public key's fingerprint is in the
+// allowed set.
+func verifyExplicitPubkey(conn ssh.ConnMetadata, key ssh.PublicKey, watcher *AuthWatcher) (*ssh.Permissions, error) {
+	fingerprint := ssh.FingerprintSHA256(key)
+	if !watcher.IsPubkeyAllowed(fingerprint) {
+		return nil, fmt.Errorf("public key %s is not in the allowed list", fingerprint)
+	}
+
+	slog.Info("explicit pubkey auth succeeded",
+		"user", conn.User(),
+		"remote", conn.RemoteAddr().String(),
+		"key_fingerprint", fingerprint,
+	)
+	return &ssh.Permissions{
+		Extensions: map[string]string{
+			ExtFingerprint: fingerprint,
+			ExtIdentity:    fmt.Sprintf("pubkey:%s", fingerprint),
+		},
+	}, nil
 }
 
 // looksLikeSessionID reports whether user matches the blip session ID format.
@@ -137,7 +169,7 @@ func looksLikeSessionID(user string) bool {
 // oidcCallback returns a PasswordCallback that validates GitHub Actions OIDC tokens.
 // The watcher is consulted on every auth attempt, so ConfigMap changes take
 // effect without restarting the gateway.
-func oidcCallback(watcher *RepoWatcher) func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
+func oidcCallback(watcher *AuthWatcher) func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 		token := string(password)
 		allowedRepos := watcher.AllowedRepos()

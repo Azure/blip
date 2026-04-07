@@ -29,9 +29,11 @@ type GatewayConfig struct {
 	PodName            string
 	MaxSessionDuration time.Duration
 
-	// AllowedReposConfigMap is the name of the ConfigMap (in VMNamespace) that holds
-	// the allowed GitHub Actions repository list. Empty disables OIDC auth.
-	AllowedReposConfigMap string
+	// AuthConfigMap is the name of the ConfigMap (in VMNamespace) that holds
+	// the allowed GitHub Actions repository list (key: "allowed-repos") and
+	// explicitly allowed SSH public keys (key: "allowed-pubkeys").
+	// Empty disables OIDC and explicit pubkey auth.
+	AuthConfigMap string
 
 	MaxBlipsPerUser int
 
@@ -48,13 +50,13 @@ func RunGateway(cfg *GatewayConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start the ConfigMap-backed repo watcher for GitHub Actions OIDC auth.
-	var repoWatcher *auth.RepoWatcher
-	if cfg.AllowedReposConfigMap != "" {
+	// Start the ConfigMap-backed auth watcher for OIDC and explicit pubkey auth.
+	var authWatcher *auth.AuthWatcher
+	if cfg.AuthConfigMap != "" {
 		var err error
-		repoWatcher, err = auth.NewRepoWatcher(ctx, cfg.VMNamespace, cfg.AllowedReposConfigMap)
+		authWatcher, err = auth.NewAuthWatcher(ctx, cfg.VMNamespace, cfg.AuthConfigMap)
 		if err != nil {
-			return fmt.Errorf("start repo watcher: %w", err)
+			return fmt.Errorf("start auth watcher: %w", err)
 		}
 	}
 
@@ -68,7 +70,7 @@ func RunGateway(cfg *GatewayConfig) error {
 		MaxSessionDuration: cfg.MaxSessionDuration,
 		LoginGraceTime:     cfg.LoginGraceTime,
 		MaxAuthTries:       cfg.MaxAuthTries,
-		RepoWatcher:        repoWatcher,
+		AuthWatcher:        authWatcher,
 	})
 	if err != nil {
 		return err
@@ -130,8 +132,8 @@ func RunGateway(cfg *GatewayConfig) error {
 		"namespace", cfg.VMNamespace,
 		"pool", cfg.VMPoolName,
 		"max_session", cfg.MaxSessionDuration.String(),
-		"github_actions_auth", repoWatcher != nil,
-		"allowed_repos_configmap", cfg.AllowedReposConfigMap,
+		"github_actions_auth", authWatcher != nil,
+		"auth_configmap", cfg.AuthConfigMap,
 		"ca_cert_enabled", true,
 	)
 
