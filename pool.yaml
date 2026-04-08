@@ -26,10 +26,8 @@ stringData:
           sudo: ALL=(ALL) NOPASSWD:ALL
           shell: /bin/bash
           lock_passwd: true
-    package_update: true
+    package_update: false
     package_upgrade: false
-    packages:
-        - ca-certificates
     write_files:
         - path: /usr/local/bin/blip
           permissions: "0755"
@@ -335,16 +333,8 @@ stringData:
 
             main "$@"
         - chmod -x /etc/update-motd.d/*
-        - systemctl disable --now snapd.service snapd.socket snapd.seeded.service snapd.snap-repair.timer || true
+        - systemctl disable --now snapd.service snapd.socket snapd.seeded.service snapd.snap-repair.timer multipathd.service multipathd.socket ModemManager.service unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer udisks2.service polkit.service fwupd.service packagekit.service networkd-dispatcher.service 2>/dev/null || true
         - apt-get purge -y --auto-remove snapd && rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd || true
-        - systemctl disable --now multipathd.service multipathd.socket || true
-        - systemctl disable --now ModemManager.service || true
-        - systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
-        - systemctl disable --now udisks2.service || true
-        - systemctl disable --now polkit.service || true
-        - systemctl disable --now fwupd.service || true
-        - systemctl disable --now packagekit.service || true
-        - systemctl disable --now networkd-dispatcher.service || true
         - touch /etc/cloud/cloud-init.disabled
         - mkdir -p /etc/systemd/journald.conf.d
         - printf '[Journal]\nSystemMaxUse=16M\nRuntimeMaxUse=16M\n' > /etc/systemd/journald.conf.d/size.conf
