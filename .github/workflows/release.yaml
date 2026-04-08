@@ -59,12 +59,19 @@ jobs:
       - name: Copy VM pool manifest
         run: cp pool.yaml dist/pool.yaml
 
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ steps.tag.outputs.version }}" \
-            --generate-notes \
-            dist/manifest.yaml \
-            dist/pool.yaml
+          if ! gh release view "${{ steps.tag.outputs.version }}" > /dev/null 2>&1; then
+            gh release create "${{ steps.tag.outputs.version }}" \
+              --generate-notes \
+              dist/manifest.yaml \
+              dist/pool.yaml
+          else
+            gh release upload "${{ steps.tag.outputs.version }}" \
+              --clobber \
+              dist/manifest.yaml \
+              dist/pool.yaml
+          fi
 
