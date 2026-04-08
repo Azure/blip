@@ -235,13 +235,12 @@ func bridgeUpstreamChannel(ctx context.Context, sessionID string, serverConn *ss
 
 // bridge performs bidirectional data copying and request forwarding between two channels.
 func bridge(ctx context.Context, sessionID string, clientChan ssh.Channel, clientReqs <-chan *ssh.Request, upstreamChan ssh.Channel, upstreamReqs <-chan *ssh.Request) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	clientToUpstreamDone := make(chan struct{})
+	upstreamToClientDone := make(chan struct{})
 	upstreamReqsDone := make(chan struct{})
 
 	go func() {
-		defer wg.Done()
+		defer close(clientToUpstreamDone)
 		if _, err := io.Copy(upstreamChan, clientChan); err != nil {
 			slog.Debug("client->upstream copy ended", "session_id", sessionID, "error", err)
 		}
@@ -249,7 +248,7 @@ func bridge(ctx context.Context, sessionID string, clientChan ssh.Channel, clien
 	}()
 
 	go func() {
-		defer wg.Done()
+		defer close(upstreamToClientDone)
 		if _, err := io.Copy(clientChan, upstreamChan); err != nil {
 			slog.Debug("upstream->client copy ended", "session_id", sessionID, "error", err)
 		}
@@ -263,19 +262,28 @@ func bridge(ctx context.Context, sessionID string, clientChan ssh.Channel, clien
 		forwardRequests(ctx, upstreamReqs, clientChan)
 	}()
 
-	// Wait for the data copies to finish first.
-	wg.Wait()
+	// When the upstream command finishes, the upstream->client copy
+	// returns (EOF from upstream). We then wait briefly for trailing
+	// channel requests (e.g. exit-status) to be relayed, and close
+	// both channels. This unblocks the client->upstream copy if the
+	// client has not sent EOF yet — which happens when a recursive SSH
+	// session inherits stdin from a parent that keeps it open.
+	<-upstreamToClientDone
 
-	// Wait briefly for the upstream request forwarder to relay trailing
-	// channel requests (e.g. exit-status) that arrive after data EOF.
 	select {
 	case <-upstreamReqsDone:
 	case <-time.After(5 * time.Second):
 		slog.Debug("timed out waiting for upstream channel requests to drain", "session_id", sessionID)
 	}
 
+	// Close channels to tear down the bridge. This also unblocks the
+	// client->upstream copy if it is still reading from clientChan.
 	clientChan.Close()
 	upstreamChan.Close()
+
+	// Wait for the client->upstream copy to finish so we don't leak
+	// the goroutine.
+	<-clientToUpstreamDone
 }
 
 func forwardRequests(ctx context.Context, reqs <-chan *ssh.Request, dest ssh.Channel) {
