@@ -465,7 +465,7 @@ def setup():
 
     # 10. Wait for VMs to become ready
     print("  Waiting for VMs to become ready...", flush=True)
-    wait_for_pool_ready(min_ready=1, timeout=600)
+    wait_for_pool_ready(min_ready=1, timeout=300)
 
     # 11. TOFU: make an initial connection with accept-new to record the
     #     gateway's host key. All gateway replicas share the same stable
@@ -786,11 +786,6 @@ def main():
                 failed += 1
                 print(f"--- FAIL: {test.__name__}: {e}\n", flush=True)
                 traceback.print_exc()
-            # Wait for pool to replenish between tests
-            try:
-                wait_for_pool_ready(min_ready=1, timeout=300)
-            except TimeoutError:
-                print("  Warning: pool did not replenish", flush=True)
     finally:
         if failed > 0:
             dump_pod_logs()
