@@ -349,8 +349,9 @@ func TestWaitForSessionChannel(t *testing.T) {
 		elapsed := time.Since(start)
 		assert.Nil(t, first)
 		assert.Empty(t, queued)
-		// Should return after ~3s timeout, not block forever
-		assert.Less(t, elapsed, 10*time.Second)
+		// Should return after ~100ms timeout, not block forever.
+		// Use a generous upper bound to avoid flakes on slow CI.
+		assert.Less(t, elapsed, 2*time.Second)
 	})
 }
 

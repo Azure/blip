@@ -337,12 +337,17 @@ func extractAuthExtensions(conn *ssh.ServerConn) (fingerprint, identity string) 
 
 // waitForSessionChannel reads from chans until a "session" channel arrives.
 // Non-session channels are returned as queued for later forwarding.
+//
+// For reconnecting clients the timeout is kept short (100ms) so that
+// session-less connections (e.g. port-forward with -N) proceed quickly.
+// A 3-second wait would delay the start of the Forward loop, preventing
+// direct-tcpip channels from being processed in time.
 func waitForSessionChannel(chans <-chan ssh.NewChannel, reconnecting bool) (ssh.NewChannel, []ssh.NewChannel) {
 	var queued []ssh.NewChannel
 
 	var timeout <-chan time.Time
 	if reconnecting {
-		timeout = time.After(3 * time.Second)
+		timeout = time.After(100 * time.Millisecond)
 	}
 
 	for {
