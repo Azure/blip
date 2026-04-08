@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -159,7 +158,7 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 			"error", err,
 		)
 		if firstClientChan != nil {
-			writeBanner(firstClientChan, crlf("\n  >>> Failed to verify VM identity\n\n"))
+			writeBanner(firstClientChan, hostKeyErrorBanner())
 			firstClientChan.Close()
 		}
 		return
@@ -300,11 +299,10 @@ func (m *Manager) allocateOrReconnect(ctx context.Context, user, authFingerprint
 func (m *Manager) logAndBannerAllocError(ch ssh.Channel, remoteAddr, user string, reconnecting bool, sessionID string, err error) {
 	if reconnecting {
 		slog.Warn("reconnect failed", "session_id", user, "remote", remoteAddr, "error", err)
-		writeBanner(ch, crlf("\n  >>> Reconnect failed: "+err.Error()+"\n\n"))
 	} else {
 		slog.Error("no VMs available", "error", err, "session_id", sessionID)
-		writeBanner(ch, crlf("\n  >>> VM allocation failed: "+err.Error()+"\n\n"))
 	}
+	writeBanner(ch, allocErrorBanner(reconnecting, err))
 }
 
 // releaseIfEphemeral checks if the VM for the given session is still
@@ -366,12 +364,6 @@ func waitForSessionChannel(chans <-chan ssh.NewChannel, reconnecting bool) (ssh.
 	}
 }
 
-func writeBanner(ch ssh.Channel, banner string) {
-	if _, err := ch.Stderr().Write([]byte(banner)); err != nil {
-		slog.Debug("failed to write banner", "error", err)
-	}
-}
-
 const sessionIDPrefix = "blip-"
 
 // generateSessionID returns a new random session ID (e.g. "blip-a3f29c04b1").
@@ -398,81 +390,4 @@ func isSessionID(user string) bool {
 		}
 	}
 	return true
-}
-
-const bannerSpacer = "\n\n\n-----------------------------------\n\n\n"
-
-func crlf(s string) string {
-	return strings.ReplaceAll(s, "\n", "\r\n")
-}
-
-func welcomeBanner(reconnecting bool) string {
-	status := ">>> Allocating VM..."
-	if reconnecting {
-		status = ">>> Reconnecting..."
-	}
-	banner := fmt.Sprintf(`
-  ____  _ _
- | __ )| (_)_ __
- |  _ \| | | '_ \
- | |_) | | | |_) |
- |____/|_|_| .__/
-            |_|
-
-  %s
-`, status)
-	return crlf(banner)
-}
-
-func vmInfoBanner(sessionID, vmName, site string, reconnecting bool, ttl time.Duration) string {
-	connMsg := ">>> Connected to gateway"
-	if reconnecting {
-		connMsg = ">>> Reconnected to gateway"
-	}
-	banner := fmt.Sprintf(`  %s
-  Session : %s
-  VM      : %s
-  Lease   : ephemeral (%s TTL)`, connMsg, sessionID, vmName, formatDuration(ttl))
-	if site != "" {
-		banner += fmt.Sprintf("\n  Site    : %s", site)
-	}
-	banner += fmt.Sprintf(`
-
-  This blip is ephemeral and will be destroyed when you
-  disconnect. Run 'blip retain' to preserve it.`)
-	banner += bannerSpacer
-	return crlf(banner)
-}
-
-// formatDuration produces a human-friendly duration string like "8h" or "2h30m".
-func formatDuration(d time.Duration) string {
-	d = d.Round(time.Minute)
-	h := int(d.Hours())
-	m := int(d.Minutes()) % 60
-	if h > 0 && m > 0 {
-		return fmt.Sprintf("%dh%dm", h, m)
-	}
-	if h > 0 {
-		return fmt.Sprintf("%dh", h)
-	}
-	return fmt.Sprintf("%dm", m)
-}
-
-func shutdownBanner() string {
-	banner := `
-
------------------------------------
-
-  >>> Gateway is shutting down.
-  >>> Your VM is still running.
-  >>> Reconnect with your session ID.
-
------------------------------------
-
-`
-	return crlf(banner)
-}
-
-func sessionIDBanner(sessionID string) string {
-	return crlf(fmt.Sprintf("  [session: %s]\n", sessionID))
 }
