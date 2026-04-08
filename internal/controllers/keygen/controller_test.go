@@ -2,12 +2,16 @@ package keygen
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -51,6 +55,16 @@ func makeSecret(name string, data map[string][]byte) *corev1.Secret {
 		},
 		Data: data,
 	}
+}
+
+// generateTestHostKeyPEM creates a valid ed25519 SSH private key in PEM format for tests.
+func generateTestHostKeyPEM(t *testing.T) []byte {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	pemBlock, err := ssh.MarshalPrivateKey(priv, "")
+	require.NoError(t, err)
+	return pem.EncodeToMemory(pemBlock)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +152,8 @@ func TestEnsureHostKey(t *testing.T) {
 	})
 
 	t.Run("idempotent: existing host key is preserved", func(t *testing.T) {
-		existing := makeSecret("ssh-host-key", map[string][]byte{"host_key": []byte("original-key")})
+		originalKey := generateTestHostKeyPEM(t)
+		existing := makeSecret("ssh-host-key", map[string][]byte{"host_key": originalKey})
 		cl := testClient(t, existing)
 
 		err := ensureHostKey(context.Background(), cl, testNamespace)
@@ -147,7 +162,7 @@ func TestEnsureHostKey(t *testing.T) {
 		var secret corev1.Secret
 		err = cl.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: "ssh-host-key"}, &secret)
 		require.NoError(t, err)
-		assert.Equal(t, []byte("original-key"), secret.Data["host_key"])
+		assert.Equal(t, originalKey, secret.Data["host_key"])
 	})
 }
 

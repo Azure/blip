@@ -35,6 +35,10 @@ type Config struct {
 	// AuthWatcher provides the dynamic allowed-repos and allowed-pubkeys
 	// lists from a ConfigMap; nil disables OIDC and explicit pubkey auth.
 	AuthWatcher *auth.AuthWatcher
+
+	// VMKeyResolver resolves VM client key fingerprints to user identities
+	// for recursive blip connections; nil disables VM key auth.
+	VMKeyResolver auth.VMKeyResolver
 }
 
 // ConnHandler is called for each successfully authenticated SSH connection.
@@ -59,9 +63,10 @@ func New(cfg Config) (*Server, error) {
 	)
 
 	sshConfig := auth.NewServerConfig(auth.Config{
-		HostSigner:   hostSigner,
-		MaxAuthTries: cfg.MaxAuthTries,
-		AuthWatcher:  cfg.AuthWatcher,
+		HostSigner:    hostSigner,
+		MaxAuthTries:  cfg.MaxAuthTries,
+		AuthWatcher:   cfg.AuthWatcher,
+		VMKeyResolver: cfg.VMKeyResolver,
 	})
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)

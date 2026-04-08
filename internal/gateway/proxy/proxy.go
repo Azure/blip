@@ -340,7 +340,8 @@ func rejectChannel(ch ssh.NewChannel, err error) {
 }
 
 // InjectGatewayConfig writes a minimal SSH config into the VM so the user
-// can SSH back to the gateway for recursive blip allocation.
+// can SSH back to the gateway for recursive blip allocation. The VM uses
+// its own client key (generated at boot) for authentication.
 func InjectGatewayConfig(upstream *ssh.Client, gatewayHost string) error {
 	if err := validateShellSafe(gatewayHost); err != nil {
 		return fmt.Errorf("invalid gateway host: %w", err)
@@ -362,6 +363,8 @@ Host blip blip-gateway
     HostName %s
     Port 22
     User runner
+    IdentityFile /etc/ssh/ssh_client_ed25519_key
+    StrictHostKeyChecking yes
 BLIP_CONFIG_EOF
 chmod 644 ~/.ssh/config
 `, gatewayHost)
