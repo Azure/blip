@@ -288,7 +288,21 @@ stringData:
             		chown runner:runner ~runner/.ssh/known_hosts
             	fi
 
-            	# --- 4. Register host-key and client-key annotations ---
+            	# --- 4. Restart sshd BEFORE registering annotations ---
+            	# sshd may already be running (Ubuntu 24.04 starts it via socket
+            	# activation). Restart to ensure it is running and picks up any
+            	# configuration changes (e.g. new authorized_keys). This MUST
+            	# happen before the annotation PATCH below, because the gateway
+            	# treats the annotations as the VM readiness signal and may
+            	# connect immediately. If sshd restarts after the gateway has
+            	# already established an SSH session, the connection is killed
+            	# and the proxy hangs until the client times out.
+            	systemctl enable ssh
+            	systemctl restart ssh
+
+            	# --- 5. Register host-key and client-key annotations ---
+            	# This is the readiness signal: once these annotations are set,
+            	# the gateway considers this VM eligible for allocation.
             	local host_key client_key patch
             	host_key="$(awk '{print $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
             	client_key="$(awk '{print $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
@@ -316,11 +330,6 @@ stringData:
             		exit 1
             	fi
 
-            	# sshd may already be running (Ubuntu 24.04 starts it via socket
-            	# activation). Restart to ensure it is running and picks up any
-            	# configuration changes.
-            	systemctl enable ssh
-            	systemctl restart ssh
             	echo "[blip-setup] complete"
             }
 
