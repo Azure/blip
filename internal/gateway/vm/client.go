@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -36,10 +38,9 @@ var (
 )
 
 const (
-	indexVMPool         = ".metadata.labels.blip.io/pool"
-	indexVMSessionID    = ".metadata.annotations.blip.io/session-id"
-	indexVMUser         = ".metadata.annotations.blip.io/user"
-	indexVMSSHPublicKey = ".metadata.annotations.blip.io/ssh-public-key"
+	indexVMPool      = ".metadata.labels.blip.io/pool"
+	indexVMSessionID = ".metadata.annotations.blip.io/session-id"
+	indexVMUser      = ".metadata.annotations.blip.io/user"
 )
 
 type ClaimResult struct {
@@ -117,16 +118,6 @@ func New(ctx context.Context, namespace string) (*Client, error) {
 		return nil, fmt.Errorf("index VMs by user: %w", err)
 	}
 
-	if err := informerCache.IndexField(ctx, &kubevirtv1.VirtualMachine{}, indexVMSSHPublicKey, func(obj client.Object) []string {
-		fp := obj.GetAnnotations()["blip.io/ssh-public-key"]
-		if fp == "" {
-			return nil
-		}
-		return []string{fp}
-	}); err != nil {
-		return nil, fmt.Errorf("index VMs by ssh-public-key: %w", err)
-	}
-
 	go func() {
 		if err := informerCache.Start(ctx); err != nil {
 			slog.Error("informer cache stopped", "error", err)
@@ -171,6 +162,9 @@ func (c *Client) Claim(ctx context.Context, poolName, sessionID, gatewayPodName 
 				continue
 			}
 			if a.Annotations["blip.io/host-key"] == "" {
+				continue
+			}
+			if a.Annotations["blip.io/client-key"] == "" {
 				continue
 			}
 			inst, err := c.getInstance(ctx, a.Name)
@@ -275,38 +269,41 @@ func (c *Client) GetHostKey(ctx context.Context, vmName string) (string, error) 
 	return key, nil
 }
 
-// StoreSSHPublicKey records the SSH public key fingerprint on the VM for identity resolution.
-func (c *Client) StoreSSHPublicKey(ctx context.Context, sessionID, fingerprint string) error {
-	allocs, err := c.listAllocationsBySessionDirect(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("list VMs: %w", err)
-	}
-	for _, a := range allocs {
-		a.Annotations["blip.io/ssh-public-key"] = fingerprint
-		return c.updateAllocation(ctx, &a)
-	}
-	return fmt.Errorf("VM with session ID %s not found", sessionID)
-}
-
-// ResolveRootIdentity returns the root user identity for a VM identified by SSH public key fingerprint.
-// A single lookup suffices because blip.io/user is always set to the root identity at claim time.
+// ResolveRootIdentity returns the root user identity for a VM identified by SSH
+// client key fingerprint (e.g. "SHA256:..."). It iterates claimed VMs and
+// parses each blip.io/client-key annotation to find a match.
 func (c *Client) ResolveRootIdentity(ctx context.Context, fingerprint string) (string, error) {
 	var list kubevirtv1.VirtualMachineList
 	if err := c.cache.List(ctx, &list,
 		client.InNamespace(c.namespace),
-		client.MatchingFields{indexVMSSHPublicKey: fingerprint},
 	); err != nil {
-		return "", fmt.Errorf("list VMs by ssh-public-key: %w", err)
-	}
-	if len(list.Items) == 0 {
-		return "", fmt.Errorf("no VM found with ssh-public-key fingerprint %s", fingerprint)
+		return "", fmt.Errorf("list VMs for client-key lookup: %w", err)
 	}
 
-	user := list.Items[0].Annotations["blip.io/user"]
-	if user == "" {
-		return "", fmt.Errorf("VM %s has no blip.io/user annotation", list.Items[0].Name)
+	for _, vm := range list.Items {
+		ann := vm.Annotations
+		clientKeyRaw := ann["blip.io/client-key"]
+		if clientKeyRaw == "" {
+			continue
+		}
+		// Only search claimed VMs (those with a session).
+		if ann["blip.io/session-id"] == "" {
+			continue
+		}
+
+		pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(clientKeyRaw))
+		if err != nil {
+			continue
+		}
+		if ssh.FingerprintSHA256(pub) == fingerprint {
+			user := ann["blip.io/user"]
+			if user == "" {
+				return "", fmt.Errorf("VM %s has no blip.io/user annotation", vm.Name)
+			}
+			return user, nil
+		}
 	}
-	return user, nil
+	return "", fmt.Errorf("no VM found with client-key fingerprint %s", fingerprint)
 }
 
 // MaxLifespan is the absolute maximum lifespan for a blip from its original claim time.

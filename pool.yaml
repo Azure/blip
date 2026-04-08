@@ -202,30 +202,101 @@ stringData:
             *) usage ;;
             esac
     runcmd:
-        - mkdir -p /var/run/secrets/kubernetes.io/serviceaccount && mount -t iso9660 -o ro /dev/vdc /var/run/secrets/kubernetes.io/serviceaccount && cp -a /var/run/secrets/kubernetes.io/serviceaccount /var/run/secrets/kubernetes.io/serviceaccount-rw && umount /var/run/secrets/kubernetes.io/serviceaccount && rmdir /var/run/secrets/kubernetes.io/serviceaccount && mv /var/run/secrets/kubernetes.io/serviceaccount-rw /var/run/secrets/kubernetes.io/serviceaccount && chmod -R a+r /var/run/secrets/kubernetes.io/serviceaccount
+        - - /bin/bash
+          - -c
+          - |
+            exec > /dev/ttyS0 2>&1
+            echo "[blip-init] mounting service account ISO..."
+            mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+            mount -t iso9660 -o ro /dev/vdc /var/run/secrets/kubernetes.io/serviceaccount
+            cp -a /var/run/secrets/kubernetes.io/serviceaccount /var/run/secrets/kubernetes.io/serviceaccount-rw
+            umount /var/run/secrets/kubernetes.io/serviceaccount
+            rmdir /var/run/secrets/kubernetes.io/serviceaccount
+            mv /var/run/secrets/kubernetes.io/serviceaccount-rw /var/run/secrets/kubernetes.io/serviceaccount
+            chmod -R a+r /var/run/secrets/kubernetes.io/serviceaccount
+            echo "[blip-init] service account mounted"
         - - /bin/bash
           - -c
           - |
             #!/bin/bash
 
+            exec > /dev/ttyS0 2>&1
             set -euo pipefail
+            trap 'echo "[blip-setup] ERROR on line $LINENO (exit $?)"' ERR
 
             readonly SA_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
 
             main() {
-            	local token ns ca vm_name api_url host_key patch
+            	local token ns ca vm_name api_url
             	token="$(cat "$SA_DIR/token")"
             	ns="$(cat "$SA_DIR/namespace")"
             	ca="$SA_DIR/ca.crt"
             	vm_name="$(hostname)"
             	api_url="https://kubernetes.default.svc/apis/kubevirt.io/v1/namespaces/${ns}/virtualmachines/${vm_name}"
+            	echo "[blip-setup] vm=$vm_name ns=$ns"
 
+            	# --- 1. Generate a VM client key pair ---
+            	ssh-keygen -t ed25519 -f /etc/ssh/ssh_client_ed25519_key -N "" -q
+            	chmod 644 /etc/ssh/ssh_client_ed25519_key
+            	chmod 644 /etc/ssh/ssh_client_ed25519_key.pub
+
+            	# --- 2. Fetch gateway client pubkey from ConfigMap -> authorized_keys ---
+            	local cm_url="https://kubernetes.default.svc/api/v1/namespaces/${ns}/configmaps/ssh-gateway-client-pubkey"
+            	local gw_client_pubkey=""
+            	for _retry in $(seq 1 30); do
+            		local cm_body=""
+            		cm_body=$(curl --silent --connect-timeout 5 --max-time 10 --cacert "$ca" \
+            			-H "Authorization: Bearer ${token}" \
+            			"$cm_url" 2>&1) || { sleep 2; continue; }
+            		gw_client_pubkey=$(printf '%s' "$cm_body" | grep -oP '"client_key\.pub"\s*:\s*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\\n/\n/g') || true
+            		if [ -n "$gw_client_pubkey" ]; then
+            			break
+            		fi
+            		sleep 2
+            	done
+            	if [ -z "$gw_client_pubkey" ]; then
+            		echo "[blip-setup] FATAL: could not fetch gateway client pubkey" >&2
+            		exit 1
+            	fi
+            	mkdir -p ~runner/.ssh
+            	printf '%s\n' "$gw_client_pubkey" > ~runner/.ssh/authorized_keys
+            	chmod 600 ~runner/.ssh/authorized_keys
+            	chown -R runner:runner ~runner/.ssh
+
+            	# --- 3. Fetch gateway host pubkey from ConfigMap -> known_hosts ---
+            	local host_cm_url="https://kubernetes.default.svc/api/v1/namespaces/${ns}/configmaps/ssh-gateway-host-pubkey"
+            	local gw_host_pubkey=""
+            	for _retry in $(seq 1 30); do
+            		local host_cm_body
+            		host_cm_body=$(curl --silent --connect-timeout 5 --max-time 10 --cacert "$ca" \
+            			-H "Authorization: Bearer ${token}" \
+            			"$host_cm_url") || { sleep 2; continue; }
+            		gw_host_pubkey=$(printf '%s' "$host_cm_body" | grep -oP '"host_key\.pub"\s*:\s*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\\n/\n/g') || true
+            		if [ -n "$gw_host_pubkey" ]; then
+            			break
+            		fi
+            		sleep 2
+            	done
+            	if [ -n "$gw_host_pubkey" ]; then
+            		# Write known_hosts entries for the gateway service names.
+            		# SSH uses the resolved HostName for known_hosts lookup, and
+            		# for the default port (22) it uses plain hostnames (no brackets).
+            		printf '%s %s\n' "ssh-gateway.blip.svc.cluster.local" "$gw_host_pubkey" > ~runner/.ssh/known_hosts
+            		printf '%s %s\n' "blip" "$gw_host_pubkey" >> ~runner/.ssh/known_hosts
+            		printf '%s %s\n' "blip-gateway" "$gw_host_pubkey" >> ~runner/.ssh/known_hosts
+            		chmod 644 ~runner/.ssh/known_hosts
+            		chown runner:runner ~runner/.ssh/known_hosts
+            	fi
+
+            	# --- 4. Register host-key and client-key annotations ---
+            	local host_key client_key patch
             	host_key="$(awk '{print $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
-            	patch=$(printf '{"metadata":{"annotations":{"blip.io/host-key":"%s"}}}' "$host_key")
+            	client_key="$(awk '{print $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
+            	patch=$(printf '{"metadata":{"annotations":{"blip.io/host-key":"%s","blip.io/client-key":"%s"}}}' "$host_key" "$client_key")
 
             	local ok=false code
             	for _retry in $(seq 1 10); do
-            		code=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            		code=$(curl --silent --connect-timeout 5 --max-time 10 --output /dev/null --write-out "%{http_code}" \
             			--cacert "$ca" \
             			-X PATCH \
             			-H "Authorization: Bearer ${token}" \
@@ -236,11 +307,12 @@ stringData:
             			ok=true
             			break
             		fi
+            		echo "[blip-setup] PATCH retry $_retry: HTTP $code"
             		sleep 2
             	done
 
             	if [ "$ok" != "true" ]; then
-            		echo "FATAL: failed to store host key annotation after retries (last HTTP $code)" >&2
+            		echo "[blip-setup] FATAL: failed to register key annotations (HTTP $code)" >&2
             		exit 1
             	fi
 
@@ -249,6 +321,7 @@ stringData:
             	# configuration changes.
             	systemctl enable ssh
             	systemctl restart ssh
+            	echo "[blip-setup] complete"
             }
 
             main "$@"

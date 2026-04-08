@@ -28,6 +28,7 @@ func newRootCmd() *cobra.Command {
 	var (
 		listenAddr         string
 		hostKeyPath        string
+		clientKeyPath      string
 		vmNamespace        string
 		vmPoolName         string
 		podName            string
@@ -48,10 +49,14 @@ func newRootCmd() *cobra.Command {
 			if hostKeyPath == "" {
 				return fmt.Errorf("--host-key-path must be set (path to stable host key shared across replicas)")
 			}
+			if clientKeyPath == "" {
+				return fmt.Errorf("--client-key-path must be set (path to stable client key shared across replicas)")
+			}
 
 			cfg := &sshgw.GatewayConfig{
 				ListenAddr:         listenAddr,
 				HostKeyPath:        hostKeyPath,
+				ClientKeyPath:      clientKeyPath,
 				VMNamespace:        vmNamespace,
 				VMPoolName:         vmPoolName,
 				PodName:            podName,
@@ -73,6 +78,7 @@ func newRootCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&listenAddr, "listen-address", envOrDefault("LISTEN_ADDRESS", ":2222"), "TCP address to listen on (env: LISTEN_ADDRESS)")
 	cmd.Flags().StringVar(&hostKeyPath, "host-key-path", envOrDefault("HOST_KEY_PATH", "/etc/blip/host-key/host_key"), "Path to stable host key shared across replicas (env: HOST_KEY_PATH)")
+	cmd.Flags().StringVar(&clientKeyPath, "client-key-path", envOrDefault("CLIENT_KEY_PATH", "/etc/blip/client-key/client_key"), "Path to stable client key shared across replicas (env: CLIENT_KEY_PATH)")
 	cmd.Flags().StringVar(&vmNamespace, "namespace", envOrDefault("VM_NAMESPACE", "blip"), "Kubernetes namespace for VMs (env: VM_NAMESPACE)")
 	cmd.Flags().StringVar(&vmPoolName, "pool-name", envOrDefault("VM_POOL_NAME", "default"), "VM pool name (env: VM_POOL_NAME)")
 	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "unknown"), "Pod name for identification (env: POD_NAME)")

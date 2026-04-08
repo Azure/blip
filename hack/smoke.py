@@ -165,6 +165,7 @@ def wait_for_pool_ready(min_ready=1, timeout=300):
                 continue
 
             has_host_key = bool(ann.get("blip.io/host-key"))
+            has_client_key = bool(ann.get("blip.io/client-key"))
 
             # Check VMI status
             vmi_ready = False
@@ -186,7 +187,7 @@ def wait_for_pool_ready(min_ready=1, timeout=300):
             except Exception:
                 pass
 
-            if vmi_ready and has_host_key:
+            if vmi_ready and has_host_key and has_client_key:
                 ready += 1
                 vm_states.append(f"{name}: ready")
             else:
@@ -201,6 +202,8 @@ def wait_for_pool_ready(min_ready=1, timeout=300):
                     reasons.append("no IP")
                 if not has_host_key:
                     reasons.append("no host-key")
+                if not has_client_key:
+                    reasons.append("no client-key")
                 vm_states.append(f"{name}: NOT ready ({'; '.join(reasons)})")
 
         elapsed = int(time.time() - start)
@@ -253,6 +256,7 @@ def dump_vm_diagnostics():
         print(f"    ready: {vm_status.get('ready', 'N/A')}", flush=True)
         print(f"    created: {vm_status.get('created', 'N/A')}", flush=True)
         print(f"    host-key: {'present' if ann.get('blip.io/host-key') else 'MISSING'}", flush=True)
+        print(f"    client-key: {'present' if ann.get('blip.io/client-key') else 'MISSING'}", flush=True)
         print(f"    session-id: {ann.get('blip.io/session-id', 'none')}", flush=True)
 
         # VMI conditions and phase
@@ -390,6 +394,11 @@ def setup():
     manifest = manifest.replace("${REGISTRY}/blip:${BLIP_TAG}", IMAGE_NAME)
     run(["kubectl", "apply", "-f", "-"], input=manifest)
 
+    # 3b. Restart controller to pick up the new image (kind reuses the tag
+    #     so the deployment spec doesn't change and won't trigger a rollout).
+    print("  Restarting blip-controller pods...", flush=True)
+    kubectl("rollout", "restart", "deploy/blip-controller", "-n", NAMESPACE)
+
     # 4. Wait for controller (creates the host key secret)
     print("  Waiting for blip-controller...", flush=True)
     kubectl("rollout", "status", "deploy/blip-controller",
@@ -401,6 +410,26 @@ def setup():
         lambda: kubectl("get", "secret", "ssh-host-key",
                         "-n", NAMESPACE, check=False).returncode == 0,
         "ssh-host-key secret", timeout=60,
+    )
+
+    # 5b. Wait for the gateway client key secret and pubkey ConfigMaps
+    print("  Waiting for ssh-gateway-client-key secret...", flush=True)
+    wait_for(
+        lambda: kubectl("get", "secret", "ssh-gateway-client-key",
+                        "-n", NAMESPACE, check=False).returncode == 0,
+        "ssh-gateway-client-key secret", timeout=60,
+    )
+    print("  Waiting for ssh-gateway-client-pubkey ConfigMap...", flush=True)
+    wait_for(
+        lambda: kubectl("get", "configmap", "ssh-gateway-client-pubkey",
+                        "-n", NAMESPACE, check=False).returncode == 0,
+        "ssh-gateway-client-pubkey configmap", timeout=60,
+    )
+    print("  Waiting for ssh-gateway-host-pubkey ConfigMap...", flush=True)
+    wait_for(
+        lambda: kubectl("get", "configmap", "ssh-gateway-host-pubkey",
+                        "-n", NAMESPACE, check=False).returncode == 0,
+        "ssh-gateway-host-pubkey configmap", timeout=60,
     )
 
     # Gateway pods may have started before the host key secret existed; restart.

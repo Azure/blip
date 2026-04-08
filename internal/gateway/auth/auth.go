@@ -32,6 +32,17 @@ type Config struct {
 	// AuthWatcher provides the dynamic allowed-repos and allowed-pubkeys
 	// lists from a ConfigMap.
 	AuthWatcher *AuthWatcher
+
+	// VMKeyResolver resolves a VM client key fingerprint to the root user
+	// identity of the session that owns the VM. This is used for recursive
+	// blip connections where VMs SSH back to the gateway.
+	VMKeyResolver VMKeyResolver
+}
+
+// VMKeyResolver resolves a VM SSH client key fingerprint to the original
+// user identity of the session that owns the VM.
+type VMKeyResolver interface {
+	ResolveRootIdentity(fingerprint string) (identity string, err error)
 }
 
 // NewServerConfig builds an ssh.ServerConfig with auth callbacks from cfg.
@@ -39,21 +50,43 @@ func NewServerConfig(cfg Config) *ssh.ServerConfig {
 	sshCfg := &ssh.ServerConfig{MaxAuthTries: cfg.MaxAuthTries}
 	sshCfg.AddHostKey(cfg.HostSigner)
 
+	if cfg.AuthWatcher != nil || cfg.VMKeyResolver != nil {
+		sshCfg.PublicKeyCallback = pubkeyCallback(cfg.AuthWatcher, cfg.VMKeyResolver)
+	}
+
 	if cfg.AuthWatcher != nil {
-		sshCfg.PublicKeyCallback = pubkeyCallback(cfg.AuthWatcher)
 		sshCfg.PasswordCallback = oidcCallback(cfg.AuthWatcher)
-	} else {
+	}
+
+	if cfg.AuthWatcher == nil && cfg.VMKeyResolver == nil {
 		slog.Warn("no auth watcher configured, all authentication is disabled")
 	}
 
 	return sshCfg
 }
 
-// pubkeyCallback returns a PublicKeyCallback that accepts raw public keys
-// whose fingerprint is in the AuthWatcher's allowed set.
-func pubkeyCallback(watcher *AuthWatcher) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
+// pubkeyCallback returns a PublicKeyCallback that first checks against the
+// AuthWatcher's explicit allowed set, and then falls back to checking if the
+// key belongs to a VM for recursive blip connections.
+func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-		return verifyExplicitPubkey(conn, key, watcher)
+		// First, try explicit pubkey auth (user keys in ConfigMap).
+		if watcher != nil {
+			perm, err := verifyExplicitPubkey(conn, key, watcher)
+			if err == nil {
+				return perm, nil
+			}
+		}
+
+		// Second, try VM client key auth (for recursive blip connections).
+		if vmResolver != nil {
+			perm, err := verifyVMClientKey(conn, key, vmResolver)
+			if err == nil {
+				return perm, nil
+			}
+		}
+
+		return nil, fmt.Errorf("public key %s is not authorized", ssh.FingerprintSHA256(key))
 	}
 }
 
@@ -74,6 +107,31 @@ func verifyExplicitPubkey(conn ssh.ConnMetadata, key ssh.PublicKey, watcher *Aut
 		Extensions: map[string]string{
 			ExtFingerprint: fingerprint,
 			ExtIdentity:    fmt.Sprintf("pubkey:%s", fingerprint),
+		},
+	}, nil
+}
+
+// verifyVMClientKey checks whether the key belongs to a VM by looking up its
+// fingerprint in the VM annotations. If found, it resolves the root user
+// identity for the session that owns the VM. This enables identity propagation
+// for recursive blip connections.
+func verifyVMClientKey(conn ssh.ConnMetadata, key ssh.PublicKey, resolver VMKeyResolver) (*ssh.Permissions, error) {
+	fingerprint := ssh.FingerprintSHA256(key)
+	identity, err := resolver.ResolveRootIdentity(fingerprint)
+	if err != nil {
+		return nil, fmt.Errorf("VM client key lookup failed for %s: %w", fingerprint, err)
+	}
+
+	slog.Info("VM client key auth succeeded",
+		"user", conn.User(),
+		"remote", conn.RemoteAddr().String(),
+		"key_fingerprint", fingerprint,
+		"resolved_identity", identity,
+	)
+	return &ssh.Permissions{
+		Extensions: map[string]string{
+			ExtFingerprint: fingerprint,
+			ExtIdentity:    identity,
 		},
 	}, nil
 }

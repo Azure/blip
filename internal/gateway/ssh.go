@@ -2,8 +2,6 @@ package gateway
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"fmt"
 	"log/slog"
 	"os"
@@ -22,6 +20,7 @@ import (
 type GatewayConfig struct {
 	ListenAddr         string
 	HostKeyPath        string
+	ClientKeyPath      string
 	VMNamespace        string
 	VMPoolName         string
 	PodName            string
@@ -58,6 +57,14 @@ func RunGateway(cfg *GatewayConfig) error {
 		}
 	}
 
+	vmcl, err := vm.New(ctx, cfg.VMNamespace)
+	if err != nil {
+		return fmt.Errorf("create k8s client: %w", err)
+	}
+
+	// Create the VM key resolver adapter for the auth system.
+	vmKeyResolver := &vmKeyResolverAdapter{vmClient: vmcl}
+
 	srv, err := server.New(server.Config{
 		ListenAddr:         cfg.ListenAddr,
 		HostKeyPath:        cfg.HostKeyPath,
@@ -66,24 +73,20 @@ func RunGateway(cfg *GatewayConfig) error {
 		LoginGraceTime:     cfg.LoginGraceTime,
 		MaxAuthTries:       cfg.MaxAuthTries,
 		AuthWatcher:        authWatcher,
+		VMKeyResolver:      vmKeyResolver,
 	})
 	if err != nil {
 		return err
 	}
 
-	// Generate an ephemeral key pair for dialing upstream VMs.
-	upstreamSigner, err := generateEphemeralSigner()
+	// Load the stable shared client key for dialing upstream VMs.
+	clientSigner, err := loadSigner(cfg.ClientKeyPath)
 	if err != nil {
-		return fmt.Errorf("generate ephemeral upstream key: %w", err)
+		return fmt.Errorf("load gateway client key: %w", err)
 	}
-	slog.Info("ephemeral upstream key generated",
-		"fingerprint", ssh.FingerprintSHA256(upstreamSigner.PublicKey()),
+	slog.Info("gateway client key loaded",
+		"fingerprint", ssh.FingerprintSHA256(clientSigner.PublicKey()),
 	)
-
-	vmcl, err := vm.New(ctx, cfg.VMNamespace)
-	if err != nil {
-		return fmt.Errorf("create k8s client: %w", err)
-	}
 
 	gatewayHost := ""
 	if len(cfg.HostPrincipals) > 0 {
@@ -91,7 +94,7 @@ func RunGateway(cfg *GatewayConfig) error {
 	}
 
 	mgr := session.New(session.Config{
-		GatewaySigner:      upstreamSigner,
+		GatewaySigner:      clientSigner,
 		GatewayHost:        gatewayHost,
 		VMClient:           vmcl,
 		VMPoolName:         cfg.VMPoolName,
@@ -144,15 +147,25 @@ func RunGateway(cfg *GatewayConfig) error {
 	return srv.Serve(ctx, mgr.HandleConnection)
 }
 
-// generateEphemeralSigner creates a fresh Ed25519 key pair for upstream VM connections.
-func generateEphemeralSigner() (ssh.Signer, error) {
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
+// loadSigner reads a PEM-encoded SSH private key from path.
+func loadSigner(path string) (ssh.Signer, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("generate ephemeral key: %w", err)
+		return nil, fmt.Errorf("read key %s: %w", path, err)
 	}
-	signer, err := ssh.NewSignerFromKey(priv)
+	signer, err := ssh.ParsePrivateKey(data)
 	if err != nil {
-		return nil, fmt.Errorf("create ephemeral signer: %w", err)
+		return nil, fmt.Errorf("parse key %s: %w", path, err)
 	}
 	return signer, nil
+}
+
+// vmKeyResolverAdapter adapts vm.Client to the auth.VMKeyResolver interface
+// by looking up the VM client key annotation and resolving the root identity.
+type vmKeyResolverAdapter struct {
+	vmClient *vm.Client
+}
+
+func (a *vmKeyResolverAdapter) ResolveRootIdentity(fingerprint string) (string, error) {
+	return a.vmClient.ResolveRootIdentity(context.Background(), fingerprint)
 }

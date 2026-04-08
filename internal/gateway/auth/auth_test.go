@@ -98,7 +98,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		fp := ssh.FingerprintSHA256(userPub)
 
 		watcher := newTestAuthWatcher(nil, map[string]bool{fp: true})
-		cb := pubkeyCallback(watcher)
+		cb := pubkeyCallback(watcher, nil)
 
 		perms, err := cb(conn, userPub)
 		require.NoError(t, err)
@@ -110,22 +110,22 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
 		watcher := newTestAuthWatcher(nil, map[string]bool{"SHA256:other": true})
-		cb := pubkeyCallback(watcher)
+		cb := pubkeyCallback(watcher, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
-		assert.ErrorContains(t, err, "not in the allowed list")
+		assert.ErrorContains(t, err, "not authorized")
 	})
 
 	t.Run("rejects pubkey when watcher has empty set", func(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
 		watcher := newTestAuthWatcher(nil, nil)
-		cb := pubkeyCallback(watcher)
+		cb := pubkeyCallback(watcher, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
-		assert.ErrorContains(t, err, "not in the allowed list")
+		assert.ErrorContains(t, err, "not authorized")
 	})
 }
 

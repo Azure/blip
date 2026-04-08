@@ -80,7 +80,10 @@ rules:
   verbs: ["create", "patch"]
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["get", "create"]
+  verbs: ["get", "list", "watch", "create"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -134,7 +137,10 @@ metadata:
 rules:
 - apiGroups: ["kubevirt.io"]
   resources: ["virtualmachines"]
-  verbs: ["patch"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -155,6 +161,8 @@ roleRef:
 #   - blip.io/release: "true"        — signals early session release
 #   - blip.io/host-key: <key>        — stores the SSH host public key for
 #                                       gateway-side host key verification
+#   - blip.io/client-key: <key>      — stores the SSH client public key for
+#                                       VM-to-gateway authentication
 #   - blip.io/ephemeral: "false"     — marks VM as retained (via "blip retain")
 #   - blip.io/max-duration: <secs>   — updates TTL (via "blip retain --ttl")
 # Without this policy the SA's RBAC permission to patch any VM in the
@@ -165,10 +173,11 @@ roleRef:
 #      extra field). This prevents a compromised VM from modifying other VMs.
 #   2. blip.io/release may only be set to "true".
 #   3. blip.io/host-key must match SSH public key format.
-#   4. blip.io/ephemeral may only be set to "false".
-#   5. blip.io/max-duration must be a numeric string.
-#   6. No other annotations may be changed, added, or removed.
-#   7. Labels, finalizers, and the spec are not modified.
+#   4. blip.io/client-key must match SSH public key format.
+#   5. blip.io/ephemeral may only be set to "false".
+#   6. blip.io/max-duration must be a numeric string.
+#   7. No other annotations may be changed, added, or removed.
+#   8. Labels, finalizers, and the spec are not modified.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -204,39 +213,44 @@ spec:
       !('blip.io/host-key' in object.metadata.annotations) ||
       object.metadata.annotations['blip.io/host-key'].matches('^ssh-[a-z0-9-]+ [A-Za-z0-9+/=]+$')
     message: "blip.io/host-key must be a valid SSH public key (type + base64)"
-  # 4. If blip.io/ephemeral is present it must be exactly "false".
+  # 4. If blip.io/client-key is present it must look like an SSH public key.
+  - expression: >-
+      !('blip.io/client-key' in object.metadata.annotations) ||
+      object.metadata.annotations['blip.io/client-key'].matches('^ssh-[a-z0-9-]+ [A-Za-z0-9+/=]+$')
+    message: "blip.io/client-key must be a valid SSH public key (type + base64)"
+  # 5. If blip.io/ephemeral is present it must be exactly "false".
   - expression: >-
       !('blip.io/ephemeral' in object.metadata.annotations) ||
       object.metadata.annotations['blip.io/ephemeral'] == 'false'
     message: "vm-release SA may only set blip.io/ephemeral to \"false\""
-  # 5. If blip.io/max-duration is present it must be a numeric string (seconds).
+  # 6. If blip.io/max-duration is present it must be a numeric string (seconds).
   - expression: >-
       !('blip.io/max-duration' in object.metadata.annotations) ||
       object.metadata.annotations['blip.io/max-duration'].matches('^[0-9]+$')
     message: "blip.io/max-duration must be a numeric string (seconds)"
-  # 6. No existing annotations may be changed or removed (except the allowed set).
+  # 7. No existing annotations may be changed or removed (except the allowed set).
   - expression: >-
       oldObject.metadata.annotations.all(k,
-        k == 'blip.io/release' || k == 'blip.io/host-key' || k == 'blip.io/ephemeral' || k == 'blip.io/max-duration' ||
+        k == 'blip.io/release' || k == 'blip.io/host-key' || k == 'blip.io/client-key' || k == 'blip.io/ephemeral' || k == 'blip.io/max-duration' ||
         (k in object.metadata.annotations && object.metadata.annotations[k] == oldObject.metadata.annotations[k])
       )
-    message: "vm-release SA may not modify or remove any annotation other than blip.io/release, blip.io/host-key, blip.io/ephemeral, and blip.io/max-duration"
-  # 7. No new annotations may be added (except the allowed set).
+    message: "vm-release SA may not modify or remove any annotation other than blip.io/release, blip.io/host-key, blip.io/client-key, blip.io/ephemeral, and blip.io/max-duration"
+  # 8. No new annotations may be added (except the allowed set).
   - expression: >-
       object.metadata.annotations.all(k,
-        k == 'blip.io/release' || k == 'blip.io/host-key' || k == 'blip.io/ephemeral' || k == 'blip.io/max-duration' || k in oldObject.metadata.annotations
+        k == 'blip.io/release' || k == 'blip.io/host-key' || k == 'blip.io/client-key' || k == 'blip.io/ephemeral' || k == 'blip.io/max-duration' || k in oldObject.metadata.annotations
       )
-    message: "vm-release SA may not add annotations other than blip.io/release, blip.io/host-key, blip.io/ephemeral, and blip.io/max-duration"
-  # 8. Labels must not be changed.
+    message: "vm-release SA may not add annotations other than blip.io/release, blip.io/host-key, blip.io/client-key, blip.io/ephemeral, and blip.io/max-duration"
+  # 9. Labels must not be changed.
   - expression: >-
       object.metadata.labels == oldObject.metadata.labels
     message: "vm-release SA may not modify labels"
-  # 9. Finalizers must not be changed (prevents blocking VM deletion).
+  # 10. Finalizers must not be changed (prevents blocking VM deletion).
   - expression: >-
       (has(object.metadata.finalizers) ? object.metadata.finalizers : []) ==
       (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])
     message: "vm-release SA may not modify finalizers"
-  # 10. Spec must not be changed.
+  # 11. Spec must not be changed.
   - expression: >-
       object.spec == oldObject.spec
     message: "vm-release SA may not modify the VM spec"
@@ -363,9 +377,14 @@ spec:
           value: "ssh-gateway.blip.svc.cluster.local"
         - name: HOST_KEY_PATH
           value: "/etc/blip/host-key/host_key"
+        - name: CLIENT_KEY_PATH
+          value: "/etc/blip/client-key/client_key"
         volumeMounts:
         - name: host-key
           mountPath: /etc/blip/host-key
+          readOnly: true
+        - name: client-key
+          mountPath: /etc/blip/client-key
           readOnly: true
         readinessProbe:
           tcpSocket:
@@ -390,6 +409,13 @@ spec:
           items:
           - key: host_key
             path: host_key
+      - name: client-key
+        secret:
+          secretName: ssh-gateway-client-key
+          defaultMode: 0440
+          items:
+          - key: client_key
+            path: client_key
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

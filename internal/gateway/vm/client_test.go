@@ -2,6 +2,8 @@ package vm
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
 	"strconv"
 	"testing"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	gossh "golang.org/x/crypto/ssh"
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -89,13 +92,6 @@ func newTestClient(t *testing.T, objs ...client.Object) *Client {
 				return nil
 			}
 			return []string{user}
-		}).
-		WithIndex(&kubevirtv1.VirtualMachine{}, indexVMSSHPublicKey, func(obj client.Object) []string {
-			fp := obj.GetAnnotations()["blip.io/ssh-public-key"]
-			if fp == "" {
-				return nil
-			}
-			return []string{fp}
 		})
 
 	fc := builder.Build()
@@ -141,13 +137,6 @@ func newTestClientSplit(t *testing.T, writerInterceptor interceptor.Funcs, objs 
 				return nil
 			}
 			return []string{user}
-		}).
-		WithIndex(&kubevirtv1.VirtualMachine{}, indexVMSSHPublicKey, func(obj client.Object) []string {
-			fp := obj.GetAnnotations()["blip.io/ssh-public-key"]
-			if fp == "" {
-				return nil
-			}
-			return []string{fp}
 		})
 
 	writerBuilder := fake.NewClientBuilder().
@@ -174,6 +163,11 @@ func makeVM(name, pool string, createdAt time.Time, annotations map[string]strin
 	if _, ok := annotations["blip.io/host-key"]; !ok {
 		annotations["blip.io/host-key"] = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeTestKeyData"
 	}
+	// Simulate cloud-init having registered a client key so the VM is
+	// eligible for claiming (Claim skips VMs without a client key).
+	if _, ok := annotations["blip.io/client-key"]; !ok {
+		annotations["blip.io/client-key"] = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeClientKeyData"
+	}
 	return &kubevirtv1.VirtualMachine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              name,
@@ -184,6 +178,22 @@ func makeVM(name, pool string, createdAt time.Time, annotations map[string]strin
 			ResourceVersion:   "1",
 		},
 	}
+}
+
+// generateTestKey creates a real ed25519 key pair and returns the authorized_keys
+// format public key string and its SHA256 fingerprint.
+func generateTestKey(t *testing.T) (authorizedKey string, fingerprint string) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := gossh.NewSignerFromKey(priv)
+	require.NoError(t, err)
+	pub := signer.PublicKey()
+	authorizedKey = string(gossh.MarshalAuthorizedKey(pub))
+	// MarshalAuthorizedKey appends a newline; trim it for annotation storage.
+	authorizedKey = authorizedKey[:len(authorizedKey)-1]
+	fingerprint = gossh.FingerprintSHA256(pub)
+	return authorizedKey, fingerprint
 }
 
 // makeReadyVMI creates a ready VirtualMachineInstance with an IP.
@@ -847,51 +857,20 @@ func TestIsEphemeral(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// StoreSSHPublicKey
-// ---------------------------------------------------------------------------
-
-func TestStoreSSHPublicKey(t *testing.T) {
-	t.Run("stores fingerprint on claimed VM", func(t *testing.T) {
-		vm := makeVM("vm-sshpk", "pool-s", time.Now(), map[string]string{
-			"blip.io/session-id": "sess-sshpk",
-		})
-
-		c := newTestClient(t, vm)
-		err := c.StoreSSHPublicKey(context.Background(), "sess-sshpk", "SHA256:vmfp123")
-		require.NoError(t, err)
-
-		// Verify the annotation was persisted.
-		var updated kubevirtv1.VirtualMachine
-		err = c.writer.Get(context.Background(), client.ObjectKey{
-			Namespace: testNamespace,
-			Name:      "vm-sshpk",
-		}, &updated)
-		require.NoError(t, err)
-		assert.Equal(t, "SHA256:vmfp123", updated.Annotations["blip.io/ssh-public-key"])
-	})
-
-	t.Run("returns error for unknown session", func(t *testing.T) {
-		c := newTestClient(t)
-		err := c.StoreSSHPublicKey(context.Background(), "no-such-session", "fp")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "not found")
-	})
-}
-
-// ---------------------------------------------------------------------------
 // ResolveRootIdentity
 // ---------------------------------------------------------------------------
 
 func TestResolveRootIdentity(t *testing.T) {
 	t.Run("resolves root identity from SSH public key fingerprint", func(t *testing.T) {
+		clientKey, clientFP := generateTestKey(t)
 		vm := makeVM("vm-resolve", "pool-res", time.Now(), map[string]string{
-			"blip.io/session-id":     "sess-resolve",
-			"blip.io/user":           "alice@example.com",
-			"blip.io/ssh-public-key": "SHA256:vmkey123",
+			"blip.io/session-id": "sess-resolve",
+			"blip.io/user":       "alice@example.com",
+			"blip.io/client-key": clientKey,
 		})
 
 		c := newTestClient(t, vm)
-		identity, err := c.ResolveRootIdentity(context.Background(), "SHA256:vmkey123")
+		identity, err := c.ResolveRootIdentity(context.Background(), clientFP)
 		require.NoError(t, err)
 		assert.Equal(t, "alice@example.com", identity)
 	})
@@ -904,15 +883,16 @@ func TestResolveRootIdentity(t *testing.T) {
 	})
 
 	t.Run("returns error when VM has no user annotation", func(t *testing.T) {
+		clientKey, clientFP := generateTestKey(t)
 		vm := makeVM("vm-nouser", "pool-res", time.Now(), map[string]string{
-			"blip.io/session-id":     "sess-nouser",
-			"blip.io/ssh-public-key": "SHA256:nouser",
+			"blip.io/session-id": "sess-nouser",
+			"blip.io/client-key": clientKey,
 		})
 		// Remove the user annotation that makeVM doesn't set by default.
 		delete(vm.Annotations, "blip.io/user")
 
 		c := newTestClient(t, vm)
-		_, err := c.ResolveRootIdentity(context.Background(), "SHA256:nouser")
+		_, err := c.ResolveRootIdentity(context.Background(), clientFP)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "no blip.io/user annotation")
 	})
@@ -921,14 +901,15 @@ func TestResolveRootIdentity(t *testing.T) {
 		// Simulate a recursive blip: the inner VM's user annotation points to
 		// the root user (not another blip-vm identity), because the session
 		// manager resolves the root identity before claiming.
+		clientKey, clientFP := generateTestKey(t)
 		innerVM := makeVM("vm-inner", "pool-res", time.Now(), map[string]string{
-			"blip.io/session-id":     "sess-inner",
-			"blip.io/user":           "root-user@corp.com",
-			"blip.io/ssh-public-key": "SHA256:innerkey",
+			"blip.io/session-id": "sess-inner",
+			"blip.io/user":       "root-user@corp.com",
+			"blip.io/client-key": clientKey,
 		})
 
 		c := newTestClient(t, innerVM)
-		identity, err := c.ResolveRootIdentity(context.Background(), "SHA256:innerkey")
+		identity, err := c.ResolveRootIdentity(context.Background(), clientFP)
 		require.NoError(t, err)
 		assert.Equal(t, "root-user@corp.com", identity)
 	})
