@@ -11,7 +11,6 @@ Verifies:
 import json
 import os
 import re
-import selectors
 import shutil
 import socket
 import subprocess
@@ -40,15 +39,19 @@ _known_hosts = None
 # Helpers
 # ---------------------------------------------------------------------------
 
-def run(cmd, *, check=True, capture=True, timeout=120, **kw):
+def log(msg=""):
+    print(msg, flush=True)
+
+
+def run(cmd, *, check=True, capture=True, timeout=120, verbose=False, **kw):
     """Run a command and return CompletedProcess."""
-    print(f"  $ {' '.join(cmd) if isinstance(cmd, list) else cmd}", flush=True)
-    r = subprocess.run(
-        cmd, capture_output=capture, text=True, timeout=timeout, **kw,
-    )
+    if verbose:
+        cmdstr = " ".join(cmd) if isinstance(cmd, list) else cmd
+        log(f"  $ {cmdstr}")
+    r = subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout, **kw)
     if check and r.returncode != 0:
         out = (r.stdout or "") + (r.stderr or "")
-        cmdstr = ' '.join(cmd) if isinstance(cmd, list) else cmd
+        cmdstr = " ".join(cmd) if isinstance(cmd, list) else cmd
         raise RuntimeError(f"command failed ({r.returncode}): {cmdstr}\n{out}")
     return r
 
@@ -62,21 +65,30 @@ def kubectl_json(*args):
     return json.loads(r.stdout)
 
 
-def ssh_cmd(user, *extra_args, batch=True):
-    """Build an ssh command list targeting the gateway."""
-    cmd = [
-        "ssh",
+def _conn_opts():
+    """Common SSH/SCP options for connecting through the gateway."""
+    return [
         "-o", "StrictHostKeyChecking=yes",
         "-o", f"UserKnownHostsFile={_known_hosts}",
         "-o", "LogLevel=ERROR",
+        "-o", "BatchMode=yes",
         "-i", _ssh_key,
-        "-p", str(GATEWAY_PORT),
     ]
-    if batch:
-        cmd += ["-o", "BatchMode=yes"]
-    cmd += list(extra_args)
-    cmd.append(f"{user}@{GATEWAY_HOST}")
-    return cmd
+
+
+def ssh_cmd(user, *extra_args):
+    """Build an ssh command list targeting the gateway."""
+    return [
+        "ssh", *_conn_opts(),
+        "-p", str(GATEWAY_PORT),
+        *extra_args,
+        f"{user}@{GATEWAY_HOST}",
+    ]
+
+
+def scp_cmd(*args):
+    """Build an scp command list targeting the gateway."""
+    return ["scp", *_conn_opts(), "-P", str(GATEWAY_PORT), *args]
 
 
 def ssh_session(user, remote_cmd, *, timeout=60):
@@ -105,6 +117,11 @@ def wait_for(predicate, description, timeout=60, interval=2):
     raise TimeoutError(f"Timed out waiting for: {description}")
 
 
+def resource_exists(*kubectl_args):
+    """Check if a kubectl resource exists (returns bool)."""
+    return kubectl(*kubectl_args, check=False).returncode == 0
+
+
 def vm_annotation(session_id, key):
     """Read a specific annotation from the VM with the given session-id."""
     vms = kubectl_json("get", "vm", "-n", NAMESPACE,
@@ -125,10 +142,10 @@ def vm_exists(session_id):
 def wait_for_vm_deleted(session_id, timeout=60):
     wait_for(
         lambda: not vm_exists(session_id),
-        f"VM with session {session_id} to be deleted",
+        f"VM {session_id} to be deleted",
         timeout=timeout,
     )
-    print(f"    VM {session_id} deleted", flush=True)
+    log(f"    VM {session_id} deleted")
 
 
 def wait_for_pool_ready(min_ready=1, timeout=300):
@@ -142,14 +159,14 @@ def wait_for_pool_ready(min_ready=1, timeout=300):
             vms = kubectl_json("get", "vm", "-n", NAMESPACE,
                                "-l", f"blip.io/pool={POOL_NAME}")
         except Exception as e:
-            print(f"    [pool] failed to list VMs: {e}", flush=True)
+            log(f"    [pool] failed to list VMs: {e}")
             return False
 
         items = vms.get("items", [])
         if not items:
-            summary = "no VMs exist in pool"
+            summary = "no VMs exist yet"
             if summary != last_summary:
-                print(f"    [pool] {summary}", flush=True)
+                log(f"    [pool] {summary}")
                 last_summary = summary
             return False
 
@@ -158,208 +175,161 @@ def wait_for_pool_ready(min_ready=1, timeout=300):
         for item in items:
             name = item["metadata"]["name"]
             ann = item.get("metadata", {}).get("annotations", {})
-            phase = item.get("status", {}).get("printableStatus", "Unknown")
 
             if "blip.io/session-id" in ann:
-                vm_states.append(f"{name}: claimed({ann['blip.io/session-id']})")
+                vm_states.append(f"{name}:claimed")
                 continue
 
-            has_host_key = bool(ann.get("blip.io/host-key"))
-            has_client_key = bool(ann.get("blip.io/client-key"))
-
-            # Check VMI status
+            has_keys = bool(ann.get("blip.io/host-key") and ann.get("blip.io/client-key"))
             vmi_ready = False
-            vmi_phase = "NoVMI"
-            vmi_ip = ""
-            vmi_conditions = []
             try:
                 vmi = kubectl_json("get", "vmi", name, "-n", NAMESPACE)
-                vmi_phase = vmi.get("status", {}).get("phase", "Unknown")
                 for cond in vmi.get("status", {}).get("conditions", []):
-                    ctype = cond.get("type", "")
-                    cstatus = cond.get("status", "")
-                    vmi_conditions.append(f"{ctype}={cstatus}")
-                    if ctype == "Ready" and cstatus == "True":
+                    if cond.get("type") == "Ready" and cond.get("status") == "True":
                         vmi_ready = True
-                interfaces = vmi.get("status", {}).get("interfaces", [])
-                if interfaces:
-                    vmi_ip = interfaces[0].get("ip", "")
             except Exception:
                 pass
 
-            if vmi_ready and has_host_key and has_client_key:
+            if vmi_ready and has_keys:
                 ready += 1
-                vm_states.append(f"{name}: ready")
+                vm_states.append(f"{name}:ready")
             else:
                 reasons = []
-                if vmi_phase == "NoVMI":
-                    reasons.append("no VMI")
-                elif not vmi_ready:
-                    reasons.append(f"vmi_phase={vmi_phase}")
-                    if vmi_conditions:
-                        reasons.append(f"conditions=[{', '.join(vmi_conditions)}]")
-                if not vmi_ip and vmi_phase != "NoVMI":
-                    reasons.append("no IP")
-                if not has_host_key:
-                    reasons.append("no host-key")
-                if not has_client_key:
-                    reasons.append("no client-key")
-                vm_states.append(f"{name}: NOT ready ({'; '.join(reasons)})")
+                if not vmi_ready:
+                    reasons.append("vmi-not-ready")
+                if not has_keys:
+                    reasons.append("no-keys")
+                vm_states.append(f"{name}:wait({','.join(reasons)})")
 
         elapsed = int(time.time() - start)
-        summary = f"{ready}/{len(items)} ready ({elapsed}s) | {' | '.join(vm_states)}"
+        summary = f"{ready}/{len(items)} ready ({elapsed}s) [{' '.join(vm_states)}]"
         if summary != last_summary:
-            print(f"    [pool] {summary}", flush=True)
+            log(f"    [pool] {summary}")
             last_summary = summary
         return ready >= min_ready
 
     try:
-        wait_for(check, f"at least {min_ready} VM(s) ready in pool",
-                 timeout=timeout, interval=5)
+        wait_for(check, f">= {min_ready} VM(s) ready", timeout=timeout, interval=5)
     except TimeoutError:
-        dump_vm_diagnostics()
+        dump_diagnostics()
         raise
-    print(f"    Pool has >= {min_ready} ready VM(s)", flush=True)
+    log(f"    Pool ready (>= {min_ready})")
 
 
-def dump_vm_diagnostics():
-    """Dump detailed diagnostics for all VMs in the pool. Called on timeout."""
-    print("\n=== VM Pool Diagnostics (timeout) ===", flush=True)
+# ---------------------------------------------------------------------------
+# Diagnostics (called on failure only)
+# ---------------------------------------------------------------------------
 
-    # 1. VirtualMachinePool status
+def dump_diagnostics():
+    """Dump VM pool state and pod logs. Called only on failure/timeout."""
+    log("\n=== Diagnostics ===")
+
+    # Pool status
     try:
         pool = kubectl_json("get", "virtualmachinepool", POOL_NAME, "-n", NAMESPACE)
+        spec_r = pool.get("spec", {}).get("replicas", "?")
         status = pool.get("status", {})
-        spec_replicas = pool.get("spec", {}).get("replicas", "unset")
-        print(f"  VirtualMachinePool '{POOL_NAME}': "
-              f"spec.replicas={spec_replicas}, "
-              f"status.replicas={status.get('replicas', 'N/A')}, "
-              f"status.readyReplicas={status.get('readyReplicas', 'N/A')}",
-              flush=True)
+        log(f"  Pool: spec.replicas={spec_r} "
+            f"status.replicas={status.get('replicas', '?')} "
+            f"readyReplicas={status.get('readyReplicas', '?')}")
     except Exception as e:
-        print(f"  VirtualMachinePool: failed to get: {e}", flush=True)
+        log(f"  Pool: {e}")
 
-    # 2. Per-VM and VMI detail
+    # Per-VM detail
     try:
         vms = kubectl_json("get", "vm", "-n", NAMESPACE,
                            "-l", f"blip.io/pool={POOL_NAME}")
     except Exception as e:
-        print(f"  VMs: failed to list: {e}", flush=True)
+        log(f"  VMs: {e}")
         vms = {"items": []}
 
     for item in vms.get("items", []):
         name = item["metadata"]["name"]
         ann = item.get("metadata", {}).get("annotations", {})
-        vm_status = item.get("status", {})
-        print(f"\n  --- VM: {name} ---", flush=True)
-        print(f"    printableStatus: {vm_status.get('printableStatus', 'N/A')}", flush=True)
-        print(f"    ready: {vm_status.get('ready', 'N/A')}", flush=True)
-        print(f"    created: {vm_status.get('created', 'N/A')}", flush=True)
-        print(f"    host-key: {'present' if ann.get('blip.io/host-key') else 'MISSING'}", flush=True)
-        print(f"    client-key: {'present' if ann.get('blip.io/client-key') else 'MISSING'}", flush=True)
-        print(f"    session-id: {ann.get('blip.io/session-id', 'none')}", flush=True)
+        st = item.get("status", {})
+        log(f"\n  VM {name}: status={st.get('printableStatus', '?')} "
+            f"ready={st.get('ready', '?')} "
+            f"host-key={'Y' if ann.get('blip.io/host-key') else 'N'} "
+            f"client-key={'Y' if ann.get('blip.io/client-key') else 'N'} "
+            f"session={ann.get('blip.io/session-id', 'none')}")
 
-        # VMI conditions and phase
+        # VMI
         try:
             vmi = kubectl_json("get", "vmi", name, "-n", NAMESPACE)
-            vmi_status = vmi.get("status", {})
-            print(f"    VMI phase: {vmi_status.get('phase', 'N/A')}", flush=True)
-            print(f"    VMI nodeName: {vmi_status.get('nodeName', 'N/A')}", flush=True)
-            for cond in vmi_status.get("conditions", []):
-                print(f"    VMI condition: {cond.get('type')}={cond.get('status')}"
-                      f" reason={cond.get('reason', '')} message={cond.get('message', '')}",
-                      flush=True)
-            interfaces = vmi_status.get("interfaces", [])
-            if interfaces:
-                print(f"    VMI IP: {interfaces[0].get('ip', 'N/A')}", flush=True)
-            else:
-                print(f"    VMI IP: no interfaces", flush=True)
-        except Exception as e:
-            print(f"    VMI: not found or error: {e}", flush=True)
+            vmi_st = vmi.get("status", {})
+            conds = ", ".join(
+                f"{c['type']}={c['status']}" for c in vmi_st.get("conditions", [])
+            )
+            ips = [iface.get("ip", "?") for iface in vmi_st.get("interfaces", [])]
+            log(f"    VMI: phase={vmi_st.get('phase', '?')} "
+                f"node={vmi_st.get('nodeName', '?')} "
+                f"ip={','.join(ips) or 'none'} "
+                f"conditions=[{conds}]")
+        except Exception:
+            log(f"    VMI: not found")
 
-        # virt-launcher pod status
+        # virt-launcher pod
         try:
             pods = kubectl_json("get", "pods", "-n", NAMESPACE,
-                                "-l", f"kubevirt.io/domain={name}",
-                                "--sort-by=.metadata.creationTimestamp")
+                                "-l", f"kubevirt.io/domain={name}")
             for pod in pods.get("items", []):
-                pod_name = pod["metadata"]["name"]
-                pod_phase = pod.get("status", {}).get("phase", "Unknown")
-                print(f"    Pod: {pod_name} phase={pod_phase}", flush=True)
+                pname = pod["metadata"]["name"]
+                phase = pod.get("status", {}).get("phase", "?")
+                containers = []
                 for cs in pod.get("status", {}).get("containerStatuses", []):
-                    state = cs.get("state", {})
-                    state_desc = "unknown"
-                    for sname, sval in state.items():
-                        reason = sval.get("reason", "")
-                        msg = sval.get("message", "")
-                        state_desc = f"{sname}" + (f" ({reason})" if reason else "") + (f": {msg}" if msg else "")
-                    print(f"      container {cs.get('name')}: ready={cs.get('ready')} "
-                          f"restarts={cs.get('restartCount')} state={state_desc}",
-                          flush=True)
-                # Pod events (scheduling failures, image pull errors, etc.)
+                    state_key = next(iter(cs.get("state", {})), "?")
+                    containers.append(
+                        f"{cs.get('name')}:{state_key}(restarts={cs.get('restartCount', 0)})"
+                    )
+                log(f"    Pod {pname}: phase={phase} [{', '.join(containers)}]")
+
+                # Recent events
                 try:
                     events = kubectl_json("get", "events", "-n", NAMESPACE,
-                                          "--field-selector", f"involvedObject.name={pod_name}",
+                                          "--field-selector",
+                                          f"involvedObject.name={pname}",
                                           "--sort-by=.lastTimestamp")
-                    recent = events.get("items", [])[-5:]
-                    if recent:
-                        print(f"      Recent events:", flush=True)
-                        for ev in recent:
-                            print(f"        {ev.get('reason', '?')}: {ev.get('message', '?')}", flush=True)
+                    for ev in events.get("items", [])[-3:]:
+                        log(f"      event: {ev.get('reason', '?')}: "
+                            f"{ev.get('message', '?')}")
                 except Exception:
                     pass
         except Exception:
-            print(f"    Pod: no virt-launcher pods found", flush=True)
+            pass
 
-    # 3. Cluster-level context: node readiness and resources
+    # Node status
     try:
         nodes = kubectl_json("get", "nodes")
-        print(f"\n  --- Nodes ({len(nodes.get('items', []))}) ---", flush=True)
         for node in nodes.get("items", []):
-            node_name = node["metadata"]["name"]
-            conditions = {c["type"]: c["status"] for c in node.get("status", {}).get("conditions", [])}
-            print(f"    {node_name}: Ready={conditions.get('Ready', '?')} "
-                  f"MemoryPressure={conditions.get('MemoryPressure', '?')} "
-                  f"DiskPressure={conditions.get('DiskPressure', '?')}",
-                  flush=True)
+            conds = {c["type"]: c["status"]
+                     for c in node.get("status", {}).get("conditions", [])}
+            log(f"  Node {node['metadata']['name']}: "
+                f"Ready={conds.get('Ready', '?')} "
+                f"MemPressure={conds.get('MemoryPressure', '?')} "
+                f"DiskPressure={conds.get('DiskPressure', '?')}")
     except Exception as e:
-        print(f"  Nodes: failed: {e}", flush=True)
+        log(f"  Nodes: {e}")
 
-    print("\n=== End Diagnostics ===\n", flush=True)
-
-
-def resolve_gateway_ip():
-    """Return the LoadBalancer external IP of the ssh-gateway service."""
-    svc = kubectl_json("get", "svc", "ssh-gateway", "-n", NAMESPACE)
-    for ing in svc.get("status", {}).get("loadBalancer", {}).get("ingress", []):
-        if ing.get("ip"):
-            return ing["ip"]
-    raise RuntimeError("ssh-gateway service has no LoadBalancer IP")
-
-
-def dump_pod_logs():
-    """Dump logs from key pods to aid debugging CI failures."""
-    print("\n=== Pod Logs ===", flush=True)
-    for label, ns in [
-        ("app=blip-controller", NAMESPACE),
-        ("app=ssh-gateway", NAMESPACE),
-        ("kubevirt.io=virt-handler", "kubevirt"),
-    ]:
+    # Pod logs
+    for label, ns in [("app=blip-controller", NAMESPACE),
+                      ("app=ssh-gateway", NAMESPACE),
+                      ("kubevirt.io=virt-handler", "kubevirt")]:
         try:
             pods = kubectl_json("get", "pods", "-n", ns, "-l", label)
             for pod in pods.get("items", []):
-                pod_name = pod["metadata"]["name"]
-                phase = pod.get("status", {}).get("phase", "Unknown")
-                print(f"\n  --- {pod_name} ({ns}, phase={phase}) ---", flush=True)
-                r = kubectl("logs", pod_name, "-n", ns,
+                pname = pod["metadata"]["name"]
+                phase = pod.get("status", {}).get("phase", "?")
+                log(f"\n  --- logs: {pname} ({ns}, {phase}) ---")
+                r = kubectl("logs", pname, "-n", ns,
                             "--tail=80", "--all-containers",
                             check=False, timeout=15)
-                print(r.stdout or "(no stdout)", flush=True)
+                log(r.stdout or "(empty)")
                 if r.stderr:
-                    print(r.stderr, flush=True)
+                    log(r.stderr)
         except Exception as e:
-            print(f"  [{label}] failed to collect logs: {e}", flush=True)
-    print("=== End Pod Logs ===\n", flush=True)
+            log(f"  [{label}] logs: {e}")
+
+    log("\n=== End Diagnostics ===\n")
 
 
 # ---------------------------------------------------------------------------
@@ -367,111 +337,98 @@ def dump_pod_logs():
 # ---------------------------------------------------------------------------
 
 def setup():
-    """One-time setup: deploy blip, create pool, sign key."""
+    """One-time setup: deploy blip, create pool, generate key."""
     global _tmpdir, _ssh_key, _known_hosts, GATEWAY_HOST
 
     _tmpdir = tempfile.mkdtemp(prefix="blip-smoke-")
     _ssh_key = os.path.join(_tmpdir, "id_ed25519")
     _known_hosts = os.path.join(_tmpdir, "known_hosts")
 
-    print("\n=== Setup ===", flush=True)
+    log("\n=== Setup ===")
 
     # 1. Ensure KubeVirt CRDs are available
-    print("  Checking KubeVirt...", flush=True)
+    log("  Checking KubeVirt...")
     kubectl("get", "crd", "virtualmachines.kubevirt.io")
 
-    # 2. Build container image and load into kind
-    print("  Building container image...", flush=True)
+    # 2. Build and load image
+    log("  Building image...")
     run(["docker", "build", "-t", IMAGE_NAME, "-f", "Dockerfile", "."],
-        timeout=300)
-    print("  Loading image into kind...", flush=True)
-    run(["kind", "load", "docker-image", IMAGE_NAME], timeout=120)
+        timeout=300, verbose=True)
+    log("  Loading image into kind...")
+    run(["kind", "load", "docker-image", IMAGE_NAME], timeout=120, verbose=True)
 
-    # 3. Apply base manifests with image substitution
-    print("  Applying deploy.yaml...", flush=True)
+    # 3. Apply manifests with image substitution
+    log("  Applying deploy.yaml...")
     with open("deploy.yaml") as f:
         manifest = f.read()
     manifest = manifest.replace("${REGISTRY}/blip:${BLIP_TAG}", IMAGE_NAME)
     run(["kubectl", "apply", "-f", "-"], input=manifest)
 
-    # 3b. Restart controller to pick up the new image (kind reuses the tag
-    #     so the deployment spec doesn't change and won't trigger a rollout).
-    print("  Restarting blip-controller pods...", flush=True)
+    # Restart controller to pick up the new image (kind reuses the tag
+    # so the deployment spec doesn't change and won't trigger a rollout).
+    log("  Restarting blip-controller...")
     kubectl("rollout", "restart", "deploy/blip-controller", "-n", NAMESPACE)
 
-    # 4. Wait for controller (creates the host key secret)
-    print("  Waiting for blip-controller...", flush=True)
+    # 4. Wait for controller
+    log("  Waiting for blip-controller...")
     kubectl("rollout", "status", "deploy/blip-controller",
             "-n", NAMESPACE, "--timeout=120s", timeout=150)
 
-    # 5. Wait for the host key secret
-    print("  Waiting for ssh-host-key secret...", flush=True)
+    # 5. Wait for all generated secrets and configmaps
+    log("  Waiting for gateway keys...")
+    required_resources = [
+        ("secret", "ssh-host-key"),
+        ("secret", "ssh-gateway-client-key"),
+        ("configmap", "ssh-gateway-client-pubkey"),
+        ("configmap", "ssh-gateway-host-pubkey"),
+    ]
     wait_for(
-        lambda: kubectl("get", "secret", "ssh-host-key",
-                        "-n", NAMESPACE, check=False).returncode == 0,
-        "ssh-host-key secret", timeout=60,
+        lambda: all(
+            resource_exists("get", kind, name, "-n", NAMESPACE)
+            for kind, name in required_resources
+        ),
+        "gateway secrets and configmaps",
+        timeout=90,
     )
 
-    # 5b. Wait for the gateway client key secret and pubkey ConfigMaps
-    print("  Waiting for ssh-gateway-client-key secret...", flush=True)
-    wait_for(
-        lambda: kubectl("get", "secret", "ssh-gateway-client-key",
-                        "-n", NAMESPACE, check=False).returncode == 0,
-        "ssh-gateway-client-key secret", timeout=60,
-    )
-    print("  Waiting for ssh-gateway-client-pubkey ConfigMap...", flush=True)
-    wait_for(
-        lambda: kubectl("get", "configmap", "ssh-gateway-client-pubkey",
-                        "-n", NAMESPACE, check=False).returncode == 0,
-        "ssh-gateway-client-pubkey configmap", timeout=60,
-    )
-    print("  Waiting for ssh-gateway-host-pubkey ConfigMap...", flush=True)
-    wait_for(
-        lambda: kubectl("get", "configmap", "ssh-gateway-host-pubkey",
-                        "-n", NAMESPACE, check=False).returncode == 0,
-        "ssh-gateway-host-pubkey configmap", timeout=60,
-    )
-
-    # Gateway pods may have started before the host key secret existed; restart.
-    print("  Restarting ssh-gateway pods...", flush=True)
+    # Restart gateway to pick up keys that may have been created after it started.
+    log("  Restarting ssh-gateway...")
     kubectl("rollout", "restart", "deploy/ssh-gateway", "-n", NAMESPACE)
 
-    # 6. Apply VM pool manifest and scale to desired replicas
-    print("  Creating VM pool...", flush=True)
+    # 6. Create VM pool and scale
+    log("  Creating VM pool...")
     kubectl("apply", "-f", "pool.yaml")
     kubectl("patch", "virtualmachinepool", POOL_NAME, "-n", NAMESPACE,
             "--type=merge", "-p",
             f'{{"spec":{{"replicas":{REPLICAS}}}}}')
 
-    # 7. Generate SSH keypair and add it to the gateway allow-list
-    print("  Generating SSH key...", flush=True)
+    # 7. Generate SSH keypair and add to gateway allow-list
+    log("  Generating SSH key...")
     run(["ssh-keygen", "-t", "ed25519", "-f", _ssh_key, "-N", "", "-q"])
     with open(f"{_ssh_key}.pub") as f:
         pub_key = f.read().strip()
-    # Use apply so it works whether the ConfigMap already exists or not.
     cm_yaml = kubectl("create", "configmap", "ssh-gateway-auth", "-n", NAMESPACE,
                       f"--from-literal=allowed-pubkeys={pub_key}",
                       "--dry-run=client", "-o", "yaml").stdout
     run(["kubectl", "apply", "-f", "-"], input=cm_yaml)
 
     # 8. Wait for gateway rollout
-    print("  Waiting for ssh-gateway...", flush=True)
+    log("  Waiting for ssh-gateway...")
     kubectl("rollout", "status", "deploy/ssh-gateway",
             "-n", NAMESPACE, "--timeout=120s", timeout=150)
 
-    # 9. Resolve the LoadBalancer IP
-    GATEWAY_HOST = resolve_gateway_ip()
-    print(f"    Gateway at {GATEWAY_HOST}:{GATEWAY_PORT}", flush=True)
+    # 9. Resolve LoadBalancer IP (may take a moment after service creation)
+    log("  Resolving gateway address...")
+    GATEWAY_HOST = wait_for(resolve_gateway_ip, "gateway LoadBalancer IP", timeout=30)
+    log(f"    Gateway: {GATEWAY_HOST}:{GATEWAY_PORT}")
 
-    # 10. Wait for VMs to become ready
-    print("  Waiting for VMs to become ready...", flush=True)
+    # 10. Wait for VMs
+    log("  Waiting for VMs...")
     wait_for_pool_ready(min_ready=1, timeout=300)
 
-    # 11. TOFU: make an initial connection with accept-new to record the
-    #     gateway's host key. All gateway replicas share the same stable
-    #     host key, so this mirrors the real user experience: first
-    #     connection trusts the key, subsequent ones verify it.
-    print("  Recording gateway host key (TOFU)...", flush=True)
+    # 11. TOFU: record the gateway's host key. All replicas share the same
+    #     stable key, so this mirrors the real user experience.
+    log("  Recording gateway host key (TOFU)...")
     tofu_cmd = [
         "ssh",
         "-o", "StrictHostKeyChecking=accept-new",
@@ -485,24 +442,33 @@ def setup():
     ]
     r = run(tofu_cmd, check=False, timeout=30)
     if r.returncode != 0:
-        raise RuntimeError(
-            f"TOFU probe failed (rc={r.returncode}): {r.stderr}"
-        )
+        raise RuntimeError(f"TOFU probe failed (rc={r.returncode}): {r.stderr}")
     if not os.path.exists(_known_hosts) or os.path.getsize(_known_hosts) == 0:
         raise RuntimeError("TOFU probe did not record a host key")
-    print(f"    Host key recorded in {_known_hosts}", flush=True)
 
-    print("=== Setup complete ===\n", flush=True)
+    log("=== Setup complete ===\n")
+
+
+def resolve_gateway_ip():
+    """Return the LoadBalancer external IP, or None if not yet assigned."""
+    try:
+        svc = kubectl_json("get", "svc", "ssh-gateway", "-n", NAMESPACE)
+        for ing in svc.get("status", {}).get("loadBalancer", {}).get("ingress", []):
+            if ing.get("ip"):
+                return ing["ip"]
+    except Exception:
+        pass
+    return None
 
 
 def teardown():
-    print("\n=== Teardown ===", flush=True)
+    log("\n=== Teardown ===")
     kubectl("delete", "virtualmachinepool", POOL_NAME,
             "-n", NAMESPACE, "--ignore-not-found", check=False)
     kubectl("delete", "vm", "--all", "-n", NAMESPACE, check=False)
     if _tmpdir:
         shutil.rmtree(_tmpdir, ignore_errors=True)
-    print("=== Teardown complete ===\n", flush=True)
+    log("=== Teardown complete ===\n")
 
 
 # ---------------------------------------------------------------------------
@@ -510,223 +476,170 @@ def teardown():
 # ---------------------------------------------------------------------------
 
 def test_ephemeral_session():
-    """Test 1: Connect, verify blip, disconnect -> VM should be deleted."""
-    print("--- Test: Ephemeral Session ---", flush=True)
-
+    """Connect, verify blip, disconnect -> VM deleted."""
     wait_for_pool_ready(min_ready=1, timeout=300)
 
     stdout, stderr, rc = ssh_session(SSH_USER, "echo BLIP_OK && hostname")
     assert rc == 0, f"SSH failed (rc={rc}): {stderr}"
-    assert "BLIP_OK" in stdout, f"Expected BLIP_OK in output: {stdout}"
+    assert "BLIP_OK" in stdout, f"Expected BLIP_OK in: {stdout}"
 
     session_id = extract_session_id(stderr)
-    print(f"    Session: {session_id}", flush=True)
+    log(f"    Session: {session_id}")
 
-    # After disconnect the gateway sets blip.io/release=true and the
-    # deallocation controller deletes the VM.
-    print("    Waiting for VM to be deleted...", flush=True)
+    log("    Waiting for VM deletion...")
     wait_for_vm_deleted(session_id)
-
-    print("--- PASS: Ephemeral Session ---\n", flush=True)
 
 
 def test_retained_session():
-    """Test 2: Connect, retain, disconnect, reconnect, test SCP + port-forward."""
-    print("--- Test: Retained Session ---", flush=True)
-
+    """Connect, retain, disconnect, reconnect, SCP, port-forward."""
     wait_for_pool_ready(min_ready=1, timeout=300)
 
-    # Connect and retain the VM
-    stdout, stderr, rc = ssh_session(
-        SSH_USER, "blip retain && echo RETAINED_OK"
-    )
+    # Connect and retain
+    stdout, stderr, rc = ssh_session(SSH_USER, "blip retain && echo RETAINED_OK")
     assert rc == 0, f"SSH failed (rc={rc}): {stderr}"
     assert "RETAINED_OK" in stdout or "Blip retained successfully" in stdout, \
         f"Retain did not succeed: {stdout}"
 
     session_id = extract_session_id(stderr)
-    print(f"    Session: {session_id}", flush=True)
+    log(f"    Session: {session_id}")
 
-    # Verify VM is no longer ephemeral
-    time.sleep(2)
-    ann = vm_annotation(session_id, "blip.io/ephemeral")
-    assert ann == "false", f"Expected ephemeral=false after retain, got {ann}"
-
-    # VM should NOT be deleted after disconnect
-    time.sleep(5)
-    assert vm_exists(session_id), "VM was deleted after retain - should not be"
+    # Verify VM is retained (not ephemeral, not deleted)
+    wait_for(
+        lambda: vm_annotation(session_id, "blip.io/ephemeral") == "false",
+        "ephemeral=false after retain",
+        timeout=10,
+    )
+    assert vm_exists(session_id), "Retained VM was deleted"
 
     # Reconnect using session ID
-    print("    Reconnecting...", flush=True)
+    log("    Reconnecting...")
     stdout, stderr, rc = ssh_session(session_id, "echo RECONNECTED_OK")
-    assert rc == 0, f"Reconnect to {session_id} failed (rc={rc}): {stderr}"
+    assert rc == 0, f"Reconnect failed (rc={rc}): {stderr}"
     assert "RECONNECTED_OK" in stdout, f"Expected RECONNECTED_OK: {stdout}"
     assert "Reconnected" in stderr, f"Expected reconnect banner: {stderr}"
 
     # SCP upload
-    print("    Testing SCP upload...", flush=True)
+    log("    Testing SCP upload...")
     test_file = os.path.join(_tmpdir, "scp_test.txt")
     with open(test_file, "w") as f:
         f.write("blip-scp-test-data\n")
-
-    scp_base = [
-        "scp",
-        "-o", "StrictHostKeyChecking=yes",
-        "-o", f"UserKnownHostsFile={_known_hosts}",
-        "-o", "LogLevel=ERROR",
-        "-o", "BatchMode=yes",
-        "-i", _ssh_key,
-        "-P", str(GATEWAY_PORT),
-    ]
-    run(scp_base + [test_file, f"{session_id}@{GATEWAY_HOST}:/tmp/scp_test.txt"])
+    run(scp_cmd(test_file, f"{session_id}@{GATEWAY_HOST}:/tmp/scp_test.txt"))
 
     stdout, _, rc = ssh_session(session_id, "cat /tmp/scp_test.txt")
     assert rc == 0 and "blip-scp-test-data" in stdout, \
         f"SCP upload verify failed: {stdout}"
 
     # SCP download
-    print("    Testing SCP download...", flush=True)
+    log("    Testing SCP download...")
     dl_file = os.path.join(_tmpdir, "scp_download.txt")
-    run(scp_base + [f"{session_id}@{GATEWAY_HOST}:/tmp/scp_test.txt", dl_file])
+    run(scp_cmd(f"{session_id}@{GATEWAY_HOST}:/tmp/scp_test.txt", dl_file))
     with open(dl_file) as f:
         assert "blip-scp-test-data" in f.read(), "Downloaded file content mismatch"
 
     # Port forwarding
-    print("    Testing port forwarding...", flush=True)
+    log("    Testing port forwarding...")
     ssh_session(session_id,
                 "nohup bash -c 'echo PORT_FWD_OK | nc -l -p 9999 -q1' "
                 "&>/dev/null &")
-    time.sleep(1)
 
     pf_proc = subprocess.Popen(
         ssh_cmd(session_id, "-L", "18222:localhost:9999", "-N"),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
-        time.sleep(2)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        sock.connect(("127.0.0.1", 18222))
+        # Poll until the tunnel is connectable instead of a fixed sleep.
+        sock = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect(("127.0.0.1", 18222))
+                break
+            except OSError:
+                sock.close()
+                sock = None
+                time.sleep(0.5)
+        assert sock is not None, "Could not connect to port-forward tunnel"
         data = sock.recv(1024).decode()
         sock.close()
         assert "PORT_FWD_OK" in data, f"Port forward data mismatch: {data}"
-        print("    Port forwarding verified", flush=True)
+        log("    Port forwarding verified")
     finally:
         pf_proc.terminate()
-        pf_proc.wait()
+        try:
+            pf_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pf_proc.kill()
+            pf_proc.wait()
 
-    # Clean up: manually release the retained VM
-    print("    Cleaning up retained VM...", flush=True)
+    # Release the retained VM
+    log("    Releasing retained VM...")
     vms = kubectl_json("get", "vm", "-n", NAMESPACE,
                        "-l", f"blip.io/pool={POOL_NAME}")
     for item in vms.get("items", []):
         ann = item.get("metadata", {}).get("annotations", {})
         if ann.get("blip.io/session-id") == session_id:
-            vm_name = item["metadata"]["name"]
-            kubectl("annotate", "vm", vm_name, "-n", NAMESPACE,
+            kubectl("annotate", "vm", item["metadata"]["name"], "-n", NAMESPACE,
                     "blip.io/release=true", "--overwrite")
             break
 
     wait_for_vm_deleted(session_id)
-    print("--- PASS: Retained Session ---\n", flush=True)
 
 
 def test_retained_with_ttl():
-    """Test 3: retain --ttl 1m -> VM expires -> session ends -> VM deleted.
+    """retain --ttl 1m -> VM expires -> session ends -> VM deleted.
 
     'blip retain --ttl 1m' sets blip.io/max-duration=60 on the VM. The
-    deallocation controller deletes the VM once claimed-at + 60s elapses.
-    The upstream SSH connection breaks, terminating our session.
+    deallocation controller deletes the VM once claimed-at + 60s elapses,
+    breaking the upstream SSH connection and terminating our session.
     """
-    print("--- Test: Retained with TTL ---", flush=True)
-
     wait_for_pool_ready(min_ready=1, timeout=300)
 
-    cmd = ssh_cmd(SSH_USER)
-    cmd.append("blip retain --ttl 1m && echo TTL_RETAINED && sleep 300")
+    cmd = ssh_cmd(SSH_USER) + [
+        "blip retain --ttl 1m && echo TTL_RETAINED && sleep 300"
+    ]
 
-    print("    Connecting with --ttl 1m retain...", flush=True)
+    log("    Connecting with --ttl 1m retain...")
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-
-    # Watch for TTL_RETAINED on stdout
-    stdout_lines = []
-    stderr_text = ""
-
-    sel = selectors.DefaultSelector()
-    sel.register(proc.stdout, selectors.EVENT_READ)
-    sel.register(proc.stderr, selectors.EVENT_READ)
-
-    retained = False
-    deadline = time.time() + 30
-    while time.time() < deadline and not retained:
-        for key, _ in sel.select(timeout=1):
-            data = key.fileobj.readline()
-            if not data:
-                continue
-            if key.fileobj == proc.stdout:
-                stdout_lines.append(data)
-                if "TTL_RETAINED" in data:
-                    retained = True
-            else:
-                stderr_text += data
-
-    assert retained, (
-        f"TTL retain did not succeed. stdout={stdout_lines}, stderr={stderr_text}"
-    )
-
-    # Drain remaining stderr to capture session ID
-    extra_deadline = time.time() + 5
-    while time.time() < extra_deadline:
-        for key, _ in sel.select(timeout=0.5):
-            data = key.fileobj.readline()
-            if data and key.fileobj == proc.stderr:
-                stderr_text += data
-
-    session_id = extract_session_id(stderr_text)
-    print(f"    Session: {session_id} (TTL 1m)", flush=True)
-    sel.unregister(proc.stdout)
-    sel.unregister(proc.stderr)
-    sel.close()
-
-    # Wait for the deallocation controller to delete the VM (~60s),
-    # which breaks the upstream and terminates our session.
-    print("    Waiting for session to end (VM deletion)...", flush=True)
     try:
-        proc.wait(timeout=120)
+        # The remote command runs: retain, echo, then sleep 300.
+        # The deallocation controller will kill the VM ~60s after claim,
+        # which terminates the SSH session (and the sleep).
+        # Total wait: ~90s worst case (60s TTL + 30s controller interval).
+        stdout, stderr = proc.communicate(timeout=150)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        raise RuntimeError("Session was not terminated after TTL expiry")
+        raise RuntimeError("Session was not terminated after TTL expiry (150s)")
 
-    print(f"    Session terminated (rc={proc.returncode})", flush=True)
+    assert "TTL_RETAINED" in stdout, \
+        f"TTL retain did not succeed. stdout={stdout!r}, stderr={stderr!r}"
 
-    print("    Waiting for VM to be deleted...", flush=True)
+    session_id = extract_session_id(stderr)
+    log(f"    Session: {session_id} (TTL 1m)")
+    log(f"    Session terminated (rc={proc.returncode})")
+
+    log("    Waiting for VM deletion...")
     wait_for_vm_deleted(session_id)
-
-    print("--- PASS: Retained with TTL ---\n", flush=True)
 
 
 def test_recurse_session():
-    """Test 4: SSH from one blip into another via 'ssh blip'.
+    """SSH from one blip into another via 'ssh blip'.
 
     The gateway injects SSH credentials and config into each VM so that
     running 'ssh blip' from inside a blip connects back to the gateway
-    and allocates a new (recursive) blip. This test proves the full
-    recursive path works end-to-end:
+    and allocates a new (recursive) blip:
 
       local -> gateway -> VM-1  --ssh blip-->  gateway -> VM-2
     """
-    print("--- Test: Recurse Session ---", flush=True)
-
-    # We need two VMs: one for the outer session and one for the inner
-    # recursive session.
     wait_for_pool_ready(min_ready=2, timeout=300)
 
     # The gateway injects the VM identity asynchronously after the
-    # upstream connection is established, so the credentials may not be
-    # available immediately. We retry the inner SSH a few times.
+    # upstream connection is established, so credentials may not be
+    # available immediately. Retry the inner SSH a few times.
     stdout, stderr, rc = ssh_session(
         SSH_USER,
         "for i in $(seq 1 15); do "
@@ -740,18 +653,13 @@ def test_recurse_session():
         timeout=90,
     )
     assert rc == 0, f"Recurse SSH failed (rc={rc}): {stderr}"
-    assert "RECURSE_OK" in stdout, f"Expected RECURSE_OK in output: {stdout}"
+    assert "RECURSE_OK" in stdout, f"Expected RECURSE_OK in: {stdout}"
 
     session_id = extract_session_id(stderr)
-    print(f"    Outer session: {session_id}", flush=True)
+    log(f"    Outer session: {session_id}")
 
-    # Both the outer and inner sessions are ephemeral, so the gateway
-    # releases them on disconnect. Wait for the outer VM to be deleted
-    # to confirm cleanup.
-    print("    Waiting for outer VM to be deleted...", flush=True)
+    log("    Waiting for outer VM deletion...")
     wait_for_vm_deleted(session_id)
-
-    print("--- PASS: Recurse Session ---\n", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -769,9 +677,9 @@ def main():
     try:
         setup()
     except Exception:
-        print("=== Setup FAILED ===", flush=True)
+        log("=== Setup FAILED ===")
         traceback.print_exc()
-        dump_pod_logs()
+        dump_diagnostics()
         teardown()
         return 1
 
@@ -779,21 +687,25 @@ def main():
     failed = 0
     try:
         for test in tests:
+            name = test.__name__.replace("test_", "").replace("_", " ").title()
+            log(f"--- {name} ---")
+            t0 = time.time()
             try:
                 test()
                 passed += 1
+                log(f"--- PASS: {name} ({time.time() - t0:.0f}s) ---\n")
             except Exception as e:
                 failed += 1
-                print(f"--- FAIL: {test.__name__}: {e}\n", flush=True)
+                log(f"--- FAIL: {name} ({time.time() - t0:.0f}s): {e}\n")
                 traceback.print_exc()
     finally:
         if failed > 0:
-            dump_pod_logs()
+            dump_diagnostics()
         teardown()
 
-    print(f"\n{'='*40}")
-    print(f"Results: {passed} passed, {failed} failed, {passed+failed} total")
-    print(f"{'='*40}")
+    log(f"\n{'=' * 40}")
+    log(f"Results: {passed} passed, {failed} failed, {passed + failed} total")
+    log(f"{'=' * 40}")
 
     return 1 if failed else 0
 
