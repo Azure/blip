@@ -362,6 +362,8 @@ spec:
           labels:
             blip.io/pool: default
         spec:
+          evictionStrategy: None
+          priorityClassName: blip-low-priority
           domain:
             cpu:
               cores: 2

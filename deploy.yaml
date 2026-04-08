@@ -3,6 +3,17 @@ kind: Namespace
 metadata:
   name: blip
 ---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: blip-low-priority
+value: -1
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: >-
+  Low-priority class for Blip VM pool workloads. VMs using this class are
+  preemptible and will be evicted when higher-priority pods need resources.
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
