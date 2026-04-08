@@ -272,7 +272,7 @@ func bridge(ctx context.Context, sessionID string, clientChan ssh.Channel, clien
 
 	select {
 	case <-upstreamReqsDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(500 * time.Millisecond):
 		slog.Debug("timed out waiting for upstream channel requests to drain", "session_id", sessionID)
 	}
 
