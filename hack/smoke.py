@@ -561,6 +561,7 @@ def test_retained_session():
                 sock = None
                 time.sleep(0.5)
         assert sock is not None, "Could not connect to port-forward tunnel"
+        sock.settimeout(10)
         data = sock.recv(1024).decode()
         sock.close()
         assert "PORT_FWD_OK" in data, f"Port forward data mismatch: {data}"
