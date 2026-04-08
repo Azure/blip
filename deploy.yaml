@@ -336,11 +336,6 @@ kind: ConfigMap
 metadata:
   name: ssh-gateway-auth
   namespace: blip
-data:
-  allowed-repos: |
-    my-org/my-repo
-  allowed-pubkeys: |
-    # ssh-ed25519 AAAAC3... user@host
 ---
 apiVersion: apps/v1
 kind: Deployment
