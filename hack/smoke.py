@@ -440,7 +440,7 @@ def setup():
         f"{SSH_USER}@{GATEWAY_HOST}",
         "true",
     ]
-    r = run(tofu_cmd, check=False, timeout=30)
+    r = run(tofu_cmd, check=False, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(f"TOFU probe failed (rc={r.returncode}): {r.stderr}")
     if not os.path.exists(_known_hosts) or os.path.getsize(_known_hosts) == 0:
