@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,11 +13,11 @@ import (
 )
 
 // newTestAuthWatcher creates an AuthWatcher pre-loaded with the given repos
-// and pubkey fingerprints, without starting an informer cache. Suitable for
-// unit tests only.
-func newTestAuthWatcher(repos []string, pubkeyFingerprints map[string]bool) *AuthWatcher {
+// and pubkey fingerprints (fingerprint -> comment/username), without starting
+// an informer cache. Suitable for unit tests only.
+func newTestAuthWatcher(repos []string, pubkeyFingerprints map[string]string) *AuthWatcher {
 	if pubkeyFingerprints == nil {
-		pubkeyFingerprints = make(map[string]bool)
+		pubkeyFingerprints = make(map[string]string)
 	}
 	return &AuthWatcher{repos: repos, pubkeys: pubkeyFingerprints}
 }
@@ -97,19 +98,19 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 		fp := ssh.FingerprintSHA256(userPub)
 
-		watcher := newTestAuthWatcher(nil, map[string]bool{fp: true})
+		watcher := newTestAuthWatcher(nil, map[string]string{fp: "alice@laptop"})
 		cb := pubkeyCallback(watcher, nil)
 
 		perms, err := cb(conn, userPub)
 		require.NoError(t, err)
 		assert.Equal(t, fp, perms.Extensions[ExtFingerprint])
-		assert.Equal(t, "pubkey:"+fp, perms.Extensions[ExtIdentity])
+		assert.Equal(t, "pubkey:alice@laptop", perms.Extensions[ExtIdentity])
 	})
 
 	t.Run("rejects unknown pubkey", func(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
-		watcher := newTestAuthWatcher(nil, map[string]bool{"SHA256:other": true})
+		watcher := newTestAuthWatcher(nil, map[string]string{"SHA256:other": "bob@desktop"})
 		cb := pubkeyCallback(watcher, nil)
 
 		perms, err := cb(conn, userPub)
@@ -126,6 +127,29 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
 		assert.ErrorContains(t, err, "not authorized")
+	})
+
+	t.Run("rejects pubkey with empty comment via callback", func(t *testing.T) {
+		userPub, _ := generateUserKey(t)
+		fp := ssh.FingerprintSHA256(userPub)
+
+		watcher := newTestAuthWatcher(nil, map[string]string{fp: ""})
+		cb := pubkeyCallback(watcher, nil)
+
+		perms, err := cb(conn, userPub)
+		assert.Nil(t, perms)
+		assert.ErrorContains(t, err, "not authorized")
+	})
+
+	t.Run("rejects pubkey with empty comment directly", func(t *testing.T) {
+		userPub, _ := generateUserKey(t)
+		fp := ssh.FingerprintSHA256(userPub)
+
+		watcher := newTestAuthWatcher(nil, map[string]string{fp: ""})
+
+		perms, err := verifyExplicitPubkey(conn, userPub, watcher)
+		assert.Nil(t, perms)
+		assert.ErrorContains(t, err, "no comment")
 	})
 }
 
@@ -242,14 +266,14 @@ func TestPubkeyAuthEndToEnd(t *testing.T) {
 	sshCfg := NewServerConfig(Config{
 		HostSigner:   hostKey,
 		MaxAuthTries: 1,
-		AuthWatcher:  newTestAuthWatcher(nil, map[string]bool{fp: true}),
+		AuthWatcher:  newTestAuthWatcher(nil, map[string]string{fp: "alice@laptop"}),
 	})
 
 	conn := fakeConnMeta{user: "runner"}
 	perms, err := sshCfg.PublicKeyCallback(conn, userPub)
 	require.NoError(t, err)
 	assert.Equal(t, fp, perms.Extensions[ExtFingerprint])
-	assert.Equal(t, "pubkey:"+fp, perms.Extensions[ExtIdentity])
+	assert.Equal(t, "pubkey:alice@laptop", perms.Extensions[ExtIdentity])
 }
 
 func TestParseLineList(t *testing.T) {
@@ -298,26 +322,39 @@ func TestParsePubkeyList(t *testing.T) {
 	require.NoError(t, err)
 	sshPub, err := ssh.NewPublicKey(pub)
 	require.NoError(t, err)
-	authorizedKey := string(ssh.MarshalAuthorizedKey(sshPub))
+	// MarshalAuthorizedKey produces "ssh-ed25519 AAAA...\n" without a comment.
+	bareKey := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub)))
+	// Add a comment to create a full authorized_keys line.
+	authorizedKey := bareKey + " alice@laptop"
 	expectedFP := ssh.FingerprintSHA256(sshPub)
 
-	t.Run("parses valid key", func(t *testing.T) {
+	t.Run("parses valid key with comment", func(t *testing.T) {
 		fps := parsePubkeyList(authorizedKey)
-		assert.True(t, fps[expectedFP])
+		assert.Contains(t, fps, expectedFP)
+		assert.Equal(t, "alice@laptop", fps[expectedFP])
+		assert.Len(t, fps, 1)
+	})
+
+	t.Run("parses key without comment as empty string", func(t *testing.T) {
+		fps := parsePubkeyList(bareKey)
+		assert.Contains(t, fps, expectedFP)
+		assert.Equal(t, "", fps[expectedFP])
 		assert.Len(t, fps, 1)
 	})
 
 	t.Run("skips comments and blank lines", func(t *testing.T) {
 		raw := "# this is a comment\n\n" + authorizedKey + "\n  \n# another comment\n"
 		fps := parsePubkeyList(raw)
-		assert.True(t, fps[expectedFP])
+		assert.Contains(t, fps, expectedFP)
+		assert.Equal(t, "alice@laptop", fps[expectedFP])
 		assert.Len(t, fps, 1)
 	})
 
 	t.Run("skips invalid lines", func(t *testing.T) {
 		raw := "not-a-valid-key\n" + authorizedKey
 		fps := parsePubkeyList(raw)
-		assert.True(t, fps[expectedFP])
+		assert.Contains(t, fps, expectedFP)
+		assert.Equal(t, "alice@laptop", fps[expectedFP])
 		assert.Len(t, fps, 1)
 	})
 
@@ -326,18 +363,21 @@ func TestParsePubkeyList(t *testing.T) {
 		assert.Empty(t, fps)
 	})
 
-	t.Run("multiple keys", func(t *testing.T) {
+	t.Run("multiple keys with different usernames", func(t *testing.T) {
 		pub2, _, err := ed25519.GenerateKey(rand.Reader)
 		require.NoError(t, err)
 		sshPub2, err := ssh.NewPublicKey(pub2)
 		require.NoError(t, err)
-		key2 := string(ssh.MarshalAuthorizedKey(sshPub2))
+		bareKey2 := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub2)))
+		key2 := bareKey2 + " bob@desktop"
 		fp2 := ssh.FingerprintSHA256(sshPub2)
 
-		raw := authorizedKey + key2
+		raw := authorizedKey + "\n" + key2
 		fps := parsePubkeyList(raw)
-		assert.True(t, fps[expectedFP])
-		assert.True(t, fps[fp2])
+		assert.Contains(t, fps, expectedFP)
+		assert.Equal(t, "alice@laptop", fps[expectedFP])
+		assert.Contains(t, fps, fp2)
+		assert.Equal(t, "bob@desktop", fps[fp2])
 		assert.Len(t, fps, 2)
 	})
 }

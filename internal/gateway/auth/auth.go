@@ -97,22 +97,28 @@ func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver) func(ssh.Con
 }
 
 // verifyExplicitPubkey checks whether a raw public key's fingerprint is in the
-// allowed set.
+// allowed set, and uses the pubkey's comment (username) as the stable identity.
 func verifyExplicitPubkey(conn ssh.ConnMetadata, key ssh.PublicKey, watcher *AuthWatcher) (*ssh.Permissions, error) {
 	fingerprint := ssh.FingerprintSHA256(key)
 	if !watcher.IsPubkeyAllowed(fingerprint) {
 		return nil, fmt.Errorf("public key %s is not in the allowed list", fingerprint)
 	}
 
+	username := watcher.PubkeyUsername(fingerprint)
+	if username == "" {
+		return nil, fmt.Errorf("public key %s has no comment (username) in authorized_keys entry", fingerprint)
+	}
+
 	slog.Info("explicit pubkey auth succeeded",
 		"user", conn.User(),
 		"remote", conn.RemoteAddr().String(),
 		"key_fingerprint", fingerprint,
+		"pubkey_username", username,
 	)
 	return &ssh.Permissions{
 		Extensions: map[string]string{
 			ExtFingerprint: fingerprint,
-			ExtIdentity:    fmt.Sprintf("pubkey:%s", fingerprint),
+			ExtIdentity:    fmt.Sprintf("pubkey:%s", username),
 		},
 	}, nil
 }

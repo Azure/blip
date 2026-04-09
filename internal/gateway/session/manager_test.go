@@ -234,12 +234,12 @@ func TestExtractAuthExtensions(t *testing.T) {
 			perms: &ssh.Permissions{
 				Extensions: map[string]string{
 					auth.ExtFingerprint: "SHA256:vm-key",
-					auth.ExtIdentity:    "pubkey:SHA256:root",
+					auth.ExtIdentity:    "pubkey:alice@laptop",
 					auth.ExtIsVMClient:  "true",
 				},
 			},
 			wantFP:       "SHA256:vm-key",
-			wantID:       "pubkey:SHA256:root",
+			wantID:       "pubkey:alice@laptop",
 			wantVMClient: true,
 		},
 	}
