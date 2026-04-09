@@ -299,10 +299,6 @@ spec:
           value: "blip"
         - name: VM_POOL_NAME
           value: "blip"
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
         resources:
           requests:
             cpu: 50m
@@ -381,8 +377,6 @@ spec:
           value: "20"
         - name: GATEWAY_HOST_PRINCIPALS
           value: "ssh-gateway.blip.svc.cluster.local"
-        - name: GATEWAY_EXTERNAL_HOST
-          value: ""  # Set to the public hostname for reconnect instructions
         - name: HOST_KEY_PATH
           value: "/etc/blip/host-key/host_key"
         - name: CLIENT_KEY_PATH
