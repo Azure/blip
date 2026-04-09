@@ -377,17 +377,11 @@ func generateSessionID() string {
 
 // isSessionID reports whether user matches the blip session ID format.
 func isSessionID(user string) bool {
-	if !strings.HasPrefix(user, sessionIDPrefix) {
+	suffix, ok := strings.CutPrefix(user, sessionIDPrefix)
+	if !ok || len(suffix) != 10 {
 		return false
 	}
-	suffix := user[len(sessionIDPrefix):]
-	if len(suffix) != 10 {
-		return false
-	}
-	for _, c := range suffix {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return false
-		}
-	}
-	return true
+	// Only lowercase hex is valid (generateSessionID produces lowercase).
+	_, err := hex.DecodeString(suffix)
+	return err == nil && suffix == strings.ToLower(suffix)
 }

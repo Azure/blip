@@ -103,6 +103,24 @@ func sshPipe(t *testing.T) sshEndpoints {
 	}
 }
 
+// startEchoServer accepts channels from the server side and echoes data back.
+func startEchoServer(t *testing.T, chans <-chan ssh.NewChannel) {
+	t.Helper()
+	go func() {
+		for newCh := range chans {
+			ch, reqs, err := newCh.Accept()
+			if err != nil {
+				continue
+			}
+			go ssh.DiscardRequests(reqs)
+			go func(ch ssh.Channel) {
+				io.Copy(ch, ch)
+				ch.CloseWrite()
+			}(ch)
+		}
+	}()
+}
+
 // ---------------------------------------------------------------------------
 // Session lifecycle tests
 // ---------------------------------------------------------------------------
@@ -111,9 +129,8 @@ func TestSession_CloseIsIdempotent(t *testing.T) {
 	ep := sshPipe(t)
 
 	cancelCount := 0
-	ctx, cancel := context.WithCancel(context.Background())
+	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_ = ctx
 
 	wrappedCancel := func() { cancelCount++; cancel() }
 	sess := NewSession(wrappedCancel, ep.serverConn)
@@ -137,9 +154,8 @@ func TestSession_CloseWithAndWithoutUpstream(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ep := sshPipe(t)
-			ctx, cancel := context.WithCancel(context.Background())
+			_, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			_ = ctx
 
 			sess := NewSession(cancel, ep.serverConn)
 			if tt.setUpstream {
@@ -175,9 +191,8 @@ func TestSendBannerAndClose(t *testing.T) {
 	a := <-result
 	require.NoError(t, a.err)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_ = ctx
 	sess := NewSession(cancel, ep.serverConn)
 	sess.SetBannerChannel(a.ch)
 
@@ -192,9 +207,8 @@ func TestSendBannerAndClose(t *testing.T) {
 
 func TestSendBannerAndClose_NoBannerChannel(t *testing.T) {
 	ep := sshPipe(t)
-	ctx, cancel := context.WithCancel(context.Background())
+	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_ = ctx
 	sess := NewSession(cancel, ep.serverConn)
 
 	// No banner channel set – should not panic.
@@ -218,19 +232,7 @@ func TestForward_BidirectionalDataThroughChannel(t *testing.T) {
 		clientSide.serverNewChans, nil)
 
 	// Upstream server: accept the forwarded channel and echo data back.
-	go func() {
-		for newCh := range upstreamSide.serverNewChans {
-			ch, reqs, err := newCh.Accept()
-			if err != nil {
-				return
-			}
-			go ssh.DiscardRequests(reqs)
-			go func(ch ssh.Channel) {
-				io.Copy(ch, ch) // echo
-				ch.CloseWrite()
-			}(ch)
-		}
-	}()
+	startEchoServer(t, upstreamSide.serverNewChans)
 
 	// Client opens a session channel.
 	clientCh, _, err := clientSide.client.OpenChannel("session", nil)
@@ -257,19 +259,7 @@ func TestForward_MultipleChannels(t *testing.T) {
 		clientSide.serverNewChans, nil)
 
 	// Upstream echoes.
-	go func() {
-		for newCh := range upstreamSide.serverNewChans {
-			ch, reqs, err := newCh.Accept()
-			if err != nil {
-				continue
-			}
-			go ssh.DiscardRequests(reqs)
-			go func(ch ssh.Channel) {
-				io.Copy(ch, ch)
-				ch.CloseWrite()
-			}(ch)
-		}
-	}()
+	startEchoServer(t, upstreamSide.serverNewChans)
 
 	const numChannels = 5
 	var wg sync.WaitGroup
@@ -305,13 +295,7 @@ func TestForward_ContextCancellationStopsLoop(t *testing.T) {
 	}()
 
 	cancel()
-
-	select {
-	case <-done:
-		// Forward returned – success.
-	case <-time.After(2 * time.Second):
-		t.Fatal("Forward did not return after context cancellation")
-	}
+	<-done // If Forward doesn't return, the test framework's -timeout will catch it.
 }
 
 func TestForward_ClosedClientChansStopsLoop(t *testing.T) {
@@ -332,11 +316,7 @@ func TestForward_ClosedClientChansStopsLoop(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Forward did not return after clientChans closed")
-	}
+	<-done // If Forward doesn't return, the test framework's -timeout will catch it.
 }
 
 // ---------------------------------------------------------------------------
@@ -549,19 +529,7 @@ func TestBridgeClientChannel_EndToEnd(t *testing.T) {
 	defer cancel()
 
 	// Upstream: echo server.
-	go func() {
-		for newCh := range upstreamSide.serverNewChans {
-			ch, reqs, err := newCh.Accept()
-			if err != nil {
-				continue
-			}
-			go ssh.DiscardRequests(reqs)
-			go func(ch ssh.Channel) {
-				io.Copy(ch, ch)
-				ch.CloseWrite()
-			}(ch)
-		}
-	}()
+	startEchoServer(t, upstreamSide.serverNewChans)
 
 	// Accept the channel on the gateway side in a goroutine so
 	// OpenChannel on the client can complete.
@@ -602,54 +570,59 @@ func TestBridgeClientChannel_EndToEnd(t *testing.T) {
 // rejectChannel
 // ---------------------------------------------------------------------------
 
-func TestRejectChannel_UsesOpenChannelErrorReason(t *testing.T) {
-	clientSide := sshPipe(t)
-	upstreamSide := sshPipe(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Upstream: reject every channel with a specific error.
-	go func() {
-		for newCh := range upstreamSide.serverNewChans {
-			newCh.Reject(ssh.Prohibited, "not allowed")
-		}
-	}()
-
-	// Forward client channels through.
-	go Forward(ctx, "test-reject", clientSide.serverConn, upstreamSide.client,
-		clientSide.serverNewChans, nil)
-
-	// Client tries to open a channel – should get rejection.
-	_, _, err := clientSide.client.OpenChannel("session", nil)
-	require.Error(t, err)
-
-	var openErr *ssh.OpenChannelError
-	if assert.ErrorAs(t, err, &openErr) {
-		assert.Equal(t, ssh.Prohibited, openErr.Reason)
-		assert.Equal(t, "not allowed", openErr.Message)
+func TestRejectChannel(t *testing.T) {
+	tests := []struct {
+		name          string
+		closeUpstream bool // close upstream before forwarding?
+		wantReason    ssh.RejectionReason
+		wantMessage   string // if non-empty, assert the message too
+	}{
+		{
+			name:          "OpenChannelError reason is preserved",
+			closeUpstream: false,
+			wantReason:    ssh.Prohibited,
+			wantMessage:   "not allowed",
+		},
+		{
+			name:          "generic error uses ConnectionFailed",
+			closeUpstream: true,
+			wantReason:    ssh.ConnectionFailed,
+		},
 	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientSide := sshPipe(t)
+			upstreamSide := sshPipe(t)
 
-func TestRejectChannel_GenericErrorUsesConnectionFailed(t *testing.T) {
-	clientSide := sshPipe(t)
-	upstreamSide := sshPipe(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+			if tt.closeUpstream {
+				// Close the upstream connection so OpenChannel fails with a generic error.
+				upstreamSide.client.Close()
+			} else {
+				// Upstream: reject every channel with a specific error.
+				go func() {
+					for newCh := range upstreamSide.serverNewChans {
+						newCh.Reject(ssh.Prohibited, "not allowed")
+					}
+				}()
+			}
 
-	// Close the upstream connection so OpenChannel fails with a generic error.
-	upstreamSide.client.Close()
+			go Forward(ctx, "test-reject", clientSide.serverConn, upstreamSide.client,
+				clientSide.serverNewChans, nil)
 
-	go Forward(ctx, "test-reject-generic", clientSide.serverConn, upstreamSide.client,
-		clientSide.serverNewChans, nil)
+			_, _, err := clientSide.client.OpenChannel("session", nil)
+			require.Error(t, err)
 
-	_, _, err := clientSide.client.OpenChannel("session", nil)
-	require.Error(t, err)
-
-	var openErr *ssh.OpenChannelError
-	if assert.ErrorAs(t, err, &openErr) {
-		assert.Equal(t, ssh.ConnectionFailed, openErr.Reason)
+			var openErr *ssh.OpenChannelError
+			if assert.ErrorAs(t, err, &openErr) {
+				assert.Equal(t, tt.wantReason, openErr.Reason)
+				if tt.wantMessage != "" {
+					assert.Equal(t, tt.wantMessage, openErr.Message)
+				}
+			}
+		})
 	}
 }
 
@@ -793,19 +766,7 @@ func TestBridgeNewClientChannel_EndToEnd(t *testing.T) {
 	defer cancel()
 
 	// Upstream: echo server.
-	go func() {
-		for newCh := range upstreamSide.serverNewChans {
-			ch, reqs, err := newCh.Accept()
-			if err != nil {
-				continue
-			}
-			go ssh.DiscardRequests(reqs)
-			go func(ch ssh.Channel) {
-				io.Copy(ch, ch)
-				ch.CloseWrite()
-			}(ch)
-		}
-	}()
+	startEchoServer(t, upstreamSide.serverNewChans)
 
 	// Bridge each client channel via BridgeNewClientChannel.
 	go func() {

@@ -24,25 +24,18 @@ const (
 	testPool      = "blip"
 )
 
-func newScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
+var testScheme = func() *runtime.Scheme {
 	s := runtime.NewScheme()
-	require.NoError(t, kubevirtv1.AddToScheme(s))
+	if err := kubevirtv1.AddToScheme(s); err != nil {
+		panic(err)
+	}
 	return s
-}
+}()
 
-func newClient(t *testing.T, objs ...client.Object) client.Client {
+func newClient(t *testing.T, fns interceptor.Funcs, objs ...client.Object) client.Client {
 	t.Helper()
 	return fake.NewClientBuilder().
-		WithScheme(newScheme(t)).
-		WithObjects(objs...).
-		Build()
-}
-
-func newClientWithInterceptor(t *testing.T, fns interceptor.Funcs, objs ...client.Object) client.Client {
-	t.Helper()
-	return fake.NewClientBuilder().
-		WithScheme(newScheme(t)).
+		WithScheme(testScheme).
 		WithObjects(objs...).
 		WithInterceptorFuncs(fns).
 		Build()
@@ -70,23 +63,17 @@ func req(name string) reconcile.Request {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Reconcile
-// ---------------------------------------------------------------------------
-
 func TestReconcile(t *testing.T) {
 	now := time.Now()
 
 	tests := []struct {
-		name           string
-		vm             *kubevirtv1.VirtualMachine
-		request        reconcile.Request
-		intercept      interceptor.Funcs
-		wantRequeue    bool
-		wantErr        string
-		wantDeleted    bool
-		controllerNS   string
-		controllerPool string
+		name        string
+		vm          *kubevirtv1.VirtualMachine
+		request     reconcile.Request
+		intercept   interceptor.Funcs
+		wantRequeue bool
+		wantErr     string
+		wantDeleted bool
 	}{
 		{
 			name:    "ignores VM in a different namespace",
@@ -192,23 +179,9 @@ func TestReconcile(t *testing.T) {
 				objs = append(objs, tt.vm)
 			}
 
-			var cl client.Client
-			if tt.intercept.Get != nil || tt.intercept.Delete != nil {
-				cl = newClientWithInterceptor(t, tt.intercept, objs...)
-			} else {
-				cl = newClient(t, objs...)
-			}
+			cl := newClient(t, tt.intercept, objs...)
 
-			ns := testNamespace
-			if tt.controllerNS != "" {
-				ns = tt.controllerNS
-			}
-			pool := testPool
-			if tt.controllerPool != "" {
-				pool = tt.controllerPool
-			}
-
-			r := &controller{Client: cl, Namespace: ns, PoolName: pool}
+			r := &controller{Client: cl, Namespace: testNamespace, PoolName: testPool}
 			result, err := r.Reconcile(context.Background(), tt.request)
 
 			if tt.wantErr != "" {
@@ -235,10 +208,6 @@ func TestReconcile(t *testing.T) {
 		})
 	}
 }
-
-// ---------------------------------------------------------------------------
-// parseClaimTTL
-// ---------------------------------------------------------------------------
 
 func TestParseClaimTTL(t *testing.T) {
 	validTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -301,10 +270,6 @@ func TestParseClaimTTL(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// isExpired / timeUntilExpiry – tested together as they share the same logic
-// ---------------------------------------------------------------------------
-
 func TestExpiryBehavior(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -357,10 +322,6 @@ func TestExpiryBehavior(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// End-to-end scenario: release flow
-// ---------------------------------------------------------------------------
-
 func TestReconcile_ReleaseFlow(t *testing.T) {
 	// Simulate a full lifecycle: a claimed VM receives the release annotation
 	// and is deleted on reconcile.
@@ -372,7 +333,7 @@ func TestReconcile_ReleaseFlow(t *testing.T) {
 		"blip.io/user":         "testuser",
 	})
 
-	cl := newClient(t, vm)
+	cl := newClient(t, interceptor.Funcs{}, vm)
 	r := &controller{Client: cl, Namespace: testNamespace, PoolName: testPool}
 
 	// First reconcile: VM is claimed but not expired -> requeue.
@@ -400,10 +361,6 @@ func TestReconcile_ReleaseFlow(t *testing.T) {
 	assert.Error(t, getErr, "VM should be deleted")
 }
 
-// ---------------------------------------------------------------------------
-// End-to-end scenario: expiry flow
-// ---------------------------------------------------------------------------
-
 func TestReconcile_ExpiryFlow(t *testing.T) {
 	// VM claimed 2 hours ago with max-duration of 1 hour -> should be deleted.
 	vm := makeVM("expired-vm", testPool, map[string]string{
@@ -412,7 +369,7 @@ func TestReconcile_ExpiryFlow(t *testing.T) {
 		"blip.io/max-duration": "3600",
 	})
 
-	cl := newClient(t, vm)
+	cl := newClient(t, interceptor.Funcs{}, vm)
 	r := &controller{Client: cl, Namespace: testNamespace, PoolName: testPool}
 
 	result, err := r.Reconcile(context.Background(), req("expired-vm"))

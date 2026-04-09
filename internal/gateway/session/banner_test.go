@@ -8,20 +8,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ---------------------------------------------------------------------------
-// CRLF conversion
-// ---------------------------------------------------------------------------
-
 func TestCRLF(t *testing.T) {
 	assert.Equal(t, "a\r\nb\r\nc", crlf("a\nb\nc"))
 	assert.Equal(t, "no newlines", crlf("no newlines"))
 	assert.Equal(t, "\r\n\r\n", crlf("\n\n"))
 	assert.Equal(t, "", crlf(""))
 }
-
-// ---------------------------------------------------------------------------
-// Banner generation
-// ---------------------------------------------------------------------------
 
 func TestBanners(t *testing.T) {
 	t.Run("welcome banner differentiates new vs reconnect", func(t *testing.T) {
@@ -67,10 +59,6 @@ func TestBanners(t *testing.T) {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// writeBanner
-// ---------------------------------------------------------------------------
-
 func TestWriteBanner(t *testing.T) {
 	ep := sshPipe(t)
 	clientCh, serverCh := openAndAcceptChannel(t, ep)
@@ -95,10 +83,6 @@ func TestWriteBanner_ClosedChannel(t *testing.T) {
 		writeBanner(serverCh, "should not crash")
 	})
 }
-
-// ---------------------------------------------------------------------------
-// formatDuration
-// ---------------------------------------------------------------------------
 
 func TestFormatDuration(t *testing.T) {
 	tests := []struct {

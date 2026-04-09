@@ -18,10 +18,6 @@ import (
 	"github.com/project-unbounded/blip/internal/gateway/proxy"
 )
 
-// ---------------------------------------------------------------------------
-// Test helpers
-// ---------------------------------------------------------------------------
-
 func generateSigner(t *testing.T) ssh.Signer {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -137,10 +133,6 @@ func (f *fakeNewChannel) Reject(ssh.RejectionReason, string) error          { re
 func (f *fakeNewChannel) ChannelType() string                               { return f.chanType }
 func (f *fakeNewChannel) ExtraData() []byte                                 { return nil }
 
-// ---------------------------------------------------------------------------
-// Session ID generation and validation
-// ---------------------------------------------------------------------------
-
 func TestSessionID_GenerateAndValidate(t *testing.T) {
 	seen := make(map[string]struct{})
 	for range 20 {
@@ -179,10 +171,6 @@ func TestIsSessionID(t *testing.T) {
 		})
 	}
 }
-
-// ---------------------------------------------------------------------------
-// extractAuthExtensions
-// ---------------------------------------------------------------------------
 
 func TestExtractAuthExtensions(t *testing.T) {
 	tests := []struct {
@@ -255,10 +243,6 @@ func TestExtractAuthExtensions(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// waitForSessionChannel
-// ---------------------------------------------------------------------------
-
 func TestWaitForSessionChannel(t *testing.T) {
 	t.Run("session channel arrives first", func(t *testing.T) {
 		ch := make(chan ssh.NewChannel, 1)
@@ -318,10 +302,6 @@ func TestWaitForSessionChannel(t *testing.T) {
 		assert.Less(t, elapsed, 2*time.Second)
 	})
 }
-
-// ---------------------------------------------------------------------------
-// Manager creation and session registry
-// ---------------------------------------------------------------------------
 
 func TestNew(t *testing.T) {
 	cfg := Config{
@@ -391,20 +371,15 @@ func TestRegisterUnregister_ConcurrentSafety(t *testing.T) {
 	assert.Empty(t, m.sessions)
 }
 
-// ---------------------------------------------------------------------------
-// NotifyShutdown
-// ---------------------------------------------------------------------------
-
 func TestNotifyShutdown(t *testing.T) {
 	t.Run("sends banner to all sessions and closes them", func(t *testing.T) {
 		m := New(Config{})
 
-		type sessionFixture struct {
+		type fixture struct {
 			clientCh ssh.Channel
-			sess     *proxy.Session
 			id       string
 		}
-		var fixtures []sessionFixture
+		var fixtures []fixture
 
 		for range 3 {
 			ep := sshPipe(t)
@@ -417,9 +392,8 @@ func TestNotifyShutdown(t *testing.T) {
 			id := generateSessionID()
 			m.register(id, sess)
 
-			fixtures = append(fixtures, sessionFixture{
+			fixtures = append(fixtures, fixture{
 				clientCh: clientCh,
-				sess:     sess,
 				id:       id,
 			})
 		}
@@ -439,10 +413,6 @@ func TestNotifyShutdown(t *testing.T) {
 		assert.NotPanics(t, func() { m.NotifyShutdown() })
 	})
 }
-
-// ---------------------------------------------------------------------------
-// logAndBannerAllocError
-// ---------------------------------------------------------------------------
 
 func TestLogAndBannerAllocError(t *testing.T) {
 	tests := []struct {
@@ -478,93 +448,54 @@ func TestLogAndBannerAllocError(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// HandleConnection: early exit scenarios
-// ---------------------------------------------------------------------------
-
-func TestHandleConnection_NoSessionChannel(t *testing.T) {
-	// When the client closes channels before sending a "session" channel,
-	// HandleConnection should return gracefully without panicking.
-	m := New(Config{
-		GatewaySigner: generateSigner(t),
-		PodName:       "test-gw",
-	})
-
-	ep := sshPipe(t)
-
-	chans := make(chan ssh.NewChannel)
-	close(chans)
-	reqs := make(chan *ssh.Request)
-	close(reqs)
-
-	done := make(chan struct{})
-	go func() {
-		m.HandleConnection(context.Background(), ep.serverConn, chans, reqs)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("HandleConnection did not return when channels were closed immediately")
-	}
-}
-
-func TestHandleConnection_NonSessionChannelsThenClose(t *testing.T) {
-	// Non-session channels arrive, then the stream closes before any
-	// "session" channel. HandleConnection should return gracefully.
-	m := New(Config{
-		GatewaySigner: generateSigner(t),
-		PodName:       "test-gw",
-	})
-
-	ep := sshPipe(t)
-
-	chans := make(chan ssh.NewChannel, 2)
-	chans <- &fakeNewChannel{chanType: "direct-tcpip"}
-	chans <- &fakeNewChannel{chanType: "forwarded-tcpip"}
-	close(chans)
-
-	reqs := make(chan *ssh.Request)
-	close(reqs)
-
-	done := make(chan struct{})
-	go func() {
-		m.HandleConnection(context.Background(), ep.serverConn, chans, reqs)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("HandleConnection did not return after non-session channels closed")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Reconnect detection via username
-// ---------------------------------------------------------------------------
-
-func TestHandleConnection_DetectsReconnectVsNewSession(t *testing.T) {
+func TestHandleConnection_NoSessionChannelEarlyExit(t *testing.T) {
 	tests := []struct {
-		name       string
-		user       string
-		wantReconn bool
+		name    string
+		prefill []string // channel types to enqueue before closing
+		wantMsg string
 	}{
-		{"normal user is new session", "runner", false},
-		{"session ID is reconnect", "blip-a1b2c3d4e5", true},
-		{"partial session ID is new session", "blip-short", false},
+		{
+			name:    "no channels at all",
+			prefill: nil,
+			wantMsg: "HandleConnection did not return when channels were closed immediately",
+		},
+		{
+			name:    "non-session channels then close",
+			prefill: []string{"direct-tcpip", "forwarded-tcpip"},
+			wantMsg: "HandleConnection did not return after non-session channels closed",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.wantReconn, isSessionID(tt.user))
+			m := New(Config{
+				GatewaySigner: generateSigner(t),
+				PodName:       "test-gw",
+			})
+			ep := sshPipe(t)
+
+			chans := make(chan ssh.NewChannel, len(tt.prefill))
+			for _, ct := range tt.prefill {
+				chans <- &fakeNewChannel{chanType: ct}
+			}
+			close(chans)
+
+			reqs := make(chan *ssh.Request)
+			close(reqs)
+
+			done := make(chan struct{})
+			go func() {
+				m.HandleConnection(context.Background(), ep.serverConn, chans, reqs)
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal(tt.wantMsg)
+			}
 		})
 	}
 }
-
-// ---------------------------------------------------------------------------
-// sessionTTL and isOIDCIdentity
-// ---------------------------------------------------------------------------
 
 func TestIsOIDCIdentity(t *testing.T) {
 	tests := []struct {
