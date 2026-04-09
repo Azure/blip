@@ -72,6 +72,7 @@ def _conn_opts():
         "-o", f"UserKnownHostsFile={_known_hosts}",
         "-o", "LogLevel=ERROR",
         "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
         "-i", _ssh_key,
     ]
 
@@ -591,6 +592,7 @@ def setup():
         "-o", f"UserKnownHostsFile={_known_hosts}",
         "-o", "LogLevel=ERROR",
         "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
         "-i", _ssh_key,
         "-p", str(GATEWAY_PORT),
         f"{SSH_USER}@{GATEWAY_HOST}",
@@ -813,17 +815,19 @@ def test_recurse_session():
     # The gateway injects the VM identity asynchronously after the
     # upstream connection is established, so credentials may not be
     # available immediately. Retry the inner SSH a few times.
+    # ConnectTimeout=10 keeps each attempt short so retries cycle fast
+    # instead of hanging on the default TCP timeout.
     stdout, stderr, rc = ssh_session(
         SSH_USER,
-        "for i in $(seq 1 15); do "
-        "  if ssh -o StrictHostKeyChecking=yes -o BatchMode=yes "
+        "for i in $(seq 1 30); do "
+        "  if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o BatchMode=yes "
         "       blip 'echo RECURSE_OK'; then "
         "    exit 0; "
         "  fi; "
         "  sleep 2; "
         "done; "
         "exit 1",
-        timeout=90,
+        timeout=180,
     )
     assert rc == 0, f"Recurse SSH failed (rc={rc}): {stderr}"
     assert "RECURSE_OK" in stdout, f"Expected RECURSE_OK in: {stdout}"
