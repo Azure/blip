@@ -41,7 +41,7 @@ type AuthWatcher struct {
 
 	mu      sync.RWMutex
 	repos   []string
-	pubkeys map[string]bool // SHA256 fingerprint -> true
+	pubkeys map[string]string // SHA256 fingerprint -> comment (username)
 }
 
 // NewAuthWatcher creates an AuthWatcher that watches the named ConfigMap.
@@ -76,7 +76,7 @@ func NewAuthWatcher(ctx context.Context, namespace, configMapName string) (*Auth
 		cache:     informerCache,
 		namespace: namespace,
 		name:      configMapName,
-		pubkeys:   make(map[string]bool),
+		pubkeys:   make(map[string]string),
 	}
 
 	go func() {
@@ -131,11 +131,20 @@ func (w *AuthWatcher) AllowedRepos() []string {
 func (w *AuthWatcher) IsPubkeyAllowed(fingerprint string) bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
+	_, ok := w.pubkeys[fingerprint]
+	return ok
+}
+
+// PubkeyUsername returns the comment (username) associated with the given
+// fingerprint, or "" if the fingerprint is not in the allowed set.
+func (w *AuthWatcher) PubkeyUsername(fingerprint string) string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 	return w.pubkeys[fingerprint]
 }
 
-// allowedPubkeyFingerprints returns the count for logging. Lock must not be held.
-func (w *AuthWatcher) allowedPubkeyFingerprints() map[string]bool {
+// allowedPubkeyFingerprints returns the map for logging. Lock must not be held.
+func (w *AuthWatcher) allowedPubkeyFingerprints() map[string]string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.pubkeys
@@ -153,7 +162,7 @@ func (w *AuthWatcher) reload(ctx context.Context) {
 		)
 		w.mu.Lock()
 		w.repos = nil
-		w.pubkeys = make(map[string]bool)
+		w.pubkeys = make(map[string]string)
 		w.mu.Unlock()
 		return
 	}
@@ -188,15 +197,15 @@ func parseLineList(raw string) []string {
 }
 
 // parsePubkeyList parses newline-delimited authorized_keys entries and returns
-// a set of their SHA256 fingerprints.
-func parsePubkeyList(raw string) map[string]bool {
-	fps := make(map[string]bool)
+// a map of their SHA256 fingerprints to the comment (username) field.
+func parsePubkeyList(raw string) map[string]string {
+	fps := make(map[string]string)
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+		pub, comment, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
 		if err != nil {
 			slog.Warn("auth watcher: skipping invalid public key line",
 				"error", err,
@@ -205,20 +214,21 @@ func parsePubkeyList(raw string) map[string]bool {
 			continue
 		}
 		fp := ssh.FingerprintSHA256(pub)
-		fps[fp] = true
+		fps[fp] = comment
 		slog.Debug("auth watcher: loaded allowed pubkey",
 			"fingerprint", fp,
+			"comment", comment,
 		)
 	}
 	return fps
 }
 
 // NewTestAuthWatcher creates an AuthWatcher pre-loaded with the given repos
-// and pubkey fingerprints, without starting an informer cache. Intended for
-// use in tests outside of this package.
-func NewTestAuthWatcher(repos []string, pubkeyFingerprints map[string]bool) *AuthWatcher {
+// and pubkey fingerprints (fingerprint -> comment), without starting an
+// informer cache. Intended for use in tests outside of this package.
+func NewTestAuthWatcher(repos []string, pubkeyFingerprints map[string]string) *AuthWatcher {
 	if pubkeyFingerprints == nil {
-		pubkeyFingerprints = make(map[string]bool)
+		pubkeyFingerprints = make(map[string]string)
 	}
 	return &AuthWatcher{repos: repos, pubkeys: pubkeyFingerprints}
 }

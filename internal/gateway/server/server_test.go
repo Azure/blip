@@ -44,7 +44,8 @@ func newTestHostKey(t *testing.T, dir string) testHostKey {
 }
 
 // newTestAuthWatcher creates an AuthWatcher with the given pubkey fingerprints allowed.
-func newTestAuthWatcher(fingerprints map[string]bool) *auth.AuthWatcher {
+// The map value is the comment (username) associated with the fingerprint.
+func newTestAuthWatcher(fingerprints map[string]string) *auth.AuthWatcher {
 	return auth.NewTestAuthWatcher(nil, fingerprints)
 }
 
@@ -148,7 +149,7 @@ func TestServe_AuthenticatedClientReceivesCallback(t *testing.T) {
 	cfg := validConfig(hk)
 
 	clientCfg, fp := allowedPubkeyClientConfig(t)
-	cfg.AuthWatcher = newTestAuthWatcher(map[string]bool{fp: true})
+	cfg.AuthWatcher = newTestAuthWatcher(map[string]string{fp: "runner@test"})
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
@@ -169,7 +170,7 @@ func TestServe_AuthenticatedClientReceivesCallback(t *testing.T) {
 			handlerCalled.Store(true)
 			assert.Equal(t, "runner", sc.User())
 			assert.NotEmpty(t, sc.Permissions.Extensions["auth-fingerprint"])
-			assert.Equal(t, "pubkey:"+fp, sc.Permissions.Extensions["auth-identity"])
+			assert.Equal(t, "pubkey:runner@test", sc.Permissions.Extensions["auth-identity"])
 			sc.Close()
 		})
 	}()
@@ -190,7 +191,7 @@ func TestServe_GracefulShutdownDrainsConnections(t *testing.T) {
 	cfg := validConfig(hk)
 
 	clientCfg, fp := allowedPubkeyClientConfig(t)
-	cfg.AuthWatcher = newTestAuthWatcher(map[string]bool{fp: true})
+	cfg.AuthWatcher = newTestAuthWatcher(map[string]string{fp: "runner@test"})
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
@@ -237,7 +238,7 @@ func TestServe_UnauthenticatedClientRejected(t *testing.T) {
 	cfg := validConfig(hk)
 
 	// Allow a specific key, then connect with a different one.
-	cfg.AuthWatcher = newTestAuthWatcher(map[string]bool{"SHA256:allowed-key": true})
+	cfg.AuthWatcher = newTestAuthWatcher(map[string]string{"SHA256:allowed-key": "someone@host"})
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
@@ -284,11 +285,11 @@ func TestServe_ConcurrentClients(t *testing.T) {
 		fp  string
 	}
 	clients := make([]clientInfo, numClients)
-	fpSet := make(map[string]bool)
+	fpSet := make(map[string]string)
 	for i := range numClients {
 		cc, fp := allowedPubkeyClientConfig(t)
 		clients[i] = clientInfo{cfg: cc, fp: fp}
-		fpSet[fp] = true
+		fpSet[fp] = fmt.Sprintf("user%d@host", i)
 		_ = i
 	}
 	cfg.AuthWatcher = newTestAuthWatcher(fpSet)
@@ -456,15 +457,17 @@ func TestServe_MultipleSequentialSessions(t *testing.T) {
 
 	const numClients = 3
 	type clientInfo struct {
-		cfg *ssh.ClientConfig
-		fp  string
+		cfg      *ssh.ClientConfig
+		fp       string
+		username string
 	}
 	clients := make([]clientInfo, numClients)
-	fpSet := make(map[string]bool)
+	fpSet := make(map[string]string)
 	for i := range numClients {
 		cc, fp := allowedPubkeyClientConfig(t)
-		clients[i] = clientInfo{cfg: cc, fp: fp}
-		fpSet[fp] = true
+		username := fmt.Sprintf("user%d@host", i)
+		clients[i] = clientInfo{cfg: cc, fp: fp, username: username}
+		fpSet[fp] = username
 		_ = i
 	}
 	cfg.AuthWatcher = newTestAuthWatcher(fpSet)
@@ -505,6 +508,6 @@ func TestServe_MultipleSequentialSessions(t *testing.T) {
 	defer mu.Unlock()
 	require.Len(t, identities, numClients)
 	for i, id := range identities {
-		assert.Equal(t, fmt.Sprintf("pubkey:%s", clients[i].fp), id)
+		assert.Equal(t, fmt.Sprintf("pubkey:%s", clients[i].username), id)
 	}
 }
