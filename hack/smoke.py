@@ -4,7 +4,7 @@
 Verifies:
   1. Ephemeral session: connect, confirm blip, disconnect -> VM deleted
   2. Retained session:  connect, retain, disconnect, reconnect -> SCP + port-forward
-  3. Retained with TTL: connect, retain --ttl 1m -> VM expires -> disconnect -> VM deleted
+  3. Retained with TTL: connect, retain --ttl 45s -> VM expires -> disconnect -> VM deleted
   4. Recurse session:   SSH from one blip to another via "ssh blip"
 """
 
@@ -21,7 +21,7 @@ import traceback
 
 NAMESPACE = "blip"
 POOL_NAME = "blip"
-REPLICAS = 2
+REPLICAS = 3
 SSH_USER = "runner"
 IMAGE_NAME = "localhost/blip:smoke"
 
@@ -422,9 +422,9 @@ def setup():
     GATEWAY_HOST = wait_for(resolve_gateway_ip, "gateway LoadBalancer IP", timeout=30)
     log(f"    Gateway: {GATEWAY_HOST}:{GATEWAY_PORT}")
 
-    # 10. Wait for VMs
+    # 10. Wait for VMs (need at least 2 for the recurse test which runs first)
     log("  Waiting for VMs...")
-    wait_for_pool_ready(min_ready=1, timeout=300)
+    wait_for_pool_ready(min_ready=2, timeout=300)
 
     # 11. TOFU: record the gateway's host key. All replicas share the same
     #     stable key, so this mirrors the real user experience.
@@ -589,38 +589,37 @@ def test_retained_session():
 
 
 def test_retained_with_ttl():
-    """retain --ttl 1m -> VM expires -> session ends -> VM deleted.
+    """retain --ttl 45s -> VM expires -> session ends -> VM deleted.
 
-    'blip retain --ttl 1m' sets blip.io/max-duration=60 on the VM. The
-    deallocation controller deletes the VM once claimed-at + 60s elapses,
+    'blip retain --ttl 45s' sets blip.io/max-duration=45 on the VM. The
+    deallocation controller deletes the VM once claimed-at + 45s elapses,
     breaking the upstream SSH connection and terminating our session.
     """
     wait_for_pool_ready(min_ready=1, timeout=300)
 
     cmd = ssh_cmd(SSH_USER) + [
-        "blip retain --ttl 1m && echo TTL_RETAINED && sleep 300"
+        "blip retain --ttl 45s && echo TTL_RETAINED && sleep 300"
     ]
 
-    log("    Connecting with --ttl 1m retain...")
+    log("    Connecting with --ttl 45s retain...")
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
         # The remote command runs: retain, echo, then sleep 300.
-        # The deallocation controller will kill the VM ~60s after claim,
+        # The deallocation controller will kill the VM ~45s after claim,
         # which terminates the SSH session (and the sleep).
-        # Total wait: ~90s worst case (60s TTL + 30s controller interval).
-        stdout, stderr = proc.communicate(timeout=150)
+        stdout, stderr = proc.communicate(timeout=90)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        raise RuntimeError("Session was not terminated after TTL expiry (150s)")
+        raise RuntimeError("Session was not terminated after TTL expiry (90s)")
 
     assert "TTL_RETAINED" in stdout, \
         f"TTL retain did not succeed. stdout={stdout!r}, stderr={stderr!r}"
 
     session_id = extract_session_id(stderr)
-    log(f"    Session: {session_id} (TTL 1m)")
+    log(f"    Session: {session_id} (TTL 45s)")
     log(f"    Session terminated (rc={proc.returncode})")
 
     log("    Waiting for VM deletion...")
@@ -669,10 +668,10 @@ def test_recurse_session():
 
 def main():
     tests = [
+        test_recurse_session,     # needs 2 VMs — run first when pool is fresh
         test_ephemeral_session,
         test_retained_session,
-        test_retained_with_ttl,
-        test_recurse_session,
+        test_retained_with_ttl,   # long idle wait — run last
     ]
 
     try:
