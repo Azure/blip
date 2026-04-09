@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  KUBEVIRT_VERSION: v1.8.1
+  CONTAINERDISK_IMAGE: quay.io/containerdisks/ubuntu:24.04
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
@@ -22,15 +26,51 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install KubeVirt and CDI CRDs
+      - name: Cache KubeVirt and containerdisk images
+        id: image-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/kubevirt-images.tar
+          key: kubevirt-images-${{ env.KUBEVIRT_VERSION }}-${{ env.CONTAINERDISK_IMAGE }}
+
+      - name: Pull images for cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          IMAGES=(
+            "quay.io/kubevirt/virt-operator:${KUBEVIRT_VERSION}"
+            "quay.io/kubevirt/virt-api:${KUBEVIRT_VERSION}"
+            "quay.io/kubevirt/virt-controller:${KUBEVIRT_VERSION}"
+            "quay.io/kubevirt/virt-handler:${KUBEVIRT_VERSION}"
+            "quay.io/kubevirt/virt-launcher:${KUBEVIRT_VERSION}"
+            "quay.io/kubevirt/virt-exportproxy:${KUBEVIRT_VERSION}"
+            "${CONTAINERDISK_IMAGE}"
+          )
+          pids=()
+          for img in "${IMAGES[@]}"; do
+            docker pull "$img" &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do
+            wait "$pid"
+          done
+          docker save "${IMAGES[@]}" -o /tmp/kubevirt-images.tar
+
+      - name: Create kind cluster and load cached images
         run: |
           set -euo pipefail
 
-          # Create a kind cluster with the default configuration.
           kind create cluster --wait 60s
 
-          # Deploy KubeVirt operator and CR.
-          KUBEVIRT_VERSION="$(curl -sL https://storage.googleapis.com/kubevirt-prow/release/kubevirt/kubevirt/stable.txt)"
+          # Load cached images into the kind node if they exist.
+          if [ -f /tmp/kubevirt-images.tar ]; then
+            kind load image-archive /tmp/kubevirt-images.tar
+          fi
+
+      - name: Install KubeVirt
+        run: |
+          set -euo pipefail
+
           kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml"
           kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml"
 

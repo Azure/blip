@@ -62,15 +62,15 @@ stringData:
             		cut -d'"' -f4
             }
 
-            # Parse a duration string like "5m", "2h", "1h30m" into total seconds.
-            # Supports hours (h) and minutes (m).
+            # Parse a duration string like "5m", "2h", "1h30m", "30s" into total seconds.
+            # Supports hours (h), minutes (m), and seconds (s).
             _parse_duration() {
             	local input="$1"
             	local total=0 num=""
 
-            	# Validate: only digits, 'h', and 'm' allowed.
-            	if ! printf '%s' "$input" | grep -qE '^[0-9]+[hm]([0-9]+[hm])?$'; then
-            		echo "Invalid duration format: $input (use e.g. 5m, 2h, 1h30m)" >&2
+            	# Validate: only digits, 'h', 'm', and 's' allowed.
+            	if ! printf '%s' "$input" | grep -qE '^([0-9]+[hms])+$'; then
+            		echo "Invalid duration format: $input (use e.g. 30s, 5m, 2h, 1h30m)" >&2
             		return 1
             	fi
 
@@ -89,6 +89,7 @@ stringData:
             		case "$unit" in
             		h) total=$((total + num * 3600)) ;;
             		m) total=$((total + num * 60)) ;;
+            		s) total=$((total + num)) ;;
             		*)
             			echo "Unknown duration unit: $unit" >&2
             			return 1
