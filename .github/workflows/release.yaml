@@ -10,7 +10,7 @@ permissions:
   packages: write
 
 env:
-  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  REGISTRY: ghcr.io
   IMAGE_NAME: blip
 
 jobs:
@@ -23,6 +23,10 @@ jobs:
       - name: Extract tag
         id: tag
         run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Lowercase owner
+        id: owner
+        run: echo "name=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -40,8 +44,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.version }}
+            ${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/${{ env.IMAGE_NAME }}:latest
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -51,7 +55,7 @@ jobs:
         env:
           BLIP_TAG: ${{ steps.tag.outputs.version }}
         run: |
-          export REGISTRY="${{ env.REGISTRY }}"
+          export REGISTRY="${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}"
           export BLIP_TAG
           mkdir -p dist
           envsubst '$REGISTRY $BLIP_TAG' < deploy.yaml > dist/manifest.yaml
