@@ -152,7 +152,7 @@ func Forward(ctx context.Context, sessionID string, serverConn *ssh.ServerConn, 
 			if !ok {
 				return
 			}
-			go bridgeClientChannel(ctx, sessionID, upstream, newChan)
+			go BridgeNewClientChannel(ctx, sessionID, upstream, newChan)
 		case newChan, ok := <-upstreamForwardedChans:
 			if !ok {
 				upstreamForwardedChans = nil
@@ -194,10 +194,6 @@ func BridgeClientChannel(ctx context.Context, sessionID string, upstream *ssh.Cl
 
 // BridgeNewClientChannel accepts a client channel, opens an upstream match, and bridges them.
 func BridgeNewClientChannel(ctx context.Context, sessionID string, upstream *ssh.Client, newChan ssh.NewChannel) {
-	bridgeClientChannel(ctx, sessionID, upstream, newChan)
-}
-
-func bridgeClientChannel(ctx context.Context, sessionID string, upstream *ssh.Client, newChan ssh.NewChannel) {
 	slog.Debug("client channel open", "session_id", sessionID, "type", newChan.ChannelType())
 
 	upstreamChan, upstreamReqs, err := upstream.OpenChannel(newChan.ChannelType(), newChan.ExtraData())

@@ -53,7 +53,7 @@ type Server struct {
 
 // New creates a Server ready to accept SSH connections.
 func New(cfg Config) (*Server, error) {
-	hostSigner, err := loadSigner(cfg.HostKeyPath, "host key")
+	hostSigner, err := LoadSigner(cfg.HostKeyPath, "host key")
 	if err != nil {
 		return nil, err
 	}
@@ -126,8 +126,8 @@ func (s *Server) Serve(ctx context.Context, handler ConnHandler) error {
 // Close immediately closes the listener.
 func (s *Server) Close() error { return s.listener.Close() }
 
-// loadSigner reads a PEM-encoded SSH private key from path.
-func loadSigner(path, label string) (ssh.Signer, error) {
+// LoadSigner reads a PEM-encoded SSH private key from path.
+func LoadSigner(path, label string) (ssh.Signer, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s %s: %w", label, path, err)

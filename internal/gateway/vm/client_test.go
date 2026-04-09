@@ -25,10 +25,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// ---------------------------------------------------------------------------
-// Test helpers
-// ---------------------------------------------------------------------------
-
 const testNamespace = "test-ns"
 
 // fakeCache wraps a fake client.WithWatch to satisfy the cache.Cache interface.
@@ -57,17 +53,13 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-// newTestClient builds a Client with a fake cache and writer. Objects are
-// shared between both so that writes via the writer are visible through the
-// cache. Each call produces independent state.
-func newTestClient(t *testing.T, objs ...client.Object) *Client {
+// newIndexedBuilder returns a ClientBuilder pre-configured with the shared
+// scheme, REST mapper, seed objects, and the three VM indexes used by Client.
+func newIndexedBuilder(t *testing.T, objs ...client.Object) *fake.ClientBuilder {
 	t.Helper()
-	s := testScheme(t)
-	mapper := newStaticRESTMapper()
-
-	builder := fake.NewClientBuilder().
-		WithScheme(s).
-		WithRESTMapper(mapper).
+	return fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithRESTMapper(newStaticRESTMapper()).
 		WithObjects(objs...).
 		WithIndex(&kubevirtv1.VirtualMachine{}, indexVMPool, func(obj client.Object) []string {
 			pool := obj.GetLabels()["blip.io/pool"]
@@ -93,9 +85,14 @@ func newTestClient(t *testing.T, objs ...client.Object) *Client {
 			}
 			return []string{user}
 		})
+}
 
-	fc := builder.Build()
-
+// newTestClient builds a Client with a fake cache and writer. Objects are
+// shared between both so that writes via the writer are visible through the
+// cache. Each call produces independent state.
+func newTestClient(t *testing.T, objs ...client.Object) *Client {
+	t.Helper()
+	fc := newIndexedBuilder(t, objs...).Build()
 	return &Client{
 		cache:     fakeCache{fc},
 		writer:    fc,
@@ -107,47 +104,16 @@ func newTestClient(t *testing.T, objs ...client.Object) *Client {
 // allowing interceptors on the writer for error injection.
 func newTestClientSplit(t *testing.T, writerInterceptor interceptor.Funcs, objs ...client.Object) *Client {
 	t.Helper()
-	s := testScheme(t)
-	mapper := newStaticRESTMapper()
-
-	cacheBuilder := fake.NewClientBuilder().
-		WithScheme(s).
-		WithRESTMapper(mapper).
+	cacheClient := newIndexedBuilder(t, objs...).Build()
+	writerClient := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithRESTMapper(newStaticRESTMapper()).
 		WithObjects(objs...).
-		WithIndex(&kubevirtv1.VirtualMachine{}, indexVMPool, func(obj client.Object) []string {
-			pool := obj.GetLabels()["blip.io/pool"]
-			if pool == "" {
-				return nil
-			}
-			return []string{pool}
-		}).
-		WithIndex(&kubevirtv1.VirtualMachine{}, indexVMSessionID, func(obj client.Object) []string {
-			sid := obj.GetAnnotations()["blip.io/session-id"]
-			if sid == "" {
-				return nil
-			}
-			return []string{sid}
-		}).
-		WithIndex(&kubevirtv1.VirtualMachine{}, indexVMUser, func(obj client.Object) []string {
-			user := obj.GetAnnotations()["blip.io/user"]
-			if user == "" {
-				return nil
-			}
-			if obj.GetAnnotations()["blip.io/session-id"] == "" {
-				return nil
-			}
-			return []string{user}
-		})
-
-	writerBuilder := fake.NewClientBuilder().
-		WithScheme(s).
-		WithRESTMapper(mapper).
-		WithObjects(objs...).
-		WithInterceptorFuncs(writerInterceptor)
-
+		WithInterceptorFuncs(writerInterceptor).
+		Build()
 	return &Client{
-		cache:     fakeCache{cacheBuilder.Build()},
-		writer:    writerBuilder.Build(),
+		cache:     fakeCache{cacheClient},
+		writer:    writerClient,
 		namespace: testNamespace,
 	}
 }
@@ -250,10 +216,6 @@ func makeNode(name string, labels map[string]string) *corev1.Node {
 		},
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 func TestClaim(t *testing.T) {
 	t.Run("success: claims an unclaimed ready VM and returns connection details", func(t *testing.T) {
@@ -453,14 +415,9 @@ func TestStoreAuthFingerprint(t *testing.T) {
 
 func TestGetHostKey(t *testing.T) {
 	t.Run("returns host key from annotation", func(t *testing.T) {
-		vm := &kubevirtv1.VirtualMachine{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:            "vm-hk",
-				Namespace:       testNamespace,
-				Annotations:     map[string]string{"blip.io/host-key": "ssh-ed25519 AAAA..."},
-				ResourceVersion: "1",
-			},
-		}
+		vm := makeVM("vm-hk", "test", time.Now(), map[string]string{
+			"blip.io/host-key": "ssh-ed25519 AAAA...",
+		})
 
 		c := newTestClient(t, vm)
 		key, err := c.GetHostKey(context.Background(), "vm-hk")
@@ -469,13 +426,10 @@ func TestGetHostKey(t *testing.T) {
 	})
 
 	t.Run("error when annotation is missing", func(t *testing.T) {
-		vm := &kubevirtv1.VirtualMachine{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:            "vm-nokey",
-				Namespace:       testNamespace,
-				ResourceVersion: "1",
-			},
-		}
+		vm := makeVM("vm-nokey", "test", time.Now(), map[string]string{
+			"blip.io/host-key": "",
+		})
+		delete(vm.Annotations, "blip.io/host-key")
 
 		c := newTestClient(t, vm)
 		_, err := c.GetHostKey(context.Background(), "vm-nokey")
@@ -581,16 +535,8 @@ func TestVmiInstance(t *testing.T) {
 			ip:    "10.0.0.1",
 		},
 		{
-			name: "not ready VMI with IP",
-			vmi: &kubevirtv1.VirtualMachineInstance{
-				ObjectMeta: metav1.ObjectMeta{Name: "vm-nr"},
-				Status: kubevirtv1.VirtualMachineInstanceStatus{
-					Conditions: []kubevirtv1.VirtualMachineInstanceCondition{
-						{Type: kubevirtv1.VirtualMachineInstanceReady, Status: corev1.ConditionFalse},
-					},
-					Interfaces: []kubevirtv1.VirtualMachineInstanceNetworkInterface{{IP: "10.0.0.2"}},
-				},
-			},
+			name:  "not ready VMI with IP",
+			vmi:   makeUnreadyVMI("vm-nr", "10.0.0.2"),
 			ready: false,
 			ip:    "10.0.0.2",
 		},
@@ -629,30 +575,26 @@ func TestVmiInstance(t *testing.T) {
 }
 
 func TestSetClaimAnnotations(t *testing.T) {
-	t.Run("sets all expected annotations including ephemeral", func(t *testing.T) {
-		a := &allocation{}
-		setClaimAnnotations(a, "sess-123", "gw-pod-1", 7200, "alice@example.com")
+	// With user identity.
+	a := &allocation{}
+	setClaimAnnotations(a, "sess-123", "gw-pod-1", 7200, "alice@example.com")
 
-		assert.Equal(t, "sess-123", a.Annotations["blip.io/session-id"])
-		assert.Equal(t, "gw-pod-1", a.Annotations["blip.io/claimed-by"])
-		assert.Equal(t, "7200", a.Annotations["blip.io/max-duration"])
-		assert.Equal(t, "alice@example.com", a.Annotations["blip.io/user"])
-		assert.Equal(t, "true", a.Annotations["blip.io/ephemeral"])
+	assert.Equal(t, "sess-123", a.Annotations["blip.io/session-id"])
+	assert.Equal(t, "gw-pod-1", a.Annotations["blip.io/claimed-by"])
+	assert.Equal(t, "7200", a.Annotations["blip.io/max-duration"])
+	assert.Equal(t, "alice@example.com", a.Annotations["blip.io/user"])
+	assert.Equal(t, "true", a.Annotations["blip.io/ephemeral"])
+	_, err := time.Parse(time.RFC3339, a.Annotations["blip.io/claimed-at"])
+	assert.NoError(t, err)
 
-		// claimed-at should be a valid RFC3339 timestamp.
-		_, err := time.Parse(time.RFC3339, a.Annotations["blip.io/claimed-at"])
-		assert.NoError(t, err)
-	})
+	// Without user identity — annotation must be absent.
+	b := &allocation{}
+	setClaimAnnotations(b, "sess-456", "gw-pod-2", 300, "")
 
-	t.Run("omits user annotation when empty", func(t *testing.T) {
-		a := &allocation{}
-		setClaimAnnotations(a, "sess-456", "gw-pod-2", 300, "")
-
-		assert.Equal(t, "sess-456", a.Annotations["blip.io/session-id"])
-		_, hasUser := a.Annotations["blip.io/user"]
-		assert.False(t, hasUser)
-		assert.Equal(t, "true", a.Annotations["blip.io/ephemeral"])
-	})
+	assert.Equal(t, "sess-456", b.Annotations["blip.io/session-id"])
+	_, hasUser := b.Annotations["blip.io/user"]
+	assert.False(t, hasUser)
+	assert.Equal(t, "true", b.Annotations["blip.io/ephemeral"])
 }
 
 func TestAllocationFromObject(t *testing.T) {
@@ -772,10 +714,6 @@ func TestClaimEndToEnd(t *testing.T) {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// ReleaseVM
-// ---------------------------------------------------------------------------
-
 func TestReleaseVM(t *testing.T) {
 	t.Run("sets release annotation on VM", func(t *testing.T) {
 		vm := makeVM("vm-rel", "pool-r", time.Now(), map[string]string{
@@ -804,10 +742,6 @@ func TestReleaseVM(t *testing.T) {
 		assert.Contains(t, err.Error(), "not found")
 	})
 }
-
-// ---------------------------------------------------------------------------
-// IsEphemeral
-// ---------------------------------------------------------------------------
 
 func TestIsEphemeral(t *testing.T) {
 	t.Run("returns true for ephemeral VM", func(t *testing.T) {
@@ -851,14 +785,6 @@ func TestIsEphemeral(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
-
-// ---------------------------------------------------------------------------
-// Retain
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// ResolveRootIdentity
-// ---------------------------------------------------------------------------
 
 func TestResolveRootIdentity(t *testing.T) {
 	t.Run("resolves root identity from SSH public key fingerprint", func(t *testing.T) {
@@ -914,10 +840,6 @@ func TestResolveRootIdentity(t *testing.T) {
 		assert.Equal(t, "root-user@corp.com", identity)
 	})
 }
-
-// ---------------------------------------------------------------------------
-// Retain
-// ---------------------------------------------------------------------------
 
 func TestRetain(t *testing.T) {
 	t.Run("marks VM as non-ephemeral", func(t *testing.T) {

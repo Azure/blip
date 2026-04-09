@@ -85,9 +85,9 @@ func RunGateway(cfg *GatewayConfig) error {
 	}
 
 	// Load the stable shared client key for dialing upstream VMs.
-	clientSigner, err := loadSigner(cfg.ClientKeyPath)
+	clientSigner, err := server.LoadSigner(cfg.ClientKeyPath, "gateway client key")
 	if err != nil {
-		return fmt.Errorf("load gateway client key: %w", err)
+		return err
 	}
 	slog.Info("gateway client key loaded",
 		"fingerprint", ssh.FingerprintSHA256(clientSigner.PublicKey()),
@@ -136,34 +136,12 @@ func RunGateway(cfg *GatewayConfig) error {
 		srv.Close()
 		mgr.NotifyShutdown()
 
-		done := make(chan struct{})
-		go func() {
-			<-done
-		}()
-
-		select {
-		case <-done:
-			slog.Info("all sessions drained, exiting")
-		case <-time.After(drainTimeout):
-			slog.Warn("session drain timeout, forcing exit")
-		}
+		time.Sleep(drainTimeout)
+		slog.Warn("session drain timeout, forcing exit")
 		os.Exit(0)
 	}()
 
 	return srv.Serve(ctx, mgr.HandleConnection)
-}
-
-// loadSigner reads a PEM-encoded SSH private key from path.
-func loadSigner(path string) (ssh.Signer, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read key %s: %w", path, err)
-	}
-	signer, err := ssh.ParsePrivateKey(data)
-	if err != nil {
-		return nil, fmt.Errorf("parse key %s: %w", path, err)
-	}
-	return signer, nil
 }
 
 // vmKeyResolverAdapter adapts vm.Client to the auth.VMKeyResolver interface

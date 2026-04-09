@@ -25,22 +25,18 @@ import (
 
 const testNamespace = "test-ns"
 
-func testClient(t *testing.T, objs ...client.Object) client.Client {
-	t.Helper()
+var testScheme = func() *runtime.Scheme {
 	s := runtime.NewScheme()
-	require.NoError(t, corev1.AddToScheme(s))
-	return fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(objs...).
-		Build()
-}
+	if err := corev1.AddToScheme(s); err != nil {
+		panic(err)
+	}
+	return s
+}()
 
-func testClientWithInterceptor(t *testing.T, fns interceptor.Funcs, objs ...client.Object) client.Client {
+func testClient(t *testing.T, fns interceptor.Funcs, objs ...client.Object) client.Client {
 	t.Helper()
-	s := runtime.NewScheme()
-	require.NoError(t, corev1.AddToScheme(s))
 	return fake.NewClientBuilder().
-		WithScheme(s).
+		WithScheme(testScheme).
 		WithObjects(objs...).
 		WithInterceptorFuncs(fns).
 		Build()
@@ -66,10 +62,6 @@ func generateTestHostKeyPEM(t *testing.T) []byte {
 	require.NoError(t, err)
 	return pem.EncodeToMemory(pemBlock)
 }
-
-// ---------------------------------------------------------------------------
-// ensureSecret
-// ---------------------------------------------------------------------------
 
 func TestEnsureSecret(t *testing.T) {
 	tests := []struct {
@@ -115,12 +107,7 @@ func TestEnsureSecret(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var cl client.Client
-			if tt.intercept.Get != nil || tt.intercept.Create != nil {
-				cl = testClientWithInterceptor(t, tt.intercept, tt.existing...)
-			} else {
-				cl = testClient(t, tt.existing...)
-			}
+			cl := testClient(t, tt.intercept, tt.existing...)
 
 			err := ensureSecret(context.Background(), cl, testNamespace, "test-secret", map[string][]byte{"k": []byte("v")})
 
@@ -134,13 +121,9 @@ func TestEnsureSecret(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// ensureHostKey
-// ---------------------------------------------------------------------------
-
 func TestEnsureHostKey(t *testing.T) {
 	t.Run("creates host key secret", func(t *testing.T) {
-		cl := testClient(t)
+		cl := testClient(t, interceptor.Funcs{})
 		err := ensureHostKey(context.Background(), cl, testNamespace)
 		require.NoError(t, err)
 
@@ -154,7 +137,7 @@ func TestEnsureHostKey(t *testing.T) {
 	t.Run("idempotent: existing host key is preserved", func(t *testing.T) {
 		originalKey := generateTestHostKeyPEM(t)
 		existing := makeSecret("ssh-host-key", map[string][]byte{"host_key": originalKey})
-		cl := testClient(t, existing)
+		cl := testClient(t, interceptor.Funcs{}, existing)
 
 		err := ensureHostKey(context.Background(), cl, testNamespace)
 		require.NoError(t, err)
@@ -166,13 +149,9 @@ func TestEnsureHostKey(t *testing.T) {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// initSecretsRunnable.Start – integration
-// ---------------------------------------------------------------------------
-
 func TestInitSecretsRunnableStart(t *testing.T) {
 	t.Run("initializes host key then blocks until context is cancelled", func(t *testing.T) {
-		cl := testClient(t)
+		cl := testClient(t, interceptor.Funcs{})
 		r := initSecretsRunnable{cl: cl, namespace: testNamespace}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -206,7 +185,7 @@ func TestInitSecretsRunnableStart(t *testing.T) {
 	})
 
 	t.Run("returns error when host key initialization fails", func(t *testing.T) {
-		cl := testClientWithInterceptor(t, interceptor.Funcs{
+		cl := testClient(t, interceptor.Funcs{
 			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				return fmt.Errorf("api server down")
 			},

@@ -12,16 +12,6 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// newTestAuthWatcher creates an AuthWatcher pre-loaded with the given repos
-// and pubkey fingerprints (fingerprint -> comment/username), without starting
-// an informer cache. Suitable for unit tests only.
-func newTestAuthWatcher(repos []string, pubkeyFingerprints map[string]string) *AuthWatcher {
-	if pubkeyFingerprints == nil {
-		pubkeyFingerprints = make(map[string]string)
-	}
-	return &AuthWatcher{repos: repos, pubkeys: pubkeyFingerprints}
-}
-
 // generateHostKey creates a fresh host key signer for testing.
 func generateHostKey(t *testing.T) ssh.Signer {
 	t.Helper()
@@ -69,7 +59,7 @@ func TestNewServerConfig(t *testing.T) {
 		cfg := NewServerConfig(Config{
 			HostSigner:   hostKey,
 			MaxAuthTries: 3,
-			AuthWatcher:  newTestAuthWatcher([]string{"org/repo"}, nil),
+			AuthWatcher:  NewTestAuthWatcher([]string{"org/repo"}, nil),
 		})
 
 		assert.NotNil(t, cfg.PublicKeyCallback, "PublicKeyCallback should be set")
@@ -98,7 +88,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 		fp := ssh.FingerprintSHA256(userPub)
 
-		watcher := newTestAuthWatcher(nil, map[string]string{fp: "alice@laptop"})
+		watcher := NewTestAuthWatcher(nil, map[string]string{fp: "alice@laptop"})
 		cb := pubkeyCallback(watcher, nil)
 
 		perms, err := cb(conn, userPub)
@@ -110,7 +100,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 	t.Run("rejects unknown pubkey", func(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
-		watcher := newTestAuthWatcher(nil, map[string]string{"SHA256:other": "bob@desktop"})
+		watcher := NewTestAuthWatcher(nil, map[string]string{"SHA256:other": "bob@desktop"})
 		cb := pubkeyCallback(watcher, nil)
 
 		perms, err := cb(conn, userPub)
@@ -121,7 +111,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 	t.Run("rejects pubkey when watcher has empty set", func(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
-		watcher := newTestAuthWatcher(nil, nil)
+		watcher := NewTestAuthWatcher(nil, nil)
 		cb := pubkeyCallback(watcher, nil)
 
 		perms, err := cb(conn, userPub)
@@ -133,7 +123,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 		fp := ssh.FingerprintSHA256(userPub)
 
-		watcher := newTestAuthWatcher(nil, map[string]string{fp: ""})
+		watcher := NewTestAuthWatcher(nil, map[string]string{fp: ""})
 		cb := pubkeyCallback(watcher, nil)
 
 		perms, err := cb(conn, userPub)
@@ -145,7 +135,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 		fp := ssh.FingerprintSHA256(userPub)
 
-		watcher := newTestAuthWatcher(nil, map[string]string{fp: ""})
+		watcher := NewTestAuthWatcher(nil, map[string]string{fp: ""})
 
 		perms, err := verifyExplicitPubkey(conn, userPub, watcher)
 		assert.Nil(t, perms)
@@ -217,7 +207,7 @@ func TestOIDCCallback(t *testing.T) {
 	conn := fakeConnMeta{user: "runner"}
 
 	t.Run("rejects empty password", func(t *testing.T) {
-		cb := oidcCallback(newTestAuthWatcher([]string{"org/repo"}, nil))
+		cb := oidcCallback(NewTestAuthWatcher([]string{"org/repo"}, nil))
 
 		perms, err := cb(conn, []byte(""))
 		assert.Nil(t, perms)
@@ -225,7 +215,7 @@ func TestOIDCCallback(t *testing.T) {
 	})
 
 	t.Run("rejects whitespace-only password", func(t *testing.T) {
-		cb := oidcCallback(newTestAuthWatcher([]string{"org/repo"}, nil))
+		cb := oidcCallback(NewTestAuthWatcher([]string{"org/repo"}, nil))
 
 		perms, err := cb(conn, []byte("   \t\n  "))
 		assert.Nil(t, perms)
@@ -233,7 +223,7 @@ func TestOIDCCallback(t *testing.T) {
 	})
 
 	t.Run("rejects invalid JWT token", func(t *testing.T) {
-		cb := oidcCallback(newTestAuthWatcher([]string{"org/repo"}, nil))
+		cb := oidcCallback(NewTestAuthWatcher([]string{"org/repo"}, nil))
 
 		perms, err := cb(conn, []byte("not-a-valid-jwt-token"))
 		assert.Nil(t, perms)
@@ -266,7 +256,7 @@ func TestPubkeyAuthEndToEnd(t *testing.T) {
 	sshCfg := NewServerConfig(Config{
 		HostSigner:   hostKey,
 		MaxAuthTries: 1,
-		AuthWatcher:  newTestAuthWatcher(nil, map[string]string{fp: "alice@laptop"}),
+		AuthWatcher:  NewTestAuthWatcher(nil, map[string]string{fp: "alice@laptop"}),
 	})
 
 	conn := fakeConnMeta{user: "runner"}

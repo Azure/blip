@@ -108,46 +108,7 @@ func ensureConfigMap(ctx context.Context, cl client.Client, namespace, name stri
 // The private key is stored in a Secret and the public key in a ConfigMap
 // so VMs can pin the gateway identity for known_hosts.
 func ensureHostKey(ctx context.Context, cl client.Client, namespace string) error {
-	var privPEM []byte
-
-	// Check if the Secret already exists; if so, derive the public key from it.
-	var existing corev1.Secret
-	err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "ssh-host-key"}, &existing)
-	if err == nil {
-		privPEM = existing.Data["host_key"]
-	} else if !k8serrors.IsNotFound(err) {
-		return fmt.Errorf("check host key secret: %w", err)
-	}
-
-	// Generate a new key pair only if no Secret exists.
-	if len(privPEM) == 0 {
-		_, priv, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return fmt.Errorf("generate host key: %w", err)
-		}
-		pemBlock, err := ssh.MarshalPrivateKey(priv, "")
-		if err != nil {
-			return fmt.Errorf("marshal host key: %w", err)
-		}
-		privPEM = pem.EncodeToMemory(pemBlock)
-
-		if err := ensureSecret(ctx, cl, namespace, "ssh-host-key", map[string][]byte{
-			"host_key": privPEM,
-		}); err != nil {
-			return err
-		}
-	}
-
-	// Derive the public key from the private key for the ConfigMap.
-	signer, err := ssh.ParsePrivateKey(privPEM)
-	if err != nil {
-		return fmt.Errorf("parse host key for pubkey derivation: %w", err)
-	}
-	authorizedKey := string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
-
-	return ensureConfigMap(ctx, cl, namespace, "ssh-gateway-host-pubkey", map[string]string{
-		"host_key.pub": authorizedKey,
-	})
+	return ensureKeyPair(ctx, cl, namespace, "ssh-host-key", "host_key", "ssh-gateway-host-pubkey", "host_key.pub", "host key")
 }
 
 // ensureClientKey generates a stable Ed25519 client key pair for the SSH
@@ -155,44 +116,48 @@ func ensureHostKey(ctx context.Context, cl client.Client, namespace string) erro
 // Secret (mounted by the gateway pods) and the public key is stored in a
 // ConfigMap so VMs can load it into their authorized_keys.
 func ensureClientKey(ctx context.Context, cl client.Client, namespace string) error {
+	return ensureKeyPair(ctx, cl, namespace, "ssh-gateway-client-key", "client_key", "ssh-gateway-client-pubkey", "client_key.pub", "client key")
+}
+
+// ensureKeyPair generates and stores an Ed25519 key pair as a Secret (private)
+// and ConfigMap (public authorized_keys format). If the Secret already exists,
+// the public key is derived from it without regeneration.
+func ensureKeyPair(ctx context.Context, cl client.Client, namespace, secretName, secretKey, cmName, cmKey, label string) error {
 	var privPEM []byte
 
-	// Check if the Secret already exists; if so, derive the public key from it.
 	var existing corev1.Secret
-	err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "ssh-gateway-client-key"}, &existing)
+	err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &existing)
 	if err == nil {
-		privPEM = existing.Data["client_key"]
+		privPEM = existing.Data[secretKey]
 	} else if !k8serrors.IsNotFound(err) {
-		return fmt.Errorf("check client key secret: %w", err)
+		return fmt.Errorf("check %s secret: %w", label, err)
 	}
 
-	// Generate a new key pair only if no Secret exists.
 	if len(privPEM) == 0 {
 		_, priv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
-			return fmt.Errorf("generate client key: %w", err)
+			return fmt.Errorf("generate %s: %w", label, err)
 		}
 		pemBlock, err := ssh.MarshalPrivateKey(priv, "")
 		if err != nil {
-			return fmt.Errorf("marshal client key: %w", err)
+			return fmt.Errorf("marshal %s: %w", label, err)
 		}
 		privPEM = pem.EncodeToMemory(pemBlock)
 
-		if err := ensureSecret(ctx, cl, namespace, "ssh-gateway-client-key", map[string][]byte{
-			"client_key": privPEM,
+		if err := ensureSecret(ctx, cl, namespace, secretName, map[string][]byte{
+			secretKey: privPEM,
 		}); err != nil {
 			return err
 		}
 	}
 
-	// Derive the public key from the private key for the ConfigMap.
 	signer, err := ssh.ParsePrivateKey(privPEM)
 	if err != nil {
-		return fmt.Errorf("parse client key for pubkey derivation: %w", err)
+		return fmt.Errorf("parse %s for pubkey derivation: %w", label, err)
 	}
 	authorizedKey := string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
 
-	return ensureConfigMap(ctx, cl, namespace, "ssh-gateway-client-pubkey", map[string]string{
-		"client_key.pub": authorizedKey,
+	return ensureConfigMap(ctx, cl, namespace, cmName, map[string]string{
+		cmKey: authorizedKey,
 	})
 }

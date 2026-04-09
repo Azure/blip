@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -82,8 +83,6 @@ func allowedPubkeyClientConfig(t *testing.T) (*ssh.ClientConfig, string) {
 		Timeout:         3 * time.Second,
 	}, fp
 }
-
-// ---------- Tests ----------
 
 func TestNew(t *testing.T) {
 	tests := []struct {
@@ -254,17 +253,7 @@ func TestServe_UnauthenticatedClientRejected(t *testing.T) {
 	}()
 
 	// Try connecting with a random key not in the allowed list.
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	require.NoError(t, err)
-	signer, err := ssh.NewSignerFromKey(priv)
-	require.NoError(t, err)
-
-	clientCfg := &ssh.ClientConfig{
-		User:            "runner",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         2 * time.Second,
-	}
+	clientCfg, _ := allowedPubkeyClientConfig(t) // generates a key not in the allowed set
 	_, err = ssh.Dial("tcp", srv.Addr().String(), clientCfg)
 	assert.Error(t, err)
 
@@ -350,13 +339,7 @@ func TestServe_HandshakeTimeout(t *testing.T) {
 	require.NoError(t, err)
 
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buf := make([]byte, 4096)
-	for {
-		_, readErr := conn.Read(buf)
-		if readErr != nil {
-			break
-		}
-	}
+	_, _ = io.ReadAll(conn)
 	conn.Close()
 
 	cancel()
@@ -392,8 +375,8 @@ func TestAddr(t *testing.T) {
 	addr := srv.Addr()
 	require.NotNil(t, addr)
 
-	tcpAddr, ok := addr.(*net.TCPAddr)
-	require.True(t, ok)
+	assert.IsType(t, &net.TCPAddr{}, addr)
+	tcpAddr := addr.(*net.TCPAddr)
 	assert.NotZero(t, tcpAddr.Port, "port should be non-zero when using :0")
 	assert.Equal(t, "127.0.0.1", tcpAddr.IP.String())
 }
@@ -438,7 +421,7 @@ func TestLoadSigner(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			path := tt.setup(dir)
-			signer, err := loadSigner(path, "test key")
+			signer, err := LoadSigner(path, "test key")
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
