@@ -578,9 +578,9 @@ def setup():
     GATEWAY_HOST = wait_for(resolve_gateway_ip, "gateway LoadBalancer IP", timeout=30)
     log(f"    Gateway: {GATEWAY_HOST}:{GATEWAY_PORT}")
 
-    # 10. Wait for VMs (need at least 2 for the recurse test which runs first)
+    # 10. Wait for VMs (ephemeral runs first, only needs 1)
     log("  Waiting for VMs...")
-    wait_for_pool_ready(min_ready=2, timeout=480)
+    wait_for_pool_ready(min_ready=1, timeout=480)
 
     # 11. TOFU: record the gateway's host key. All replicas share the same
     #     stable key, so this mirrors the real user experience.
@@ -841,9 +841,9 @@ def test_recurse_session():
 
 def main():
     tests = [
-        test_recurse_session,     # needs 2 VMs — run first when pool is fresh
-        test_ephemeral_session,
-        test_retained_session,
+        test_ephemeral_session,   # single VM — pool has all replicas ready
+        test_retained_session,    # single VM — pool mostly full
+        test_recurse_session,     # needs 2 VMs — run after singles so pool has replenished
         test_retained_with_ttl,   # long idle wait — run last
     ]
 
