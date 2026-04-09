@@ -3,9 +3,8 @@
 
 Verifies:
   1. Ephemeral session: connect, confirm blip, disconnect -> VM deleted
-  2. Retained session:  connect, retain, disconnect, reconnect -> SCP + port-forward
-  3. Retained with TTL: connect, retain --ttl 45s -> VM expires -> disconnect -> VM deleted
-  4. Recurse session:   SSH from one blip to another via "ssh blip"
+  2. Retained session:  retain with TTL, reconnect, SCP, port-forward,
+                        recurse (ssh blip from inside VM), TTL expiry
 """
 
 import json
@@ -18,10 +17,11 @@ import sys
 import tempfile
 import time
 import traceback
+from datetime import datetime, timezone
 
 NAMESPACE = "blip"
 POOL_NAME = "blip"
-REPLICAS = 3
+REPLICAS = 4
 SSH_USER = "runner"
 IMAGE_NAME = "localhost/blip:smoke"
 
@@ -579,9 +579,23 @@ def setup():
     GATEWAY_HOST = wait_for(resolve_gateway_ip, "gateway LoadBalancer IP", timeout=30)
     log(f"    Gateway: {GATEWAY_HOST}:{GATEWAY_PORT}")
 
-    # 10. Wait for VMs (ephemeral runs first, only needs 1)
+    # 10. Wait for all VMs to be ready up-front.  The test sequence consumes
+    #     VMs faster than the pool controller can replace them (each
+    #     replacement VM takes 60-120s to boot on software-emulated KubeVirt).
+    #     By ensuring all replicas are ready before the first test, every
+    #     subsequent wait_for_pool_ready() is satisfied by VMs that were
+    #     provisioned in this initial (and only) round:
+    #
+    #       Setup TOFU probe : 1 VM (ephemeral, deleted)
+    #       test_ephemeral   : 1 VM (deleted)
+    #       test_retained    : 2 VMs (outer retained + inner recursive)
+    #                          ----
+    #                          4 VMs consumed sequentially
+    #
+    #     With REPLICAS=4 and all 4 ready here, the pool always has enough
+    #     unclaimed VMs for the next test without a second provisioning round.
     log("  Waiting for VMs...")
-    wait_for_pool_ready(min_ready=1, timeout=480)
+    wait_for_pool_ready(min_ready=REPLICAS, timeout=480)
 
     # 11. TOFU: record the gateway's host key. All replicas share the same
     #     stable key, so this mirrors the real user experience.
@@ -649,11 +663,26 @@ def test_ephemeral_session():
 
 
 def test_retained_session():
-    """Connect, retain, disconnect, reconnect, SCP, port-forward."""
-    wait_for_pool_ready(min_ready=1)
+    """Retained session with reconnect, SCP, port-forward, recurse, and TTL.
 
-    # Connect and retain
-    stdout, stderr, rc = ssh_session(SSH_USER, "blip retain && echo RETAINED_OK")
+    This consolidated test covers:
+      - retain with --ttl: connect, retain with a 180s TTL
+      - reconnect: disconnect and reconnect using session ID
+      - SCP: upload and download a file via SCP
+      - port-forward: TCP tunnel through the gateway
+      - recurse: from inside the retained VM, 'ssh blip' allocates a second VM
+      - TTL expiry: the deallocation controller deletes the VM after the TTL
+
+    The test uses at most 2 VMs from the initial pool (the retained outer
+    session and the recursive inner session), avoiding any need to wait for
+    replacement VMs to be provisioned.
+    """
+    wait_for_pool_ready(min_ready=2)
+
+    # -- Phase 1: Connect and retain with TTL --
+    log("    Connecting and retaining with --ttl 180s...")
+    stdout, stderr, rc = ssh_session(
+        SSH_USER, "blip retain --ttl 180s && echo RETAINED_OK")
     assert rc == 0, f"SSH failed (rc={rc}): {stderr}"
     assert "RETAINED_OK" in stdout or "Blip retained successfully" in stdout, \
         f"Retain did not succeed: {stdout}"
@@ -669,14 +698,32 @@ def test_retained_session():
     )
     assert vm_exists(session_id), "Retained VM was deleted"
 
-    # Reconnect using session ID
+    # Verify TTL annotation was set
+    max_dur = vm_annotation(session_id, "blip.io/max-duration")
+    assert max_dur == "180", f"Expected max-duration=180, got {max_dur!r}"
+    log("    TTL annotation verified (180s)")
+
+    # Read claimed-at from the VM annotation for accurate TTL tracking.
+    # The deallocation controller computes expiry as claimed-at + max-duration,
+    # so we use the same reference point rather than a local monotonic clock.
+    claimed_at_str = wait_for(
+        lambda: vm_annotation(session_id, "blip.io/claimed-at"),
+        "claimed-at annotation",
+        timeout=10,
+    )
+    claimed_at = datetime.fromisoformat(claimed_at_str.replace("Z", "+00:00"))
+    if claimed_at.tzinfo is None:
+        claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+    log(f"    Claimed at: {claimed_at_str}")
+
+    # -- Phase 2: Reconnect --
     log("    Reconnecting...")
     stdout, stderr, rc = ssh_session(session_id, "echo RECONNECTED_OK")
     assert rc == 0, f"Reconnect failed (rc={rc}): {stderr}"
     assert "RECONNECTED_OK" in stdout, f"Expected RECONNECTED_OK: {stdout}"
     assert "Reconnected" in stderr, f"Expected reconnect banner: {stderr}"
 
-    # SCP upload
+    # -- Phase 3: SCP upload + download --
     log("    Testing SCP upload...")
     test_file = os.path.join(_tmpdir, "scp_test.txt")
     with open(test_file, "w") as f:
@@ -687,18 +734,19 @@ def test_retained_session():
     assert rc == 0 and "blip-scp-test-data" in stdout, \
         f"SCP upload verify failed: {stdout}"
 
-    # SCP download
     log("    Testing SCP download...")
     dl_file = os.path.join(_tmpdir, "scp_download.txt")
     run(scp_cmd(f"{session_id}@{GATEWAY_HOST}:/tmp/scp_test.txt", dl_file))
     with open(dl_file) as f:
         assert "blip-scp-test-data" in f.read(), "Downloaded file content mismatch"
 
-    # Port forwarding
+    # -- Phase 4: Port forwarding --
     log("    Testing port forwarding...")
-    ssh_session(session_id,
-                "nohup bash -c 'echo PORT_FWD_OK | nc -l -p 9999 -q1' "
-                "&>/dev/null &")
+    _, pf_stderr, pf_rc = ssh_session(
+        session_id,
+        "nohup bash -c 'echo PORT_FWD_OK | nc -l -p 9999 -q1' "
+        "&>/dev/null &")
+    assert pf_rc == 0, f"Failed to start nc listener (rc={pf_rc}): {pf_stderr}"
 
     pf_proc = subprocess.Popen(
         ssh_cmd(session_id, "-L", "18222:localhost:9999", "-N"),
@@ -727,98 +775,15 @@ def test_retained_session():
     finally:
         pf_proc.terminate()
         try:
-            pf_proc.wait(timeout=5)
+            pf_proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             pf_proc.kill()
-            pf_proc.wait()
+            pf_proc.communicate()
 
-    # Release the retained VM
-    log("    Releasing retained VM...")
-    vms = kubectl_json("get", "vm", "-n", NAMESPACE,
-                       "-l", f"blip.io/pool={POOL_NAME}")
-    for item in vms.get("items", []):
-        ann = item.get("metadata", {}).get("annotations", {})
-        if ann.get("blip.io/session-id") == session_id:
-            kubectl("annotate", "vm", item["metadata"]["name"], "-n", NAMESPACE,
-                    "blip.io/release=true", "--overwrite")
-            break
-
-    wait_for_vm_deleted(session_id)
-
-
-def test_retained_with_ttl():
-    """retain --ttl 45s -> VM deleted by deallocation controller.
-
-    'blip retain --ttl 45s' sets blip.io/max-duration=45 on the VM. The
-    deallocation controller deletes the VM once claimed-at + 45s elapses.
-
-    We verify the TTL mechanism by:
-      1. Connecting and retaining with --ttl 45s
-      2. Reading the session ID from the initial SSH output
-      3. Waiting for the VM to be deleted (proving the controller honoured the TTL)
-      4. Terminating the SSH process (the gateway proxy may hold the
-         connection open after the VM dies, so we don't rely on SSH exit)
-    """
-    wait_for_pool_ready(min_ready=1)
-
-    cmd = ssh_cmd(SSH_USER) + [
-        "blip retain --ttl 45s && echo TTL_RETAINED && sleep 300"
-    ]
-
-    log("    Connecting with --ttl 45s retain...")
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    try:
-        # Wait long enough for the SSH session to start and "blip retain"
-        # to execute. The initial output (banner + TTL_RETAINED) arrives
-        # quickly once connected, but the connection itself can take 15-30s
-        # on software-emulated VMs.
-        stdout, stderr = proc.communicate(timeout=60)
-    except subprocess.TimeoutExpired:
-        # The session is still connected (expected — the VM hasn't expired
-        # yet and the remote "sleep 300" is running). Read whatever output
-        # has been produced so far. Since communicate() timed out, we need
-        # to read from the pipes directly.
-        #
-        # Terminate the process first so the pipes close, then collect output.
-        proc.terminate()
-        try:
-            stdout, stderr = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-
-    assert "TTL_RETAINED" in (stdout or ""), \
-        f"TTL retain did not succeed. stdout={stdout!r}, stderr={stderr!r}"
-
-    session_id = extract_session_id(stderr or "")
-    log(f"    Session: {session_id} (TTL 45s)")
-
-    # The VM was claimed ~45s+ ago (including connection time). Wait for
-    # the deallocation controller to delete it once the TTL expires.
-    log("    Waiting for VM deletion (TTL expiry)...")
-    wait_for_vm_deleted(session_id, timeout=120)
-
-
-def test_recurse_session():
-    """SSH from one blip into another via 'ssh blip'.
-
-    The gateway injects SSH credentials and config into each VM so that
-    running 'ssh blip' from inside a blip connects back to the gateway
-    and allocates a new (recursive) blip:
-
-      local -> gateway -> VM-1  --ssh blip-->  gateway -> VM-2
-    """
-    wait_for_pool_ready(min_ready=2)
-
-    # The gateway injects the VM identity asynchronously after the
-    # upstream connection is established, so credentials may not be
-    # available immediately. Retry the inner SSH a few times.
-    # ConnectTimeout=10 keeps each attempt short so retries cycle fast
-    # instead of hanging on the default TCP timeout.
+    # -- Phase 5: Recurse (ssh blip from inside the VM) --
+    log("    Testing recurse (ssh blip from inside VM)...")
     stdout, stderr, rc = ssh_session(
-        SSH_USER,
+        session_id,
         "for i in $(seq 1 30); do "
         "  if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o BatchMode=yes "
         "       blip 'echo RECURSE_OK'; then "
@@ -831,12 +796,16 @@ def test_recurse_session():
     )
     assert rc == 0, f"Recurse SSH failed (rc={rc}): {stderr}"
     assert "RECURSE_OK" in stdout, f"Expected RECURSE_OK in: {stdout}"
+    log("    Recurse verified")
 
-    session_id = extract_session_id(stderr)
-    log(f"    Outer session: {session_id}")
-
-    log("    Waiting for outer VM deletion...")
-    wait_for_vm_deleted(session_id)
+    # -- Phase 6: Wait for TTL expiry --
+    # The deallocation controller deletes the VM once claimed-at + max-duration
+    # elapses.  Use the real claimed-at timestamp for an accurate estimate.
+    now = datetime.now(timezone.utc)
+    elapsed = (now - claimed_at).total_seconds()
+    remaining = max(0, 180 - elapsed)
+    log(f"    Waiting for TTL expiry ({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)...")
+    wait_for_vm_deleted(session_id, timeout=int(remaining) + 60)
 
 
 # ---------------------------------------------------------------------------
@@ -845,10 +814,8 @@ def test_recurse_session():
 
 def main():
     tests = [
-        test_ephemeral_session,   # single VM — pool has all replicas ready
-        test_retained_session,    # single VM — pool mostly full
-        test_recurse_session,     # needs 2 VMs — run after singles so pool has replenished
-        test_retained_with_ttl,   # long idle wait — run last
+        test_ephemeral_session,   # 1 VM — pool has all replicas ready
+        test_retained_session,    # 2 VMs — pool still has 2+ ready after ephemeral
     ]
 
     try:
