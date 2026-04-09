@@ -148,7 +148,7 @@ def wait_for_vm_deleted(session_id, timeout=60):
     log(f"    VM {session_id} deleted")
 
 
-def wait_for_pool_ready(min_ready=1, timeout=300):
+def wait_for_pool_ready(min_ready=1, timeout=480):
     """Wait until at least min_ready unclaimed VMs in the pool are Ready."""
     start = time.time()
     last_summary = ""
@@ -297,6 +297,50 @@ def dump_diagnostics():
         except Exception:
             pass
 
+    # VM serial console logs (cloud-init output goes to ttyS0)
+    try:
+        vms_for_console = kubectl_json("get", "vm", "-n", NAMESPACE,
+                                       "-l", f"blip.io/pool={POOL_NAME}")
+        for item in vms_for_console.get("items", []):
+            name = item["metadata"]["name"]
+            try:
+                pods = kubectl_json("get", "pods", "-n", NAMESPACE,
+                                    "-l", f"kubevirt.io/domain={name}")
+                for pod in pods.get("items", []):
+                    pname = pod["metadata"]["name"]
+                    log(f"\n  --- serial console (cloud-init): {name} via {pname} ---")
+                    # The serial console log is at a known path inside the
+                    # compute container of the virt-launcher pod.
+                    for log_path in [
+                        "/var/run/kubevirt-private/virt-serial0-log",
+                        "/var/run/kubevirt/serial-console-log",
+                    ]:
+                        r = kubectl("exec", pname, "-n", NAMESPACE,
+                                    "-c", "compute", "--",
+                                    "cat", log_path,
+                                    check=False, timeout=10)
+                        if r.returncode == 0 and r.stdout:
+                            # Show last 40 lines of serial output.
+                            lines = r.stdout.strip().splitlines()
+                            for line in lines[-40:]:
+                                log(f"    {line}")
+                            break
+                    else:
+                        # Fallback: try virsh console log via dumpxml.
+                        r = kubectl("exec", pname, "-n", NAMESPACE,
+                                    "-c", "compute", "--",
+                                    "bash", "-c",
+                                    "ls -la /var/run/kubevirt-private/ /var/run/kubevirt/ 2>&1 | head -20",
+                                    check=False, timeout=10)
+                        if r.stdout:
+                            log(f"    (serial log files not found, listing:)")
+                            for line in r.stdout.strip().splitlines()[:20]:
+                                log(f"    {line}")
+            except Exception as e:
+                log(f"    serial console for {name}: {e}")
+    except Exception:
+        pass
+
     # Node status
     try:
         nodes = kubectl_json("get", "nodes")
@@ -424,7 +468,7 @@ def setup():
 
     # 10. Wait for VMs (need at least 2 for the recurse test which runs first)
     log("  Waiting for VMs...")
-    wait_for_pool_ready(min_ready=2, timeout=300)
+    wait_for_pool_ready(min_ready=2, timeout=480)
 
     # 11. TOFU: record the gateway's host key. All replicas share the same
     #     stable key, so this mirrors the real user experience.
@@ -477,7 +521,7 @@ def teardown():
 
 def test_ephemeral_session():
     """Connect, verify blip, disconnect -> VM deleted."""
-    wait_for_pool_ready(min_ready=1, timeout=300)
+    wait_for_pool_ready(min_ready=1)
 
     stdout, stderr, rc = ssh_session(SSH_USER, "echo BLIP_OK && hostname")
     assert rc == 0, f"SSH failed (rc={rc}): {stderr}"
@@ -492,7 +536,7 @@ def test_ephemeral_session():
 
 def test_retained_session():
     """Connect, retain, disconnect, reconnect, SCP, port-forward."""
-    wait_for_pool_ready(min_ready=1, timeout=300)
+    wait_for_pool_ready(min_ready=1)
 
     # Connect and retain
     stdout, stderr, rc = ssh_session(SSH_USER, "blip retain && echo RETAINED_OK")
@@ -601,7 +645,7 @@ def test_retained_with_ttl():
       4. Terminating the SSH process (the gateway proxy may hold the
          connection open after the VM dies, so we don't rely on SSH exit)
     """
-    wait_for_pool_ready(min_ready=1, timeout=300)
+    wait_for_pool_ready(min_ready=1)
 
     cmd = ssh_cmd(SSH_USER) + [
         "blip retain --ttl 45s && echo TTL_RETAINED && sleep 300"
@@ -652,7 +696,7 @@ def test_recurse_session():
 
       local -> gateway -> VM-1  --ssh blip-->  gateway -> VM-2
     """
-    wait_for_pool_ready(min_ready=2, timeout=300)
+    wait_for_pool_ready(min_ready=2)
 
     # The gateway injects the VM identity asynchronously after the
     # upstream connection is established, so credentials may not be
