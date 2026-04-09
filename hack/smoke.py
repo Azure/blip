@@ -597,7 +597,7 @@ def test_retained_with_ttl():
     """
     wait_for_pool_ready(min_ready=1, timeout=300)
 
-    cmd = ssh_cmd(SSH_USER) + [
+    cmd = ssh_cmd(SSH_USER, "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3") + [
         "blip retain --ttl 45s && echo TTL_RETAINED && sleep 300"
     ]
 
@@ -608,12 +608,14 @@ def test_retained_with_ttl():
     try:
         # The remote command runs: retain, echo, then sleep 300.
         # The deallocation controller will kill the VM ~45s after claim,
-        # which terminates the SSH session (and the sleep).
-        stdout, stderr = proc.communicate(timeout=90)
+        # breaking the upstream SSH connection. The client-side
+        # ServerAliveInterval ensures SSH detects the dead connection
+        # promptly (5s * 3 = 15s worst case after upstream dies).
+        stdout, stderr = proc.communicate(timeout=120)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        raise RuntimeError("Session was not terminated after TTL expiry (90s)")
+        raise RuntimeError("Session was not terminated after TTL expiry (120s)")
 
     assert "TTL_RETAINED" in stdout, \
         f"TTL retain did not succeed. stdout={stdout!r}, stderr={stderr!r}"
