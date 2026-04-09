@@ -303,7 +303,11 @@ stringData:
             	systemctl enable ssh
             	systemctl restart ssh
 
-            	# --- 5. Register host-key and client-key annotations ---
+            	# --- 5. Debug: dump token claims to serial console ---
+            	echo "[blip-setup] token payload (claims):"
+            	printf '%s' "$token" | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "[blip-setup] (could not decode token)"
+
+            	# --- 6. Register host-key and client-key annotations ---
             	# This is the readiness signal: once these annotations are set,
             	# the gateway considers this VM eligible for allocation.
             	local host_key client_key patch
@@ -311,25 +315,29 @@ stringData:
             	client_key="$(awk '{print $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
             	patch=$(printf '{"metadata":{"annotations":{"blip.io/host-key":"%s","blip.io/client-key":"%s"}}}' "$host_key" "$client_key")
 
-            	local ok=false code
+            	local ok=false code resp_body
             	for _retry in $(seq 1 10); do
-            		code=$(curl --silent --connect-timeout 5 --max-time 10 --output /dev/null --write-out "%{http_code}" \
+            		resp_body=$(curl --silent --connect-timeout 5 --max-time 10 --write-out "\n%{http_code}" \
             			--cacert "$ca" \
             			-X PATCH \
             			-H "Authorization: Bearer ${token}" \
             			-H "Content-Type: application/merge-patch+json" \
             			-d "$patch" \
             			"$api_url")
+            		code=$(printf '%s' "$resp_body" | tail -1)
+            		resp_body=$(printf '%s' "$resp_body" | sed '$d')
             		if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
             			ok=true
             			break
             		fi
             		echo "[blip-setup] PATCH retry $_retry: HTTP $code"
+            		echo "[blip-setup] response: $resp_body"
             		sleep 2
             	done
 
             	if [ "$ok" != "true" ]; then
             		echo "[blip-setup] FATAL: failed to register key annotations (HTTP $code)" >&2
+            		echo "[blip-setup] last response: $resp_body" >&2
             		exit 1
             	fi
 
