@@ -37,6 +37,7 @@ const (
 type Config struct {
 	GatewaySigner      ssh.Signer
 	GatewayHost        string
+	ExternalHost       string
 	VMClient           *vm.Client
 	VMPoolName         string
 	PodName            string
@@ -78,7 +79,7 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 		close(bufferedReqs)
 	}()
 
-	authFingerprint, authIdentity := extractAuthExtensions(serverConn)
+	authFingerprint, authIdentity, isVMClient := extractAuthExtensions(serverConn)
 
 	slog.Info("client authenticated",
 		"user", serverConn.User(),
@@ -131,14 +132,14 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 	site := m.cfg.VMClient.GetNodeLabel(ctx, alloc.NodeName, "unbounded.aks.azure.com/site")
 
 	if reconnecting {
-		slog.Info("VM reconnected",
+		slog.Info("blip reconnected",
 			"session_id", sessionID,
 			"vm_name", alloc.Name,
 			"vm_ip", alloc.PodIP,
 			"remote", remoteAddr,
 		)
 	} else {
-		slog.Info("VM claimed",
+		slog.Info("blip claimed",
 			"session_id", sessionID,
 			"vm_name", alloc.Name,
 			"vm_ip", alloc.PodIP,
@@ -153,7 +154,7 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 
 	hostKey, err := m.cfg.VMClient.GetHostKey(ctx, alloc.Name)
 	if err != nil {
-		slog.Error("failed to read host key for VM",
+		slog.Error("failed to read host key for blip",
 			"vm_name", alloc.Name,
 			"error", err,
 		)
@@ -166,7 +167,7 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 
 	upstreamConn, err := proxy.DialUpstream(alloc.PodIP, m.cfg.GatewaySigner, hostKey)
 	if err != nil {
-		slog.Error("failed to connect to VM",
+		slog.Error("failed to connect to blip",
 			"vm_name", alloc.Name,
 			"vm_ip", alloc.PodIP,
 			"error", err,
@@ -181,12 +182,20 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 		sess.SetBannerChannel(firstClientChan)
 	}
 
-	// Inject SSH config for recursive blip connections (gateway host + key).
+	// Inject SSH config for recursive blip connections (gateway host + key)
+	// and the reconnect host for the `blip retain` command.
 	if !reconnecting && m.cfg.GatewayHost != "" {
+		// VMs allocated from inside another blip (VM client key auth) use
+		// the in-cluster "blip" alias. External users get the public hostname.
+		reconnectHost := m.cfg.ExternalHost
+		if isVMClient {
+			reconnectHost = "blip"
+		}
 		go func() {
 			if err := proxy.InjectGatewayConfig(
 				upstreamConn,
 				m.cfg.GatewayHost,
+				reconnectHost,
 			); err != nil {
 				slog.Warn("failed to inject gateway config",
 					"session_id", sessionID,
@@ -203,7 +212,7 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 	m.register(sessionID, sess)
 	defer m.unregister(sessionID)
 
-	slog.Info("connected to VM",
+	slog.Info("connected to blip",
 		"session_id", sessionID,
 		"vm_name", alloc.Name,
 		"vm_ip", alloc.PodIP,
@@ -226,16 +235,6 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 
 	if firstSession != nil {
 		go proxy.BridgeClientChannel(sessionCtx, sessionID, upstreamConn, firstSession, firstClientChan, firstClientReqs)
-
-		go func() {
-			time.Sleep(500 * time.Millisecond)
-			select {
-			case <-sessionCtx.Done():
-				return
-			default:
-			}
-			writeBanner(firstClientChan, sessionIDBanner(sessionID))
-		}()
 	}
 
 	for _, queuedChan := range queued {
@@ -300,7 +299,7 @@ func (m *Manager) logAndBannerAllocError(ch ssh.Channel, remoteAddr, user string
 	if reconnecting {
 		slog.Warn("reconnect failed", "session_id", user, "remote", remoteAddr, "error", err)
 	} else {
-		slog.Error("no VMs available", "error", err, "session_id", sessionID)
+		slog.Error("no blips available", "error", err, "session_id", sessionID)
 	}
 	writeBanner(ch, allocErrorBanner(reconnecting, err))
 }
@@ -325,10 +324,11 @@ func (m *Manager) releaseIfEphemeral(ctx context.Context, sessionID string) {
 	slog.Info("ephemeral blip released", "session_id", sessionID)
 }
 
-func extractAuthExtensions(conn *ssh.ServerConn) (fingerprint, identity string) {
+func extractAuthExtensions(conn *ssh.ServerConn) (fingerprint, identity string, isVMClient bool) {
 	if conn.Permissions != nil && conn.Permissions.Extensions != nil {
 		fingerprint = conn.Permissions.Extensions[auth.ExtFingerprint]
 		identity = conn.Permissions.Extensions[auth.ExtIdentity]
+		isVMClient = conn.Permissions.Extensions[auth.ExtIsVMClient] == "true"
 	}
 	return
 }

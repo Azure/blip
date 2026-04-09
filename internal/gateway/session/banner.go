@@ -24,7 +24,7 @@ func writeBanner(ch ssh.Channel, banner string) {
 }
 
 func welcomeBanner(reconnecting bool) string {
-	status := ">>> Allocating VM..."
+	status := ">>> Allocating blip..."
 	if reconnecting {
 		status = ">>> Reconnecting..."
 	}
@@ -48,7 +48,7 @@ func vmInfoBanner(sessionID, vmName, site string, reconnecting bool, ttl time.Du
 	}
 	banner := fmt.Sprintf(`  %s
   Session : %s
-  VM      : %s
+  Blip    : %s
   Lease   : ephemeral (%s TTL)`, connMsg, sessionID, vmName, formatDuration(ttl))
 	if site != "" {
 		banner += fmt.Sprintf("\n  Site    : %s", site)
@@ -81,7 +81,7 @@ func shutdownBanner() string {
 -----------------------------------
 
   >>> Gateway is shutting down.
-  >>> Your VM is still running.
+  >>> Your blip is still running.
   >>> Reconnect with your session ID.
 
 -----------------------------------
@@ -90,20 +90,16 @@ func shutdownBanner() string {
 	return crlf(banner)
 }
 
-func sessionIDBanner(sessionID string) string {
-	return crlf(fmt.Sprintf("  [session: %s]\n", sessionID))
-}
-
 // allocErrorBanner returns the user-facing banner text for an allocation or reconnection failure.
 func allocErrorBanner(reconnecting bool, err error) string {
 	if reconnecting {
 		return crlf("\n  >>> Reconnect failed: " + err.Error() + "\n\n")
 	}
-	return crlf("\n  >>> VM allocation failed: " + err.Error() + "\n\n")
+	return crlf("\n  >>> Blip allocation failed: " + err.Error() + "\n\n")
 }
 
-// hostKeyErrorBanner returns the user-facing banner text shown when the VM's
+// hostKeyErrorBanner returns the user-facing banner text shown when the blip's
 // host key cannot be retrieved.
 func hostKeyErrorBanner() string {
-	return crlf("\n  >>> Failed to verify VM identity\n\n")
+	return crlf("\n  >>> Failed to verify blip identity\n\n")
 }

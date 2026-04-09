@@ -70,7 +70,7 @@ func (r *controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, nil
 	}
 
-	slog.Info("deleting VM",
+	slog.Info("deleting blip",
 		"name", vm.Name,
 		"reason", reason,
 		"session_id", ann["blip.io/session-id"],
@@ -86,7 +86,7 @@ func (r *controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, fmt.Errorf("delete VM %s: %w", vm.Name, err)
 	}
 
-	slog.Info("deleted VM", "name", vm.Name, "reason", reason)
+	slog.Info("deleted blip", "name", vm.Name, "reason", reason)
 	return reconcile.Result{}, nil
 }
 

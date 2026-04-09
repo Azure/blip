@@ -41,8 +41,8 @@ func newRootCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "blip-controller",
-		Short: "Kubernetes controller for Blip VM lifecycle management",
-		Long:  "Manages SSH host key generation and VM deallocation for the Blip platform.",
+		Short: "Kubernetes controller for Blip lifecycle management",
+		Long:  "Manages SSH host key generation and blip deallocation for the Blip platform.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !cmd.Flags().Changed("lease-namespace") {
 				leaseNamespace = namespace
@@ -53,8 +53,8 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 
-	cmd.Flags().StringVar(&namespace, "namespace", envOrDefault("VM_NAMESPACE", "blip"), "Kubernetes namespace for VMs (env: VM_NAMESPACE)")
-	cmd.Flags().StringVar(&poolName, "pool-name", envOrDefault("VM_POOL_NAME", "default"), "VM pool name (env: VM_POOL_NAME)")
+	cmd.Flags().StringVar(&namespace, "namespace", envOrDefault("VM_NAMESPACE", "blip"), "Kubernetes namespace for blips (env: VM_NAMESPACE)")
+	cmd.Flags().StringVar(&poolName, "pool-name", envOrDefault("VM_POOL_NAME", "default"), "Blip pool name (env: VM_POOL_NAME)")
 	cmd.Flags().StringVar(&leaseNamespace, "lease-namespace", envOrDefault("LEASE_NAMESPACE", ""), "Namespace for leader election lease; defaults to --namespace (env: LEASE_NAMESPACE)")
 	cmd.Flags().StringVar(&leaseName, "lease-name", envOrDefault("LEASE_NAME", "blip-controller"), "Name of the leader election lease (env: LEASE_NAME)")
 

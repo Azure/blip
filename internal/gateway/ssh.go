@@ -37,6 +37,11 @@ type GatewayConfig struct {
 	// HostPrincipals are the hostnames/IPs used for gateway identification.
 	HostPrincipals []string
 
+	// ExternalHost is the public hostname for the gateway, used in
+	// reconnect instructions shown to users (e.g. "ssh blip-xxx@<host>").
+	// When empty, reconnect messages fall back to <gateway-host> placeholder.
+	ExternalHost string
+
 	LoginGraceTime    time.Duration
 	MaxAuthTries      int
 	KeepAliveInterval time.Duration
@@ -96,6 +101,7 @@ func RunGateway(cfg *GatewayConfig) error {
 	mgr := session.New(session.Config{
 		GatewaySigner:      clientSigner,
 		GatewayHost:        gatewayHost,
+		ExternalHost:       cfg.ExternalHost,
 		VMClient:           vmcl,
 		VMPoolName:         cfg.VMPoolName,
 		PodName:            cfg.PodName,

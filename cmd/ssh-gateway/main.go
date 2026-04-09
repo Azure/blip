@@ -36,12 +36,13 @@ func newRootCmd() *cobra.Command {
 		maxBlipsPerUser    int
 		authConfigMap      string
 		hostPrincipals     []string
+		externalHost       string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "ssh-gateway",
 		Short: "Blip SSH gateway server",
-		Long:  "SSH gateway that authenticates users and proxies connections to Blip VMs.",
+		Long:  "SSH gateway that authenticates users and proxies connections to blips.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if maxSessionDuration <= 0 {
 				return fmt.Errorf("--max-session-duration must be greater than 0, got %d", maxSessionDuration)
@@ -64,6 +65,7 @@ func newRootCmd() *cobra.Command {
 				MaxBlipsPerUser:    maxBlipsPerUser,
 				AuthConfigMap:      authConfigMap,
 				HostPrincipals:     hostPrincipals,
+				ExternalHost:       externalHost,
 				LoginGraceTime:     30 * time.Second,
 				MaxAuthTries:       3,
 				KeepAliveInterval:  60 * time.Second,
@@ -79,13 +81,14 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&listenAddr, "listen-address", envOrDefault("LISTEN_ADDRESS", ":2222"), "TCP address to listen on (env: LISTEN_ADDRESS)")
 	cmd.Flags().StringVar(&hostKeyPath, "host-key-path", envOrDefault("HOST_KEY_PATH", "/etc/blip/host-key/host_key"), "Path to stable host key shared across replicas (env: HOST_KEY_PATH)")
 	cmd.Flags().StringVar(&clientKeyPath, "client-key-path", envOrDefault("CLIENT_KEY_PATH", "/etc/blip/client-key/client_key"), "Path to stable client key shared across replicas (env: CLIENT_KEY_PATH)")
-	cmd.Flags().StringVar(&vmNamespace, "namespace", envOrDefault("VM_NAMESPACE", "blip"), "Kubernetes namespace for VMs (env: VM_NAMESPACE)")
-	cmd.Flags().StringVar(&vmPoolName, "pool-name", envOrDefault("VM_POOL_NAME", "default"), "VM pool name (env: VM_POOL_NAME)")
+	cmd.Flags().StringVar(&vmNamespace, "namespace", envOrDefault("VM_NAMESPACE", "blip"), "Kubernetes namespace for blips (env: VM_NAMESPACE)")
+	cmd.Flags().StringVar(&vmPoolName, "pool-name", envOrDefault("VM_POOL_NAME", "default"), "Blip pool name (env: VM_POOL_NAME)")
 	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "unknown"), "Pod name for identification (env: POD_NAME)")
 	cmd.Flags().IntVar(&maxSessionDuration, "max-session-duration", envOrDefaultInt("MAX_SESSION_DURATION", 43200), "Maximum session duration in seconds (env: MAX_SESSION_DURATION)")
 	cmd.Flags().IntVar(&maxBlipsPerUser, "max-blips-per-user", envOrDefaultInt("MAX_BLIPS_PER_USER", 0), "Per-user blip quota, 0 = unlimited (env: MAX_BLIPS_PER_USER)")
 	cmd.Flags().StringVar(&authConfigMap, "auth-configmap", envOrDefault("AUTH_CONFIGMAP", ""), "ConfigMap name for auth config: allowed GitHub repos (key: \"allowed-repos\") and allowed SSH pubkeys (key: \"allowed-pubkeys\") (env: AUTH_CONFIGMAP)")
 	cmd.Flags().StringSliceVar(&hostPrincipals, "host-principals", envOrDefaultStringSlice("GATEWAY_HOST_PRINCIPALS"), "Hostnames/IPs for gateway identification, comma-separated (env: GATEWAY_HOST_PRINCIPALS)")
+	cmd.Flags().StringVar(&externalHost, "external-host", envOrDefault("GATEWAY_EXTERNAL_HOST", ""), "Public hostname for the gateway, shown in reconnect instructions (env: GATEWAY_EXTERNAL_HOST)")
 
 	return cmd
 }

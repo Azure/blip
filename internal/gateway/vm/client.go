@@ -30,11 +30,11 @@ import (
 var ErrQuotaExceeded = fmt.Errorf("per-user blip quota exceeded")
 
 var (
-	errNoVMsAvailable      = errors.New("no unclaimed ready VMs available")
-	errAllocationFailed    = errors.New("failed to claim a VM after retries")
-	errSessionNotFound     = errors.New("no VM found with the given session ID")
+	errNoVMsAvailable      = errors.New("no unclaimed ready blips available")
+	errAllocationFailed    = errors.New("failed to claim a blip after retries")
+	errSessionNotFound     = errors.New("blip does not exist")
 	errSessionAuthMismatch = errors.New("auth fingerprint does not match the session owner")
-	errSessionVMNotReady   = errors.New("VM for session is not ready")
+	errSessionVMNotReady   = errors.New("blip for session is not ready")
 )
 
 const (
@@ -253,7 +253,7 @@ func (c *Client) StoreAuthFingerprint(ctx context.Context, sessionID, fingerprin
 		a.Annotations["blip.io/auth-fingerprint"] = fingerprint
 		return c.updateAllocation(ctx, &a)
 	}
-	return fmt.Errorf("VM with session ID %s not found", sessionID)
+	return fmt.Errorf("blip with session ID %s not found", sessionID)
 }
 
 // GetHostKey reads the host-key annotation from the VM via a direct API call.
@@ -264,7 +264,7 @@ func (c *Client) GetHostKey(ctx context.Context, vmName string) (string, error) 
 	}
 	key := vm.Annotations["blip.io/host-key"]
 	if key == "" {
-		return "", fmt.Errorf("VM %s has no blip.io/host-key annotation", vmName)
+		return "", fmt.Errorf("blip %s has no blip.io/host-key annotation", vmName)
 	}
 	return key, nil
 }
@@ -298,12 +298,12 @@ func (c *Client) ResolveRootIdentity(ctx context.Context, fingerprint string) (s
 		if ssh.FingerprintSHA256(pub) == fingerprint {
 			user := ann["blip.io/user"]
 			if user == "" {
-				return "", fmt.Errorf("VM %s has no blip.io/user annotation", vm.Name)
+				return "", fmt.Errorf("blip %s has no blip.io/user annotation", vm.Name)
 			}
 			return user, nil
 		}
 	}
-	return "", fmt.Errorf("no VM found with client-key fingerprint %s", fingerprint)
+	return "", fmt.Errorf("no blip found with client-key fingerprint %s", fingerprint)
 }
 
 // MaxLifespan is the absolute maximum lifespan for a blip from its original claim time.
@@ -322,7 +322,7 @@ func (c *Client) ReleaseVM(ctx context.Context, sessionID string) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("VM with session ID %s not found", sessionID)
+	return fmt.Errorf("blip with session ID %s not found", sessionID)
 }
 
 // IsEphemeral reports whether the VM for sessionID is marked as ephemeral.
@@ -334,7 +334,7 @@ func (c *Client) IsEphemeral(ctx context.Context, sessionID string) (bool, error
 	for _, a := range allocs {
 		return a.Annotations["blip.io/ephemeral"] == "true", nil
 	}
-	return false, fmt.Errorf("VM with session ID %s not found", sessionID)
+	return false, fmt.Errorf("blip with session ID %s not found", sessionID)
 }
 
 // Retain marks the VM as non-ephemeral, optionally updating TTL (capped by MaxLifespan).
@@ -349,7 +349,7 @@ func (c *Client) Retain(ctx context.Context, sessionID string, newTTLSeconds int
 		if newTTLSeconds > 0 {
 			claimedAtStr, ok := a.Annotations["blip.io/claimed-at"]
 			if !ok {
-				return "", fmt.Errorf("VM %s missing claimed-at annotation", a.Name)
+				return "", fmt.Errorf("blip %s missing claimed-at annotation", a.Name)
 			}
 			claimedAt, err := time.Parse(time.RFC3339, claimedAtStr)
 			if err != nil {
@@ -375,7 +375,7 @@ func (c *Client) Retain(ctx context.Context, sessionID string, newTTLSeconds int
 		}
 		return a.Annotations["blip.io/session-id"], nil
 	}
-	return "", fmt.Errorf("VM with session ID %s not found", sessionID)
+	return "", fmt.Errorf("blip with session ID %s not found", sessionID)
 }
 
 // GetNodeLabel returns the value of the given label on the named node.
@@ -515,7 +515,7 @@ func vmiInstance(vmi *kubevirtv1.VirtualMachineInstance) (*allocationInstance, e
 	}
 
 	if inst.PodIP == "" {
-		return nil, fmt.Errorf("VMI %s has no IP address in status.interfaces", inst.Name)
+		return nil, fmt.Errorf("blip %s has no IP address in status.interfaces", inst.Name)
 	}
 	return inst, nil
 }

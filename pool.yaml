@@ -171,10 +171,14 @@ stringData:
 
             		echo "Blip retained successfully."
             		if [ -n "$session_id" ]; then
+            			local gw_host="<gateway-host>"
+            			if [ -f "$HOME/.blip/reconnect-host" ]; then
+            				gw_host="$(cat "$HOME/.blip/reconnect-host")"
+            			fi
             			echo ""
             			echo "  Session ID: $session_id"
             			echo ""
-            			echo "  Reconnect with: ssh $session_id@<gateway-host>"
+            			echo "  Reconnect with: ssh $session_id@$gw_host"
             		fi
             		if [ -n "$ttl_flag" ]; then
             			echo "  TTL updated to: $ttl_flag"
@@ -344,23 +348,23 @@ stringData:
 apiVersion: pool.kubevirt.io/v1beta1
 kind: VirtualMachinePool
 metadata:
-  name: default
+  name: blip
   namespace: blip
 spec:
   replicas: 5
   selector:
     matchLabels:
-      blip.io/pool: default
+      blip.io/pool: blip
   virtualMachineTemplate:
     metadata:
       labels:
-        blip.io/pool: default
+        blip.io/pool: blip
     spec:
       runStrategy: Always
       template:
         metadata:
           labels:
-            blip.io/pool: default
+            blip.io/pool: blip
         spec:
           evictionStrategy: None
           priorityClassName: blip-low-priority
