@@ -298,6 +298,9 @@ def dump_diagnostics():
             pass
 
     # VM serial console logs (cloud-init output goes to ttyS0)
+    # KubeVirt stores the serial console log on the host node at a path
+    # that varies by version.  We also try `virsh dumpxml` to find the
+    # log device path dynamically.
     try:
         vms_for_console = kubectl_json("get", "vm", "-n", NAMESPACE,
                                        "-l", f"blip.io/pool={POOL_NAME}")
@@ -309,37 +312,133 @@ def dump_diagnostics():
                 for pod in pods.get("items", []):
                     pname = pod["metadata"]["name"]
                     log(f"\n  --- serial console (cloud-init): {name} via {pname} ---")
-                    # The serial console log is at a known path inside the
-                    # compute container of the virt-launcher pod.
-                    for log_path in [
+
+                    found = False
+
+                    # Approach 1: find the log file via virsh dumpxml
+                    r = kubectl("exec", pname, "-n", NAMESPACE,
+                                "-c", "compute", "--",
+                                "bash", "-c",
+                                "virsh dumpxml --domain default_blip-* 2>/dev/null"
+                                " | grep -A2 'serial' | grep 'source' | head -5"
+                                " || virsh list --name 2>/dev/null",
+                                check=False, timeout=10)
+                    if r.returncode == 0 and r.stdout:
+                        log(f"    virsh serial info: {r.stdout.strip()}")
+
+                    # Approach 2: try known paths
+                    serial_paths = [
                         "/var/run/kubevirt-private/virt-serial0-log",
                         "/var/run/kubevirt/serial-console-log",
-                    ]:
+                        "/var/run/kubevirt-private/{name}/virt-serial0-log",
+                    ]
+                    for log_path in serial_paths:
+                        log_path = log_path.format(name=name)
                         r = kubectl("exec", pname, "-n", NAMESPACE,
                                     "-c", "compute", "--",
                                     "cat", log_path,
                                     check=False, timeout=10)
                         if r.returncode == 0 and r.stdout:
-                            # Show last 40 lines of serial output.
                             lines = r.stdout.strip().splitlines()
-                            for line in lines[-40:]:
+                            for line in lines[-60:]:
                                 log(f"    {line}")
+                            found = True
                             break
-                    else:
-                        # Fallback: try virsh console log via dumpxml.
+
+                    # Approach 3: find any log files under /var/run/kubevirt*
+                    if not found:
                         r = kubectl("exec", pname, "-n", NAMESPACE,
                                     "-c", "compute", "--",
                                     "bash", "-c",
-                                    "ls -la /var/run/kubevirt-private/ /var/run/kubevirt/ 2>&1 | head -20",
+                                    "find /var/run/kubevirt* -name '*serial*' -o -name '*log*' 2>/dev/null"
+                                    " | head -20; echo '---';"
+                                    " ls -laR /var/run/kubevirt-private/ 2>/dev/null | head -40",
                                     check=False, timeout=10)
                         if r.stdout:
-                            log(f"    (serial log files not found, listing:)")
-                            for line in r.stdout.strip().splitlines()[:20]:
+                            log(f"    (searching for serial log files:)")
+                            for line in r.stdout.strip().splitlines()[:50]:
                                 log(f"    {line}")
+
+                    # Approach 4: virt-launcher pod logs (sometimes captures serial)
+                    if not found:
+                        r = kubectl("logs", pname, "-n", NAMESPACE,
+                                    "-c", "compute", "--tail=30",
+                                    check=False, timeout=10)
+                        if r.returncode == 0 and r.stdout:
+                            log(f"    (compute container logs:)")
+                            for line in r.stdout.strip().splitlines()[-30:]:
+                                log(f"    {line}")
+
             except Exception as e:
                 log(f"    serial console for {name}: {e}")
     except Exception:
         pass
+
+    # Decode and dump the SA token from inside a virt-launcher pod.
+    # This lets us check whether KubeVirt's serviceAccountVolume produces
+    # a pod-bound token (with 'pod' in the claims) — needed by the
+    # ValidatingAdmissionPolicy rule #1.
+    try:
+        vms_for_token = kubectl_json("get", "vm", "-n", NAMESPACE,
+                                     "-l", f"blip.io/pool={POOL_NAME}")
+        for item in vms_for_token.get("items", [])[:1]:  # Only need one
+            name = item["metadata"]["name"]
+            pods = kubectl_json("get", "pods", "-n", NAMESPACE,
+                                "-l", f"kubevirt.io/domain={name}")
+            for pod in pods.get("items", [])[:1]:
+                pname = pod["metadata"]["name"]
+                log(f"\n  --- SA token inspection for {name} via {pname} ---")
+
+                # Read the token from the VM's SA disk (the ISO)
+                # KubeVirt mounts the SA token at a path inside the compute
+                # container that can be accessed.  We look for the token file
+                # in the serviceaccount disk image that is generated for the VM.
+                r = kubectl("exec", pname, "-n", NAMESPACE,
+                            "-c", "compute", "--",
+                            "bash", "-c",
+                            # The SA disk is stored as a temporary file by
+                            # KubeVirt.  Find the ISO file that contains the
+                            # token.
+                            "find /var/run/kubevirt-private /var/run/kubevirt "
+                            "-name '*.iso' -o -name 'token' 2>/dev/null "
+                            "| head -20",
+                            check=False, timeout=10)
+                if r.stdout:
+                    log(f"    SA disk/token files: {r.stdout.strip()}")
+
+                # Try to mount the ISO and read the token
+                r = kubectl("exec", pname, "-n", NAMESPACE,
+                            "-c", "compute", "--",
+                            "bash", "-c",
+                            "ISO=$(find /var/run/kubevirt* -name '*service*' -name '*.iso' 2>/dev/null | head -1);"
+                            " if [ -n \"$ISO\" ]; then"
+                            "   mkdir -p /tmp/sa_mount && mount -o loop,ro \"$ISO\" /tmp/sa_mount 2>/dev/null"
+                            "   && cat /tmp/sa_mount/token"
+                            "   && umount /tmp/sa_mount;"
+                            " fi",
+                            check=False, timeout=10)
+                if r.returncode == 0 and r.stdout and r.stdout.startswith("ey"):
+                    token = r.stdout.strip()
+                    # Decode JWT claims
+                    import base64
+                    parts = token.split(".")
+                    if len(parts) >= 2:
+                        payload = parts[1]
+                        # Add padding
+                        payload += "=" * (4 - len(payload) % 4)
+                        try:
+                            claims = json.loads(base64.urlsafe_b64decode(payload))
+                            log(f"    Token claims:")
+                            for k, v in claims.items():
+                                log(f"      {k}: {json.dumps(v)}")
+                        except Exception as e:
+                            log(f"    Failed to decode token: {e}")
+                else:
+                    log(f"    Could not read SA token from ISO (rc={r.returncode})")
+                    if r.stderr:
+                        log(f"    stderr: {r.stderr.strip()[:200]}")
+    except Exception as e:
+        log(f"  SA token inspection failed: {e}")
 
     # Node status
     try:
@@ -372,6 +471,19 @@ def dump_diagnostics():
                     log(r.stderr)
         except Exception as e:
             log(f"  [{label}] logs: {e}")
+
+    # Kubernetes events (may capture admission rejections)
+    try:
+        r = kubectl("get", "events", "-n", NAMESPACE,
+                    "--sort-by=.lastTimestamp",
+                    check=False, timeout=10)
+        if r.returncode == 0 and r.stdout:
+            log(f"\n  --- events in {NAMESPACE} ---")
+            lines = r.stdout.strip().splitlines()
+            for line in lines[-40:]:
+                log(f"    {line}")
+    except Exception:
+        pass
 
     log("\n=== End Diagnostics ===\n")
 
