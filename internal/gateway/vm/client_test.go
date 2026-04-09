@@ -258,11 +258,11 @@ func makeNode(name string, labels map[string]string) *corev1.Node {
 func TestClaim(t *testing.T) {
 	t.Run("success: claims an unclaimed ready VM and returns connection details", func(t *testing.T) {
 		now := time.Now()
-		vm := makeVM("vm-1", "default", now, nil)
+		vm := makeVM("vm-1", "blip", now, nil)
 		vmi := makeReadyVMI("vm-1", "10.0.0.1", "node-1")
 
 		c := newTestClient(t, vm, vmi)
-		result, err := c.Claim(context.Background(), "default", "sess-1", "gw-1", 3600, "", 0)
+		result, err := c.Claim(context.Background(), "blip", "sess-1", "gw-1", 3600, "", 0)
 
 		require.NoError(t, err)
 		assert.Equal(t, "vm-1", result.Name)
@@ -272,7 +272,7 @@ func TestClaim(t *testing.T) {
 
 	t.Run("no VMs available returns specific error", func(t *testing.T) {
 		c := newTestClient(t)
-		_, err := c.Claim(context.Background(), "default", "sess-1", "gw-1", 3600, "", 0)
+		_, err := c.Claim(context.Background(), "blip", "sess-1", "gw-1", 3600, "", 0)
 		assert.ErrorIs(t, err, errNoVMsAvailable)
 	})
 
@@ -879,7 +879,7 @@ func TestResolveRootIdentity(t *testing.T) {
 		c := newTestClient(t)
 		_, err := c.ResolveRootIdentity(context.Background(), "SHA256:unknown")
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "no VM found")
+		assert.Contains(t, err.Error(), "no blip found")
 	})
 
 	t.Run("returns error when VM has no user annotation", func(t *testing.T) {

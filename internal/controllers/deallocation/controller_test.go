@@ -21,7 +21,7 @@ import (
 
 const (
 	testNamespace = "test-ns"
-	testPool      = "default"
+	testPool      = "blip"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {

@@ -32,7 +32,7 @@ resources:
 patches:
   - target:
       kind: VirtualMachinePool
-      name: default
+      name: blip
     patch: |
       - op: replace
         path: /spec/replicas

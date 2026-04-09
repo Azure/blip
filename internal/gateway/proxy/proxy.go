@@ -83,7 +83,7 @@ func RunKeepalive(ctx context.Context, conn *ssh.ServerConn, sessionID string, c
 	}
 }
 
-// DialUpstream connects to the target VM via SSH with retry and exponential backoff.
+// DialUpstream connects to the target blip via SSH with retry and exponential backoff.
 func DialUpstream(vmIP string, signer ssh.Signer, expectedHostKey string) (*ssh.Client, error) {
 	const (
 		maxAttempts = 10
@@ -94,7 +94,7 @@ func DialUpstream(vmIP string, signer ssh.Signer, expectedHostKey string) (*ssh.
 	)
 
 	if expectedHostKey == "" {
-		return nil, fmt.Errorf("no host key available for VM %s; cannot verify identity", vmIP)
+		return nil, fmt.Errorf("no host key available for blip %s; cannot verify identity", vmIP)
 	}
 
 	hostKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(expectedHostKey))
@@ -350,9 +350,18 @@ func rejectChannel(ch ssh.NewChannel, err error) {
 // InjectGatewayConfig writes a minimal SSH config into the VM so the user
 // can SSH back to the gateway for recursive blip allocation. The VM uses
 // its own client key (generated at boot) for authentication.
-func InjectGatewayConfig(upstream *ssh.Client, gatewayHost string) error {
+//
+// reconnectHost is the hostname shown in `blip retain` output. For VMs
+// allocated from inside another blip this is the in-cluster alias "blip";
+// for external users it is the public gateway hostname. When empty the
+// reconnect-host file is not written and the blip script falls back to
+// a <gateway-host> placeholder.
+func InjectGatewayConfig(upstream *ssh.Client, gatewayHost, reconnectHost string) error {
 	if err := validateShellSafe(gatewayHost); err != nil {
 		return fmt.Errorf("invalid gateway host: %w", err)
+	}
+	if err := validateShellSafe(reconnectHost); err != nil {
+		return fmt.Errorf("invalid reconnect host: %w", err)
 	}
 
 	session, err := upstream.NewSession()
@@ -376,6 +385,15 @@ Host blip blip-gateway
 BLIP_CONFIG_EOF
 chmod 644 ~/.ssh/config
 `, gatewayHost)
+
+	// Write the reconnect host so the `blip retain` command can show
+	// a correct reconnect instruction.
+	if reconnectHost != "" {
+		script += fmt.Sprintf(`
+mkdir -p ~/.blip
+printf '%%s' '%s' > ~/.blip/reconnect-host
+`, reconnectHost)
+	}
 
 	if err := session.Run(script); err != nil {
 		return fmt.Errorf("inject gateway config script: %w", err)

@@ -28,11 +28,11 @@ func TestBanners(t *testing.T) {
 		newBanner := welcomeBanner(false)
 		reconnectBanner := welcomeBanner(true)
 
-		assert.Contains(t, newBanner, "Allocating VM")
+		assert.Contains(t, newBanner, "Allocating blip")
 		assert.NotContains(t, newBanner, "Reconnecting")
 
 		assert.Contains(t, reconnectBanner, "Reconnecting")
-		assert.NotContains(t, reconnectBanner, "Allocating VM")
+		assert.NotContains(t, reconnectBanner, "Allocating blip")
 
 		for _, b := range []string{newBanner, reconnectBanner} {
 			assert.Contains(t, b, "____")

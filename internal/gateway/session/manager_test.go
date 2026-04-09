@@ -186,10 +186,11 @@ func TestIsSessionID(t *testing.T) {
 
 func TestExtractAuthExtensions(t *testing.T) {
 	tests := []struct {
-		name   string
-		perms  *ssh.Permissions
-		wantFP string
-		wantID string
+		name         string
+		perms        *ssh.Permissions
+		wantFP       string
+		wantID       string
+		wantVMClient bool
 	}{
 		{
 			name: "both extensions present",
@@ -199,20 +200,23 @@ func TestExtractAuthExtensions(t *testing.T) {
 					auth.ExtIdentity:    "user@example.com",
 				},
 			},
-			wantFP: "SHA256:abc",
-			wantID: "user@example.com",
+			wantFP:       "SHA256:abc",
+			wantID:       "user@example.com",
+			wantVMClient: false,
 		},
 		{
-			name:   "nil permissions",
-			perms:  nil,
-			wantFP: "",
-			wantID: "",
+			name:         "nil permissions",
+			perms:        nil,
+			wantFP:       "",
+			wantID:       "",
+			wantVMClient: false,
 		},
 		{
-			name:   "nil extensions map",
-			perms:  &ssh.Permissions{},
-			wantFP: "",
-			wantID: "",
+			name:         "nil extensions map",
+			perms:        &ssh.Permissions{},
+			wantFP:       "",
+			wantID:       "",
+			wantVMClient: false,
 		},
 		{
 			name: "only fingerprint",
@@ -221,17 +225,32 @@ func TestExtractAuthExtensions(t *testing.T) {
 					auth.ExtFingerprint: "SHA256:xyz",
 				},
 			},
-			wantFP: "SHA256:xyz",
-			wantID: "",
+			wantFP:       "SHA256:xyz",
+			wantID:       "",
+			wantVMClient: false,
+		},
+		{
+			name: "VM client key auth",
+			perms: &ssh.Permissions{
+				Extensions: map[string]string{
+					auth.ExtFingerprint: "SHA256:vm-key",
+					auth.ExtIdentity:    "pubkey:SHA256:root",
+					auth.ExtIsVMClient:  "true",
+				},
+			},
+			wantFP:       "SHA256:vm-key",
+			wantID:       "pubkey:SHA256:root",
+			wantVMClient: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ep := sshPipe(t)
 			ep.serverConn.Permissions = tt.perms
-			fp, id := extractAuthExtensions(ep.serverConn)
+			fp, id, isVM := extractAuthExtensions(ep.serverConn)
 			assert.Equal(t, tt.wantFP, fp)
 			assert.Equal(t, tt.wantID, id)
+			assert.Equal(t, tt.wantVMClient, isVM)
 		})
 	}
 }
@@ -434,7 +453,7 @@ func TestLogAndBannerAllocError(t *testing.T) {
 		{
 			name:         "new session allocation failure",
 			reconnecting: false,
-			wantContains: "VM allocation failed",
+			wantContains: "Blip allocation failed",
 		},
 		{
 			name:         "reconnect failure",

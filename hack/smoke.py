@@ -20,7 +20,7 @@ import time
 import traceback
 
 NAMESPACE = "blip"
-POOL_NAME = "default"
+POOL_NAME = "blip"
 REPLICAS = 2
 SSH_USER = "runner"
 IMAGE_NAME = "localhost/blip:smoke"

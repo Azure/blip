@@ -22,6 +22,12 @@ const (
 
 	// ExtIdentity is a stable user identity string derived from the auth method.
 	ExtIdentity = "auth-identity"
+
+	// ExtIsVMClient is set to "true" when the connection was authenticated
+	// using a VM client key (recursive blip). Used to determine whether the
+	// reconnect host should be the internal cluster alias ("blip") rather
+	// than the external gateway hostname.
+	ExtIsVMClient = "auth-is-vm-client"
 )
 
 // Config holds authentication parameters for building an ssh.ServerConfig.
@@ -122,7 +128,7 @@ func verifyVMClientKey(conn ssh.ConnMetadata, key ssh.PublicKey, resolver VMKeyR
 		return nil, fmt.Errorf("VM client key lookup failed for %s: %w", fingerprint, err)
 	}
 
-	slog.Info("VM client key auth succeeded",
+	slog.Info("blip client key auth succeeded",
 		"user", conn.User(),
 		"remote", conn.RemoteAddr().String(),
 		"key_fingerprint", fingerprint,
@@ -132,6 +138,7 @@ func verifyVMClientKey(conn ssh.ConnMetadata, key ssh.PublicKey, resolver VMKeyR
 		Extensions: map[string]string{
 			ExtFingerprint: fingerprint,
 			ExtIdentity:    identity,
+			ExtIsVMClient:  "true",
 		},
 	}, nil
 }

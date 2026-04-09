@@ -298,7 +298,7 @@ spec:
         - name: VM_NAMESPACE
           value: "blip"
         - name: VM_POOL_NAME
-          value: "default"
+          value: "blip"
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -370,7 +370,7 @@ spec:
         - name: AUTH_CONFIGMAP
           value: "ssh-gateway-auth"
         - name: VM_POOL_NAME
-          value: "default"
+          value: "blip"
         - name: VM_NAMESPACE
           value: "blip"
         - name: POD_NAME
@@ -381,6 +381,8 @@ spec:
           value: "20"
         - name: GATEWAY_HOST_PRINCIPALS
           value: "ssh-gateway.blip.svc.cluster.local"
+        - name: GATEWAY_EXTERNAL_HOST
+          value: ""  # Set to the public hostname for reconnect instructions
         - name: HOST_KEY_PATH
           value: "/etc/blip/host-key/host_key"
         - name: CLIENT_KEY_PATH
@@ -457,7 +459,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      blip.io/pool: "default"
+      blip.io/pool: "blip"
   policyTypes:
   - Ingress
   ingress:
@@ -477,7 +479,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      blip.io/pool: "default"
+      blip.io/pool: "blip"
   policyTypes:
   - Egress
   egress:
