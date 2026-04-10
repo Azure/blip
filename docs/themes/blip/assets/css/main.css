@@ -967,7 +967,7 @@ html {
 .chroma .gu { color: #75715e; }
 
 .highlight {
-  margin: 0;
+  margin: 2rem 0;
 }
 
 .highlight pre {

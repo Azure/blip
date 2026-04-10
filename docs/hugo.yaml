@@ -1,4 +1,4 @@
-baseURL: https://project-unbounded.github.io/blip/
+baseURL: https://azure.github.io/blip/
 title: BLIP
 theme: blip
 
@@ -11,7 +11,7 @@ menus:
       url: /docs/
       weight: 1
     - name: GITHUB
-      url: https://github.com/project-unbounded/blip
+      url: https://github.com/Azure/blip
       weight: 2
 
 markup:

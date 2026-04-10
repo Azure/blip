@@ -20,13 +20,13 @@ kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEV
 ## Install Blip
 
 ```shell
-kubectl apply -f https://github.com/project-unbounded/blip/releases/latest/download/manifest.yaml
+kubectl apply -f https://github.com/Azure/blip/releases/latest/download/manifest.yaml
 ```
 
 ## Create a VM Pool
 
 ```shell
-kubectl apply -f https://github.com/project-unbounded/blip/releases/latest/download/pool.yaml
+kubectl apply -f https://github.com/Azure/blip/releases/latest/download/pool.yaml
 ```
 
 See [Create a VM Pool]({{% relref "create-vm-pool" %}}) for customization options and kustomize usage.

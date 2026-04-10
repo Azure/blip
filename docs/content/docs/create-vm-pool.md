@@ -11,13 +11,13 @@ A VM pool is a set of pre-provisioned KubeVirt VMs. Idle VMs are allocated on SS
 Apply the pool manifest directly from the latest release:
 
 ```shell
-kubectl apply -f https://github.com/project-unbounded/blip/releases/latest/download/pool.yaml
+kubectl apply -f https://github.com/Azure/blip/releases/latest/download/pool.yaml
 ```
 
 Or pin to a specific version:
 
 ```shell
-kubectl apply -f https://github.com/project-unbounded/blip/releases/download/v0.1.0/pool.yaml
+kubectl apply -f https://github.com/Azure/blip/releases/download/v0.1.0/pool.yaml
 ```
 
 ## Kustomize
@@ -28,7 +28,7 @@ Reference the release artifact as a remote resource in your `kustomization.yaml`
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - https://github.com/project-unbounded/blip/releases/latest/download/pool.yaml
+  - https://github.com/Azure/blip/releases/latest/download/pool.yaml
 patches:
   - target:
       kind: VirtualMachinePool
@@ -44,7 +44,7 @@ patches:
 Download the manifest and edit it before applying:
 
 ```shell
-curl -fsSLO https://github.com/project-unbounded/blip/releases/latest/download/pool.yaml
+curl -fsSLO https://github.com/Azure/blip/releases/latest/download/pool.yaml
 # edit pool.yaml
 kubectl apply -f pool.yaml
 ```
