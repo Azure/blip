@@ -145,11 +145,12 @@ func RunGateway(cfg *GatewayConfig) error {
 }
 
 // vmKeyResolverAdapter adapts vm.Client to the auth.VMKeyResolver interface
-// by looking up the VM client key annotation and resolving the root identity.
+// by looking up the VM client key annotation and resolving the root identity
+// and auth fingerprint.
 type vmKeyResolverAdapter struct {
 	vmClient *vm.Client
 }
 
-func (a *vmKeyResolverAdapter) ResolveRootIdentity(fingerprint string) (string, error) {
+func (a *vmKeyResolverAdapter) ResolveRootIdentity(fingerprint string) (string, string, error) {
 	return a.vmClient.ResolveRootIdentity(context.Background(), fingerprint)
 }

@@ -269,15 +269,18 @@ func (c *Client) GetHostKey(ctx context.Context, vmName string) (string, error) 
 	return key, nil
 }
 
-// ResolveRootIdentity returns the root user identity for a VM identified by SSH
-// client key fingerprint (e.g. "SHA256:..."). It iterates claimed VMs and
-// parses each blip.io/client-key annotation to find a match.
-func (c *Client) ResolveRootIdentity(ctx context.Context, fingerprint string) (string, error) {
+// ResolveRootIdentity returns the root user identity and auth fingerprint for
+// a VM identified by SSH client key fingerprint (e.g. "SHA256:..."). It
+// iterates claimed VMs and parses each blip.io/client-key annotation to find a
+// match. The returned auth fingerprint is the original user's SSH key
+// fingerprint stored in blip.io/auth-fingerprint, enabling nested blips to be
+// retained and reconnected to directly by the original user.
+func (c *Client) ResolveRootIdentity(ctx context.Context, fingerprint string) (string, string, error) {
 	var list kubevirtv1.VirtualMachineList
 	if err := c.cache.List(ctx, &list,
 		client.InNamespace(c.namespace),
 	); err != nil {
-		return "", fmt.Errorf("list VMs for client-key lookup: %w", err)
+		return "", "", fmt.Errorf("list VMs for client-key lookup: %w", err)
 	}
 
 	for _, vm := range list.Items {
@@ -298,12 +301,13 @@ func (c *Client) ResolveRootIdentity(ctx context.Context, fingerprint string) (s
 		if ssh.FingerprintSHA256(pub) == fingerprint {
 			user := ann["blip.io/user"]
 			if user == "" {
-				return "", fmt.Errorf("blip %s has no blip.io/user annotation", vm.Name)
+				return "", "", fmt.Errorf("blip %s has no blip.io/user annotation", vm.Name)
 			}
-			return user, nil
+			authFP := ann["blip.io/auth-fingerprint"]
+			return user, authFP, nil
 		}
 	}
-	return "", fmt.Errorf("no blip found with client-key fingerprint %s", fingerprint)
+	return "", "", fmt.Errorf("no blip found with client-key fingerprint %s", fingerprint)
 }
 
 // MaxLifespan is the absolute maximum lifespan for a blip from its original claim time.

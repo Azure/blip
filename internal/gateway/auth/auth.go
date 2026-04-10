@@ -46,9 +46,9 @@ type Config struct {
 }
 
 // VMKeyResolver resolves a VM SSH client key fingerprint to the original
-// user identity of the session that owns the VM.
+// user identity and auth fingerprint of the session that owns the VM.
 type VMKeyResolver interface {
-	ResolveRootIdentity(fingerprint string) (identity string, err error)
+	ResolveRootIdentity(fingerprint string) (identity string, authFingerprint string, err error)
 }
 
 // NewServerConfig builds an ssh.ServerConfig with auth callbacks from cfg.
@@ -125,20 +125,37 @@ func verifyExplicitPubkey(conn ssh.ConnMetadata, key ssh.PublicKey, watcher *Aut
 
 // verifyVMClientKey checks whether the key belongs to a VM by looking up its
 // fingerprint in the VM annotations. If found, it resolves the root user
-// identity for the session that owns the VM. This enables identity propagation
-// for recursive blip connections.
+// identity and auth fingerprint for the session that owns the VM. This enables
+// identity propagation for recursive blip connections so that nested blips are
+// owned by the original connecting user.
 func verifyVMClientKey(conn ssh.ConnMetadata, key ssh.PublicKey, resolver VMKeyResolver) (*ssh.Permissions, error) {
-	fingerprint := ssh.FingerprintSHA256(key)
-	identity, err := resolver.ResolveRootIdentity(fingerprint)
+	vmFingerprint := ssh.FingerprintSHA256(key)
+	identity, rootAuthFingerprint, err := resolver.ResolveRootIdentity(vmFingerprint)
 	if err != nil {
-		return nil, fmt.Errorf("VM client key lookup failed for %s: %w", fingerprint, err)
+		return nil, fmt.Errorf("VM client key lookup failed for %s: %w", vmFingerprint, err)
+	}
+
+	// Use the root user's auth fingerprint when available so that the
+	// nested blip can be retained and reconnected to directly by the
+	// original user. Fall back to the VM client key fingerprint when the
+	// parent VM has no auth-fingerprint stored (should not happen in
+	// practice, but keeps the system robust).
+	fingerprint := rootAuthFingerprint
+	if fingerprint == "" {
+		slog.Warn("VM client key auth: parent VM has no auth-fingerprint, "+
+			"falling back to VM client key fingerprint — reconnect to nested blip may fail",
+			"vm_client_key_fingerprint", vmFingerprint,
+			"resolved_identity", identity,
+		)
+		fingerprint = vmFingerprint
 	}
 
 	slog.Info("blip client key auth succeeded",
 		"user", conn.User(),
 		"remote", conn.RemoteAddr().String(),
-		"key_fingerprint", fingerprint,
+		"key_fingerprint", vmFingerprint,
 		"resolved_identity", identity,
+		"resolved_auth_fingerprint", fingerprint,
 	)
 	return &ssh.Permissions{
 		Extensions: map[string]string{
