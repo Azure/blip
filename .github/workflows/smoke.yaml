@@ -15,11 +15,17 @@ env:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-4-cores
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -60,7 +66,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          kind create cluster --wait 60s
+          cat > /tmp/kind-config.yaml <<'KINDCFG'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraMounts:
+                - hostPath: /dev/kvm
+                  containerPath: /dev/kvm
+          KINDCFG
+
+          kind create cluster --config /tmp/kind-config.yaml --wait 60s
 
           # Load cached images into the kind node if they exist.
           if [ -f /tmp/kubevirt-images.tar ]; then
@@ -73,11 +89,6 @@ jobs:
 
           kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml"
           kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml"
-
-          # GitHub Actions runners do not support nested virtualization;
-          # configure KubeVirt to use software emulation.
-          kubectl -n kubevirt patch kubevirt kubevirt --type merge \
-            --patch '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true}}}}'
 
           # Wait for KubeVirt to become ready.
           kubectl -n kubevirt wait kv kubevirt --for condition=Available --timeout=300s
