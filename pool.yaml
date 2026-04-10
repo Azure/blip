@@ -170,19 +170,20 @@ stringData:
             		local session_id
             		session_id=$(_json_field "$body" 'blip\.io/session-id')
 
-            		echo "Blip retained successfully."
+            		echo "Blip retained successfully." >&2
             		if [ -n "$session_id" ]; then
             			local gw_host="<gateway-host>"
             			if [ -f "$HOME/.blip/reconnect-host" ]; then
             				gw_host="$(cat "$HOME/.blip/reconnect-host")"
             			fi
-            			echo ""
-            			echo "  Session ID: $session_id"
-            			echo ""
-            			echo "  Reconnect with: ssh $session_id@$gw_host"
-            		fi
-            		if [ -n "$ttl_flag" ]; then
-            			echo "  TTL updated to: $ttl_flag"
+            			echo "" >&2
+            			echo "  Only you can reconnect to this blip:" >&2
+            			echo "    ssh $session_id@$gw_host" >&2
+            			if [ -n "$ttl_flag" ]; then
+            				echo "  TTL updated to $ttl_flag" >&2
+            			fi
+            			echo "" >&2
+            			echo "$session_id"
             		fi
 
             		# Allow output to flush through the SSH channel before exiting.
