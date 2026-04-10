@@ -688,10 +688,14 @@ def test_retained_session():
     stdout, stderr, rc = ssh_session(
         SSH_USER, "blip retain --ttl 180s && echo RETAINED_OK")
     assert rc == 0, f"SSH failed (rc={rc}): {stderr}"
-    assert "RETAINED_OK" in stdout or "Blip retained successfully" in stdout, \
-        f"Retain did not succeed: {stdout}"
+    assert "RETAINED_OK" in stdout, f"Retain did not succeed: {stdout}"
+    assert "retained successfully" in stderr, \
+        f"Expected retain status on stderr: {stderr}"
 
     session_id = extract_session_id(stderr)
+    # Session ID should also appear on stdout (for scripting).
+    assert session_id in stdout, \
+        f"Expected session ID on stdout: {stdout}"
     log(f"    Session: {session_id}")
 
     # Verify VM is retained (not ephemeral, not deleted)
@@ -812,8 +816,9 @@ def test_retained_session():
         timeout=180,
     )
     assert rc == 0, f"Recurse+retain failed (rc={rc}): {stderr}"
-    # The retain output (and SSH banner) both contain the session ID.
-    # Search stdout first (retain output), then stderr (SSH banner).
+    # The retain command prints the session ID to stdout; the SSH banner
+    # (on stderr) also contains it. The inner SSH used 2>&1, so both
+    # streams are merged into the outer stdout.
     combined_output = stdout + stderr
     inner_match = re.search(r"(blip-[0-9a-f]{10})", combined_output)
     assert inner_match, \
