@@ -4,7 +4,9 @@
 Verifies:
   1. Ephemeral session: connect, confirm blip, disconnect -> VM deleted
   2. Retained session:  retain with TTL, reconnect, SCP, port-forward,
-                        recurse (ssh blip from inside VM), TTL expiry
+                        nested retain with identity propagation (retain inner
+                        blip, direct reconnect bypassing outer, independence
+                        after outer deleted), TTL expiry
 """
 
 import json
@@ -663,15 +665,17 @@ def test_ephemeral_session():
 
 
 def test_retained_session():
-    """Retained session with reconnect, SCP, port-forward, recurse, and TTL.
+    """Retained session with reconnect, SCP, port-forward, nested retain, and TTL.
 
     This consolidated test covers:
       - retain with --ttl: connect, retain with a 180s TTL
       - reconnect: disconnect and reconnect using session ID
       - SCP: upload and download a file via SCP
       - port-forward: TCP tunnel through the gateway
-      - recurse: from inside the retained VM, 'ssh blip' allocates a second VM
-      - TTL expiry: the deallocation controller deletes the VM after the TTL
+      - nested retain: from inside the retained VM, 'ssh blip' allocates a
+        second VM, retains it, and verifies the user can reconnect directly
+        to the inner blip (bypassing the outer), even after the outer is deleted
+      - TTL expiry: the deallocation controller deletes the inner VM after TTL
 
     The test uses at most 2 VMs from the initial pool (the retained outer
     session and the recursive inner session), avoiding any need to wait for
@@ -780,32 +784,138 @@ def test_retained_session():
             pf_proc.kill()
             pf_proc.communicate()
 
-    # -- Phase 5: Recurse (ssh blip from inside the VM) --
-    log("    Testing recurse (ssh blip from inside VM)...")
+    # -- Phase 5: Recurse with retain and direct reconnect --
+    # From inside the retained VM, allocate a nested blip, retain it, extract
+    # its session ID, then reconnect to it directly from outside (bypassing
+    # the outer blip) using the original user's SSH key.  This exercises the
+    # fix that propagates the root user's auth-fingerprint through nested
+    # blips, so that `blip retain` + direct reconnect work.
+    log("    Testing recurse with retain and direct reconnect...")
+
+    # Phase 5a: Allocate + retain nested blip from inside the outer VM,
+    # capturing the nested session ID from the retain output.
     stdout, stderr, rc = ssh_session(
         session_id,
+        # Retry loop: the inner gateway config injection may not be ready
+        # immediately after the outer blip boots.
         "for i in $(seq 1 30); do "
-        "  if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o BatchMode=yes "
-        "       blip 'echo RECURSE_OK'; then "
-        "    exit 0; "
-        "  fi; "
-        "  sleep 2; "
-        "done; "
+        "  output=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "
+        "               -o BatchMode=yes blip 'blip retain --ttl 120s' 2>&1) ; "
+        "  if echo \"$output\" | grep -q 'retained successfully'; then "
+        "    echo \"$output\" ; "
+        "    exit 0 ; "
+        "  fi ; "
+        "  sleep 2 ; "
+        "done ; "
+        "echo \"$output\" ; "
         "exit 1",
         timeout=180,
     )
-    assert rc == 0, f"Recurse SSH failed (rc={rc}): {stderr}"
-    assert "RECURSE_OK" in stdout, f"Expected RECURSE_OK in: {stdout}"
-    log("    Recurse verified")
+    assert rc == 0, f"Recurse+retain failed (rc={rc}): {stderr}"
+    # The retain output (and SSH banner) both contain the session ID.
+    # Search stdout first (retain output), then stderr (SSH banner).
+    combined_output = stdout + stderr
+    inner_match = re.search(r"(blip-[0-9a-f]{10})", combined_output)
+    assert inner_match, \
+        f"Could not find inner session ID in output:\n{combined_output}"
+    inner_session_id = inner_match.group(1)
+    # Make sure we didn't accidentally pick up the outer session ID.
+    if inner_session_id == session_id:
+        # Find the next match.
+        all_ids = re.findall(r"(blip-[0-9a-f]{10})", combined_output)
+        inner_ids = [sid for sid in all_ids if sid != session_id]
+        assert inner_ids, \
+            f"Only found outer session ID in output:\n{combined_output}"
+        inner_session_id = inner_ids[0]
+    log(f"    Inner session: {inner_session_id}")
 
-    # -- Phase 6: Wait for TTL expiry --
-    # The deallocation controller deletes the VM once claimed-at + max-duration
-    # elapses.  Use the real claimed-at timestamp for an accurate estimate.
-    now = datetime.now(timezone.utc)
-    elapsed = (now - claimed_at).total_seconds()
-    remaining = max(0, 180 - elapsed)
-    log(f"    Waiting for TTL expiry ({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)...")
-    wait_for_vm_deleted(session_id, timeout=int(remaining) + 60)
+    # Verify the inner blip was retained.
+    wait_for(
+        lambda: vm_annotation(inner_session_id, "blip.io/ephemeral") == "false",
+        "inner blip ephemeral=false after retain",
+        timeout=30,
+    )
+    log("    Inner blip retained")
+
+    # Phase 5b: Verify the inner blip has the same user identity as the outer.
+    outer_user = vm_annotation(session_id, "blip.io/user")
+    inner_user = vm_annotation(inner_session_id, "blip.io/user")
+    assert outer_user and inner_user, \
+        f"Missing user annotation: outer={outer_user!r}, inner={inner_user!r}"
+    assert outer_user == inner_user, \
+        f"Identity mismatch: outer={outer_user!r}, inner={inner_user!r}"
+    log(f"    Identity propagated: {inner_user}")
+
+    # Phase 5c: Verify the inner blip has the original user's auth fingerprint
+    # (not the VM client key fingerprint).
+    outer_auth_fp = vm_annotation(session_id, "blip.io/auth-fingerprint")
+    inner_auth_fp = vm_annotation(inner_session_id, "blip.io/auth-fingerprint")
+    assert outer_auth_fp and inner_auth_fp, \
+        f"Missing auth-fingerprint: outer={outer_auth_fp!r}, inner={inner_auth_fp!r}"
+    assert outer_auth_fp == inner_auth_fp, \
+        f"Auth fingerprint mismatch: outer={outer_auth_fp!r}, inner={inner_auth_fp!r}"
+    log(f"    Auth fingerprint propagated: {inner_auth_fp}")
+
+    # Phase 5d: Reconnect directly to the inner blip from outside using the
+    # original user's SSH key, bypassing the outer blip entirely.
+    log("    Reconnecting directly to inner blip...")
+    stdout, stderr, rc = ssh_session(inner_session_id, "echo DIRECT_RECONNECT_OK")
+    assert rc == 0, f"Direct reconnect to inner blip failed (rc={rc}): {stderr}"
+    assert "DIRECT_RECONNECT_OK" in stdout, \
+        f"Expected DIRECT_RECONNECT_OK: {stdout}"
+    assert "Reconnected" in stderr, \
+        f"Expected reconnect banner: {stderr}"
+    log("    Direct reconnect to inner blip verified")
+
+    # Phase 5e: Release the outer blip, then reconnect to the inner blip again
+    # to prove the inner blip is fully independent of the outer.
+    log("    Releasing outer blip to prove inner blip independence...")
+    # Find the outer VM by its session-id annotation and mark it for release.
+    vms_json = kubectl_json("get", "vm", "-n", NAMESPACE,
+                            "-l", f"blip.io/pool={POOL_NAME}")
+    outer_released = False
+    for item in vms_json.get("items", []):
+        ann = item.get("metadata", {}).get("annotations", {})
+        if ann.get("blip.io/session-id") == session_id:
+            vm_name = item["metadata"]["name"]
+            kubectl("annotate", "vm", vm_name, "-n", NAMESPACE,
+                    "blip.io/release=true", "--overwrite")
+            log(f"    Outer blip {vm_name} marked for release")
+            outer_released = True
+            break
+    assert outer_released, f"Could not find outer VM with session {session_id}"
+
+    # Wait for the outer blip to be deleted.
+    wait_for_vm_deleted(session_id, timeout=60)
+
+    # Reconnect to the inner blip again after the outer is gone.
+    log("    Reconnecting to inner blip after outer deleted...")
+    stdout, stderr, rc = ssh_session(inner_session_id, "echo INDEPENDENT_OK")
+    assert rc == 0, \
+        f"Reconnect to inner blip after outer deletion failed (rc={rc}): {stderr}"
+    assert "INDEPENDENT_OK" in stdout, \
+        f"Expected INDEPENDENT_OK: {stdout}"
+    log("    Inner blip independence verified")
+
+    # -- Phase 6: Wait for inner blip TTL expiry --
+    # The inner blip was retained with 120s TTL. Wait for the deallocation
+    # controller to delete it.
+    inner_claimed_at_str = vm_annotation(inner_session_id, "blip.io/claimed-at")
+    if inner_claimed_at_str:
+        inner_claimed_at = datetime.fromisoformat(
+            inner_claimed_at_str.replace("Z", "+00:00"))
+        if inner_claimed_at.tzinfo is None:
+            inner_claimed_at = inner_claimed_at.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        inner_elapsed = (now - inner_claimed_at).total_seconds()
+        inner_remaining = max(0, 120 - inner_elapsed)
+        log(f"    Waiting for inner blip TTL expiry "
+            f"({inner_elapsed:.0f}s elapsed, ~{inner_remaining:.0f}s remaining)...")
+        wait_for_vm_deleted(inner_session_id, timeout=int(inner_remaining) + 60)
+    else:
+        # Fallback: just wait a reasonable time.
+        log("    Waiting for inner blip TTL expiry...")
+        wait_for_vm_deleted(inner_session_id, timeout=180)
 
 
 # ---------------------------------------------------------------------------

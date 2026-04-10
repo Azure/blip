@@ -796,14 +796,31 @@ func TestResolveRootIdentity(t *testing.T) {
 		})
 
 		c := newTestClient(t, vm)
-		identity, err := c.ResolveRootIdentity(context.Background(), clientFP)
+		identity, authFP, err := c.ResolveRootIdentity(context.Background(), clientFP)
 		require.NoError(t, err)
 		assert.Equal(t, "alice@example.com", identity)
+		assert.Empty(t, authFP, "auth-fingerprint should be empty when not set")
+	})
+
+	t.Run("returns auth fingerprint when set", func(t *testing.T) {
+		clientKey, clientFP := generateTestKey(t)
+		vm := makeVM("vm-withfp", "pool-res", time.Now(), map[string]string{
+			"blip.io/session-id":       "sess-withfp",
+			"blip.io/user":             "alice@example.com",
+			"blip.io/client-key":       clientKey,
+			"blip.io/auth-fingerprint": "SHA256:alicekey",
+		})
+
+		c := newTestClient(t, vm)
+		identity, authFP, err := c.ResolveRootIdentity(context.Background(), clientFP)
+		require.NoError(t, err)
+		assert.Equal(t, "alice@example.com", identity)
+		assert.Equal(t, "SHA256:alicekey", authFP)
 	})
 
 	t.Run("returns error for unknown fingerprint", func(t *testing.T) {
 		c := newTestClient(t)
-		_, err := c.ResolveRootIdentity(context.Background(), "SHA256:unknown")
+		_, _, err := c.ResolveRootIdentity(context.Background(), "SHA256:unknown")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "no blip found")
 	})
@@ -818,7 +835,7 @@ func TestResolveRootIdentity(t *testing.T) {
 		delete(vm.Annotations, "blip.io/user")
 
 		c := newTestClient(t, vm)
-		_, err := c.ResolveRootIdentity(context.Background(), clientFP)
+		_, _, err := c.ResolveRootIdentity(context.Background(), clientFP)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "no blip.io/user annotation")
 	})
@@ -835,9 +852,29 @@ func TestResolveRootIdentity(t *testing.T) {
 		})
 
 		c := newTestClient(t, innerVM)
-		identity, err := c.ResolveRootIdentity(context.Background(), clientFP)
+		identity, _, err := c.ResolveRootIdentity(context.Background(), clientFP)
 		require.NoError(t, err)
 		assert.Equal(t, "root-user@corp.com", identity)
+	})
+
+	t.Run("propagates auth fingerprint through nested blips", func(t *testing.T) {
+		// Simulate: Alice -> VM-1 (outer) -> VM-2 (inner)
+		// VM-1 has Alice's auth-fingerprint. When VM-2 looks up VM-1's
+		// client key, it should get Alice's auth-fingerprint back.
+		clientKey, clientFP := generateTestKey(t)
+		outerVM := makeVM("vm-outer", "pool-res", time.Now(), map[string]string{
+			"blip.io/session-id":       "sess-outer",
+			"blip.io/user":             "pubkey:alice@laptop",
+			"blip.io/client-key":       clientKey,
+			"blip.io/auth-fingerprint": "SHA256:aliceOriginalKey",
+		})
+
+		c := newTestClient(t, outerVM)
+		identity, authFP, err := c.ResolveRootIdentity(context.Background(), clientFP)
+		require.NoError(t, err)
+		assert.Equal(t, "pubkey:alice@laptop", identity)
+		assert.Equal(t, "SHA256:aliceOriginalKey", authFP,
+			"nested blip should get the root user's auth fingerprint")
 	})
 }
 
