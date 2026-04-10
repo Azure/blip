@@ -92,3 +92,6 @@ jobs:
 - Tokens are short-lived (~5 min) and single-use.
 - All GitHub Actions authentications are logged with the full subject claim.
 
+## Next steps
+
+- [Nested Blips]({{% relref "nested-blips" %}})
