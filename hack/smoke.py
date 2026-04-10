@@ -685,12 +685,16 @@ def test_retained_session():
 
     # -- Phase 1: Connect and retain with TTL --
     log("    Connecting and retaining with --ttl 180s...")
+    # The `blip retain` command writes its status message to stderr inside
+    # the VM, but the SSH bridge only forwards the main data stream (stdout)
+    # — not extended-data / stderr.  Redirect retain's stderr into stdout
+    # so the message is captured reliably on the client side.
     stdout, stderr, rc = ssh_session(
-        SSH_USER, "blip retain --ttl 180s && echo RETAINED_OK")
+        SSH_USER, "blip retain --ttl 180s 2>&1 && echo RETAINED_OK")
     assert rc == 0, f"SSH failed (rc={rc}): {stderr}"
     assert "RETAINED_OK" in stdout, f"Retain did not succeed: {stdout}"
-    assert "retained successfully" in stderr, \
-        f"Expected retain status on stderr: {stderr}"
+    assert "retained successfully" in stdout, \
+        f"Expected retain status on stdout: {stdout}"
 
     session_id = extract_session_id(stderr)
     # Session ID should also appear on stdout (for scripting).
@@ -802,9 +806,14 @@ def test_retained_session():
         session_id,
         # Retry loop: the inner gateway config injection may not be ready
         # immediately after the outer blip boots.
+        # The inner `blip retain` writes its status to stderr inside the
+        # nested VM, but the SSH bridge only forwards stdout.  Use
+        # `2>&1` on the retain command so the message reaches the inner
+        # SSH client's stdout, and again on the outer ssh invocation so
+        # the gateway banner (also on stderr) is merged into $output.
         "for i in $(seq 1 30); do "
         "  output=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "
-        "               -o BatchMode=yes blip 'blip retain --ttl 120s' 2>&1) ; "
+        "               -o BatchMode=yes blip 'blip retain --ttl 120s 2>&1' 2>&1) ; "
         "  if echo \"$output\" | grep -q 'retained successfully'; then "
         "    echo \"$output\" ; "
         "    exit 0 ; "
