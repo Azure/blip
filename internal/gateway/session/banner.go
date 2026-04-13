@@ -90,6 +90,32 @@ func shutdownBanner() string {
 	return crlf(banner)
 }
 
+func goodbyeBanner(sessionID string, ephemeral bool, remainingTTL time.Duration, gatewayHost string) string {
+	banner := bannerSpacer
+	banner += `  ____
+ | __ ) _   _  ___
+ |  _ \| | | |/ _ \
+ | |_) | |_| |  __/
+ |____/ \__, |\___|
+        |___/
+
+`
+	if ephemeral {
+		banner += "  >>> Blip terminated. This session was ephemeral.\n"
+	} else if remainingTTL > 0 {
+		banner += fmt.Sprintf("  >>> Disconnected. Blip retained for %s.\n", formatDuration(remainingTTL))
+		if gatewayHost != "" {
+			banner += fmt.Sprintf("  >>> Reconnect: ssh %s@%s\n", sessionID, gatewayHost)
+		} else {
+			banner += fmt.Sprintf("  >>> Reconnect: ssh %s@<gateway>\n", sessionID)
+		}
+	} else {
+		banner += "  >>> Disconnected. Blip lease has expired.\n"
+	}
+	banner += "\n"
+	return crlf(banner)
+}
+
 // allocErrorBanner returns the user-facing banner text for an allocation or reconnection failure.
 func allocErrorBanner(reconnecting bool, err error) string {
 	if reconnecting {

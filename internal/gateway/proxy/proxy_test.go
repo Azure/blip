@@ -215,6 +215,49 @@ func TestSendBannerAndClose_NoBannerChannel(t *testing.T) {
 	assert.NotPanics(t, func() { sess.SendBannerAndClose("some banner") })
 }
 
+func TestSendBanner(t *testing.T) {
+	ep := sshPipe(t)
+
+	type accepted struct {
+		ch  ssh.Channel
+		err error
+	}
+	result := make(chan accepted, 1)
+	go func() {
+		newChan := <-ep.serverNewChans
+		ch, _, err := newChan.Accept()
+		result <- accepted{ch, err}
+	}()
+
+	clientCh, _, err := ep.client.OpenChannel("session", nil)
+	require.NoError(t, err)
+
+	a := <-result
+	require.NoError(t, a.err)
+
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := NewSession(cancel, ep.serverConn)
+	sess.SetBannerChannel(a.ch)
+
+	const bannerText = "goodbye banner\n"
+	sess.SendBanner(bannerText)
+
+	buf := make([]byte, 256)
+	n, _ := clientCh.Stderr().Read(buf)
+	assert.Equal(t, bannerText, string(buf[:n]))
+}
+
+func TestSendBanner_NoBannerChannel(t *testing.T) {
+	ep := sshPipe(t)
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := NewSession(cancel, ep.serverConn)
+
+	// No banner channel set – should not panic.
+	assert.NotPanics(t, func() { sess.SendBanner("some banner") })
+}
+
 // ---------------------------------------------------------------------------
 // Channel forwarding end-to-end
 // ---------------------------------------------------------------------------

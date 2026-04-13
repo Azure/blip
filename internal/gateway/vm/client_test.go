@@ -786,6 +786,76 @@ func TestIsEphemeral(t *testing.T) {
 	})
 }
 
+func TestGetSessionStatus(t *testing.T) {
+	t.Run("ephemeral with remaining TTL", func(t *testing.T) {
+		claimedAt := time.Now().Add(-1 * time.Hour)
+		vm := makeVM("vm-ss1", "pool-ss", time.Now(), map[string]string{
+			"blip.io/session-id":   "sess-ss1",
+			"blip.io/ephemeral":    "true",
+			"blip.io/claimed-at":   claimedAt.Format(time.RFC3339),
+			"blip.io/max-duration": strconv.Itoa(int((8 * time.Hour).Seconds())),
+		})
+
+		c := newTestClient(t, vm)
+		status, err := c.GetSessionStatus(context.Background(), "sess-ss1")
+		require.NoError(t, err)
+		assert.True(t, status.Ephemeral)
+		// Claimed 1h ago with 8h TTL → ~7h remaining.
+		assert.InDelta(t, (7 * time.Hour).Seconds(), status.RemainingTTL.Seconds(), 60)
+	})
+
+	t.Run("retained with remaining TTL", func(t *testing.T) {
+		claimedAt := time.Now().Add(-2 * time.Hour)
+		vm := makeVM("vm-ss2", "pool-ss", time.Now(), map[string]string{
+			"blip.io/session-id":   "sess-ss2",
+			"blip.io/ephemeral":    "false",
+			"blip.io/claimed-at":   claimedAt.Format(time.RFC3339),
+			"blip.io/max-duration": strconv.Itoa(int((8 * time.Hour).Seconds())),
+		})
+
+		c := newTestClient(t, vm)
+		status, err := c.GetSessionStatus(context.Background(), "sess-ss2")
+		require.NoError(t, err)
+		assert.False(t, status.Ephemeral)
+		assert.InDelta(t, (6 * time.Hour).Seconds(), status.RemainingTTL.Seconds(), 60)
+	})
+
+	t.Run("expired TTL returns zero remaining", func(t *testing.T) {
+		claimedAt := time.Now().Add(-10 * time.Hour)
+		vm := makeVM("vm-ss3", "pool-ss", time.Now(), map[string]string{
+			"blip.io/session-id":   "sess-ss3",
+			"blip.io/ephemeral":    "false",
+			"blip.io/claimed-at":   claimedAt.Format(time.RFC3339),
+			"blip.io/max-duration": strconv.Itoa(int((8 * time.Hour).Seconds())),
+		})
+
+		c := newTestClient(t, vm)
+		status, err := c.GetSessionStatus(context.Background(), "sess-ss3")
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), status.RemainingTTL)
+	})
+
+	t.Run("missing annotations returns zero remaining", func(t *testing.T) {
+		vm := makeVM("vm-ss4", "pool-ss", time.Now(), map[string]string{
+			"blip.io/session-id": "sess-ss4",
+			"blip.io/ephemeral":  "true",
+		})
+
+		c := newTestClient(t, vm)
+		status, err := c.GetSessionStatus(context.Background(), "sess-ss4")
+		require.NoError(t, err)
+		assert.True(t, status.Ephemeral)
+		assert.Equal(t, time.Duration(0), status.RemainingTTL)
+	})
+
+	t.Run("returns error for unknown session", func(t *testing.T) {
+		c := newTestClient(t)
+		_, err := c.GetSessionStatus(context.Background(), "nonexistent")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+	})
+}
+
 func TestResolveRootIdentity(t *testing.T) {
 	t.Run("resolves root identity from SSH public key fingerprint", func(t *testing.T) {
 		clientKey, clientFP := generateTestKey(t)
