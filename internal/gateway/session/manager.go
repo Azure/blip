@@ -243,11 +243,17 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 
 	proxy.Forward(sessionCtx, sessionID, serverConn, upstreamConn, chans, upstreamForwardedChans)
 
+	// Show a goodbye banner before tearing down.
+	// Use a fresh context because the session context is already cancelled.
+	goodbyeCtx, goodbyeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer goodbyeCancel()
+	m.sendGoodbyeBanner(goodbyeCtx, sess, sessionID)
+
 	// Release ephemeral VMs after session ends. Use a fresh context
 	// because the session context is already cancelled.
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer releaseCancel()
 	m.releaseIfEphemeral(releaseCtx, sessionID)
-	releaseCancel()
 
 	slog.Info("session ended",
 		"session_id", sessionID,
@@ -322,6 +328,17 @@ func (m *Manager) releaseIfEphemeral(ctx context.Context, sessionID string) {
 		return
 	}
 	slog.Info("ephemeral blip released", "session_id", sessionID)
+}
+
+// sendGoodbyeBanner queries the VM status and writes a goodbye banner
+// to the session's banner channel.
+func (m *Manager) sendGoodbyeBanner(ctx context.Context, sess *proxy.Session, sessionID string) {
+	status, err := m.cfg.VMClient.GetSessionStatus(ctx, sessionID)
+	if err != nil {
+		slog.Debug("failed to get session status for goodbye banner", "session_id", sessionID, "error", err)
+		return
+	}
+	sess.SendBanner(goodbyeBanner(sessionID, status.Ephemeral, status.RemainingTTL, m.cfg.ExternalHost))
 }
 
 func extractAuthExtensions(conn *ssh.ServerConn) (fingerprint, identity string, isVMClient bool) {

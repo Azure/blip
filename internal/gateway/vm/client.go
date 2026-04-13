@@ -341,6 +341,40 @@ func (c *Client) IsEphemeral(ctx context.Context, sessionID string) (bool, error
 	return false, fmt.Errorf("blip with session ID %s not found", sessionID)
 }
 
+// SessionStatus describes the current lifecycle state of a session's VM.
+type SessionStatus struct {
+	Ephemeral    bool
+	RemainingTTL time.Duration
+}
+
+// GetSessionStatus returns the ephemeral flag and remaining TTL for the given session.
+func (c *Client) GetSessionStatus(ctx context.Context, sessionID string) (SessionStatus, error) {
+	allocs, err := c.listAllocationsBySession(ctx, sessionID)
+	if err != nil {
+		return SessionStatus{}, fmt.Errorf("list VMs: %w", err)
+	}
+	for _, a := range allocs {
+		ephemeral := a.Annotations["blip.io/ephemeral"] == "true"
+
+		var remaining time.Duration
+		claimedAtStr := a.Annotations["blip.io/claimed-at"]
+		maxDurStr := a.Annotations["blip.io/max-duration"]
+		if claimedAtStr != "" && maxDurStr != "" {
+			if claimedAt, err := time.Parse(time.RFC3339, claimedAtStr); err == nil {
+				if maxDurSec, err := strconv.Atoi(maxDurStr); err == nil && maxDurSec > 0 {
+					remaining = time.Until(claimedAt.Add(time.Duration(maxDurSec) * time.Second))
+					if remaining < 0 {
+						remaining = 0
+					}
+				}
+			}
+		}
+
+		return SessionStatus{Ephemeral: ephemeral, RemainingTTL: remaining}, nil
+	}
+	return SessionStatus{}, fmt.Errorf("blip with session ID %s not found", sessionID)
+}
+
 // Retain marks the VM as non-ephemeral, optionally updating TTL (capped by MaxLifespan).
 func (c *Client) Retain(ctx context.Context, sessionID string, newTTLSeconds int) (string, error) {
 	allocs, err := c.listAllocationsBySession(ctx, sessionID)

@@ -42,6 +42,15 @@ func (s *Session) Close() {
 	})
 }
 
+// SendBanner writes a banner to the session's stderr stream without closing.
+func (s *Session) SendBanner(banner string) {
+	if s.bannerCh != nil {
+		if _, err := s.bannerCh.Stderr().Write([]byte(banner)); err != nil {
+			slog.Debug("failed to write banner", "error", err)
+		}
+	}
+}
+
 // SendBannerAndClose writes a shutdown banner to stderr and tears down the session.
 func (s *Session) SendBannerAndClose(banner string) {
 	if s.bannerCh != nil {

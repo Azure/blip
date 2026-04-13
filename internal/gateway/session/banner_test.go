@@ -57,6 +57,39 @@ func TestBanners(t *testing.T) {
 		assert.Contains(t, banner, "Reconnect")
 		assert.Contains(t, banner, "\r\n")
 	})
+
+	t.Run("goodbye banner ephemeral", func(t *testing.T) {
+		banner := goodbyeBanner("blip-abc1234567", true, 0, "gw.example.com")
+		assert.Contains(t, banner, "____")
+		assert.Contains(t, banner, "terminated")
+		assert.Contains(t, banner, "ephemeral")
+		assert.NotContains(t, banner, "Reconnect")
+		assert.NotContains(t, banner, "retained")
+		assert.Contains(t, banner, "\r\n", "banner should use CRLF")
+	})
+
+	t.Run("goodbye banner retained", func(t *testing.T) {
+		banner := goodbyeBanner("blip-abc1234567", false, 7*time.Hour+30*time.Minute, "gw.example.com")
+		assert.Contains(t, banner, "____")
+		assert.Contains(t, banner, "retained")
+		assert.Contains(t, banner, "7h30m")
+		assert.Contains(t, banner, "ssh blip-abc1234567@gw.example.com")
+		assert.NotContains(t, banner, "terminated")
+		assert.NotContains(t, banner, "ephemeral")
+		assert.Contains(t, banner, "\r\n", "banner should use CRLF")
+	})
+
+	t.Run("goodbye banner retained with zero TTL", func(t *testing.T) {
+		banner := goodbyeBanner("blip-abc1234567", false, 0, "gw.example.com")
+		assert.Contains(t, banner, "expired")
+		assert.NotContains(t, banner, "Reconnect")
+		assert.NotContains(t, banner, "retained for")
+	})
+
+	t.Run("goodbye banner retained without gateway host", func(t *testing.T) {
+		banner := goodbyeBanner("blip-abc1234567", false, 2*time.Hour, "")
+		assert.Contains(t, banner, "ssh blip-abc1234567@<gateway>")
+	})
 }
 
 func TestWriteBanner(t *testing.T) {
