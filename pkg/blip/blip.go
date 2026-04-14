@@ -77,12 +77,10 @@ func WithTTL(d time.Duration) RetainOption {
 // After retaining, you can reconnect to the blip using [Client.Reconnect]
 // with the session ID from [Blip.ID].
 func (b *Blip) Retain(ctx context.Context, opts ...RetainOption) error {
-	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		return ErrClosed
+	conn, err := b.sshConn()
+	if err != nil {
+		return err
 	}
-	b.mu.Unlock()
 
 	cfg := &retainConfig{}
 	for _, opt := range opts {
@@ -94,7 +92,7 @@ func (b *Blip) Retain(ctx context.Context, opts ...RetainOption) error {
 		cmd = fmt.Sprintf("blip retain --ttl %s", formatDuration(cfg.ttl))
 	}
 
-	session, err := b.conn.NewSession()
+	session, err := conn.NewSession()
 	if err != nil {
 		return fmt.Errorf("open session for retain: %w", err)
 	}
@@ -129,13 +127,11 @@ func (b *Blip) Retain(ctx context.Context, opts ...RetainOption) error {
 //
 // Callers are responsible for closing the returned session.
 func (b *Blip) NewSession() (*ssh.Session, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.closed {
-		return nil, ErrClosed
+	conn, err := b.sshConn()
+	if err != nil {
+		return nil, err
 	}
-	return b.conn.NewSession()
+	return conn.NewSession()
 }
 
 // SSHClient returns the underlying SSH client connected to the blip VM.
@@ -145,13 +141,7 @@ func (b *Blip) NewSession() (*ssh.Session, error) {
 // The returned client shares the connection with the Blip. Do not close
 // it directly; use [Blip.Close] instead.
 func (b *Blip) SSHClient() (*ssh.Client, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.closed {
-		return nil, ErrClosed
-	}
-	return b.conn, nil
+	return b.sshConn()
 }
 
 // Close disconnects from the blip. If the blip is still ephemeral (not
