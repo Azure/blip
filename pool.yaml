@@ -6,21 +6,29 @@ metadata:
 stringData:
   userdata: |
     #cloud-config
-    disk_setup:
-        /dev/vdb:
-            table_type: gpt
-            overwrite: false
-    fs_setup:
-        - device: /dev/vdb
-          filesystem: ext4
-          overwrite: false
-    mounts:
-        - - /dev/vdb
-          - /home
-          - ext4
-          - defaults,nofail
-          - "0"
-          - "2"
+    bootcmd:
+        # The containerDisk COW layer is tiny, so we overlay writable
+        # directories onto the emptyDisk using overlayfs.  Each overlay
+        # uses the existing directory content as the read-only lower
+        # layer and writes new/changed files to the emptyDisk — no
+        # bulk copy required.  bootcmd runs before services or runcmd.
+        - |
+          set -e
+          dev=/dev/vdb
+          mnt=/mnt/data
+          for i in $(seq 1 30); do [ -b "$dev" ] && break; sleep 0.5; done
+          if ! blkid -s TYPE -o value "$dev" 2>/dev/null | grep -q ext4; then
+            mkfs.ext4 -q -L data "$dev"
+          fi
+          mkdir -p "$mnt"
+          mountpoint -q "$mnt" || mount -t ext4 "$dev" "$mnt"
+          for dir in /usr /var /opt /tmp /home; do
+            mkdir -p "$mnt/overlay${dir}/upper" "$mnt/overlay${dir}/work"
+            mount -t overlay overlay \
+              -o "lowerdir=${dir},upperdir=$mnt/overlay${dir}/upper,workdir=$mnt/overlay${dir}/work" \
+              "$dir"
+          done
+          chmod 1777 /tmp
     users:
         - name: runner
           sudo: ALL=(ALL) NOPASSWD:ALL
@@ -210,14 +218,9 @@ stringData:
           - -c
           - |
             exec > /dev/ttyS0 2>&1
-            echo "[blip-init] mounting service account ISO..."
+            echo "[blip-init] mounting service account via virtiofs..."
             mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
-            mount -t iso9660 -o ro /dev/vdc /var/run/secrets/kubernetes.io/serviceaccount
-            cp -a /var/run/secrets/kubernetes.io/serviceaccount /var/run/secrets/kubernetes.io/serviceaccount-rw
-            umount /var/run/secrets/kubernetes.io/serviceaccount
-            rmdir /var/run/secrets/kubernetes.io/serviceaccount
-            mv /var/run/secrets/kubernetes.io/serviceaccount-rw /var/run/secrets/kubernetes.io/serviceaccount
-            chmod -R a+r /var/run/secrets/kubernetes.io/serviceaccount
+            mount -t virtiofs sadisk /var/run/secrets/kubernetes.io/serviceaccount
             echo "[blip-init] service account mounted"
         - - /bin/bash
           - -c
@@ -385,10 +388,10 @@ spec:
                 name: datadisk
               - disk:
                   bus: virtio
-                name: sadisk
-              - disk:
-                  bus: virtio
                 name: cloudinitdisk
+              filesystems:
+              - name: sadisk
+                virtiofs: {}
               interfaces:
               - masquerade: {}
                 name: default
@@ -415,7 +418,7 @@ spec:
               imagePullPolicy: IfNotPresent
             name: rootdisk
           - emptyDisk:
-              capacity: 20Gi
+              capacity: 32Gi
             name: datadisk
           - name: sadisk
             serviceAccount:
