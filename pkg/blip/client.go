@@ -28,6 +28,23 @@
 // For advanced operations use [Blip.SFTPClient] to get a full
 // [github.com/pkg/sftp.Client].
 //
+// # Port Forwarding
+//
+// TCP ports can be forwarded in both directions through the SSH tunnel:
+//
+//	// Local forwarding (ssh -L): access a remote service locally.
+//	fwd, _ := b.Forward(ctx, "127.0.0.1:0", "localhost:5432")
+//	defer fwd.Close()
+//	db, _ := sql.Open("postgres", fwd.Addr.String())
+//
+//	// Reverse forwarding (ssh -R): expose a local service on the VM.
+//	fwd, _ := b.ReverseForward(ctx, "0.0.0.0:9090", "localhost:9090")
+//	defer fwd.Close()
+//
+//	// Direct TCP dial through the VM.
+//	conn, _ := b.Dial(ctx, "tcp", "internal-service:8080")
+//	defer conn.Close()
+//
 // # Example
 //
 //	client, err := blip.NewClient("gateway.example.com")
