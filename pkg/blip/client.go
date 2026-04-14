@@ -17,6 +17,17 @@
 // Call [Blip.Retain] to make it persistent, then reconnect later with
 // [Client.Reconnect] using the session ID from [Blip.ID].
 //
+// # File Transfer
+//
+// Files can be transferred to and from the VM using SFTP:
+//
+//	b.Upload(ctx, "local.tar.gz", "/tmp/local.tar.gz")
+//	b.Download(ctx, "/var/log/syslog", "syslog.log")
+//	b.UploadDir(ctx, "./build", "/home/runner/build")
+//
+// For advanced operations use [Blip.SFTPClient] to get a full
+// [github.com/pkg/sftp.Client].
+//
 // # Example
 //
 //	client, err := blip.NewClient("gateway.example.com")
@@ -29,6 +40,11 @@
 //	// Run a command on the blip VM.
 //	sess, _ := b.NewSession()
 //	output, _ := sess.CombinedOutput("uname -a")
+//
+//	// Upload a file, then run it.
+//	b.Upload(ctx, "./script.sh", "/tmp/script.sh")
+//	sess2, _ := b.NewSession()
+//	sess2.Run("bash /tmp/script.sh")
 //
 //	// Keep the blip alive after disconnect.
 //	b.Retain(ctx, blip.WithTTL(2 * time.Hour))
