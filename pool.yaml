@@ -40,8 +40,8 @@ stringData:
             # Build the KubeVirt VM API URL for this VM.
             _vm_api_url() {
             	local token ns ca vm_name
-            	token="$(cat "$SA_DIR/token")"
-            	ns="$(cat "$SA_DIR/namespace")"
+            	token="$(sudo cat "$SA_DIR/token")"
+            	ns="$(sudo cat "$SA_DIR/namespace")"
             	ca="$SA_DIR/ca.crt"
             	vm_name="$(hostname)"
 
