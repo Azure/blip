@@ -365,16 +365,3 @@ func (h *Handler) ActiveSessionCount() int {
 func (h *Handler) WaitForPending() {
 	h.wg.Wait()
 }
-
-// Healthz returns an http.HandlerFunc for health/readiness checks.
-func (h *Handler) Healthz() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":          "ok",
-			"active_sessions": h.ActiveSessionCount(),
-			"timestamp":       time.Now().UTC().Format(time.RFC3339),
-		})
-	}
-}
