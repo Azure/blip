@@ -90,7 +90,7 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 		close(bufferedReqs)
 	}()
 
-	authFingerprint, authIdentity, isVMClient := extractAuthExtensions(serverConn)
+	authFingerprint, authIdentity, _ := extractAuthExtensions(serverConn)
 	deviceFlowPending := isDeviceFlowPending(serverConn)
 	offeredPubkey := extractOfferedPubkey(serverConn)
 	identityLinked := isIdentityLinked(serverConn)
@@ -284,20 +284,12 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 		sess.SetBannerChannel(firstClientChan)
 	}
 
-	// Inject SSH config for recursive blip connections (gateway host + key)
-	// and the reconnect host for the `blip retain` command.
+	// Inject SSH config and blip CLI shim for recursive blip connections.
 	if !reconnecting && m.cfg.GatewayHost != "" {
-		// VMs allocated from inside another blip (VM client key auth) use
-		// the in-cluster "blip" alias. External users get the public hostname.
-		reconnectHost := m.cfg.ExternalHost
-		if isVMClient {
-			reconnectHost = "blip"
-		}
 		go func() {
 			if err := proxy.InjectGatewayConfig(
 				upstreamConn,
 				m.cfg.GatewayHost,
-				reconnectHost,
 			); err != nil {
 				slog.Warn("failed to inject gateway config",
 					"session_id", sessionID,
@@ -735,7 +727,7 @@ func (m *Manager) verifyIdentityLink(ctx context.Context, pubkeyFingerprint, sto
 }
 
 // bindPubkeyAsync asynchronously binds the client's offered SSH public key
-// to their OIDC identity in the auth ConfigMap.
+// to their OIDC identity by creating a BlipOwner CR.
 func (m *Manager) bindPubkeyAsync(ctx context.Context, conn *ssh.ServerConn, authorizedKeyLine string, identity string) {
 	if m.cfg.AuthWatcher == nil {
 		return

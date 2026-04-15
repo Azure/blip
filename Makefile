@@ -28,6 +28,10 @@ manifest:
 	mkdir -p dist
 	envsubst '$$REGISTRY $$BLIP_TAG' < deploy.yaml > dist/manifest.yaml
 
+.PHONY: generate
+generate:
+	go generate ./api/...
+
 .PHONY: pool
 pool:
 	mkdir -p dist

@@ -32,8 +32,8 @@ type Config struct {
 
 	MaxAuthTries int
 
-	// AuthWatcher provides the dynamic OIDC providers and allowed-pubkeys
-	// lists from a ConfigMap; nil disables OIDC and explicit pubkey auth.
+	// AuthWatcher provides the dynamic OIDC providers and SSH public keys
+	// from BlipOwner CRs; nil disables OIDC and explicit pubkey auth.
 	AuthWatcher *auth.AuthWatcher
 
 	// VMKeyResolver resolves VM client key fingerprints to user identities

@@ -4,22 +4,37 @@ description: "Add your SSH public key to the gateway allow-list"
 weight: 3
 ---
 
-Blip authenticates SSH connections using public keys in the gateway's allow-list.
+Blip authenticates SSH connections using public keys registered as BlipOwner CRs.
 
 ## Add your key
 
-Add your public key to the `ssh-gateway-auth` ConfigMap (`authorized_keys` format, one key per line):
+Create a BlipOwner CR with your public key:
 
-```shell
-kubectl edit configmap ssh-gateway-auth -n blip
+```yaml
+apiVersion: blip.io/v1alpha1
+kind: BlipOwner
+metadata:
+  name: alice-laptop
+  namespace: blip
+spec:
+  sshKey:
+    publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop"
 ```
 
-Or patch it directly:
+Or create it directly from the command line:
 
 ```shell
 KEY=$(cat ~/.ssh/id_ed25519.pub)
-kubectl patch configmap ssh-gateway-auth -n blip \
-  --type merge -p "{\"data\":{\"allowed-pubkeys\":\"$KEY\n\"}}"
+kubectl apply -f - <<EOF
+apiVersion: blip.io/v1alpha1
+kind: BlipOwner
+metadata:
+  name: $(whoami)-key
+  namespace: blip
+spec:
+  sshKey:
+    publicKey: "$KEY"
+EOF
 ```
 
 Changes take effect without a gateway restart.

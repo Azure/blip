@@ -34,7 +34,7 @@ func newRootCmd() *cobra.Command {
 		podName            string
 		maxSessionDuration int
 		maxBlipsPerUser    int
-		authConfigMap      string
+		enableAuth         bool
 		hostPrincipals     []string
 		externalHost       string
 		vmRegisterSA       string
@@ -75,7 +75,7 @@ func newRootCmd() *cobra.Command {
 				PodName:            podName,
 				MaxSessionDuration: time.Duration(maxSessionDuration) * time.Second,
 				MaxBlipsPerUser:    maxBlipsPerUser,
-				AuthConfigMap:      authConfigMap,
+				EnableAuth:         enableAuth,
 				HostPrincipals:     hostPrincipals,
 				ExternalHost:       externalHost,
 				VMRegisterSA:       vmRegisterSA,
@@ -97,8 +97,8 @@ func newRootCmd() *cobra.Command {
 				if len(runnerLabels) == 0 {
 					return fmt.Errorf("--runner-labels is required when --github-app-id is set (e.g. 'self-hosted,blip')")
 				}
-				if authConfigMap == "" {
-					return fmt.Errorf("--auth-configmap is required when --github-app-id is set (repos are read from the 'actions-repos' key)")
+				if !enableAuth {
+					return fmt.Errorf("--enable-auth is required when --github-app-id is set (repos are read from BlipOwner CRs)")
 				}
 				cfg.Actions = &sshgw.ActionsConfig{
 					GitHubAppID:        githubAppID,
@@ -124,7 +124,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "unknown"), "Pod name for identification (env: POD_NAME)")
 	cmd.Flags().IntVar(&maxSessionDuration, "max-session-duration", envOrDefaultInt("MAX_SESSION_DURATION", 43200), "Maximum session duration in seconds (env: MAX_SESSION_DURATION)")
 	cmd.Flags().IntVar(&maxBlipsPerUser, "max-blips-per-user", envOrDefaultInt("MAX_BLIPS_PER_USER", 0), "Per-user blip quota, 0 = unlimited (env: MAX_BLIPS_PER_USER)")
-	cmd.Flags().StringVar(&authConfigMap, "auth-configmap", envOrDefault("AUTH_CONFIGMAP", ""), "ConfigMap name for auth config: OIDC providers, SSH pubkeys, and actions repos (env: AUTH_CONFIGMAP)")
+	cmd.Flags().BoolVar(&enableAuth, "enable-auth", envOrDefaultBool("ENABLE_AUTH", false), "Enable BlipOwner CRD-based auth: OIDC providers, SSH pubkeys, and actions repos (env: ENABLE_AUTH)")
 	cmd.Flags().StringSliceVar(&hostPrincipals, "host-principals", envOrDefaultStringSlice("GATEWAY_HOST_PRINCIPALS"), "Hostnames/IPs for gateway identification, comma-separated (env: GATEWAY_HOST_PRINCIPALS)")
 	cmd.Flags().StringVar(&externalHost, "external-host", envOrDefault("GATEWAY_EXTERNAL_HOST", ""), "Public hostname for the gateway, shown in reconnect instructions (env: GATEWAY_EXTERNAL_HOST)")
 	cmd.Flags().StringVar(&vmRegisterSA, "vm-register-sa", envOrDefault("VM_REGISTER_SA", "vm-register"), "ServiceAccount name for VM registration token validation (env: VM_REGISTER_SA)")
@@ -189,4 +189,12 @@ func envOrDefaultStringSlice(key string) []string {
 		}
 	}
 	return result
+}
+
+func envOrDefaultBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v == "true" || v == "1" || v == "yes"
 }

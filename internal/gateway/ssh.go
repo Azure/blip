@@ -30,12 +30,10 @@ type GatewayConfig struct {
 	PodName            string
 	MaxSessionDuration time.Duration
 
-	// AuthConfigMap is the name of the ConfigMap (in VMNamespace) that holds
-	// OIDC provider configuration (key: "oidc-providers"), explicitly
-	// allowed SSH public keys (key: "allowed-pubkeys"), and the list of
-	// GitHub repos to poll for Actions jobs (key: "actions-repos").
-	// Empty disables OIDC, explicit pubkey auth, and Actions polling.
-	AuthConfigMap string
+	// EnableAuth enables BlipOwner CRD-based authentication. When true, the
+	// gateway watches BlipOwner CRs in VMNamespace for OIDC provider
+	// configurations, allowed SSH public keys, and Actions repo associations.
+	EnableAuth bool
 
 	MaxBlipsPerUser int
 
@@ -69,7 +67,7 @@ type GatewayConfig struct {
 // ActionsConfig holds the configuration for the GitHub Actions polling
 // integration. When enabled, the gateway polls the GitHub API for queued
 // workflow jobs and allocates Blip VMs as just-in-time self-hosted runners.
-// The list of repos to poll is read from the auth ConfigMap (key: "actions-repos").
+// The list of repos to poll is read from BlipOwner CRs with actionsRepo specs.
 type ActionsConfig struct {
 	// GitHubAppID is the GitHub App ID used for authentication.
 	GitHubAppID int64
@@ -97,11 +95,11 @@ func RunGateway(cfg *GatewayConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start the ConfigMap-backed auth watcher for OIDC and pubkey auth.
+	// Start the BlipOwner CRD-backed auth watcher for OIDC and pubkey auth.
 	var authWatcher *auth.AuthWatcher
-	if cfg.AuthConfigMap != "" {
+	if cfg.EnableAuth {
 		var err error
-		authWatcher, err = auth.NewAuthWatcher(ctx, cfg.VMNamespace, cfg.AuthConfigMap)
+		authWatcher, err = auth.NewAuthWatcher(ctx, cfg.VMNamespace)
 		if err != nil {
 			return fmt.Errorf("start auth watcher: %w", err)
 		}
@@ -189,7 +187,7 @@ func RunGateway(cfg *GatewayConfig) error {
 	var actionsPoller *ghactions.Poller
 	if cfg.Actions != nil && cfg.Actions.GitHubAppID > 0 {
 		if authWatcher == nil {
-			return fmt.Errorf("actions polling requires --auth-configmap to be set (repos are read from the %q key)", auth.KeyActionsRepos)
+			return fmt.Errorf("actions polling requires --enable-auth (repos are read from BlipOwner CRs with actionsRepo specs)")
 		}
 
 		ghClient, err := ghactions.NewGitHubClient(
@@ -255,7 +253,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		"pool", cfg.VMPoolName,
 		"max_session", cfg.MaxSessionDuration.String(),
 		"oidc_auth", authWatcher != nil,
-		"auth_configmap", cfg.AuthConfigMap,
 		"actions_enabled", actionsPoller != nil,
 	)
 

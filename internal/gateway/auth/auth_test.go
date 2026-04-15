@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
+
+	blipv1alpha1 "github.com/project-unbounded/blip/api/v1alpha1"
 )
 
 // generateHostKey creates a fresh host key signer for testing.
@@ -393,124 +395,113 @@ func TestGlobMatch(t *testing.T) {
 	}
 }
 
-func TestParseOIDCProviders(t *testing.T) {
-	t.Run("parses valid YAML", func(t *testing.T) {
-		raw := `
-- issuer: https://token.actions.githubusercontent.com
-  audience: blip
-  allowed-subjects:
-    - "repo:my-org/my-repo:*"
-- issuer: https://login.microsoftonline.com/tenant-id/v2.0
-  audience: api://blip
-  identity-claim: oid
-  allowed-subjects:
-    - "00000000-0000-0000-0000-000000000001"
-`
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 2)
-
-		assert.Equal(t, "https://token.actions.githubusercontent.com", providers[0].Issuer)
-		assert.Equal(t, "blip", providers[0].Audience)
-		assert.Equal(t, "", providers[0].IdentityClaim) // defaults to "sub" at verification time
-		assert.Equal(t, []string{"repo:my-org/my-repo:*"}, providers[0].AllowedSubjects)
-
-		assert.Equal(t, "https://login.microsoftonline.com/tenant-id/v2.0", providers[1].Issuer)
-		assert.Equal(t, "api://blip", providers[1].Audience)
-		assert.Equal(t, "oid", providers[1].IdentityClaim)
-		assert.Equal(t, []string{"00000000-0000-0000-0000-000000000001"}, providers[1].AllowedSubjects)
+func TestValidateOIDCFromCR(t *testing.T) {
+	t.Run("validates valid OIDC spec", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:          "https://token.actions.githubusercontent.com",
+			Audience:        "blip",
+			AllowedSubjects: []string{"repo:my-org/my-repo:*"},
+		}
+		p, ok := validateOIDCFromCR(spec)
+		require.True(t, ok)
+		assert.Equal(t, "https://token.actions.githubusercontent.com", p.Issuer)
+		assert.Equal(t, "blip", p.Audience)
+		assert.Equal(t, "", p.IdentityClaim)
+		assert.Equal(t, []string{"repo:my-org/my-repo:*"}, p.AllowedSubjects)
 	})
 
-	t.Run("empty string returns nil", func(t *testing.T) {
-		providers := parseOIDCProviders("")
-		assert.Nil(t, providers)
+	t.Run("validates with identity claim", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:          "https://login.microsoftonline.com/tenant-id/v2.0",
+			Audience:        "api://blip",
+			IdentityClaim:   "oid",
+			AllowedSubjects: []string{"00000000-0000-0000-0000-000000000001"},
+		}
+		p, ok := validateOIDCFromCR(spec)
+		require.True(t, ok)
+		assert.Equal(t, "https://login.microsoftonline.com/tenant-id/v2.0", p.Issuer)
+		assert.Equal(t, "api://blip", p.Audience)
+		assert.Equal(t, "oid", p.IdentityClaim)
+		assert.Equal(t, []string{"00000000-0000-0000-0000-000000000001"}, p.AllowedSubjects)
 	})
 
-	t.Run("whitespace-only returns nil", func(t *testing.T) {
-		providers := parseOIDCProviders("   \n  ")
-		assert.Nil(t, providers)
+	t.Run("rejects empty issuer", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:   "",
+			Audience: "blip",
+		}
+		_, ok := validateOIDCFromCR(spec)
+		assert.False(t, ok)
 	})
 
-	t.Run("invalid YAML returns nil", func(t *testing.T) {
-		providers := parseOIDCProviders("not: valid: yaml: list")
-		assert.Nil(t, providers)
+	t.Run("rejects empty audience", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:   "https://example.com",
+			Audience: "",
+		}
+		_, ok := validateOIDCFromCR(spec)
+		assert.False(t, ok)
 	})
 
-	t.Run("skips entries with empty issuer", func(t *testing.T) {
-		raw := `
-- issuer: ""
-  audience: blip
-- issuer: https://example.com
-  audience: test
-`
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 1)
-		assert.Equal(t, "https://example.com", providers[0].Issuer)
+	t.Run("accepts provider with no allowed subjects", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:   "https://example.com",
+			Audience: "blip",
+		}
+		p, ok := validateOIDCFromCR(spec)
+		require.True(t, ok)
+		assert.Nil(t, p.AllowedSubjects)
 	})
 
-	t.Run("skips entries with empty audience", func(t *testing.T) {
-		raw := `
-- issuer: https://example.com
-  audience: ""
-- issuer: https://example2.com
-  audience: test
-`
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 1)
-		assert.Equal(t, "https://example2.com", providers[0].Issuer)
-	})
+	t.Run("rejects non-HTTPS issuer", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:   "http://insecure.example.com",
+			Audience: "blip",
+		}
+		_, ok := validateOIDCFromCR(spec)
+		assert.False(t, ok)
 
-	t.Run("provider with no allowed subjects", func(t *testing.T) {
-		raw := `
-- issuer: https://example.com
-  audience: blip
-`
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 1)
-		assert.Nil(t, providers[0].AllowedSubjects)
-	})
-
-	t.Run("skips non-HTTPS issuers", func(t *testing.T) {
-		raw := `
-- issuer: http://insecure.example.com
-  audience: blip
-- issuer: not-a-url
-  audience: blip
-- issuer: https://secure.example.com
-  audience: blip
-`
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 1)
-		assert.Equal(t, "https://secure.example.com", providers[0].Issuer)
+		spec2 := &blipv1alpha1.OIDCSpec{
+			Issuer:   "not-a-url",
+			Audience: "blip",
+		}
+		_, ok2 := validateOIDCFromCR(spec2)
+		assert.False(t, ok2)
 	})
 
 	t.Run("normalizes trailing slash on issuer", func(t *testing.T) {
-		raw := `
-- issuer: https://example.com/
-  audience: blip
-- issuer: https://example2.com///
-  audience: blip
-`
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 2)
-		assert.Equal(t, "https://example.com", providers[0].Issuer)
-		assert.Equal(t, "https://example2.com", providers[1].Issuer)
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:   "https://example.com/",
+			Audience: "blip",
+		}
+		p, ok := validateOIDCFromCR(spec)
+		require.True(t, ok)
+		assert.Equal(t, "https://example.com", p.Issuer)
+
+		spec2 := &blipv1alpha1.OIDCSpec{
+			Issuer:   "https://example2.com///",
+			Audience: "blip",
+		}
+		p2, ok2 := validateOIDCFromCR(spec2)
+		require.True(t, ok2)
+		assert.Equal(t, "https://example2.com", p2.Issuer)
 	})
 
 	t.Run("trims whitespace from fields", func(t *testing.T) {
-		raw := `
-- issuer: "  https://example.com  "
-  audience: "  blip  "
-  identity-claim: "  oid  "
-`
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 1)
-		assert.Equal(t, "https://example.com", providers[0].Issuer)
-		assert.Equal(t, "blip", providers[0].Audience)
-		assert.Equal(t, "oid", providers[0].IdentityClaim)
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:        "  https://example.com  ",
+			Audience:      "  blip  ",
+			IdentityClaim: "  oid  ",
+		}
+		p, ok := validateOIDCFromCR(spec)
+		require.True(t, ok)
+		assert.Equal(t, "https://example.com", p.Issuer)
+		assert.Equal(t, "blip", p.Audience)
+		assert.Equal(t, "oid", p.IdentityClaim)
 	})
 }
 
-func TestParsePubkeyList(t *testing.T) {
+func TestParseSSHKeyFromCR(t *testing.T) {
 	// Generate a real ed25519 key to get a valid authorized_keys line.
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
@@ -523,55 +514,32 @@ func TestParsePubkeyList(t *testing.T) {
 	expectedFP := ssh.FingerprintSHA256(sshPub)
 
 	t.Run("parses valid key with comment", func(t *testing.T) {
-		fps := parsePubkeyList(authorizedKey)
-		assert.Contains(t, fps, expectedFP)
-		assert.Equal(t, "alice@laptop", fps[expectedFP])
-		assert.Len(t, fps, 1)
+		fp, comment := parseSSHKeyFromCR(authorizedKey)
+		assert.Equal(t, expectedFP, fp)
+		assert.Equal(t, "alice@laptop", comment)
 	})
 
 	t.Run("parses key without comment as empty string", func(t *testing.T) {
-		fps := parsePubkeyList(bareKey)
-		assert.Contains(t, fps, expectedFP)
-		assert.Equal(t, "", fps[expectedFP])
-		assert.Len(t, fps, 1)
+		fp, comment := parseSSHKeyFromCR(bareKey)
+		assert.Equal(t, expectedFP, fp)
+		assert.Equal(t, "", comment)
 	})
 
-	t.Run("skips comments and blank lines", func(t *testing.T) {
-		raw := "# this is a comment\n\n" + authorizedKey + "\n  \n# another comment\n"
-		fps := parsePubkeyList(raw)
-		assert.Contains(t, fps, expectedFP)
-		assert.Equal(t, "alice@laptop", fps[expectedFP])
-		assert.Len(t, fps, 1)
+	t.Run("returns empty for invalid key", func(t *testing.T) {
+		fp, comment := parseSSHKeyFromCR("not-a-valid-key")
+		assert.Equal(t, "", fp)
+		assert.Equal(t, "", comment)
 	})
 
-	t.Run("skips invalid lines", func(t *testing.T) {
-		raw := "not-a-valid-key\n" + authorizedKey
-		fps := parsePubkeyList(raw)
-		assert.Contains(t, fps, expectedFP)
-		assert.Equal(t, "alice@laptop", fps[expectedFP])
-		assert.Len(t, fps, 1)
+	t.Run("returns empty for empty input", func(t *testing.T) {
+		fp, comment := parseSSHKeyFromCR("")
+		assert.Equal(t, "", fp)
+		assert.Equal(t, "", comment)
 	})
 
-	t.Run("empty input returns empty map", func(t *testing.T) {
-		fps := parsePubkeyList("")
-		assert.Empty(t, fps)
-	})
-
-	t.Run("multiple keys with different usernames", func(t *testing.T) {
-		pub2, _, err := ed25519.GenerateKey(rand.Reader)
-		require.NoError(t, err)
-		sshPub2, err := ssh.NewPublicKey(pub2)
-		require.NoError(t, err)
-		bareKey2 := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub2)))
-		key2 := bareKey2 + " bob@desktop"
-		fp2 := ssh.FingerprintSHA256(sshPub2)
-
-		raw := authorizedKey + "\n" + key2
-		fps := parsePubkeyList(raw)
-		assert.Contains(t, fps, expectedFP)
-		assert.Equal(t, "alice@laptop", fps[expectedFP])
-		assert.Contains(t, fps, fp2)
-		assert.Equal(t, "bob@desktop", fps[fp2])
-		assert.Len(t, fps, 2)
+	t.Run("trims whitespace", func(t *testing.T) {
+		fp, comment := parseSSHKeyFromCR("  " + authorizedKey + "  ")
+		assert.Equal(t, expectedFP, fp)
+		assert.Equal(t, "alice@laptop", comment)
 	})
 }

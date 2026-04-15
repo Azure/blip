@@ -11,58 +11,64 @@ Blip supports OIDC authentication from any standards-compliant provider (Azure E
 
 ## Configure the gateway
 
-Providers are configured in the `ssh-gateway-auth` ConfigMap. No restart required.
-
-The `oidc-providers` key holds a YAML list:
+Each OIDC provider is configured as a BlipOwner CR with `spec.oidc`. No restart required — the gateway watches these CRs in real time.
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `issuer` | yes | OIDC issuer URL |
 | `audience` | yes | Expected `aud` claim |
-| `identity-claim` | no | Claim used as user identity (default: `sub`) |
-| `allowed-subjects` | no | Allowlist of subject patterns (glob: `*`) |
-| `device-flow` | no | Enable device authorization grant (default: `false`) |
-| `client-id` | device-flow | OAuth2 client ID (public client, no secret) |
-| `device-auth-url` | device-flow | Device authorization endpoint |
-| `token-url` | device-flow | Token endpoint |
+| `identityClaim` | no | Claim used as user identity (default: `sub`) |
+| `allowedSubjects` | no | Allowlist of subject patterns (glob: `*`) |
+| `deviceFlow` | no | Enable device authorization grant (default: `false`) |
+| `clientID` | device-flow | OAuth2 client ID (public client, no secret) |
+| `deviceAuthURL` | device-flow | Device authorization endpoint |
+| `tokenURL` | device-flow | Token endpoint |
 | `scopes` | no | OAuth2 scopes for device flow |
-
-Examples below show the `data` section of this ConfigMap.
 
 ### Azure Entra (AAD)
 
 ```yaml
-data:
-  oidc-providers: |
-    - issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
-      audience: api://blip
-      identity-claim: oid
-      allowed-subjects:
-        - "<user-or-service-principal-object-id>"
+apiVersion: blip.io/v1alpha1
+kind: BlipOwner
+metadata:
+  name: azure-entra-oidc
+  namespace: blip
+spec:
+  oidc:
+    issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
+    audience: api://blip
+    identityClaim: oid
+    allowedSubjects:
+      - "<user-or-service-principal-object-id>"
 ```
 
-Multiple providers are supported; the gateway tries each in order and accepts the first match.
+Multiple providers are supported — create one BlipOwner CR per provider. The gateway tries each in order and accepts the first match.
 
 ## Device flow
 
-The gateway displays a login URL ([RFC 8628](https://datatracker.ietf.org/doc/html/rfc8628)) and waits for browser authentication. After login, the user's SSH key is bound to their OIDC identity — subsequent connections use SSH key auth. Remove the key from `allowed-pubkeys` to revoke.
+The gateway displays a login URL ([RFC 8628](https://datatracker.ietf.org/doc/html/rfc8628)) and waits for browser authentication. After login, the user's SSH key is bound to their OIDC identity — subsequent connections use SSH key auth. Delete the BlipOwner CR to revoke.
 
 ### Azure Entra (AAD)
 
 Requires a public client app with "Allow public client flows" enabled.
 
 ```yaml
-data:
-  oidc-providers: |
-    - issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
-      audience: api://blip
-      identity-claim: oid
-      device-flow: true
-      client-id: <your-app-client-id>
-      device-auth-url: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/devicecode
-      token-url: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
-      scopes:
-        - api://blip/.default
+apiVersion: blip.io/v1alpha1
+kind: BlipOwner
+metadata:
+  name: azure-entra-device-flow
+  namespace: blip
+spec:
+  oidc:
+    issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
+    audience: api://blip
+    identityClaim: oid
+    deviceFlow: true
+    clientID: <your-app-client-id>
+    deviceAuthURL: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/devicecode
+    tokenURL: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
+    scopes:
+      - api://blip/.default
 ```
 
 ## Pin the gateway host key
@@ -107,26 +113,26 @@ client, err := blip.NewClient("gateway.example.com")
 ## Session behavior
 
 - **TTL:** 30 min (OIDC) / 8 hours (SSH key). Device flow uses OIDC TTL until key binding, then SSH key TTL.
-- **Identity:** `oidc:<subject-claim>` (or configured `identity-claim` value).
+- **Identity:** `oidc:<subject-claim>` (or configured `identityClaim` value).
 - Per-user quotas apply using the OIDC identity.
 
 ## Subject allowlists
 
-Glob patterns with `*` (matches any character including `/` and `:`). Case-insensitive. Checked against `identity-claim` (default: `sub`).
+Glob patterns with `*` (matches any character including `/` and `:`). Case-insensitive. Checked against `identityClaim` (default: `sub`).
 
 ```yaml
-allowed-subjects:
+allowedSubjects:
   - "<user-or-service-principal-object-id>"   # specific identity
   - "<tenant-id>/*"                           # any identity in tenant
 ```
 
-Empty `allowed-subjects` permits any valid token from the issuer.
+Empty `allowedSubjects` permits any valid token from the issuer.
 
 ## Security
 
 - Tokens verified against the provider's JWKS endpoint (key rotation handled automatically).
 - All OIDC authentications logged with full identity claim and issuer.
-- **Device flow:** `allowed-subjects` is enforced after browser authentication. All device flow endpoints must use HTTPS.
+- **Device flow:** `allowedSubjects` is enforced after browser authentication. All device flow endpoints must use HTTPS.
 
 ## Next steps
 

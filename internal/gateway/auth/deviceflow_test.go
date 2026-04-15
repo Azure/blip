@@ -3,7 +3,6 @@ package auth
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
+
+	blipv1alpha1 "github.com/project-unbounded/blip/api/v1alpha1"
 )
 
 func TestRequestDeviceCode(t *testing.T) {
@@ -416,120 +417,121 @@ func TestDeviceFlowError(t *testing.T) {
 	})
 }
 
-func TestParseOIDCProvidersDeviceFlow(t *testing.T) {
-	t.Run("parses device flow config", func(t *testing.T) {
-		raw := `
-- issuer: https://login.microsoftonline.com/tenant/v2.0
-  audience: api://blip
-  identity-claim: oid
-  device-flow: true
-  client-id: my-client-id
-  device-auth-url: https://login.microsoftonline.com/tenant/oauth2/v2.0/devicecode
-  token-url: https://login.microsoftonline.com/tenant/oauth2/v2.0/token
-  scopes:
-    - "api://blip/.default"
-    - "openid"
-`
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 1)
-		assert.True(t, providers[0].DeviceFlow)
-		assert.Equal(t, "my-client-id", providers[0].ClientID)
-		assert.Equal(t, "https://login.microsoftonline.com/tenant/oauth2/v2.0/devicecode", providers[0].DeviceAuthURL)
-		assert.Equal(t, "https://login.microsoftonline.com/tenant/oauth2/v2.0/token", providers[0].TokenURL)
-		assert.Equal(t, []string{"api://blip/.default", "openid"}, providers[0].Scopes)
+func TestValidateOIDCFromCRDeviceFlow(t *testing.T) {
+	t.Run("validates device flow config", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:        "https://login.microsoftonline.com/tenant/v2.0",
+			Audience:      "api://blip",
+			IdentityClaim: "oid",
+			DeviceFlow:    true,
+			ClientID:      "my-client-id",
+			DeviceAuthURL: "https://login.microsoftonline.com/tenant/oauth2/v2.0/devicecode",
+			TokenURL:      "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+			Scopes:        []string{"api://blip/.default", "openid"},
+		}
+		p, ok := validateOIDCFromCR(spec)
+		require.True(t, ok)
+		assert.True(t, p.DeviceFlow)
+		assert.Equal(t, "my-client-id", p.ClientID)
+		assert.Equal(t, "https://login.microsoftonline.com/tenant/oauth2/v2.0/devicecode", p.DeviceAuthURL)
+		assert.Equal(t, "https://login.microsoftonline.com/tenant/oauth2/v2.0/token", p.TokenURL)
+		assert.Equal(t, []string{"api://blip/.default", "openid"}, p.Scopes)
 	})
 
-	t.Run("skips device-flow without client-id", func(t *testing.T) {
-		raw := `
-- issuer: https://example.com
-  audience: blip
-  device-flow: true
-  device-auth-url: https://example.com/device
-  token-url: https://example.com/token
-`
-		providers := parseOIDCProviders(raw)
-		assert.Empty(t, providers)
+	t.Run("rejects device-flow without client-id", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:        "https://example.com",
+			Audience:      "blip",
+			DeviceFlow:    true,
+			DeviceAuthURL: "https://example.com/device",
+			TokenURL:      "https://example.com/token",
+		}
+		_, ok := validateOIDCFromCR(spec)
+		assert.False(t, ok)
 	})
 
-	t.Run("skips device-flow without device-auth-url", func(t *testing.T) {
-		raw := `
-- issuer: https://example.com
-  audience: blip
-  device-flow: true
-  client-id: my-client
-  token-url: https://example.com/token
-`
-		providers := parseOIDCProviders(raw)
-		assert.Empty(t, providers)
+	t.Run("rejects device-flow without device-auth-url", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:     "https://example.com",
+			Audience:   "blip",
+			DeviceFlow: true,
+			ClientID:   "my-client",
+			TokenURL:   "https://example.com/token",
+		}
+		_, ok := validateOIDCFromCR(spec)
+		assert.False(t, ok)
 	})
 
-	t.Run("skips device-flow without token-url", func(t *testing.T) {
-		raw := `
-- issuer: https://example.com
-  audience: blip
-  device-flow: true
-  client-id: my-client
-  device-auth-url: https://example.com/device
-`
-		providers := parseOIDCProviders(raw)
-		assert.Empty(t, providers)
+	t.Run("rejects device-flow without token-url", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:        "https://example.com",
+			Audience:      "blip",
+			DeviceFlow:    true,
+			ClientID:      "my-client",
+			DeviceAuthURL: "https://example.com/device",
+		}
+		_, ok := validateOIDCFromCR(spec)
+		assert.False(t, ok)
 	})
 
-	t.Run("skips device-flow with non-HTTPS device-auth-url", func(t *testing.T) {
-		raw := `
-- issuer: https://example.com
-  audience: blip
-  device-flow: true
-  client-id: my-client
-  device-auth-url: http://example.com/device
-  token-url: https://example.com/token
-`
-		providers := parseOIDCProviders(raw)
-		assert.Empty(t, providers)
+	t.Run("rejects device-flow with non-HTTPS device-auth-url", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:        "https://example.com",
+			Audience:      "blip",
+			DeviceFlow:    true,
+			ClientID:      "my-client",
+			DeviceAuthURL: "http://example.com/device",
+			TokenURL:      "https://example.com/token",
+		}
+		_, ok := validateOIDCFromCR(spec)
+		assert.False(t, ok)
 	})
 
-	t.Run("skips device-flow with non-HTTPS token-url", func(t *testing.T) {
-		raw := `
-- issuer: https://example.com
-  audience: blip
-  device-flow: true
-  client-id: my-client
-  device-auth-url: https://example.com/device
-  token-url: http://example.com/token
-`
-		providers := parseOIDCProviders(raw)
-		assert.Empty(t, providers)
+	t.Run("rejects device-flow with non-HTTPS token-url", func(t *testing.T) {
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:        "https://example.com",
+			Audience:      "blip",
+			DeviceFlow:    true,
+			ClientID:      "my-client",
+			DeviceAuthURL: "https://example.com/device",
+			TokenURL:      "http://example.com/token",
+		}
+		_, ok := validateOIDCFromCR(spec)
+		assert.False(t, ok)
 	})
 
 	t.Run("non-device-flow provider ignores device fields", func(t *testing.T) {
-		raw := `
-- issuer: https://token.actions.githubusercontent.com
-  audience: blip
-`
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 1)
-		assert.False(t, providers[0].DeviceFlow)
-		assert.Empty(t, providers[0].ClientID)
+		spec := &blipv1alpha1.OIDCSpec{
+			Issuer:   "https://token.actions.githubusercontent.com",
+			Audience: "blip",
+		}
+		p, ok := validateOIDCFromCR(spec)
+		require.True(t, ok)
+		assert.False(t, p.DeviceFlow)
+		assert.Empty(t, p.ClientID)
 	})
 
 	t.Run("mixed providers", func(t *testing.T) {
-		raw := fmt.Sprintf(`
-- issuer: https://token.actions.githubusercontent.com
-  audience: blip
-  allowed-subjects:
-    - "repo:my-org/*:*"
-- issuer: https://login.microsoftonline.com/tenant/v2.0
-  audience: api://blip
-  identity-claim: oid
-  device-flow: true
-  client-id: my-client
-  device-auth-url: https://login.microsoftonline.com/tenant/oauth2/v2.0/devicecode
-  token-url: https://login.microsoftonline.com/tenant/oauth2/v2.0/token
-`)
-		providers := parseOIDCProviders(raw)
-		require.Len(t, providers, 2)
-		assert.False(t, providers[0].DeviceFlow)
-		assert.True(t, providers[1].DeviceFlow)
+		spec1 := &blipv1alpha1.OIDCSpec{
+			Issuer:          "https://token.actions.githubusercontent.com",
+			Audience:        "blip",
+			AllowedSubjects: []string{"repo:my-org/*:*"},
+		}
+		spec2 := &blipv1alpha1.OIDCSpec{
+			Issuer:        "https://login.microsoftonline.com/tenant/v2.0",
+			Audience:      "api://blip",
+			IdentityClaim: "oid",
+			DeviceFlow:    true,
+			ClientID:      "my-client",
+			DeviceAuthURL: "https://login.microsoftonline.com/tenant/oauth2/v2.0/devicecode",
+			TokenURL:      "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+		}
+		p1, ok1 := validateOIDCFromCR(spec1)
+		p2, ok2 := validateOIDCFromCR(spec2)
+		require.True(t, ok1)
+		require.True(t, ok2)
+		assert.False(t, p1.DeviceFlow)
+		assert.True(t, p2.DeviceFlow)
 	})
 }
 

@@ -363,21 +363,12 @@ func rejectChannel(ch ssh.NewChannel, err error) {
 	}
 }
 
-// InjectGatewayConfig writes a minimal SSH config into the VM so the user
-// can SSH back to the gateway for recursive blip allocation. The VM uses
-// its own client key (generated at boot) for authentication.
-//
-// reconnectHost is the hostname shown in `blip retain` output. For VMs
-// allocated from inside another blip this is the in-cluster alias "blip";
-// for external users it is the public gateway hostname. When empty the
-// reconnect-host file is not written and the blip script falls back to
-// a <gateway-host> placeholder.
-func InjectGatewayConfig(upstream *ssh.Client, gatewayHost, reconnectHost string) error {
+// InjectGatewayConfig writes SSH config and a blip CLI shim into the VM.
+// The SSH config enables recursive blip allocation (ssh blip-gateway), and
+// the shim forwards `blip <command>` to the gateway's VM command handler.
+func InjectGatewayConfig(upstream *ssh.Client, gatewayHost string) error {
 	if err := validateShellSafe(gatewayHost); err != nil {
 		return fmt.Errorf("invalid gateway host: %w", err)
-	}
-	if err := validateShellSafe(reconnectHost); err != nil {
-		return fmt.Errorf("invalid reconnect host: %w", err)
 	}
 
 	session, err := upstream.NewSession()
@@ -400,16 +391,13 @@ Host blip blip-gateway
     StrictHostKeyChecking yes
 BLIP_CONFIG_EOF
 chmod 644 ~/.ssh/config
-`, gatewayHost)
 
-	// Write the reconnect host so the `blip retain` command can show
-	// a correct reconnect instruction.
-	if reconnectHost != "" {
-		script += fmt.Sprintf(`
-mkdir -p ~/.blip
-printf '%%s' '%s' > ~/.blip/reconnect-host
-`, reconnectHost)
-	}
+sudo tee /usr/local/bin/blip > /dev/null << 'BLIP_SHIM_EOF'
+#!/bin/sh
+exec ssh -o User=_blip blip-gateway -- "$@"
+BLIP_SHIM_EOF
+sudo chmod 755 /usr/local/bin/blip
+`, gatewayHost)
 
 	if err := session.Run(script); err != nil {
 		return fmt.Errorf("inject gateway config script: %w", err)
