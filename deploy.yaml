@@ -373,7 +373,7 @@ spec:
       labels:
         app: ssh-gateway
     spec:
-      terminationGracePeriodSeconds: 35
+      terminationGracePeriodSeconds: 75
       serviceAccountName: ssh-gateway
       securityContext:
         fsGroup: 65534
@@ -383,11 +383,15 @@ spec:
         ports:
         - containerPort: 2222
           name: ssh
+        - containerPort: 8080
+          name: http
         env:
         - name: MAX_SESSION_DURATION
           value: "3600"
         - name: LISTEN_ADDRESS
           value: ":2222"
+        - name: HTTP_ADDRESS
+          value: ":8080"
         - name: AUTH_CONFIGMAP
           value: "ssh-gateway-auth"
         - name: VM_POOL_NAME
@@ -406,6 +410,23 @@ spec:
           value: "/etc/blip/host-key/host_key"
         - name: CLIENT_KEY_PATH
           value: "/etc/blip/client-key/client_key"
+        # GitHub Actions webhook integration (optional).
+        # Uncomment and set these to enable the /webhook endpoint:
+        # - name: GITHUB_APP_ID
+        #   value: "<app-id>"
+        # - name: GITHUB_INSTALL_ID
+        #   value: "<install-id>"
+        # - name: GITHUB_KEY_PATH
+        #   value: "/etc/blip/github-key/private-key.pem"
+        # - name: WEBHOOK_SECRET
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: github-webhook-secret
+        #       key: secret
+        # - name: RUNNER_LABELS
+        #   value: "self-hosted,blip"
+        # - name: ACTIONS_SESSION_DURATION
+        #   value: "3600"
         volumeMounts:
         - name: host-key
           mountPath: /etc/blip/host-key
@@ -413,13 +434,19 @@ spec:
         - name: client-key
           mountPath: /etc/blip/client-key
           readOnly: true
+        # Uncomment when enabling GitHub Actions webhook:
+        # - name: github-key
+        #   mountPath: /etc/blip/github-key
+        #   readOnly: true
         readinessProbe:
-          tcpSocket:
-            port: 2222
+          httpGet:
+            path: /readyz
+            port: 8080
           initialDelaySeconds: 3
         livenessProbe:
-          tcpSocket:
-            port: 2222
+          httpGet:
+            path: /healthz
+            port: 8080
           initialDelaySeconds: 5
         resources:
           requests:
@@ -443,6 +470,14 @@ spec:
           items:
           - key: client_key
             path: client_key
+      # Uncomment when enabling GitHub Actions webhook:
+      # - name: github-key
+      #   secret:
+      #     secretName: github-app-key
+      #     defaultMode: 0440
+      #     items:
+      #     - key: private-key.pem
+      #       path: private-key.pem
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -469,6 +504,11 @@ spec:
     targetPort: 2222
     protocol: TCP
     name: ssh
+  # Uncomment to expose the webhook endpoint externally (for GitHub webhook delivery):
+  # - port: 8080
+  #   targetPort: 8080
+  #   protocol: TCP
+  #   name: http
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

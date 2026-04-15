@@ -56,6 +56,11 @@ type Client struct {
 	namespace string
 }
 
+// Writer returns the underlying Kubernetes client used for write operations.
+// This allows other components (e.g. the webhook VMAnnotator) to reuse the
+// same client rather than creating a separate one.
+func (c *Client) Writer() client.Client { return c.writer }
+
 // New creates a Client backed by an in-cluster informer cache scoped to the given namespace.
 func New(ctx context.Context, namespace string) (*Client, error) {
 	cfg, err := rest.InClusterConfig()

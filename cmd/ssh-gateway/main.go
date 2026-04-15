@@ -37,6 +37,17 @@ func newRootCmd() *cobra.Command {
 		authConfigMap      string
 		hostPrincipals     []string
 		externalHost       string
+
+		// HTTP server for health checks and webhook endpoint.
+		httpListenAddr string
+
+		// GitHub Actions webhook integration (optional).
+		webhookSecret          string
+		githubAppID            int64
+		githubInstallID        int64
+		githubKeyPath          string
+		runnerLabels           []string
+		actionsSessionDuration int
 	)
 
 	cmd := &cobra.Command{
@@ -70,6 +81,31 @@ func newRootCmd() *cobra.Command {
 				MaxAuthTries:       3,
 				KeepAliveInterval:  60 * time.Second,
 				KeepAliveMax:       3,
+				HTTPListenAddr:     httpListenAddr,
+			}
+
+			// Enable GitHub Actions webhook integration if configured.
+			if githubAppID > 0 {
+				if githubInstallID <= 0 {
+					return fmt.Errorf("--github-install-id is required when --github-app-id is set")
+				}
+				if githubKeyPath == "" {
+					return fmt.Errorf("--github-key-path is required when --github-app-id is set")
+				}
+				if len(runnerLabels) == 0 {
+					return fmt.Errorf("--runner-labels is required when --github-app-id is set (e.g. 'self-hosted,blip')")
+				}
+				if webhookSecret == "" {
+					slog.Warn("SECURITY WARNING: --webhook-secret is not set; webhook payloads will not be verified")
+				}
+				cfg.Actions = &sshgw.ActionsConfig{
+					WebhookSecret:      webhookSecret,
+					GitHubAppID:        githubAppID,
+					GitHubInstallID:    githubInstallID,
+					GitHubKeyPath:      githubKeyPath,
+					RunnerLabels:       runnerLabels,
+					MaxSessionDuration: actionsSessionDuration,
+				}
 			}
 
 			return sshgw.RunGateway(cfg)
@@ -90,6 +126,17 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringSliceVar(&hostPrincipals, "host-principals", envOrDefaultStringSlice("GATEWAY_HOST_PRINCIPALS"), "Hostnames/IPs for gateway identification, comma-separated (env: GATEWAY_HOST_PRINCIPALS)")
 	cmd.Flags().StringVar(&externalHost, "external-host", envOrDefault("GATEWAY_EXTERNAL_HOST", ""), "Public hostname for the gateway, shown in reconnect instructions (env: GATEWAY_EXTERNAL_HOST)")
 
+	// HTTP server flags.
+	cmd.Flags().StringVar(&httpListenAddr, "http-address", envOrDefault("HTTP_ADDRESS", ":8080"), "HTTP address for health checks and webhook endpoint (env: HTTP_ADDRESS)")
+
+	// GitHub Actions webhook flags (optional).
+	cmd.Flags().StringVar(&webhookSecret, "webhook-secret", envOrDefault("WEBHOOK_SECRET", ""), "GitHub webhook secret for signature validation (env: WEBHOOK_SECRET)")
+	cmd.Flags().Int64Var(&githubAppID, "github-app-id", envOrDefaultInt64("GITHUB_APP_ID", 0), "GitHub App ID for Actions webhook integration (env: GITHUB_APP_ID)")
+	cmd.Flags().Int64Var(&githubInstallID, "github-install-id", envOrDefaultInt64("GITHUB_INSTALL_ID", 0), "GitHub App installation ID (env: GITHUB_INSTALL_ID)")
+	cmd.Flags().StringVar(&githubKeyPath, "github-key-path", envOrDefault("GITHUB_KEY_PATH", ""), "Path to GitHub App PEM private key (env: GITHUB_KEY_PATH)")
+	cmd.Flags().StringSliceVar(&runnerLabels, "runner-labels", envOrDefaultStringSlice("RUNNER_LABELS"), "Runner labels to match against workflow_job labels, comma-separated (env: RUNNER_LABELS)")
+	cmd.Flags().IntVar(&actionsSessionDuration, "actions-session-duration", envOrDefaultInt("ACTIONS_SESSION_DURATION", 3600), "Maximum runner session duration in seconds (env: ACTIONS_SESSION_DURATION)")
+
 	return cmd
 }
 
@@ -106,6 +153,19 @@ func envOrDefaultInt(key string, def int) int {
 		return def
 	}
 	var n int
+	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
+		slog.Error("invalid integer environment variable", "key", key, "value", v)
+		os.Exit(1)
+	}
+	return n
+}
+
+func envOrDefaultInt64(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	var n int64
 	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
 		slog.Error("invalid integer environment variable", "key", key, "value", v)
 		os.Exit(1)

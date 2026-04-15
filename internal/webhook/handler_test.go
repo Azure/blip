@@ -489,19 +489,23 @@ func TestHandler_InvalidJSON(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
-func TestHandler_Healthz(t *testing.T) {
-	h := newTestHandler(&mockVMClaimer{}, &mockTokenProvider{}, &mockConfigStore{})
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	h.Healthz()(w, r)
+func TestHandler_ActiveSessionCount(t *testing.T) {
+	claimer := &mockVMClaimer{
+		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
+	}
+	tokens := &mockTokenProvider{
+		token: &RegistrationToken{Token: "tok"},
+	}
+	store := &mockConfigStore{}
+	h := newTestHandler(claimer, tokens, store)
 
-	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Header().Get("Content-Type"), "application/json")
+	assert.Equal(t, 0, h.ActiveSessionCount())
 
-	var result map[string]any
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &result))
-	assert.Equal(t, "ok", result["status"])
-	assert.Equal(t, float64(0), result["active_sessions"])
+	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
+	sendWebhook(h, body, "workflow_job")
+	waitForSessions(t, h, 1)
+
+	assert.Equal(t, 1, h.ActiveSessionCount())
 }
 
 func TestVerifyWebhookSignature(t *testing.T) {
