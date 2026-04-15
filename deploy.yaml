@@ -140,146 +140,6 @@ roleRef:
   name: blip-controller-vms
   apiGroup: rbac.authorization.k8s.io
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: vm-release
-  namespace: blip
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: vm-release
-  namespace: blip
-rules:
-- apiGroups: ["kubevirt.io"]
-  resources: ["virtualmachines"]
-  verbs: ["get", "patch"]
-- apiGroups: [""]
-  resources: ["configmaps"]
-  verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: vm-release
-  namespace: blip
-subjects:
-- kind: ServiceAccount
-  name: vm-release
-roleRef:
-  kind: Role
-  name: vm-release
-  apiGroup: rbac.authorization.k8s.io
----
-# ValidatingAdmissionPolicy: restrict what the vm-release service account can
-# modify on VirtualMachine objects. VMs use this SA to set annotations on
-# their own VM object:
-#   - blip.io/release: "true"        — signals early session release
-#   - blip.io/host-key: <key>        — stores the SSH host public key for
-#                                       gateway-side host key verification
-#   - blip.io/client-key: <key>      — stores the SSH client public key for
-#                                       VM-to-gateway authentication
-#   - blip.io/ephemeral: "false"     — marks VM as retained (via "blip retain")
-#   - blip.io/max-duration: <secs>   — updates TTL (via "blip retain --ttl")
-# Without this policy the SA's RBAC permission to patch any VM in the
-# namespace would allow a compromised VM to tamper with other VMs' metadata or
-# spec. The policy enforces that:
-#   1. The request's bound SA token must originate from the virt-launcher pod
-#      that owns the target VM (via the authentication.kubernetes.io/pod-name
-#      extra field). This prevents a compromised VM from modifying other VMs.
-#   2. blip.io/release may only be set to "true".
-#   3. blip.io/host-key must match SSH public key format.
-#   4. blip.io/client-key must match SSH public key format.
-#   5. blip.io/ephemeral may only be set to "false".
-#   6. blip.io/max-duration must be a numeric string.
-#   7. No other annotations may be changed, added, or removed.
-#   8. Labels, finalizers, and the spec are not modified.
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicy
-metadata:
-  name: vm-release-restrict
-spec:
-  failurePolicy: Fail
-  matchConstraints:
-    resourceRules:
-    - apiGroups: ["kubevirt.io"]
-      apiVersions: ["*"]
-      resources: ["virtualmachines"]
-      operations: ["UPDATE"]
-  matchConditions:
-  # Only apply to requests from the vm-release service account.
-  - name: is-vm-release-sa
-    expression: >-
-      request.userInfo.username == 'system:serviceaccount:blip:vm-release'
-  validations:
-  # 1. The request must originate from the virt-launcher pod that owns this VM.
-  - expression: >-
-      has(request.userInfo.extra) &&
-      'authentication.kubernetes.io/pod-name' in request.userInfo.extra &&
-      request.userInfo.extra['authentication.kubernetes.io/pod-name'].size() > 0 &&
-      request.userInfo.extra['authentication.kubernetes.io/pod-name'][0].startsWith('virt-launcher-' + object.metadata.name + '-')
-    message: "vm-release SA may only modify the VM corresponding to its own virt-launcher pod"
-  # 2. If blip.io/release is present it must be exactly "true".
-  - expression: >-
-      !('blip.io/release' in object.metadata.annotations) ||
-      object.metadata.annotations['blip.io/release'] == 'true'
-    message: "vm-release SA may only set blip.io/release to \"true\""
-  # 3. If blip.io/host-key is present it must look like an SSH public key.
-  - expression: >-
-      !('blip.io/host-key' in object.metadata.annotations) ||
-      object.metadata.annotations['blip.io/host-key'].matches('^ssh-[a-z0-9-]+ [A-Za-z0-9+/=]+$')
-    message: "blip.io/host-key must be a valid SSH public key (type + base64)"
-  # 4. If blip.io/client-key is present it must look like an SSH public key.
-  - expression: >-
-      !('blip.io/client-key' in object.metadata.annotations) ||
-      object.metadata.annotations['blip.io/client-key'].matches('^ssh-[a-z0-9-]+ [A-Za-z0-9+/=]+$')
-    message: "blip.io/client-key must be a valid SSH public key (type + base64)"
-  # 5. If blip.io/ephemeral is present it must be exactly "false".
-  - expression: >-
-      !('blip.io/ephemeral' in object.metadata.annotations) ||
-      object.metadata.annotations['blip.io/ephemeral'] == 'false'
-    message: "vm-release SA may only set blip.io/ephemeral to \"false\""
-  # 6. If blip.io/max-duration is present it must be a numeric string (seconds).
-  - expression: >-
-      !('blip.io/max-duration' in object.metadata.annotations) ||
-      object.metadata.annotations['blip.io/max-duration'].matches('^[0-9]+$')
-    message: "blip.io/max-duration must be a numeric string (seconds)"
-  # 7. No existing annotations may be changed or removed (except the allowed set).
-  - expression: >-
-      oldObject.metadata.annotations.all(k,
-        k == 'blip.io/release' || k == 'blip.io/host-key' || k == 'blip.io/client-key' || k == 'blip.io/ephemeral' || k == 'blip.io/max-duration' ||
-        (k in object.metadata.annotations && object.metadata.annotations[k] == oldObject.metadata.annotations[k])
-      )
-    message: "vm-release SA may not modify or remove any annotation other than blip.io/release, blip.io/host-key, blip.io/client-key, blip.io/ephemeral, and blip.io/max-duration"
-  # 8. No new annotations may be added (except the allowed set).
-  - expression: >-
-      object.metadata.annotations.all(k,
-        k == 'blip.io/release' || k == 'blip.io/host-key' || k == 'blip.io/client-key' || k == 'blip.io/ephemeral' || k == 'blip.io/max-duration' || k in oldObject.metadata.annotations
-      )
-    message: "vm-release SA may not add annotations other than blip.io/release, blip.io/host-key, blip.io/client-key, blip.io/ephemeral, and blip.io/max-duration"
-  # 9. Labels must not be changed.
-  - expression: >-
-      object.metadata.labels == oldObject.metadata.labels
-    message: "vm-release SA may not modify labels"
-  # 10. Finalizers must not be changed (prevents blocking VM deletion).
-  - expression: >-
-      (has(object.metadata.finalizers) ? object.metadata.finalizers : []) ==
-      (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])
-    message: "vm-release SA may not modify finalizers"
-  # 11. Spec must not be changed.
-  - expression: >-
-      object.spec == oldObject.spec
-    message: "vm-release SA may not modify the VM spec"
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicyBinding
-metadata:
-  name: vm-release-restrict
-spec:
-  policyName: vm-release-restrict
-  validationActions: [Deny]
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -333,8 +193,11 @@ spec:
 #                    (GitHub Actions, Azure Entra / AAD, etc.).
 #   allowed-pubkeys: One SSH public key per line (authorized_keys format).
 #                    Controls which public keys are accepted.
+#   actions-repos:   One owner/repo per line. Lists which GitHub repos the
+#                    Actions poller should monitor for queued workflow jobs.
 #
-# Remove the ConfigMap (or leave keys empty) to disable OIDC and pubkey auth.
+# Remove the ConfigMap (or leave keys empty) to disable OIDC, explicit pubkey
+# auth, and Actions polling.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -357,6 +220,9 @@ data:
   # allowed-pubkeys: |
   #   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop
   #   ssh-rsa AAAAB3NzaC1yc2EAAAA... bob@desktop
+  # actions-repos: |
+  #   my-org/my-repo
+  #   my-org/another-repo
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -410,23 +276,20 @@ spec:
           value: "/etc/blip/host-key/host_key"
         - name: CLIENT_KEY_PATH
           value: "/etc/blip/client-key/client_key"
-        # GitHub Actions webhook integration (optional).
-        # Uncomment and set these to enable the /webhook endpoint:
+        # GitHub Actions polling integration (optional).
+        # Uncomment and set these to enable the Actions runner poller:
         # - name: GITHUB_APP_ID
         #   value: "<app-id>"
         # - name: GITHUB_INSTALL_ID
         #   value: "<install-id>"
         # - name: GITHUB_KEY_PATH
         #   value: "/etc/blip/github-key/private-key.pem"
-        # - name: WEBHOOK_SECRET
-        #   valueFrom:
-        #     secretKeyRef:
-        #       name: github-webhook-secret
-        #       key: secret
         # - name: RUNNER_LABELS
         #   value: "self-hosted,blip"
         # - name: ACTIONS_SESSION_DURATION
         #   value: "3600"
+        # - name: ACTIONS_POLL_INTERVAL
+        #   value: "10"
         volumeMounts:
         - name: host-key
           mountPath: /etc/blip/host-key
@@ -434,7 +297,7 @@ spec:
         - name: client-key
           mountPath: /etc/blip/client-key
           readOnly: true
-        # Uncomment when enabling GitHub Actions webhook:
+        # Uncomment when enabling GitHub Actions polling:
         # - name: github-key
         #   mountPath: /etc/blip/github-key
         #   readOnly: true
@@ -470,7 +333,7 @@ spec:
           items:
           - key: client_key
             path: client_key
-      # Uncomment when enabling GitHub Actions webhook:
+      # Uncomment when enabling GitHub Actions polling:
       # - name: github-key
       #   secret:
       #     secretName: github-app-key
@@ -504,12 +367,17 @@ spec:
     targetPort: 2222
     protocol: TCP
     name: ssh
-  # Uncomment to expose the webhook endpoint externally (for GitHub webhook delivery):
+  - port: 2222
+    targetPort: 2222
+    protocol: TCP
+    name: ssh-internal
+  # Uncomment to expose the HTTP health/readiness endpoints externally:
   # - port: 8080
   #   targetPort: 8080
   #   protocol: TCP
   #   name: http
 ---
+# VM Ingress: only the SSH gateway can connect to VMs.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -530,6 +398,21 @@ spec:
     - protocol: TCP
       port: 22
 ---
+# VM Egress: VMs may only reach the public internet and the SSH gateway.
+# All internal cluster traffic (apiserver, services, pods, nodes) is blocked
+# by default. Access uses an allowlist approach: only explicitly permitted
+# destinations and ports are reachable.
+#
+# Allowed:
+#   - DNS (UDP/TCP 53) to kube-dns in kube-system (required for name resolution)
+#   - HTTP/HTTPS (TCP 80/443) to the public internet (RFC1918 excluded)
+#   - SSH (TCP 2222) to the gateway pods (for blip CLI and recursive blips)
+#
+# Blocked (by omission — NetworkPolicy is deny-by-default for listed policyTypes):
+#   - Kubernetes API server (TCP 443 on service CIDR)
+#   - All pod-to-pod traffic within the cluster
+#   - All service CIDR traffic
+#   - All node CIDR traffic
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -542,19 +425,41 @@ spec:
   policyTypes:
   - Egress
   egress:
-  - to: []
+  # DNS: allow to kube-dns only (not to arbitrary internal IPs).
+  # NOTE: The label selector k8s-app=kube-dns works for kubeadm, GKE, EKS,
+  # and most distributions. If your cluster uses a different label for the
+  # DNS pods (e.g. AKS uses k8s-app=coredns), adjust the selector below.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
     ports:
     - protocol: UDP
       port: 53
     - protocol: TCP
       port: 53
-  - to: []
+   # HTTP/HTTPS: allow to public internet only.
+  # Exclude all RFC1918 private ranges, link-local, and CGNAT to block
+  # apiserver, services, pods, nodes, and cloud metadata endpoints.
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - 100.64.0.0/10
     ports:
     - protocol: TCP
       port: 443
     - protocol: TCP
       port: 80
-  # Allow VMs to SSH back to the gateway for recursive blip allocation.
+  # SSH to gateway: allow VMs to connect back for management commands
+  # (blip retain, blip register-keys) and recursive blip allocation.
   - to:
     - podSelector:
         matchLabels:
@@ -562,5 +467,3 @@ spec:
     ports:
     - protocol: TCP
       port: 2222
-    - protocol: TCP
-      port: 22

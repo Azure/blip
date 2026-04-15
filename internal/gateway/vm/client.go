@@ -399,7 +399,7 @@ func (c *Client) Retain(ctx context.Context, sessionID string, newTTLSeconds int
 				return "", fmt.Errorf("parse claimed-at: %w", err)
 			}
 
-			// Cap the new TTL so that claimed-at + newTTL does not exceed MaxLifespan.
+			// Cap the new TTL so that claimed-at + total does not exceed MaxLifespan.
 			maxAllowedSeconds := int(MaxLifespan.Seconds())
 			elapsed := int(time.Since(claimedAt).Seconds())
 			remainingBudget := maxAllowedSeconds - elapsed
@@ -410,7 +410,10 @@ func (c *Client) Retain(ctx context.Context, sessionID string, newTTLSeconds int
 				newTTLSeconds = remainingBudget
 			}
 
-			a.Annotations["blip.io/max-duration"] = strconv.Itoa(newTTLSeconds)
+			// Store as total seconds from claimed-at (not from now) so that
+			// GetSessionStatus can compute remaining TTL correctly:
+			//   remaining = claimed-at + max-duration - now
+			a.Annotations["blip.io/max-duration"] = strconv.Itoa(elapsed + newTTLSeconds)
 		}
 
 		if err := c.updateAllocation(ctx, &a); err != nil {
@@ -433,7 +436,8 @@ func (c *Client) GetSessionIDByVMName(ctx context.Context, vmName string) string
 
 // RegisterKeys sets the host-key and client-key annotations on the named VM.
 // This is the readiness signal: once set, the gateway considers the VM
-// eligible for allocation.
+// eligible for allocation. Registration is one-shot: if keys are already
+// set, the call is rejected to prevent session hijacking.
 func (c *Client) RegisterKeys(ctx context.Context, vmName, hostKey, clientKey string) error {
 	var vm kubevirtv1.VirtualMachine
 	if err := c.writer.Get(ctx, client.ObjectKey{Namespace: c.namespace, Name: vmName}, &vm); err != nil {
@@ -442,21 +446,51 @@ func (c *Client) RegisterKeys(ctx context.Context, vmName, hostKey, clientKey st
 	if vm.Annotations == nil {
 		vm.Annotations = make(map[string]string)
 	}
+	// Reject if keys are already registered to prevent re-registration attacks.
+	if vm.Annotations["blip.io/host-key"] != "" || vm.Annotations["blip.io/client-key"] != "" {
+		return fmt.Errorf("keys already registered for VM %s", vmName)
+	}
 	vm.Annotations["blip.io/host-key"] = hostKey
 	vm.Annotations["blip.io/client-key"] = clientKey
 	return c.writer.Update(ctx, &vm)
 }
 
 // ResolveVMNameByIP looks up the VM name for the given pod IP address by
-// searching VirtualMachineInstances. Returns "" if no match is found.
+// searching VirtualMachineInstances. Falls back to a direct API call if the
+// informer cache doesn't have a match (handles the race where a VMI boots
+// before the cache has synced its entry). Returns "" if no match is found.
 func (c *Client) ResolveVMNameByIP(ctx context.Context, podIP string) string {
+	// Try the informer cache first (fast path).
+	if name := c.resolveVMNameByIPFromCache(ctx, podIP); name != "" {
+		return name
+	}
+
+	// Fallback: direct API call to handle informer cache lag at VM boot.
+	var list kubevirtv1.VirtualMachineInstanceList
+	if err := c.writer.List(ctx, &list, client.InNamespace(c.namespace)); err != nil {
+		slog.Debug("ResolveVMNameByIP direct API fallback failed", "error", err)
+		return ""
+	}
+	for _, vmi := range list.Items {
+		for _, iface := range vmi.Status.Interfaces {
+			if iface.IP == podIP {
+				return vmi.Name
+			}
+		}
+	}
+	return ""
+}
+
+func (c *Client) resolveVMNameByIPFromCache(ctx context.Context, podIP string) string {
 	var list kubevirtv1.VirtualMachineInstanceList
 	if err := c.cache.List(ctx, &list, client.InNamespace(c.namespace)); err != nil {
 		return ""
 	}
 	for _, vmi := range list.Items {
-		if len(vmi.Status.Interfaces) > 0 && vmi.Status.Interfaces[0].IP == podIP {
-			return vmi.Name
+		for _, iface := range vmi.Status.Interfaces {
+			if iface.IP == podIP {
+				return vmi.Name
+			}
 		}
 	}
 	return ""

@@ -996,7 +996,11 @@ func TestRetain(t *testing.T) {
 		}, &updated)
 		require.NoError(t, err)
 		assert.Equal(t, "false", updated.Annotations["blip.io/ephemeral"])
-		assert.Equal(t, "7200", updated.Annotations["blip.io/max-duration"])
+		// max-duration is stored as elapsed + newTTL (total seconds from claimed-at).
+		// VM was claimed 1h ago, so elapsed ≈ 3600, total ≈ 3600 + 7200 = 10800.
+		maxDur, parseErr := strconv.Atoi(updated.Annotations["blip.io/max-duration"])
+		require.NoError(t, parseErr)
+		assert.InDelta(t, 10800, maxDur, 60, "max-duration should be elapsed + requested TTL")
 	})
 
 	t.Run("caps TTL at MaxLifespan", func(t *testing.T) {
@@ -1022,11 +1026,12 @@ func TestRetain(t *testing.T) {
 		}, &updated)
 		require.NoError(t, err)
 
-		// The max-duration should be capped: 12h - 11h = 1h = 3600s (approximately).
+		// The max-duration is stored as elapsed + capped TTL (total seconds from claimed-at).
+		// VM was claimed 11h ago, remaining budget ≈ 1h = 3600s, so total ≈ 39600 + 3600 = 43200.
 		maxDur, parseErr := strconv.Atoi(updated.Annotations["blip.io/max-duration"])
 		require.NoError(t, parseErr)
-		// Should be roughly 3600 (±60s for test timing).
-		assert.InDelta(t, 3600, maxDur, 60, "TTL should be capped to remaining lifespan budget")
+		// Should be roughly 43200 (12h in seconds, ±60s for test timing).
+		assert.InDelta(t, 43200, maxDur, 60, "TTL should be capped to remaining lifespan budget")
 	})
 
 	t.Run("returns error for unknown session", func(t *testing.T) {
