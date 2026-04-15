@@ -19,6 +19,9 @@ import (
 // VMClaimer abstracts VM claim/release operations for testability.
 type VMClaimer interface {
 	Claim(ctx context.Context, poolName, sessionID, gatewayPodName string, maxDuration int, userIdentity string, maxBlips int) (*vm.ClaimResult, error)
+	// ReleaseVM marks a previously claimed VM for deallocation. Must be
+	// idempotent — calling ReleaseVM on an already-released or non-existent
+	// session must be a safe no-op.
 	ReleaseVM(ctx context.Context, sessionID string) error
 }
 
@@ -160,18 +163,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"repo", event.Repository.FullName,
 	)
 
-	// Accept the webhook immediately — processing happens asynchronously
-	// to avoid GitHub's 10-second delivery timeout on slow Kubernetes/GitHub API calls.
 	switch event.Action {
 	case "queued":
-		// Start async processing. We respond 200 immediately.
+		// Claim a VM synchronously so we can report allocation failures
+		// back to GitHub as HTTP errors. The Claim operation is fast
+		// (Kubernetes API calls with optimistic concurrency) so blocking
+		// the webhook response is acceptable.
+		claimCtx, claimCancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer claimCancel()
+
+		result, err := h.claimForJob(claimCtx, log, &event)
+		if err != nil {
+			log.Error("failed to claim VM for queued job", "error", err)
+			http.Error(w, "failed to allocate blip: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		// VM claimed successfully — finish setup (token + config) asynchronously.
+		w.WriteHeader(http.StatusOK)
+
+		// If claimForJob returned nil (label mismatch or duplicate), there
+		// is no setup work to do — skip spawning the goroutine.
+		if result == nil {
+			return
+		}
+
 		h.wg.Add(1)
 		go func() {
 			defer h.wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
-			if err := h.handleQueued(ctx, log, &event); err != nil {
-				log.Error("failed to handle queued job", "error", err)
+			if err := h.finishQueuedSetup(ctx, log, &event, result); err != nil {
+				log.Error("failed to finish queued job setup", "error", err)
 			}
 		}()
 	case "completed":
@@ -184,11 +207,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				log.Error("failed to handle completed job", "error", err)
 			}
 		}()
+		w.WriteHeader(http.StatusOK)
 	default:
 		log.Debug("ignoring workflow_job action")
+		w.WriteHeader(http.StatusOK)
 	}
-
-	w.WriteHeader(http.StatusOK)
 }
 
 // matchesLabels returns true if the job's labels include at least one of our configured runner labels.
@@ -207,18 +230,27 @@ func sessionID(jobID int64) string {
 	return fmt.Sprintf("blip-%016x", jobID)
 }
 
-func (h *Handler) handleQueued(ctx context.Context, log *slog.Logger, event *workflowJobEvent) error {
+// DefaultActionsTTL is the default TTL for Blips allocated for GitHub Actions
+// runners. This acts as a safety net: if the webhook server crashes before it
+// can release a runner VM on the "completed" event, the deallocation controller
+// will clean up the VM after this duration.
+const DefaultActionsTTL = 30 * time.Minute
+
+// claimForJob validates the event labels and repository, checks idempotency,
+// and claims a VM from the pool. It is called synchronously from ServeHTTP
+// so allocation failures can be reported as HTTP errors.
+func (h *Handler) claimForJob(ctx context.Context, log *slog.Logger, event *workflowJobEvent) (*vm.ClaimResult, error) {
 	if !h.matchesLabels(event.WorkflowJob.Labels) {
 		log.Debug("job labels do not match runner labels, skipping",
 			"job_labels", event.WorkflowJob.Labels,
 			"runner_labels", h.cfg.RunnerLabels,
 		)
-		return nil
+		return nil, nil
 	}
 
 	// Validate repository format to prevent URL injection.
 	if !ownerRepoRe.MatchString(event.Repository.FullName) {
-		return fmt.Errorf("invalid repository format: %q", event.Repository.FullName)
+		return nil, fmt.Errorf("invalid repository format: %q", event.Repository.FullName)
 	}
 
 	jobIDStr := strconv.FormatInt(event.WorkflowJob.ID, 10)
@@ -230,7 +262,7 @@ func (h *Handler) handleQueued(ctx context.Context, log *slog.Logger, event *wor
 	if _, exists := h.activeSessions[jobIDStr]; exists {
 		h.mu.Unlock()
 		log.Info("job already has an active session, skipping duplicate", "session_id", sid)
-		return nil
+		return nil, nil
 	}
 	h.activeSessions[jobIDStr] = "" // sentinel: in-flight
 	h.mu.Unlock()
@@ -247,18 +279,24 @@ func (h *Handler) handleQueued(ctx context.Context, log *slog.Logger, event *wor
 
 	log.Info("claiming VM for queued job", "session_id", sid)
 
+	// Use the configured TTL, falling back to the 30-minute default safety net.
+	ttl := h.cfg.MaxSessionDuration
+	if ttl <= 0 {
+		ttl = int(DefaultActionsTTL.Seconds())
+	}
+
 	// Claim a VM from the pool.
 	result, err := h.cfg.VMClaimer.Claim(
 		ctx,
 		h.cfg.VMPoolName,
 		sid,
 		h.cfg.PodName,
-		h.cfg.MaxSessionDuration,
+		ttl,
 		"github-actions:"+event.Repository.FullName,
 		0, // no per-user quota for actions
 	)
 	if err != nil {
-		return fmt.Errorf("claim VM: %w", err)
+		return nil, fmt.Errorf("claim VM: %w", err)
 	}
 
 	log.Info("VM claimed for runner",
@@ -267,10 +305,47 @@ func (h *Handler) handleQueued(ctx context.Context, log *slog.Logger, event *wor
 		"vm_ip", result.PodIP,
 	)
 
+	success = true
+	return result, nil
+}
+
+// finishQueuedSetup completes the runner setup after a VM has been claimed.
+// It fetches a registration token from GitHub, patches the VM with runner
+// configuration, and finalises the active session. This runs asynchronously
+// after the HTTP response has been sent.
+func (h *Handler) finishQueuedSetup(ctx context.Context, log *slog.Logger, event *workflowJobEvent, result *vm.ClaimResult) error {
+	// If claimForJob returned nil (label mismatch, duplicate, etc.), nothing to do.
+	if result == nil {
+		return nil
+	}
+
+	jobIDStr := strconv.FormatInt(event.WorkflowJob.ID, 10)
+	sid := sessionID(event.WorkflowJob.ID)
+
+	// Check early whether a concurrent "completed" event already removed
+	// the session. This avoids unnecessary GitHub API calls and annotation
+	// patches on a VM that is already being released.
+	h.mu.Lock()
+	if _, stillActive := h.activeSessions[jobIDStr]; !stillActive {
+		h.mu.Unlock()
+		log.Warn("session was released by a concurrent completed event before setup, releasing VM",
+			"session_id", sid,
+			"vm_name", result.Name,
+		)
+		if releaseErr := h.cfg.VMClaimer.ReleaseVM(ctx, sid); releaseErr != nil {
+			log.Error("failed to release VM after concurrent completion", "error", releaseErr)
+		}
+		return nil
+	}
+	h.mu.Unlock()
+
 	// Fetch a runner registration token from GitHub.
 	regToken, err := h.cfg.TokenProvider.CreateRegistrationToken(ctx, event.Repository.FullName)
 	if err != nil {
 		log.Error("failed to get registration token, releasing VM", "error", err)
+		h.mu.Lock()
+		delete(h.activeSessions, jobIDStr)
+		h.mu.Unlock()
 		if releaseErr := h.cfg.VMClaimer.ReleaseVM(ctx, sid); releaseErr != nil {
 			log.Error("failed to release VM after token failure", "error", releaseErr)
 		}
@@ -285,6 +360,9 @@ func (h *Handler) handleQueued(ctx context.Context, log *slog.Logger, event *wor
 		Labels:  event.WorkflowJob.Labels,
 	}); err != nil {
 		log.Error("failed to store runner config on VM", "error", err)
+		h.mu.Lock()
+		delete(h.activeSessions, jobIDStr)
+		h.mu.Unlock()
 		if releaseErr := h.cfg.VMClaimer.ReleaseVM(ctx, sid); releaseErr != nil {
 			log.Error("failed to release VM after config failure", "error", releaseErr)
 		}
@@ -298,7 +376,6 @@ func (h *Handler) handleQueued(ctx context.Context, log *slog.Logger, event *wor
 	if _, stillActive := h.activeSessions[jobIDStr]; stillActive {
 		h.activeSessions[jobIDStr] = sid
 		h.mu.Unlock()
-		success = true
 	} else {
 		h.mu.Unlock()
 		log.Warn("session was released by a concurrent completed event during setup, releasing VM",
@@ -308,7 +385,6 @@ func (h *Handler) handleQueued(ctx context.Context, log *slog.Logger, event *wor
 		if releaseErr := h.cfg.VMClaimer.ReleaseVM(ctx, sid); releaseErr != nil {
 			log.Error("failed to release VM after concurrent completion", "error", releaseErr)
 		}
-		// success stays false — defer will not try to delete (already deleted).
 		return nil
 	}
 

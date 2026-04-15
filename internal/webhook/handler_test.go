@@ -32,16 +32,18 @@ type mockVMClaimer struct {
 
 	// Track calls for assertions.
 	claimedSessions  []string
+	claimedDurations []int // maxDuration values passed to Claim
 	releasedSessions []string
 }
 
-func (m *mockVMClaimer) Claim(_ context.Context, _, sessionID, _ string, _ int, _ string, _ int) (*vm.ClaimResult, error) {
+func (m *mockVMClaimer) Claim(_ context.Context, _, sessionID, _ string, maxDuration int, _ string, _ int) (*vm.ClaimResult, error) {
 	if m.claimDelay != nil {
 		m.claimDelay()
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.claimedSessions = append(m.claimedSessions, sessionID)
+	m.claimedDurations = append(m.claimedDurations, maxDuration)
 	if m.claimErr != nil {
 		return nil, m.claimErr
 	}
@@ -256,6 +258,62 @@ func TestHandler_QueuedJob(t *testing.T) {
 	assert.Equal(t, 1, h.ActiveSessionCount())
 }
 
+func TestHandler_QueuedJob_DefaultTTLFallback(t *testing.T) {
+	claimer := &mockVMClaimer{
+		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
+	}
+	tokens := &mockTokenProvider{
+		token: &RegistrationToken{Token: "tok"},
+	}
+	store := &mockConfigStore{}
+
+	// Create handler with MaxSessionDuration = 0, which should trigger the default 30min TTL.
+	h := NewHandler(HandlerConfig{
+		VMClaimer:          claimer,
+		RunnerConfigStore:  store,
+		TokenProvider:      tokens,
+		VMPoolName:         "blip",
+		RunnerLabels:       []string{"blip"},
+		MaxSessionDuration: 0,
+		PodName:            "test-pod",
+	})
+
+	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
+	w := sendWebhook(h, body, "workflow_job")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	waitForSessions(t, h, 1)
+
+	claimer.mu.Lock()
+	require.Len(t, claimer.claimedDurations, 1)
+	assert.Equal(t, int(DefaultActionsTTL.Seconds()), claimer.claimedDurations[0],
+		"should fall back to DefaultActionsTTL (30min) when MaxSessionDuration is 0")
+	claimer.mu.Unlock()
+}
+
+func TestHandler_QueuedJob_ExplicitTTL(t *testing.T) {
+	claimer := &mockVMClaimer{
+		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
+	}
+	tokens := &mockTokenProvider{
+		token: &RegistrationToken{Token: "tok"},
+	}
+	store := &mockConfigStore{}
+	h := newTestHandler(claimer, tokens, store) // uses MaxSessionDuration: 3600
+
+	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
+	w := sendWebhook(h, body, "workflow_job")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	waitForSessions(t, h, 1)
+
+	claimer.mu.Lock()
+	require.Len(t, claimer.claimedDurations, 1)
+	assert.Equal(t, 3600, claimer.claimedDurations[0],
+		"should use configured MaxSessionDuration")
+	claimer.mu.Unlock()
+}
+
 func TestHandler_QueuedJob_NonMatchingLabels(t *testing.T) {
 	claimer := &mockVMClaimer{}
 	tokens := &mockTokenProvider{}
@@ -337,10 +395,10 @@ func TestHandler_QueuedJob_ClaimFailure(t *testing.T) {
 	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
 	w := sendWebhook(h, body, "workflow_job")
 
-	// Response is always 200 (async processing).
-	assert.Equal(t, http.StatusOK, w.Code)
+	// Claim failure is now reported synchronously as HTTP 503.
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 
-	// Wait for async processing to clean up.
+	// Wait for any async processing to clean up.
 	waitForSessions(t, h, 0)
 
 	assert.Equal(t, int64(0), tokens.calls.Load(), "should not request token if claim fails")
@@ -405,9 +463,12 @@ func TestHandler_QueuedJob_InvalidRepoFormat(t *testing.T) {
 
 	// Send a payload with an invalid repository name.
 	body := makeWebhookPayload("queued", 42, []string{"blip"}, "../evil/../../etc/passwd")
-	sendWebhook(h, body, "workflow_job")
+	w := sendWebhook(h, body, "workflow_job")
 
-	// Wait for async processing.
+	// Invalid repo format is caught during synchronous claim and returns 503.
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	// Wait for any async processing.
 	waitForSessions(t, h, 0)
 
 	// Should not claim any VM.
@@ -581,44 +642,49 @@ func TestHandler_ConcurrentDuplicateWebhooks(t *testing.T) {
 	claimer.mu.Unlock()
 }
 
-func TestHandler_CompletedDuringInflightQueued(t *testing.T) {
-	// Simulate a "completed" event arriving while "queued" is still processing
-	// (e.g., between Claim and StoreRunnerConfig). The completed handler should
-	// delete the sentinel, and the queued handler should detect this and release
-	// the VM rather than leaving a zombie session.
+func TestHandler_CompletedDuringInflightSetup(t *testing.T) {
+	// Simulate a "completed" event arriving while "queued" is still in the
+	// async finishQueuedSetup phase (e.g., between Claim and StoreRunnerConfig).
+	// With the synchronous claim, the completed event can only race with the
+	// async setup phase, not the claim itself.
 
-	claimReady := make(chan struct{})
-	claimProceed := make(chan struct{})
+	tokenReady := make(chan struct{})
+	tokenProceed := make(chan struct{})
 
-	claimer := &mockVMClaimer{
-		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
-		claimDelay: func() {
-			// Signal that we're inside Claim, then wait for the test to send "completed".
-			close(claimReady)
-			<-claimProceed
-		},
-	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "tok"},
 	}
+
+	claimer := &mockVMClaimer{
+		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
+	}
 	store := &mockConfigStore{}
+
 	h := newTestHandler(claimer, tokens, store)
 
-	// Send "queued" — the Claim call will block until we release it.
+	// Intercept the token provider to pause during async setup.
+	tokens.token = &RegistrationToken{Token: "tok"}
+	tokens.err = nil
+	originalProvider := h.cfg.TokenProvider
+	h.cfg.TokenProvider = &blockingTokenProvider{
+		delegate:  originalProvider,
+		readyCh:   tokenReady,
+		proceedCh: tokenProceed,
+	}
+
+	// Send "queued" — Claim completes synchronously, then async setup starts.
 	queueBody := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-	sendWebhook(h, queueBody, "workflow_job")
+	w := sendWebhook(h, queueBody, "workflow_job")
+	assert.Equal(t, http.StatusOK, w.Code)
 
-	// Wait until the goroutine is inside the Claim call.
-	<-claimReady
+	// Wait until the goroutine is inside the token fetch.
+	<-tokenReady
 
-	// Now send "completed" while "queued" is still in-flight.
+	// Now send "completed" while setup is still in-flight.
 	completeBody := makeWebhookPayload("completed", 42, []string{"blip"}, "org/repo")
 	sendWebhook(h, completeBody, "workflow_job")
 
-	// Let the "completed" handler finish (it will delete the sentinel and release).
-	// We need to wait for the completed goroutine to process. Use a brief sleep
-	// since we can't use WaitForPending while queued is still blocked.
-	// The completed goroutine should be fast (just map delete + ReleaseVM).
+	// Let the "completed" handler finish.
 	for range 1000 {
 		claimer.mu.Lock()
 		released := len(claimer.releasedSessions)
@@ -629,18 +695,35 @@ func TestHandler_CompletedDuringInflightQueued(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	// Now let the Claim call proceed.
-	close(claimProceed)
+	// Now let the token fetch proceed.
+	close(tokenProceed)
 
 	// Wait for all goroutines to finish.
 	h.WaitForPending()
 
-	// The queued handler should detect the sentinel was deleted and release the VM.
-	// The completed handler also releases. So we expect 2 releases total.
+	// The completed handler releases once, and finishQueuedSetup detects
+	// that the session was removed and releases again. So 2 releases total.
 	claimer.mu.Lock()
-	assert.Len(t, claimer.releasedSessions, 2, "both completed and queued should release")
+	assert.Len(t, claimer.releasedSessions, 2, "both completed and setup should release")
 	claimer.mu.Unlock()
 
 	// No zombie sessions should remain.
 	assert.Equal(t, 0, h.ActiveSessionCount(), "no zombie sessions should remain")
+}
+
+// blockingTokenProvider wraps a TokenProvider, blocking on the first call
+// until signalled. Used for testing races between setup and completion.
+type blockingTokenProvider struct {
+	delegate  TokenProvider
+	readyCh   chan struct{}
+	proceedCh chan struct{}
+	once      sync.Once
+}
+
+func (b *blockingTokenProvider) CreateRegistrationToken(ctx context.Context, ownerRepo string) (*RegistrationToken, error) {
+	b.once.Do(func() {
+		close(b.readyCh)
+		<-b.proceedCh
+	})
+	return b.delegate.CreateRegistrationToken(ctx, ownerRepo)
 }

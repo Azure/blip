@@ -183,7 +183,7 @@ func RunGateway(cfg *GatewayConfig) error {
 
 		actionsMaxDuration := cfg.Actions.MaxSessionDuration
 		if actionsMaxDuration <= 0 {
-			actionsMaxDuration = int(cfg.MaxSessionDuration.Seconds())
+			actionsMaxDuration = int(webhook.DefaultActionsTTL.Seconds())
 		}
 
 		webhookHandler = webhook.NewHandler(webhook.HandlerConfig{
