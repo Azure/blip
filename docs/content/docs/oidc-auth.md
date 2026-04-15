@@ -4,7 +4,7 @@ description: "Authenticate using OIDC tokens or interactive device login"
 weight: 4
 ---
 
-Blip supports OIDC authentication from any standards-compliant provider (GitHub Actions, Azure Entra, Google Cloud, etc.). Two modes:
+Blip supports OIDC authentication from any standards-compliant provider (Azure Entra, Google Cloud, etc.). Two modes:
 
 1. **Token mode** (default) — Client passes an OIDC token as the SSH password. Best for CI/CD.
 2. **Device flow** — Gateway presents a login URL in the SSH terminal. Best for interactive use.
@@ -29,17 +29,6 @@ The `oidc-providers` key holds a YAML list:
 
 Examples below show the `data` section of this ConfigMap.
 
-### GitHub Actions
-
-```yaml
-data:
-  oidc-providers: |
-    - issuer: https://token.actions.githubusercontent.com
-      audience: blip
-      allowed-subjects:
-        - "repo:my-org/my-repo:*"
-```
-
 ### Azure Entra (AAD)
 
 ```yaml
@@ -57,23 +46,6 @@ Multiple providers are supported; the gateway tries each in order and accepts th
 ## Device flow
 
 The gateway displays a login URL ([RFC 8628](https://datatracker.ietf.org/doc/html/rfc8628)) and waits for browser authentication. After login, the user's SSH key is bound to their OIDC identity — subsequent connections use SSH key auth. Remove the key from `allowed-pubkeys` to revoke.
-
-### GitHub
-
-Requires a GitHub [OAuth App](https://github.com/settings/developers) (not GitHub App) with device flow enabled.
-
-```yaml
-data:
-  oidc-providers: |
-    - issuer: https://token.actions.githubusercontent.com
-      audience: blip
-      device-flow: true
-      client-id: <your-github-oauth-app-client-id>
-      device-auth-url: https://github.com/login/device/code
-      token-url: https://github.com/login/oauth/access_token
-      scopes:
-        - read:user
-```
 
 ### Azure Entra (AAD)
 
@@ -108,46 +80,6 @@ Add to `known_hosts`:
 ```
 ssh-gateway.example.com ssh-ed25519 AAAAC3Nza...
 ```
-
-## Example: GitHub Actions
-
-```yaml
-name: CI
-on: push
-
-env:
-  GATEWAY_HOST: ssh-gateway.example.com
-  GATEWAY_HOST_KEY: ssh-gateway.example.com ssh-ed25519 AAAAC3Nza...
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-
-    steps:
-      - name: Get OIDC Token
-        id: token
-        run: |
-          TOKEN=$(curl -sS \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=blip" \
-            | jq -r '.value')
-          echo "::add-mask::$TOKEN"
-          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
-
-      - name: SSH to Blip VM
-        run: |
-          mkdir -p ~/.ssh
-          echo "$GATEWAY_HOST_KEY" > ~/.ssh/blip_known_hosts
-          sshpass -p "${{ steps.token.outputs.token }}" \
-            ssh -o StrictHostKeyChecking=yes \
-                -o UserKnownHostsFile=~/.ssh/blip_known_hosts \
-                runner@"$GATEWAY_HOST" \
-                "echo 'Connected to Blip VM'; uname -a"
-```
-
-`permissions.id-token: write` is required.
 
 ## Example: Azure Entra (AAD)
 
@@ -184,9 +116,8 @@ Glob patterns with `*` (matches any character including `/` and `:`). Case-insen
 
 ```yaml
 allowed-subjects:
-  - "repo:my-org/my-repo:*"          # any ref in my-repo
-  - "repo:my-org/*:*"                # any repo in my-org
-  - "repo:my-org/my-repo:ref:refs/heads/main"  # only main branch
+  - "<user-or-service-principal-object-id>"   # specific identity
+  - "<tenant-id>/*"                           # any identity in tenant
 ```
 
 Empty `allowed-subjects` permits any valid token from the issuer.
@@ -199,4 +130,5 @@ Empty `allowed-subjects` permits any valid token from the issuer.
 
 ## Next steps
 
+- [GitHub Actions Runner]({{% relref "github-actions-runner" %}})
 - [Nested Blips]({{% relref "nested-blips" %}})
