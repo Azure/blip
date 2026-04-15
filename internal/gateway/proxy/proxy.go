@@ -394,7 +394,7 @@ chmod 700 ~/.ssh
 cat > ~/.ssh/config << 'BLIP_CONFIG_EOF'
 Host blip blip-gateway
     HostName %s
-    Port 22
+    Port 2222
     User runner
     IdentityFile /etc/ssh/ssh_client_ed25519_key
     StrictHostKeyChecking yes

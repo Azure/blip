@@ -20,69 +20,30 @@ stringData:
             #!/bin/bash
             set -euo pipefail
 
-            readonly SA_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
-
-            # Build the KubeVirt VM API URL for this VM.
-            _vm_api_url() {
-            	local token ns ca vm_name
-            	token="$(sudo cat "$SA_DIR/token")"
-            	ns="$(sudo cat "$SA_DIR/namespace")"
-            	ca="$SA_DIR/ca.crt"
-            	vm_name="$(hostname)"
-
-            	# Export for caller use.
-            	VM_TOKEN="$token"
-            	VM_CA="$ca"
-            	VM_NAME="$vm_name"
-            	VM_API_URL="https://kubernetes.default.svc/apis/kubevirt.io/v1/namespaces/${ns}/virtualmachines/${vm_name}"
-            }
+            # SSH connection to the gateway for management commands.
+            readonly GW_HOST="ssh-gateway.blip.svc.cluster.local"
+            readonly GW_PORT="2222"
+            readonly CLIENT_KEY="/etc/ssh/ssh_client_ed25519_key"
 
             # Extract a JSON string value by key from flat JSON.  Handles simple
             # single-line objects only (no jq dependency in the VM image).
+            # Uses sed instead of grep -oP to avoid PCRE dependency.
             _json_field() {
             	local body="$1" key="$2"
             	printf '%s' "$body" |
-            		grep -oP "\"${key}\"\\s*:\\s*\"[^\"]*\"" |
-            		head -1 |
-            		cut -d'"' -f4
+            		sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" |
+            		head -1
             }
 
-            # Parse a duration string like "5m", "2h", "1h30m", "30s" into total seconds.
-            # Supports hours (h), minutes (m), and seconds (s).
-            _parse_duration() {
-            	local input="$1"
-            	local total=0 num=""
-
-            	# Validate: only digits, 'h', 'm', and 's' allowed.
-            	if ! printf '%s' "$input" | grep -qE '^([0-9]+[hms])+$'; then
-            		echo "Invalid duration format: $input (use e.g. 30s, 5m, 2h, 1h30m)" >&2
-            		return 1
-            	fi
-
-            	while [ -n "$input" ]; do
-            		# Extract leading digits.
-            		num=$(printf '%s' "$input" | grep -oE '^[0-9]+')
-            		if [ -z "$num" ]; then
-            			echo "Invalid duration format" >&2
-            			return 1
-            		fi
-            		# Remove the digits from input.
-            		input="${input#"$num"}"
-            		# Read the unit character.
-            		local unit="${input:0:1}"
-            		input="${input:1}"
-            		case "$unit" in
-            		h) total=$((total + num * 3600)) ;;
-            		m) total=$((total + num * 60)) ;;
-            		s) total=$((total + num)) ;;
-            		*)
-            			echo "Unknown duration unit: $unit" >&2
-            			return 1
-            			;;
-            		esac
-            	done
-
-            	printf '%d' "$total"
+            # Execute a blip command on the gateway via SSH.
+            _gateway_exec() {
+            	ssh -o BatchMode=yes \
+            		-o StrictHostKeyChecking=yes \
+            		-o ConnectTimeout=10 \
+            		-i "$CLIENT_KEY" \
+            		-p "$GW_PORT" \
+            		"_blip@${GW_HOST}" \
+            		"$@" 2>/dev/null
             }
 
             usage() {
@@ -94,10 +55,7 @@ stringData:
             }
 
             cmd_retain() {
-            	_vm_api_url
-
             	local ttl_flag=""
-            	local new_ttl_sec=""
 
             	# Parse arguments.
             	while [ $# -gt 0 ]; do
@@ -122,61 +80,47 @@ stringData:
             		esac
             	done
 
-            	# Build the patch: always set ephemeral=false.
-            	local patch
+            	# Build the remote command.
+            	local cmd="blip retain"
             	if [ -n "$ttl_flag" ]; then
-            		new_ttl_sec=$(_parse_duration "$ttl_flag") || exit 1
-
-            		# Cap at 12 hours (43200 seconds).
-            		if [ "$new_ttl_sec" -gt 43200 ]; then
-            			echo "Warning: TTL capped to 12h (maximum total lifespan)" >&2
-            			new_ttl_sec=43200
-            		fi
-
-            		patch=$(printf '{"metadata":{"annotations":{"blip.io/ephemeral":"false","blip.io/max-duration":"%d"}}}' "$new_ttl_sec")
-            	else
-            		patch='{"metadata":{"annotations":{"blip.io/ephemeral":"false"}}}'
+            		cmd="blip retain --ttl $ttl_flag"
             	fi
 
-            	local code response
-            	response=$(curl --silent --write-out "\n%{http_code}" \
-            		--cacert "$VM_CA" \
-            		-X PATCH \
-            		-H "Authorization: Bearer ${VM_TOKEN}" \
-            		-H "Content-Type: application/merge-patch+json" \
-            		-d "$patch" \
-            		"$VM_API_URL")
+            	local response
+            	response=$(_gateway_exec "$cmd")
+            	local rc=$?
 
-            	code=$(printf '%s' "$response" | tail -1)
-            	local body
-            	body=$(printf '%s' "$response" | sed '$d')
-
-            	if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
-            		local session_id
-            		session_id=$(_json_field "$body" 'blip\.io/session-id')
-
-            		echo "Blip retained successfully." >&2
-            		if [ -n "$session_id" ]; then
-            			local gw_host="<gateway-host>"
-            			if [ -f "$HOME/.blip/reconnect-host" ]; then
-            				gw_host="$(cat "$HOME/.blip/reconnect-host")"
-            			fi
-            			echo "" >&2
-            			echo "  Only you can reconnect to this blip:" >&2
-            			echo "    ssh $session_id@$gw_host" >&2
-            			if [ -n "$ttl_flag" ]; then
-            				echo "  TTL updated to $ttl_flag" >&2
-            			fi
-            			echo "" >&2
-            			echo "$session_id"
+            	if [ $rc -ne 0 ]; then
+            		echo "Failed to retain blip" >&2
+            		if [ -n "$response" ]; then
+            			echo "$response" >&2
             		fi
-
-            		# Allow output to flush through the SSH channel before exiting.
-            		sleep 0.1
-            	else
-            		echo "Failed to retain blip (HTTP $code)" >&2
             		exit 1
             	fi
+
+            	local session_id
+            	session_id=$(_json_field "$response" "session_id")
+
+            	echo "Blip retained successfully." >&2
+            	if [ -n "$session_id" ]; then
+            		local gw_host="<gateway-host>"
+            		if [ -f "$HOME/.blip/reconnect-host" ]; then
+            			gw_host="$(cat "$HOME/.blip/reconnect-host")"
+            		fi
+            		echo "" >&2
+            		echo "  Only you can reconnect to this blip:" >&2
+            		echo "    ssh $session_id@$gw_host" >&2
+            		local ttl_val
+            		ttl_val=$(_json_field "$response" "ttl")
+            		if [ -n "$ttl_val" ]; then
+            			echo "  TTL: $ttl_val" >&2
+            		fi
+            		echo "" >&2
+            		echo "$session_id"
+            	fi
+
+            	# Allow output to flush through the SSH channel before exiting.
+            	sleep 0.1
             }
 
             if [ $# -lt 1 ]; then
@@ -195,10 +139,12 @@ stringData:
           - -c
           - |
             exec > /dev/ttyS0 2>&1
-            echo "[blip-init] mounting service account via virtiofs..."
-            mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
-            mount -t virtiofs sadisk /var/run/secrets/kubernetes.io/serviceaccount
-            echo "[blip-init] service account mounted"
+            echo "[blip-init] mounting gateway pubkeys via virtiofs..."
+            mkdir -p /var/run/blip/gateway-client-pubkey
+            mount -t virtiofs gw-client-pubkey /var/run/blip/gateway-client-pubkey
+            mkdir -p /var/run/blip/gateway-host-pubkey
+            mount -t virtiofs gw-host-pubkey /var/run/blip/gateway-host-pubkey
+            echo "[blip-init] gateway pubkeys mounted"
         - - /bin/bash
           - -c
           - |
@@ -208,38 +154,35 @@ stringData:
             set -euo pipefail
             trap 'echo "[blip-setup] ERROR on line $LINENO (exit $?)"' ERR
 
-            readonly SA_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
+            readonly GW_HOST="ssh-gateway.blip.svc.cluster.local"
+            readonly GW_PORT="2222"
+            readonly GW_CLIENT_PUBKEY_DIR="/var/run/blip/gateway-client-pubkey"
+            readonly GW_HOST_PUBKEY_DIR="/var/run/blip/gateway-host-pubkey"
 
             main() {
-            	local token ns ca vm_name api_url
-            	token="$(cat "$SA_DIR/token")"
-            	ns="$(cat "$SA_DIR/namespace")"
-            	ca="$SA_DIR/ca.crt"
+            	local vm_name
             	vm_name="$(hostname)"
-            	api_url="https://kubernetes.default.svc/apis/kubevirt.io/v1/namespaces/${ns}/virtualmachines/${vm_name}"
-            	echo "[blip-setup] vm=$vm_name ns=$ns"
+            	echo "[blip-setup] vm=$vm_name"
 
             	# --- 1. Generate a VM client key pair ---
             	ssh-keygen -t ed25519 -f /etc/ssh/ssh_client_ed25519_key -N "" -q
-            	chmod 644 /etc/ssh/ssh_client_ed25519_key
+            	chmod 600 /etc/ssh/ssh_client_ed25519_key
+            	chown runner:runner /etc/ssh/ssh_client_ed25519_key
             	chmod 644 /etc/ssh/ssh_client_ed25519_key.pub
 
-            	# --- 2. Fetch gateway client pubkey from ConfigMap -> authorized_keys ---
-            	local cm_url="https://kubernetes.default.svc/api/v1/namespaces/${ns}/configmaps/ssh-gateway-client-pubkey"
+            	# --- 2. Read gateway client pubkey from mounted ConfigMap -> authorized_keys ---
             	local gw_client_pubkey=""
             	for _retry in $(seq 1 30); do
-            		local cm_body=""
-            		cm_body=$(curl --silent --connect-timeout 5 --max-time 10 --cacert "$ca" \
-            			-H "Authorization: Bearer ${token}" \
-            			"$cm_url" 2>&1) || { sleep 2; continue; }
-            		gw_client_pubkey=$(printf '%s' "$cm_body" | grep -oP '"client_key\.pub"\s*:\s*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\\n/\n/g') || true
-            		if [ -n "$gw_client_pubkey" ]; then
-            			break
+            		if [ -f "$GW_CLIENT_PUBKEY_DIR/client_key.pub" ]; then
+            			gw_client_pubkey="$(cat "$GW_CLIENT_PUBKEY_DIR/client_key.pub")"
+            			if [ -n "$gw_client_pubkey" ]; then
+            				break
+            			fi
             		fi
             		sleep 2
             	done
             	if [ -z "$gw_client_pubkey" ]; then
-            		echo "[blip-setup] FATAL: could not fetch gateway client pubkey" >&2
+            		echo "[blip-setup] FATAL: could not read gateway client pubkey from $GW_CLIENT_PUBKEY_DIR" >&2
             		exit 1
             	fi
             	mkdir -p ~runner/.ssh
@@ -247,70 +190,69 @@ stringData:
             	chmod 600 ~runner/.ssh/authorized_keys
             	chown -R runner:runner ~runner/.ssh
 
-            	# --- 3. Fetch gateway host pubkey from ConfigMap -> known_hosts ---
-            	local host_cm_url="https://kubernetes.default.svc/api/v1/namespaces/${ns}/configmaps/ssh-gateway-host-pubkey"
+            	# --- 3. Read gateway host pubkey from mounted ConfigMap -> known_hosts ---
             	local gw_host_pubkey=""
-            	for _retry in $(seq 1 30); do
-            		local host_cm_body
-            		host_cm_body=$(curl --silent --connect-timeout 5 --max-time 10 --cacert "$ca" \
-            			-H "Authorization: Bearer ${token}" \
-            			"$host_cm_url") || { sleep 2; continue; }
-            		gw_host_pubkey=$(printf '%s' "$host_cm_body" | grep -oP '"host_key\.pub"\s*:\s*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\\n/\n/g') || true
-            		if [ -n "$gw_host_pubkey" ]; then
-            			break
-            		fi
-            		sleep 2
-            	done
+            	if [ -f "$GW_HOST_PUBKEY_DIR/host_key.pub" ]; then
+            		gw_host_pubkey="$(cat "$GW_HOST_PUBKEY_DIR/host_key.pub")"
+            	fi
             	if [ -n "$gw_host_pubkey" ]; then
             		# Write known_hosts entries for the gateway service names.
-            		# SSH uses the resolved HostName for known_hosts lookup, and
-            		# for the default port (22) it uses plain hostnames (no brackets).
-            		printf '%s %s\n' "ssh-gateway.blip.svc.cluster.local" "$gw_host_pubkey" > ~runner/.ssh/known_hosts
-            		printf '%s %s\n' "blip" "$gw_host_pubkey" >> ~runner/.ssh/known_hosts
-            		printf '%s %s\n' "blip-gateway" "$gw_host_pubkey" >> ~runner/.ssh/known_hosts
+            		# Since the VM connects on port 2222, use [host]:port format
+            		# which is what SSH looks up for non-default ports.
+            		printf '[%s]:%s %s\n' "$GW_HOST" "2222" "$gw_host_pubkey" > ~runner/.ssh/known_hosts
+            		printf '[%s]:%s %s\n' "blip" "2222" "$gw_host_pubkey" >> ~runner/.ssh/known_hosts
+            		printf '[%s]:%s %s\n' "blip-gateway" "2222" "$gw_host_pubkey" >> ~runner/.ssh/known_hosts
             		chmod 644 ~runner/.ssh/known_hosts
             		chown runner:runner ~runner/.ssh/known_hosts
+            		# Also write system-wide known_hosts for root SSH commands.
+            		cp ~runner/.ssh/known_hosts /etc/ssh/ssh_known_hosts
+            		chmod 644 /etc/ssh/ssh_known_hosts
             	fi
 
-            	# --- 4. Restart sshd BEFORE registering annotations ---
+            	# --- 4. Restart sshd BEFORE registering keys ---
             	# sshd may already be running (Ubuntu 24.04 starts it via socket
             	# activation). Restart to ensure it is running and picks up any
             	# configuration changes (e.g. new authorized_keys). This MUST
-            	# happen before the annotation PATCH below, because the gateway
-            	# treats the annotations as the VM readiness signal and may
-            	# connect immediately. If sshd restarts after the gateway has
-            	# already established an SSH session, the connection is killed
-            	# and the proxy hangs until the client times out.
+            	# happen before key registration, because the gateway treats
+            	# registered keys as the VM readiness signal and may connect
+            	# immediately. If sshd restarts after the gateway has already
+            	# established an SSH session, the connection is killed and the
+            	# proxy hangs until the client times out.
             	systemctl enable ssh
             	systemctl restart ssh
 
-            	# --- 5. Register host-key and client-key annotations ---
-            	# This is the readiness signal: once these annotations are set,
-            	# the gateway considers this VM eligible for allocation.
-            	local host_key client_key patch
-            	host_key="$(awk '{print $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
-            	client_key="$(awk '{print $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
-            	patch=$(printf '{"metadata":{"annotations":{"blip.io/host-key":"%s","blip.io/client-key":"%s"}}}' "$host_key" "$client_key")
+            	# --- 5. Register host-key and client-key with the gateway via SSH ---
+            	# This replaces the old K8s API PATCH. The VM SSHs to the
+            	# gateway as _register (no-auth) and the gateway identifies
+            	# the VM by its source pod IP.
+            	#
+            	# Keys are colon-joined (e.g. "ssh-ed25519:AAAA...") because
+            	# the SSH exec protocol splits arguments on spaces. The gateway
+            	# reconstructs the standard space-separated format.
+            	local host_key client_key
+            	host_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
+            	client_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
 
-            	local ok=false code
+            	local ok=false
             	for _retry in $(seq 1 10); do
-            		code=$(curl --silent --connect-timeout 5 --max-time 10 --output /dev/null --write-out "%{http_code}" \
-            			--cacert "$ca" \
-            			-X PATCH \
-            			-H "Authorization: Bearer ${token}" \
-            			-H "Content-Type: application/merge-patch+json" \
-            			-d "$patch" \
-            			"$api_url")
-            		if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+            		local response
+            		response=$(ssh -o BatchMode=yes \
+            			-o StrictHostKeyChecking=yes \
+            			-o PreferredAuthentications=none \
+            			-o ConnectTimeout=10 \
+            			-p "$GW_PORT" \
+            			"_register@${GW_HOST}" \
+            			"blip register-keys --host-key $host_key --client-key $client_key" 2>/dev/null) || true
+            		if printf '%s' "$response" | grep -q '"ok":true'; then
             			ok=true
             			break
             		fi
-            		echo "[blip-setup] PATCH retry $_retry: HTTP $code"
+            		echo "[blip-setup] register-keys retry $_retry"
             		sleep 2
             	done
 
             	if [ "$ok" != "true" ]; then
-            		echo "[blip-setup] FATAL: failed to register key annotations (HTTP $code)" >&2
+            		echo "[blip-setup] FATAL: failed to register key annotations via SSH" >&2
             		exit 1
             	fi
 
@@ -377,7 +319,9 @@ spec:
                   bus: virtio
                 name: cloudinitdisk
               filesystems:
-              - name: sadisk
+              - name: gw-client-pubkey
+                virtiofs: {}
+              - name: gw-host-pubkey
                 virtiofs: {}
               interfaces:
               - masquerade: {}
@@ -403,9 +347,12 @@ spec:
           - dataVolume:
               name: rootdisk
             name: rootdisk
-          - name: sadisk
-            serviceAccount:
-              serviceAccountName: vm-release
+          - name: gw-client-pubkey
+            configMap:
+              name: ssh-gateway-client-pubkey
+          - name: gw-host-pubkey
+            configMap:
+              name: ssh-gateway-host-pubkey
           - cloudInitNoCloud:
               secretRef:
                 name: default-cloudinit

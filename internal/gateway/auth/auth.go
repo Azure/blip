@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -164,6 +165,50 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 		// Enable keyboard-interactive auth for device flow when any
 		// OIDC provider has device-flow enabled.
 		sshCfg.KeyboardInteractiveCallback = deviceFlowKeyboardInteractive(cfg.AuthWatcher, pending)
+	}
+
+	// Allow "none" auth for _register connections from VMs. VMs use this
+	// to register their SSH keys before a session is assigned. The
+	// gateway verifies the source IP belongs to a known VM pod in the
+	// session handler (not in the auth layer). As an additional safety
+	// measure, reject _register from non-private IPs to prevent abuse
+	// from the public internet via the LoadBalancer.
+	registerLimiter := rate.NewLimiter(20, 40) // 20/s with burst of 40
+	sshCfg.NoClientAuth = true
+	sshCfg.NoClientAuthCallback = func(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
+		if conn.User() != "_register" {
+			return nil, fmt.Errorf("none auth not allowed for user %q", conn.User())
+		}
+
+		// Rate-limit _register connections to prevent abuse.
+		if !registerLimiter.Allow() {
+			return nil, fmt.Errorf("too many registration attempts, please try again later")
+		}
+
+		// Reject connections from non-private IPs. The _register endpoint
+		// should only be reachable from cluster-internal VM pods, never
+		// from the public internet via the LoadBalancer.
+		remoteAddr := conn.RemoteAddr().String()
+		host, _, err := net.SplitHostPort(remoteAddr)
+		if err != nil {
+			host = remoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsPrivate() {
+			slog.Warn("VM registration auth: rejected non-private source IP",
+				"remote", remoteAddr,
+			)
+			return nil, fmt.Errorf("none auth not allowed from non-private IP")
+		}
+
+		slog.Info("VM registration auth: none-auth accepted for _register",
+			"remote", remoteAddr,
+		)
+		return &ssh.Permissions{
+			Extensions: map[string]string{
+				ExtIdentity: "vm-register",
+			},
+		}, nil
 	}
 
 	if cfg.AuthWatcher == nil && cfg.VMKeyResolver == nil {
