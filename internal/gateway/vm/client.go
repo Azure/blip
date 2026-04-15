@@ -57,7 +57,7 @@ type Client struct {
 }
 
 // Writer returns the underlying Kubernetes client used for write operations.
-// This allows other components (e.g. the webhook VMAnnotator) to reuse the
+// This allows other components (e.g. the ghactions VMAnnotator) to reuse the
 // same client rather than creating a separate one.
 func (c *Client) Writer() client.Client { return c.writer }
 
@@ -419,6 +419,47 @@ func (c *Client) Retain(ctx context.Context, sessionID string, newTTLSeconds int
 		return a.Annotations["blip.io/session-id"], nil
 	}
 	return "", fmt.Errorf("blip with session ID %s not found", sessionID)
+}
+
+// GetSessionIDByVMName returns the session ID annotation for the named VM,
+// or "" if the VM is not claimed.
+func (c *Client) GetSessionIDByVMName(ctx context.Context, vmName string) string {
+	var vm kubevirtv1.VirtualMachine
+	if err := c.cache.Get(ctx, client.ObjectKey{Namespace: c.namespace, Name: vmName}, &vm); err != nil {
+		return ""
+	}
+	return vm.Annotations["blip.io/session-id"]
+}
+
+// RegisterKeys sets the host-key and client-key annotations on the named VM.
+// This is the readiness signal: once set, the gateway considers the VM
+// eligible for allocation.
+func (c *Client) RegisterKeys(ctx context.Context, vmName, hostKey, clientKey string) error {
+	var vm kubevirtv1.VirtualMachine
+	if err := c.writer.Get(ctx, client.ObjectKey{Namespace: c.namespace, Name: vmName}, &vm); err != nil {
+		return fmt.Errorf("get VM %s: %w", vmName, err)
+	}
+	if vm.Annotations == nil {
+		vm.Annotations = make(map[string]string)
+	}
+	vm.Annotations["blip.io/host-key"] = hostKey
+	vm.Annotations["blip.io/client-key"] = clientKey
+	return c.writer.Update(ctx, &vm)
+}
+
+// ResolveVMNameByIP looks up the VM name for the given pod IP address by
+// searching VirtualMachineInstances. Returns "" if no match is found.
+func (c *Client) ResolveVMNameByIP(ctx context.Context, podIP string) string {
+	var list kubevirtv1.VirtualMachineInstanceList
+	if err := c.cache.List(ctx, &list, client.InNamespace(c.namespace)); err != nil {
+		return ""
+	}
+	for _, vmi := range list.Items {
+		if len(vmi.Status.Interfaces) > 0 && vmi.Status.Interfaces[0].IP == podIP {
+			return vmi.Name
+		}
+	}
+	return ""
 }
 
 // GetNodeLabel returns the value of the given label on the named node.

@@ -1,6 +1,6 @@
-// Package webhook implements a GitHub Actions polling handler that provides
+// Package ghactions implements a GitHub Actions polling handler that provides
 // just-in-time self-hosted runners backed by Blip VMs.
-package webhook
+package ghactions
 
 import (
 	"context"
@@ -111,27 +111,9 @@ func (c *GitHubClient) CreateRegistrationToken(ctx context.Context, ownerRepo st
 		url = fmt.Sprintf("%s/orgs/%s/actions/runners/registration-token", c.baseURL, ownerRepo)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-
-	resp, err := c.httpClient.Do(req)
+	body, err := c.doAPI(ctx, http.MethodPost, url, token, http.StatusCreated)
 	if err != nil {
 		return nil, fmt.Errorf("request registration token: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
-	if err != nil {
-		return nil, fmt.Errorf("read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("registration token request failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 
 	var rt RegistrationToken
@@ -159,7 +141,7 @@ func (c *GitHubClient) ListQueuedJobs(ctx context.Context, ownerRepo string) ([]
 		allRuns = append(allRuns, runs...)
 	}
 
-	// Deduplicate run IDs (shouldn't happen, but defensive).
+	// Deduplicate run IDs.
 	seen := make(map[int64]bool, len(allRuns))
 	var uniqueRuns []int64
 	for _, id := range allRuns {
@@ -189,27 +171,9 @@ func (c *GitHubClient) ListQueuedJobs(ctx context.Context, ownerRepo string) ([]
 func (c *GitHubClient) listRunIDs(ctx context.Context, ownerRepo, status, token string) ([]int64, error) {
 	url := fmt.Sprintf("%s/repos/%s/actions/runs?status=%s&per_page=100", c.baseURL, ownerRepo, status)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-
-	resp, err := c.httpClient.Do(req)
+	body, err := c.doAPI(ctx, http.MethodGet, url, token, http.StatusOK)
 	if err != nil {
 		return nil, fmt.Errorf("list %s runs: %w", status, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
-	if err != nil {
-		return nil, fmt.Errorf("read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list %s runs failed (HTTP %d): %s", status, resp.StatusCode, string(body))
 	}
 
 	var runsResp struct {
@@ -231,27 +195,9 @@ func (c *GitHubClient) listRunIDs(ctx context.Context, ownerRepo, status, token 
 func (c *GitHubClient) listJobsForRun(ctx context.Context, ownerRepo string, runID int64, token string) ([]WorkflowJob, error) {
 	url := fmt.Sprintf("%s/repos/%s/actions/runs/%d/jobs?filter=latest&per_page=100", c.baseURL, ownerRepo, runID)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-
-	resp, err := c.httpClient.Do(req)
+	body, err := c.doAPI(ctx, http.MethodGet, url, token, http.StatusOK)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs for run %d: %w", runID, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
-	if err != nil {
-		return nil, fmt.Errorf("read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list jobs for run %d failed (HTTP %d): %s", runID, resp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -262,6 +208,33 @@ func (c *GitHubClient) listJobsForRun(ctx context.Context, ownerRepo string, run
 	}
 
 	return result.Jobs, nil
+}
+
+// doAPI performs an authenticated GitHub API request and returns the response body.
+func (c *GitHubClient) doAPI(ctx context.Context, method, url, token string, expectStatus int) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+
+	if resp.StatusCode != expectStatus {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return body, nil
 }
 
 // getInstallationToken returns a cached installation access token, refreshing if expired.
@@ -280,27 +253,9 @@ func (c *GitHubClient) getInstallationToken(ctx context.Context) (string, error)
 	}
 
 	url := fmt.Sprintf("%s/app/installations/%d/access_tokens", c.baseURL, c.installationID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+jwt)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-
-	resp, err := c.httpClient.Do(req)
+	body, err := c.doAPI(ctx, http.MethodPost, url, jwt, http.StatusCreated)
 	if err != nil {
 		return "", fmt.Errorf("request installation token: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
-	if err != nil {
-		return "", fmt.Errorf("read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("installation token request failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {

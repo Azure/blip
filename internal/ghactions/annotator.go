@@ -1,4 +1,4 @@
-package webhook
+package ghactions
 
 import (
 	"context"
@@ -33,7 +33,6 @@ type VMAnnotator struct {
 	namespace string
 }
 
-// Ensure VMAnnotator implements RunnerConfigStore.
 var _ RunnerConfigStore = (*VMAnnotator)(nil)
 
 // NewVMAnnotator creates a VMAnnotator using the provided Kubernetes client.
@@ -43,15 +42,13 @@ func NewVMAnnotator(writer client.Client, namespace string) *VMAnnotator {
 
 // StoreRunnerConfig patches the named VM with runner configuration annotations.
 func (a *VMAnnotator) StoreRunnerConfig(ctx context.Context, vmName string, cfg RunnerConfig) error {
-	annotations := map[string]string{
-		AnnotationRunnerToken:  cfg.Token,
-		AnnotationRunnerURL:    cfg.RepoURL,
-		AnnotationRunnerLabels: strings.Join(cfg.Labels, ","),
-	}
-
 	patch := map[string]any{
 		"metadata": map[string]any{
-			"annotations": annotations,
+			"annotations": map[string]string{
+				AnnotationRunnerToken:  cfg.Token,
+				AnnotationRunnerURL:    cfg.RepoURL,
+				AnnotationRunnerLabels: strings.Join(cfg.Labels, ","),
+			},
 		},
 	}
 	patchData, err := json.Marshal(patch)

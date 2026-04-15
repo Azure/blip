@@ -1,4 +1,4 @@
-package webhook
+package ghactions
 
 import (
 	"context"
@@ -57,7 +57,6 @@ func TestVMAnnotator_StoreRunnerConfig(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Verify annotations were patched.
 	var got kubevirtv1.VirtualMachine
 	require.NoError(t, fc.Get(context.Background(), client.ObjectKey{
 		Namespace: testNamespace,
@@ -91,18 +90,16 @@ func TestVMAnnotator_StoreRunnerConfig_PreservesExistingAnnotations(t *testing.T
 		Name:      "vm-1",
 	}, &got))
 
-	// Runner annotations present.
 	assert.Equal(t, "tok", got.Annotations[AnnotationRunnerToken])
 	assert.Equal(t, "https://github.com/o/r", got.Annotations[AnnotationRunnerURL])
 	assert.Equal(t, "blip", got.Annotations[AnnotationRunnerLabels])
 
-	// Original annotations preserved.
 	assert.Equal(t, "blip-000000000000002a", got.Annotations["blip.io/session-id"])
 	assert.Equal(t, "default", got.Annotations["blip.io/pool"])
 }
 
 func TestVMAnnotator_StoreRunnerConfig_VMNotFound(t *testing.T) {
-	fc := newFakeClient(t, interceptor.Funcs{}) // No objects.
+	fc := newFakeClient(t, interceptor.Funcs{})
 	a := NewVMAnnotator(fc, testNamespace)
 
 	err := a.StoreRunnerConfig(context.Background(), "nonexistent", RunnerConfig{

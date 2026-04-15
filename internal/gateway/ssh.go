@@ -18,7 +18,7 @@ import (
 	"github.com/project-unbounded/blip/internal/gateway/server"
 	"github.com/project-unbounded/blip/internal/gateway/session"
 	"github.com/project-unbounded/blip/internal/gateway/vm"
-	"github.com/project-unbounded/blip/internal/webhook"
+	"github.com/project-unbounded/blip/internal/ghactions"
 )
 
 type GatewayConfig struct {
@@ -166,13 +166,13 @@ func RunGateway(cfg *GatewayConfig) error {
 	})
 
 	// --- Actions poller (optional) ---
-	var actionsPoller *webhook.Poller
+	var actionsPoller *ghactions.Poller
 	if cfg.Actions != nil && cfg.Actions.GitHubAppID > 0 {
 		if authWatcher == nil {
 			return fmt.Errorf("actions polling requires --auth-configmap to be set (repos are read from the %q key)", auth.KeyActionsRepos)
 		}
 
-		ghClient, err := webhook.NewGitHubClient(
+		ghClient, err := ghactions.NewGitHubClient(
 			cfg.Actions.GitHubAppID,
 			cfg.Actions.GitHubInstallID,
 			cfg.Actions.GitHubKeyPath,
@@ -181,14 +181,14 @@ func RunGateway(cfg *GatewayConfig) error {
 			return fmt.Errorf("create GitHub client: %w", err)
 		}
 
-		annotator := webhook.NewVMAnnotator(vmcl.Writer(), cfg.VMNamespace)
+		annotator := ghactions.NewVMAnnotator(vmcl.Writer(), cfg.VMNamespace)
 
 		actionsMaxDuration := cfg.Actions.MaxSessionDuration
 		if actionsMaxDuration <= 0 {
-			actionsMaxDuration = int(webhook.DefaultActionsTTL.Seconds())
+			actionsMaxDuration = int(ghactions.DefaultActionsTTL.Seconds())
 		}
 
-		actionsPoller = webhook.NewPoller(webhook.PollerConfig{
+		actionsPoller = ghactions.NewPoller(ghactions.PollerConfig{
 			VMClaimer:          vmcl,
 			RunnerConfigStore:  annotator,
 			TokenProvider:      ghClient,
@@ -308,13 +308,24 @@ func RunGateway(cfg *GatewayConfig) error {
 		}
 	}()
 
-	err = srv.Serve(ctx, mgr.HandleConnection)
+	// Route incoming SSH connections: VM management commands
+	// (_blip/_register users) go to the command handler; everything
+	// else goes through the normal session proxy flow.
+	connHandler := func(ctx context.Context, serverConn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
+		if session.IsVMCommandConnection(serverConn) {
+			mgr.HandleVMCommand(ctx, serverConn, chans, reqs)
+			return
+		}
+		mgr.HandleConnection(ctx, serverConn, chans, reqs)
+	}
+
+	err = srv.Serve(ctx, connHandler)
 	close(sshDone)
 	return err
 }
 
 // healthzHandler returns an HTTP handler that always reports healthy.
-func healthzHandler(poller *webhook.Poller) http.HandlerFunc {
+func healthzHandler(poller *ghactions.Poller) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -330,7 +341,7 @@ func healthzHandler(poller *webhook.Poller) http.HandlerFunc {
 }
 
 // readyzHandler returns an HTTP handler that reports readiness.
-func readyzHandler(poller *webhook.Poller, shuttingDown *atomic.Int32) http.HandlerFunc {
+func readyzHandler(poller *ghactions.Poller, shuttingDown *atomic.Int32) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 

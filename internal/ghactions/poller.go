@@ -1,4 +1,4 @@
-package webhook
+package ghactions
 
 import (
 	"context"
@@ -17,7 +17,7 @@ import (
 type VMClaimer interface {
 	Claim(ctx context.Context, poolName, sessionID, gatewayPodName string, maxDuration int, userIdentity string, maxBlips int) (*vm.ClaimResult, error)
 	// ReleaseVM marks a previously claimed VM for deallocation. Must be
-	// idempotent — calling ReleaseVM on an already-released or non-existent
+	// idempotent -- calling ReleaseVM on an already-released or non-existent
 	// session must be a safe no-op.
 	ReleaseVM(ctx context.Context, sessionID string) error
 }
@@ -34,35 +34,16 @@ type RepoProvider interface {
 
 // PollerConfig configures the polling-based Actions runner.
 type PollerConfig struct {
-	// VMClaimer provides VM claim/release operations.
-	VMClaimer VMClaimer
-
-	// RunnerConfigStore patches runner config annotations onto claimed VMs.
-	RunnerConfigStore RunnerConfigStore
-
-	// TokenProvider fetches runner registration tokens from the GitHub API.
-	TokenProvider TokenProvider
-
-	// JobsProvider lists queued workflow jobs for a repository.
-	JobsProvider JobsProvider
-
-	// RepoProvider returns the current list of repos to poll.
-	RepoProvider RepoProvider
-
-	// VMPoolName is the KubeVirt pool to allocate VMs from.
-	VMPoolName string
-
-	// RunnerLabels are the self-hosted runner labels (e.g. ["self-hosted", "blip"]).
-	RunnerLabels []string
-
-	// MaxSessionDuration is the TTL for claimed runner VMs in seconds.
+	VMClaimer          VMClaimer
+	RunnerConfigStore  RunnerConfigStore
+	TokenProvider      TokenProvider
+	JobsProvider       JobsProvider
+	RepoProvider       RepoProvider
+	VMPoolName         string
+	RunnerLabels       []string
 	MaxSessionDuration int
-
-	// PodName identifies this pod (used as claimed-by).
-	PodName string
-
-	// PollInterval is how often to poll for queued jobs.
-	PollInterval time.Duration
+	PodName            string
+	PollInterval       time.Duration
 }
 
 // Poller polls the GitHub API for queued workflow jobs and allocates VMs.
@@ -71,10 +52,17 @@ type Poller struct {
 	labelSet map[string]struct{}
 
 	mu             sync.Mutex
-	activeSessions map[string]string // workflow_job.id (string) -> session ID ("" = in-flight)
+	activeSessions map[string]string // job ID (string) -> session ID ("" = in-flight)
 
 	wg sync.WaitGroup
 }
+
+// ownerRepoRe validates GitHub owner/repo format.
+var ownerRepoRe = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]*/[a-zA-Z0-9_][a-zA-Z0-9._-]*$`)
+
+// DefaultActionsTTL is the default TTL for Blips allocated for GitHub Actions
+// runners. Acts as a safety net for cleanup.
+const DefaultActionsTTL = 30 * time.Minute
 
 // NewPoller creates a new polling-based Actions runner handler.
 func NewPoller(cfg PollerConfig) *Poller {
@@ -91,13 +79,6 @@ func NewPoller(cfg PollerConfig) *Poller {
 		activeSessions: make(map[string]string),
 	}
 }
-
-// ownerRepoRe validates GitHub owner/repo format.
-var ownerRepoRe = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]*/[a-zA-Z0-9_][a-zA-Z0-9._-]*$`)
-
-// DefaultActionsTTL is the default TTL for Blips allocated for GitHub Actions
-// runners. Acts as a safety net for cleanup.
-const DefaultActionsTTL = 30 * time.Minute
 
 // sessionID returns a deterministic session ID for a workflow job.
 func sessionID(jobID int64) string {
@@ -129,9 +110,8 @@ func (p *Poller) poll(ctx context.Context) {
 		return
 	}
 
-	// Collect all currently-queued job IDs across all repos so we can
-	// reconcile activeSessions afterwards. If any repo listing fails,
-	// skip reconciliation entirely to avoid false cleanup.
+	// Collect all currently-queued job IDs so we can reconcile afterwards.
+	// If any repo listing fails, skip reconciliation to avoid false cleanup.
 	seenJobIDs := make(map[string]bool)
 	listComplete := true
 
@@ -158,29 +138,23 @@ func (p *Poller) poll(ctx context.Context) {
 		}
 	}
 
-	// Reconcile: release sessions for jobs no longer in the queued set.
-	// Skip reconciliation if any repo listing failed to avoid releasing
-	// sessions based on incomplete data.
 	if !listComplete {
 		return
 	}
+	p.reconcile(ctx, seenJobIDs)
+}
 
-	// Skip sessions with empty sentinel (still setting up).
+// reconcile releases sessions for jobs no longer in the queued set.
+func (p *Poller) reconcile(ctx context.Context, seenJobIDs map[string]bool) {
+	type staleEntry struct{ jobID, sid string }
+
 	p.mu.Lock()
-	var stale []struct {
-		jobID string
-		sid   string
-	}
+	var stale []staleEntry
 	for jobID, sid := range p.activeSessions {
 		if sid != "" && !seenJobIDs[jobID] {
-			stale = append(stale, struct {
-				jobID string
-				sid   string
-			}{jobID, sid})
+			stale = append(stale, staleEntry{jobID, sid})
+			delete(p.activeSessions, jobID)
 		}
-	}
-	for _, s := range stale {
-		delete(p.activeSessions, s.jobID)
 	}
 	p.mu.Unlock()
 
@@ -194,18 +168,13 @@ func (p *Poller) poll(ctx context.Context) {
 
 // handleQueuedJob claims a VM for a queued job and sets it up.
 func (p *Poller) handleQueuedJob(ctx context.Context, repo string, job WorkflowJob) {
-	log := slog.With(
-		"job_id", job.ID,
-		"job_name", job.Name,
-		"repo", repo,
-	)
-
 	if !p.matchesLabels(job.Labels) {
 		return
 	}
 
 	jobIDStr := strconv.FormatInt(job.ID, 10)
 	sid := sessionID(job.ID)
+	log := slog.With("job_id", job.ID, "job_name", job.Name, "repo", repo)
 
 	// Idempotency: atomically check and reserve the session slot.
 	p.mu.Lock()
@@ -236,13 +205,8 @@ func (p *Poller) handleQueuedJob(ctx context.Context, repo string, job WorkflowJ
 	defer claimCancel()
 
 	result, err := p.cfg.VMClaimer.Claim(
-		claimCtx,
-		p.cfg.VMPoolName,
-		sid,
-		p.cfg.PodName,
-		ttl,
-		"github-actions:"+repo,
-		0,
+		claimCtx, p.cfg.VMPoolName, sid, p.cfg.PodName,
+		ttl, "github-actions:"+repo, 0,
 	)
 	if err != nil {
 		log.Error("failed to claim VM", "error", err)
@@ -264,16 +228,6 @@ func (p *Poller) handleQueuedJob(ctx context.Context, repo string, job WorkflowJ
 	}()
 }
 
-// releaseSession removes the session from tracking and releases the VM.
-func (p *Poller) releaseSession(ctx context.Context, log *slog.Logger, jobIDStr, sid string) {
-	p.mu.Lock()
-	delete(p.activeSessions, jobIDStr)
-	p.mu.Unlock()
-	if err := p.cfg.VMClaimer.ReleaseVM(ctx, sid); err != nil {
-		log.Error("failed to release VM", "session_id", sid, "error", err)
-	}
-}
-
 func (p *Poller) finishSetup(ctx context.Context, log *slog.Logger, repo string, job WorkflowJob, result *vm.ClaimResult) error {
 	jobIDStr := strconv.FormatInt(job.ID, 10)
 	sid := sessionID(job.ID)
@@ -293,7 +247,7 @@ func (p *Poller) finishSetup(ctx context.Context, log *slog.Logger, repo string,
 	regToken, err := p.cfg.TokenProvider.CreateRegistrationToken(ctx, repo)
 	if err != nil {
 		log.Error("failed to get registration token, releasing VM", "error", err)
-		p.releaseSession(ctx, log, jobIDStr, sid)
+		p.removeAndRelease(ctx, log, jobIDStr, sid)
 		return fmt.Errorf("create registration token: %w", err)
 	}
 
@@ -303,7 +257,7 @@ func (p *Poller) finishSetup(ctx context.Context, log *slog.Logger, repo string,
 		Labels:  job.Labels,
 	}); err != nil {
 		log.Error("failed to store runner config", "error", err)
-		p.releaseSession(ctx, log, jobIDStr, sid)
+		p.removeAndRelease(ctx, log, jobIDStr, sid)
 		return fmt.Errorf("store runner config: %w", err)
 	}
 
@@ -326,7 +280,18 @@ func (p *Poller) finishSetup(ctx context.Context, log *slog.Logger, repo string,
 	return nil
 }
 
-// matchesLabels returns true if the job's labels include at least one of our configured runner labels.
+// removeAndRelease removes the session from tracking and releases the VM.
+func (p *Poller) removeAndRelease(ctx context.Context, log *slog.Logger, jobIDStr, sid string) {
+	p.mu.Lock()
+	delete(p.activeSessions, jobIDStr)
+	p.mu.Unlock()
+	if err := p.cfg.VMClaimer.ReleaseVM(ctx, sid); err != nil {
+		log.Error("failed to release VM", "session_id", sid, "error", err)
+	}
+}
+
+// matchesLabels returns true if the job's labels include at least one of our
+// configured runner labels (case-insensitive).
 func (p *Poller) matchesLabels(jobLabels []string) bool {
 	for _, l := range jobLabels {
 		if _, ok := p.labelSet[strings.ToLower(l)]; ok {
