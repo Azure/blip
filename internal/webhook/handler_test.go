@@ -2,14 +2,7 @@ package webhook
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,12 +20,11 @@ type mockVMClaimer struct {
 	mu          sync.Mutex
 	claimResult *vm.ClaimResult
 	claimErr    error
-	claimDelay  func() // optional delay to simulate slow claims
+	claimDelay  func()
 	releaseErr  error
 
-	// Track calls for assertions.
 	claimedSessions  []string
-	claimedDurations []int // maxDuration values passed to Claim
+	claimedDurations []int
 	releasedSessions []string
 }
 
@@ -71,6 +63,21 @@ func (m *mockTokenProvider) CreateRegistrationToken(_ context.Context, _ string)
 	return m.token, nil
 }
 
+type mockJobsProvider struct {
+	mu   sync.Mutex
+	jobs map[string][]WorkflowJob // repo -> jobs
+	err  error
+}
+
+func (m *mockJobsProvider) ListQueuedJobs(_ context.Context, ownerRepo string) ([]WorkflowJob, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.jobs[ownerRepo], nil
+}
+
 type mockConfigStore struct {
 	mu     sync.Mutex
 	stored []storedConfig
@@ -89,73 +96,27 @@ func (m *mockConfigStore) StoreRunnerConfig(_ context.Context, vmName string, cf
 	return m.err
 }
 
+type staticRepoProvider struct {
+	repos []string
+}
+
+func (s *staticRepoProvider) ActionsRepos() []string { return s.repos }
+
 // --- Helpers ---
 
-func signPayload(body []byte, secret string) string {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(body)
-	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
-}
-
-func makeWebhookPayload(action string, jobID int64, labels []string, repo string) []byte {
-	event := workflowJobEvent{
-		Action: action,
-		WorkflowJob: workflowJob{
-			ID:     jobID,
-			Labels: labels,
-			Name:   "test-job",
-		},
-		Repository: repository{
-			FullName: repo,
-		},
-	}
-	data, _ := json.Marshal(event)
-	return data
-}
-
-func newTestHandler(claimer *mockVMClaimer, tokens *mockTokenProvider, store *mockConfigStore) *Handler {
-	return NewHandler(HandlerConfig{
+func newTestPoller(claimer *mockVMClaimer, tokens *mockTokenProvider, jobs *mockJobsProvider, store *mockConfigStore, repos []string) *Poller {
+	return NewPoller(PollerConfig{
 		VMClaimer:          claimer,
 		RunnerConfigStore:  store,
 		TokenProvider:      tokens,
+		JobsProvider:       jobs,
+		RepoProvider:       &staticRepoProvider{repos: repos},
 		VMPoolName:         "blip",
 		RunnerLabels:       []string{"self-hosted", "blip"},
 		MaxSessionDuration: 3600,
 		PodName:            "test-pod",
+		PollInterval:       time.Second,
 	})
-}
-
-func newTestHandlerWithSecret(claimer *mockVMClaimer, tokens *mockTokenProvider, store *mockConfigStore, secret string) *Handler {
-	return NewHandler(HandlerConfig{
-		WebhookSecret:      []byte(secret),
-		VMClaimer:          claimer,
-		RunnerConfigStore:  store,
-		TokenProvider:      tokens,
-		VMPoolName:         "blip",
-		RunnerLabels:       []string{"self-hosted", "blip"},
-		MaxSessionDuration: 3600,
-		PodName:            "test-pod",
-	})
-}
-
-// sendWebhook is a helper that sends a POST to the handler and waits for async processing.
-func sendWebhook(h *Handler, body []byte, event string) *httptest.ResponseRecorder {
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
-	r.Header.Set("X-GitHub-Event", event)
-	h.ServeHTTP(w, r)
-	return w
-}
-
-// waitForSessions waits for all async goroutines to complete, then asserts the
-// expected number of active sessions.
-func waitForSessions(t *testing.T, h *Handler, expected int) {
-	t.Helper()
-	h.WaitForPending()
-	got := h.ActiveSessionCount()
-	if got != expected {
-		t.Fatalf("expected %d active sessions, got %d", expected, got)
-	}
 }
 
 // --- Tests ---
@@ -164,89 +125,34 @@ func TestSessionID(t *testing.T) {
 	assert.Equal(t, "blip-00000000000003e8", sessionID(1000))
 	assert.Equal(t, "blip-0000000000000001", sessionID(1))
 	assert.Equal(t, "blip-0000000000000000", sessionID(0))
-	// Verify it can handle large IDs.
 	assert.Equal(t, "blip-7fffffffffffffff", sessionID(9223372036854775807))
 }
 
-func TestHandler_MethodNotAllowed(t *testing.T) {
-	h := newTestHandler(&mockVMClaimer{}, &mockTokenProvider{}, &mockConfigStore{})
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/webhook", nil)
-	h.ServeHTTP(w, r)
-	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
-}
-
-func TestHandler_PingEvent(t *testing.T) {
-	h := newTestHandler(&mockVMClaimer{}, &mockTokenProvider{}, &mockConfigStore{})
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader("{}"))
-	r.Header.Set("X-GitHub-Event", "ping")
-	h.ServeHTTP(w, r)
-	assert.Equal(t, http.StatusOK, w.Code)
-}
-
-func TestHandler_SignatureValidation(t *testing.T) {
-	secret := "test-secret"
-	h := newTestHandlerWithSecret(&mockVMClaimer{}, &mockTokenProvider{}, &mockConfigStore{}, secret)
-
-	t.Run("missing signature", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader("{}"))
-		r.Header.Set("X-GitHub-Event", "ping")
-		h.ServeHTTP(w, r)
-		assert.Equal(t, http.StatusForbidden, w.Code)
-	})
-
-	t.Run("invalid signature", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader("{}"))
-		r.Header.Set("X-GitHub-Event", "ping")
-		r.Header.Set("X-Hub-Signature-256", "sha256=deadbeef")
-		h.ServeHTTP(w, r)
-		assert.Equal(t, http.StatusForbidden, w.Code)
-	})
-
-	t.Run("valid signature", func(t *testing.T) {
-		body := []byte(`{}`)
-		sig := signPayload(body, secret)
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
-		r.Header.Set("X-GitHub-Event", "ping")
-		r.Header.Set("X-Hub-Signature-256", sig)
-		h.ServeHTTP(w, r)
-		assert.Equal(t, http.StatusOK, w.Code)
-	})
-}
-
-func TestHandler_QueuedJob(t *testing.T) {
+func TestPoller_QueuedJob(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1", NodeName: "node-1"},
 	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "AABBC123"},
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Name: "test-job", Labels: []string{"self-hosted", "blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	body := makeWebhookPayload("queued", 42, []string{"self-hosted", "blip"}, "org/repo")
-	w := sendWebhook(h, body, "workflow_job")
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	// Response is immediate (async processing).
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	// Wait for async processing.
-	waitForSessions(t, h, 1)
-
-	// Verify VM was claimed.
 	claimer.mu.Lock()
 	require.Len(t, claimer.claimedSessions, 1)
 	assert.Equal(t, "blip-000000000000002a", claimer.claimedSessions[0])
 	claimer.mu.Unlock()
 
-	// Verify registration token was requested.
 	assert.Equal(t, int64(1), tokens.calls.Load())
 
-	// Verify runner config was stored with VM name.
 	store.mu.Lock()
 	require.Len(t, store.stored, 1)
 	assert.Equal(t, "vm-1", store.stored[0].VMName)
@@ -255,464 +161,504 @@ func TestHandler_QueuedJob(t *testing.T) {
 	assert.Equal(t, []string{"self-hosted", "blip"}, store.stored[0].Config.Labels)
 	store.mu.Unlock()
 
-	assert.Equal(t, 1, h.ActiveSessionCount())
+	assert.Equal(t, 1, p.ActiveSessionCount())
 }
 
-func TestHandler_QueuedJob_DefaultTTLFallback(t *testing.T) {
+func TestPoller_DefaultTTLFallback(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "tok"},
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
 
-	// Create handler with MaxSessionDuration = 0, which should trigger the default 30min TTL.
-	h := NewHandler(HandlerConfig{
+	p := NewPoller(PollerConfig{
 		VMClaimer:          claimer,
 		RunnerConfigStore:  store,
 		TokenProvider:      tokens,
+		JobsProvider:       jobs,
+		RepoProvider:       &staticRepoProvider{repos: []string{"org/repo"}},
 		VMPoolName:         "blip",
 		RunnerLabels:       []string{"blip"},
 		MaxSessionDuration: 0,
 		PodName:            "test-pod",
 	})
 
-	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-	w := sendWebhook(h, body, "workflow_job")
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	waitForSessions(t, h, 1)
+	p.poll(context.Background())
+	p.WaitForPending()
 
 	claimer.mu.Lock()
 	require.Len(t, claimer.claimedDurations, 1)
-	assert.Equal(t, int(DefaultActionsTTL.Seconds()), claimer.claimedDurations[0],
-		"should fall back to DefaultActionsTTL (30min) when MaxSessionDuration is 0")
+	assert.Equal(t, int(DefaultActionsTTL.Seconds()), claimer.claimedDurations[0])
 	claimer.mu.Unlock()
 }
 
-func TestHandler_QueuedJob_ExplicitTTL(t *testing.T) {
+func TestPoller_ExplicitTTL(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "tok"},
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store) // uses MaxSessionDuration: 3600
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-	w := sendWebhook(h, body, "workflow_job")
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	waitForSessions(t, h, 1)
+	p.poll(context.Background())
+	p.WaitForPending()
 
 	claimer.mu.Lock()
 	require.Len(t, claimer.claimedDurations, 1)
-	assert.Equal(t, 3600, claimer.claimedDurations[0],
-		"should use configured MaxSessionDuration")
+	assert.Equal(t, 3600, claimer.claimedDurations[0])
 	claimer.mu.Unlock()
 }
 
-func TestHandler_QueuedJob_NonMatchingLabels(t *testing.T) {
+func TestPoller_NonMatchingLabels(t *testing.T) {
 	claimer := &mockVMClaimer{}
 	tokens := &mockTokenProvider{}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"ubuntu-latest"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	body := makeWebhookPayload("queued", 42, []string{"ubuntu-latest"}, "org/repo")
-	w := sendWebhook(h, body, "workflow_job")
-
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	// Give async goroutine a chance to run (it should be a no-op).
-	waitForSessions(t, h, 0)
+	p.poll(context.Background())
+	p.WaitForPending()
 
 	claimer.mu.Lock()
-	assert.Empty(t, claimer.claimedSessions, "should not claim VM for non-matching labels")
+	assert.Empty(t, claimer.claimedSessions)
 	claimer.mu.Unlock()
 	assert.Equal(t, int64(0), tokens.calls.Load())
 }
 
-func TestHandler_QueuedJob_CaseInsensitiveLabels(t *testing.T) {
+func TestPoller_CaseInsensitiveLabels(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "tok"},
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"BLIP"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	body := makeWebhookPayload("queued", 42, []string{"BLIP"}, "org/repo")
-	w := sendWebhook(h, body, "workflow_job")
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	waitForSessions(t, h, 1)
+	p.poll(context.Background())
+	p.WaitForPending()
 
 	claimer.mu.Lock()
-	assert.Len(t, claimer.claimedSessions, 1, "should match case-insensitively")
+	assert.Len(t, claimer.claimedSessions, 1)
 	claimer.mu.Unlock()
 }
 
-func TestHandler_QueuedJob_DuplicateIsIdempotent(t *testing.T) {
+func TestPoller_DuplicateIsIdempotent(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "tok"},
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
+	// First poll.
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	// First request.
-	sendWebhook(h, body, "workflow_job")
-	waitForSessions(t, h, 1)
+	// Second poll (same job still queued).
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	// Second request (duplicate webhook delivery).
-	sendWebhook(h, body, "workflow_job")
-
-	// Give the second goroutine time to process (it should skip).
-	waitForSessions(t, h, 1)
-
-	// VM should only be claimed once.
 	claimer.mu.Lock()
 	assert.Len(t, claimer.claimedSessions, 1)
 	claimer.mu.Unlock()
 	assert.Equal(t, int64(1), tokens.calls.Load())
 }
 
-func TestHandler_QueuedJob_ClaimFailure(t *testing.T) {
+func TestPoller_ClaimFailure(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimErr: fmt.Errorf("no VMs available"),
 	}
 	tokens := &mockTokenProvider{}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-	w := sendWebhook(h, body, "workflow_job")
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	// Claim failure is now reported synchronously as HTTP 503.
-	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
-
-	// Wait for any async processing to clean up.
-	waitForSessions(t, h, 0)
-
-	assert.Equal(t, int64(0), tokens.calls.Load(), "should not request token if claim fails")
-	assert.Equal(t, 0, h.ActiveSessionCount(), "should not track failed sessions")
+	assert.Equal(t, int64(0), tokens.calls.Load())
+	assert.Equal(t, 0, p.ActiveSessionCount())
 }
 
-func TestHandler_QueuedJob_TokenFailure_ReleasesVM(t *testing.T) {
+func TestPoller_TokenFailure_ReleasesVM(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
 	tokens := &mockTokenProvider{
 		err: fmt.Errorf("GitHub API error"),
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-	sendWebhook(h, body, "workflow_job")
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	// Wait for async processing.
-	waitForSessions(t, h, 0)
-
-	// VM should have been released after token failure.
 	claimer.mu.Lock()
 	require.Len(t, claimer.releasedSessions, 1)
 	assert.Equal(t, "blip-000000000000002a", claimer.releasedSessions[0])
 	claimer.mu.Unlock()
-	assert.Equal(t, 0, h.ActiveSessionCount())
+	assert.Equal(t, 0, p.ActiveSessionCount())
 }
 
-func TestHandler_QueuedJob_ConfigStoreFailure_ReleasesVM(t *testing.T) {
+func TestPoller_ConfigStoreFailure_ReleasesVM(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "tok"},
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{err: fmt.Errorf("patch failed")}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-	sendWebhook(h, body, "workflow_job")
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	// Wait for async processing.
-	waitForSessions(t, h, 0)
-
-	// VM should have been released after config store failure.
 	claimer.mu.Lock()
 	require.Len(t, claimer.releasedSessions, 1)
 	assert.Equal(t, "blip-000000000000002a", claimer.releasedSessions[0])
 	claimer.mu.Unlock()
-	assert.Equal(t, 0, h.ActiveSessionCount())
+	assert.Equal(t, 0, p.ActiveSessionCount())
 }
 
-func TestHandler_QueuedJob_InvalidRepoFormat(t *testing.T) {
-	claimer := &mockVMClaimer{
-		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
-	}
+func TestPoller_InvalidRepoFormat(t *testing.T) {
+	claimer := &mockVMClaimer{}
 	tokens := &mockTokenProvider{}
+	jobs := &mockJobsProvider{}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"../evil/../../etc/passwd"})
 
-	// Send a payload with an invalid repository name.
-	body := makeWebhookPayload("queued", 42, []string{"blip"}, "../evil/../../etc/passwd")
-	w := sendWebhook(h, body, "workflow_job")
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	// Invalid repo format is caught during synchronous claim and returns 503.
-	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
-
-	// Wait for any async processing.
-	waitForSessions(t, h, 0)
-
-	// Should not claim any VM.
 	claimer.mu.Lock()
 	assert.Empty(t, claimer.claimedSessions)
 	claimer.mu.Unlock()
 }
 
-func TestHandler_CompletedJob(t *testing.T) {
+func TestPoller_Reconciliation(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "tok"},
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	// First, queue the job.
-	queueBody := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-	sendWebhook(h, queueBody, "workflow_job")
-	waitForSessions(t, h, 1)
+	// Poll to claim.
+	p.poll(context.Background())
+	p.WaitForPending()
+	assert.Equal(t, 1, p.ActiveSessionCount())
 
-	// Now, complete the job.
-	completeBody := makeWebhookPayload("completed", 42, []string{"blip"}, "org/repo")
-	sendWebhook(h, completeBody, "workflow_job")
+	// Simulate job completing: remove it from the mock jobs list.
+	jobs.mu.Lock()
+	jobs.jobs["org/repo"] = nil
+	jobs.mu.Unlock()
 
-	// Wait for release.
-	waitForSessions(t, h, 0)
+	// Next poll should reconcile and release.
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	// VM should have been released.
 	claimer.mu.Lock()
 	require.Len(t, claimer.releasedSessions, 1)
 	assert.Equal(t, "blip-000000000000002a", claimer.releasedSessions[0])
 	claimer.mu.Unlock()
+	assert.Equal(t, 0, p.ActiveSessionCount())
 }
 
-func TestHandler_CompletedJob_Untracked(t *testing.T) {
-	claimer := &mockVMClaimer{}
-	h := newTestHandler(claimer, &mockTokenProvider{}, &mockConfigStore{})
+func TestPoller_Reconciliation_SkipsInFlightSessions(t *testing.T) {
+	// Sessions with empty sentinel (still setting up) should not be reconciled.
+	claimer := &mockVMClaimer{
+		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
+	}
+	// Use a blocking token provider to keep the session in-flight.
+	tokenReady := make(chan struct{})
+	tokenProceed := make(chan struct{})
+	tokens := &blockingTokenProvider{
+		delegate:  &mockTokenProvider{token: &RegistrationToken{Token: "tok"}},
+		readyCh:   tokenReady,
+		proceedCh: tokenProceed,
+	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
+	store := &mockConfigStore{}
 
-	// Complete a job we never queued.
-	body := makeWebhookPayload("completed", 999, []string{"blip"}, "org/repo")
-	sendWebhook(h, body, "workflow_job")
+	p := NewPoller(PollerConfig{
+		VMClaimer:          claimer,
+		RunnerConfigStore:  store,
+		TokenProvider:      tokens,
+		JobsProvider:       jobs,
+		RepoProvider:       &staticRepoProvider{repos: []string{"org/repo"}},
+		VMPoolName:         "blip",
+		RunnerLabels:       []string{"blip"},
+		MaxSessionDuration: 3600,
+		PodName:            "test-pod",
+	})
 
-	// Wait for async processing.
-	waitForSessions(t, h, 0)
+	// First poll: claims VM, setup goroutine blocks on token fetch.
+	p.poll(context.Background())
+	<-tokenReady
 
-	// Should still attempt release.
+	// Remove the job from the queue and poll again.
+	// The session has an empty sentinel, so reconciliation should skip it.
+	jobs.mu.Lock()
+	jobs.jobs["org/repo"] = nil
+	jobs.mu.Unlock()
+
+	p.poll(context.Background())
+
+	// Session should still be tracked (not reconciled away).
+	assert.Equal(t, 1, p.ActiveSessionCount())
+
+	// Let setup complete.
+	close(tokenProceed)
+	p.WaitForPending()
+
+	// Now a third poll should reconcile it (job still not in queue, session is fully set up).
+	p.poll(context.Background())
+
 	claimer.mu.Lock()
-	require.Len(t, claimer.releasedSessions, 1)
+	// One release from reconciliation.
+	assert.Len(t, claimer.releasedSessions, 1)
+	claimer.mu.Unlock()
+	assert.Equal(t, 0, p.ActiveSessionCount())
+}
+
+func TestPoller_NoRepos(t *testing.T) {
+	claimer := &mockVMClaimer{}
+	p := newTestPoller(claimer, &mockTokenProvider{}, &mockJobsProvider{}, &mockConfigStore{}, nil)
+
+	p.poll(context.Background())
+	p.WaitForPending()
+
+	claimer.mu.Lock()
+	assert.Empty(t, claimer.claimedSessions)
 	claimer.mu.Unlock()
 }
 
-func TestHandler_IgnoresOtherActions(t *testing.T) {
-	claimer := &mockVMClaimer{}
-	h := newTestHandler(claimer, &mockTokenProvider{}, &mockConfigStore{})
-
-	for _, action := range []string{"in_progress", "waiting"} {
-		t.Run(action, func(t *testing.T) {
-			body := makeWebhookPayload(action, 42, []string{"blip"}, "org/repo")
-			w := sendWebhook(h, body, "workflow_job")
-			assert.Equal(t, http.StatusOK, w.Code)
-
-			claimer.mu.Lock()
-			assert.Empty(t, claimer.claimedSessions)
-			assert.Empty(t, claimer.releasedSessions)
-			claimer.mu.Unlock()
-		})
-	}
-}
-
-func TestHandler_InvalidJSON(t *testing.T) {
-	h := newTestHandler(&mockVMClaimer{}, &mockTokenProvider{}, &mockConfigStore{})
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader("not json"))
-	r.Header.Set("X-GitHub-Event", "workflow_job")
-	h.ServeHTTP(w, r)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestHandler_ActiveSessionCount(t *testing.T) {
+func TestPoller_MultipleRepos(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "tok"},
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo1": {{ID: 1, Labels: []string{"blip"}, Status: "queued"}},
+			"org/repo2": {{ID: 2, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo1", "org/repo2"})
 
-	assert.Equal(t, 0, h.ActiveSessionCount())
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-	sendWebhook(h, body, "workflow_job")
-	waitForSessions(t, h, 1)
-
-	assert.Equal(t, 1, h.ActiveSessionCount())
+	claimer.mu.Lock()
+	assert.Len(t, claimer.claimedSessions, 2)
+	claimer.mu.Unlock()
+	assert.Equal(t, 2, p.ActiveSessionCount())
 }
 
-func TestVerifyWebhookSignature(t *testing.T) {
-	secret := []byte("mysecret")
-	body := []byte(`{"action":"queued"}`)
-
-	t.Run("valid", func(t *testing.T) {
-		sig := signPayload(body, "mysecret")
-		assert.True(t, VerifyWebhookSignature(body, sig, secret))
-	})
-
-	t.Run("wrong secret", func(t *testing.T) {
-		sig := signPayload(body, "wrong")
-		assert.False(t, VerifyWebhookSignature(body, sig, secret))
-	})
-
-	t.Run("no prefix", func(t *testing.T) {
-		assert.False(t, VerifyWebhookSignature(body, "deadbeef", secret))
-	})
-
-	t.Run("invalid hex", func(t *testing.T) {
-		assert.False(t, VerifyWebhookSignature(body, "sha256=zzzz", secret))
-	})
-
-	t.Run("empty signature", func(t *testing.T) {
-		assert.False(t, VerifyWebhookSignature(body, "", secret))
-	})
-}
-
-func TestMatchesLabels(t *testing.T) {
-	h := NewHandler(HandlerConfig{
-		RunnerLabels: []string{"self-hosted", "blip"},
-	})
-
-	assert.True(t, h.matchesLabels([]string{"self-hosted", "blip"}))
-	assert.True(t, h.matchesLabels([]string{"BLIP"}))
-	assert.True(t, h.matchesLabels([]string{"ubuntu-latest", "Self-Hosted"}))
-	assert.False(t, h.matchesLabels([]string{"ubuntu-latest"}))
-	assert.False(t, h.matchesLabels([]string{}))
-	assert.False(t, h.matchesLabels(nil))
-}
-
-func TestHandler_ConcurrentDuplicateWebhooks(t *testing.T) {
-	// Verify that concurrent duplicate webhooks for the same job ID only claim one VM.
+func TestPoller_ConcurrentDuplicates(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
 	tokens := &mockTokenProvider{
 		token: &RegistrationToken{Token: "tok"},
 	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
-	h := newTestHandler(claimer, tokens, store)
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	body := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-
-	// Fire 10 concurrent webhooks for the same job.
+	// Fire 10 concurrent polls.
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sendWebhook(h, body, "workflow_job")
+			p.poll(context.Background())
 		}()
 	}
 	wg.Wait()
+	p.WaitForPending()
 
-	// Wait for all async processing.
-	waitForSessions(t, h, 1)
-
-	// Only one VM should be claimed.
 	claimer.mu.Lock()
-	assert.Len(t, claimer.claimedSessions, 1, "should only claim one VM for duplicate webhooks")
+	assert.Len(t, claimer.claimedSessions, 1)
 	claimer.mu.Unlock()
 }
 
-func TestHandler_CompletedDuringInflightSetup(t *testing.T) {
-	// Simulate a "completed" event arriving while "queued" is still in the
-	// async finishQueuedSetup phase (e.g., between Claim and StoreRunnerConfig).
-	// With the synchronous claim, the completed event can only race with the
-	// async setup phase, not the claim itself.
+func TestPoller_RunStopsOnCancel(t *testing.T) {
+	p := newTestPoller(&mockVMClaimer{}, &mockTokenProvider{}, &mockJobsProvider{}, &mockConfigStore{}, nil)
+	p.cfg.PollInterval = 10 * time.Millisecond
 
-	tokenReady := make(chan struct{})
-	tokenProceed := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
 
-	tokens := &mockTokenProvider{
-		token: &RegistrationToken{Token: "tok"},
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after context cancellation")
 	}
+}
 
+func TestMatchesLabels(t *testing.T) {
+	p := NewPoller(PollerConfig{
+		RunnerLabels: []string{"self-hosted", "blip"},
+		RepoProvider: &staticRepoProvider{},
+	})
+
+	assert.True(t, p.matchesLabels([]string{"self-hosted", "blip"}))
+	assert.True(t, p.matchesLabels([]string{"BLIP"}))
+	assert.True(t, p.matchesLabels([]string{"ubuntu-latest", "Self-Hosted"}))
+	assert.False(t, p.matchesLabels([]string{"ubuntu-latest"}))
+	assert.False(t, p.matchesLabels([]string{}))
+	assert.False(t, p.matchesLabels(nil))
+}
+
+func TestPoller_ActiveSessionCount(t *testing.T) {
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
+	tokens := &mockTokenProvider{
+		token: &RegistrationToken{Token: "tok"},
+	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
 	store := &mockConfigStore{}
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	h := newTestHandler(claimer, tokens, store)
+	assert.Equal(t, 0, p.ActiveSessionCount())
 
-	// Intercept the token provider to pause during async setup.
-	tokens.token = &RegistrationToken{Token: "tok"}
-	tokens.err = nil
-	originalProvider := h.cfg.TokenProvider
-	h.cfg.TokenProvider = &blockingTokenProvider{
-		delegate:  originalProvider,
-		readyCh:   tokenReady,
-		proceedCh: tokenProceed,
+	p.poll(context.Background())
+	p.WaitForPending()
+
+	assert.Equal(t, 1, p.ActiveSessionCount())
+}
+
+func TestPoller_ListJobsError(t *testing.T) {
+	claimer := &mockVMClaimer{}
+	tokens := &mockTokenProvider{}
+	jobs := &mockJobsProvider{
+		err: fmt.Errorf("API error"),
 	}
+	store := &mockConfigStore{}
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	// Send "queued" — Claim completes synchronously, then async setup starts.
-	queueBody := makeWebhookPayload("queued", 42, []string{"blip"}, "org/repo")
-	w := sendWebhook(h, queueBody, "workflow_job")
-	assert.Equal(t, http.StatusOK, w.Code)
+	p.poll(context.Background())
+	p.WaitForPending()
 
-	// Wait until the goroutine is inside the token fetch.
-	<-tokenReady
-
-	// Now send "completed" while setup is still in-flight.
-	completeBody := makeWebhookPayload("completed", 42, []string{"blip"}, "org/repo")
-	sendWebhook(h, completeBody, "workflow_job")
-
-	// Let the "completed" handler finish.
-	for range 1000 {
-		claimer.mu.Lock()
-		released := len(claimer.releasedSessions)
-		claimer.mu.Unlock()
-		if released >= 1 {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	// Now let the token fetch proceed.
-	close(tokenProceed)
-
-	// Wait for all goroutines to finish.
-	h.WaitForPending()
-
-	// The completed handler releases once, and finishQueuedSetup detects
-	// that the session was removed and releases again. So 2 releases total.
 	claimer.mu.Lock()
-	assert.Len(t, claimer.releasedSessions, 2, "both completed and setup should release")
+	assert.Empty(t, claimer.claimedSessions)
 	claimer.mu.Unlock()
+}
 
-	// No zombie sessions should remain.
-	assert.Equal(t, 0, h.ActiveSessionCount(), "no zombie sessions should remain")
+func TestPoller_ListJobsError_SkipsReconciliation(t *testing.T) {
+	// Existing sessions must survive when ListQueuedJobs fails, because
+	// the incomplete job list could cause false reconciliation.
+	claimer := &mockVMClaimer{
+		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
+	}
+	tokens := &mockTokenProvider{
+		token: &RegistrationToken{Token: "tok"},
+	}
+	jobs := &mockJobsProvider{
+		jobs: map[string][]WorkflowJob{
+			"org/repo": {{ID: 42, Labels: []string{"blip"}, Status: "queued"}},
+		},
+	}
+	store := &mockConfigStore{}
+	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
+
+	// First poll: claim a VM.
+	p.poll(context.Background())
+	p.WaitForPending()
+	assert.Equal(t, 1, p.ActiveSessionCount())
+
+	// Make listing fail on next poll.
+	jobs.mu.Lock()
+	jobs.err = fmt.Errorf("transient API error")
+	jobs.mu.Unlock()
+
+	// Second poll: listing fails, reconciliation should be skipped.
+	p.poll(context.Background())
+	p.WaitForPending()
+
+	// Session must still be active — not falsely reconciled.
+	assert.Equal(t, 1, p.ActiveSessionCount())
+	claimer.mu.Lock()
+	assert.Empty(t, claimer.releasedSessions, "should not release sessions when listing fails")
+	claimer.mu.Unlock()
 }
 
 // blockingTokenProvider wraps a TokenProvider, blocking on the first call
-// until signalled. Used for testing races between setup and completion.
+// until signalled. Used for testing races between setup and reconciliation.
 type blockingTokenProvider struct {
 	delegate  TokenProvider
 	readyCh   chan struct{}

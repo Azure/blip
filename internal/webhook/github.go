@@ -1,21 +1,19 @@
-// Package webhook implements a GitHub Actions webhook handler that provides
+// Package webhook implements a GitHub Actions polling handler that provides
 // just-in-time self-hosted runners backed by Blip VMs.
 package webhook
 
 import (
 	"context"
 	"crypto"
-	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -24,11 +22,29 @@ import (
 	"time"
 )
 
-// maxResponseBodySize limits the size of GitHub API response bodies we read.
 const maxResponseBodySize = 1 << 20 // 1 MB
 
-// GitHubClient obtains runner registration tokens from the GitHub API using
-// GitHub App authentication.
+// WorkflowJob represents a GitHub Actions workflow job.
+type WorkflowJob struct {
+	ID     int64    `json:"id"`
+	Name   string   `json:"name"`
+	Labels []string `json:"labels"`
+	RunID  int64    `json:"run_id"`
+	Status string   `json:"status"`
+}
+
+// TokenProvider is an interface for obtaining runner registration tokens.
+type TokenProvider interface {
+	CreateRegistrationToken(ctx context.Context, ownerRepo string) (*RegistrationToken, error)
+}
+
+// JobsProvider lists queued workflow jobs for a repository.
+type JobsProvider interface {
+	ListQueuedJobs(ctx context.Context, ownerRepo string) ([]WorkflowJob, error)
+}
+
+// GitHubClient obtains runner registration tokens and lists workflow jobs
+// using GitHub App authentication.
 type GitHubClient struct {
 	appID          int64
 	installationID int64
@@ -41,8 +57,10 @@ type GitHubClient struct {
 	installTokenExp time.Time
 }
 
+var _ TokenProvider = (*GitHubClient)(nil)
+var _ JobsProvider = (*GitHubClient)(nil)
+
 // NewGitHubClient creates a client that authenticates as a GitHub App.
-// keyPath is the path to the PEM-encoded RSA private key.
 func NewGitHubClient(appID, installationID int64, keyPath string) (*GitHubClient, error) {
 	data, err := os.ReadFile(keyPath)
 	if err != nil {
@@ -54,7 +72,6 @@ func NewGitHubClient(appID, installationID int64, keyPath string) (*GitHubClient
 	}
 	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	if err != nil {
-		// Try PKCS8.
 		k, err2 := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err2 != nil {
 			return nil, fmt.Errorf("parse private key (PKCS1: %v, PKCS8: %v)", err, err2)
@@ -80,15 +97,13 @@ type RegistrationToken struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// CreateRegistrationToken requests a new runner registration token for the given
-// repository (owner/repo format) or organization.
+// CreateRegistrationToken requests a new runner registration token.
 func (c *GitHubClient) CreateRegistrationToken(ctx context.Context, ownerRepo string) (*RegistrationToken, error) {
 	token, err := c.getInstallationToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get installation token: %w", err)
 	}
 
-	// Determine if this is an org or repo registration.
 	var url string
 	if strings.Contains(ownerRepo, "/") {
 		url = fmt.Sprintf("%s/repos/%s/actions/runners/registration-token", c.baseURL, ownerRepo)
@@ -126,10 +141,131 @@ func (c *GitHubClient) CreateRegistrationToken(ctx context.Context, ownerRepo st
 	return &rt, nil
 }
 
+// ListQueuedJobs lists workflow jobs with status "queued" for a repository.
+// It queries both queued and in_progress runs because a multi-job run moves
+// to in_progress once its first job starts, but later jobs may still be queued.
+func (c *GitHubClient) ListQueuedJobs(ctx context.Context, ownerRepo string) ([]WorkflowJob, error) {
+	token, err := c.getInstallationToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get installation token: %w", err)
+	}
+
+	var allRuns []int64
+	for _, status := range []string{"queued", "in_progress"} {
+		runs, err := c.listRunIDs(ctx, ownerRepo, status, token)
+		if err != nil {
+			return nil, fmt.Errorf("list %s runs: %w", status, err)
+		}
+		allRuns = append(allRuns, runs...)
+	}
+
+	// Deduplicate run IDs (shouldn't happen, but defensive).
+	seen := make(map[int64]bool, len(allRuns))
+	var uniqueRuns []int64
+	for _, id := range allRuns {
+		if !seen[id] {
+			seen[id] = true
+			uniqueRuns = append(uniqueRuns, id)
+		}
+	}
+
+	var jobs []WorkflowJob
+	for _, runID := range uniqueRuns {
+		runJobs, err := c.listJobsForRun(ctx, ownerRepo, runID, token)
+		if err != nil {
+			slog.Error("failed to list jobs for run, skipping", "repo", ownerRepo, "run_id", runID, "error", err)
+			continue
+		}
+		for _, j := range runJobs {
+			if j.Status == "queued" {
+				jobs = append(jobs, j)
+			}
+		}
+	}
+
+	return jobs, nil
+}
+
+func (c *GitHubClient) listRunIDs(ctx context.Context, ownerRepo, status, token string) ([]int64, error) {
+	url := fmt.Sprintf("%s/repos/%s/actions/runs?status=%s&per_page=100", c.baseURL, ownerRepo, status)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list %s runs: %w", status, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list %s runs failed (HTTP %d): %s", status, resp.StatusCode, string(body))
+	}
+
+	var runsResp struct {
+		WorkflowRuns []struct {
+			ID int64 `json:"id"`
+		} `json:"workflow_runs"`
+	}
+	if err := json.Unmarshal(body, &runsResp); err != nil {
+		return nil, fmt.Errorf("decode runs response: %w", err)
+	}
+
+	ids := make([]int64, len(runsResp.WorkflowRuns))
+	for i, r := range runsResp.WorkflowRuns {
+		ids[i] = r.ID
+	}
+	return ids, nil
+}
+
+func (c *GitHubClient) listJobsForRun(ctx context.Context, ownerRepo string, runID int64, token string) ([]WorkflowJob, error) {
+	url := fmt.Sprintf("%s/repos/%s/actions/runs/%d/jobs?filter=latest&per_page=100", c.baseURL, ownerRepo, runID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list jobs for run %d: %w", runID, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list jobs for run %d failed (HTTP %d): %s", runID, resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Jobs []WorkflowJob `json:"jobs"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode jobs response: %w", err)
+	}
+
+	return result.Jobs, nil
+}
+
 // getInstallationToken returns a cached installation access token, refreshing if expired.
-// Uses a check-lock-check pattern to avoid holding the mutex during HTTP requests.
 func (c *GitHubClient) getInstallationToken(ctx context.Context) (string, error) {
-	// Fast path: check cache under read-like lock.
 	c.mu.Lock()
 	if c.installToken != "" && time.Now().Add(60*time.Second).Before(c.installTokenExp) {
 		token := c.installToken
@@ -138,7 +274,6 @@ func (c *GitHubClient) getInstallationToken(ctx context.Context) (string, error)
 	}
 	c.mu.Unlock()
 
-	// Slow path: fetch a new token (outside lock).
 	jwt, err := c.createJWT()
 	if err != nil {
 		return "", fmt.Errorf("create JWT: %w", err)
@@ -176,7 +311,6 @@ func (c *GitHubClient) getInstallationToken(ctx context.Context) (string, error)
 		return "", fmt.Errorf("decode installation token: %w", err)
 	}
 
-	// Store under lock.
 	c.mu.Lock()
 	c.installToken = result.Token
 	c.installTokenExp = result.ExpiresAt
@@ -185,7 +319,6 @@ func (c *GitHubClient) getInstallationToken(ctx context.Context) (string, error)
 	return result.Token, nil
 }
 
-// createJWT creates a short-lived JWT for GitHub App authentication.
 func (c *GitHubClient) createJWT() (string, error) {
 	now := time.Now().Add(-30 * time.Second) // Clock skew tolerance.
 	exp := now.Add(10 * time.Minute)
@@ -215,29 +348,4 @@ func (c *GitHubClient) createJWT() (string, error) {
 
 func base64URLEncode(data []byte) string {
 	return base64.RawURLEncoding.EncodeToString(data)
-}
-
-// TokenProvider is an interface for obtaining runner registration tokens.
-// This allows the handler to be tested with a mock implementation.
-type TokenProvider interface {
-	CreateRegistrationToken(ctx context.Context, ownerRepo string) (*RegistrationToken, error)
-}
-
-// Ensure GitHubClient implements TokenProvider.
-var _ TokenProvider = (*GitHubClient)(nil)
-
-// VerifyWebhookSignature verifies the X-Hub-Signature-256 header against the
-// request body using the shared webhook secret.
-func VerifyWebhookSignature(body []byte, signature string, secret []byte) bool {
-	if !strings.HasPrefix(signature, "sha256=") {
-		return false
-	}
-	sigBytes, err := hex.DecodeString(strings.TrimPrefix(signature, "sha256="))
-	if err != nil {
-		return false
-	}
-	mac := hmac.New(sha256.New, secret)
-	mac.Write(body)
-	expected := mac.Sum(nil)
-	return subtle.ConstantTimeCompare(expected, sigBytes) == 1
 }

@@ -31,9 +31,10 @@ type GatewayConfig struct {
 	MaxSessionDuration time.Duration
 
 	// AuthConfigMap is the name of the ConfigMap (in VMNamespace) that holds
-	// OIDC provider configuration (key: "oidc-providers") and explicitly
-	// allowed SSH public keys (key: "allowed-pubkeys").
-	// Empty disables OIDC and explicit pubkey auth.
+	// OIDC provider configuration (key: "oidc-providers"), explicitly
+	// allowed SSH public keys (key: "allowed-pubkeys"), and the list of
+	// GitHub repos to poll for Actions jobs (key: "actions-repos").
+	// Empty disables OIDC, explicit pubkey auth, and Actions polling.
 	AuthConfigMap string
 
 	MaxBlipsPerUser int
@@ -51,24 +52,20 @@ type GatewayConfig struct {
 	KeepAliveInterval time.Duration
 	KeepAliveMax      int
 
-	// HTTPListenAddr is the address for the HTTP server that serves webhook
-	// endpoints and health checks. Default: ":8080".
+	// HTTPListenAddr is the address for the HTTP server that serves health
+	// checks. Default: ":8080".
 	HTTPListenAddr string
 
-	// Actions configures the GitHub Actions webhook handler. When nil (or
-	// GitHubAppID is 0), the webhook endpoint is not registered and the
-	// HTTP server only serves health checks.
+	// Actions configures the GitHub Actions polling handler. When nil (or
+	// GitHubAppID is 0), Actions polling is disabled.
 	Actions *ActionsConfig
 }
 
-// ActionsConfig holds the configuration for the GitHub Actions webhook
-// integration. When enabled, the gateway accepts GitHub workflow_job
-// webhooks and allocates Blip VMs as just-in-time self-hosted runners.
+// ActionsConfig holds the configuration for the GitHub Actions polling
+// integration. When enabled, the gateway polls the GitHub API for queued
+// workflow jobs and allocates Blip VMs as just-in-time self-hosted runners.
+// The list of repos to poll is read from the auth ConfigMap (key: "actions-repos").
 type ActionsConfig struct {
-	// WebhookSecret is the shared secret for validating X-Hub-Signature-256.
-	// Empty disables signature validation (not recommended for production).
-	WebhookSecret string
-
 	// GitHubAppID is the GitHub App ID used for authentication.
 	GitHubAppID int64
 
@@ -86,6 +83,9 @@ type ActionsConfig struct {
 	// MaxSessionDuration is the TTL for claimed runner VMs in seconds.
 	// Separate from the SSH session max duration.
 	MaxSessionDuration int
+
+	// PollInterval is how often to poll for queued jobs. Default: 10s.
+	PollInterval time.Duration
 }
 
 func RunGateway(cfg *GatewayConfig) error {
@@ -165,9 +165,13 @@ func RunGateway(cfg *GatewayConfig) error {
 		IdentityStore:      identityStore,
 	})
 
-	// --- HTTP server for health checks and optional webhook endpoint ---
-	var webhookHandler *webhook.Handler
+	// --- Actions poller (optional) ---
+	var actionsPoller *webhook.Poller
 	if cfg.Actions != nil && cfg.Actions.GitHubAppID > 0 {
+		if authWatcher == nil {
+			return fmt.Errorf("actions polling requires --auth-configmap to be set (repos are read from the %q key)", auth.KeyActionsRepos)
+		}
+
 		ghClient, err := webhook.NewGitHubClient(
 			cfg.Actions.GitHubAppID,
 			cfg.Actions.GitHubInstallID,
@@ -177,8 +181,6 @@ func RunGateway(cfg *GatewayConfig) error {
 			return fmt.Errorf("create GitHub client: %w", err)
 		}
 
-		// Reuse the vm.Client's Kubernetes writer for the VMAnnotator
-		// rather than creating a separate Kubernetes client.
 		annotator := webhook.NewVMAnnotator(vmcl.Writer(), cfg.VMNamespace)
 
 		actionsMaxDuration := cfg.Actions.MaxSessionDuration
@@ -186,20 +188,23 @@ func RunGateway(cfg *GatewayConfig) error {
 			actionsMaxDuration = int(webhook.DefaultActionsTTL.Seconds())
 		}
 
-		webhookHandler = webhook.NewHandler(webhook.HandlerConfig{
-			WebhookSecret:      []byte(cfg.Actions.WebhookSecret),
+		actionsPoller = webhook.NewPoller(webhook.PollerConfig{
 			VMClaimer:          vmcl,
 			RunnerConfigStore:  annotator,
 			TokenProvider:      ghClient,
+			JobsProvider:       ghClient,
+			RepoProvider:       authWatcher,
 			VMPoolName:         cfg.VMPoolName,
 			RunnerLabels:       cfg.Actions.RunnerLabels,
 			MaxSessionDuration: actionsMaxDuration,
 			PodName:            cfg.PodName,
+			PollInterval:       cfg.Actions.PollInterval,
 		})
 
-		slog.Info("github actions webhook handler enabled",
+		slog.Info("github actions poller enabled",
 			"runner_labels", cfg.Actions.RunnerLabels,
 			"actions_max_session", actionsMaxDuration,
+			"poll_interval", cfg.Actions.PollInterval,
 		)
 	}
 
@@ -209,15 +214,11 @@ func RunGateway(cfg *GatewayConfig) error {
 	}
 
 	// shuttingDown is set to 1 when a shutdown signal is received.
-	// The readiness probe uses this to report not-ready during drain.
 	var shuttingDown atomic.Int32
 
 	mux := http.NewServeMux()
-	if webhookHandler != nil {
-		mux.Handle("/webhook", webhookHandler)
-	}
-	mux.HandleFunc("/healthz", healthzHandler(webhookHandler))
-	mux.HandleFunc("/readyz", readyzHandler(webhookHandler, &shuttingDown))
+	mux.HandleFunc("/healthz", healthzHandler(actionsPoller))
+	mux.HandleFunc("/readyz", readyzHandler(actionsPoller, &shuttingDown))
 
 	httpServer := &http.Server{
 		Addr:         httpAddr,
@@ -235,11 +236,10 @@ func RunGateway(cfg *GatewayConfig) error {
 		"max_session", cfg.MaxSessionDuration.String(),
 		"oidc_auth", authWatcher != nil,
 		"auth_configmap", cfg.AuthConfigMap,
-		"actions_enabled", webhookHandler != nil,
+		"actions_enabled", actionsPoller != nil,
 	)
 
-	// Start HTTP server in background. If it fails to bind (e.g. port
-	// conflict), the error is surfaced immediately via httpErrCh.
+	// Start HTTP server in background.
 	httpErrCh := make(chan error, 1)
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -247,19 +247,19 @@ func RunGateway(cfg *GatewayConfig) error {
 		}
 	}()
 
-	// Give the HTTP server a moment to fail on bind errors before
-	// committing to the SSH accept loop.
 	select {
 	case err := <-httpErrCh:
 		return fmt.Errorf("HTTP server failed to start: %w", err)
 	case <-time.After(50 * time.Millisecond):
-		// HTTP server is likely listening — proceed.
 	}
 
-	// Maximum time to wait for active SSH sessions to drain after a signal.
+	// Start actions poller in background.
+	if actionsPoller != nil {
+		go actionsPoller.Run(ctx)
+	}
+
 	const drainTimeout = 30 * time.Second
 
-	// sshDone signals when the SSH server's Serve() method returns.
 	sshDone := make(chan struct{})
 
 	sigCh := make(chan os.Signal, 1)
@@ -271,43 +271,34 @@ func RunGateway(cfg *GatewayConfig) error {
 			"drain_timeout", drainTimeout.String(),
 		)
 
-		// Mark as shutting down so /readyz returns 503.
 		shuttingDown.Store(1)
 
-		// Cancel the main context — this triggers srv.listener.Close()
-		// via context.AfterFunc in server.New, which unblocks Serve().
+		// Cancel the main context — stops poller and SSH listener.
 		cancel()
 
-		// Notify active SSH sessions of the impending shutdown.
 		mgr.NotifyShutdown()
 
-		// Shut down the HTTP server gracefully. This stops accepting
-		// new webhooks and waits for in-flight HTTP handlers to complete.
 		httpShutdownCtx, httpShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer httpShutdownCancel()
 		if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
 			slog.Error("HTTP server shutdown error", "error", err)
 		}
 
-		// Drain in-flight webhook goroutines. These run detached from
-		// the HTTP handler and have their own timeouts (up to 2 min for
-		// queued jobs). We cap the wait to keep it within the Kubernetes
-		// termination grace period.
-		if webhookHandler != nil {
-			webhookDrainDone := make(chan struct{})
+		// Drain in-flight poller goroutines.
+		if actionsPoller != nil {
+			pollerDrainDone := make(chan struct{})
 			go func() {
-				webhookHandler.WaitForPending()
-				close(webhookDrainDone)
+				actionsPoller.WaitForPending()
+				close(pollerDrainDone)
 			}()
 			select {
-			case <-webhookDrainDone:
-				slog.Info("webhook goroutines drained")
+			case <-pollerDrainDone:
+				slog.Info("actions poller goroutines drained")
 			case <-time.After(drainTimeout):
-				slog.Warn("webhook drain timeout, some operations may be interrupted")
+				slog.Warn("poller drain timeout, some operations may be interrupted")
 			}
 		}
 
-		// Wait for SSH sessions to drain, or timeout.
 		select {
 		case <-sshDone:
 			slog.Info("ssh server stopped, all sessions drained")
@@ -322,10 +313,8 @@ func RunGateway(cfg *GatewayConfig) error {
 	return err
 }
 
-// healthzHandler returns an HTTP handler that always reports healthy (the process
-// is alive). When a webhook handler is configured, the response includes the
-// active webhook session count.
-func healthzHandler(wh *webhook.Handler) http.HandlerFunc {
+// healthzHandler returns an HTTP handler that always reports healthy.
+func healthzHandler(poller *webhook.Poller) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -333,17 +322,15 @@ func healthzHandler(wh *webhook.Handler) http.HandlerFunc {
 			"status":    "ok",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 		}
-		if wh != nil {
-			resp["active_webhook_sessions"] = wh.ActiveSessionCount()
+		if poller != nil {
+			resp["active_actions_sessions"] = poller.ActiveSessionCount()
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
 
-// readyzHandler returns an HTTP handler that reports readiness. It returns
-// 503 Service Unavailable during shutdown so Kubernetes stops routing new
-// traffic to the pod while it drains.
-func readyzHandler(wh *webhook.Handler, shuttingDown *atomic.Int32) http.HandlerFunc {
+// readyzHandler returns an HTTP handler that reports readiness.
+func readyzHandler(poller *webhook.Poller, shuttingDown *atomic.Int32) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -361,16 +348,14 @@ func readyzHandler(wh *webhook.Handler, shuttingDown *atomic.Int32) http.Handler
 			"status":    "ok",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 		}
-		if wh != nil {
-			resp["active_webhook_sessions"] = wh.ActiveSessionCount()
+		if poller != nil {
+			resp["active_actions_sessions"] = poller.ActiveSessionCount()
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
 
-// vmKeyResolverAdapter adapts vm.Client to the auth.VMKeyResolver interface
-// by looking up the VM client key annotation and resolving the root identity
-// and auth fingerprint.
+// vmKeyResolverAdapter adapts vm.Client to the auth.VMKeyResolver interface.
 type vmKeyResolverAdapter struct {
 	vmClient *vm.Client
 }

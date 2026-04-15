@@ -38,16 +38,16 @@ func newRootCmd() *cobra.Command {
 		hostPrincipals     []string
 		externalHost       string
 
-		// HTTP server for health checks and webhook endpoint.
+		// HTTP server for health checks.
 		httpListenAddr string
 
-		// GitHub Actions webhook integration (optional).
-		webhookSecret          string
+		// GitHub Actions polling integration (optional).
 		githubAppID            int64
 		githubInstallID        int64
 		githubKeyPath          string
 		runnerLabels           []string
 		actionsSessionDuration int
+		actionsPollInterval    int
 	)
 
 	cmd := &cobra.Command{
@@ -84,7 +84,7 @@ func newRootCmd() *cobra.Command {
 				HTTPListenAddr:     httpListenAddr,
 			}
 
-			// Enable GitHub Actions webhook integration if configured.
+			// Enable GitHub Actions polling integration if configured.
 			if githubAppID > 0 {
 				if githubInstallID <= 0 {
 					return fmt.Errorf("--github-install-id is required when --github-app-id is set")
@@ -95,16 +95,16 @@ func newRootCmd() *cobra.Command {
 				if len(runnerLabels) == 0 {
 					return fmt.Errorf("--runner-labels is required when --github-app-id is set (e.g. 'self-hosted,blip')")
 				}
-				if webhookSecret == "" {
-					slog.Warn("SECURITY WARNING: --webhook-secret is not set; webhook payloads will not be verified")
+				if authConfigMap == "" {
+					return fmt.Errorf("--auth-configmap is required when --github-app-id is set (repos are read from the 'actions-repos' key)")
 				}
 				cfg.Actions = &sshgw.ActionsConfig{
-					WebhookSecret:      webhookSecret,
 					GitHubAppID:        githubAppID,
 					GitHubInstallID:    githubInstallID,
 					GitHubKeyPath:      githubKeyPath,
 					RunnerLabels:       runnerLabels,
 					MaxSessionDuration: actionsSessionDuration,
+					PollInterval:       time.Duration(actionsPollInterval) * time.Second,
 				}
 			}
 
@@ -122,20 +122,20 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "unknown"), "Pod name for identification (env: POD_NAME)")
 	cmd.Flags().IntVar(&maxSessionDuration, "max-session-duration", envOrDefaultInt("MAX_SESSION_DURATION", 43200), "Maximum session duration in seconds (env: MAX_SESSION_DURATION)")
 	cmd.Flags().IntVar(&maxBlipsPerUser, "max-blips-per-user", envOrDefaultInt("MAX_BLIPS_PER_USER", 0), "Per-user blip quota, 0 = unlimited (env: MAX_BLIPS_PER_USER)")
-	cmd.Flags().StringVar(&authConfigMap, "auth-configmap", envOrDefault("AUTH_CONFIGMAP", ""), "ConfigMap name for auth config: OIDC providers (key: \"oidc-providers\") and allowed SSH pubkeys (key: \"allowed-pubkeys\") (env: AUTH_CONFIGMAP)")
+	cmd.Flags().StringVar(&authConfigMap, "auth-configmap", envOrDefault("AUTH_CONFIGMAP", ""), "ConfigMap name for auth config: OIDC providers, SSH pubkeys, and actions repos (env: AUTH_CONFIGMAP)")
 	cmd.Flags().StringSliceVar(&hostPrincipals, "host-principals", envOrDefaultStringSlice("GATEWAY_HOST_PRINCIPALS"), "Hostnames/IPs for gateway identification, comma-separated (env: GATEWAY_HOST_PRINCIPALS)")
 	cmd.Flags().StringVar(&externalHost, "external-host", envOrDefault("GATEWAY_EXTERNAL_HOST", ""), "Public hostname for the gateway, shown in reconnect instructions (env: GATEWAY_EXTERNAL_HOST)")
 
 	// HTTP server flags.
-	cmd.Flags().StringVar(&httpListenAddr, "http-address", envOrDefault("HTTP_ADDRESS", ":8080"), "HTTP address for health checks and webhook endpoint (env: HTTP_ADDRESS)")
+	cmd.Flags().StringVar(&httpListenAddr, "http-address", envOrDefault("HTTP_ADDRESS", ":8080"), "HTTP address for health checks (env: HTTP_ADDRESS)")
 
-	// GitHub Actions webhook flags (optional).
-	cmd.Flags().StringVar(&webhookSecret, "webhook-secret", envOrDefault("WEBHOOK_SECRET", ""), "GitHub webhook secret for signature validation (env: WEBHOOK_SECRET)")
-	cmd.Flags().Int64Var(&githubAppID, "github-app-id", envOrDefaultInt64("GITHUB_APP_ID", 0), "GitHub App ID for Actions webhook integration (env: GITHUB_APP_ID)")
+	// GitHub Actions polling flags (optional).
+	cmd.Flags().Int64Var(&githubAppID, "github-app-id", envOrDefaultInt64("GITHUB_APP_ID", 0), "GitHub App ID for Actions polling integration (env: GITHUB_APP_ID)")
 	cmd.Flags().Int64Var(&githubInstallID, "github-install-id", envOrDefaultInt64("GITHUB_INSTALL_ID", 0), "GitHub App installation ID (env: GITHUB_INSTALL_ID)")
 	cmd.Flags().StringVar(&githubKeyPath, "github-key-path", envOrDefault("GITHUB_KEY_PATH", ""), "Path to GitHub App PEM private key (env: GITHUB_KEY_PATH)")
 	cmd.Flags().StringSliceVar(&runnerLabels, "runner-labels", envOrDefaultStringSlice("RUNNER_LABELS"), "Runner labels to match against workflow_job labels, comma-separated (env: RUNNER_LABELS)")
 	cmd.Flags().IntVar(&actionsSessionDuration, "actions-session-duration", envOrDefaultInt("ACTIONS_SESSION_DURATION", 3600), "Maximum runner session duration in seconds (env: ACTIONS_SESSION_DURATION)")
+	cmd.Flags().IntVar(&actionsPollInterval, "actions-poll-interval", envOrDefaultInt("ACTIONS_POLL_INTERVAL", 10), "How often to poll for queued jobs in seconds (env: ACTIONS_POLL_INTERVAL)")
 
 	return cmd
 }
