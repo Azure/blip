@@ -142,6 +142,47 @@ def vm_exists(session_id):
     return vm_annotation(session_id, "blip.io/session-id") is not None
 
 
+def vm_name_for_session(session_id):
+    """Return the VM name for a given session-id, or None."""
+    vms = kubectl_json("get", "vm", "-n", NAMESPACE,
+                       "-l", f"blip.io/pool={POOL_NAME}",
+                       "--ignore-not-found")
+    for item in vms.get("items", []):
+        ann = item.get("metadata", {}).get("annotations", {})
+        if ann.get("blip.io/session-id") == session_id:
+            return item["metadata"]["name"]
+    return None
+
+
+def pvcs_for_vm(vm_name):
+    """Return the list of PVC names associated with the given VM.
+
+    DataVolumeTemplates create the ownership chain VM -> DV -> PVC.
+    We look for DataVolumes owned by the VM, then find PVCs owned by
+    those DataVolumes.
+    """
+    # Step 1: Find DataVolumes owned by the VM.
+    dvs = kubectl_json("get", "dv", "-n", NAMESPACE, "--ignore-not-found")
+    dv_names = []
+    for dv in dvs.get("items", []):
+        owners = dv.get("metadata", {}).get("ownerReferences", [])
+        for owner in owners:
+            if owner.get("name") == vm_name:
+                dv_names.append(dv["metadata"]["name"])
+
+    # Step 2: Find PVCs owned by those DataVolumes.
+    if not dv_names:
+        return []
+    pvcs = kubectl_json("get", "pvc", "-n", NAMESPACE, "--ignore-not-found")
+    result = []
+    for pvc in pvcs.get("items", []):
+        owners = pvc.get("metadata", {}).get("ownerReferences", [])
+        for owner in owners:
+            if owner.get("name") in dv_names:
+                result.append(pvc["metadata"]["name"])
+    return result
+
+
 def wait_for_vm_deleted(session_id, timeout=60):
     wait_for(
         lambda: not vm_exists(session_id),
@@ -151,7 +192,7 @@ def wait_for_vm_deleted(session_id, timeout=60):
     log(f"    VM {session_id} deleted")
 
 
-def wait_for_pool_ready(min_ready=1, timeout=480):
+def wait_for_pool_ready(min_ready=1, timeout=600):
     """Wait until at least min_ready unclaimed VMs in the pool are Ready."""
     start = time.time()
     last_summary = ""
@@ -202,6 +243,17 @@ def wait_for_pool_ready(min_ready=1, timeout=480):
                     reasons.append("vmi-not-ready")
                 if not has_keys:
                     reasons.append("no-keys")
+                # Check DataVolume status for additional context.
+                try:
+                    dvs = kubectl_json("get", "dv", "-n", NAMESPACE,
+                                       "-l", f"kubevirt.io/created-by={item['metadata'].get('uid', '')}")
+                except Exception:
+                    dvs = {"items": []}
+                for dv in dvs.get("items", []):
+                    dv_phase = dv.get("status", {}).get("phase", "?")
+                    if dv_phase != "Succeeded":
+                        progress = dv.get("status", {}).get("progress", "?")
+                        reasons.append(f"dv:{dv_phase}({progress})")
                 vm_states.append(f"{name}:wait({','.join(reasons)})")
 
         elapsed = int(time.time() - start)
@@ -245,6 +297,27 @@ def dump_diagnostics():
     except Exception as e:
         log(f"  VMs: {e}")
         vms = {"items": []}
+
+    # DataVolume and PVC status
+    try:
+        dvs = kubectl_json("get", "dv", "-n", NAMESPACE)
+        for dv in dvs.get("items", []):
+            dv_name = dv["metadata"]["name"]
+            dv_phase = dv.get("status", {}).get("phase", "?")
+            dv_progress = dv.get("status", {}).get("progress", "?")
+            log(f"  DV {dv_name}: phase={dv_phase} progress={dv_progress}")
+    except Exception as e:
+        log(f"  DataVolumes: {e}")
+
+    try:
+        pvcs = kubectl_json("get", "pvc", "-n", NAMESPACE)
+        for pvc in pvcs.get("items", []):
+            pvc_name = pvc["metadata"]["name"]
+            pvc_phase = pvc.get("status", {}).get("phase", "?")
+            pvc_cap = pvc.get("status", {}).get("capacity", {}).get("storage", "?")
+            log(f"  PVC {pvc_name}: phase={pvc_phase} capacity={pvc_cap}")
+    except Exception as e:
+        log(f"  PVCs: {e}")
 
     for item in vms.get("items", []):
         name = item["metadata"]["name"]
@@ -597,7 +670,7 @@ def setup():
     #     With REPLICAS=4 and all 4 ready here, the pool always has enough
     #     unclaimed VMs for the next test without a second provisioning round.
     log("  Waiting for VMs...")
-    wait_for_pool_ready(min_ready=REPLICAS, timeout=480)
+    wait_for_pool_ready(min_ready=REPLICAS, timeout=600)
 
     # 11. TOFU: record the gateway's host key. All replicas share the same
     #     stable key, so this mirrors the real user experience.
@@ -640,6 +713,8 @@ def teardown():
     kubectl("delete", "virtualmachinepool", POOL_NAME,
             "-n", NAMESPACE, "--ignore-not-found", check=False)
     kubectl("delete", "vm", "--all", "-n", NAMESPACE, check=False)
+    kubectl("delete", "dv", "--all", "-n", NAMESPACE, check=False)
+    kubectl("delete", "pvc", "--all", "-n", NAMESPACE, check=False)
     if _tmpdir:
         shutil.rmtree(_tmpdir, ignore_errors=True)
     log("=== Teardown complete ===\n")
@@ -650,7 +725,7 @@ def teardown():
 # ---------------------------------------------------------------------------
 
 def test_ephemeral_session():
-    """Connect, verify blip, disconnect -> VM deleted."""
+    """Connect, verify blip, disconnect -> VM and PVCs deleted."""
     wait_for_pool_ready(min_ready=1)
 
     stdout, stderr, rc = ssh_session(SSH_USER, "echo BLIP_OK && hostname")
@@ -660,8 +735,26 @@ def test_ephemeral_session():
     session_id = extract_session_id(stderr)
     log(f"    Session: {session_id}")
 
+    # Capture the VM name before deletion so we can verify PVC cleanup.
+    vm_name = vm_name_for_session(session_id)
+    assert vm_name, f"Could not find VM for session {session_id}"
+    pvc_names = pvcs_for_vm(vm_name)
+    log(f"    VM: {vm_name}, PVCs: {pvc_names}")
+
     log("    Waiting for VM deletion...")
     wait_for_vm_deleted(session_id)
+
+    # Verify PVCs owned by the VM are also deleted (DataVolumeTemplates
+    # set ownerReferences so the PVC is garbage-collected with the VM).
+    if pvc_names:
+        log("    Verifying PVC cleanup...")
+        def pvcs_gone():
+            for name in pvc_names:
+                if resource_exists("get", "pvc", name, "-n", NAMESPACE):
+                    return False
+            return True
+        wait_for(pvcs_gone, "PVCs deleted with VM", timeout=60)
+        log("    PVCs cleaned up")
 
 
 def test_retained_session():

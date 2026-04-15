@@ -490,10 +490,35 @@ func TestDialUpstream_Validation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := DialUpstream("192.0.2.1", signer, tt.hostKey)
+			_, err := DialUpstream(context.Background(), "192.0.2.1", signer, tt.hostKey)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErrMsg)
 		})
+	}
+}
+
+func TestDialUpstream_ContextCancellation(t *testing.T) {
+	signer := generateSigner(t)
+	hostKey := string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+
+	// Use an unreachable address so the dial blocks.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := DialUpstream(ctx, "192.0.2.1", signer, hostKey)
+		done <- err
+	}()
+
+	// Cancel quickly — the dial should abort rather than retrying.
+	cancel()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cancelled")
+	case <-time.After(5 * time.Second):
+		t.Fatal("DialUpstream did not return after context cancellation")
 	}
 }
 

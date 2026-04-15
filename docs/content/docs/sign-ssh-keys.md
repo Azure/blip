@@ -4,17 +4,11 @@ description: "Add your SSH public key to the gateway allow-list"
 weight: 3
 ---
 
-Blip authenticates SSH connections using explicitly allowed public keys. The gateway trusts any key present in its allow-list.
-
-## Generate an SSH key
-
-```shell
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
-```
+Blip authenticates SSH connections using public keys in the gateway's allow-list.
 
 ## Add your key
 
-Add your public key to the `ssh-gateway-auth` ConfigMap in the `blip` namespace. One key per line, `authorized_keys` format.
+Add your public key to the `ssh-gateway-auth` ConfigMap (`authorized_keys` format, one key per line):
 
 ```shell
 kubectl edit configmap ssh-gateway-auth -n blip
@@ -28,7 +22,7 @@ kubectl patch configmap ssh-gateway-auth -n blip \
   --type merge -p "{\"data\":{\"allowed-pubkeys\":\"$KEY\n\"}}"
 ```
 
-The gateway picks up changes in real time — no restart required.
+Changes take effect without a gateway restart.
 
 ## Connect
 
@@ -40,18 +34,11 @@ ssh $GATEWAY
 
 ## Session lifecycle
 
-Default max session duration is 8 hours (configurable via `--max-session-duration`).
-
-VMs are ephemeral by default — destroyed on disconnect.
+Default max session duration is 8 hours (configurable via `--max-session-duration`). VMs are ephemeral — destroyed on disconnect. Per-user quotas via `--max-blips-per-user`.
 
 - **`blip retain`** — keeps the VM alive, prints a session ID for reconnection.
 - **`blip release`** — destroys the VM immediately.
 
-## Security
-
-- Each connection is logged with the key fingerprint and identity.
-- Per-user quotas via `--max-blips-per-user`.
-
 ## Next steps
 
-- [Github Actions Auth]({{% relref "github-actions-auth" %}})
+- [OIDC Authentication]({{% relref "oidc-auth" %}})

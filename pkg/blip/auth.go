@@ -12,16 +12,16 @@ import (
 
 // resolveAuth returns the SSH auth methods to use for connecting to the gateway.
 // It checks, in order:
-//  1. An explicit GitHub Actions OIDC token (from [WithGitHubToken] or GITHUB_TOKEN env var)
+//  1. An explicit OIDC token (from [WithOIDCToken] or BLIP_OIDC_TOKEN env var)
 //  2. An explicit SSH key path (from [WithSSHKey])
 //  3. The ssh-agent (via SSH_AUTH_SOCK)
 //  4. Default SSH keys from ~/.ssh/ (id_ed25519, id_rsa, id_ecdsa)
 func resolveAuth(cfg *clientConfig) ([]ssh.AuthMethod, error) {
-	// GitHub Actions OIDC token auth: passed as SSH password.
-	// The gateway validates the JWT against the GitHub Actions OIDC provider.
-	token := cfg.githubToken
+	// OIDC token auth: passed as SSH password.
+	// The gateway validates the JWT against the configured OIDC providers.
+	token := cfg.oidcToken
 	if token == "" {
-		token = os.Getenv("GITHUB_TOKEN")
+		token = os.Getenv("BLIP_OIDC_TOKEN")
 	}
 	if token != "" {
 		return []ssh.AuthMethod{ssh.Password(token)}, nil
@@ -70,7 +70,7 @@ func resolveAuth(cfg *clientConfig) ([]ssh.AuthMethod, error) {
 	}
 
 	if len(signers) == 0 {
-		return nil, fmt.Errorf("no authentication method available: set GITHUB_TOKEN, start ssh-agent, or provide an SSH key")
+		return nil, fmt.Errorf("no authentication method available: set BLIP_OIDC_TOKEN, start ssh-agent, or provide an SSH key")
 	}
 
 	return []ssh.AuthMethod{ssh.PublicKeys(signers...)}, nil

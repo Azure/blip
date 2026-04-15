@@ -86,7 +86,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "unknown"), "Pod name for identification (env: POD_NAME)")
 	cmd.Flags().IntVar(&maxSessionDuration, "max-session-duration", envOrDefaultInt("MAX_SESSION_DURATION", 43200), "Maximum session duration in seconds (env: MAX_SESSION_DURATION)")
 	cmd.Flags().IntVar(&maxBlipsPerUser, "max-blips-per-user", envOrDefaultInt("MAX_BLIPS_PER_USER", 0), "Per-user blip quota, 0 = unlimited (env: MAX_BLIPS_PER_USER)")
-	cmd.Flags().StringVar(&authConfigMap, "auth-configmap", envOrDefault("AUTH_CONFIGMAP", ""), "ConfigMap name for auth config: allowed GitHub repos (key: \"allowed-repos\") and allowed SSH pubkeys (key: \"allowed-pubkeys\") (env: AUTH_CONFIGMAP)")
+	cmd.Flags().StringVar(&authConfigMap, "auth-configmap", envOrDefault("AUTH_CONFIGMAP", ""), "ConfigMap name for auth config: OIDC providers (key: \"oidc-providers\") and allowed SSH pubkeys (key: \"allowed-pubkeys\") (env: AUTH_CONFIGMAP)")
 	cmd.Flags().StringSliceVar(&hostPrincipals, "host-principals", envOrDefaultStringSlice("GATEWAY_HOST_PRINCIPALS"), "Hostnames/IPs for gateway identification, comma-separated (env: GATEWAY_HOST_PRINCIPALS)")
 	cmd.Flags().StringVar(&externalHost, "external-host", envOrDefault("GATEWAY_EXTERNAL_HOST", ""), "Public hostname for the gateway, shown in reconnect instructions (env: GATEWAY_EXTERNAL_HOST)")
 

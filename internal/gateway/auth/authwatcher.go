@@ -8,11 +8,14 @@ import (
 	"sync"
 
 	"golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v3"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	toolscache "k8s.io/client-go/tools/cache"
@@ -22,26 +25,31 @@ import (
 
 // ConfigMap key names inside the unified auth ConfigMap.
 const (
-	// KeyAllowedRepos holds the allowed GitHub Actions repository list
-	// (one owner/repo per line).
-	KeyAllowedRepos = "allowed-repos"
+	// KeyOIDCProviders holds the OIDC provider configuration as a YAML list.
+	// Each entry specifies an issuer, audience, identity claim, and optional
+	// subject allowlist.
+	KeyOIDCProviders = "oidc-providers"
 
 	// KeyAllowedPubkeys holds explicitly allowed SSH public keys
 	// (one key per line in authorized_keys format).
 	KeyAllowedPubkeys = "allowed-pubkeys"
 )
 
-// AuthWatcher watches a ConfigMap for the allowed GitHub Actions repository
-// list and explicitly allowed SSH public keys, providing thread-safe access
+// AuthWatcher watches a ConfigMap for OIDC provider configuration and
+// explicitly allowed SSH public keys, providing thread-safe access
 // to the current sets.
 type AuthWatcher struct {
 	cache     crcache.Cache
 	namespace string
 	name      string
 
-	mu      sync.RWMutex
-	repos   []string
-	pubkeys map[string]string // SHA256 fingerprint -> comment (username)
+	// k8sClient is used for writing pubkey bindings back to the ConfigMap.
+	// Created once during initialization to avoid per-request overhead.
+	k8sClient kubernetes.Interface
+
+	mu            sync.RWMutex
+	oidcProviders []OIDCProviderConfig
+	pubkeys       map[string]string // SHA256 fingerprint -> comment (username)
 }
 
 // NewAuthWatcher creates an AuthWatcher that watches the named ConfigMap.
@@ -72,10 +80,17 @@ func NewAuthWatcher(ctx context.Context, namespace, configMapName string) (*Auth
 		return nil, fmt.Errorf("create configmap informer cache: %w", err)
 	}
 
+	// Create a Kubernetes clientset for writing pubkey bindings.
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create kubernetes clientset: %w", err)
+	}
+
 	w := &AuthWatcher{
 		cache:     informerCache,
 		namespace: namespace,
 		name:      configMapName,
+		k8sClient: clientset,
 		pubkeys:   make(map[string]string),
 	}
 
@@ -111,19 +126,20 @@ func NewAuthWatcher(ctx context.Context, namespace, configMapName string) (*Auth
 	slog.Info("auth watcher started",
 		"namespace", namespace,
 		"configmap", configMapName,
-		"initial_repos", w.AllowedRepos(),
-		"initial_pubkey_count", len(w.allowedPubkeyFingerprints()),
+		"initial_oidc_providers", len(w.OIDCProviders()),
+		"initial_pubkey_count", w.allowedPubkeyCount(),
 	)
 
 	return w, nil
 }
 
-// AllowedRepos returns the current snapshot of allowed repos. The returned
-// slice must not be modified by the caller.
-func (w *AuthWatcher) AllowedRepos() []string {
+// OIDCProviders returns a copy of the current OIDC provider configurations.
+func (w *AuthWatcher) OIDCProviders() []OIDCProviderConfig {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return w.repos
+	result := make([]OIDCProviderConfig, len(w.oidcProviders))
+	copy(result, w.oidcProviders)
+	return result
 }
 
 // IsPubkeyAllowed reports whether the given fingerprint (e.g. "SHA256:...")
@@ -143,11 +159,148 @@ func (w *AuthWatcher) PubkeyUsername(fingerprint string) string {
 	return w.pubkeys[fingerprint]
 }
 
-// allowedPubkeyFingerprints returns the map for logging. Lock must not be held.
-func (w *AuthWatcher) allowedPubkeyFingerprints() map[string]string {
+// allowedPubkeyCount returns the number of allowed pubkeys for logging.
+func (w *AuthWatcher) allowedPubkeyCount() int {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return w.pubkeys
+	return len(w.pubkeys)
+}
+
+// DeviceFlowProviders returns the subset of OIDC providers that have device
+// flow enabled. Returns nil if none are configured.
+func (w *AuthWatcher) DeviceFlowProviders() []OIDCProviderConfig {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	var result []OIDCProviderConfig
+	for _, p := range w.oidcProviders {
+		if p.DeviceFlow {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// HasDeviceFlowProviders reports whether any OIDC provider has device flow enabled.
+func (w *AuthWatcher) HasDeviceFlowProviders() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	for _, p := range w.oidcProviders {
+		if p.DeviceFlow {
+			return true
+		}
+	}
+	return false
+}
+
+// BindPubkey adds an SSH public key to the allowed set, bound to the given
+// OIDC identity. The key is persisted to the ConfigMap so it survives restarts.
+// This is called after successful device flow authentication to enable
+// subsequent connections to use fast public key auth.
+func (w *AuthWatcher) BindPubkey(ctx context.Context, fingerprint, authorizedKeyLine string) error {
+	// Persist to ConfigMap first. If this fails, we don't update in-memory
+	// state — avoids inconsistency where the key works temporarily but is
+	// lost on the next ConfigMap reload.
+	if err := w.appendPubkeyToConfigMap(ctx, authorizedKeyLine); err != nil {
+		return err
+	}
+
+	// Update in-memory for immediate effect (the informer will also
+	// eventually pick up the ConfigMap change).
+	w.mu.Lock()
+	w.pubkeys[fingerprint] = extractPubkeyComment(authorizedKeyLine)
+	w.mu.Unlock()
+
+	return nil
+}
+
+// extractPubkeyComment returns the comment field from an authorized_keys line.
+func extractPubkeyComment(line string) string {
+	_, comment, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+	if err != nil {
+		return ""
+	}
+	return comment
+}
+
+// appendPubkeyToConfigMap reads the current ConfigMap, appends the key line
+// to allowed-pubkeys, and writes it back with optimistic concurrency.
+func (w *AuthWatcher) appendPubkeyToConfigMap(ctx context.Context, keyLine string) error {
+	// Pre-parse the new key to avoid panics inside the loop and to
+	// compute the fingerprint once.
+	newPub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(keyLine))
+	if err != nil {
+		return fmt.Errorf("invalid key line for binding: %w", err)
+	}
+	newFingerprint := ssh.FingerprintSHA256(newPub)
+
+	cmClient := w.k8sClient.CoreV1().ConfigMaps(w.namespace)
+
+	// Retry on conflict (optimistic concurrency).
+	for attempt := 0; attempt < 3; attempt++ {
+		cm, err := cmClient.Get(ctx, w.name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get ConfigMap %s/%s: %w", w.namespace, w.name, err)
+		}
+
+		if cm.Data == nil {
+			cm.Data = make(map[string]string)
+		}
+
+		// Check if the key is already present to avoid duplicates.
+		existing := cm.Data[KeyAllowedPubkeys]
+		alreadyBound := false
+		for _, line := range strings.Split(existing, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+			if err != nil {
+				continue
+			}
+			if ssh.FingerprintSHA256(pub) == newFingerprint {
+				slog.Info("pubkey already bound, skipping",
+					"fingerprint", newFingerprint,
+				)
+				alreadyBound = true
+				break
+			}
+		}
+		if alreadyBound {
+			return nil
+		}
+
+		// Append the new key.
+		if existing != "" && !strings.HasSuffix(existing, "\n") {
+			existing += "\n"
+		}
+		cm.Data[KeyAllowedPubkeys] = existing + keyLine + "\n"
+
+		_, err = cmClient.Update(ctx, cm, metav1.UpdateOptions{})
+		if err == nil {
+			slog.Info("pubkey bound to ConfigMap",
+				"configmap", w.name,
+				"fingerprint", newFingerprint,
+			)
+			return nil
+		}
+		if !apierrors.IsConflict(err) {
+			return fmt.Errorf("update ConfigMap %s/%s: %w", w.namespace, w.name, err)
+		}
+		slog.Debug("ConfigMap update conflict, retrying",
+			"attempt", attempt+1,
+			"error", err,
+		)
+	}
+
+	return fmt.Errorf("failed to update ConfigMap %s/%s after 3 conflict retries", w.namespace, w.name)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // reload reads the ConfigMap from the cache and replaces the in-memory data.
@@ -155,45 +308,139 @@ func (w *AuthWatcher) reload(ctx context.Context) {
 	var cm corev1.ConfigMap
 	key := client.ObjectKey{Namespace: w.namespace, Name: w.name}
 	if err := w.cache.Get(ctx, key, &cm); err != nil {
+		// If the context was cancelled (shutdown), don't clear auth data —
+		// in-flight authentication should continue to work during drain.
+		if ctx.Err() != nil {
+			return
+		}
 		slog.Warn("auth watcher: ConfigMap not found, clearing auth data",
 			"namespace", w.namespace,
 			"configmap", w.name,
 			"error", err,
 		)
 		w.mu.Lock()
-		w.repos = nil
+		w.oidcProviders = nil
 		w.pubkeys = make(map[string]string)
 		w.mu.Unlock()
+		pruneProviderCache(nil)
 		return
 	}
 
-	repos := parseLineList(cm.Data[KeyAllowedRepos])
+	providers := parseOIDCProviders(cm.Data[KeyOIDCProviders])
 	pubkeys := parsePubkeyList(cm.Data[KeyAllowedPubkeys])
 
 	w.mu.Lock()
-	w.repos = repos
+	w.oidcProviders = providers
 	w.pubkeys = pubkeys
 	w.mu.Unlock()
 
+	// Evict cached OIDC providers that are no longer in the active set.
+	activeIssuers := make(map[string]bool, len(providers))
+	issuers := make([]string, len(providers))
+	for i, p := range providers {
+		activeIssuers[p.Issuer] = true
+		issuers[i] = p.Issuer
+	}
+	pruneProviderCache(activeIssuers)
+
 	slog.Info("auth watcher: config updated",
 		"configmap", w.name,
-		"repos", repos,
+		"oidc_providers", issuers,
 		"allowed_pubkey_count", len(pubkeys),
 	)
 }
 
-// parseLineList splits a newline-delimited string into trimmed, non-empty entries.
-// Lines starting with # are treated as comments.
-func parseLineList(raw string) []string {
-	var items []string
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+// parseOIDCProviders parses the YAML-formatted OIDC provider configuration.
+// The format is a YAML list:
+//
+//   - issuer: https://token.actions.githubusercontent.com
+//     audience: blip
+//     identity-claim: sub
+//     allowed-subjects:
+//   - "repo:my-org/my-repo:*"
+func parseOIDCProviders(raw string) []OIDCProviderConfig {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	var providers []OIDCProviderConfig
+	if err := yaml.Unmarshal([]byte(raw), &providers); err != nil {
+		slog.Error("auth watcher: failed to parse oidc-providers YAML",
+			"error", err,
+		)
+		return nil
+	}
+
+	// Validate and filter out invalid entries.
+	var valid []OIDCProviderConfig
+	for _, p := range providers {
+		p.Issuer = strings.TrimSpace(p.Issuer)
+		p.Audience = strings.TrimSpace(p.Audience)
+		p.IdentityClaim = strings.TrimSpace(p.IdentityClaim)
+		p.ClientID = strings.TrimSpace(p.ClientID)
+		p.DeviceAuthURL = strings.TrimSpace(p.DeviceAuthURL)
+		p.TokenURL = strings.TrimSpace(p.TokenURL)
+
+		if p.Issuer == "" {
+			slog.Warn("auth watcher: skipping OIDC provider with empty issuer")
 			continue
 		}
-		items = append(items, line)
+		if !strings.HasPrefix(p.Issuer, "https://") {
+			slog.Warn("auth watcher: skipping OIDC provider with non-HTTPS issuer",
+				"issuer", p.Issuer,
+			)
+			continue
+		}
+		// Normalize trailing slash to prevent duplicate cache entries.
+		p.Issuer = strings.TrimRight(p.Issuer, "/")
+
+		if p.Audience == "" {
+			slog.Warn("auth watcher: skipping OIDC provider with empty audience",
+				"issuer", p.Issuer,
+			)
+			continue
+		}
+
+		// Validate device flow configuration.
+		if p.DeviceFlow {
+			if p.ClientID == "" {
+				slog.Warn("auth watcher: skipping device-flow provider with empty client-id",
+					"issuer", p.Issuer,
+				)
+				continue
+			}
+			if p.DeviceAuthURL == "" {
+				slog.Warn("auth watcher: skipping device-flow provider with empty device-auth-url",
+					"issuer", p.Issuer,
+				)
+				continue
+			}
+			if !strings.HasPrefix(p.DeviceAuthURL, "https://") {
+				slog.Warn("auth watcher: skipping device-flow provider with non-HTTPS device-auth-url",
+					"issuer", p.Issuer,
+					"device-auth-url", p.DeviceAuthURL,
+				)
+				continue
+			}
+			if p.TokenURL == "" {
+				slog.Warn("auth watcher: skipping device-flow provider with empty token-url",
+					"issuer", p.Issuer,
+				)
+				continue
+			}
+			if !strings.HasPrefix(p.TokenURL, "https://") {
+				slog.Warn("auth watcher: skipping device-flow provider with non-HTTPS token-url",
+					"issuer", p.Issuer,
+					"token-url", p.TokenURL,
+				)
+				continue
+			}
+		}
+
+		valid = append(valid, p)
 	}
-	return items
+	return valid
 }
 
 // parsePubkeyList parses newline-delimited authorized_keys entries and returns
@@ -223,14 +470,14 @@ func parsePubkeyList(raw string) map[string]string {
 	return fps
 }
 
-// NewTestAuthWatcher creates an AuthWatcher pre-loaded with the given repos
-// and pubkey fingerprints (fingerprint -> comment), without starting an
-// informer cache. Intended for use in tests outside of this package.
-func NewTestAuthWatcher(repos []string, pubkeyFingerprints map[string]string) *AuthWatcher {
+// NewTestAuthWatcher creates an AuthWatcher pre-loaded with the given OIDC
+// providers and pubkey fingerprints (fingerprint -> comment), without starting
+// an informer cache. Intended for use in tests outside of this package.
+func NewTestAuthWatcher(providers []OIDCProviderConfig, pubkeyFingerprints map[string]string) *AuthWatcher {
 	if pubkeyFingerprints == nil {
 		pubkeyFingerprints = make(map[string]string)
 	}
-	return &AuthWatcher{repos: repos, pubkeys: pubkeyFingerprints}
+	return &AuthWatcher{oidcProviders: providers, pubkeys: pubkeyFingerprints}
 }
 
 func newCoreRESTMapper() meta.RESTMapper {

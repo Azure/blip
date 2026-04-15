@@ -27,8 +27,8 @@ type GatewayConfig struct {
 	MaxSessionDuration time.Duration
 
 	// AuthConfigMap is the name of the ConfigMap (in VMNamespace) that holds
-	// the allowed GitHub Actions repository list (key: "allowed-repos") and
-	// explicitly allowed SSH public keys (key: "allowed-pubkeys").
+	// OIDC provider configuration (key: "oidc-providers") and explicitly
+	// allowed SSH public keys (key: "allowed-pubkeys").
 	// Empty disables OIDC and explicit pubkey auth.
 	AuthConfigMap string
 
@@ -52,13 +52,24 @@ func RunGateway(cfg *GatewayConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start the ConfigMap-backed auth watcher for OIDC and explicit pubkey auth.
+	// Start the ConfigMap-backed auth watcher for OIDC and pubkey auth.
 	var authWatcher *auth.AuthWatcher
 	if cfg.AuthConfigMap != "" {
 		var err error
 		authWatcher, err = auth.NewAuthWatcher(ctx, cfg.VMNamespace, cfg.AuthConfigMap)
 		if err != nil {
 			return fmt.Errorf("start auth watcher: %w", err)
+		}
+	}
+
+	// Start the identity store for refresh token storage and
+	// SSH pubkey-to-OIDC identity linking.
+	var identityStore *auth.IdentityStore
+	if authWatcher != nil {
+		var err error
+		identityStore, err = auth.NewIdentityStore(ctx, cfg.VMNamespace, auth.DefaultPubkeyLinkTTL)
+		if err != nil {
+			return fmt.Errorf("start identity store: %w", err)
 		}
 	}
 
@@ -70,7 +81,7 @@ func RunGateway(cfg *GatewayConfig) error {
 	// Create the VM key resolver adapter for the auth system.
 	vmKeyResolver := &vmKeyResolverAdapter{vmClient: vmcl}
 
-	srv, err := server.New(server.Config{
+	srv, err := server.New(ctx, server.Config{
 		ListenAddr:         cfg.ListenAddr,
 		HostKeyPath:        cfg.HostKeyPath,
 		PodName:            cfg.PodName,
@@ -79,6 +90,7 @@ func RunGateway(cfg *GatewayConfig) error {
 		MaxAuthTries:       cfg.MaxAuthTries,
 		AuthWatcher:        authWatcher,
 		VMKeyResolver:      vmKeyResolver,
+		IdentityStore:      identityStore,
 	})
 	if err != nil {
 		return err
@@ -109,6 +121,8 @@ func RunGateway(cfg *GatewayConfig) error {
 		MaxSessionDuration: cfg.MaxSessionDuration,
 		KeepAliveInterval:  cfg.KeepAliveInterval,
 		KeepAliveMax:       cfg.KeepAliveMax,
+		AuthWatcher:        authWatcher,
+		IdentityStore:      identityStore,
 	})
 
 	slog.Info("ssh-gateway starting",
@@ -116,7 +130,7 @@ func RunGateway(cfg *GatewayConfig) error {
 		"namespace", cfg.VMNamespace,
 		"pool", cfg.VMPoolName,
 		"max_session", cfg.MaxSessionDuration.String(),
-		"github_actions_auth", authWatcher != nil,
+		"oidc_auth", authWatcher != nil,
 		"auth_configmap", cfg.AuthConfigMap,
 	)
 

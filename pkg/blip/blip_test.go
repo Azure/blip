@@ -173,8 +173,8 @@ func TestIsValidSessionID(t *testing.T) {
 	}
 }
 
-func TestResolveAuthGitHubToken(t *testing.T) {
-	cfg := &clientConfig{githubToken: "test-token"}
+func TestResolveAuthOIDCToken(t *testing.T) {
+	cfg := &clientConfig{oidcToken: "test-token"}
 	methods, err := resolveAuth(cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -192,8 +192,8 @@ func TestResolveAuthNoMethods(t *testing.T) {
 	}
 }
 
-func TestNewClientWithGitHubToken(t *testing.T) {
-	c, err := NewClient("example.com", WithGitHubToken("test-token"))
+func TestNewClientWithOIDCToken(t *testing.T) {
+	c, err := NewClient("example.com", WithOIDCToken("test-token"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestNewClientWithGitHubToken(t *testing.T) {
 }
 
 func TestNewClientWithPort(t *testing.T) {
-	c, err := NewClient("example.com", WithGitHubToken("tok"), WithPort("2222"))
+	c, err := NewClient("example.com", WithOIDCToken("tok"), WithPort("2222"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestNewClientWithPort(t *testing.T) {
 }
 
 func TestNewClientWithTimeout(t *testing.T) {
-	c, err := NewClient("example.com", WithGitHubToken("tok"), WithTimeout(5*time.Second))
+	c, err := NewClient("example.com", WithOIDCToken("tok"), WithTimeout(5*time.Second))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestNewClientWithTimeout(t *testing.T) {
 }
 
 func TestNewClientDefaultTimeout(t *testing.T) {
-	c, err := NewClient("example.com", WithGitHubToken("tok"))
+	c, err := NewClient("example.com", WithOIDCToken("tok"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestBlipRetainAfterClose(t *testing.T) {
 }
 
 func TestReconnectInvalidSessionID(t *testing.T) {
-	c, err := NewClient("example.com", WithGitHubToken("tok"))
+	c, err := NewClient("example.com", WithOIDCToken("tok"))
 	if err != nil {
 		t.Fatal(err)
 	}

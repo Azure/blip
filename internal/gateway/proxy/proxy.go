@@ -93,7 +93,9 @@ func RunKeepalive(ctx context.Context, conn *ssh.ServerConn, sessionID string, c
 }
 
 // DialUpstream connects to the target blip via SSH with retry and exponential backoff.
-func DialUpstream(vmIP string, signer ssh.Signer, expectedHostKey string) (*ssh.Client, error) {
+// The context controls the overall dial lifetime; cancellation aborts any
+// in-flight attempt and stops further retries.
+func DialUpstream(ctx context.Context, vmIP string, signer ssh.Signer, expectedHostKey string) (*ssh.Client, error) {
 	const (
 		maxAttempts = 10
 		dialTimeout = 3 * time.Second
@@ -120,10 +122,15 @@ func DialUpstream(vmIP string, signer ssh.Signer, expectedHostKey string) (*ssh.
 	}
 
 	addr := net.JoinHostPort(vmIP, "22")
+	dialer := net.Dialer{Timeout: dialTimeout}
 
 	var lastErr error
 	for attempt := range maxAttempts {
-		tcpConn, dialErr := net.DialTimeout("tcp", addr, dialTimeout)
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("dial %s cancelled: %w", addr, err)
+		}
+
+		tcpConn, dialErr := dialer.DialContext(ctx, "tcp", addr)
 		if dialErr != nil {
 			lastErr = fmt.Errorf("tcp dial (attempt %d/%d): %w", attempt+1, maxAttempts, dialErr)
 			slog.Debug("upstream TCP dial failed", "addr", addr, "attempt", attempt+1, "error", dialErr)
@@ -145,7 +152,11 @@ func DialUpstream(vmIP string, signer ssh.Signer, expectedHostKey string) (*ssh.
 			if backoff > maxBackoff {
 				backoff = maxBackoff
 			}
-			time.Sleep(backoff)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("dial %s cancelled: %w", addr, ctx.Err())
+			case <-time.After(backoff):
+			}
 		}
 	}
 	return nil, fmt.Errorf("dial %s after %d attempts: %w", addr, maxAttempts, lastErr)
