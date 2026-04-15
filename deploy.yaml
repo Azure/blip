@@ -140,6 +140,33 @@ roleRef:
   name: blip-controller-vms
   apiGroup: rbac.authorization.k8s.io
 ---
+# ServiceAccount for VMs to authenticate during key registration.
+# This SA has NO RBAC permissions — it exists solely as an identity
+# for the SA token that VMs present to the gateway during registration.
+# The token is validated via TokenReview, proving the VM is a real
+# virt-launcher pod in the blip namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vm-register
+  namespace: blip
+---
+# Allow the ssh-gateway to validate ServiceAccount tokens via the
+# TokenReview API. This is a cluster-scoped permission required for
+# the gateway to verify VM registration tokens.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ssh-gateway-token-reviewer
+subjects:
+- kind: ServiceAccount
+  name: ssh-gateway
+  namespace: blip
+roleRef:
+  kind: ClusterRole
+  name: system:auth-delegator
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -276,6 +303,8 @@ spec:
           value: "/etc/blip/host-key/host_key"
         - name: CLIENT_KEY_PATH
           value: "/etc/blip/client-key/client_key"
+        - name: VM_REGISTER_SA
+          value: "vm-register"
         # GitHub Actions polling integration (optional).
         # Uncomment and set these to enable the Actions runner poller:
         # - name: GITHUB_APP_ID

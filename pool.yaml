@@ -139,12 +139,14 @@ stringData:
           - -c
           - |
             exec > /dev/ttyS0 2>&1
-            echo "[blip-init] mounting gateway pubkeys via virtiofs..."
+            echo "[blip-init] mounting volumes via virtiofs..."
             mkdir -p /var/run/blip/gateway-client-pubkey
             mount -t virtiofs gw-client-pubkey /var/run/blip/gateway-client-pubkey
             mkdir -p /var/run/blip/gateway-host-pubkey
             mount -t virtiofs gw-host-pubkey /var/run/blip/gateway-host-pubkey
-            echo "[blip-init] gateway pubkeys mounted"
+            mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+            mount -t virtiofs sa-token /var/run/secrets/kubernetes.io/serviceaccount
+            echo "[blip-init] volumes mounted"
         - - /bin/bash
           - -c
           - |
@@ -158,6 +160,7 @@ stringData:
             readonly GW_PORT="2222"
             readonly GW_CLIENT_PUBKEY_DIR="/var/run/blip/gateway-client-pubkey"
             readonly GW_HOST_PUBKEY_DIR="/var/run/blip/gateway-host-pubkey"
+            readonly SA_TOKEN_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
 
             main() {
             	local vm_name
@@ -222,23 +225,28 @@ stringData:
             	systemctl restart ssh
 
             	# --- 5. Register host-key and client-key with the gateway via SSH ---
-            	# This replaces the old K8s API PATCH. The VM SSHs to the
-            	# gateway as _register (no-auth) and the gateway identifies
-            	# the VM by its source pod IP.
+            	# The VM authenticates to the gateway using its mounted SA token
+            	# as the SSH password. The gateway validates the token via the
+            	# Kubernetes TokenReview API, which proves this is a real
+            	# virt-launcher pod and extracts the VM name from the token's
+            	# bound pod claim.
             	#
             	# Keys are colon-joined (e.g. "ssh-ed25519:AAAA...") because
             	# the SSH exec protocol splits arguments on spaces. The gateway
             	# reconstructs the standard space-separated format.
-            	local host_key client_key
+            	local host_key client_key sa_token
             	host_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
             	client_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
+            	sa_token="$(cat "$SA_TOKEN_DIR/token")"
 
             	local ok=false
             	for _retry in $(seq 1 10); do
             		local response
-            		response=$(ssh -o BatchMode=yes \
+            		response=$(sshpass -p "$sa_token" ssh \
+            			-o BatchMode=no \
             			-o StrictHostKeyChecking=yes \
-            			-o PreferredAuthentications=none \
+            			-o PreferredAuthentications=password \
+            			-o PubkeyAuthentication=no \
             			-o ConnectTimeout=10 \
             			-p "$GW_PORT" \
             			"_register@${GW_HOST}" \
@@ -252,7 +260,7 @@ stringData:
             	done
 
             	if [ "$ok" != "true" ]; then
-            		echo "[blip-setup] FATAL: failed to register key annotations via SSH" >&2
+            		echo "[blip-setup] FATAL: failed to register keys via SSH" >&2
             		exit 1
             	fi
 
@@ -323,6 +331,8 @@ spec:
                 virtiofs: {}
               - name: gw-host-pubkey
                 virtiofs: {}
+              - name: sa-token
+                virtiofs: {}
               interfaces:
               - masquerade: {}
                 name: default
@@ -353,6 +363,9 @@ spec:
           - name: gw-host-pubkey
             configMap:
               name: ssh-gateway-host-pubkey
+          - name: sa-token
+            serviceAccount:
+              serviceAccountName: vm-register
           - cloudInitNoCloud:
               secretRef:
                 name: default-cloudinit

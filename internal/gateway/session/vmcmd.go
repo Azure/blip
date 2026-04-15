@@ -120,14 +120,29 @@ func (m *Manager) handleVMCommandChannel(ctx context.Context, ch ssh.Channel, re
 }
 
 // resolveVMName determines the VM name for a VM command connection.
-// For VM client key auth (VMCommandUser), the VM is identified by its
-// source IP address. For registration (VMRegisterUser), the VM is
-// also identified by source IP since its client key isn't registered yet.
+// For _register connections, the VM name is extracted from the auth
+// extensions (set by SA token validation during the SSH handshake).
+// For _blip connections (VM client key auth), the VM is identified by
+// its source IP address.
 func (m *Manager) resolveVMName(ctx context.Context, conn *ssh.ServerConn) string {
+	// For _register connections, the token reviewer already validated the
+	// SA token and extracted the VM name from the virt-launcher pod name.
+	if conn.User() == VMRegisterUser {
+		if conn.Permissions != nil && conn.Permissions.Extensions != nil {
+			if vmName := conn.Permissions.Extensions[auth.ExtVMName]; vmName != "" {
+				return vmName
+			}
+		}
+		slog.Warn("vm command: _register connection has no VM name in auth extensions",
+			"remote", conn.RemoteAddr().String(),
+		)
+		return ""
+	}
+
+	// For _blip connections, resolve by source IP.
 	remoteAddr := conn.RemoteAddr().String()
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		// Shouldn't happen, but fall back to raw address.
 		host = remoteAddr
 	}
 
