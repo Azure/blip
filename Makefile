@@ -1,5 +1,6 @@
 REGISTRY ?= stargatetmedev.azurecr.io
 BLIP_TAG ?= latest
+RUNNER_VERSION ?= 2.321.0
 CONTAINER_ENGINE ?= docker
 
 export REGISTRY BLIP_TAG
@@ -12,6 +13,15 @@ blip:
 	$(CONTAINER_ENGINE) build -t $(REGISTRY)/blip:$(BLIP_TAG) -f Dockerfile .
 	mkdir -p dist
 	$(CONTAINER_ENGINE) save $(REGISTRY)/blip:$(BLIP_TAG) -o dist/image.tar.gz
+
+.PHONY: github-runner
+github-runner:
+	$(CONTAINER_ENGINE) build \
+		--build-arg RUNNER_VERSION=$(RUNNER_VERSION) \
+		-t $(REGISTRY)/blip-github-runner:$(BLIP_TAG) \
+		-f images/github-runner/Containerfile .
+	mkdir -p dist
+	$(CONTAINER_ENGINE) save $(REGISTRY)/blip-github-runner:$(BLIP_TAG) -o dist/github-runner.tar.gz
 
 .PHONY: manifest
 manifest:
