@@ -111,17 +111,17 @@ kind load docker-image "$IMAGE_NAME" --name "$KIND_CLUSTER_NAME"
 # ---------------------------------------------------------------------------
 # 6. Render and apply manifests
 # ---------------------------------------------------------------------------
-info "Applying deploy.yaml..."
+info "Applying deploy manifest (CRD + deploy.yaml)..."
 export REGISTRY BLIP_TAG
-envsubst '${REGISTRY} ${BLIP_TAG}' < "$REPO_ROOT/deploy.yaml" | kubectl apply -f -
+{ cat "$REPO_ROOT/config/crd/blip.io_blipowners.yaml"; echo '---'; envsubst '${REGISTRY} ${BLIP_TAG}' < "$REPO_ROOT/manifests/deploy.yaml"; } | kubectl apply -f -
 
 info "Applying pool.yaml..."
 if [[ -n "$POOL_REPLICAS" ]]; then
     # Patch replica count on the fly.
-    sed "s/replicas: [0-9]*/replicas: ${POOL_REPLICAS}/" "$REPO_ROOT/pool.yaml" \
+    sed "s/replicas: [0-9]*/replicas: ${POOL_REPLICAS}/" "$REPO_ROOT/manifests/pool.yaml" \
         | kubectl apply -f -
 else
-    kubectl apply -f "$REPO_ROOT/pool.yaml"
+    kubectl apply -f "$REPO_ROOT/manifests/pool.yaml"
 fi
 
 # ---------------------------------------------------------------------------

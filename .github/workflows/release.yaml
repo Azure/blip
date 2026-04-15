@@ -51,17 +51,17 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.tag.outputs.version }}
 
-      - name: Generate deployment manifest
+      - name: Build deployment manifest
         env:
           BLIP_TAG: ${{ steps.tag.outputs.version }}
         run: |
           export REGISTRY="${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}"
           export BLIP_TAG
           mkdir -p dist
-          envsubst '$REGISTRY $BLIP_TAG' < deploy.yaml > dist/manifest.yaml
+          { cat config/crd/blip.io_blipowners.yaml; echo '---'; envsubst '$REGISTRY $BLIP_TAG' < manifests/deploy.yaml; } > dist/manifest.yaml
 
       - name: Copy VM pool manifest
-        run: cp pool.yaml dist/pool.yaml
+        run: cp manifests/pool.yaml dist/pool.yaml
 
       - name: Create or update GitHub release
         env:
@@ -78,4 +78,3 @@ jobs:
               dist/manifest.yaml \
               dist/pool.yaml
           fi
-

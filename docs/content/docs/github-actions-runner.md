@@ -61,7 +61,7 @@ kubectl apply -f actions-repos.yaml
 
 The gateway watches BlipOwner CRs in real time — changes take effect without a restart.
 
-Uncomment all the GitHub Actions sections in `deploy.yaml` (environment variables, volume mount, and volume) and fill in your App ID and installation ID:
+Uncomment all the GitHub Actions sections in `manifests/deploy.yaml` (environment variables, volume mount, and volume) and fill in your App ID and installation ID:
 
 ```yaml
 - name: GITHUB_APP_ID
@@ -73,7 +73,7 @@ Uncomment all the GitHub Actions sections in `deploy.yaml` (environment variable
 Apply:
 
 ```shell
-kubectl apply -f deploy.yaml
+kubectl apply -f manifests/deploy.yaml
 ```
 
 ## Configuration reference

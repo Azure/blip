@@ -62,6 +62,10 @@ type GatewayConfig struct {
 	// Actions configures the GitHub Actions polling handler. When nil (or
 	// GitHubAppID is 0), Actions polling is disabled.
 	Actions *ActionsConfig
+
+	// ScaleSet configures the GitHub Actions scale set listener. When nil,
+	// scale set mode is disabled. Mutually exclusive with Actions.
+	ScaleSet *ScaleSetConfig
 }
 
 // ActionsConfig holds the configuration for the GitHub Actions polling
@@ -89,6 +93,30 @@ type ActionsConfig struct {
 
 	// PollInterval is how often to poll for queued jobs. Default: 10s.
 	PollInterval time.Duration
+}
+
+// ScaleSetConfig holds the configuration for the GitHub Actions scale set
+// listener integration. When enabled, the gateway uses the Runner Scale Set
+// protocol to receive job assignments via long-poll from the Actions Service.
+// This does not require a GitHub App -- only a registration token stored in
+// a K8s Secret.
+type ScaleSetConfig struct {
+	// ConfigURL is the GitHub URL (repo or org) for the scale set.
+	// e.g. "https://github.com/my-org/my-repo"
+	ConfigURL string
+
+	// TokenSecretName is the K8s Secret containing the registration token.
+	// The Secret must have a "token" key.
+	TokenSecretName string
+
+	// ScaleSetName is the name for the runner scale set.
+	ScaleSetName string
+
+	// RunnerLabels are the labels for the scale set runners.
+	RunnerLabels []string
+
+	// MaxRunners is the maximum number of concurrent runners.
+	MaxRunners int
 }
 
 func RunGateway(cfg *GatewayConfig) error {
@@ -186,7 +214,11 @@ func RunGateway(cfg *GatewayConfig) error {
 
 	// --- Actions poller (optional) ---
 	var actionsPoller *ghactions.Poller
+	var actionsListener *ghactions.Listener
 	if cfg.Actions != nil && cfg.Actions.GitHubAppID > 0 {
+		if cfg.ScaleSet != nil {
+			return fmt.Errorf("cannot use both --github-app-id and --scaleset-config-url; choose one mode")
+		}
 		if authWatcher == nil {
 			return fmt.Errorf("actions polling requires --enable-auth (repos are read from BlipOwner CRs with actionsRepo specs)")
 		}
@@ -227,6 +259,55 @@ func RunGateway(cfg *GatewayConfig) error {
 		)
 	}
 
+	// --- Scale set listener (optional, mutually exclusive with poller) ---
+	var tokenWatcher *ghactions.TokenWatcher
+	if cfg.ScaleSet != nil && cfg.ScaleSet.ConfigURL != "" {
+		ssClient := ghactions.NewScaleSetClient(cfg.ScaleSet.ConfigURL)
+
+		// Set up the token watcher to feed registration tokens from the K8s
+		// Secret to the scale set client.
+		var err error
+		tokenWatcher, err = ghactions.NewTokenWatcher(ssClient, cfg.VMNamespace, cfg.ScaleSet.TokenSecretName)
+		if err != nil {
+			return fmt.Errorf("create token watcher: %w", err)
+		}
+		if err := tokenWatcher.Start(ctx); err != nil {
+			return fmt.Errorf("start token watcher: %w", err)
+		}
+
+		// Register or find the scale set. This requires the admin token,
+		// which was bootstrapped by the initial token load above.
+		runnerGroupID := 1 // default runner group
+		if _, err := ssClient.GetOrCreateScaleSet(
+			ctx,
+			cfg.ScaleSet.ScaleSetName,
+			cfg.ScaleSet.RunnerLabels,
+			runnerGroupID,
+		); err != nil {
+			tokenWatcher.Stop()
+			return fmt.Errorf("get or create scale set: %w", err)
+		}
+
+		annotator := ghactions.NewVMAnnotator(vmcl.Writer(), cfg.VMNamespace)
+
+		actionsListener = ghactions.NewListener(ghactions.ListenerConfig{
+			Client:            ssClient,
+			VMClaimer:         vmcl,
+			RunnerConfigStore: annotator,
+			VMPoolName:        cfg.VMPoolName,
+			PodName:           cfg.PodName,
+			MaxRunners:        cfg.ScaleSet.MaxRunners,
+		})
+
+		slog.Info("github actions scale set listener enabled",
+			"config_url", cfg.ScaleSet.ConfigURL,
+			"scale_set_name", cfg.ScaleSet.ScaleSetName,
+			"token_secret", cfg.ScaleSet.TokenSecretName,
+			"max_runners", cfg.ScaleSet.MaxRunners,
+			"runner_labels", cfg.ScaleSet.RunnerLabels,
+		)
+	}
+
 	httpAddr := cfg.HTTPListenAddr
 	if httpAddr == "" {
 		httpAddr = ":8080"
@@ -235,9 +316,18 @@ func RunGateway(cfg *GatewayConfig) error {
 	// shuttingDown is set to 1 when a shutdown signal is received.
 	var shuttingDown atomic.Int32
 
+	// Determine active session counter for health endpoints. Either the poller
+	// or the listener is active, never both.
+	var activeSessionCounter activeSessionProvider
+	if actionsPoller != nil {
+		activeSessionCounter = actionsPoller
+	} else if actionsListener != nil {
+		activeSessionCounter = actionsListener
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthzHandler(actionsPoller))
-	mux.HandleFunc("/readyz", readyzHandler(actionsPoller, &shuttingDown))
+	mux.HandleFunc("/healthz", healthzHandler(activeSessionCounter))
+	mux.HandleFunc("/readyz", readyzHandler(activeSessionCounter, &shuttingDown))
 
 	httpServer := &http.Server{
 		Addr:         httpAddr,
@@ -255,6 +345,7 @@ func RunGateway(cfg *GatewayConfig) error {
 		"max_session", cfg.MaxSessionDuration.String(),
 		"oidc_auth", authWatcher != nil,
 		"actions_enabled", actionsPoller != nil,
+		"scaleset_enabled", actionsListener != nil,
 	)
 
 	// Start HTTP server in background.
@@ -276,6 +367,15 @@ func RunGateway(cfg *GatewayConfig) error {
 		go actionsPoller.Run(ctx)
 	}
 
+	// Start scale set listener in background.
+	if actionsListener != nil {
+		go func() {
+			if err := actionsListener.Run(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("scale set listener exited with error", "error", err)
+			}
+		}()
+	}
+
 	const drainTimeout = 30 * time.Second
 
 	sshDone := make(chan struct{})
@@ -291,8 +391,13 @@ func RunGateway(cfg *GatewayConfig) error {
 
 		shuttingDown.Store(1)
 
-		// Cancel the main context — stops poller and SSH listener.
+		// Cancel the main context — stops poller, listener, and SSH listener.
 		cancel()
+
+		// Stop the token watcher informer.
+		if tokenWatcher != nil {
+			tokenWatcher.Stop()
+		}
 
 		mgr.NotifyShutdown()
 
@@ -302,7 +407,7 @@ func RunGateway(cfg *GatewayConfig) error {
 			slog.Error("HTTP server shutdown error", "error", err)
 		}
 
-		// Drain in-flight poller goroutines.
+		// Drain in-flight poller/listener goroutines.
 		if actionsPoller != nil {
 			pollerDrainDone := make(chan struct{})
 			go func() {
@@ -314,6 +419,19 @@ func RunGateway(cfg *GatewayConfig) error {
 				slog.Info("actions poller goroutines drained")
 			case <-time.After(drainTimeout):
 				slog.Warn("poller drain timeout, some operations may be interrupted")
+			}
+		}
+		if actionsListener != nil {
+			listenerDrainDone := make(chan struct{})
+			go func() {
+				actionsListener.WaitForPending()
+				close(listenerDrainDone)
+			}()
+			select {
+			case <-listenerDrainDone:
+				slog.Info("scale set listener goroutines drained")
+			case <-time.After(drainTimeout):
+				slog.Warn("listener drain timeout, some operations may be interrupted")
 			}
 		}
 
@@ -342,8 +460,14 @@ func RunGateway(cfg *GatewayConfig) error {
 	return err
 }
 
+// activeSessionProvider abstracts session counting for health endpoints.
+// Both Poller and Listener implement this interface.
+type activeSessionProvider interface {
+	ActiveSessionCount() int
+}
+
 // healthzHandler returns an HTTP handler that always reports healthy.
-func healthzHandler(poller *ghactions.Poller) http.HandlerFunc {
+func healthzHandler(provider activeSessionProvider) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -351,15 +475,15 @@ func healthzHandler(poller *ghactions.Poller) http.HandlerFunc {
 			"status":    "ok",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 		}
-		if poller != nil {
-			resp["active_actions_sessions"] = poller.ActiveSessionCount()
+		if provider != nil {
+			resp["active_actions_sessions"] = provider.ActiveSessionCount()
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
 
 // readyzHandler returns an HTTP handler that reports readiness.
-func readyzHandler(poller *ghactions.Poller, shuttingDown *atomic.Int32) http.HandlerFunc {
+func readyzHandler(provider activeSessionProvider, shuttingDown *atomic.Int32) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -377,8 +501,8 @@ func readyzHandler(poller *ghactions.Poller, shuttingDown *atomic.Int32) http.Ha
 			"status":    "ok",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 		}
-		if poller != nil {
-			resp["active_actions_sessions"] = poller.ActiveSessionCount()
+		if provider != nil {
+			resp["active_actions_sessions"] = provider.ActiveSessionCount()
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}

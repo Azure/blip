@@ -1,0 +1,93 @@
+apiVersion: pool.kubevirt.io/v1beta1
+kind: VirtualMachinePool
+metadata:
+  name: blip
+  namespace: blip
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      blip.io/pool: blip
+  virtualMachineTemplate:
+    metadata:
+      labels:
+        blip.io/pool: blip
+    spec:
+      dataVolumeTemplates:
+      - metadata:
+          name: rootdisk
+        spec:
+          storage:
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                storage: 32Gi
+          source:
+            registry:
+              url: docker://quay.io/containerdisks/ubuntu:24.04
+      runStrategy: Always
+      template:
+        metadata:
+          labels:
+            blip.io/pool: blip
+        spec:
+          evictionStrategy: None
+          priorityClassName: blip-low-priority
+          domain:
+            cpu:
+              cores: 2
+              sockets: 1
+              threads: 1
+            devices:
+              disks:
+              - disk:
+                  bus: virtio
+                name: rootdisk
+              - disk:
+                  bus: virtio
+                name: cloudinitdisk
+              filesystems:
+              - name: gw-client-pubkey
+                virtiofs: {}
+              - name: gw-host-pubkey
+                virtiofs: {}
+              - name: sa-token
+                virtiofs: {}
+              interfaces:
+              - masquerade: {}
+                name: default
+            memory:
+              guest: 4Gi
+            resources:
+              overcommitGuestOverhead: true
+              requests:
+                cpu: 500m
+                memory: 1Gi
+          networks:
+          - name: default
+            pod: {}
+          readinessProbe:
+            failureThreshold: 10
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            tcpSocket:
+              port: 22
+          terminationGracePeriodSeconds: 5
+          volumes:
+          - dataVolume:
+              name: rootdisk
+            name: rootdisk
+          - name: gw-client-pubkey
+            configMap:
+              name: ssh-gateway-client-pubkey
+          - name: gw-host-pubkey
+            configMap:
+              name: ssh-gateway-host-pubkey
+          - name: sa-token
+            serviceAccount:
+              serviceAccountName: vm-register
+          - cloudInitNoCloud:
+              secretRef:
+                name: default-cloudinit
+            name: cloudinitdisk
