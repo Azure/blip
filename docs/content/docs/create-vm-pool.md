@@ -4,25 +4,17 @@ description: "Deploy a VM pool"
 weight: 2
 ---
 
-A VM pool is a set of pre-provisioned KubeVirt VMs. Idle VMs are allocated on SSH connection, destroyed on disconnect, and automatically replaced to maintain replica count. The gateway selects VMs by the `blip.io/pool` label.
+A VM pool is a set of pre-provisioned KubeVirt VMs. Idle VMs are allocated on SSH connection, destroyed on disconnect, and automatically replaced to maintain replica count.
 
 ## Deploy
-
-Apply the pool manifest directly from the latest release:
 
 ```shell
 kubectl apply -f https://github.com/Azure/blip/releases/latest/download/pool.yaml
 ```
 
-Or pin to a specific version:
-
-```shell
-kubectl apply -f https://github.com/Azure/blip/releases/download/v0.1.0/pool.yaml
-```
+Pin a version by replacing `latest/download` with e.g. `download/v0.1.0`.
 
 ## Kustomize
-
-Reference the release artifact as a remote resource in your `kustomization.yaml`:
 
 ```yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -41,24 +33,16 @@ patches:
 
 ## Customization
 
-Download the manifest and edit it before applying:
-
 ```shell
 curl -fsSLO https://github.com/Azure/blip/releases/latest/download/pool.yaml
-# edit pool.yaml
-kubectl apply -f pool.yaml
 ```
 
 ### CPU and memory
-
-`domain.resources.requests` controls pod-level resource requests:
 
 ```yaml
 domain:
   cpu:
     cores: 4
-    sockets: 1
-    threads: 1
   memory:
     guest: 8Gi
   resources:
@@ -67,16 +51,25 @@ domain:
       cpu: "1"
 ```
 
-### Base image
+### Base image and disk size
 
-Any cloud-init-compatible image with `sshd` installed:
+Root disk via CDI DataVolume:
 
 ```yaml
-volumes:
-  - name: rootdisk
-    containerDisk:
-      image: quay.io/containerdisks/fedora:40
+dataVolumeTemplates:
+  - metadata:
+      name: rootdisk
+    spec:
+      storage:
+        resources:
+          requests:
+            storage: 64Gi
+      source:
+        registry:
+          url: docker://quay.io/containerdisks/fedora:40
 ```
+
+The image must be cloud-init-compatible with `sshd` installed. PVCs are deleted with the VM.
 
 ## Next steps
 

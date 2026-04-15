@@ -35,6 +35,12 @@ rules:
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get", "list", "watch"]
+# Identity store: secrets store refresh tokens linked to SSH pubkeys.
+# The gateway creates/updates/deletes "blip-identity-*" secrets for
+# OIDC identity binding and TTL-based pubkey de-linking.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -321,8 +327,10 @@ spec:
 # in real time — edits take effect without a restart.
 #
 # Keys:
-#   allowed-repos:   One owner/repo per line. Lines starting with # are comments.
-#                    Controls which GitHub Actions repos may authenticate via OIDC.
+#   oidc-providers:  YAML list of OIDC provider configurations. Each entry
+#                    specifies an issuer, audience, identity claim, and optional
+#                    subject allowlist. Supports any OIDC-compliant provider
+#                    (GitHub Actions, Azure Entra / AAD, etc.).
 #   allowed-pubkeys: One SSH public key per line (authorized_keys format).
 #                    Controls which public keys are accepted.
 #
@@ -332,6 +340,23 @@ kind: ConfigMap
 metadata:
   name: ssh-gateway-auth
   namespace: blip
+data:
+  oidc-providers: |
+    # GitHub Actions OIDC
+    # - issuer: https://token.actions.githubusercontent.com
+    #   audience: blip
+    #   allowed-subjects:
+    #     - "repo:my-org/my-repo:*"
+    #
+    # Azure Entra (AAD)
+    # - issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
+    #   audience: api://blip
+    #   identity-claim: oid
+    #   allowed-subjects:
+    #     - "<object-id>"
+  # allowed-pubkeys: |
+  #   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop
+  #   ssh-rsa AAAAB3NzaC1yc2EAAAA... bob@desktop
 ---
 apiVersion: apps/v1
 kind: Deployment

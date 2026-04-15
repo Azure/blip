@@ -6,29 +6,6 @@ metadata:
 stringData:
   userdata: |
     #cloud-config
-    bootcmd:
-        # The containerDisk COW layer is tiny, so we overlay writable
-        # directories onto the emptyDisk using overlayfs.  Each overlay
-        # uses the existing directory content as the read-only lower
-        # layer and writes new/changed files to the emptyDisk — no
-        # bulk copy required.  bootcmd runs before services or runcmd.
-        - |
-          set -e
-          dev=/dev/vdb
-          mnt=/mnt/data
-          for i in $(seq 1 30); do [ -b "$dev" ] && break; sleep 0.5; done
-          if ! blkid -s TYPE -o value "$dev" 2>/dev/null | grep -q ext4; then
-            mkfs.ext4 -q -L data "$dev"
-          fi
-          mkdir -p "$mnt"
-          mountpoint -q "$mnt" || mount -t ext4 "$dev" "$mnt"
-          for dir in /usr /var /opt /tmp /home; do
-            mkdir -p "$mnt/overlay${dir}/upper" "$mnt/overlay${dir}/work"
-            mount -t overlay overlay \
-              -o "lowerdir=${dir},upperdir=$mnt/overlay${dir}/upper,workdir=$mnt/overlay${dir}/work" \
-              "$dir"
-          done
-          chmod 1777 /tmp
     users:
         - name: runner
           sudo: ALL=(ALL) NOPASSWD:ALL
@@ -365,6 +342,19 @@ spec:
       labels:
         blip.io/pool: blip
     spec:
+      dataVolumeTemplates:
+      - metadata:
+          name: rootdisk
+        spec:
+          storage:
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                storage: 32Gi
+          source:
+            registry:
+              url: docker://quay.io/containerdisks/ubuntu:24.04
       runStrategy: Always
       template:
         metadata:
@@ -383,9 +373,6 @@ spec:
               - disk:
                   bus: virtio
                 name: rootdisk
-              - disk:
-                  bus: virtio
-                name: datadisk
               - disk:
                   bus: virtio
                 name: cloudinitdisk
@@ -413,13 +400,9 @@ spec:
               port: 22
           terminationGracePeriodSeconds: 5
           volumes:
-          - containerDisk:
-              image: quay.io/containerdisks/ubuntu:24.04
-              imagePullPolicy: IfNotPresent
+          - dataVolume:
+              name: rootdisk
             name: rootdisk
-          - emptyDisk:
-              capacity: 32Gi
-            name: datadisk
           - name: sadisk
             serviceAccount:
               serviceAccountName: vm-release

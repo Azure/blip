@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
@@ -56,10 +57,12 @@ func TestNewServerConfig(t *testing.T) {
 	t.Run("with auth watcher enables both auth methods", func(t *testing.T) {
 		hostKey := generateHostKey(t)
 
-		cfg := NewServerConfig(Config{
+		cfg := NewServerConfig(context.Background(), Config{
 			HostSigner:   hostKey,
 			MaxAuthTries: 3,
-			AuthWatcher:  NewTestAuthWatcher([]string{"org/repo"}, nil),
+			AuthWatcher: NewTestAuthWatcher([]OIDCProviderConfig{
+				{Issuer: "https://example.com", Audience: "blip"},
+			}, nil),
 		})
 
 		assert.NotNil(t, cfg.PublicKeyCallback, "PublicKeyCallback should be set")
@@ -70,7 +73,7 @@ func TestNewServerConfig(t *testing.T) {
 	t.Run("without auth watcher disables all auth", func(t *testing.T) {
 		hostKey := generateHostKey(t)
 
-		cfg := NewServerConfig(Config{
+		cfg := NewServerConfig(context.Background(), Config{
 			HostSigner:   hostKey,
 			MaxAuthTries: 5,
 		})
@@ -89,7 +92,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		fp := ssh.FingerprintSHA256(userPub)
 
 		watcher := NewTestAuthWatcher(nil, map[string]string{fp: "alice@laptop"})
-		cb := pubkeyCallback(watcher, nil)
+		cb := pubkeyCallback(watcher, nil, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		require.NoError(t, err)
@@ -101,7 +104,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
 		watcher := NewTestAuthWatcher(nil, map[string]string{"SHA256:other": "bob@desktop"})
-		cb := pubkeyCallback(watcher, nil)
+		cb := pubkeyCallback(watcher, nil, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
@@ -112,7 +115,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
 		watcher := NewTestAuthWatcher(nil, nil)
-		cb := pubkeyCallback(watcher, nil)
+		cb := pubkeyCallback(watcher, nil, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
@@ -124,11 +127,33 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		fp := ssh.FingerprintSHA256(userPub)
 
 		watcher := NewTestAuthWatcher(nil, map[string]string{fp: ""})
-		cb := pubkeyCallback(watcher, nil)
+		cb := pubkeyCallback(watcher, nil, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
 		assert.ErrorContains(t, err, "not authorized")
+	})
+
+	t.Run("stores offered pubkey in pending when rejected", func(t *testing.T) {
+		userPub, _ := generateUserKey(t)
+		fp := ssh.FingerprintSHA256(userPub)
+
+		watcher := NewTestAuthWatcher(nil, nil)
+		pending := newPendingPubkeys(context.Background())
+		cb := pubkeyCallback(watcher, nil, nil, pending)
+
+		perms, err := cb(conn, userPub)
+		assert.Nil(t, perms)
+		assert.ErrorContains(t, err, "not authorized")
+
+		// Verify the key was stored for later binding (keyed by session ID).
+		stored, ok := pending.LoadAndDelete(string(conn.SessionID()))
+		assert.True(t, ok, "offered pubkey should be stored")
+		assert.Equal(t, fp, ssh.FingerprintSHA256(stored))
+
+		// Second load should return nothing.
+		_, ok = pending.LoadAndDelete(string(conn.SessionID()))
+		assert.False(t, ok, "key should be consumed after LoadAndDelete")
 	})
 
 	t.Run("rejects pubkey with empty comment directly", func(t *testing.T) {
@@ -143,57 +168,75 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 	})
 }
 
-func TestCheckRepoAllowed(t *testing.T) {
+func TestCheckSubjectAllowed(t *testing.T) {
 	tests := []struct {
-		name         string
-		repo         string
-		allowedRepos []string
-		wantErr      bool
-		errContains  string
+		name            string
+		subject         string
+		allowedSubjects []string
+		wantErr         bool
+		errContains     string
 	}{
 		{
-			name:         "empty allowlist permits any repo",
-			repo:         "any-org/any-repo",
-			allowedRepos: nil,
-			wantErr:      false,
+			name:            "empty allowlist permits any subject",
+			subject:         "anything",
+			allowedSubjects: nil,
+			wantErr:         false,
 		},
 		{
-			name:         "exact match is allowed",
-			repo:         "my-org/my-repo",
-			allowedRepos: []string{"my-org/my-repo"},
-			wantErr:      false,
+			name:            "exact match is allowed",
+			subject:         "repo:my-org/my-repo:ref:refs/heads/main",
+			allowedSubjects: []string{"repo:my-org/my-repo:ref:refs/heads/main"},
+			wantErr:         false,
 		},
 		{
-			name:         "case-insensitive match",
-			repo:         "My-Org/My-Repo",
-			allowedRepos: []string{"my-org/my-repo"},
-			wantErr:      false,
+			name:            "case-insensitive match",
+			subject:         "Repo:My-Org/My-Repo:ref:refs/heads/main",
+			allowedSubjects: []string{"repo:my-org/my-repo:ref:refs/heads/main"},
+			wantErr:         false,
 		},
 		{
-			name:         "multiple allowed repos matches second",
-			repo:         "org/second",
-			allowedRepos: []string{"org/first", "org/second", "org/third"},
-			wantErr:      false,
+			name:            "glob wildcard match",
+			subject:         "repo:my-org/my-repo:ref:refs/heads/main",
+			allowedSubjects: []string{"repo:my-org/my-repo:*"},
+			wantErr:         false,
 		},
 		{
-			name:         "repo not in list is rejected",
-			repo:         "evil-org/evil-repo",
-			allowedRepos: []string{"good-org/good-repo"},
-			wantErr:      true,
-			errContains:  "not in the allowed list",
+			name:            "glob wildcard matches any repo in org",
+			subject:         "repo:my-org/any-repo:ref:refs/heads/main",
+			allowedSubjects: []string{"repo:my-org/*:*"},
+			wantErr:         false,
 		},
 		{
-			name:         "partial match is rejected",
-			repo:         "my-org/my-repo-fork",
-			allowedRepos: []string{"my-org/my-repo"},
-			wantErr:      true,
-			errContains:  "not in the allowed list",
+			name:            "multiple allowed subjects matches second",
+			subject:         "user-b-oid",
+			allowedSubjects: []string{"user-a-oid", "user-b-oid", "user-c-oid"},
+			wantErr:         false,
+		},
+		{
+			name:            "subject not in list is rejected",
+			subject:         "evil-subject",
+			allowedSubjects: []string{"good-subject"},
+			wantErr:         true,
+			errContains:     "not in the allowed list",
+		},
+		{
+			name:            "partial match is rejected",
+			subject:         "repo:my-org/my-repo-fork:ref:refs/heads/main",
+			allowedSubjects: []string{"repo:my-org/my-repo:*"},
+			wantErr:         true,
+			errContains:     "not in the allowed list",
+		},
+		{
+			name:            "azure oid exact match",
+			subject:         "00000000-0000-0000-0000-000000000001",
+			allowedSubjects: []string{"00000000-0000-0000-0000-000000000001"},
+			wantErr:         false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := checkRepoAllowed(tt.repo, tt.allowedRepos)
+			err := checkSubjectAllowed(tt.subject, tt.allowedSubjects)
 			if tt.wantErr {
 				assert.ErrorContains(t, err, tt.errContains)
 			} else {
@@ -206,42 +249,64 @@ func TestCheckRepoAllowed(t *testing.T) {
 func TestOIDCCallback(t *testing.T) {
 	conn := fakeConnMeta{user: "runner"}
 
+	providers := []OIDCProviderConfig{
+		{Issuer: "https://token.actions.githubusercontent.com", Audience: "blip"},
+	}
+
 	t.Run("rejects empty password", func(t *testing.T) {
-		cb := oidcCallback(NewTestAuthWatcher([]string{"org/repo"}, nil))
+		cb := oidcCallback(NewTestAuthWatcher(providers, nil))
 
 		perms, err := cb(conn, []byte(""))
 		assert.Nil(t, perms)
-		assert.ErrorContains(t, err, "GitHub Actions authentication failed")
+		assert.ErrorContains(t, err, "OIDC authentication failed")
 	})
 
 	t.Run("rejects whitespace-only password", func(t *testing.T) {
-		cb := oidcCallback(NewTestAuthWatcher([]string{"org/repo"}, nil))
+		cb := oidcCallback(NewTestAuthWatcher(providers, nil))
 
 		perms, err := cb(conn, []byte("   \t\n  "))
 		assert.Nil(t, perms)
-		assert.ErrorContains(t, err, "GitHub Actions authentication failed")
+		assert.ErrorContains(t, err, "OIDC authentication failed")
 	})
 
 	t.Run("rejects invalid JWT token", func(t *testing.T) {
-		cb := oidcCallback(NewTestAuthWatcher([]string{"org/repo"}, nil))
+		cb := oidcCallback(NewTestAuthWatcher(providers, nil))
 
 		perms, err := cb(conn, []byte("not-a-valid-jwt-token"))
 		assert.Nil(t, perms)
-		assert.ErrorContains(t, err, "GitHub Actions authentication failed")
+		assert.ErrorContains(t, err, "OIDC authentication failed")
+	})
+
+	t.Run("rejects when no providers configured", func(t *testing.T) {
+		cb := oidcCallback(NewTestAuthWatcher(nil, nil))
+
+		perms, err := cb(conn, []byte("some-token"))
+		assert.Nil(t, perms)
+		assert.ErrorContains(t, err, "OIDC authentication failed")
 	})
 }
 
-func TestVerifyGitHubActionsToken(t *testing.T) {
+func TestVerifyOIDCToken(t *testing.T) {
+	providers := []OIDCProviderConfig{
+		{Issuer: "https://token.actions.githubusercontent.com", Audience: "blip"},
+	}
+
 	t.Run("empty token returns error", func(t *testing.T) {
-		identity, err := verifyGitHubActionsToken("", []string{"org/repo"})
+		identity, err := verifyOIDCToken("", providers)
 		assert.Empty(t, identity)
 		assert.ErrorContains(t, err, "empty token")
 	})
 
 	t.Run("whitespace-only token returns error", func(t *testing.T) {
-		identity, err := verifyGitHubActionsToken("   ", []string{"org/repo"})
+		identity, err := verifyOIDCToken("   ", providers)
 		assert.Empty(t, identity)
 		assert.ErrorContains(t, err, "empty token")
+	})
+
+	t.Run("no providers returns error", func(t *testing.T) {
+		identity, err := verifyOIDCToken("some-token", nil)
+		assert.Empty(t, identity)
+		assert.ErrorContains(t, err, "not accepted by any configured OIDC provider")
 	})
 }
 
@@ -253,7 +318,7 @@ func TestPubkeyAuthEndToEnd(t *testing.T) {
 	userPub, _ := generateUserKey(t)
 	fp := ssh.FingerprintSHA256(userPub)
 
-	sshCfg := NewServerConfig(Config{
+	sshCfg := NewServerConfig(context.Background(), Config{
 		HostSigner:   hostKey,
 		MaxAuthTries: 1,
 		AuthWatcher:  NewTestAuthWatcher(nil, map[string]string{fp: "alice@laptop"}),
@@ -266,44 +331,183 @@ func TestPubkeyAuthEndToEnd(t *testing.T) {
 	assert.Equal(t, "pubkey:alice@laptop", perms.Extensions[ExtIdentity])
 }
 
-func TestParseLineList(t *testing.T) {
+func TestGlobMatch(t *testing.T) {
 	tests := []struct {
-		name string
-		raw  string
-		want []string
+		pattern string
+		str     string
+		want    bool
 	}{
-		{
-			name: "simple list",
-			raw:  "org/repo1\norg/repo2\n",
-			want: []string{"org/repo1", "org/repo2"},
-		},
-		{
-			name: "blank lines and comments",
-			raw:  "# comment\norg/repo1\n\n  # another comment\norg/repo2\n",
-			want: []string{"org/repo1", "org/repo2"},
-		},
-		{
-			name: "whitespace trimmed",
-			raw:  "  org/repo1  \n  org/repo2  ",
-			want: []string{"org/repo1", "org/repo2"},
-		},
-		{
-			name: "empty string",
-			raw:  "",
-			want: nil,
-		},
-		{
-			name: "only whitespace and comments",
-			raw:  "  \n# comment\n  \n",
-			want: nil,
-		},
+		// Basic matching.
+		{"", "", true},
+		{"a", "a", true},
+		{"a", "b", false},
+		{"abc", "abc", true},
+		{"abc", "ab", false},
+		{"ab", "abc", false},
+
+		// Star matches zero or more characters.
+		{"*", "", true},
+		{"*", "anything", true},
+		{"a*", "a", true},
+		{"a*", "abc", true},
+		{"*c", "abc", true},
+		{"a*c", "ac", true},
+		{"a*c", "abc", true},
+		{"a*c", "aXXc", true},
+		{"a*c", "aXX", false},
+
+		// Star matches "/" and ":" (unlike filepath.Match).
+		{"repo:*", "repo:my-org/my-repo:ref:refs/heads/main", true},
+		{"repo:my-org/*:*", "repo:my-org/any-repo:ref:refs/heads/main", true},
+		{"repo:my-org/my-repo:*", "repo:my-org/my-repo:ref:refs/heads/main", true},
+		{"*/foo", "bar/foo", true},
+
+		// Multiple stars.
+		{"*a*b*c*", "abc", true},
+		{"*a*b*c*", "xaxbxcx", true},
+		{"*a*b*c*", "xaxbx", false},
+		{"**", "anything", true},
+		{"a**b", "ab", true},
+		{"a**b", "aXXb", true},
+
+		// Consecutive stars.
+		{"***", "", true},
+		{"***", "abc", true},
+
+		// No partial matching.
+		{"repo:my-org/my-repo:*", "repo:my-org/my-repo-fork:ref:refs/heads/main", false},
+
+		// Empty pattern vs non-empty string.
+		{"", "a", false},
+
+		// Performance: this should complete instantly with iterative algorithm.
+		// Pattern with many stars against a non-matching string.
+		{"*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaa", false},
 	}
+
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := parseLineList(tt.raw)
-			assert.Equal(t, tt.want, got)
+		t.Run(tt.pattern+"_vs_"+tt.str, func(t *testing.T) {
+			got := globMatch(tt.pattern, tt.str)
+			assert.Equal(t, tt.want, got, "globMatch(%q, %q)", tt.pattern, tt.str)
 		})
 	}
+}
+
+func TestParseOIDCProviders(t *testing.T) {
+	t.Run("parses valid YAML", func(t *testing.T) {
+		raw := `
+- issuer: https://token.actions.githubusercontent.com
+  audience: blip
+  allowed-subjects:
+    - "repo:my-org/my-repo:*"
+- issuer: https://login.microsoftonline.com/tenant-id/v2.0
+  audience: api://blip
+  identity-claim: oid
+  allowed-subjects:
+    - "00000000-0000-0000-0000-000000000001"
+`
+		providers := parseOIDCProviders(raw)
+		require.Len(t, providers, 2)
+
+		assert.Equal(t, "https://token.actions.githubusercontent.com", providers[0].Issuer)
+		assert.Equal(t, "blip", providers[0].Audience)
+		assert.Equal(t, "", providers[0].IdentityClaim) // defaults to "sub" at verification time
+		assert.Equal(t, []string{"repo:my-org/my-repo:*"}, providers[0].AllowedSubjects)
+
+		assert.Equal(t, "https://login.microsoftonline.com/tenant-id/v2.0", providers[1].Issuer)
+		assert.Equal(t, "api://blip", providers[1].Audience)
+		assert.Equal(t, "oid", providers[1].IdentityClaim)
+		assert.Equal(t, []string{"00000000-0000-0000-0000-000000000001"}, providers[1].AllowedSubjects)
+	})
+
+	t.Run("empty string returns nil", func(t *testing.T) {
+		providers := parseOIDCProviders("")
+		assert.Nil(t, providers)
+	})
+
+	t.Run("whitespace-only returns nil", func(t *testing.T) {
+		providers := parseOIDCProviders("   \n  ")
+		assert.Nil(t, providers)
+	})
+
+	t.Run("invalid YAML returns nil", func(t *testing.T) {
+		providers := parseOIDCProviders("not: valid: yaml: list")
+		assert.Nil(t, providers)
+	})
+
+	t.Run("skips entries with empty issuer", func(t *testing.T) {
+		raw := `
+- issuer: ""
+  audience: blip
+- issuer: https://example.com
+  audience: test
+`
+		providers := parseOIDCProviders(raw)
+		require.Len(t, providers, 1)
+		assert.Equal(t, "https://example.com", providers[0].Issuer)
+	})
+
+	t.Run("skips entries with empty audience", func(t *testing.T) {
+		raw := `
+- issuer: https://example.com
+  audience: ""
+- issuer: https://example2.com
+  audience: test
+`
+		providers := parseOIDCProviders(raw)
+		require.Len(t, providers, 1)
+		assert.Equal(t, "https://example2.com", providers[0].Issuer)
+	})
+
+	t.Run("provider with no allowed subjects", func(t *testing.T) {
+		raw := `
+- issuer: https://example.com
+  audience: blip
+`
+		providers := parseOIDCProviders(raw)
+		require.Len(t, providers, 1)
+		assert.Nil(t, providers[0].AllowedSubjects)
+	})
+
+	t.Run("skips non-HTTPS issuers", func(t *testing.T) {
+		raw := `
+- issuer: http://insecure.example.com
+  audience: blip
+- issuer: not-a-url
+  audience: blip
+- issuer: https://secure.example.com
+  audience: blip
+`
+		providers := parseOIDCProviders(raw)
+		require.Len(t, providers, 1)
+		assert.Equal(t, "https://secure.example.com", providers[0].Issuer)
+	})
+
+	t.Run("normalizes trailing slash on issuer", func(t *testing.T) {
+		raw := `
+- issuer: https://example.com/
+  audience: blip
+- issuer: https://example2.com///
+  audience: blip
+`
+		providers := parseOIDCProviders(raw)
+		require.Len(t, providers, 2)
+		assert.Equal(t, "https://example.com", providers[0].Issuer)
+		assert.Equal(t, "https://example2.com", providers[1].Issuer)
+	})
+
+	t.Run("trims whitespace from fields", func(t *testing.T) {
+		raw := `
+- issuer: "  https://example.com  "
+  audience: "  blip  "
+  identity-claim: "  oid  "
+`
+		providers := parseOIDCProviders(raw)
+		require.Len(t, providers, 1)
+		assert.Equal(t, "https://example.com", providers[0].Issuer)
+		assert.Equal(t, "blip", providers[0].Audience)
+		assert.Equal(t, "oid", providers[0].IdentityClaim)
+	})
 }
 
 func TestParsePubkeyList(t *testing.T) {

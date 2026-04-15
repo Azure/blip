@@ -7,7 +7,7 @@
 // # Authentication
 //
 // Authentication is resolved automatically in this order:
-//  1. GitHub Actions OIDC token from GITHUB_TOKEN env var (or [WithGitHubToken])
+//  1. OIDC token from BLIP_OIDC_TOKEN env var (or [WithOIDCToken])
 //  2. SSH keys from ssh-agent (via SSH_AUTH_SOCK)
 //  3. SSH keys from ~/.ssh/ (id_ed25519, id_rsa, id_ecdsa)
 //
@@ -88,7 +88,7 @@ type Client struct {
 }
 
 type clientConfig struct {
-	githubToken    string
+	oidcToken      string
 	sshKeyPath     string
 	knownHostsPath string
 	user           string
@@ -99,14 +99,15 @@ type clientConfig struct {
 // Option configures a [Client].
 type Option func(*clientConfig)
 
-// WithGitHubToken sets an explicit GitHub Actions OIDC token for authentication.
-// The gateway validates this JWT against the GitHub Actions OIDC provider.
-// If not set, the GITHUB_TOKEN environment variable is checked.
+// WithOIDCToken sets an explicit OIDC token for authentication.
+// The gateway validates this JWT against its configured OIDC providers
+// (GitHub Actions, Azure Entra / AAD, or any OIDC-compliant issuer).
+// If not set, the BLIP_OIDC_TOKEN environment variable is checked.
 //
-// Note: this expects a GitHub Actions OIDC JWT, not a personal access token.
-func WithGitHubToken(token string) Option {
+// Note: this expects an OIDC JWT (id_token), not a personal access token.
+func WithOIDCToken(token string) Option {
 	return func(c *clientConfig) {
-		c.githubToken = token
+		c.oidcToken = token
 	}
 }
 
@@ -147,7 +148,7 @@ func WithTimeout(d time.Duration) Option {
 // Use [WithPort] to override the default SSH port (22).
 //
 // Authentication is resolved automatically from the environment. See
-// [WithGitHubToken] and [WithSSHKey] for explicit overrides.
+// [WithOIDCToken] and [WithSSHKey] for explicit overrides.
 func NewClient(addr string, opts ...Option) (*Client, error) {
 	cfg := &clientConfig{
 		user:    "runner",

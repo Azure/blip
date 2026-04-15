@@ -129,7 +129,7 @@ func TestNew(t *testing.T) {
 				tt.mutate(&cfg, dir)
 			}
 
-			srv, err := New(cfg)
+			srv, err := New(context.Background(), cfg)
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
@@ -150,7 +150,7 @@ func TestServe_AuthenticatedClientReceivesCallback(t *testing.T) {
 	clientCfg, fp := allowedPubkeyClientConfig(t)
 	cfg.AuthWatcher = newTestAuthWatcher(map[string]string{fp: "runner@test"})
 
-	srv, err := New(cfg)
+	srv, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -192,7 +192,7 @@ func TestServe_GracefulShutdownDrainsConnections(t *testing.T) {
 	clientCfg, fp := allowedPubkeyClientConfig(t)
 	cfg.AuthWatcher = newTestAuthWatcher(map[string]string{fp: "runner@test"})
 
-	srv, err := New(cfg)
+	srv, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -239,7 +239,7 @@ func TestServe_UnauthenticatedClientRejected(t *testing.T) {
 	// Allow a specific key, then connect with a different one.
 	cfg.AuthWatcher = newTestAuthWatcher(map[string]string{"SHA256:allowed-key": "someone@host"})
 
-	srv, err := New(cfg)
+	srv, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -283,7 +283,7 @@ func TestServe_ConcurrentClients(t *testing.T) {
 	}
 	cfg.AuthWatcher = newTestAuthWatcher(fpSet)
 
-	srv, err := New(cfg)
+	srv, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -320,7 +320,7 @@ func TestServe_HandshakeTimeout(t *testing.T) {
 	cfg := validConfig(hk)
 	cfg.LoginGraceTime = 200 * time.Millisecond
 
-	srv, err := New(cfg)
+	srv, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -352,7 +352,7 @@ func TestClose(t *testing.T) {
 	hk := newTestHostKey(t, dir)
 	cfg := validConfig(hk)
 
-	srv, err := New(cfg)
+	srv, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 
 	addr := srv.Addr().String()
@@ -368,7 +368,7 @@ func TestAddr(t *testing.T) {
 	hk := newTestHostKey(t, dir)
 	cfg := validConfig(hk)
 
-	srv, err := New(cfg)
+	srv, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 	defer srv.Close()
 
@@ -455,7 +455,7 @@ func TestServe_MultipleSequentialSessions(t *testing.T) {
 	}
 	cfg.AuthWatcher = newTestAuthWatcher(fpSet)
 
-	srv, err := New(cfg)
+	srv, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
