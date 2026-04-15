@@ -47,6 +47,11 @@ type GatewayConfig struct {
 	// When empty, reconnect messages fall back to <gateway-host> placeholder.
 	ExternalHost string
 
+	// VMRegisterSA is the name of the Kubernetes ServiceAccount used by
+	// VMs to authenticate during key registration. When set, the gateway
+	// creates a TokenReviewer that validates SA tokens from this account.
+	VMRegisterSA string
+
 	LoginGraceTime    time.Duration
 	MaxAuthTries      int
 	KeepAliveInterval time.Duration
@@ -121,6 +126,20 @@ func RunGateway(cfg *GatewayConfig) error {
 	// Create the VM key resolver adapter for the auth system.
 	vmKeyResolver := &vmKeyResolverAdapter{vmClient: vmcl}
 
+	// Create the TokenReviewer for _register SA token validation.
+	var tokenReviewer auth.TokenReviewer
+	if cfg.VMRegisterSA != "" {
+		var err error
+		tokenReviewer, err = auth.NewKubeTokenReviewer(cfg.VMNamespace, cfg.VMRegisterSA)
+		if err != nil {
+			return fmt.Errorf("create token reviewer: %w", err)
+		}
+		slog.Info("VM registration token reviewer enabled",
+			"expected_sa", cfg.VMRegisterSA,
+			"namespace", cfg.VMNamespace,
+		)
+	}
+
 	srv, err := server.New(ctx, server.Config{
 		ListenAddr:         cfg.ListenAddr,
 		HostKeyPath:        cfg.HostKeyPath,
@@ -131,6 +150,7 @@ func RunGateway(cfg *GatewayConfig) error {
 		AuthWatcher:        authWatcher,
 		VMKeyResolver:      vmKeyResolver,
 		IdentityStore:      identityStore,
+		TokenReviewer:      tokenReviewer,
 	})
 	if err != nil {
 		return err

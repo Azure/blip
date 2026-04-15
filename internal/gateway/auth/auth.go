@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +29,11 @@ const (
 	// reconnect host should be the internal cluster alias ("blip") rather
 	// than the external gateway hostname.
 	ExtIsVMClient = "auth-is-vm-client"
+
+	// ExtVMName is set on _register connections after the SA token is
+	// validated. Contains the VM name derived from the virt-launcher pod
+	// name in the token's bound pod claim.
+	ExtVMName = "auth-vm-name"
 )
 
 // Config holds authentication parameters for building an ssh.ServerConfig.
@@ -51,6 +55,12 @@ type Config struct {
 	// pubkeys found in the identity store are accepted with the stored
 	// OIDC identity, subject to post-handshake refresh token verification.
 	IdentityStore *IdentityStore
+
+	// TokenReviewer validates Kubernetes ServiceAccount tokens for
+	// _register connections. When set, VMs must present a valid SA token
+	// as their SSH password to register keys. When nil, _register
+	// connections are rejected.
+	TokenReviewer TokenReviewer
 }
 
 // VMKeyResolver resolves a VM SSH client key fingerprint to the original
@@ -167,48 +177,18 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 		sshCfg.KeyboardInteractiveCallback = deviceFlowKeyboardInteractive(cfg.AuthWatcher, pending)
 	}
 
-	// Allow "none" auth for _register connections from VMs. VMs use this
-	// to register their SSH keys before a session is assigned. The
-	// gateway verifies the source IP belongs to a known VM pod in the
-	// session handler (not in the auth layer). As an additional safety
-	// measure, reject _register from non-private IPs to prevent abuse
-	// from the public internet via the LoadBalancer.
-	registerLimiter := rate.NewLimiter(20, 40) // 20/s with burst of 40
-	sshCfg.NoClientAuth = true
-	sshCfg.NoClientAuthCallback = func(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
-		if conn.User() != "_register" {
-			return nil, fmt.Errorf("none auth not allowed for user %q", conn.User())
-		}
-
-		// Rate-limit _register connections to prevent abuse.
-		if !registerLimiter.Allow() {
-			return nil, fmt.Errorf("too many registration attempts, please try again later")
-		}
-
-		// Reject connections from non-private IPs. The _register endpoint
-		// should only be reachable from cluster-internal VM pods, never
-		// from the public internet via the LoadBalancer.
-		remoteAddr := conn.RemoteAddr().String()
-		host, _, err := net.SplitHostPort(remoteAddr)
-		if err != nil {
-			host = remoteAddr
-		}
-		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsPrivate() {
-			slog.Warn("VM registration auth: rejected non-private source IP",
-				"remote", remoteAddr,
-			)
-			return nil, fmt.Errorf("none auth not allowed from non-private IP")
-		}
-
-		slog.Info("VM registration auth: none-auth accepted for _register",
-			"remote", remoteAddr,
-		)
-		return &ssh.Permissions{
-			Extensions: map[string]string{
-				ExtIdentity: "vm-register",
-			},
-		}, nil
+	// Authenticate _register connections using a Kubernetes ServiceAccount
+	// token as the SSH password. VMs mount a SA token via virtiofs and
+	// present it during registration. The gateway validates the token via
+	// the TokenReview API, verifying it belongs to the expected SA and
+	// extracting the bound pod name to derive the VM name.
+	//
+	// This replaces the previous none-auth + private-IP approach, providing
+	// cryptographic proof of VM identity rather than network-level trust.
+	if cfg.TokenReviewer != nil {
+		registerLimiter := rate.NewLimiter(20, 40) // 20/s with burst of 40
+		origPasswordCallback := sshCfg.PasswordCallback
+		sshCfg.PasswordCallback = registerPasswordCallback(cfg.TokenReviewer, registerLimiter, origPasswordCallback)
 	}
 
 	if cfg.AuthWatcher == nil && cfg.VMKeyResolver == nil {
@@ -406,6 +386,75 @@ func oidcCallback(watcher *AuthWatcher) func(ssh.ConnMetadata, []byte) (*ssh.Per
 			Extensions: map[string]string{
 				ExtFingerprint: h,
 				ExtIdentity:    identity,
+			},
+		}, nil
+	}
+}
+
+// registerPasswordCallback returns a PasswordCallback that wraps an optional
+// existing callback and adds support for _register connections authenticated
+// via Kubernetes ServiceAccount tokens.
+//
+// When the user is "_register", the password is treated as a SA token and
+// validated via the TokenReview API. The token must belong to the expected
+// SA, and the bound pod name is used to derive the VM name. The VM name is
+// stored in ExtVMName so the session handler can use it directly without
+// IP-based resolution.
+//
+// For all other users, the call is forwarded to the original password
+// callback (if any).
+func registerPasswordCallback(reviewer TokenReviewer, limiter *rate.Limiter, origCallback func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error)) func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
+	return func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		if conn.User() != "_register" {
+			if origCallback != nil {
+				return origCallback(conn, password)
+			}
+			return nil, fmt.Errorf("password auth not supported for user %q", conn.User())
+		}
+
+		// Rate-limit _register connections to prevent abuse.
+		if !limiter.Allow() {
+			return nil, fmt.Errorf("too many registration attempts, please try again later")
+		}
+
+		token := string(password)
+		if token == "" {
+			return nil, fmt.Errorf("_register requires a ServiceAccount token as password")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		result, err := reviewer.Review(ctx, token)
+		if err != nil {
+			slog.Warn("VM registration auth: token review failed",
+				"remote", conn.RemoteAddr().String(),
+				"error", err,
+			)
+			return nil, fmt.Errorf("ServiceAccount token validation failed")
+		}
+
+		vmName, err := VMNameFromPodName(result.PodName)
+		if err != nil {
+			slog.Warn("VM registration auth: cannot derive VM name from pod",
+				"remote", conn.RemoteAddr().String(),
+				"pod_name", result.PodName,
+				"error", err,
+			)
+			return nil, fmt.Errorf("cannot derive VM name from token")
+		}
+
+		slog.Info("VM registration auth: SA token validated",
+			"remote", conn.RemoteAddr().String(),
+			"service_account", result.ServiceAccountName,
+			"pod_name", result.PodName,
+			"vm_name", vmName,
+		)
+
+		return &ssh.Permissions{
+			Extensions: map[string]string{
+				ExtIdentity: "vm-register",
+				ExtVMName:   vmName,
 			},
 		}, nil
 	}

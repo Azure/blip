@@ -43,6 +43,10 @@ type Config struct {
 	// IdentityStore provides OIDC identity lookup for SSH pubkeys linked
 	// to OIDC identities via device flow refresh tokens.
 	IdentityStore *auth.IdentityStore
+
+	// TokenReviewer validates Kubernetes ServiceAccount tokens for
+	// _register connections; nil disables SA token auth for registration.
+	TokenReviewer auth.TokenReviewer
 }
 
 // ConnHandler is called for each successfully authenticated SSH connection.
@@ -72,6 +76,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		AuthWatcher:   cfg.AuthWatcher,
 		VMKeyResolver: cfg.VMKeyResolver,
 		IdentityStore: cfg.IdentityStore,
+		TokenReviewer: cfg.TokenReviewer,
 	})
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
