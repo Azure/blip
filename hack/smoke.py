@@ -639,10 +639,17 @@ def setup():
     run(["ssh-keygen", "-t", "ed25519", "-f", _ssh_key, "-N", "", "-q"])
     with open(f"{_ssh_key}.pub") as f:
         pub_key = f.read().strip()
-    cm_yaml = kubectl("create", "configmap", "ssh-gateway-auth", "-n", NAMESPACE,
-                      f"--from-literal=allowed-pubkeys={pub_key}",
-                      "--dry-run=client", "-o", "yaml").stdout
-    run(["kubectl", "apply", "-f", "-"], input=cm_yaml)
+    bo_yaml = (
+        f"apiVersion: blip.io/v1alpha1\n"
+        f"kind: BlipOwner\n"
+        f"metadata:\n"
+        f"  name: smoke-test-key\n"
+        f"  namespace: {NAMESPACE}\n"
+        f"spec:\n"
+        f"  sshKey:\n"
+        f"    publicKey: \"{pub_key}\"\n"
+    )
+    run(["kubectl", "apply", "-f", "-"], input=bo_yaml)
 
     # 8. Wait for gateway rollout
     log("  Waiting for ssh-gateway...")

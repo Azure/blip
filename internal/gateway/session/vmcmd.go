@@ -46,7 +46,7 @@ func (m *Manager) HandleVMCommand(ctx context.Context, serverConn *ssh.ServerCon
 		return
 	}
 
-	handler := vmcmd.New(m.cfg.VMClient) // reuse across channels on this connection
+	handler := vmcmd.New(m.cfg.VMClient, m.cfg.ExternalHost)
 
 	for newChan := range chans {
 		if newChan.ChannelType() != "session" {

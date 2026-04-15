@@ -41,8 +41,8 @@ type Config struct {
 	HostSigner   ssh.Signer
 	MaxAuthTries int
 
-	// AuthWatcher provides the dynamic OIDC providers, allowed-subjects,
-	// and allowed-pubkeys from a ConfigMap.
+	// AuthWatcher provides the dynamic OIDC providers, SSH public keys,
+	// and Actions repos from BlipOwner CRs.
 	AuthWatcher *AuthWatcher
 
 	// VMKeyResolver resolves a VM client key fingerprint to the root user
@@ -199,13 +199,13 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 }
 
 // pubkeyCallback returns a PublicKeyCallback that checks keys in order:
-// 1. Explicit allowed pubkeys from the AuthWatcher's ConfigMap.
+// 1. Explicit allowed pubkeys from BlipOwner CRs.
 // 2. OIDC-linked pubkeys from the IdentityStore (refresh token-backed).
 // 3. VM client keys for recursive blip connections.
 // When all fail, the key is stored in pendingKeys for post-device-flow binding.
 func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver, identityStore *IdentityStore, pendingKeys *pendingPubkeys) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-		// First, try explicit pubkey auth (user keys in ConfigMap).
+		// First, try explicit pubkey auth (user keys from BlipOwner CRs).
 		if watcher != nil {
 			perm, err := verifyExplicitPubkey(conn, key, watcher)
 			if err == nil {
@@ -355,7 +355,7 @@ func verifyVMClientKey(conn ssh.ConnMetadata, key ssh.PublicKey, resolver VMKeyR
 
 // oidcCallback returns a PasswordCallback that validates OIDC tokens against
 // all configured providers. The watcher is consulted on every auth attempt,
-// so ConfigMap changes take effect without restarting the gateway.
+// so BlipOwner CR changes take effect without restarting the gateway.
 func oidcCallback(watcher *AuthWatcher) func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 		token := string(password)
@@ -535,47 +535,47 @@ func deviceFlowKeyboardInteractive(watcher *AuthWatcher, pendingKeys *pendingPub
 type OIDCProviderConfig struct {
 	// Issuer is the OIDC issuer URL (e.g. "https://token.actions.githubusercontent.com"
 	// or "https://login.microsoftonline.com/{tenant}/v2.0").
-	Issuer string `yaml:"issuer"`
+	Issuer string
 
 	// Audience is the expected "aud" claim (e.g. "blip" or "api://blip").
-	Audience string `yaml:"audience"`
+	Audience string
 
 	// IdentityClaim is the JWT claim used as the user identity.
 	// Defaults to "sub" if empty. Common values: "sub", "oid", "email".
-	IdentityClaim string `yaml:"identity-claim"`
+	IdentityClaim string
 
 	// AllowedSubjects is a list of allowed subject patterns. If non-empty,
 	// the token's subject claim must match at least one entry. Supports
 	// glob patterns (e.g. "repo:my-org/*:*").
 	// When empty, any valid token from this issuer is accepted.
-	AllowedSubjects []string `yaml:"allowed-subjects"`
+	AllowedSubjects []string
 
 	// DeviceFlow enables the OAuth2 Device Authorization Grant (RFC 8628)
 	// for this provider. When true, users can connect without a token —
 	// the gateway presents a login URL in the SSH prompt and polls for
 	// completion. Requires ClientID and DeviceAuthURL.
-	DeviceFlow bool `yaml:"device-flow"`
+	DeviceFlow bool
 
 	// ClientID is the OAuth2 client ID for the device flow. Required when
 	// DeviceFlow is true. This is typically a public client (no secret).
-	ClientID string `yaml:"client-id"`
+	ClientID string
 
 	// DeviceAuthURL is the OAuth2 device authorization endpoint.
 	// Required when DeviceFlow is true.
 	// GitHub: "https://github.com/login/device/code"
 	// Azure:  "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode"
-	DeviceAuthURL string `yaml:"device-auth-url"`
+	DeviceAuthURL string
 
 	// TokenURL is the OAuth2 token endpoint for polling device flow completion.
 	// Required when DeviceFlow is true.
 	// GitHub: "https://github.com/login/oauth/access_token"
 	// Azure:  "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
-	TokenURL string `yaml:"token-url"`
+	TokenURL string
 
 	// Scopes is the list of OAuth2 scopes to request during device flow.
 	// GitHub: ["read:user"] or ["openid"]
 	// Azure:  ["api://blip/.default"] or ["openid", "profile"]
-	Scopes []string `yaml:"scopes"`
+	Scopes []string
 }
 
 // oidcProviderCache holds lazily-initialized OIDC providers keyed by issuer URL.

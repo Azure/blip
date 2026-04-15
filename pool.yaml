@@ -13,268 +13,92 @@ stringData:
           lock_passwd: true
     package_update: false
     package_upgrade: false
-    write_files:
-        - path: /usr/local/bin/blip
-          permissions: "0755"
-          content: |
-            #!/bin/bash
-            set -euo pipefail
-
-            # SSH connection to the gateway for management commands.
-            readonly GW_HOST="ssh-gateway.blip.svc.cluster.local"
-            readonly GW_PORT="2222"
-            readonly CLIENT_KEY="/etc/ssh/ssh_client_ed25519_key"
-
-            # Extract a JSON string value by key from flat JSON.  Handles simple
-            # single-line objects only (no jq dependency in the VM image).
-            # Uses sed instead of grep -oP to avoid PCRE dependency.
-            _json_field() {
-            	local body="$1" key="$2"
-            	printf '%s' "$body" |
-            		sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" |
-            		head -1
-            }
-
-            # Execute a blip command on the gateway via SSH.
-            _gateway_exec() {
-            	ssh -o BatchMode=yes \
-            		-o StrictHostKeyChecking=yes \
-            		-o ConnectTimeout=10 \
-            		-i "$CLIENT_KEY" \
-            		-p "$GW_PORT" \
-            		"_blip@${GW_HOST}" \
-            		"$@" 2>/dev/null
-            }
-
-            usage() {
-            	echo "Usage: blip <command>"
-            	echo ""
-            	echo "Commands:"
-            	echo "  retain [--ttl]  Preserve this blip across disconnects"
-            	exit 1
-            }
-
-            cmd_retain() {
-            	local ttl_flag=""
-
-            	# Parse arguments.
-            	while [ $# -gt 0 ]; do
-            		case "$1" in
-            		--ttl)
-            			if [ $# -lt 2 ]; then
-            				echo "Error: --ttl requires a duration value (e.g. 5m, 2h)" >&2
-            				exit 1
-            			fi
-            			ttl_flag="$2"
-            			shift 2
-            			;;
-            		--ttl=*)
-            			ttl_flag="${1#--ttl=}"
-            			shift
-            			;;
-            		*)
-            			echo "Unknown argument: $1" >&2
-            			echo "Usage: blip retain [--ttl <duration>]" >&2
-            			exit 1
-            			;;
-            		esac
-            	done
-
-            	# Build the remote command.
-            	local cmd="blip retain"
-            	if [ -n "$ttl_flag" ]; then
-            		cmd="blip retain --ttl $ttl_flag"
-            	fi
-
-            	local response
-            	response=$(_gateway_exec "$cmd")
-            	local rc=$?
-
-            	if [ $rc -ne 0 ]; then
-            		echo "Failed to retain blip" >&2
-            		if [ -n "$response" ]; then
-            			echo "$response" >&2
-            		fi
-            		exit 1
-            	fi
-
-            	local session_id
-            	session_id=$(_json_field "$response" "session_id")
-
-            	echo "Blip retained successfully." >&2
-            	if [ -n "$session_id" ]; then
-            		local gw_host="<gateway-host>"
-            		if [ -f "$HOME/.blip/reconnect-host" ]; then
-            			gw_host="$(cat "$HOME/.blip/reconnect-host")"
-            		fi
-            		echo "" >&2
-            		echo "  Only you can reconnect to this blip:" >&2
-            		echo "    ssh $session_id@$gw_host" >&2
-            		local ttl_val
-            		ttl_val=$(_json_field "$response" "ttl")
-            		if [ -n "$ttl_val" ]; then
-            			echo "  TTL: $ttl_val" >&2
-            		fi
-            		echo "" >&2
-            		echo "$session_id"
-            	fi
-
-            	# Allow output to flush through the SSH channel before exiting.
-            	sleep 0.1
-            }
-
-            if [ $# -lt 1 ]; then
-            	usage
-            fi
-
-            case "$1" in
-            retain)
-            	shift
-            	cmd_retain "$@"
-            	;;
-            *) usage ;;
-            esac
     runcmd:
         - - /bin/bash
           - -c
           - |
             exec > /dev/ttyS0 2>&1
-            echo "[blip-init] mounting volumes via virtiofs..."
-            mkdir -p /var/run/blip/gateway-client-pubkey
-            mount -t virtiofs gw-client-pubkey /var/run/blip/gateway-client-pubkey
-            mkdir -p /var/run/blip/gateway-host-pubkey
-            mount -t virtiofs gw-host-pubkey /var/run/blip/gateway-host-pubkey
-            mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
-            mount -t virtiofs sa-token /var/run/secrets/kubernetes.io/serviceaccount
-            echo "[blip-init] volumes mounted"
-        - - /bin/bash
-          - -c
-          - |
-            #!/bin/bash
-
-            exec > /dev/ttyS0 2>&1
             set -euo pipefail
             trap 'echo "[blip-setup] ERROR on line $LINENO (exit $?)"' ERR
 
-            readonly GW_HOST="ssh-gateway.blip.svc.cluster.local"
-            readonly GW_PORT="2222"
-            readonly GW_CLIENT_PUBKEY_DIR="/var/run/blip/gateway-client-pubkey"
-            readonly GW_HOST_PUBKEY_DIR="/var/run/blip/gateway-host-pubkey"
-            readonly SA_TOKEN_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
+            GW_HOST="ssh-gateway.blip.svc.cluster.local"
+            GW_CLIENT_PUBKEY_DIR="/var/run/blip/gateway-client-pubkey"
+            GW_HOST_PUBKEY_DIR="/var/run/blip/gateway-host-pubkey"
+            SA_TOKEN_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
 
-            main() {
-            	local vm_name
-            	vm_name="$(hostname)"
-            	echo "[blip-setup] vm=$vm_name"
+            # Mount virtiofs volumes.
+            for vol in "$GW_CLIENT_PUBKEY_DIR" "$GW_HOST_PUBKEY_DIR" "$SA_TOKEN_DIR"; do
+            	mkdir -p "$vol"
+            done
+            mount -t virtiofs gw-client-pubkey "$GW_CLIENT_PUBKEY_DIR"
+            mount -t virtiofs gw-host-pubkey "$GW_HOST_PUBKEY_DIR"
+            mount -t virtiofs sa-token "$SA_TOKEN_DIR"
 
-            	# --- 1. Generate a VM client key pair ---
-            	ssh-keygen -t ed25519 -f /etc/ssh/ssh_client_ed25519_key -N "" -q
-            	chmod 600 /etc/ssh/ssh_client_ed25519_key
-            	chown runner:runner /etc/ssh/ssh_client_ed25519_key
-            	chmod 644 /etc/ssh/ssh_client_ed25519_key.pub
+            # Generate VM client key pair.
+            ssh-keygen -t ed25519 -f /etc/ssh/ssh_client_ed25519_key -N "" -q
+            chmod 600 /etc/ssh/ssh_client_ed25519_key
+            chown runner:runner /etc/ssh/ssh_client_ed25519_key
+            chmod 644 /etc/ssh/ssh_client_ed25519_key.pub
 
-            	# --- 2. Read gateway client pubkey from mounted ConfigMap -> authorized_keys ---
-            	local gw_client_pubkey=""
-            	for _retry in $(seq 1 30); do
-            		if [ -f "$GW_CLIENT_PUBKEY_DIR/client_key.pub" ]; then
-            			gw_client_pubkey="$(cat "$GW_CLIENT_PUBKEY_DIR/client_key.pub")"
-            			if [ -n "$gw_client_pubkey" ]; then
-            				break
-            			fi
-            		fi
-            		sleep 2
-            	done
-            	if [ -z "$gw_client_pubkey" ]; then
-            		echo "[blip-setup] FATAL: could not read gateway client pubkey from $GW_CLIENT_PUBKEY_DIR" >&2
-            		exit 1
+            # Wait for gateway client pubkey and install as authorized_keys.
+            gw_client_pubkey=""
+            for _ in $(seq 1 30); do
+            	if [ -s "$GW_CLIENT_PUBKEY_DIR/client_key.pub" ]; then
+            		gw_client_pubkey="$(cat "$GW_CLIENT_PUBKEY_DIR/client_key.pub")"
+            		break
             	fi
-            	mkdir -p ~runner/.ssh
-            	printf '%s\n' "$gw_client_pubkey" > ~runner/.ssh/authorized_keys
-            	chmod 600 ~runner/.ssh/authorized_keys
-            	chown -R runner:runner ~runner/.ssh
+            	sleep 2
+            done
+            [ -n "$gw_client_pubkey" ] || { echo "[blip-setup] FATAL: no gateway client pubkey" >&2; exit 1; }
+            mkdir -p ~runner/.ssh
+            printf '%s\n' "$gw_client_pubkey" > ~runner/.ssh/authorized_keys
+            chmod 600 ~runner/.ssh/authorized_keys
+            chown -R runner:runner ~runner/.ssh
 
-            	# --- 3. Read gateway host pubkey from mounted ConfigMap -> known_hosts ---
-            	local gw_host_pubkey=""
-            	if [ -f "$GW_HOST_PUBKEY_DIR/host_key.pub" ]; then
-            		gw_host_pubkey="$(cat "$GW_HOST_PUBKEY_DIR/host_key.pub")"
-            	fi
-            	if [ -n "$gw_host_pubkey" ]; then
-            		# Write known_hosts entries for the gateway service names.
-            		# Since the VM connects on port 2222, use [host]:port format
-            		# which is what SSH looks up for non-default ports.
-            		printf '[%s]:%s %s\n' "$GW_HOST" "2222" "$gw_host_pubkey" > ~runner/.ssh/known_hosts
-            		printf '[%s]:%s %s\n' "blip" "2222" "$gw_host_pubkey" >> ~runner/.ssh/known_hosts
-            		printf '[%s]:%s %s\n' "blip-gateway" "2222" "$gw_host_pubkey" >> ~runner/.ssh/known_hosts
-            		chmod 644 ~runner/.ssh/known_hosts
-            		chown runner:runner ~runner/.ssh/known_hosts
-            		# Also write system-wide known_hosts for root SSH commands.
-            		cp ~runner/.ssh/known_hosts /etc/ssh/ssh_known_hosts
-            		chmod 644 /etc/ssh/ssh_known_hosts
-            	fi
+            # Install gateway host pubkey as known_hosts (port 2222 bracket format).
+            if [ -s "$GW_HOST_PUBKEY_DIR/host_key.pub" ]; then
+            	gw_host_pubkey="$(cat "$GW_HOST_PUBKEY_DIR/host_key.pub")"
+            	{
+            		printf '[%s]:%s %s\n' "$GW_HOST" 2222 "$gw_host_pubkey"
+            		printf '[%s]:%s %s\n' blip 2222 "$gw_host_pubkey"
+            		printf '[%s]:%s %s\n' blip-gateway 2222 "$gw_host_pubkey"
+            	} | tee ~runner/.ssh/known_hosts > /etc/ssh/ssh_known_hosts
+            	chmod 644 ~runner/.ssh/known_hosts /etc/ssh/ssh_known_hosts
+            	chown runner:runner ~runner/.ssh/known_hosts
+            fi
 
-            	# --- 4. Restart sshd BEFORE registering keys ---
-            	# sshd may already be running (Ubuntu 24.04 starts it via socket
-            	# activation). Restart to ensure it is running and picks up any
-            	# configuration changes (e.g. new authorized_keys). This MUST
-            	# happen before key registration, because the gateway treats
-            	# registered keys as the VM readiness signal and may connect
-            	# immediately. If sshd restarts after the gateway has already
-            	# established an SSH session, the connection is killed and the
-            	# proxy hangs until the client times out.
-            	systemctl enable ssh
-            	systemctl restart ssh
+            # Restart sshd BEFORE registering keys. The gateway connects
+            # immediately after registration, so sshd must be ready first.
+            systemctl enable ssh
+            systemctl restart ssh
 
-            	# --- 5. Register host-key and client-key with the gateway via SSH ---
-            	# The VM authenticates to the gateway using its mounted SA token
-            	# as the SSH password. The gateway validates the token via the
-            	# Kubernetes TokenReview API, which proves this is a real
-            	# virt-launcher pod and extracts the VM name from the token's
-            	# bound pod claim.
-            	#
-            	# Keys are colon-joined (e.g. "ssh-ed25519:AAAA...") because
-            	# the SSH exec protocol splits arguments on spaces. The gateway
-            	# reconstructs the standard space-separated format.
-            	local host_key client_key sa_token
-            	host_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
-            	client_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
-            	sa_token="$(cat "$SA_TOKEN_DIR/token")"
+            # Register host+client keys with the gateway. Keys are colon-joined
+            # because the SSH exec protocol splits arguments on spaces.
+            host_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
+            client_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
+            sa_token="$(cat "$SA_TOKEN_DIR/token")"
 
-            	local ok=false
-            	for _retry in $(seq 1 10); do
-            		local response
-            		response=$(sshpass -p "$sa_token" ssh \
-            			-o BatchMode=no \
-            			-o StrictHostKeyChecking=yes \
-            			-o PreferredAuthentications=password \
-            			-o PubkeyAuthentication=no \
-            			-o ConnectTimeout=10 \
-            			-p "$GW_PORT" \
-            			"_register@${GW_HOST}" \
-            			"blip register-keys --host-key $host_key --client-key $client_key" 2>/dev/null) || true
-            		if printf '%s' "$response" | grep -q '"ok":true'; then
-            			ok=true
-            			break
-            		fi
-            		echo "[blip-setup] register-keys retry $_retry"
-            		sleep 2
-            	done
+            ok=false
+            for _ in $(seq 1 10); do
+            	resp=$(sshpass -p "$sa_token" ssh \
+            		-o BatchMode=no \
+            		-o StrictHostKeyChecking=yes \
+            		-o PreferredAuthentications=password \
+            		-o PubkeyAuthentication=no \
+            		-o ConnectTimeout=10 \
+            		-p 2222 "_register@${GW_HOST}" \
+            		"register-keys --host-key $host_key --client-key $client_key" 2>/dev/null) || true
+            	if printf '%s' "$resp" | grep -q '"ok":true'; then ok=true; break; fi
+            	sleep 2
+            done
+            [ "$ok" = true ] || { echo "[blip-setup] FATAL: key registration failed" >&2; exit 1; }
 
-            	if [ "$ok" != "true" ]; then
-            		echo "[blip-setup] FATAL: failed to register keys via SSH" >&2
-            		exit 1
-            	fi
-
-            	echo "[blip-setup] complete"
-            }
-
-            main "$@"
+            echo "[blip-setup] complete"
         - chmod -x /etc/update-motd.d/*
         - systemctl disable --now snapd.service snapd.socket snapd.seeded.service snapd.snap-repair.timer multipathd.service multipathd.socket ModemManager.service unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer udisks2.service polkit.service fwupd.service packagekit.service networkd-dispatcher.service 2>/dev/null || true
         - apt-get purge -y --auto-remove snapd && rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd || true
         - touch /etc/cloud/cloud-init.disabled
-        - mkdir -p /etc/systemd/journald.conf.d
-        - printf '[Journal]\nSystemMaxUse=16M\nRuntimeMaxUse=16M\n' > /etc/systemd/journald.conf.d/size.conf
-        - systemctl restart systemd-journald
+        - mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\nSystemMaxUse=16M\nRuntimeMaxUse=16M\n' > /etc/systemd/journald.conf.d/size.conf && systemctl restart systemd-journald
         - sync && echo 3 > /proc/sys/vm/drop_caches || true
 ---
 apiVersion: pool.kubevirt.io/v1beta1

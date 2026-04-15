@@ -33,18 +33,33 @@ kubectl create secret generic github-app-key \
   -n blip --from-file=private-key.pem=<path-to-pem-file>
 ```
 
-Add the repositories to poll to the auth ConfigMap (`actions-repos` key, one `owner/repo` per line):
+Create a BlipOwner CR for each repository to poll (one CR per repo):
 
-```shell
-kubectl patch configmap ssh-gateway-auth -n blip --type merge -p '
-data:
-  actions-repos: |
-    my-org/my-repo
-    my-org/another-repo
-'
+```yaml
+apiVersion: blip.io/v1alpha1
+kind: BlipOwner
+metadata:
+  name: myorg-myrepo
+  namespace: blip
+spec:
+  actionsRepo:
+    repo: my-org/my-repo
+---
+apiVersion: blip.io/v1alpha1
+kind: BlipOwner
+metadata:
+  name: myorg-another-repo
+  namespace: blip
+spec:
+  actionsRepo:
+    repo: my-org/another-repo
 ```
 
-The gateway watches this ConfigMap in real time — edits take effect without a restart.
+```shell
+kubectl apply -f actions-repos.yaml
+```
+
+The gateway watches BlipOwner CRs in real time — changes take effect without a restart.
 
 Uncomment all the GitHub Actions sections in `deploy.yaml` (environment variables, volume mount, and volume) and fill in your App ID and installation ID:
 
@@ -72,7 +87,7 @@ kubectl apply -f deploy.yaml
 | `ACTIONS_SESSION_DURATION` | `--actions-session-duration` | no | Max runner session TTL in seconds (default: `3600`) |
 | `ACTIONS_POLL_INTERVAL` | `--actions-poll-interval` | no | How often to poll for queued jobs in seconds (default: `10`) |
 
-The list of repositories to poll is read from the `actions-repos` key in the auth ConfigMap (set via `--auth-configmap`), not from environment variables.
+The list of repositories to poll is read from BlipOwner CRs with `spec.actionsRepo` set, not from environment variables.
 
 ## Workflow
 
@@ -112,10 +127,10 @@ The VM's cloud-init script must:
 kubectl logs -n blip -l app=ssh-gateway --tail=200
 ```
 
-- **`failed to list queued jobs`** — the GitHub App may lack permissions, or the repo format in the ConfigMap is invalid (must be `owner/repo`).
+- **`failed to list queued jobs`** — the GitHub App may lack permissions, or the repo format in the BlipOwner CR is invalid (must be `owner/repo`).
 - **`request registration token: HTTP 403`** — missing permissions or app not installed on the repo.
 - **`job labels do not match runner labels`** — `runs-on` labels do not overlap with `RUNNER_LABELS`.
-- **No VMs being allocated** — verify the `actions-repos` key in the auth ConfigMap lists the correct repos and that `RUNNER_LABELS` matches your workflow's `runs-on`.
+- **No VMs being allocated** — verify that BlipOwner CRs with `spec.actionsRepo` exist for the correct repos and that `RUNNER_LABELS` matches your workflow's `runs-on`.
 
 ## Next steps
 
