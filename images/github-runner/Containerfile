@@ -1,6 +1,6 @@
 # images/github-runner/Containerfile
 #
-# Extends the base Ubuntu 24.04 containerdisk used by pool.yaml to include
+# Extends the base Ubuntu 24.04 containerdisk used by manifests/pool.yaml to include
 # the GitHub Actions runner agent and its dependencies. The resulting image
 # is a KubeVirt containerdisk: a container whose sole purpose is to carry
 # a qcow2 virtual-machine disk at /disk/.
@@ -14,7 +14,7 @@
 #       -t <registry>/blip-github-runner:latest \
 #       -f images/github-runner/Containerfile .
 #
-# After building, update pool.yaml to use this image:
+# After building, update manifests/pool.yaml to use this image:
 #   source:
 #     registry:
 #       url: docker://<registry>/blip-github-runner:latest
@@ -180,6 +180,7 @@ echo "[runner-setup] waiting for runner annotations..."
 token=""
 runner_url=""
 runner_labels=""
+jitconfig=""
 
 # Poll until the webhook server has patched the runner annotations.
 # 360 iterations x 5s sleep = 30 minutes max wait.
@@ -196,6 +197,17 @@ for i in $(seq 1 360); do
         "$api_url" 2>/dev/null) || { sleep 5; continue; }
 
     # Use jq for reliable JSON parsing (installed in the guest).
+    # Check for JIT config first (scale set flow).
+    jitconfig=$(printf '%s' "$body" | jq -r '.metadata.annotations["blip.io/runner-jitconfig"] // empty') || true
+
+    if [ -n "$jitconfig" ]; then
+        echo "[runner-setup] received JIT config, starting runner directly"
+        cd "$RUNNER_DIR"
+        sudo -u runner ./run.sh --jitconfig "$jitconfig"
+        exit $?
+    fi
+
+    # Fall back to registration token flow (legacy).
     token=$(printf '%s' "$body" | jq -r '.metadata.annotations["blip.io/runner-token"] // empty') || true
     runner_url=$(printf '%s' "$body" | jq -r '.metadata.annotations["blip.io/runner-url"] // empty') || true
     runner_labels=$(printf '%s' "$body" | jq -r '.metadata.annotations["blip.io/runner-labels"] // empty') || true

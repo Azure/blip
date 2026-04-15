@@ -2,4 +2,5 @@
 .gitignore
 *.md
 LICENSE
-deploy.yaml
+manifests/
+config/

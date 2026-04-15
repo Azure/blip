@@ -3,237 +3,111 @@ kind: Namespace
 metadata:
   name: blip
 ---
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
+apiVersion: v1
+kind: Secret
 metadata:
-  annotations:
-    controller-gen.kubebuilder.io/version: v0.20.1
-  name: blipowners.blip.io
-spec:
-  group: blip.io
-  names:
-    kind: BlipOwner
-    listKind: BlipOwnerList
-    plural: blipowners
-    shortNames:
-    - bo
-    singular: blipowner
-  scope: Namespaced
-  versions:
-  - additionalPrinterColumns:
-    - jsonPath: .status.conditions[?(@.type=="Ready")].status
-      name: Ready
-      type: string
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date
-    name: v1alpha1
-    schema:
-      openAPIV3Schema:
-        description: |-
-          BlipOwner represents a single authorization entry for the Blip SSH gateway.
-          Each CR encodes exactly one of: an SSH public key, an OIDC provider
-          configuration, or a GitHub Actions runner repo association.
+  name: default-cloudinit
+  namespace: blip
+stringData:
+  userdata: |
+    #cloud-config
+    users:
+        - name: runner
+          sudo: ALL=(ALL) NOPASSWD:ALL
+          shell: /bin/bash
+          lock_passwd: true
+    package_update: false
+    package_upgrade: false
+    runcmd:
+        - - /bin/bash
+          - -c
+          - |
+            exec > /dev/ttyS0 2>&1
+            set -euo pipefail
+            trap 'echo "[blip-setup] ERROR on line $LINENO (exit $?)"' ERR
 
-          Exactly one of spec.sshKey, spec.oidc, or spec.actionsRepo must be set.
-          This constraint is enforced by CEL validation rules on the CRD schema.
-        properties:
-          apiVersion:
-            description: |-
-              APIVersion defines the versioned schema of this representation of an object.
-              Servers should convert recognized schemas to the latest internal value, and
-              may reject unrecognized values.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
-            type: string
-          kind:
-            description: |-
-              Kind is a string value representing the REST resource this object represents.
-              Servers may infer this from the endpoint the client submits requests to.
-              Cannot be updated.
-              In CamelCase.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
-            type: string
-          metadata:
-            type: object
-          spec:
-            description: |-
-              BlipOwnerSpec defines the desired state of a BlipOwner.
-              Exactly one of SSHKey, OIDC, or ActionsRepo must be set.
-            properties:
-              actionsRepo:
-                description: ActionsRepo associates a GitHub repository for Actions
-                  runner polling.
-                properties:
-                  repo:
-                    description: Repo is the full "owner/repo" identifier (e.g. "my-org/my-repo").
-                    minLength: 1
-                    type: string
-                required:
-                - repo
-                type: object
-                x-kubernetes-validations:
-                - message: repo must be in 'owner/repo' format
-                  rule: self.repo.matches('^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$')
-              oidc:
-                description: OIDC configures an OIDC provider for token-based authentication.
-                properties:
-                  allowedSubjects:
-                    description: |-
-                      AllowedSubjects is a list of allowed subject patterns.
-                      Supports glob patterns (e.g. "repo:my-org/*:*").
-                      When empty, any valid token from this issuer is accepted.
-                    items:
-                      type: string
-                    type: array
-                  audience:
-                    description: Audience is the expected "aud" claim.
-                    minLength: 1
-                    type: string
-                  clientID:
-                    description: |-
-                      ClientID is the OAuth2 client ID for device flow.
-                      Required when deviceFlow is true.
-                    type: string
-                  deviceAuthURL:
-                    description: |-
-                      DeviceAuthURL is the OAuth2 device authorization endpoint (must be HTTPS).
-                      Required when deviceFlow is true.
-                    type: string
-                  deviceFlow:
-                    description: DeviceFlow enables the OAuth2 Device Authorization
-                      Grant (RFC 8628).
-                    type: boolean
-                  identityClaim:
-                    description: |-
-                      IdentityClaim is the JWT claim used as the user identity.
-                      Defaults to "sub" if empty.
-                    type: string
-                  issuer:
-                    description: Issuer is the OIDC issuer URL (must be HTTPS).
-                    minLength: 1
-                    type: string
-                  scopes:
-                    description: Scopes is the list of OAuth2 scopes to request during
-                      device flow.
-                    items:
-                      type: string
-                    type: array
-                  tokenURL:
-                    description: |-
-                      TokenURL is the OAuth2 token endpoint for polling device flow completion (must be HTTPS).
-                      Required when deviceFlow is true.
-                    type: string
-                required:
-                - audience
-                - issuer
-                type: object
-                x-kubernetes-validations:
-                - message: issuer must start with https://
-                  rule: self.issuer.startsWith('https://')
-                - message: clientID, deviceAuthURL, and tokenURL are required when
-                    deviceFlow is true
-                  rule: '!self.deviceFlow || (self.clientID != '''' && self.deviceAuthURL
-                    != '''' && self.tokenURL != '''')'
-                - message: deviceAuthURL must start with https://
-                  rule: '!has(self.deviceAuthURL) || self.deviceAuthURL == '''' ||
-                    self.deviceAuthURL.startsWith(''https://'')'
-                - message: tokenURL must start with https://
-                  rule: '!has(self.tokenURL) || self.tokenURL == '''' || self.tokenURL.startsWith(''https://'')'
-              sshKey:
-                description: SSHKey configures an explicitly allowed SSH public key.
-                properties:
-                  publicKey:
-                    description: |-
-                      PublicKey is the SSH public key in authorized_keys format
-                      (e.g. "ssh-ed25519 AAAAC3... alice@laptop").
-                    minLength: 1
-                    type: string
-                required:
-                - publicKey
-                type: object
-            type: object
-            x-kubernetes-validations:
-            - message: exactly one of sshKey, oidc, or actionsRepo must be set
-              rule: '(has(self.sshKey) ? 1 : 0) + (has(self.oidc) ? 1 : 0) + (has(self.actionsRepo)
-                ? 1 : 0) == 1'
-          status:
-            description: BlipOwnerStatus describes the observed state of a BlipOwner.
-            properties:
-              conditions:
-                description: |-
-                  Conditions represent the latest available observations of the
-                  BlipOwner's state.
-                items:
-                  description: Condition contains details for one aspect of the current
-                    state of this API Resource.
-                  properties:
-                    lastTransitionTime:
-                      description: |-
-                        lastTransitionTime is the last time the condition transitioned from one status to another.
-                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
-                      format: date-time
-                      type: string
-                    message:
-                      description: |-
-                        message is a human readable message indicating details about the transition.
-                        This may be an empty string.
-                      maxLength: 32768
-                      type: string
-                    observedGeneration:
-                      description: |-
-                        observedGeneration represents the .metadata.generation that the condition was set based upon.
-                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
-                        with respect to the current state of the instance.
-                      format: int64
-                      minimum: 0
-                      type: integer
-                    reason:
-                      description: |-
-                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
-                        Producers of specific condition types may define expected values and meanings for this field,
-                        and whether the values are considered a guaranteed API.
-                        The value should be a CamelCase string.
-                        This field may not be empty.
-                      maxLength: 1024
-                      minLength: 1
-                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
-                      type: string
-                    status:
-                      description: status of the condition, one of True, False, Unknown.
-                      enum:
-                      - "True"
-                      - "False"
-                      - Unknown
-                      type: string
-                    type:
-                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
-                      maxLength: 316
-                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
-                      type: string
-                  required:
-                  - lastTransitionTime
-                  - message
-                  - reason
-                  - status
-                  - type
-                  type: object
-                type: array
-                x-kubernetes-list-map-keys:
-                - type
-                x-kubernetes-list-type: map
-              fingerprint:
-                description: |-
-                  Fingerprint is the computed SHA256 fingerprint for SSHKey entries.
-                  Empty for non-SSHKey types.
-                type: string
-            type: object
-        required:
-        - spec
-        type: object
-    served: true
-    storage: true
-    subresources:
-      status: {}
+            GW_HOST="ssh-gateway.blip.svc.cluster.local"
+            GW_CLIENT_PUBKEY_DIR="/var/run/blip/gateway-client-pubkey"
+            GW_HOST_PUBKEY_DIR="/var/run/blip/gateway-host-pubkey"
+            SA_TOKEN_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
+
+            # Mount virtiofs volumes.
+            for vol in "$GW_CLIENT_PUBKEY_DIR" "$GW_HOST_PUBKEY_DIR" "$SA_TOKEN_DIR"; do
+            	mkdir -p "$vol"
+            done
+            mount -t virtiofs gw-client-pubkey "$GW_CLIENT_PUBKEY_DIR"
+            mount -t virtiofs gw-host-pubkey "$GW_HOST_PUBKEY_DIR"
+            mount -t virtiofs sa-token "$SA_TOKEN_DIR"
+
+            # Generate VM client key pair.
+            ssh-keygen -t ed25519 -f /etc/ssh/ssh_client_ed25519_key -N "" -q
+            chmod 600 /etc/ssh/ssh_client_ed25519_key
+            chown runner:runner /etc/ssh/ssh_client_ed25519_key
+            chmod 644 /etc/ssh/ssh_client_ed25519_key.pub
+
+            # Wait for gateway client pubkey and install as authorized_keys.
+            gw_client_pubkey=""
+            for _ in $(seq 1 30); do
+            	if [ -s "$GW_CLIENT_PUBKEY_DIR/client_key.pub" ]; then
+            		gw_client_pubkey="$(cat "$GW_CLIENT_PUBKEY_DIR/client_key.pub")"
+            		break
+            	fi
+            	sleep 2
+            done
+            [ -n "$gw_client_pubkey" ] || { echo "[blip-setup] FATAL: no gateway client pubkey" >&2; exit 1; }
+            mkdir -p ~runner/.ssh
+            printf '%s\n' "$gw_client_pubkey" > ~runner/.ssh/authorized_keys
+            chmod 600 ~runner/.ssh/authorized_keys
+            chown -R runner:runner ~runner/.ssh
+
+            # Install gateway host pubkey as known_hosts (port 2222 bracket format).
+            if [ -s "$GW_HOST_PUBKEY_DIR/host_key.pub" ]; then
+            	gw_host_pubkey="$(cat "$GW_HOST_PUBKEY_DIR/host_key.pub")"
+            	{
+            		printf '[%s]:%s %s\n' "$GW_HOST" 2222 "$gw_host_pubkey"
+            		printf '[%s]:%s %s\n' blip 2222 "$gw_host_pubkey"
+            		printf '[%s]:%s %s\n' blip-gateway 2222 "$gw_host_pubkey"
+            	} | tee ~runner/.ssh/known_hosts > /etc/ssh/ssh_known_hosts
+            	chmod 644 ~runner/.ssh/known_hosts /etc/ssh/ssh_known_hosts
+            	chown runner:runner ~runner/.ssh/known_hosts
+            fi
+
+            # Restart sshd BEFORE registering keys. The gateway connects
+            # immediately after registration, so sshd must be ready first.
+            systemctl enable ssh
+            systemctl restart ssh
+
+            # Register host+client keys with the gateway. Keys are colon-joined
+            # because the SSH exec protocol splits arguments on spaces.
+            host_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
+            client_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
+            sa_token="$(cat "$SA_TOKEN_DIR/token")"
+            vm_name="$(hostname)"
+
+            # Connect with none-auth and pass the SA token in the exec
+            # command. OpenSSH truncates SSH passwords to 1023 bytes but
+            # pod-bound SA tokens are ~1192 bytes, so we pass the token
+            # as a --token argument in the exec channel instead.
+            ok=false
+            for _ in $(seq 1 10); do
+            	resp=$(ssh \
+            		-o StrictHostKeyChecking=yes \
+            		-o PreferredAuthentications=none \
+            		-o ConnectTimeout=10 \
+            		-p 2222 "_register@${GW_HOST}" \
+            		"register-keys --host-key $host_key --client-key $client_key --vm-name $vm_name --token $sa_token" 2>/dev/null) || true
+            	if printf '%s' "$resp" | grep -q '"ok":true'; then ok=true; break; fi
+            	sleep 2
+            done
+            [ "$ok" = true ] || { echo "[blip-setup] FATAL: key registration failed" >&2; exit 1; }
+
+            echo "[blip-setup] complete"
+        - chmod -x /etc/update-motd.d/*
+        - systemctl disable --now snapd.service snapd.socket snapd.seeded.service snapd.snap-repair.timer multipathd.service multipathd.socket ModemManager.service unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer udisks2.service polkit.service fwupd.service packagekit.service networkd-dispatcher.service 2>/dev/null || true
+        - apt-get purge -y --auto-remove snapd && rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd || true
+        - touch /etc/cloud/cloud-init.disabled
+        - mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\nSystemMaxUse=16M\nRuntimeMaxUse=16M\n' > /etc/systemd/journald.conf.d/size.conf && systemctl restart systemd-journald
+        - sync && echo 3 > /proc/sys/vm/drop_caches || true
 ---
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass

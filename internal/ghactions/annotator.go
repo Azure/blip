@@ -15,16 +15,20 @@ import (
 // RunnerConfig holds the GitHub Actions runner configuration to be stored
 // on a VM as annotations so the cloud-init script can start the runner agent.
 type RunnerConfig struct {
-	Token   string
-	RepoURL string
-	Labels  []string
+	// Token is the registration token (legacy App-based flow).
+	Token string
+	// JITConfig is the base64-encoded JIT runner config (scale set flow).
+	JITConfig string
+	RepoURL   string
+	Labels    []string
 }
 
 // Annotations used for runner configuration.
 const (
-	AnnotationRunnerToken  = "blip.io/runner-token"
-	AnnotationRunnerURL    = "blip.io/runner-url"
-	AnnotationRunnerLabels = "blip.io/runner-labels"
+	AnnotationRunnerToken     = "blip.io/runner-token"
+	AnnotationRunnerURL       = "blip.io/runner-url"
+	AnnotationRunnerLabels    = "blip.io/runner-labels"
+	AnnotationRunnerJITConfig = "blip.io/runner-jitconfig"
 )
 
 // VMAnnotator patches runner configuration annotations on VMs.
@@ -41,14 +45,25 @@ func NewVMAnnotator(writer client.Client, namespace string) *VMAnnotator {
 }
 
 // StoreRunnerConfig patches the named VM with runner configuration annotations.
+// If JITConfig is set, the JIT config annotation is written (scale set flow).
+// Otherwise, the token/URL/labels annotations are written (legacy flow).
 func (a *VMAnnotator) StoreRunnerConfig(ctx context.Context, vmName string, cfg RunnerConfig) error {
+	annotations := make(map[string]string)
+
+	if cfg.JITConfig != "" {
+		// Scale set flow: only the JIT config is needed. The VM will
+		// use run.sh --jitconfig instead of config.sh.
+		annotations[AnnotationRunnerJITConfig] = cfg.JITConfig
+	} else {
+		// Legacy App-based flow.
+		annotations[AnnotationRunnerToken] = cfg.Token
+		annotations[AnnotationRunnerURL] = cfg.RepoURL
+		annotations[AnnotationRunnerLabels] = strings.Join(cfg.Labels, ",")
+	}
+
 	patch := map[string]any{
 		"metadata": map[string]any{
-			"annotations": map[string]string{
-				AnnotationRunnerToken:  cfg.Token,
-				AnnotationRunnerURL:    cfg.RepoURL,
-				AnnotationRunnerLabels: strings.Join(cfg.Labels, ","),
-			},
+			"annotations": annotations,
 		},
 	}
 	patchData, err := json.Marshal(patch)

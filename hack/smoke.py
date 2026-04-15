@@ -592,10 +592,15 @@ def setup():
     log("  Loading image into kind...")
     run(["kind", "load", "docker-image", IMAGE_NAME], timeout=120, verbose=True)
 
-    # 3. Apply manifests with image substitution
-    log("  Applying deploy.yaml...")
-    with open("deploy.yaml") as f:
-        manifest = f.read()
+    # 3. Apply manifests with image substitution.
+    #    Build the full manifest by concatenating the CRD and deploy.yaml,
+    #    matching the release build process (see Makefile / release workflow).
+    log("  Applying deploy manifest (CRD + deploy.yaml)...")
+    with open("config/crd/blip.io_blipowners.yaml") as f:
+        crd = f.read()
+    with open("manifests/deploy.yaml") as f:
+        deploy = f.read()
+    manifest = crd + "\n---\n" + deploy
     manifest = manifest.replace("${REGISTRY}/blip:${BLIP_TAG}", IMAGE_NAME)
     run(["kubectl", "apply", "-f", "-"], input=manifest)
 
@@ -632,7 +637,7 @@ def setup():
 
     # 6. Create VM pool and scale
     log("  Creating VM pool...")
-    kubectl("apply", "-f", "pool.yaml")
+    kubectl("apply", "-f", "manifests/pool.yaml")
     kubectl("patch", "virtualmachinepool", POOL_NAME, "-n", NAMESPACE,
             "--type=merge", "-p",
             f'{{"spec":{{"replicas":{REPLICAS}}}}}')
