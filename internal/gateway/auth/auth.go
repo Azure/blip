@@ -183,12 +183,22 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 	// the TokenReview API, verifying it belongs to the expected SA and
 	// extracting the bound pod name to derive the VM name.
 	//
-	// This replaces the previous none-auth + private-IP approach, providing
-	// cryptographic proof of VM identity rather than network-level trust.
+	// Because OpenSSH clients truncate passwords to 1023 bytes and
+	// pod-bound SA tokens are ~1192 bytes, we also accept none-auth for
+	// _register connections. In that case, the VM must pass the token via
+	// the exec command's --token flag, and the session handler validates
+	// it post-connect.
 	if cfg.TokenReviewer != nil {
 		registerLimiter := rate.NewLimiter(20, 40) // 20/s with burst of 40
 		origPasswordCallback := sshCfg.PasswordCallback
 		sshCfg.PasswordCallback = registerPasswordCallback(cfg.TokenReviewer, registerLimiter, origPasswordCallback)
+
+		// Allow none-auth for _register so VMs can pass full-length
+		// tokens via the exec command instead of truncated passwords.
+		// NoClientAuth must be true for NoClientAuthCallback to fire;
+		// the callback rejects non-_register connections.
+		sshCfg.NoClientAuth = true
+		sshCfg.NoClientAuthCallback = registerNoneAuthCallback()
 	}
 
 	if cfg.AuthWatcher == nil && cfg.VMKeyResolver == nil {
@@ -434,27 +444,64 @@ func registerPasswordCallback(reviewer TokenReviewer, limiter *rate.Limiter, ori
 			return nil, fmt.Errorf("ServiceAccount token validation failed")
 		}
 
-		vmName, err := VMNameFromPodName(result.PodName)
-		if err != nil {
-			slog.Warn("VM registration auth: cannot derive VM name from pod",
-				"remote", conn.RemoteAddr().String(),
-				"pod_name", result.PodName,
-				"error", err,
-			)
-			return nil, fmt.Errorf("cannot derive VM name from token")
+		extensions := map[string]string{
+			ExtIdentity: "vm-register",
+		}
+
+		// Derive VM name from the token's bound pod name when available.
+		// Tokens without pod binding (e.g. short-lived tokens created to
+		// work around SSH password length limits) won't have this — the
+		// VM name will be provided in the exec command instead.
+		if result.PodName != "" {
+			vmName, err := VMNameFromPodName(result.PodName)
+			if err != nil {
+				slog.Warn("VM registration auth: cannot derive VM name from pod",
+					"remote", conn.RemoteAddr().String(),
+					"pod_name", result.PodName,
+					"error", err,
+				)
+				// Still allow registration — VM name will come from exec command.
+			} else {
+				extensions[ExtVMName] = vmName
+			}
 		}
 
 		slog.Info("VM registration auth: SA token validated",
 			"remote", conn.RemoteAddr().String(),
 			"service_account", result.ServiceAccountName,
 			"pod_name", result.PodName,
-			"vm_name", vmName,
+			"vm_name", extensions[ExtVMName],
 		)
 
 		return &ssh.Permissions{
+			Extensions: extensions,
+		}, nil
+	}
+}
+
+// registerNoneAuthCallback returns a NoClientAuthCallback that accepts
+// none-auth only for _register connections. This allows VMs to connect
+// without password auth and pass their SA token via the exec command's
+// --token flag, bypassing OpenSSH's 1023-byte password truncation limit.
+//
+// The token is validated post-connect in the vmcmd handler before any
+// keys are registered, so no unauthenticated state changes occur.
+func registerNoneAuthCallback() func(ssh.ConnMetadata) (*ssh.Permissions, error) {
+	limiter := rate.NewLimiter(20, 40) // 20/s with burst of 40
+	return func(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
+		if conn.User() != "_register" {
+			return nil, fmt.Errorf("none auth not supported for user %q", conn.User())
+		}
+		if !limiter.Allow() {
+			return nil, fmt.Errorf("too many registration attempts")
+		}
+		slog.Debug("none-auth accepted for _register, token will be validated post-connect",
+			"remote", conn.RemoteAddr().String(),
+		)
+		return &ssh.Permissions{
 			Extensions: map[string]string{
 				ExtIdentity: "vm-register",
-				ExtVMName:   vmName,
+				// No ExtVMName — will be provided via --vm-name in exec command.
 			},
 		}, nil
 	}

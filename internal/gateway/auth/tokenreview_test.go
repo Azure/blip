@@ -154,8 +154,11 @@ func TestRegisterPasswordCallback(t *testing.T) {
 			},
 		}
 		cb := registerPasswordCallback(badReviewer, unlimitedLimiter, nil)
-		_, err := cb(fakeConnMeta{user: "_register"}, []byte("some-token"))
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "cannot derive VM name")
+		// A non-virt-launcher pod name is no longer a hard error; the VM
+		// name will be provided via the exec command instead.  Registration
+		// succeeds but without ExtVMName in the permissions.
+		perms, err := cb(fakeConnMeta{user: "_register"}, []byte("some-token"))
+		require.NoError(t, err)
+		assert.Empty(t, perms.Extensions[ExtVMName], "should not set ExtVMName for bad pod name")
 	})
 }

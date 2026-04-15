@@ -56,6 +56,10 @@ type Config struct {
 	// Secrets. Used to store refresh tokens from device flow and to verify
 	// OIDC identity when reconnecting via linked SSH pubkeys.
 	IdentityStore *auth.IdentityStore
+
+	// TokenReviewer validates Kubernetes ServiceAccount tokens for
+	// post-connect validation of _register exec commands. May be nil.
+	TokenReviewer auth.TokenReviewer
 }
 
 // Manager tracks active sessions and handles incoming SSH connections.
@@ -285,22 +289,28 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 	}
 
 	// Inject SSH config and blip CLI shim for recursive blip connections.
+	// This must complete before we bridge client channels, because exec
+	// sessions (e.g. "ssh user@gw 'blip retain ...'") depend on the blip
+	// shim being installed.  Running this asynchronously caused a race
+	// where short-lived exec commands finished (and closed the upstream
+	// connection) before injection completed, yielding rc=127.
 	if !reconnecting && m.cfg.GatewayHost != "" {
-		go func() {
-			if err := proxy.InjectGatewayConfig(
-				upstreamConn,
-				m.cfg.GatewayHost,
-			); err != nil {
-				slog.Warn("failed to inject gateway config",
-					"session_id", sessionID,
-					"error", err,
-				)
-			} else {
-				slog.Info("gateway config injected",
-					"session_id", sessionID,
-				)
-			}
-		}()
+		injectCtx, injectCancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := proxy.InjectGatewayConfig(
+			injectCtx,
+			upstreamConn,
+			m.cfg.GatewayHost,
+		); err != nil {
+			slog.Warn("failed to inject gateway config",
+				"session_id", sessionID,
+				"error", err,
+			)
+		} else {
+			slog.Info("gateway config injected",
+				"session_id", sessionID,
+			)
+		}
+		injectCancel()
 	}
 
 	m.register(sessionID, sess)

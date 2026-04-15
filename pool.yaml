@@ -77,17 +77,20 @@ stringData:
             host_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
             client_key="$(awk '{printf "%s:%s", $1, $2}' /etc/ssh/ssh_client_ed25519_key.pub)"
             sa_token="$(cat "$SA_TOKEN_DIR/token")"
+            vm_name="$(hostname)"
 
+            # Connect with none-auth and pass the SA token in the exec
+            # command. OpenSSH truncates SSH passwords to 1023 bytes but
+            # pod-bound SA tokens are ~1192 bytes, so we pass the token
+            # as a --token argument in the exec channel instead.
             ok=false
             for _ in $(seq 1 10); do
-            	resp=$(sshpass -p "$sa_token" ssh \
-            		-o BatchMode=no \
+            	resp=$(ssh \
             		-o StrictHostKeyChecking=yes \
-            		-o PreferredAuthentications=password \
-            		-o PubkeyAuthentication=no \
+            		-o PreferredAuthentications=none \
             		-o ConnectTimeout=10 \
             		-p 2222 "_register@${GW_HOST}" \
-            		"register-keys --host-key $host_key --client-key $client_key" 2>/dev/null) || true
+            		"register-keys --host-key $host_key --client-key $client_key --vm-name $vm_name --token $sa_token" 2>/dev/null) || true
             	if printf '%s' "$resp" | grep -q '"ok":true'; then ok=true; break; fi
             	sleep 2
             done

@@ -181,6 +181,7 @@ func RunGateway(cfg *GatewayConfig) error {
 		KeepAliveMax:       cfg.KeepAliveMax,
 		AuthWatcher:        authWatcher,
 		IdentityStore:      identityStore,
+		TokenReviewer:      tokenReviewer,
 	})
 
 	// --- Actions poller (optional) ---
