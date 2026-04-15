@@ -46,7 +46,7 @@ func (m *Manager) HandleVMCommand(ctx context.Context, serverConn *ssh.ServerCon
 		return
 	}
 
-	handler := vmcmd.New(m.cfg.VMClient, m.cfg.ExternalHost)
+	handler := vmcmd.New(m.cfg.VMClient, m.cfg.ExternalHost, m.cfg.TokenReviewer)
 
 	for newChan := range chans {
 		if newChan.ChannelType() != "session" {
@@ -120,23 +120,26 @@ func (m *Manager) handleVMCommandChannel(ctx context.Context, ch ssh.Channel, re
 }
 
 // resolveVMName determines the VM name for a VM command connection.
-// For _register connections, the VM name is extracted from the auth
-// extensions (set by SA token validation during the SSH handshake).
+// For _register connections, the VM name is first checked in the auth
+// extensions (set by SA token validation during the SSH handshake when
+// the token is bound to a pod). If not present (e.g. when using an
+// unbound token), the VM name will be resolved later from the exec
+// command's --vm-name flag.
 // For _blip connections (VM client key auth), the VM is identified by
 // its source IP address.
 func (m *Manager) resolveVMName(ctx context.Context, conn *ssh.ServerConn) string {
-	// For _register connections, the token reviewer already validated the
-	// SA token and extracted the VM name from the virt-launcher pod name.
+	// For _register connections, the token reviewer may have set the VM name.
+	// If not (unbound token), return a sentinel so the handler can extract
+	// the VM name from the exec command's --vm-name flag.
 	if conn.User() == VMRegisterUser {
 		if conn.Permissions != nil && conn.Permissions.Extensions != nil {
 			if vmName := conn.Permissions.Extensions[auth.ExtVMName]; vmName != "" {
 				return vmName
 			}
 		}
-		slog.Warn("vm command: _register connection has no VM name in auth extensions",
-			"remote", conn.RemoteAddr().String(),
-		)
-		return ""
+		// Return a sentinel value — the actual VM name will be provided in
+		// the register-keys command via --vm-name.
+		return "_pending"
 	}
 
 	// For _blip connections, resolve by source IP.

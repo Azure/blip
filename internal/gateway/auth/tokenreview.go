@@ -3,7 +3,6 @@ package auth
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 
 	authv1 "k8s.io/api/authentication/v1"
@@ -93,17 +92,18 @@ func (r *KubeTokenReviewer) Review(ctx context.Context, token string) (*TokenRev
 		return nil, fmt.Errorf("token service account %q does not match expected %q", saName, r.expectedSA)
 	}
 
-	// Extract pod name from extra fields.
+	// Extract pod name from extra fields (optional — tokens created via
+	// TokenRequest without pod binding won't have this).
+	var podName string
 	podNames := result.Status.User.Extra["authentication.kubernetes.io/pod-name"]
-	if len(podNames) == 0 {
-		slog.Warn("token review: no pod-name in extra fields", "username", username)
-		return nil, fmt.Errorf("token has no bound pod name")
+	if len(podNames) > 0 {
+		podName = string(podNames[0])
 	}
 
 	return &TokenReviewResult{
 		ServiceAccountName: saName,
 		Namespace:          saNamespace,
-		PodName:            string(podNames[0]),
+		PodName:            podName,
 	}, nil
 }
 

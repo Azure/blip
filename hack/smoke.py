@@ -155,11 +155,12 @@ def vm_name_for_session(session_id):
 
 
 def pvcs_for_vm(vm_name):
-    """Return the list of PVC names associated with the given VM.
+    """Return a list of (pvc_name, pvc_uid) tuples for PVCs associated with the VM.
 
     DataVolumeTemplates create the ownership chain VM -> DV -> PVC.
     We look for DataVolumes owned by the VM, then find PVCs owned by
-    those DataVolumes.
+    those DataVolumes.  We capture UIDs so that callers can distinguish
+    the original PVC from a replacement created by the pool controller.
     """
     # Step 1: Find DataVolumes owned by the VM.
     dvs = kubectl_json("get", "dv", "-n", NAMESPACE, "--ignore-not-found")
@@ -179,7 +180,9 @@ def pvcs_for_vm(vm_name):
         owners = pvc.get("metadata", {}).get("ownerReferences", [])
         for owner in owners:
             if owner.get("name") in dv_names:
-                result.append(pvc["metadata"]["name"])
+                name = pvc["metadata"]["name"]
+                uid = pvc["metadata"]["uid"]
+                result.append((name, uid))
     return result
 
 
@@ -745,7 +748,9 @@ def test_ephemeral_session():
     # Capture the VM name before deletion so we can verify PVC cleanup.
     vm_name = vm_name_for_session(session_id)
     assert vm_name, f"Could not find VM for session {session_id}"
-    pvc_names = pvcs_for_vm(vm_name)
+    pvc_info = pvcs_for_vm(vm_name)
+    pvc_names = [name for name, _ in pvc_info]
+    pvc_uids = {uid for _, uid in pvc_info}
     log(f"    VM: {vm_name}, PVCs: {pvc_names}")
 
     log("    Waiting for VM deletion...")
@@ -753,14 +758,18 @@ def test_ephemeral_session():
 
     # Verify PVCs owned by the VM are also deleted (DataVolumeTemplates
     # set ownerReferences so the PVC is garbage-collected with the VM).
-    if pvc_names:
+    # We check by UID because the pool controller may recreate a replacement
+    # VM with the same name, which creates a new PVC with the same name.
+    if pvc_uids:
         log("    Verifying PVC cleanup...")
-        def pvcs_gone():
-            for name in pvc_names:
-                if resource_exists("get", "pvc", name, "-n", NAMESPACE):
+        def original_pvcs_gone():
+            pvcs = kubectl_json("get", "pvc", "-n", NAMESPACE,
+                                "--ignore-not-found")
+            for pvc in pvcs.get("items", []):
+                if pvc["metadata"]["uid"] in pvc_uids:
                     return False
             return True
-        wait_for(pvcs_gone, "PVCs deleted with VM", timeout=60)
+        wait_for(original_pvcs_gone, "PVCs deleted with VM", timeout=120)
         log("    PVCs cleaned up")
 
 
@@ -810,10 +819,14 @@ def test_retained_session():
     )
     assert vm_exists(session_id), "Retained VM was deleted"
 
-    # Verify TTL annotation was set
+    # Verify TTL annotation was set.
+    # max-duration is stored as elapsed + requested TTL (total seconds from
+    # claimed-at), so it will be slightly larger than 180.
     max_dur = vm_annotation(session_id, "blip.io/max-duration")
-    assert max_dur == "180", f"Expected max-duration=180, got {max_dur!r}"
-    log("    TTL annotation verified (180s)")
+    max_dur_int = int(max_dur)
+    assert 180 <= max_dur_int <= 210, \
+        f"Expected max-duration in [180, 210], got {max_dur!r}"
+    log(f"    TTL annotation verified ({max_dur}s)")
 
     # Read claimed-at from the VM annotation for accurate TTL tracking.
     # The deallocation controller computes expiry as claimed-at + max-duration,

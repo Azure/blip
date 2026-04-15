@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/project-unbounded/blip/internal/gateway/auth"
 	"github.com/project-unbounded/blip/internal/gateway/vm"
 )
 
@@ -23,14 +24,17 @@ import (
 // channels. Commands are authenticated via the VM's client key — the
 // gateway resolves the key to a session and applies the operation.
 type Handler struct {
-	vmClient     *vm.Client
-	externalHost string
+	vmClient      *vm.Client
+	externalHost  string
+	tokenReviewer auth.TokenReviewer // may be nil for _blip connections
 }
 
 // New creates a Handler backed by the given VM client.
 // externalHost is the public gateway hostname shown in reconnect instructions.
-func New(vmClient *vm.Client, externalHost string) *Handler {
-	return &Handler{vmClient: vmClient, externalHost: externalHost}
+// tokenReviewer is optional — when set, register-keys commands from
+// none-auth connections must include a valid --token for post-connect validation.
+func New(vmClient *vm.Client, externalHost string, tokenReviewer auth.TokenReviewer) *Handler {
+	return &Handler{vmClient: vmClient, externalHost: externalHost, tokenReviewer: tokenReviewer}
 }
 
 // registerResponse is the JSON response for a register-keys command.
@@ -128,7 +132,7 @@ func (h *Handler) handleRetain(ctx context.Context, vmName string, args []string
 }
 
 func (h *Handler) handleRegisterKeys(ctx context.Context, vmName string, args []string) ([]byte, int) {
-	var hostKey, clientKey string
+	var hostKey, clientKey, explicitVMName, token string
 	for i := 0; i < len(args); i++ {
 		switch {
 		case args[i] == "--host-key" && i+1 < len(args):
@@ -137,13 +141,46 @@ func (h *Handler) handleRegisterKeys(ctx context.Context, vmName string, args []
 		case args[i] == "--client-key" && i+1 < len(args):
 			clientKey = args[i+1]
 			i++
+		case args[i] == "--vm-name" && i+1 < len(args):
+			explicitVMName = args[i+1]
+			i++
+		case args[i] == "--token" && i+1 < len(args):
+			token = args[i+1]
+			i++
 		case strings.HasPrefix(args[i], "--host-key="):
 			hostKey = strings.TrimPrefix(args[i], "--host-key=")
 		case strings.HasPrefix(args[i], "--client-key="):
 			clientKey = strings.TrimPrefix(args[i], "--client-key=")
+		case strings.HasPrefix(args[i], "--vm-name="):
+			explicitVMName = strings.TrimPrefix(args[i], "--vm-name=")
+		case strings.HasPrefix(args[i], "--token="):
+			token = strings.TrimPrefix(args[i], "--token=")
 		default:
 			return []byte(fmt.Sprintf("error: unknown argument: %s\n", args[i])), 1
 		}
+	}
+
+	// If vmName was not determined during auth (unbound token or none-auth),
+	// use the --vm-name provided in the command.
+	if vmName == "_pending" {
+		if explicitVMName == "" {
+			return []byte("error: --vm-name is required when token is not pod-bound\n"), 1
+		}
+		if token == "" {
+			return []byte("error: --token is required for none-auth registration\n"), 1
+		}
+		// Validate the SA token post-connect.
+		if h.tokenReviewer == nil {
+			return []byte("error: token reviewer not configured\n"), 1
+		}
+		if _, err := h.tokenReviewer.Review(ctx, token); err != nil {
+			slog.Warn("register-keys: post-connect token validation failed",
+				"vm_name", explicitVMName,
+				"error", err,
+			)
+			return []byte(fmt.Sprintf("error: token validation failed: %s\n", err)), 1
+		}
+		vmName = explicitVMName
 	}
 
 	if hostKey == "" || clientKey == "" {

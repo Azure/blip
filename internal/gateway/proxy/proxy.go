@@ -366,7 +366,10 @@ func rejectChannel(ch ssh.NewChannel, err error) {
 // InjectGatewayConfig writes SSH config and a blip CLI shim into the VM.
 // The SSH config enables recursive blip allocation (ssh blip-gateway), and
 // the shim forwards `blip <command>` to the gateway's VM command handler.
-func InjectGatewayConfig(upstream *ssh.Client, gatewayHost string) error {
+//
+// The context controls the overall deadline; if it expires the underlying
+// SSH session is closed so the call does not block indefinitely.
+func InjectGatewayConfig(ctx context.Context, upstream *ssh.Client, gatewayHost string) error {
 	if err := validateShellSafe(gatewayHost); err != nil {
 		return fmt.Errorf("invalid gateway host: %w", err)
 	}
@@ -376,6 +379,12 @@ func InjectGatewayConfig(upstream *ssh.Client, gatewayHost string) error {
 		return fmt.Errorf("open session for gateway config injection: %w", err)
 	}
 	defer session.Close()
+
+	// If the context is cancelled, close the session so Run() unblocks.
+	go func() {
+		<-ctx.Done()
+		session.Close()
+	}()
 
 	script := fmt.Sprintf(`#!/bin/sh
 set -e
@@ -400,6 +409,10 @@ sudo chmod 755 /usr/local/bin/blip
 `, gatewayHost)
 
 	if err := session.Run(script); err != nil {
+		// If the context expired, report the context error instead.
+		if ctx.Err() != nil {
+			return fmt.Errorf("inject gateway config script: %w", ctx.Err())
+		}
 		return fmt.Errorf("inject gateway config script: %w", err)
 	}
 	return nil
