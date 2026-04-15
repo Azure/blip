@@ -33,6 +33,10 @@ const (
 	// KeyAllowedPubkeys holds explicitly allowed SSH public keys
 	// (one key per line in authorized_keys format).
 	KeyAllowedPubkeys = "allowed-pubkeys"
+
+	// KeyActionsRepos holds the list of GitHub repositories to poll for
+	// queued workflow jobs (one owner/repo per line).
+	KeyActionsRepos = "actions-repos"
 )
 
 // AuthWatcher watches a ConfigMap for OIDC provider configuration and
@@ -50,6 +54,7 @@ type AuthWatcher struct {
 	mu            sync.RWMutex
 	oidcProviders []OIDCProviderConfig
 	pubkeys       map[string]string // SHA256 fingerprint -> comment (username)
+	actionsRepos  []string
 }
 
 // NewAuthWatcher creates an AuthWatcher that watches the named ConfigMap.
@@ -164,6 +169,16 @@ func (w *AuthWatcher) allowedPubkeyCount() int {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return len(w.pubkeys)
+}
+
+// ActionsRepos returns a copy of the current list of repos to poll for
+// queued GitHub Actions workflow jobs.
+func (w *AuthWatcher) ActionsRepos() []string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	result := make([]string, len(w.actionsRepos))
+	copy(result, w.actionsRepos)
+	return result
 }
 
 // DeviceFlowProviders returns the subset of OIDC providers that have device
@@ -328,10 +343,12 @@ func (w *AuthWatcher) reload(ctx context.Context) {
 
 	providers := parseOIDCProviders(cm.Data[KeyOIDCProviders])
 	pubkeys := parsePubkeyList(cm.Data[KeyAllowedPubkeys])
+	repos := parseActionsRepos(cm.Data[KeyActionsRepos])
 
 	w.mu.Lock()
 	w.oidcProviders = providers
 	w.pubkeys = pubkeys
+	w.actionsRepos = repos
 	w.mu.Unlock()
 
 	// Evict cached OIDC providers that are no longer in the active set.
@@ -347,6 +364,7 @@ func (w *AuthWatcher) reload(ctx context.Context) {
 		"configmap", w.name,
 		"oidc_providers", issuers,
 		"allowed_pubkey_count", len(pubkeys),
+		"actions_repos_count", len(repos),
 	)
 }
 
@@ -470,6 +488,19 @@ func parsePubkeyList(raw string) map[string]string {
 	return fps
 }
 
+// parseActionsRepos parses a newline-delimited list of owner/repo strings.
+func parseActionsRepos(raw string) []string {
+	var repos []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		repos = append(repos, line)
+	}
+	return repos
+}
+
 // NewTestAuthWatcher creates an AuthWatcher pre-loaded with the given OIDC
 // providers and pubkey fingerprints (fingerprint -> comment), without starting
 // an informer cache. Intended for use in tests outside of this package.
@@ -478,6 +509,14 @@ func NewTestAuthWatcher(providers []OIDCProviderConfig, pubkeyFingerprints map[s
 		pubkeyFingerprints = make(map[string]string)
 	}
 	return &AuthWatcher{oidcProviders: providers, pubkeys: pubkeyFingerprints}
+}
+
+// NewTestAuthWatcherWithRepos is like NewTestAuthWatcher but also sets the
+// actions-repos list.
+func NewTestAuthWatcherWithRepos(providers []OIDCProviderConfig, pubkeyFingerprints map[string]string, repos []string) *AuthWatcher {
+	w := NewTestAuthWatcher(providers, pubkeyFingerprints)
+	w.actionsRepos = repos
+	return w
 }
 
 func newCoreRESTMapper() meta.RESTMapper {
