@@ -1,4 +1,4 @@
-package webhook
+package ghactions
 
 import (
 	"context"
@@ -281,11 +281,9 @@ func TestPoller_DuplicateIsIdempotent(t *testing.T) {
 	store := &mockConfigStore{}
 	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	// First poll.
 	p.poll(context.Background())
 	p.WaitForPending()
 
-	// Second poll (same job still queued).
 	p.poll(context.Background())
 	p.WaitForPending()
 
@@ -395,7 +393,6 @@ func TestPoller_Reconciliation(t *testing.T) {
 	store := &mockConfigStore{}
 	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	// Poll to claim.
 	p.poll(context.Background())
 	p.WaitForPending()
 	assert.Equal(t, 1, p.ActiveSessionCount())
@@ -405,7 +402,6 @@ func TestPoller_Reconciliation(t *testing.T) {
 	jobs.jobs["org/repo"] = nil
 	jobs.mu.Unlock()
 
-	// Next poll should reconcile and release.
 	p.poll(context.Background())
 	p.WaitForPending()
 
@@ -417,11 +413,9 @@ func TestPoller_Reconciliation(t *testing.T) {
 }
 
 func TestPoller_Reconciliation_SkipsInFlightSessions(t *testing.T) {
-	// Sessions with empty sentinel (still setting up) should not be reconciled.
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
-	// Use a blocking token provider to keep the session in-flight.
 	tokenReady := make(chan struct{})
 	tokenProceed := make(chan struct{})
 	tokens := &blockingTokenProvider{
@@ -452,26 +446,23 @@ func TestPoller_Reconciliation_SkipsInFlightSessions(t *testing.T) {
 	p.poll(context.Background())
 	<-tokenReady
 
-	// Remove the job from the queue and poll again.
-	// The session has an empty sentinel, so reconciliation should skip it.
+	// Remove the job and poll again. In-flight session should be skipped.
 	jobs.mu.Lock()
 	jobs.jobs["org/repo"] = nil
 	jobs.mu.Unlock()
 
 	p.poll(context.Background())
 
-	// Session should still be tracked (not reconciled away).
 	assert.Equal(t, 1, p.ActiveSessionCount())
 
 	// Let setup complete.
 	close(tokenProceed)
 	p.WaitForPending()
 
-	// Now a third poll should reconcile it (job still not in queue, session is fully set up).
+	// Now reconciliation should clean it up.
 	p.poll(context.Background())
 
 	claimer.mu.Lock()
-	// One release from reconciliation.
 	assert.Len(t, claimer.releasedSessions, 1)
 	claimer.mu.Unlock()
 	assert.Equal(t, 0, p.ActiveSessionCount())
@@ -529,7 +520,6 @@ func TestPoller_ConcurrentDuplicates(t *testing.T) {
 	store := &mockConfigStore{}
 	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	// Fire 10 concurrent polls.
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Add(1)
@@ -620,8 +610,6 @@ func TestPoller_ListJobsError(t *testing.T) {
 }
 
 func TestPoller_ListJobsError_SkipsReconciliation(t *testing.T) {
-	// Existing sessions must survive when ListQueuedJobs fails, because
-	// the incomplete job list could cause false reconciliation.
 	claimer := &mockVMClaimer{
 		claimResult: &vm.ClaimResult{Name: "vm-1", PodIP: "10.0.0.1"},
 	}
@@ -636,21 +624,17 @@ func TestPoller_ListJobsError_SkipsReconciliation(t *testing.T) {
 	store := &mockConfigStore{}
 	p := newTestPoller(claimer, tokens, jobs, store, []string{"org/repo"})
 
-	// First poll: claim a VM.
 	p.poll(context.Background())
 	p.WaitForPending()
 	assert.Equal(t, 1, p.ActiveSessionCount())
 
-	// Make listing fail on next poll.
 	jobs.mu.Lock()
 	jobs.err = fmt.Errorf("transient API error")
 	jobs.mu.Unlock()
 
-	// Second poll: listing fails, reconciliation should be skipped.
 	p.poll(context.Background())
 	p.WaitForPending()
 
-	// Session must still be active — not falsely reconciled.
 	assert.Equal(t, 1, p.ActiveSessionCount())
 	claimer.mu.Lock()
 	assert.Empty(t, claimer.releasedSessions, "should not release sessions when listing fails")
