@@ -18,6 +18,7 @@ import (
 
 	"github.com/project-unbounded/blip/internal/controllers/deallocation"
 	"github.com/project-unbounded/blip/internal/controllers/keygen"
+	"github.com/project-unbounded/blip/internal/controllers/tlscert"
 )
 
 func main() {
@@ -33,10 +34,11 @@ func main() {
 
 func newRootCmd() *cobra.Command {
 	var (
-		namespace      string
-		poolName       string
-		leaseNamespace string
-		leaseName      string
+		namespace       string
+		poolName        string
+		leaseNamespace  string
+		leaseName       string
+		gatewayHostname string
 	)
 
 	cmd := &cobra.Command{
@@ -47,7 +49,7 @@ func newRootCmd() *cobra.Command {
 			if !cmd.Flags().Changed("lease-namespace") {
 				leaseNamespace = namespace
 			}
-			return run(namespace, poolName, leaseNamespace, leaseName)
+			return run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname)
 		},
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -57,6 +59,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&poolName, "pool-name", envOrDefault("VM_POOL_NAME", "default"), "Blip pool name (env: VM_POOL_NAME)")
 	cmd.Flags().StringVar(&leaseNamespace, "lease-namespace", envOrDefault("LEASE_NAMESPACE", ""), "Namespace for leader election lease; defaults to --namespace (env: LEASE_NAMESPACE)")
 	cmd.Flags().StringVar(&leaseName, "lease-name", envOrDefault("LEASE_NAME", "blip-controller"), "Name of the leader election lease (env: LEASE_NAME)")
+	cmd.Flags().StringVar(&gatewayHostname, "gateway-hostname", envOrDefault("GATEWAY_HOSTNAME", ""), "Gateway hostname for TLS certificate generation (env: GATEWAY_HOSTNAME)")
 
 	return cmd
 }
@@ -68,7 +71,7 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-func run(namespace, poolName, leaseNamespace, leaseName string) error {
+func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname string) error {
 	s, err := newScheme()
 	if err != nil {
 		return fmt.Errorf("create scheme: %w", err)
@@ -81,7 +84,8 @@ func run(namespace, poolName, leaseNamespace, leaseName string) error {
 		Scheme: s,
 		Cache: cache.Options{
 			DefaultNamespaces: map[string]cache.Config{
-				namespace: {},
+				namespace:               {},
+				tlscert.PublicNamespace: {},
 			},
 		},
 		Metrics: metricsserver.Options{
@@ -107,6 +111,12 @@ func run(namespace, poolName, leaseNamespace, leaseName string) error {
 	err = keygen.Add(mgr, namespace)
 	if err != nil {
 		return fmt.Errorf("adding keygen controller: %w", err)
+	}
+
+	if gatewayHostname != "" {
+		if err := tlscert.Add(mgr, namespace, gatewayHostname); err != nil {
+			return fmt.Errorf("adding tlscert controller: %w", err)
+		}
 	}
 
 	err = deallocation.Add(mgr, namespace, poolName)
