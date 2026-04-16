@@ -59,6 +59,11 @@ type GatewayConfig struct {
 	// checks. Default: ":8080".
 	HTTPListenAddr string
 
+	// HTTPS is the optional configuration for the HTTPS API server.
+	// When non-nil, the gateway starts an additional TLS listener with
+	// OIDC-authenticated endpoints.
+	HTTPS *HTTPSConfig
+
 	// Actions configures the GitHub Actions polling handler. When nil (or
 	// GitHubAppID is 0), Actions polling is disabled.
 	Actions *ActionsConfig
@@ -362,6 +367,29 @@ func RunGateway(cfg *GatewayConfig) error {
 	case <-time.After(50 * time.Millisecond):
 	}
 
+	// Start HTTPS API server in background (optional).
+	var httpsServer *http.Server
+	if cfg.HTTPS != nil {
+		var err error
+		httpsServer, err = NewHTTPSServer(ctx, *cfg.HTTPS, vmcl.Cache())
+		if err != nil {
+			return fmt.Errorf("create HTTPS server: %w", err)
+		}
+		httpsErrCh := StartHTTPSServer(httpsServer)
+		select {
+		case err := <-httpsErrCh:
+			return fmt.Errorf("HTTPS server failed to start: %w", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		// Monitor for runtime errors.
+		go func() {
+			if err, ok := <-httpsErrCh; ok {
+				slog.Error("https server error", "error", err)
+			}
+		}()
+		slog.Info("https api server started", "addr", cfg.HTTPS.Addr)
+	}
+
 	// Start actions poller in background.
 	if actionsPoller != nil {
 		go actionsPoller.Run(ctx)
@@ -405,6 +433,10 @@ func RunGateway(cfg *GatewayConfig) error {
 		defer httpShutdownCancel()
 		if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
 			slog.Error("HTTP server shutdown error", "error", err)
+		}
+
+		if httpsServer != nil {
+			ShutdownHTTPSServer(httpsServer)
 		}
 
 		// Drain in-flight poller/listener goroutines.

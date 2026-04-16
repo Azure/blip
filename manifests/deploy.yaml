@@ -389,6 +389,8 @@ spec:
           name: ssh
         - containerPort: 8080
           name: http
+        - containerPort: 8443
+          name: https
         env:
         - name: MAX_SESSION_DURATION
           value: "3600"
@@ -416,6 +418,13 @@ spec:
           value: "/etc/blip/client-key/client_key"
         - name: VM_REGISTER_SA
           value: "vm-register"
+        # HTTPS API server (optional, uncomment to enable):
+        # - name: OIDC_ISSUER_URL
+        #   value: "https://accounts.google.com"
+        # - name: OIDC_AUDIENCE
+        #   value: "blip"
+        # - name: TLS_SECRET_NAME
+        #   value: "gateway-tls-key"
         # GitHub Actions polling integration (optional).
         # Uncomment and set these to enable the Actions runner poller:
         # - name: GITHUB_APP_ID
@@ -511,6 +520,10 @@ spec:
     targetPort: 2222
     protocol: TCP
     name: ssh-internal
+  - port: 443
+    targetPort: 8443
+    protocol: TCP
+    name: https
   # Uncomment to expose the HTTP health/readiness endpoints externally:
   # - port: 8080
   #   targetPort: 8080

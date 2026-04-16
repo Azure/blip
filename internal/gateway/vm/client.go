@@ -61,6 +61,11 @@ type Client struct {
 // same client rather than creating a separate one.
 func (c *Client) Writer() client.Client { return c.writer }
 
+// Cache returns the underlying informer cache. This allows other components
+// to watch additional resource types (e.g. Secrets) without creating a
+// separate cache.
+func (c *Client) Cache() crcache.Cache { return c.cache }
+
 // New creates a Client backed by an in-cluster informer cache scoped to the given namespace.
 func New(ctx context.Context, namespace string) (*Client, error) {
 	cfg, err := rest.InClusterConfig()

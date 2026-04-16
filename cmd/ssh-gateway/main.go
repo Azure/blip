@@ -42,6 +42,12 @@ func newRootCmd() *cobra.Command {
 		// HTTP server for health checks.
 		httpListenAddr string
 
+		// HTTPS API server (optional, enabled when --oidc-issuer-url is set).
+		httpsListenAddr string
+		tlsSecretName   string
+		oidcIssuerURL   string
+		oidcAudience    string
+
 		// GitHub Actions polling integration (optional).
 		githubAppID            int64
 		githubInstallID        int64
@@ -90,6 +96,23 @@ func newRootCmd() *cobra.Command {
 				KeepAliveInterval:  60 * time.Second,
 				KeepAliveMax:       3,
 				HTTPListenAddr:     httpListenAddr,
+			}
+
+			// Enable HTTPS API server if OIDC issuer is configured.
+			if oidcIssuerURL != "" {
+				if tlsSecretName == "" {
+					return fmt.Errorf("--tls-secret-name is required when --oidc-issuer-url is set")
+				}
+				if oidcAudience == "" {
+					return fmt.Errorf("--oidc-audience is required when --oidc-issuer-url is set")
+				}
+				cfg.HTTPS = &sshgw.HTTPSConfig{
+					Addr:               httpsListenAddr,
+					TLSSecretName:      tlsSecretName,
+					TLSSecretNamespace: vmNamespace,
+					OIDCIssuerURL:      oidcIssuerURL,
+					OIDCAudience:       oidcAudience,
+				}
 			}
 
 			// Enable GitHub Actions polling integration if configured.
@@ -160,6 +183,12 @@ func newRootCmd() *cobra.Command {
 
 	// HTTP server flags.
 	cmd.Flags().StringVar(&httpListenAddr, "http-address", envOrDefault("HTTP_ADDRESS", ":8080"), "HTTP address for health checks (env: HTTP_ADDRESS)")
+
+	// HTTPS API server flags (optional, enabled when --oidc-issuer-url is set).
+	cmd.Flags().StringVar(&httpsListenAddr, "https-address", envOrDefault("HTTPS_ADDRESS", ":8443"), "HTTPS address for the API server (env: HTTPS_ADDRESS)")
+	cmd.Flags().StringVar(&tlsSecretName, "tls-secret-name", envOrDefault("TLS_SECRET_NAME", "gateway-tls-key"), "Kubernetes Secret containing tls.crt and tls.key (env: TLS_SECRET_NAME)")
+	cmd.Flags().StringVar(&oidcIssuerURL, "oidc-issuer-url", envOrDefault("OIDC_ISSUER_URL", ""), "Trusted OIDC issuer URL for API authentication (env: OIDC_ISSUER_URL)")
+	cmd.Flags().StringVar(&oidcAudience, "oidc-audience", envOrDefault("OIDC_AUDIENCE", ""), "Expected OIDC audience claim (env: OIDC_AUDIENCE)")
 
 	// GitHub Actions polling flags (optional).
 	cmd.Flags().Int64Var(&githubAppID, "github-app-id", envOrDefaultInt64("GITHUB_APP_ID", 0), "GitHub App ID for Actions polling integration (env: GITHUB_APP_ID)")

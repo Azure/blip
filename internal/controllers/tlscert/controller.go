@@ -48,7 +48,8 @@ const (
 	retryInterval = 30 * time.Second
 
 	// Secret data keys.
-	keyDataKey = "tls.key"
+	keyDataKey  = "tls.key"
+	certDataKey = "tls.crt"
 
 	// ConfigMap data keys.
 	activeCertKey   = "active.crt"
@@ -127,9 +128,9 @@ func (r *certRotator) reconcile(ctx context.Context) error {
 		return fmt.Errorf("generate self-signed cert: %w", err)
 	}
 
-	// Write private key to Secret in blip namespace. We always overwrite to
-	// match the freshly generated certificate.
-	if err := r.writeSecret(ctx, keyPEM); err != nil {
+	// Write private key and certificate to Secret in blip namespace.
+	// Both are written atomically so the gateway always sees a matching pair.
+	if err := r.writeSecret(ctx, keyPEM, certPEM); err != nil {
 		return err
 	}
 
@@ -162,7 +163,8 @@ func (r *certRotator) reconcile(ctx context.Context) error {
 	return nil
 }
 
-func (r *certRotator) writeSecret(ctx context.Context, keyPEM []byte) error {
+func (r *certRotator) writeSecret(ctx context.Context, keyPEM, certPEM []byte) error {
+	data := map[string][]byte{keyDataKey: keyPEM, certDataKey: certPEM}
 	var existing corev1.Secret
 	err := r.cl.Get(ctx, client.ObjectKey{Namespace: r.namespace, Name: SecretName}, &existing)
 	if k8serrors.IsNotFound(err) {
@@ -171,7 +173,7 @@ func (r *certRotator) writeSecret(ctx context.Context, keyPEM []byte) error {
 				Namespace: r.namespace,
 				Name:      SecretName,
 			},
-			Data: map[string][]byte{keyDataKey: keyPEM},
+			Data: data,
 		}
 		if err := r.cl.Create(ctx, secret); err != nil {
 			if k8serrors.IsAlreadyExists(err) {
@@ -179,7 +181,7 @@ func (r *certRotator) writeSecret(ctx context.Context, keyPEM []byte) error {
 				if err := r.cl.Get(ctx, client.ObjectKey{Namespace: r.namespace, Name: SecretName}, &existing); err != nil {
 					return fmt.Errorf("get secret after race: %w", err)
 				}
-				existing.Data = map[string][]byte{keyDataKey: keyPEM}
+				existing.Data = data
 				return r.cl.Update(ctx, &existing)
 			}
 			return fmt.Errorf("create secret %s: %w", SecretName, err)
@@ -190,7 +192,7 @@ func (r *certRotator) writeSecret(ctx context.Context, keyPEM []byte) error {
 		return fmt.Errorf("get secret %s: %w", SecretName, err)
 	}
 
-	existing.Data = map[string][]byte{keyDataKey: keyPEM}
+	existing.Data = data
 	if err := r.cl.Update(ctx, &existing); err != nil {
 		return fmt.Errorf("update secret %s: %w", SecretName, err)
 	}
