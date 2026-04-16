@@ -67,7 +67,10 @@ func (r *controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		if remaining := timeUntilExpiry(&vm); remaining > 0 {
 			return reconcile.Result{RequeueAfter: remaining}, nil
 		}
-		return reconcile.Result{}, nil
+		// Claimed VM with missing or unparseable TTL annotations.
+		// Requeue periodically so it can be cleaned up if annotations
+		// are fixed, or detected as orphaned.
+		return reconcile.Result{RequeueAfter: 60 * time.Second}, nil
 	}
 
 	slog.Info("deleting blip",
