@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	sshgw "github.com/project-unbounded/blip/internal/gateway"
+	"github.com/project-unbounded/blip/internal/gateway/vm"
 )
 
 func main() {
@@ -78,6 +79,14 @@ func newRootCmd() *cobra.Command {
 				return fmt.Errorf("--client-key-path must be set (path to stable client key shared across replicas)")
 			}
 
+			// Create the shared controller-runtime Kubernetes clients.
+			// These are passed into GatewayConfig so that both the VM client
+			// and the HTTPS API server can share the same writer and cache.
+			kubeWriter, kubeCache, err := vm.NewKubeClients(vmNamespace)
+			if err != nil {
+				return fmt.Errorf("create kubernetes clients: %w", err)
+			}
+
 			cfg := &sshgw.GatewayConfig{
 				ListenAddr:         listenAddr,
 				HostKeyPath:        hostKeyPath,
@@ -96,6 +105,8 @@ func newRootCmd() *cobra.Command {
 				KeepAliveInterval:  60 * time.Second,
 				KeepAliveMax:       3,
 				HTTPListenAddr:     httpListenAddr,
+				KubeWriter:         kubeWriter,
+				KubeCache:          kubeCache,
 			}
 
 			// Enable HTTPS API server if OIDC issuer is configured.

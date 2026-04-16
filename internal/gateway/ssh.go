@@ -19,6 +19,9 @@ import (
 	"github.com/project-unbounded/blip/internal/gateway/session"
 	"github.com/project-unbounded/blip/internal/gateway/vm"
 	"github.com/project-unbounded/blip/internal/ghactions"
+
+	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type GatewayConfig struct {
@@ -71,6 +74,16 @@ type GatewayConfig struct {
 	// ScaleSet configures the GitHub Actions scale set listener. When nil,
 	// scale set mode is disabled. Mutually exclusive with Actions.
 	ScaleSet *ScaleSetConfig
+
+	// KubeWriter is the controller-runtime client used for Kubernetes write
+	// operations. It is created by vm.NewKubeClients in main and shared
+	// across components.
+	KubeWriter client.Client
+
+	// KubeCache is the controller-runtime informer cache. It is created by
+	// vm.NewKubeClients in main and shared across components (e.g. the VM
+	// client and the HTTPS API server).
+	KubeCache crcache.Cache
 }
 
 // ActionsConfig holds the configuration for the GitHub Actions polling
@@ -149,7 +162,7 @@ func RunGateway(cfg *GatewayConfig) error {
 		}
 	}
 
-	vmcl, err := vm.New(ctx, cfg.VMNamespace)
+	vmcl, err := vm.New(ctx, cfg.KubeWriter, cfg.KubeCache, cfg.VMNamespace)
 	if err != nil {
 		return fmt.Errorf("create k8s client: %w", err)
 	}
@@ -237,7 +250,7 @@ func RunGateway(cfg *GatewayConfig) error {
 			return fmt.Errorf("create GitHub client: %w", err)
 		}
 
-		annotator := ghactions.NewVMAnnotator(vmcl.Writer(), cfg.VMNamespace)
+		annotator := ghactions.NewVMAnnotator(cfg.KubeWriter, cfg.VMNamespace)
 
 		actionsMaxDuration := cfg.Actions.MaxSessionDuration
 		if actionsMaxDuration <= 0 {
@@ -293,7 +306,7 @@ func RunGateway(cfg *GatewayConfig) error {
 			return fmt.Errorf("get or create scale set: %w", err)
 		}
 
-		annotator := ghactions.NewVMAnnotator(vmcl.Writer(), cfg.VMNamespace)
+		annotator := ghactions.NewVMAnnotator(cfg.KubeWriter, cfg.VMNamespace)
 
 		actionsListener = ghactions.NewListener(ghactions.ListenerConfig{
 			Client:            ssClient,
@@ -371,7 +384,7 @@ func RunGateway(cfg *GatewayConfig) error {
 	var httpsServer *http.Server
 	if cfg.HTTPS != nil {
 		var err error
-		httpsServer, err = NewHTTPSServer(ctx, *cfg.HTTPS, vmcl.Cache())
+		httpsServer, err = NewHTTPSServer(ctx, *cfg.HTTPS, cfg.KubeCache)
 		if err != nil {
 			return fmt.Errorf("create HTTPS server: %w", err)
 		}
