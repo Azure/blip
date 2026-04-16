@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -88,7 +89,7 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 	})
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /auth/user", authHandler(userVerifier))
+	mux.Handle("POST /auth/user", authHandler(userVerifier, kubeWriter, namespace))
 	mux.Handle("POST /auth/github", githubAuthHandler(ghVerifier, cfg.GitHubAllowedOrgs, kubeWriter, namespace))
 
 	tlsCfg := &tls.Config{
@@ -110,16 +111,137 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 	return srv, nil
 }
 
-// authHandler returns a handler that authenticates an OIDC bearer token
-// using the given verifier. On success it returns the verified subject
-// as JSON.
-func authHandler(verifier *oidc.IDTokenVerifier) http.Handler {
+// authHandler returns a handler for POST /auth/user that:
+//  1. Verifies an OIDC bearer token from the Authorization header.
+//  2. Extracts the user ID (subject) and TTL (token expiry) from the token.
+//  3. Reads the SSH public key from the "pubkey" form value.
+//  4. Creates or updates a ConfigMap named "user-<hash>" (8-char truncated
+//     SHA-256 of the subject) in the given namespace, storing the public key
+//     and labelled with the user identity. The ConfigMap is annotated with an
+//     expiration timestamp derived from the token's expiry, so the sshpubkey
+//     controller will garbage-collect it after the token expires.
+//
+// This integrates with the AuthWatcher (which watches ConfigMaps with the
+// blip.azure.com/user label) to dynamically authorize SSH connections for
+// OIDC-authenticated users.
+func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, namespace string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		subject, ok := verifyBearer(w, r, verifier)
+		idToken, ok := verifyBearerToken(w, r, verifier)
 		if !ok {
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"subject": subject})
+
+		// Limit request body to 64 KiB to prevent memory exhaustion.
+		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
+		pubkey := r.FormValue("pubkey")
+		if pubkey == "" {
+			writeJSONError(w, http.StatusBadRequest, "missing required form value: pubkey")
+			return
+		}
+
+		// Validate the pubkey is a well-formed SSH public key.
+		if _, err := parsePubkeyString(pubkey); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid SSH public key: %v", err))
+			return
+		}
+
+		subject := idToken.Subject
+		if subject == "" {
+			writeJSONError(w, http.StatusUnauthorized, "token has empty subject claim")
+			return
+		}
+
+		// Use the token's expiry as the session TTL. If the token has no
+		// expiry (zero value), reject the request since we need a finite TTL.
+		if idToken.Expiry.IsZero() {
+			writeJSONError(w, http.StatusBadRequest, "token has no expiry claim")
+			return
+		}
+		expiration := idToken.Expiry
+
+		// Compute ConfigMap name: user-<first 8 chars of SHA-256 of subject>.
+		subjectHash := sha256.Sum256([]byte(subject))
+		cmName := "user-" + hex.EncodeToString(subjectHash[:])[:8]
+
+		// Sanitize subject for use as a Kubernetes label value (max 63 chars,
+		// must match [a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?).
+		labelValue := sanitizeLabelValue(subject)
+		if labelValue == "" {
+			slog.Error("OIDC subject produced empty label value", "subject", subject)
+			writeJSONError(w, http.StatusBadRequest, "token subject cannot be used as a user identity")
+			return
+		}
+
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      cmName,
+				Namespace: namespace,
+				Labels: map[string]string{
+					"blip.azure.com/user": labelValue,
+				},
+				Annotations: map[string]string{
+					"blip.azure.com/expiration": expiration.UTC().Format(time.RFC3339),
+					"blip.azure.com/subject":    subject,
+				},
+			},
+			Data: map[string]string{
+				"pubkey": pubkey,
+			},
+		}
+
+		// Create or update the ConfigMap. Handle the race where a concurrent
+		// request creates the ConfigMap between our Get and Create by falling
+		// back to an update on AlreadyExists.
+		existing := &corev1.ConfigMap{}
+		err := kubeWriter.Get(r.Context(), client.ObjectKey{Namespace: namespace, Name: cmName}, existing)
+		if k8serrors.IsNotFound(err) {
+			if createErr := kubeWriter.Create(r.Context(), cm); createErr != nil {
+				if !k8serrors.IsAlreadyExists(createErr) {
+					slog.Error("failed to create user pubkey configmap", "error", createErr, "configmap", cmName)
+					writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
+					return
+				}
+				// Lost the race — re-fetch and update.
+				if err := kubeWriter.Get(r.Context(), client.ObjectKey{Namespace: namespace, Name: cmName}, existing); err != nil {
+					slog.Error("failed to re-fetch user pubkey configmap after conflict", "error", err, "configmap", cmName)
+					writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
+					return
+				}
+				existing.Labels = cm.Labels
+				existing.Annotations = cm.Annotations
+				existing.Data = cm.Data
+				if err := kubeWriter.Update(r.Context(), existing); err != nil {
+					slog.Error("failed to update user pubkey configmap after conflict", "error", err, "configmap", cmName)
+					writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
+					return
+				}
+			}
+		} else if err != nil {
+			slog.Error("failed to get user pubkey configmap", "error", err, "configmap", cmName)
+			writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
+			return
+		} else {
+			existing.Labels = cm.Labels
+			existing.Annotations = cm.Annotations
+			existing.Data = cm.Data
+			if err := kubeWriter.Update(r.Context(), existing); err != nil {
+				slog.Error("failed to update user pubkey configmap", "error", err, "configmap", cmName)
+				writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
+				return
+			}
+		}
+
+		slog.Info("user pubkey stored",
+			"subject", subject,
+			"configmap", cmName,
+			"expiration", expiration.UTC().Format(time.RFC3339),
+		)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"subject":    subject,
+			"configmap":  cmName,
+			"expiration": expiration.UTC().Format(time.RFC3339),
+		})
 	})
 }
 
@@ -242,24 +364,65 @@ func githubAuthHandler(verifier *oidc.IDTokenVerifier, allowedOrgs []string, kub
 	})
 }
 
-// verifyBearer extracts and verifies a bearer token from the request.
-// On success it returns the token subject. On failure it writes an
+// verifyBearerToken extracts and verifies a bearer token from the request.
+// On success it returns the verified IDToken. On failure it writes an
 // appropriate error response and returns ok=false.
-func verifyBearer(w http.ResponseWriter, r *http.Request, verifier *oidc.IDTokenVerifier) (subject string, ok bool) {
+func verifyBearerToken(w http.ResponseWriter, r *http.Request, verifier *oidc.IDTokenVerifier) (idToken *oidc.IDToken, ok bool) {
 	token, found := parseBearerToken(r)
 	if !found {
 		writeJSONError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
-		return "", false
+		return nil, false
 	}
 
 	idToken, err := verifier.Verify(r.Context(), token)
 	if err != nil {
 		slog.Debug("oidc token verification failed", "error", err)
 		writeJSONError(w, http.StatusUnauthorized, "invalid token")
-		return "", false
+		return nil, false
 	}
 
-	return idToken.Subject, true
+	return idToken, true
+}
+
+// parsePubkeyString validates that s is a well-formed SSH public key in
+// authorized_keys format. It returns the parsed fingerprint or an error.
+func parsePubkeyString(s string) (string, error) {
+	line := strings.TrimSpace(s)
+	if line == "" {
+		return "", fmt.Errorf("empty key")
+	}
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+	if err != nil {
+		return "", fmt.Errorf("parse SSH public key: %w", err)
+	}
+	return ssh.FingerprintSHA256(pub), nil
+}
+
+// sanitizeLabelValue sanitizes a string for use as a Kubernetes label value.
+// Label values must be at most 63 characters and match the regex
+// [a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])? (or be empty).
+func sanitizeLabelValue(s string) string {
+	// Replace characters not in [a-zA-Z0-9._-] with underscores.
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	result := b.String()
+
+	// Truncate to 63 characters.
+	if len(result) > 63 {
+		result = result[:63]
+	}
+
+	// Trim leading/trailing non-alphanumeric characters.
+	result = strings.TrimLeft(result, "._-")
+	result = strings.TrimRight(result, "._-")
+
+	return result
 }
 
 // parseBearerToken extracts the token from an "Authorization: Bearer <token>"
