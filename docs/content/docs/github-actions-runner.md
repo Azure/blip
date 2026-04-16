@@ -9,8 +9,8 @@ weight: 6
 1. A GitHub PAT is stored in a Kubernetes Secret and watched by the gateway.
 2. The actions runner backend polls for queued workflow jobs in configured repositories.
 3. Each poll uses the PAT to list queued jobs and match them against configured runner labels.
-4. For each matched job, the gateway claims a VM, generates a JIT runner config via GitHub API, and patches it onto the VM as the `blip.io/runner-jitconfig` annotation.
-5. The in-VM runner agent polls for this annotation and starts with `./run.sh --jitconfig <config>`.
+4. For each matched job, the controller claims a VM and annotates it with the target repository and job ID.
+5. The runner-config controller detects the annotations, generates a JIT runner config via the GitHub API, SSHes into the VM, and starts the runner with `./run.sh --jitconfig <config>`.
 6. On job completion, the VM is released.
 
 ## Prerequisites
@@ -89,10 +89,7 @@ Matching is case-insensitive. A job is picked up if at least one label matches a
 
 ## VM image
 
-The VM's cloud-init script must:
-
-1. Poll for the `blip.io/runner-jitconfig` annotation on the VM (via the Kubernetes API using the pod-mounted service account).
-2. When the annotation appears, start the runner with `./run.sh --jitconfig <config>`.
+The VM's cloud-init script must install the GitHub Actions runner agent under `/home/runner/actions-runner/`. The runner-config controller will SSH into the VM to deliver the JIT config and start the runner process — no in-VM polling or annotation watching is required.
 
 The JIT config is sealed and ephemeral — no registration tokens or repository URLs needed.
 
@@ -100,6 +97,7 @@ See `images/github-runner/Containerfile` for a reference implementation.
 
 ## Security
 
+- JIT runner configs are delivered over SSH and never stored in Kubernetes annotations or on disk.
 - JIT runner configs are sealed by GitHub and single-use.
 - Runner VMs are hard-capped at 30 minutes (`runnerMaxTTL`).
 - Duplicate job sightings are deduplicated — only one VM per job.
