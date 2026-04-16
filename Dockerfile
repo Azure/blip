@@ -4,7 +4,6 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 FROM deps AS build-ssh-gateway
-COPY api/ api/
 COPY internal/ internal/
 COPY cmd/ssh-gateway/ cmd/ssh-gateway/
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/ssh-gateway ./cmd/ssh-gateway
