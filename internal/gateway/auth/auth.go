@@ -402,7 +402,6 @@ func registerPasswordCallback(reviewer TokenReviewer, limiter *rate.Limiter) fun
 
 		// Derive VM name from the token's bound pod name when available.
 		if result.PodName != "" {
-			// TODO: Remove this, I don't think we ever hit it
 			vmName, err := VMNameFromPodName(result.PodName)
 			if err != nil {
 				slog.Warn("VM registration auth: cannot derive VM name from pod",
