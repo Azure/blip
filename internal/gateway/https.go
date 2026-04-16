@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -13,6 +15,8 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,6 +41,12 @@ type HTTPSConfig struct {
 
 	// OIDCAudience is the expected "aud" claim in the OIDC token.
 	OIDCAudience string
+
+	// GitHubAllowedOrgs is a list of GitHub organizations whose repos are
+	// allowed to authenticate via the /auth/github endpoint. The org is
+	// extracted from the "repository" claim (owner/repo) of the GitHub
+	// Actions OIDC token.
+	GitHubAllowedOrgs []string
 }
 
 // githubActionsIssuer is the OIDC issuer URL for GitHub Actions tokens.
@@ -52,7 +62,7 @@ const githubActionsAudience = "blip"
 //   - POST /auth/github — OIDC bearer token authentication for GitHub Actions tokens
 //
 // The informerCache must already be started and synced.
-func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.Cache) (*http.Server, error) {
+func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.Cache, kubeWriter client.Client, namespace string) (*http.Server, error) {
 	// Start the TLS cert watcher using the shared cache.
 	certWatcher, err := newTLSCertWatcher(ctx, informerCache, cfg.TLSSecretNamespace, cfg.TLSSecretName)
 	if err != nil {
@@ -79,7 +89,7 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /auth/user", authHandler(userVerifier))
-	mux.Handle("POST /auth/github", authHandler(ghVerifier))
+	mux.Handle("POST /auth/github", githubAuthHandler(ghVerifier, cfg.GitHubAllowedOrgs, kubeWriter, namespace))
 
 	tlsCfg := &tls.Config{
 		MinVersion:     tls.VersionTLS12,
@@ -110,6 +120,125 @@ func authHandler(verifier *oidc.IDTokenVerifier) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"subject": subject})
+	})
+}
+
+// githubActionsClaims represents the custom claims in a GitHub Actions OIDC token.
+type githubActionsClaims struct {
+	Repository      string `json:"repository"`
+	RepositoryOwner string `json:"repository_owner"`
+}
+
+// githubAuthHandler returns a handler for POST /auth/github that:
+//  1. Reads a "token" form value from the POST body.
+//  2. Verifies it as a GitHub Actions OIDC token.
+//  3. Checks the repository owner against the allowed orgs list.
+//  4. Creates a Kubernetes Secret named "gh-<hash>" (8-char truncated SHA-256
+//     of the repository name) in the given namespace, storing the raw token
+//     and labelled with the full repository name.
+func githubAuthHandler(verifier *oidc.IDTokenVerifier, allowedOrgs []string, kubeWriter client.Client, namespace string) http.Handler {
+	// Build a set for fast org lookup.
+	orgSet := make(map[string]struct{}, len(allowedOrgs))
+	for _, org := range allowedOrgs {
+		orgSet[strings.ToLower(strings.TrimSpace(org))] = struct{}{}
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := r.FormValue("token")
+		if token == "" {
+			writeJSONError(w, http.StatusBadRequest, "missing required form value: token")
+			return
+		}
+
+		idToken, err := verifier.Verify(r.Context(), token)
+		if err != nil {
+			slog.Debug("github oidc token verification failed", "error", err)
+			writeJSONError(w, http.StatusUnauthorized, "invalid token")
+			return
+		}
+
+		var claims githubActionsClaims
+		if err := idToken.Claims(&claims); err != nil {
+			slog.Error("failed to extract github token claims", "error", err)
+			writeJSONError(w, http.StatusUnauthorized, "invalid token claims")
+			return
+		}
+
+		if claims.Repository == "" || claims.RepositoryOwner == "" {
+			writeJSONError(w, http.StatusUnauthorized, "token missing repository claims")
+			return
+		}
+
+		// Authorize against allowed orgs.
+		if len(orgSet) > 0 {
+			if _, ok := orgSet[strings.ToLower(claims.RepositoryOwner)]; !ok {
+				slog.Debug("github auth rejected: org not allowed",
+					"owner", claims.RepositoryOwner,
+					"repository", claims.Repository,
+				)
+				writeJSONError(w, http.StatusForbidden, "organization not allowed")
+				return
+			}
+		} else {
+			// No allowed orgs configured — reject all requests.
+			writeJSONError(w, http.StatusForbidden, "no github organizations configured")
+			return
+		}
+
+		// Compute secret name: gh-<first 8 chars of SHA-256 of repo name>.
+		repoHash := sha256.Sum256([]byte(claims.Repository))
+		secretName := "gh-" + hex.EncodeToString(repoHash[:])[:8]
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: namespace,
+				Labels: map[string]string{
+					"blip.azure.com/repo": strings.ReplaceAll(claims.Repository, "/", "_"),
+				},
+				Annotations: map[string]string{
+					"blip.azure.com/repo": claims.Repository,
+				},
+			},
+			Data: map[string][]byte{
+				"token": []byte(token),
+			},
+		}
+
+		// Create or update the secret.
+		existing := &corev1.Secret{}
+		err = kubeWriter.Get(r.Context(), client.ObjectKey{Namespace: namespace, Name: secretName}, existing)
+		if k8serrors.IsNotFound(err) {
+			// Secret doesn't exist, create it.
+			if err := kubeWriter.Create(r.Context(), secret); err != nil {
+				slog.Error("failed to create github token secret", "error", err, "secret", secretName)
+				writeJSONError(w, http.StatusInternalServerError, "failed to store token")
+				return
+			}
+		} else if err != nil {
+			slog.Error("failed to get github token secret", "error", err, "secret", secretName)
+			writeJSONError(w, http.StatusInternalServerError, "failed to store token")
+			return
+		} else {
+			// Secret exists, update it.
+			existing.Data = secret.Data
+			existing.Labels = secret.Labels
+			existing.Annotations = secret.Annotations
+			if err := kubeWriter.Update(r.Context(), existing); err != nil {
+				slog.Error("failed to update github token secret", "error", err, "secret", secretName)
+				writeJSONError(w, http.StatusInternalServerError, "failed to store token")
+				return
+			}
+		}
+
+		slog.Info("github token stored",
+			"repository", claims.Repository,
+			"secret", secretName,
+		)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"secret":     secretName,
+			"repository": claims.Repository,
+		})
 	})
 }
 

@@ -33,11 +33,6 @@ type GatewayConfig struct {
 	PodName            string
 	MaxSessionDuration time.Duration
 
-	// EnableAuth enables BlipOwner CRD-based authentication. When true, the
-	// gateway watches BlipOwner CRs in VMNamespace for OIDC provider
-	// configurations, allowed SSH public keys, and Actions repo associations.
-	EnableAuth bool
-
 	MaxBlipsPerUser int
 
 	// HostPrincipals are the hostnames/IPs used for gateway identification.
@@ -84,12 +79,16 @@ type GatewayConfig struct {
 	// vm.NewKubeClients in main and shared across components (e.g. the VM
 	// client and the HTTPS API server).
 	KubeCache crcache.Cache
+
+	// ActionsRepos is the static list of GitHub repos to poll for queued
+	// Actions workflow jobs. Each entry is in "owner/repo" format. Used
+	// when Actions polling is enabled.
+	ActionsRepos []string
 }
 
 // ActionsConfig holds the configuration for the GitHub Actions polling
 // integration. When enabled, the gateway polls the GitHub API for queued
 // workflow jobs and allocates Blip VMs as just-in-time self-hosted runners.
-// The list of repos to poll is read from BlipOwner CRs with actionsRepo specs.
 type ActionsConfig struct {
 	// GitHubAppID is the GitHub App ID used for authentication.
 	GitHubAppID int64
@@ -137,29 +136,25 @@ type ScaleSetConfig struct {
 	MaxRunners int
 }
 
+// staticRepoProvider implements ghactions.RepoProvider with a static list.
+type staticRepoProvider struct {
+	repos []string
+}
+
+func (p *staticRepoProvider) ActionsRepos() []string {
+	result := make([]string, len(p.repos))
+	copy(result, p.repos)
+	return result
+}
+
 func RunGateway(cfg *GatewayConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start the BlipOwner CRD-backed auth watcher for OIDC and pubkey auth.
-	var authWatcher *auth.AuthWatcher
-	if cfg.EnableAuth {
-		var err error
-		authWatcher, err = auth.NewAuthWatcher(ctx, cfg.VMNamespace)
-		if err != nil {
-			return fmt.Errorf("start auth watcher: %w", err)
-		}
-	}
-
-	// Start the identity store for refresh token storage and
-	// SSH pubkey-to-OIDC identity linking.
-	var identityStore *auth.IdentityStore
-	if authWatcher != nil {
-		var err error
-		identityStore, err = auth.NewIdentityStore(ctx, cfg.VMNamespace, auth.DefaultPubkeyLinkTTL)
-		if err != nil {
-			return fmt.Errorf("start identity store: %w", err)
-		}
+	// Start the ConfigMap-backed auth watcher for pubkey auth.
+	authWatcher, err := auth.NewAuthWatcher(ctx, cfg.VMNamespace)
+	if err != nil {
+		return fmt.Errorf("start auth watcher: %w", err)
 	}
 
 	vmcl, err := vm.New(ctx, cfg.KubeWriter, cfg.KubeCache, cfg.VMNamespace)
@@ -193,7 +188,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		MaxAuthTries:       cfg.MaxAuthTries,
 		AuthWatcher:        authWatcher,
 		VMKeyResolver:      vmKeyResolver,
-		IdentityStore:      identityStore,
 		TokenReviewer:      tokenReviewer,
 	})
 	if err != nil {
@@ -225,8 +219,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		MaxSessionDuration: cfg.MaxSessionDuration,
 		KeepAliveInterval:  cfg.KeepAliveInterval,
 		KeepAliveMax:       cfg.KeepAliveMax,
-		AuthWatcher:        authWatcher,
-		IdentityStore:      identityStore,
 		TokenReviewer:      tokenReviewer,
 	})
 
@@ -237,8 +229,8 @@ func RunGateway(cfg *GatewayConfig) error {
 		if cfg.ScaleSet != nil {
 			return fmt.Errorf("cannot use both --github-app-id and --scaleset-config-url; choose one mode")
 		}
-		if authWatcher == nil {
-			return fmt.Errorf("actions polling requires --enable-auth (repos are read from BlipOwner CRs with actionsRepo specs)")
+		if len(cfg.ActionsRepos) == 0 {
+			return fmt.Errorf("actions polling requires --actions-repos (comma-separated list of owner/repo)")
 		}
 
 		ghClient, err := ghactions.NewGitHubClient(
@@ -262,7 +254,7 @@ func RunGateway(cfg *GatewayConfig) error {
 			RunnerConfigStore:  annotator,
 			TokenProvider:      ghClient,
 			JobsProvider:       ghClient,
-			RepoProvider:       authWatcher,
+			RepoProvider:       &staticRepoProvider{repos: cfg.ActionsRepos},
 			VMPoolName:         cfg.VMPoolName,
 			RunnerLabels:       cfg.Actions.RunnerLabels,
 			MaxSessionDuration: actionsMaxDuration,
@@ -274,6 +266,7 @@ func RunGateway(cfg *GatewayConfig) error {
 			"runner_labels", cfg.Actions.RunnerLabels,
 			"actions_max_session", actionsMaxDuration,
 			"poll_interval", cfg.Actions.PollInterval,
+			"repos", cfg.ActionsRepos,
 		)
 	}
 
@@ -361,7 +354,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		"namespace", cfg.VMNamespace,
 		"pool", cfg.VMPoolName,
 		"max_session", cfg.MaxSessionDuration.String(),
-		"oidc_auth", authWatcher != nil,
 		"actions_enabled", actionsPoller != nil,
 		"scaleset_enabled", actionsListener != nil,
 	)
@@ -384,7 +376,7 @@ func RunGateway(cfg *GatewayConfig) error {
 	var httpsServer *http.Server
 	if cfg.HTTPS != nil {
 		var err error
-		httpsServer, err = NewHTTPSServer(ctx, *cfg.HTTPS, cfg.KubeCache)
+		httpsServer, err = NewHTTPSServer(ctx, *cfg.HTTPS, cfg.KubeCache, cfg.KubeWriter, cfg.VMNamespace)
 		if err != nil {
 			return fmt.Errorf("create HTTPS server: %w", err)
 		}
