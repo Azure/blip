@@ -42,4 +42,4 @@ kubectl apply -f https://github.com/Azure/blip/releases/latest/download/pool.yam
 ## Next steps
 
 - [Customize a VM Pool]({{% relref "create-vm-pool" %}})
-- [Add SSH Key]({{% relref "sign-ssh-keys" %}})
+- [User Authentication]({{% relref "sign-ssh-keys" %}})

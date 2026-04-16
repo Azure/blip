@@ -73,4 +73,4 @@ The image must be cloud-init-compatible with `sshd` installed. PVCs are deleted 
 
 ## Next steps
 
-- [Add SSH Key]({{% relref "sign-ssh-keys" %}})
+- [User Authentication]({{% relref "sign-ssh-keys" %}})
