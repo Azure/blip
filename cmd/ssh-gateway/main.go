@@ -35,7 +35,7 @@ func newRootCmd() *cobra.Command {
 		podName            string
 		maxSessionDuration int
 		maxBlipsPerUser    int
-		enableAuth         bool
+		actionsRepos       []string
 		hostPrincipals     []string
 		externalHost       string
 		vmRegisterSA       string
@@ -44,10 +44,11 @@ func newRootCmd() *cobra.Command {
 		httpListenAddr string
 
 		// HTTPS API server (optional, enabled when --oidc-issuer-url is set).
-		httpsListenAddr string
-		tlsSecretName   string
-		oidcIssuerURL   string
-		oidcAudience    string
+		httpsListenAddr   string
+		tlsSecretName     string
+		oidcIssuerURL     string
+		oidcAudience      string
+		githubAllowedOrgs []string
 
 		// GitHub Actions polling integration (optional).
 		githubAppID            int64
@@ -96,8 +97,8 @@ func newRootCmd() *cobra.Command {
 				PodName:            podName,
 				MaxSessionDuration: time.Duration(maxSessionDuration) * time.Second,
 				MaxBlipsPerUser:    maxBlipsPerUser,
-				EnableAuth:         enableAuth,
 				HostPrincipals:     hostPrincipals,
+				ActionsRepos:       actionsRepos,
 				ExternalHost:       externalHost,
 				VMRegisterSA:       vmRegisterSA,
 				LoginGraceTime:     30 * time.Second,
@@ -123,6 +124,7 @@ func newRootCmd() *cobra.Command {
 					TLSSecretNamespace: vmNamespace,
 					OIDCIssuerURL:      oidcIssuerURL,
 					OIDCAudience:       oidcAudience,
+					GitHubAllowedOrgs:  githubAllowedOrgs,
 				}
 			}
 
@@ -137,8 +139,8 @@ func newRootCmd() *cobra.Command {
 				if len(runnerLabels) == 0 {
 					return fmt.Errorf("--runner-labels is required when --github-app-id is set (e.g. 'self-hosted,blip')")
 				}
-				if !enableAuth {
-					return fmt.Errorf("--enable-auth is required when --github-app-id is set (repos are read from BlipOwner CRs)")
+				if len(actionsRepos) == 0 {
+					return fmt.Errorf("--actions-repos is required when --github-app-id is set (e.g. 'my-org/my-repo')")
 				}
 				cfg.Actions = &sshgw.ActionsConfig{
 					GitHubAppID:        githubAppID,
@@ -187,7 +189,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "unknown"), "Pod name for identification (env: POD_NAME)")
 	cmd.Flags().IntVar(&maxSessionDuration, "max-session-duration", envOrDefaultInt("MAX_SESSION_DURATION", 43200), "Maximum session duration in seconds (env: MAX_SESSION_DURATION)")
 	cmd.Flags().IntVar(&maxBlipsPerUser, "max-blips-per-user", envOrDefaultInt("MAX_BLIPS_PER_USER", 0), "Per-user blip quota, 0 = unlimited (env: MAX_BLIPS_PER_USER)")
-	cmd.Flags().BoolVar(&enableAuth, "enable-auth", envOrDefaultBool("ENABLE_AUTH", false), "Enable BlipOwner CRD-based auth: OIDC providers, SSH pubkeys, and actions repos (env: ENABLE_AUTH)")
+	cmd.Flags().StringSliceVar(&actionsRepos, "actions-repos", envOrDefaultStringSlice("ACTIONS_REPOS"), "GitHub repos for Actions polling, comma-separated owner/repo (env: ACTIONS_REPOS)")
 	cmd.Flags().StringSliceVar(&hostPrincipals, "host-principals", envOrDefaultStringSlice("GATEWAY_HOST_PRINCIPALS"), "Hostnames/IPs for gateway identification, comma-separated (env: GATEWAY_HOST_PRINCIPALS)")
 	cmd.Flags().StringVar(&externalHost, "external-host", envOrDefault("GATEWAY_EXTERNAL_HOST", ""), "Public hostname for the gateway, shown in reconnect instructions (env: GATEWAY_EXTERNAL_HOST)")
 	cmd.Flags().StringVar(&vmRegisterSA, "vm-register-sa", envOrDefault("VM_REGISTER_SA", "vm-register"), "ServiceAccount name for VM registration token validation (env: VM_REGISTER_SA)")
@@ -200,6 +202,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tlsSecretName, "tls-secret-name", envOrDefault("TLS_SECRET_NAME", "gateway-tls-key"), "Kubernetes Secret containing tls.crt and tls.key (env: TLS_SECRET_NAME)")
 	cmd.Flags().StringVar(&oidcIssuerURL, "oidc-issuer-url", envOrDefault("OIDC_ISSUER_URL", ""), "Trusted OIDC issuer URL for API authentication (env: OIDC_ISSUER_URL)")
 	cmd.Flags().StringVar(&oidcAudience, "oidc-audience", envOrDefault("OIDC_AUDIENCE", ""), "Expected OIDC audience claim (env: OIDC_AUDIENCE)")
+	cmd.Flags().StringSliceVar(&githubAllowedOrgs, "github-allowed-orgs", envOrDefaultStringSlice("GITHUB_ALLOWED_ORGS"), "Comma-separated list of GitHub orgs allowed to authenticate via /auth/github (env: GITHUB_ALLOWED_ORGS)")
 
 	// GitHub Actions polling flags (optional).
 	cmd.Flags().Int64Var(&githubAppID, "github-app-id", envOrDefaultInt64("GITHUB_APP_ID", 0), "GitHub App ID for Actions polling integration (env: GITHUB_APP_ID)")
@@ -264,12 +267,4 @@ func envOrDefaultStringSlice(key string) []string {
 		}
 	}
 	return result
-}
-
-func envOrDefaultBool(key string, def bool) bool {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	return v == "true" || v == "1" || v == "yes"
 }
