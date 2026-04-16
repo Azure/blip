@@ -33,9 +33,9 @@ type PATProvider struct {
 }
 
 // NewPATProvider creates a PATProvider that watches the named Secret for a
-// "token" key. It performs an initial load from the cache and registers an
-// event handler so token rotations are picked up immediately.
-// The cache must already be started and synced.
+// "token" key. It performs an initial load from the cache (tolerating a missing
+// Secret) and registers an event handler so token rotations and late creation
+// are picked up immediately. The cache must already be started and synced.
 func NewPATProvider(ctx context.Context, informerCache crcache.Cache, namespace, secretName string) (*PATProvider, error) {
 	p := &PATProvider{
 		namespace:  namespace,
@@ -43,12 +43,17 @@ func NewPATProvider(ctx context.Context, informerCache crcache.Cache, namespace,
 		cache:      informerCache,
 	}
 
-	// Initial load from the cache.
+	// Initial load from the cache — tolerate missing Secret so the
+	// controller can start before the PAT Secret is created.
 	var secret corev1.Secret
-	if err := informerCache.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
-		return nil, fmt.Errorf("get PAT secret %s/%s: %w", namespace, secretName, err)
+	if err := informerCache.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err == nil {
+		p.updateFromSecret(&secret)
+	} else {
+		slog.Info("PAT secret not found, actions will activate when it is created",
+			"namespace", namespace,
+			"secret", secretName,
+		)
 	}
-	p.updateFromSecret(&secret)
 
 	// Register event handler for live updates.
 	informer, err := informerCache.GetInformer(ctx, &corev1.Secret{})
@@ -65,7 +70,10 @@ func NewPATProvider(ctx context.Context, informerCache crcache.Cache, namespace,
 				return
 			}
 			if secret.Name == p.secretName && secret.Namespace == p.namespace {
-				slog.Warn("PAT secret deleted, using last known token",
+				p.mu.Lock()
+				p.token = ""
+				p.mu.Unlock()
+				slog.Warn("PAT secret deleted, actions runner disabled until recreated",
 					"namespace", p.namespace,
 					"secret", p.secretName,
 				)

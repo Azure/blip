@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
@@ -43,12 +42,7 @@ func newRootCmd() *cobra.Command {
 		leaseNamespace  string
 		leaseName       string
 		gatewayHostname string
-
-		// GitHub Actions runner flags.
-		actionsRepos     []string
-		actionsPATSecret string
-		runnerLabels     []string
-		actionsPodName   string
+		podName         string
 	)
 
 	cmd := &cobra.Command{
@@ -59,7 +53,7 @@ func newRootCmd() *cobra.Command {
 			if !cmd.Flags().Changed("lease-namespace") {
 				leaseNamespace = namespace
 			}
-			return run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname, actionsRepos, actionsPATSecret, runnerLabels, actionsPodName)
+			return run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname, podName)
 		},
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -70,12 +64,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&leaseNamespace, "lease-namespace", envOrDefault("LEASE_NAMESPACE", ""), "Namespace for leader election lease; defaults to --namespace (env: LEASE_NAMESPACE)")
 	cmd.Flags().StringVar(&leaseName, "lease-name", envOrDefault("LEASE_NAME", "blip-controller"), "Name of the leader election lease (env: LEASE_NAME)")
 	cmd.Flags().StringVar(&gatewayHostname, "gateway-hostname", envOrDefault("GATEWAY_HOSTNAME", ""), "Gateway hostname for TLS certificate generation (env: GATEWAY_HOSTNAME)")
-
-	// GitHub Actions runner flags.
-	cmd.Flags().StringSliceVar(&actionsRepos, "actions-repos", envOrDefaultStringSlice("ACTIONS_REPOS"), "GitHub repos for Actions polling, comma-separated owner/repo (env: ACTIONS_REPOS)")
-	cmd.Flags().StringVar(&actionsPATSecret, "github-pat-secret", envOrDefault("GITHUB_PAT_SECRET", ""), "Kubernetes Secret name containing the GitHub PAT in a 'token' key (env: GITHUB_PAT_SECRET)")
-	cmd.Flags().StringSliceVar(&runnerLabels, "runner-labels", envOrDefaultStringSlice("RUNNER_LABELS"), "Runner labels for JIT runners, comma-separated (env: RUNNER_LABELS)")
-	cmd.Flags().StringVar(&actionsPodName, "pod-name", envOrDefault("POD_NAME", "blip-controller"), "Pod name for identification in VM annotations (env: POD_NAME)")
+	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "blip-controller"), "Pod name for identification in VM annotations (env: POD_NAME)")
 
 	return cmd
 }
@@ -87,7 +76,7 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname string, actionsRepos []string, actionsPATSecret string, runnerLabels []string, actionsPodName string) error {
+func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname, podName string) error {
 	s, err := newScheme()
 	if err != nil {
 		return fmt.Errorf("create scheme: %w", err)
@@ -144,30 +133,24 @@ func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname string,
 		return fmt.Errorf("adding sshpubkey controller: %w", err)
 	}
 
-	// Register the GitHub Actions runner controller if configured.
-	if actionsPATSecret != "" && len(actionsRepos) > 0 {
-		if len(runnerLabels) == 0 {
-			return fmt.Errorf("--runner-labels is required when --github-pat-secret is set")
-		}
-		patHolder, err := actions.Add(mgr, actions.Config{
-			Namespace:     namespace,
-			PoolName:      poolName,
-			PodName:       actionsPodName,
-			PATSecretName: actionsPATSecret,
-			Repos:         actionsRepos,
-			RunnerLabels:  runnerLabels,
-		})
-		if err != nil {
-			return fmt.Errorf("adding actions controller: %w", err)
-		}
+	// Always register the GitHub Actions runner controller. It watches the
+	// github-actions ConfigMap and github-pat Secret dynamically — no env
+	// vars or restart needed to enable/configure.
+	patHolder, configHolder, err := actions.Add(mgr, actions.Config{
+		Namespace: namespace,
+		PoolName:  poolName,
+		PodName:   podName,
+	})
+	if err != nil {
+		return fmt.Errorf("adding actions controller: %w", err)
+	}
 
-		if err := runnerconfig.Add(mgr, runnerconfig.Config{
-			Namespace:    namespace,
-			PATHolder:    patHolder,
-			RunnerLabels: runnerLabels,
-		}); err != nil {
-			return fmt.Errorf("adding runnerconfig controller: %w", err)
-		}
+	if err := runnerconfig.Add(mgr, runnerconfig.Config{
+		Namespace:     namespace,
+		PATHolder:     patHolder,
+		ConfigWatcher: configHolder,
+	}); err != nil {
+		return fmt.Errorf("adding runnerconfig controller: %w", err)
 	}
 
 	slog.Info("blip-controller starting")
@@ -183,19 +166,4 @@ func newScheme() (*runtime.Scheme, error) {
 		return nil, fmt.Errorf("register kubevirt/v1: %w", err)
 	}
 	return s, nil
-}
-
-func envOrDefaultStringSlice(key string) []string {
-	v := os.Getenv(key)
-	if v == "" {
-		return nil
-	}
-	var result []string
-	for _, s := range strings.Split(v, ",") {
-		s = strings.TrimSpace(s)
-		if s != "" {
-			result = append(result, s)
-		}
-	}
-	return result
 }

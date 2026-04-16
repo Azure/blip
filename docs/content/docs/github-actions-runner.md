@@ -6,12 +6,14 @@ weight: 6
 
 ## How it works
 
-1. A GitHub PAT is stored in a Kubernetes Secret and watched by the gateway.
-2. The actions runner backend polls for queued workflow jobs in configured repositories.
-3. Each poll uses the PAT to list queued jobs and match them against configured runner labels.
+1. A GitHub PAT is stored in a Kubernetes Secret (`github-pat`) and watched by the controller.
+2. Runner labels and trusted repos are stored in a ConfigMap (`github-actions`) and watched by the controller.
+3. When both resources are present, the actions runner backend polls for queued workflow jobs in the configured repositories.
 4. For each matched job, the controller claims a VM and annotates it with the target repository and job ID.
 5. The runner-config controller detects the annotations, generates a JIT runner config via the GitHub API, SSHes into the VM, and starts the runner with `./run.sh --jitconfig <config>`.
 6. On job completion, the VM is released.
+
+No gateway or controller restarts are needed — configuration changes take effect immediately.
 
 ## Prerequisites
 
@@ -38,7 +40,9 @@ weight: 6
    - **Administration** — read & write (for `generate-jitconfig`)
    - **Actions** — read (for listing queued jobs)
 
-### Write the PAT to a Kubernetes Secret
+## Configure the runner
+
+### 1. Write the PAT to a Kubernetes Secret
 
 ```shell
 kubectl create secret generic github-pat \
@@ -47,30 +51,25 @@ kubectl create secret generic github-pat \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-## Configure the gateway
-
-Uncomment the GitHub Actions sections in `manifests/deploy.yaml`:
-
-```yaml
-- name: GITHUB_PAT_SECRET
-  value: "github-pat"
-- name: RUNNER_LABELS
-  value: "self-hosted,blip"
-- name: ACTIONS_REPOS
-  value: "my-org/my-repo"
-```
+### 2. Write runner labels and repos to a ConfigMap
 
 ```shell
-kubectl apply -f manifests/deploy.yaml
+kubectl create configmap github-actions \
+  -n blip \
+  --from-literal=runner-labels="self-hosted,blip" \
+  --from-literal=repos="my-org/my-repo" \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
+
+That's it. The controller detects both resources and begins polling immediately. To reconfigure, edit the ConfigMap or Secret — no restart needed.
 
 ## Configuration reference
 
-| Environment variable | CLI flag | Required | Description |
-|---------------------|----------|----------|-------------|
-| `GITHUB_PAT_SECRET` | `--github-pat-secret` | yes | Kubernetes Secret containing the GitHub PAT in a `token` key |
-| `RUNNER_LABELS` | `--runner-labels` | yes | Comma-separated runner labels (e.g. `self-hosted,blip`) |
-| `ACTIONS_REPOS` | `--actions-repos` | yes | Comma-separated repos to poll (e.g. `my-org/my-repo`) |
+| Resource | Key | Description |
+|----------|-----|-------------|
+| Secret `github-pat` | `token` | GitHub Personal Access Token |
+| ConfigMap `github-actions` | `runner-labels` | Comma-separated runner labels (e.g. `self-hosted,blip`) |
+| ConfigMap `github-actions` | `repos` | Comma-separated repos to poll (e.g. `my-org/my-repo`) |
 
 ## Workflow
 
@@ -85,7 +84,7 @@ jobs:
       - run: echo "Running on a Blip VM"
 ```
 
-Matching is case-insensitive. A job is picked up if at least one label matches a `RUNNER_LABELS` entry.
+Matching requires all configured `runner-labels` to appear in the job's `runs-on` list. For example, if `runner-labels` is `self-hosted,blip`, a job with `runs-on: [self-hosted, blip]` matches but `runs-on: [self-hosted]` does not. Label comparison is case-sensitive.
 
 ## VM image
 
@@ -106,12 +105,13 @@ See `images/github-runner/Containerfile` for a reference implementation.
 ## Troubleshooting
 
 ```shell
-kubectl logs -n blip -l app=ssh-gateway --tail=200
+kubectl logs -n blip -l app=blip-controller --tail=200
 ```
 
 | Message | Cause |
 |---------|-------|
-| `no PAT available` | PAT Secret missing or has no `token` key |
+| `no PAT available` | `github-pat` Secret missing or has no `token` key |
+| `actions config incomplete` | `github-actions` ConfigMap missing or has empty `runner-labels`/`repos` |
 | `failed to create JIT runner config` | PAT lacks permissions or not authorized for repo |
 | `failed to allocate runner VM` | No VMs available in pool |
-| `job labels do not match runner labels` | `runs-on` labels don't overlap with `RUNNER_LABELS` |
+| `job labels do not match runner labels` | `runs-on` labels don't overlap with `runner-labels` |

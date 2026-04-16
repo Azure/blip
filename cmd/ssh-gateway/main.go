@@ -45,10 +45,6 @@ func newRootCmd() *cobra.Command {
 		// HTTPS API server (enabled when OIDC ConfigMap is watched).
 		httpsListenAddr   string
 		oidcConfigMapName string
-
-		// GitHub Actions polling integration (optional).
-		githubPATSecret string
-		runnerLabels    []string
 	)
 
 	cmd := &cobra.Command{
@@ -132,9 +128,6 @@ func newRootCmd() *cobra.Command {
 	// ConfigMap at runtime, allowing reconfiguration without restarting.
 	cmd.Flags().StringVar(&httpsListenAddr, "https-address", envOrDefault("HTTPS_ADDRESS", ":8443"), "HTTPS address for the API server (env: HTTPS_ADDRESS)")
 	cmd.Flags().StringVar(&oidcConfigMapName, "oidc-config", envOrDefault("OIDC_CONFIG", ""), "ConfigMap name for OIDC auth configuration (env: OIDC_CONFIG)")
-	// GitHub Actions polling flags (optional).
-	cmd.Flags().StringVar(&githubPATSecret, "github-pat-secret", envOrDefault("GITHUB_PAT_SECRET", ""), "Kubernetes Secret name containing the GitHub PAT in a 'token' key (env: GITHUB_PAT_SECRET)")
-	cmd.Flags().StringSliceVar(&runnerLabels, "runner-labels", envOrDefaultStringSlice("RUNNER_LABELS"), "Runner labels to match against workflow_job labels, comma-separated (env: RUNNER_LABELS)")
 
 	return cmd
 }
