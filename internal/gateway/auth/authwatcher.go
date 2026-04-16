@@ -18,17 +18,17 @@ import (
 )
 
 const (
-	// PubkeyUserLabel is the label on ConfigMaps that marks them as trusted
-	// pubkeys. The label value is the user identity used by the quota logic.
+	// PubkeyUserLabel is the label on session ConfigMaps that marks them as
+	// trusted pubkeys. The label value is the user identity used by the quota logic.
 	PubkeyUserLabel = "blip.azure.com/user"
 
-	// PubkeyDataKey is the data key in the ConfigMap containing the SSH
-	// public key in authorized_keys format.
+	// PubkeyDataKey is the data key in the session ConfigMap containing the
+	// SSH public key in authorized_keys format.
 	PubkeyDataKey = "pubkey"
 )
 
-// AuthWatcher watches ConfigMaps with the blip.azure.com/user label for
-// trusted SSH public keys, providing thread-safe access to the current set.
+// AuthWatcher watches session ConfigMaps with the blip.azure.com/user label
+// for trusted SSH public keys, providing thread-safe access to the current set.
 type AuthWatcher struct {
 	cache     crcache.Cache
 	namespace string
@@ -43,8 +43,8 @@ type pubkeyEntry struct {
 	UserIdentity string
 }
 
-// NewAuthWatcher creates an AuthWatcher that watches ConfigMaps with the
-// blip.azure.com/user label in the given namespace. It starts an informer
+// NewAuthWatcher creates an AuthWatcher that watches session ConfigMaps with
+// the blip.azure.com/user label in the given namespace. It starts an informer
 // cache, waits for the initial sync, loads the current values, and installs
 // an event handler that keeps the in-memory data updated.
 func NewAuthWatcher(ctx context.Context, namespace string) (*AuthWatcher, error) {
@@ -150,7 +150,7 @@ func (w *AuthWatcher) reload(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		slog.Warn("auth watcher: failed to list pubkey ConfigMaps, clearing auth data",
+		slog.Warn("auth watcher: failed to list session ConfigMaps, clearing auth data",
 			"namespace", w.namespace,
 			"error", err,
 		)
@@ -201,7 +201,7 @@ func (w *AuthWatcher) reload(ctx context.Context) {
 	w.pubkeys = pubkeys
 	w.mu.Unlock()
 
-	slog.Info("auth watcher: config updated from pubkey ConfigMaps",
+	slog.Info("auth watcher: config updated from session ConfigMaps",
 		"configmap_count", len(cms.Items),
 		"allowed_pubkey_count", len(pubkeys),
 	)

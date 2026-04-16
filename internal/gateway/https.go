@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -18,13 +16,14 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	gatewayauth "github.com/project-unbounded/blip/internal/gateway/auth"
+
+	"github.com/project-unbounded/blip/internal/controllers/sshpubkey"
 )
 
 // HTTPSConfig holds the configuration for the HTTPS API server.
@@ -106,11 +105,13 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 //     SSH gateway during device-flow auth (via GenerateAuthURL). The JWT is
 //     verified against the gateway's TLS signing key and checked for expiry.
 //     The SSH public key is extracted from the JWT's "pubkey" claim.
-//  4. Creates or updates a ConfigMap named "user-<hash>" (8-char truncated
-//     SHA-256 of the subject) in the given namespace, storing the public key
-//     and labelled with the user identity. The ConfigMap is annotated with an
-//     expiration timestamp derived from the token's expiry, so the sshpubkey
-//     controller will garbage-collect it after the token expires.
+//  4. Creates a session ConfigMap using generateName (prefix "session-") in
+//     the given namespace, storing the public key and labelled with the user
+//     identity. The ConfigMap is annotated with an expiration timestamp
+//     derived from the token's expiry, so the session controller will
+//     garbage-collect it after the token expires. If multiple ConfigMaps
+//     exist for the same user (due to concurrent requests), the session
+//     controller deduplicates them, keeping the one with the latest expiry.
 //
 // This integrates with the AuthWatcher (which watches ConfigMaps with the
 // blip.azure.com/user label) to dynamically authorize SSH connections for
@@ -196,9 +197,9 @@ func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, names
 		}
 		expiration := idToken.Expiry
 
-		// Compute ConfigMap name: user-<first 8 chars of SHA-256 of subject>.
-		subjectHash := sha256.Sum256([]byte(subject))
-		cmName := "user-" + hex.EncodeToString(subjectHash[:])[:8]
+		// Compute ConfigMap name: use generateName for uniqueness.
+		// The session controller deduplicates if multiple ConfigMaps
+		// exist for the same user.
 
 		// Sanitize subject for use as a Kubernetes label value (max 63 chars,
 		// must match [a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?).
@@ -211,14 +212,14 @@ func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, names
 
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      cmName,
-				Namespace: namespace,
+				GenerateName: "session-",
+				Namespace:    namespace,
 				Labels: map[string]string{
-					"blip.azure.com/user": labelValue,
+					sshpubkey.LabelUser: labelValue,
 				},
 				Annotations: map[string]string{
-					"blip.azure.com/expiration": expiration.UTC().Format(time.RFC3339),
-					"blip.azure.com/subject":    subject,
+					sshpubkey.AnnotationExpiration: expiration.UTC().Format(time.RFC3339),
+					sshpubkey.AnnotationSubject:    subject,
 				},
 			},
 			Data: map[string]string{
@@ -226,56 +227,20 @@ func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, names
 			},
 		}
 
-		// Create or update the ConfigMap. Handle the race where a concurrent
-		// request creates the ConfigMap between our Get and Create by falling
-		// back to an update on AlreadyExists.
-		existing := &corev1.ConfigMap{}
-		err = kubeWriter.Get(r.Context(), client.ObjectKey{Namespace: namespace, Name: cmName}, existing)
-		if k8serrors.IsNotFound(err) {
-			if createErr := kubeWriter.Create(r.Context(), cm); createErr != nil {
-				if !k8serrors.IsAlreadyExists(createErr) {
-					slog.Error("failed to create user pubkey configmap", "error", createErr, "configmap", cmName)
-					writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
-					return
-				}
-				// Lost the race — re-fetch and update.
-				if err := kubeWriter.Get(r.Context(), client.ObjectKey{Namespace: namespace, Name: cmName}, existing); err != nil {
-					slog.Error("failed to re-fetch user pubkey configmap after conflict", "error", err, "configmap", cmName)
-					writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
-					return
-				}
-				existing.Labels = cm.Labels
-				existing.Annotations = cm.Annotations
-				existing.Data = cm.Data
-				if err := kubeWriter.Update(r.Context(), existing); err != nil {
-					slog.Error("failed to update user pubkey configmap after conflict", "error", err, "configmap", cmName)
-					writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
-					return
-				}
-			}
-		} else if err != nil {
-			slog.Error("failed to get user pubkey configmap", "error", err, "configmap", cmName)
+		if err := kubeWriter.Create(r.Context(), cm); err != nil {
+			slog.Error("failed to create session configmap", "error", err)
 			writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
 			return
-		} else {
-			existing.Labels = cm.Labels
-			existing.Annotations = cm.Annotations
-			existing.Data = cm.Data
-			if err := kubeWriter.Update(r.Context(), existing); err != nil {
-				slog.Error("failed to update user pubkey configmap", "error", err, "configmap", cmName)
-				writeJSONError(w, http.StatusInternalServerError, "failed to store public key")
-				return
-			}
 		}
 
-		slog.Info("user pubkey stored",
+		slog.Info("session configmap created",
 			"subject", subject,
-			"configmap", cmName,
+			"configmap", cm.Name,
 			"expiration", expiration.UTC().Format(time.RFC3339),
 		)
 		writeJSON(w, http.StatusOK, map[string]string{
 			"subject":    subject,
-			"configmap":  cmName,
+			"configmap":  cm.Name,
 			"expiration": expiration.UTC().Format(time.RFC3339),
 		})
 	})
