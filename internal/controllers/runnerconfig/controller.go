@@ -109,10 +109,9 @@ type controller struct {
 	namespace    string
 	runnerLabels []string
 
-	// signerOnce lazily loads the SSH client key from the Secret.
-	signerOnce sync.Once
-	signer     ssh.Signer
-	signerErr  error
+	// signerMu protects lazy loading of the SSH client key from the Secret.
+	signerMu sync.Mutex
+	signer   ssh.Signer
 }
 
 func (c *controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -300,18 +299,17 @@ func (c *controller) provisionRunner(ctx context.Context, vmIP, hostKeyStr strin
 		session.Close()
 	}()
 
-	// Start the runner with the JIT config passed via stdin to avoid it
-	// appearing in process arguments or environment variables. The script
-	// reads the config from stdin, writes it to a temporary file, starts
-	// the runner in the background via nohup, then removes the temp file.
-	// Using stdin ensures the JIT config never touches the filesystem in
-	// plaintext for longer than the brief moment between write and
-	// runner startup, and never appears in /proc/*/cmdline.
+	// Start the runner with the JIT config passed via stdin. The script
+	// writes stdin to a temporary file, then launches run.sh in the
+	// background. The backgrounded subshell reads the file, deletes it,
+	// then execs the runner. No EXIT trap is used because it would race
+	// with the background process reading the file.
 	script := `#!/bin/sh
 set -e
-JITCONFIG="$(cat)"
+TMPFILE="$(mktemp /home/runner/actions-runner/.jitconfig.XXXXXX)"
+cat > "$TMPFILE"
 cd /home/runner/actions-runner
-nohup ./run.sh --jitconfig "$JITCONFIG" > /home/runner/actions-runner/_diag/runner.log 2>&1 &
+nohup sh -c 'CFG=$(cat "'"$TMPFILE"'"); rm -f "'"$TMPFILE"'"; exec ./run.sh --jitconfig "$CFG"' > /home/runner/actions-runner/_diag/runner.log 2>&1 &
 `
 
 	session.Stdin = strings.NewReader(jitConfig)
@@ -374,32 +372,36 @@ func (c *controller) dialSSH(ctx context.Context, vmIP string, cfg *ssh.ClientCo
 }
 
 // getOrLoadSigner lazily loads the SSH client private key from the Kubernetes
-// Secret created by the keygen controller.
+// Secret created by the keygen controller. Unlike sync.Once, this retries on
+// failure so that if the keygen controller hasn't created the secret yet, the
+// next reconcile will try again.
 func (c *controller) getOrLoadSigner(ctx context.Context) (ssh.Signer, error) {
-	c.signerOnce.Do(func() {
-		var secret corev1.Secret
-		if err := c.Client.Get(ctx, client.ObjectKey{
-			Namespace: c.namespace,
-			Name:      clientKeySecretName,
-		}, &secret); err != nil {
-			c.signerErr = fmt.Errorf("get client key secret %s: %w", clientKeySecretName, err)
-			return
-		}
+	c.signerMu.Lock()
+	defer c.signerMu.Unlock()
 
-		keyPEM := secret.Data[clientKeySecretKey]
-		if len(keyPEM) == 0 {
-			c.signerErr = fmt.Errorf("client key secret %s has no %s key", clientKeySecretName, clientKeySecretKey)
-			return
-		}
+	if c.signer != nil {
+		return c.signer, nil
+	}
 
-		signer, err := ssh.ParsePrivateKey(keyPEM)
-		if err != nil {
-			c.signerErr = fmt.Errorf("parse client private key: %w", err)
-			return
-		}
-		c.signer = signer
-	})
-	return c.signer, c.signerErr
+	var secret corev1.Secret
+	if err := c.Client.Get(ctx, client.ObjectKey{
+		Namespace: c.namespace,
+		Name:      clientKeySecretName,
+	}, &secret); err != nil {
+		return nil, fmt.Errorf("get client key secret %s: %w", clientKeySecretName, err)
+	}
+
+	keyPEM := secret.Data[clientKeySecretKey]
+	if len(keyPEM) == 0 {
+		return nil, fmt.Errorf("client key secret %s has no %s key", clientKeySecretName, clientKeySecretKey)
+	}
+
+	signer, err := ssh.ParsePrivateKey(keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse client private key: %w", err)
+	}
+	c.signer = signer
+	return c.signer, nil
 }
 
 // releaseVM marks a VM for deallocation.
