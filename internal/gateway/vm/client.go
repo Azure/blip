@@ -56,31 +56,26 @@ type Client struct {
 	namespace string
 }
 
-// Writer returns the underlying Kubernetes client used for write operations.
-// This allows other components (e.g. the ghactions VMAnnotator) to reuse the
-// same client rather than creating a separate one.
-func (c *Client) Writer() client.Client { return c.writer }
-
-// Cache returns the underlying informer cache. This allows other components
-// to watch additional resource types (e.g. Secrets) without creating a
-// separate cache.
-func (c *Client) Cache() crcache.Cache { return c.cache }
-
-// New creates a Client backed by an in-cluster informer cache scoped to the given namespace.
-func New(ctx context.Context, namespace string) (*Client, error) {
+// NewKubeClients creates the controller-runtime writer client and informer
+// cache for the given namespace. The returned cache is NOT started — callers
+// must register any required index fields, then start and sync the cache
+// before use. This is separated from New so that the Kubernetes infrastructure
+// can be created in main and shared across components (e.g. the HTTPS API
+// server) without coupling them to the VM client.
+func NewKubeClients(namespace string) (client.Client, crcache.Cache, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
-		return nil, fmt.Errorf("in-cluster config: %w", err)
+		return nil, nil, fmt.Errorf("in-cluster config: %w", err)
 	}
 	s, err := newScheme()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	mapper := newStaticRESTMapper()
 
 	writer, err := client.New(cfg, client.Options{Scheme: s, Mapper: mapper})
 	if err != nil {
-		return nil, fmt.Errorf("controller-runtime client: %w", err)
+		return nil, nil, fmt.Errorf("controller-runtime client: %w", err)
 	}
 
 	informerCache, err := crcache.New(cfg, crcache.Options{
@@ -92,9 +87,17 @@ func New(ctx context.Context, namespace string) (*Client, error) {
 		DefaultTransform: crcache.TransformStripManagedFields(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create informer cache: %w", err)
+		return nil, nil, fmt.Errorf("create informer cache: %w", err)
 	}
 
+	return writer, informerCache, nil
+}
+
+// New creates a Client from pre-built controller-runtime components. It
+// registers VM-specific cache indexes, starts the cache, and blocks until
+// the cache has synced. The writer and informerCache should be created by
+// NewKubeClients (or equivalent test doubles).
+func New(ctx context.Context, writer client.Client, informerCache crcache.Cache, namespace string) (*Client, error) {
 	if err := informerCache.IndexField(ctx, &kubevirtv1.VirtualMachine{}, indexVMPool, func(obj client.Object) []string {
 		pool := obj.GetLabels()["blip.io/pool"]
 		if pool == "" {

@@ -44,7 +44,7 @@ type HTTPSConfig struct {
 //   - OIDC bearer token authentication against a single trusted issuer
 //   - A stub handler that returns 200 OK
 //
-// The informerCache must already be started and synced (e.g. from vm.Client).
+// The informerCache must already be started and synced.
 func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.Cache) (*http.Server, error) {
 	// Start the TLS cert watcher using the shared cache.
 	certWatcher, err := newTLSCertWatcher(ctx, informerCache, cfg.TLSSecretNamespace, cfg.TLSSecretName)
