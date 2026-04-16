@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -174,9 +175,10 @@ func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver, sessionWatch
 			}
 		}
 
-		// Record the fingerprint for use by keyboard-interactive fallback.
+		// Record the fingerprint and pubkey for use by keyboard-interactive fallback.
 		if pending != nil {
-			pending.Add(conn.RemoteAddr().String(), fingerprint)
+			pubkeyStr := string(ssh.MarshalAuthorizedKey(key))
+			pending.Add(conn.RemoteAddr().String(), fingerprint, strings.TrimSpace(pubkeyStr))
 		}
 
 		return nil, fmt.Errorf("public key %s is not authorized", fingerprint)
@@ -194,24 +196,24 @@ func deviceFlowKeyboardInteractive(
 	pending *PendingFingerprints,
 ) func(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
-		fingerprints := pending.Take(conn.RemoteAddr().String())
-		if len(fingerprints) == 0 {
+		pendingKeys := pending.Take(conn.RemoteAddr().String())
+		if len(pendingKeys) == 0 {
 			return nil, fmt.Errorf("no pubkey was offered before keyboard-interactive")
 		}
 
-		// Use the last fingerprint offered (most likely the intended key).
-		fingerprint := fingerprints[len(fingerprints)-1]
+		// Use the last key offered (most likely the intended key).
+		lastKey := pendingKeys[len(pendingKeys)-1]
 
 		signer := signingKeyProvider.GetSigningKey()
 		if signer == nil {
 			return nil, fmt.Errorf("device flow auth not available: no signing key")
 		}
 
-		authURL, err := GenerateAuthURL(authenticatorURL, fingerprint, signer, issuer)
+		authURL, err := GenerateAuthURL(authenticatorURL, lastKey.fingerprint, lastKey.pubkey, signer, issuer)
 		if err != nil {
 			slog.Error("failed to generate device flow auth URL",
 				"error", err,
-				"fingerprint", fingerprint,
+				"fingerprint", lastKey.fingerprint,
 			)
 			return nil, fmt.Errorf("internal error generating auth URL")
 		}
@@ -234,7 +236,7 @@ func deviceFlowKeyboardInteractive(
 		slog.Info("device flow auth initiated",
 			"user", conn.User(),
 			"remote", conn.RemoteAddr().String(),
-			"fingerprint", fingerprint,
+			"fingerprint", lastKey.fingerprint,
 		)
 
 		// Return success immediately with a pending flag. The connection
@@ -242,9 +244,9 @@ func deviceFlowKeyboardInteractive(
 		// completes.
 		return &ssh.Permissions{
 			Extensions: map[string]string{
-				ExtFingerprint:           fingerprint,
+				ExtFingerprint:           lastKey.fingerprint,
 				ExtPendingDeviceAuth:     "true",
-				ExtDeviceFlowFingerprint: fingerprint,
+				ExtDeviceFlowFingerprint: lastKey.fingerprint,
 			},
 		}, nil
 	}

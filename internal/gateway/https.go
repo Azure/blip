@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -22,6 +23,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	gatewayauth "github.com/project-unbounded/blip/internal/gateway/auth"
 )
 
 // HTTPSConfig holds the configuration for the HTTPS API server.
@@ -49,6 +52,14 @@ type HTTPSConfig struct {
 	// extracted from the "repository" claim (owner/repo) of the GitHub
 	// Actions OIDC token.
 	GitHubAllowedOrgs []string
+
+	// JWTIssuer is the expected "iss" claim in device-flow pubkey JWTs
+	// (typically the gateway's own hostname or URL).
+	JWTIssuer string
+
+	// AuthenticatorURL is the expected "aud" claim in device-flow pubkey
+	// JWTs (the URL of the web authenticator).
+	AuthenticatorURL string
 }
 
 // githubActionsIssuer is the OIDC issuer URL for GitHub Actions tokens.
@@ -90,7 +101,7 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 	})
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /auth/user", authHandler(userVerifier, kubeWriter, namespace))
+	mux.Handle("POST /auth/user", authHandler(userVerifier, kubeWriter, namespace, certWatcher, cfg.JWTIssuer, cfg.AuthenticatorURL))
 	mux.Handle("POST /auth/github", githubAuthHandler(ghVerifier, cfg.GitHubAllowedOrgs, kubeWriter, namespace))
 
 	tlsCfg := &tls.Config{
@@ -115,7 +126,10 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 // authHandler returns a handler for POST /auth/user that:
 //  1. Verifies an OIDC bearer token from the Authorization header.
 //  2. Extracts the user ID (subject) and TTL (token expiry) from the token.
-//  3. Reads the SSH public key from the "pubkey" form value.
+//  3. Reads the "pubkey" form value, which is a JWT originally issued by the
+//     SSH gateway during device-flow auth (via GenerateAuthURL). The JWT is
+//     verified against the gateway's TLS signing key and checked for expiry.
+//     The SSH public key is extracted from the JWT's "pubkey" claim.
 //  4. Creates or updates a ConfigMap named "user-<hash>" (8-char truncated
 //     SHA-256 of the subject) in the given namespace, storing the public key
 //     and labelled with the user identity. The ConfigMap is annotated with an
@@ -125,7 +139,7 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 // This integrates with the AuthWatcher (which watches ConfigMaps with the
 // blip.azure.com/user label) to dynamically authorize SSH connections for
 // OIDC-authenticated users.
-func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, namespace string) http.Handler {
+func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, namespace string, signingKeyProvider *tlsCertWatcher, jwtIssuer, jwtAudience string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		idToken, ok := verifyBearerToken(w, r, verifier)
 		if !ok {
@@ -135,15 +149,60 @@ func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, names
 		// Limit request body to 64 KiB to prevent memory exhaustion.
 		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 
-		pubkey := r.FormValue("pubkey")
-		if pubkey == "" {
+		pubkeyJWT := r.FormValue("pubkey")
+		if pubkeyJWT == "" {
 			writeJSONError(w, http.StatusBadRequest, "missing required form value: pubkey")
 			return
 		}
 
-		// Validate the pubkey is a well-formed SSH public key.
-		if _, err := parsePubkeyString(pubkey); err != nil {
-			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid SSH public key: %v", err))
+		// The pubkey form value is a JWT issued by this gateway during the
+		// device-flow auth. Verify its signature against our signing key
+		// and check expiration, then extract the SSH public key from claims.
+		signer := signingKeyProvider.GetSigningKey()
+		if signer == nil {
+			slog.Error("no signing key available to verify pubkey JWT")
+			writeJSONError(w, http.StatusInternalServerError, "server signing key unavailable")
+			return
+		}
+		ecPub, ok := signer.Public().(*ecdsa.PublicKey)
+		if !ok {
+			slog.Error("signing key is not ECDSA", "type", fmt.Sprintf("%T", signer.Public()))
+			writeJSONError(w, http.StatusInternalServerError, "server signing key has unexpected type")
+			return
+		}
+
+		claims, err := gatewayauth.VerifyES256(pubkeyJWT, ecPub)
+		if err != nil {
+			slog.Debug("pubkey JWT verification failed", "error", err)
+			writeJSONError(w, http.StatusBadRequest, "invalid pubkey token")
+			return
+		}
+
+		// Validate issuer and audience claims to prevent token confusion.
+		if iss, _ := claims["iss"].(string); iss != jwtIssuer {
+			writeJSONError(w, http.StatusBadRequest, "invalid pubkey token issuer")
+			return
+		}
+		if aud, _ := claims["aud"].(string); aud != jwtAudience {
+			writeJSONError(w, http.StatusBadRequest, "invalid pubkey token audience")
+			return
+		}
+
+		pubkey, _ := claims["pubkey"].(string)
+		if pubkey == "" {
+			writeJSONError(w, http.StatusBadRequest, "pubkey token missing pubkey claim")
+			return
+		}
+
+		// Validate the pubkey is a well-formed SSH public key and cross-check
+		// the fingerprint claim against the actual key.
+		fingerprint, err := parsePubkeyString(pubkey)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid SSH public key in token: %v", err))
+			return
+		}
+		if fpClaim, _ := claims["fingerprint"].(string); fpClaim != "" && fpClaim != fingerprint {
+			writeJSONError(w, http.StatusBadRequest, "pubkey/fingerprint mismatch in token")
 			return
 		}
 
@@ -195,7 +254,7 @@ func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, names
 		// request creates the ConfigMap between our Get and Create by falling
 		// back to an update on AlreadyExists.
 		existing := &corev1.ConfigMap{}
-		err := kubeWriter.Get(r.Context(), client.ObjectKey{Namespace: namespace, Name: cmName}, existing)
+		err = kubeWriter.Get(r.Context(), client.ObjectKey{Namespace: namespace, Name: cmName}, existing)
 		if k8serrors.IsNotFound(err) {
 			if createErr := kubeWriter.Create(r.Context(), cm); createErr != nil {
 				if !k8serrors.IsAlreadyExists(createErr) {

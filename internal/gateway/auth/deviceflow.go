@@ -194,11 +194,18 @@ func (w *AuthSessionWatcher) WaitForAuth(ctx context.Context, fingerprint string
 	}
 }
 
+// pendingKey holds a fingerprint and the corresponding authorized_keys-format
+// public key string from a failed auth attempt.
+type pendingKey struct {
+	fingerprint string
+	pubkey      string // authorized_keys format (e.g. "ssh-ed25519 AAAA...")
+}
+
 // pendingFingerprintEntry holds fingerprint(s) attempted by a connection,
 // with a timestamp for TTL-based eviction.
 type pendingFingerprintEntry struct {
-	fingerprints []string
-	createdAt    time.Time
+	keys      []pendingKey
+	createdAt time.Time
 }
 
 // PendingFingerprints tracks pubkey fingerprints from failed auth attempts
@@ -218,8 +225,9 @@ func NewPendingFingerprints(ctx context.Context) *PendingFingerprints {
 	return pf
 }
 
-// Add records a fingerprint for the given remote address.
-func (pf *PendingFingerprints) Add(remoteAddr, fingerprint string) {
+// Add records a fingerprint and its corresponding authorized_keys-format
+// public key for the given remote address.
+func (pf *PendingFingerprints) Add(remoteAddr, fingerprint, pubkey string) {
 	pf.mu.Lock()
 	defer pf.mu.Unlock()
 	entry, ok := pf.entries[remoteAddr]
@@ -228,16 +236,16 @@ func (pf *PendingFingerprints) Add(remoteAddr, fingerprint string) {
 		pf.entries[remoteAddr] = entry
 	}
 	// Avoid duplicates (pubkeyCallback fires twice per key: probe + verify).
-	for _, fp := range entry.fingerprints {
-		if fp == fingerprint {
+	for _, k := range entry.keys {
+		if k.fingerprint == fingerprint {
 			return
 		}
 	}
-	entry.fingerprints = append(entry.fingerprints, fingerprint)
+	entry.keys = append(entry.keys, pendingKey{fingerprint: fingerprint, pubkey: pubkey})
 }
 
-// Take returns and removes all fingerprints for the given remote address.
-func (pf *PendingFingerprints) Take(remoteAddr string) []string {
+// Take returns and removes all pending keys for the given remote address.
+func (pf *PendingFingerprints) Take(remoteAddr string) []pendingKey {
 	pf.mu.Lock()
 	defer pf.mu.Unlock()
 	entry, ok := pf.entries[remoteAddr]
@@ -245,7 +253,7 @@ func (pf *PendingFingerprints) Take(remoteAddr string) []string {
 		return nil
 	}
 	delete(pf.entries, remoteAddr)
-	return entry.fingerprints
+	return entry.keys
 }
 
 // evictLoop periodically removes stale entries (older than 2 minutes).
@@ -279,8 +287,9 @@ var jwtHeader = base64URLEncode([]byte(`{"alg":"ES256","typ":"JWT"}`))
 
 // GenerateAuthURL creates a device-flow authentication URL containing a JWT
 // signed with the given EC P-256 private key. The JWT contains the user's
-// pubkey fingerprint, issuer, audience, and a 5-minute expiry.
-func GenerateAuthURL(authenticatorURL, fingerprint string, signer crypto.Signer, issuer string) (string, error) {
+// pubkey fingerprint, the full SSH public key in authorized_keys format,
+// issuer, audience, and a 5-minute expiry.
+func GenerateAuthURL(authenticatorURL, fingerprint, pubkey string, signer crypto.Signer, issuer string) (string, error) {
 	// Validate the signing key is ECDSA P-256.
 	ecKey, ok := signer.Public().(*ecdsa.PublicKey)
 	if !ok || ecKey.Curve != elliptic.P256() {
@@ -290,6 +299,7 @@ func GenerateAuthURL(authenticatorURL, fingerprint string, signer crypto.Signer,
 	now := time.Now()
 	claims := map[string]interface{}{
 		"fingerprint": fingerprint,
+		"pubkey":      pubkey,
 		"iss":         issuer,
 		"aud":         authenticatorURL,
 		"iat":         now.Unix(),
@@ -366,6 +376,21 @@ func VerifyES256(tokenString string, pubKey *ecdsa.PublicKey) (map[string]interf
 		return nil, fmt.Errorf("invalid JWT: expected 3 parts, got %d", len(parts))
 	}
 
+	// Validate the JWT header specifies ES256.
+	headerBytes, err := base64URLDecode(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("decode JWT header: %w", err)
+	}
+	var header struct {
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("unmarshal JWT header: %w", err)
+	}
+	if header.Alg != "ES256" {
+		return nil, fmt.Errorf("unsupported JWT algorithm: %s", header.Alg)
+	}
+
 	signingInput := parts[0] + "." + parts[1]
 	payload, err := base64URLDecode(parts[1])
 	if err != nil {
@@ -397,12 +422,13 @@ func VerifyES256(tokenString string, pubKey *ecdsa.PublicKey) (map[string]interf
 		return nil, fmt.Errorf("unmarshal JWT claims: %w", err)
 	}
 
-	// Check expiry (required).
+	// Check expiry (required). Allow 30 seconds of clock skew.
 	exp, ok := claims["exp"].(float64)
 	if !ok {
 		return nil, fmt.Errorf("JWT missing exp claim")
 	}
-	if time.Now().Unix() > int64(exp) {
+	const clockSkewSeconds = 30
+	if time.Now().Unix() > int64(exp)+clockSkewSeconds {
 		return nil, fmt.Errorf("JWT expired")
 	}
 
