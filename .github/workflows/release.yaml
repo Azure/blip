@@ -60,8 +60,13 @@ jobs:
           mkdir -p dist
           { envsubst '$REGISTRY $BLIP_TAG' < manifests/deploy.yaml; } > dist/manifest.yaml
 
-      - name: Copy VM pool manifest
-        run: cp manifests/pool.yaml dist/pool.yaml
+      - name: Build VM pool manifest
+        env:
+          BLIP_TAG: ${{ steps.tag.outputs.version }}
+        run: |
+          export REGISTRY="${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}"
+          export BLIP_TAG
+          { envsubst '$REGISTRY $BLIP_TAG' < manifests/pool.yaml; } > dist/pool.yaml
 
       - name: Create or update GitHub release
         env:
