@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -63,17 +64,17 @@ const githubActionsAudience = "blip"
 //   - POST /auth/github — OIDC bearer token authentication for GitHub Actions tokens
 //
 // The informerCache must already be started and synced.
-func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.Cache, kubeWriter client.Client, namespace string) (*http.Server, error) {
+func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.Cache, kubeWriter client.Client, namespace string) (*http.Server, *tlsCertWatcher, error) {
 	// Start the TLS cert watcher using the shared cache.
 	certWatcher, err := newTLSCertWatcher(ctx, informerCache, cfg.TLSSecretNamespace, cfg.TLSSecretName)
 	if err != nil {
-		return nil, fmt.Errorf("create tls cert watcher: %w", err)
+		return nil, nil, fmt.Errorf("create tls cert watcher: %w", err)
 	}
 
 	// Set up the user OIDC provider and verifier.
 	userProvider, err := oidc.NewProvider(ctx, cfg.OIDCIssuerURL)
 	if err != nil {
-		return nil, fmt.Errorf("create oidc provider for %s: %w", cfg.OIDCIssuerURL, err)
+		return nil, nil, fmt.Errorf("create oidc provider for %s: %w", cfg.OIDCIssuerURL, err)
 	}
 	userVerifier := userProvider.Verifier(&oidc.Config{
 		ClientID: cfg.OIDCAudience,
@@ -82,7 +83,7 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 	// Set up the GitHub Actions OIDC provider and verifier.
 	ghProvider, err := oidc.NewProvider(ctx, githubActionsIssuer)
 	if err != nil {
-		return nil, fmt.Errorf("create oidc provider for %s: %w", githubActionsIssuer, err)
+		return nil, nil, fmt.Errorf("create oidc provider for %s: %w", githubActionsIssuer, err)
 	}
 	ghVerifier := ghProvider.Verifier(&oidc.Config{
 		ClientID: githubActionsAudience,
@@ -108,7 +109,7 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn),
 	}
 
-	return srv, nil
+	return srv, certWatcher, nil
 }
 
 // authHandler returns a handler for POST /auth/user that:
@@ -541,6 +542,21 @@ func (w *tlsCertWatcher) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate,
 		return nil, fmt.Errorf("no tls certificate available yet")
 	}
 	return w.cert, nil
+}
+
+// GetSigningKey returns the private key from the cached TLS certificate
+// as a crypto.Signer, suitable for signing JWTs.
+func (w *tlsCertWatcher) GetSigningKey() crypto.Signer {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.cert == nil || w.cert.PrivateKey == nil {
+		return nil
+	}
+	signer, ok := w.cert.PrivateKey.(crypto.Signer)
+	if !ok {
+		return nil
+	}
+	return signer
 }
 
 func (w *tlsCertWatcher) handleEvent(obj interface{}) {
