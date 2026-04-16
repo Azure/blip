@@ -28,6 +28,11 @@ RUN curl -fsSL -o /work/go.tar.gz \
     curl -fsSL -L -o /work/opencode.tar.gz \
         "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-x64.tar.gz"
 
+# Pre-download GitHub Actions runner.
+ARG RUNNER_VERSION=2.321.0
+RUN curl -fsSL -L -o /work/actions-runner.tar.gz \
+        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+
 # Expand the disk so there is room to install packages, then customise.
 # We use virt-resize to grow sda1 and its filesystem in one step.
 RUN export LIBGUESTFS_BACKEND=direct && \
@@ -63,6 +68,14 @@ EOF
 bash /tmp/install-opencode.sh --binary /tmp/opencode --no-modify-path
 ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode
 rm -f /tmp/opencode /tmp/install-opencode.sh /tmp/opencode.tar.gz
+
+# Install GitHub Actions runner.
+useradd -m -s /bin/bash runner
+mkdir -p /home/runner/actions-runner
+tar -xzf /tmp/actions-runner.tar.gz -C /home/runner/actions-runner
+rm -f /tmp/actions-runner.tar.gz
+/home/runner/actions-runner/bin/installdependencies.sh
+chown -R runner:runner /home/runner/actions-runner
 SETUP
 
 RUN export LIBGUESTFS_BACKEND=direct && \
@@ -71,6 +84,7 @@ RUN export LIBGUESTFS_BACKEND=direct && \
         --copy-in /work/go.tar.gz:/tmp \
         --copy-in /work/install-opencode.sh:/tmp \
         --copy-in /work/opencode.tar.gz:/tmp \
+        --copy-in /work/actions-runner.tar.gz:/tmp \
         --run-command 'tar -xzf /tmp/opencode.tar.gz -C /tmp && rm /tmp/opencode.tar.gz' \
         --run /work/setup.sh
 
@@ -78,5 +92,5 @@ RUN export LIBGUESTFS_BACKEND=direct && \
 # Final: package as a containerdisk (disk image at /disk/).
 # ---------------------------------------------------------------------------
 FROM scratch
-LABEL org.opencontainers.image.description="KubeVirt containerdisk: Ubuntu 24.04 with neovim, opencode, and Go"
+LABEL org.opencontainers.image.description="KubeVirt containerdisk: Ubuntu 24.04 with neovim, opencode, Go, and GitHub Actions runner"
 COPY --from=build /work/disk.qcow2 /disk/disk.qcow2
