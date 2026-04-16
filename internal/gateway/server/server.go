@@ -43,6 +43,23 @@ type Config struct {
 	// TokenReviewer validates Kubernetes ServiceAccount tokens for
 	// _register connections; nil disables SA token auth for registration.
 	TokenReviewer auth.TokenReviewer
+
+	// AuthSessionWatcher watches auth session Secrets for device-flow auth;
+	// nil disables auth session secret lookups.
+	AuthSessionWatcher *auth.AuthSessionWatcher
+
+	// PendingFingerprints tracks pubkey fingerprints from failed auth
+	// attempts for the keyboard-interactive device flow fallback.
+	PendingFingerprints *auth.PendingFingerprints
+
+	// AuthenticatorURL is the web authenticator URL for device-flow auth.
+	AuthenticatorURL string
+
+	// JWTSigner provides the signing key for device-flow JWTs.
+	JWTSigner auth.SigningKeyProvider
+
+	// JWTIssuer is the issuer claim for device-flow JWTs.
+	JWTIssuer string
 }
 
 // ConnHandler is called for each successfully authenticated SSH connection.
@@ -67,11 +84,16 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	)
 
 	sshConfig := auth.NewServerConfig(ctx, auth.Config{
-		HostSigner:    hostSigner,
-		MaxAuthTries:  cfg.MaxAuthTries,
-		AuthWatcher:   cfg.AuthWatcher,
-		VMKeyResolver: cfg.VMKeyResolver,
-		TokenReviewer: cfg.TokenReviewer,
+		HostSigner:          hostSigner,
+		MaxAuthTries:        cfg.MaxAuthTries,
+		AuthWatcher:         cfg.AuthWatcher,
+		VMKeyResolver:       cfg.VMKeyResolver,
+		TokenReviewer:       cfg.TokenReviewer,
+		AuthSessionWatcher:  cfg.AuthSessionWatcher,
+		PendingFingerprints: cfg.PendingFingerprints,
+		AuthenticatorURL:    cfg.AuthenticatorURL,
+		JWTSigner:           cfg.JWTSigner,
+		JWTIssuer:           cfg.JWTIssuer,
 	})
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)

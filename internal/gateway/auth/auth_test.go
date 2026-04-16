@@ -87,7 +87,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		fp := ssh.FingerprintSHA256(userPub)
 
 		watcher := NewTestAuthWatcher(map[string]string{fp: "alice"})
-		cb := pubkeyCallback(watcher, nil)
+		cb := pubkeyCallback(watcher, nil, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		require.NoError(t, err)
@@ -99,7 +99,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
 		watcher := NewTestAuthWatcher(map[string]string{"SHA256:other": "bob"})
-		cb := pubkeyCallback(watcher, nil)
+		cb := pubkeyCallback(watcher, nil, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
@@ -110,7 +110,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
 		watcher := NewTestAuthWatcher(nil)
-		cb := pubkeyCallback(watcher, nil)
+		cb := pubkeyCallback(watcher, nil, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
@@ -122,7 +122,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		fp := ssh.FingerprintSHA256(userPub)
 
 		watcher := NewTestAuthWatcher(map[string]string{fp: ""})
-		cb := pubkeyCallback(watcher, nil)
+		cb := pubkeyCallback(watcher, nil, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)

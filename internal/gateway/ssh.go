@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"context"
+	"crypto"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -56,6 +58,12 @@ type GatewayConfig struct {
 	// HTTPListenAddr is the address for the HTTP server that serves health
 	// checks. Default: ":8080".
 	HTTPListenAddr string
+
+	// AuthenticatorURL is the URL of the web authenticator for device-flow
+	// SSH authentication. When set and an unrecognized pubkey connects, the
+	// user is shown a URL to authenticate in their browser. The gateway
+	// blocks until the login workflow creates a matching auth session secret.
+	AuthenticatorURL string
 
 	// HTTPS is the optional configuration for the HTTPS API server.
 	// When non-nil, the gateway starts an additional TLS listener with
@@ -179,16 +187,55 @@ func RunGateway(cfg *GatewayConfig) error {
 		)
 	}
 
+	// Set up device-flow auth components if authenticator URL is configured.
+	var authSessionWatcher *auth.AuthSessionWatcher
+	var pendingFingerprints *auth.PendingFingerprints
+	var jwtSigningKeyProvider *lazySigningKeyProvider
+	jwtIssuer := cfg.ExternalHost
+
+	if cfg.AuthenticatorURL != "" {
+		var err error
+		authSessionWatcher, err = auth.NewAuthSessionWatcher(ctx, cfg.KubeCache, cfg.VMNamespace)
+		if err != nil {
+			return fmt.Errorf("create auth session watcher: %w", err)
+		}
+		pendingFingerprints = auth.NewPendingFingerprints(ctx)
+		jwtSigningKeyProvider = &lazySigningKeyProvider{}
+
+		if cfg.HTTPS == nil {
+			return fmt.Errorf("--authenticator-url requires HTTPS to be configured (set --oidc-issuer-url)")
+		}
+
+		slog.Info("device flow auth enabled",
+			"authenticator_url", cfg.AuthenticatorURL,
+		)
+	}
+
+	// Increase MaxAuthTries when device flow is enabled, since SSH clients
+	// may try multiple keys from ssh-agent before falling back to
+	// keyboard-interactive.
+	maxAuthTries := cfg.MaxAuthTries
+	if cfg.AuthenticatorURL != "" && maxAuthTries < 6 {
+		maxAuthTries = 6
+	}
+
 	srv, err := server.New(ctx, server.Config{
 		ListenAddr:         cfg.ListenAddr,
 		HostKeyPath:        cfg.HostKeyPath,
 		PodName:            cfg.PodName,
 		MaxSessionDuration: cfg.MaxSessionDuration,
 		LoginGraceTime:     cfg.LoginGraceTime,
-		MaxAuthTries:       cfg.MaxAuthTries,
+		MaxAuthTries:       maxAuthTries,
 		AuthWatcher:        authWatcher,
 		VMKeyResolver:      vmKeyResolver,
 		TokenReviewer:      tokenReviewer,
+
+		// Device flow auth parameters.
+		AuthSessionWatcher:  authSessionWatcher,
+		PendingFingerprints: pendingFingerprints,
+		AuthenticatorURL:    cfg.AuthenticatorURL,
+		JWTSigner:           jwtSigningKeyProvider,
+		JWTIssuer:           jwtIssuer,
 	})
 	if err != nil {
 		return err
@@ -263,10 +310,18 @@ func RunGateway(cfg *GatewayConfig) error {
 	// Start HTTPS API server in background (optional).
 	var httpsServer *http.Server
 	if cfg.HTTPS != nil {
+		var certWatcher *tlsCertWatcher
 		var err error
-		httpsServer, err = NewHTTPSServer(ctx, *cfg.HTTPS, cfg.KubeCache, cfg.KubeWriter, cfg.VMNamespace)
+		httpsServer, certWatcher, err = NewHTTPSServer(ctx, *cfg.HTTPS, cfg.KubeCache, cfg.KubeWriter, cfg.VMNamespace)
 		if err != nil {
 			return fmt.Errorf("create HTTPS server: %w", err)
+		}
+
+		// Wire the TLS cert watcher as the JWT signing key provider
+		// for device-flow auth (the SSH server was created before the
+		// HTTPS server, so the lazy provider bridges the gap).
+		if jwtSigningKeyProvider != nil {
+			jwtSigningKeyProvider.SetProvider(certWatcher)
 		}
 		httpsErrCh := StartHTTPSServer(httpsServer)
 		select {
@@ -287,13 +342,35 @@ func RunGateway(cfg *GatewayConfig) error {
 	// (which means GitHub token secrets may be created via /auth/github).
 	var actionsRunner *actions.Runner
 	if cfg.HTTPS != nil && len(cfg.HTTPS.GitHubAllowedOrgs) > 0 {
-		actionsRunner = actions.New(actions.Config{
+		actionsCfg := actions.Config{
 			VMClient:  vmcl,
 			KubeCache: cfg.KubeCache,
 			Namespace: cfg.VMNamespace,
 			PoolName:  cfg.VMPoolName,
 			PodName:   cfg.PodName,
-		})
+		}
+
+		// If a GitHub App is configured, create the authenticated client
+		// for JIT runner provisioning and job monitoring.
+		if cfg.Actions != nil && cfg.Actions.GitHubAppID > 0 {
+			ghApp, err := actions.NewGitHubApp(
+				cfg.Actions.GitHubAppID,
+				cfg.Actions.GitHubInstallID,
+				cfg.Actions.GitHubKeyPath,
+			)
+			if err != nil {
+				return fmt.Errorf("create github app client: %w", err)
+			}
+			actionsCfg.GitHubApp = ghApp
+			actionsCfg.RunnerLabels = cfg.Actions.RunnerLabels
+			slog.Info("github app configured for actions runner provisioning",
+				"app_id", cfg.Actions.GitHubAppID,
+				"install_id", cfg.Actions.GitHubInstallID,
+				"labels", cfg.Actions.RunnerLabels,
+			)
+		}
+
+		actionsRunner = actions.New(actionsCfg)
 		go func() {
 			if err := actionsRunner.Start(ctx); err != nil {
 				slog.Error("actions runner backend error", "error", err)
@@ -343,11 +420,56 @@ func RunGateway(cfg *GatewayConfig) error {
 	// Route incoming SSH connections: VM management commands
 	// (_blip/_register users) go to the command handler; everything
 	// else goes through the normal session proxy flow.
+	//
+	// For device-flow auth, connections with ExtPendingDeviceAuth block
+	// here until the user completes browser authentication.
 	connHandler := func(ctx context.Context, serverConn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		if session.IsVMCommandConnection(serverConn) {
 			mgr.HandleVMCommand(ctx, serverConn, chans, reqs)
 			return
 		}
+
+		// If this connection came through device-flow keyboard-interactive,
+		// block until the auth session secret appears before proxying.
+		if serverConn.Permissions != nil &&
+			serverConn.Permissions.Extensions[auth.ExtPendingDeviceAuth] == "true" &&
+			authSessionWatcher != nil {
+
+			fingerprint := serverConn.Permissions.Extensions[auth.ExtDeviceFlowFingerprint]
+			slog.Info("device flow: waiting for browser authentication",
+				"remote", serverConn.RemoteAddr().String(),
+				"fingerprint", fingerprint,
+			)
+
+			subject, err := authSessionWatcher.WaitForAuth(ctx, fingerprint, 5*time.Minute)
+			if err != nil {
+				slog.Info("device flow auth failed",
+					"remote", serverConn.RemoteAddr().String(),
+					"fingerprint", fingerprint,
+					"error", err,
+				)
+				serverConn.Close()
+				return
+			}
+
+			// Update the permissions with the authenticated identity.
+			// Create a new map to avoid data races with any concurrent
+			// readers of the extensions map.
+			newExts := make(map[string]string, len(serverConn.Permissions.Extensions))
+			for k, v := range serverConn.Permissions.Extensions {
+				newExts[k] = v
+			}
+			newExts[auth.ExtIdentity] = fmt.Sprintf("device:%s", subject)
+			delete(newExts, auth.ExtPendingDeviceAuth)
+			serverConn.Permissions.Extensions = newExts
+
+			slog.Info("device flow auth succeeded",
+				"remote", serverConn.RemoteAddr().String(),
+				"fingerprint", fingerprint,
+				"subject", subject,
+			)
+		}
+
 		mgr.HandleConnection(ctx, serverConn, chans, reqs)
 	}
 
@@ -411,4 +533,27 @@ type vmKeyResolverAdapter struct {
 
 func (a *vmKeyResolverAdapter) ResolveRootIdentity(fingerprint string) (string, string, error) {
 	return a.vmClient.ResolveRootIdentity(context.Background(), fingerprint)
+}
+
+// lazySigningKeyProvider wraps a tlsCertWatcher that may not be available at
+// construction time (the HTTPS server starts after the SSH server). The
+// underlying provider is set once the HTTPS server is created.
+type lazySigningKeyProvider struct {
+	mu       sync.Mutex
+	provider auth.SigningKeyProvider
+}
+
+func (l *lazySigningKeyProvider) SetProvider(p auth.SigningKeyProvider) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.provider = p
+}
+
+func (l *lazySigningKeyProvider) GetSigningKey() crypto.Signer {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.provider == nil {
+		return nil
+	}
+	return l.provider.GetSigningKey()
 }

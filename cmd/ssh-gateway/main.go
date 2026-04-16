@@ -43,6 +43,9 @@ func newRootCmd() *cobra.Command {
 		// HTTP server for health checks.
 		httpListenAddr string
 
+		// Authenticator URL for device-flow SSH auth (optional).
+		authenticatorURL string
+
 		// HTTPS API server (optional, enabled when --oidc-issuer-url is set).
 		httpsListenAddr   string
 		tlsSecretName     string
@@ -106,6 +109,7 @@ func newRootCmd() *cobra.Command {
 				KeepAliveInterval:  60 * time.Second,
 				KeepAliveMax:       3,
 				HTTPListenAddr:     httpListenAddr,
+				AuthenticatorURL:   authenticatorURL,
 				KubeWriter:         kubeWriter,
 				KubeCache:          kubeCache,
 			}
@@ -196,6 +200,7 @@ func newRootCmd() *cobra.Command {
 
 	// HTTP server flags.
 	cmd.Flags().StringVar(&httpListenAddr, "http-address", envOrDefault("HTTP_ADDRESS", ":8080"), "HTTP address for health checks (env: HTTP_ADDRESS)")
+	cmd.Flags().StringVar(&authenticatorURL, "authenticator-url", envOrDefault("AUTHENTICATOR_URL", ""), "URL of the web authenticator for device-flow SSH auth (env: AUTHENTICATOR_URL)")
 
 	// HTTPS API server flags (optional, enabled when --oidc-issuer-url is set).
 	cmd.Flags().StringVar(&httpsListenAddr, "https-address", envOrDefault("HTTPS_ADDRESS", ":8443"), "HTTPS address for the API server (env: HTTPS_ADDRESS)")

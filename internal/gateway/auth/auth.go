@@ -52,6 +52,27 @@ type Config struct {
 	// as their SSH password to register keys. When nil, _register
 	// connections are rejected.
 	TokenReviewer TokenReviewer
+
+	// AuthSessionWatcher watches Kubernetes Secrets for device-flow auth
+	// sessions. When set, pubkey auth also checks auth session secrets.
+	AuthSessionWatcher *AuthSessionWatcher
+
+	// AuthenticatorURL is the URL of the web authenticator for the
+	// device-flow. When set (along with AuthSessionWatcher and JWTSigner),
+	// users with unrecognized pubkeys are prompted to authenticate via
+	// their browser.
+	AuthenticatorURL string
+
+	// JWTSigner is the private key used to sign device-flow JWTs.
+	JWTSigner SigningKeyProvider
+
+	// JWTIssuer is the issuer claim for device-flow JWTs (typically the
+	// gateway's external hostname).
+	JWTIssuer string
+
+	// PendingFingerprints tracks pubkey fingerprints from failed auth
+	// attempts, bridging pubkeyCallback and keyboard-interactive.
+	PendingFingerprints *PendingFingerprints
 }
 
 // VMKeyResolver resolves a VM SSH client key fingerprint to the original
@@ -65,8 +86,18 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 	sshCfg := &ssh.ServerConfig{MaxAuthTries: cfg.MaxAuthTries}
 	sshCfg.AddHostKey(cfg.HostSigner)
 
-	if cfg.AuthWatcher != nil || cfg.VMKeyResolver != nil {
-		sshCfg.PublicKeyCallback = pubkeyCallback(cfg.AuthWatcher, cfg.VMKeyResolver)
+	if cfg.AuthWatcher != nil || cfg.VMKeyResolver != nil || cfg.AuthSessionWatcher != nil {
+		sshCfg.PublicKeyCallback = pubkeyCallback(cfg.AuthWatcher, cfg.VMKeyResolver, cfg.AuthSessionWatcher, cfg.PendingFingerprints)
+	}
+
+	// Enable keyboard-interactive for device-flow auth when configured.
+	if cfg.AuthenticatorURL != "" && cfg.AuthSessionWatcher != nil && cfg.JWTSigner != nil && cfg.PendingFingerprints != nil {
+		sshCfg.KeyboardInteractiveCallback = deviceFlowKeyboardInteractive(
+			cfg.AuthenticatorURL,
+			cfg.JWTSigner,
+			cfg.JWTIssuer,
+			cfg.PendingFingerprints,
+		)
 	}
 
 	// Authenticate _register connections using a Kubernetes ServiceAccount
@@ -101,9 +132,14 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 
 // pubkeyCallback returns a PublicKeyCallback that checks keys in order:
 // 1. Explicit allowed pubkeys from ConfigMaps with blip.azure.com/user label.
-// 2. VM client keys for recursive blip connections.
-func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
+// 2. Auth session secrets from the device-flow login workflow.
+// 3. VM client keys for recursive blip connections.
+// When all checks fail and pending is non-nil, the fingerprint is recorded
+// for use by the keyboard-interactive device flow callback.
+func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver, sessionWatcher *AuthSessionWatcher, pending *PendingFingerprints) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+		fingerprint := ssh.FingerprintSHA256(key)
+
 		// First, try explicit pubkey auth (user keys from ConfigMaps).
 		if watcher != nil {
 			perm, err := verifyExplicitPubkey(conn, key, watcher)
@@ -112,7 +148,25 @@ func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver) func(ssh.Con
 			}
 		}
 
-		// Second, try VM client key auth (for recursive blip connections).
+		// Second, try auth session secrets (device-flow completed sessions).
+		if sessionWatcher != nil {
+			if subject, found := sessionWatcher.LookupByFingerprint(context.Background(), fingerprint); found {
+				slog.Info("auth session secret auth succeeded",
+					"user", conn.User(),
+					"remote", conn.RemoteAddr().String(),
+					"key_fingerprint", fingerprint,
+					"subject", subject,
+				)
+				return &ssh.Permissions{
+					Extensions: map[string]string{
+						ExtFingerprint: fingerprint,
+						ExtIdentity:    fmt.Sprintf("device:%s", subject),
+					},
+				}, nil
+			}
+		}
+
+		// Third, try VM client key auth (for recursive blip connections).
 		if vmResolver != nil {
 			perm, err := verifyVMClientKey(conn, key, vmResolver)
 			if err == nil {
@@ -120,7 +174,79 @@ func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver) func(ssh.Con
 			}
 		}
 
-		return nil, fmt.Errorf("public key %s is not authorized", ssh.FingerprintSHA256(key))
+		// Record the fingerprint for use by keyboard-interactive fallback.
+		if pending != nil {
+			pending.Add(conn.RemoteAddr().String(), fingerprint)
+		}
+
+		return nil, fmt.Errorf("public key %s is not authorized", fingerprint)
+	}
+}
+
+// deviceFlowKeyboardInteractive returns a KeyboardInteractiveCallback that
+// presents a device-flow authentication URL to the user. It succeeds
+// immediately after showing the URL, setting ExtPendingDeviceAuth so the
+// connection handler knows to call WaitForAuth before proxying.
+func deviceFlowKeyboardInteractive(
+	authenticatorURL string,
+	signingKeyProvider SigningKeyProvider,
+	issuer string,
+	pending *PendingFingerprints,
+) func(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+	return func(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+		fingerprints := pending.Take(conn.RemoteAddr().String())
+		if len(fingerprints) == 0 {
+			return nil, fmt.Errorf("no pubkey was offered before keyboard-interactive")
+		}
+
+		// Use the last fingerprint offered (most likely the intended key).
+		fingerprint := fingerprints[len(fingerprints)-1]
+
+		signer := signingKeyProvider.GetSigningKey()
+		if signer == nil {
+			return nil, fmt.Errorf("device flow auth not available: no signing key")
+		}
+
+		authURL, err := GenerateAuthURL(authenticatorURL, fingerprint, signer, issuer)
+		if err != nil {
+			slog.Error("failed to generate device flow auth URL",
+				"error", err,
+				"fingerprint", fingerprint,
+			)
+			return nil, fmt.Errorf("internal error generating auth URL")
+		}
+
+		banner := FormatDeviceFlowBanner(authURL)
+
+		// Send the URL to the user via keyboard-interactive. We use a
+		// single prompt with no echo so the user sees the banner and
+		// presses Enter. We don't actually need their response.
+		_, err = client(
+			conn.User(),
+			banner,
+			[]string{"Press Enter after authenticating in your browser: "},
+			[]bool{true},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("keyboard-interactive challenge failed: %w", err)
+		}
+
+		slog.Info("device flow auth initiated",
+			"user", conn.User(),
+			"remote", conn.RemoteAddr().String(),
+			"fingerprint", fingerprint,
+		)
+
+		// Return success immediately with a pending flag. The connection
+		// handler will call WaitForAuth to block until the browser auth
+		// completes.
+		return &ssh.Permissions{
+			Extensions: map[string]string{
+				ExtFingerprint:           fingerprint,
+				ExtPendingDeviceAuth:     "true",
+				ExtDeviceFlowFingerprint: fingerprint,
+			},
+		}, nil
 	}
 }
 
