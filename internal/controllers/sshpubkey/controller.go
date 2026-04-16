@@ -14,6 +14,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
+// TODO: Rename to "session" configmaps
+//
+// TODO: Always use generateName for these configmaps, dedup in this controller as needed
+//
+// TODO: Add unit tests
+
 const (
 	// LabelUser identifies ConfigMaps that hold a user's SSH public key.
 	LabelUser = "blip.azure.com/user"

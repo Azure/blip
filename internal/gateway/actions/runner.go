@@ -28,6 +28,11 @@ import (
 	"github.com/project-unbounded/blip/internal/gateway/vm"
 )
 
+// TODO: Remove app credentials
+
+// TODO: Store the polling state in the VM annotations, use a controller to poll for completion
+// TODO: Same for installing the runner: ssh from a separate controller (instead of storing sensitive token in annotations)
+
 const (
 	// repoLabel is the label applied to secrets by the /auth/github handler.
 	repoLabel = "blip.azure.com/repo"

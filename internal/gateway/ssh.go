@@ -277,9 +277,13 @@ func RunGateway(cfg *GatewayConfig) error {
 	// shuttingDown is set to 1 when a shutdown signal is received.
 	var shuttingDown atomic.Int32
 
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("GET /healthz", healthzHandler(nil))
+	httpMux.HandleFunc("GET /readyz", readyzHandler(nil, &shuttingDown))
+
 	httpServer := &http.Server{
 		Addr:         httpAddr,
-		Handler:      nil, // TODO
+		Handler:      httpMux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
