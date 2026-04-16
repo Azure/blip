@@ -593,15 +593,10 @@ def setup():
     run(["kind", "load", "docker-image", IMAGE_NAME], timeout=120, verbose=True)
 
     # 3. Apply manifests with image substitution.
-    #    Build the full manifest by concatenating the CRD and deploy.yaml,
-    #    matching the release build process (see Makefile / release workflow).
-    log("  Applying deploy manifest (CRD + deploy.yaml)...")
-    with open("config/crd/blip.io_blipowners.yaml") as f:
-        crd = f.read()
+    log("  Applying deploy manifest...")
     with open("manifests/deploy.yaml") as f:
         deploy = f.read()
-    manifest = crd + "\n---\n" + deploy
-    manifest = manifest.replace("${REGISTRY}/blip:${BLIP_TAG}", IMAGE_NAME)
+    manifest = deploy.replace("${REGISTRY}/blip:${BLIP_TAG}", IMAGE_NAME)
     run(["kubectl", "apply", "-f", "-"], input=manifest)
 
     # Restart controller to pick up the new image (kind reuses the tag
@@ -647,17 +642,20 @@ def setup():
     run(["ssh-keygen", "-t", "ed25519", "-f", _ssh_key, "-N", "", "-q"])
     with open(f"{_ssh_key}.pub") as f:
         pub_key = f.read().strip()
-    bo_yaml = (
-        f"apiVersion: blip.io/v1alpha1\n"
-        f"kind: BlipOwner\n"
+    # Register the pubkey as a ConfigMap with the blip.azure.com/user label,
+    # which is what the gateway's AuthWatcher watches for allowed keys.
+    cm_yaml = (
+        f"apiVersion: v1\n"
+        f"kind: ConfigMap\n"
         f"metadata:\n"
         f"  name: smoke-test-key\n"
         f"  namespace: {NAMESPACE}\n"
-        f"spec:\n"
-        f"  sshKey:\n"
-        f"    publicKey: \"{pub_key}\"\n"
+        f"  labels:\n"
+        f"    blip.azure.com/user: smoke-test\n"
+        f"data:\n"
+        f"  pubkey: \"{pub_key}\"\n"
     )
-    run(["kubectl", "apply", "-f", "-"], input=bo_yaml)
+    run(["kubectl", "apply", "-f", "-"], input=cm_yaml)
 
     # 8. Wait for gateway rollout
     log("  Waiting for ssh-gateway...")
