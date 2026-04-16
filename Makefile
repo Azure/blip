@@ -14,14 +14,13 @@ blip:
 	mkdir -p dist
 	$(CONTAINER_ENGINE) save $(REGISTRY)/blip:$(BLIP_TAG) -o dist/image.tar.gz
 
-.PHONY: github-runner
-github-runner:
+.PHONY: base
+base:
 	$(CONTAINER_ENGINE) build \
-		--build-arg RUNNER_VERSION=$(RUNNER_VERSION) \
-		-t $(REGISTRY)/blip-github-runner:$(BLIP_TAG) \
-		-f images/github-runner/Containerfile .
+		-t $(REGISTRY)/blip-base:$(BLIP_TAG) \
+		-f images/base/Containerfile .
 	mkdir -p dist
-	$(CONTAINER_ENGINE) save $(REGISTRY)/blip-github-runner:$(BLIP_TAG) -o dist/github-runner.tar.gz
+	$(CONTAINER_ENGINE) save $(REGISTRY)/blip-base:$(BLIP_TAG) -o dist/base.tar.gz
 
 .PHONY: manifest
 manifest:
