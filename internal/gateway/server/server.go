@@ -52,11 +52,11 @@ type Config struct {
 	// attempts for the keyboard-interactive device flow fallback.
 	PendingFingerprints *auth.PendingFingerprints
 
-	// AuthenticatorURL is the web authenticator URL for device-flow auth.
-	AuthenticatorURL string
-
-	// JWTSigner provides the signing key for device-flow JWTs.
-	JWTSigner auth.SigningKeyProvider
+	// DeviceFlow provides dynamic device-flow configuration (authenticator
+	// URL and signing key) from the OIDC ConfigMap watcher. When non-nil,
+	// the keyboard-interactive callback reads the authenticator URL at
+	// runtime, allowing it to activate/deactivate without a restart.
+	DeviceFlow auth.DeviceFlowProvider
 
 	// JWTIssuer is the issuer claim for device-flow JWTs.
 	JWTIssuer string
@@ -91,8 +91,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		TokenReviewer:       cfg.TokenReviewer,
 		AuthSessionWatcher:  cfg.AuthSessionWatcher,
 		PendingFingerprints: cfg.PendingFingerprints,
-		AuthenticatorURL:    cfg.AuthenticatorURL,
-		JWTSigner:           cfg.JWTSigner,
+		DeviceFlow:          cfg.DeviceFlow,
 		JWTIssuer:           cfg.JWTIssuer,
 	})
 

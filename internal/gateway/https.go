@@ -31,57 +31,32 @@ type HTTPSConfig struct {
 	// Addr is the listen address for the HTTPS server (e.g. ":8443").
 	Addr string
 
-	// TLSSecretName is the Kubernetes Secret containing the TLS certificate
-	// (key "tls.crt") and private key (key "tls.key"). The secret is watched
-	// via the controller-runtime cache so rotations are picked up immediately.
-	TLSSecretName string
-
-	// TLSSecretNamespace is the namespace of the TLS secret.
-	TLSSecretNamespace string
-
-	// OIDCIssuerURL is the trusted OIDC issuer URL (e.g. "https://accounts.google.com").
-	// Only tokens from this issuer are accepted.
-	OIDCIssuerURL string
-
-	// OIDCAudience is the expected "aud" claim in the OIDC token.
-	OIDCAudience string
-
 	// JWTIssuer is the expected "iss" claim in device-flow pubkey JWTs
 	// (typically the gateway's own hostname or URL).
 	JWTIssuer string
 
-	// AuthenticatorURL is the expected "aud" claim in device-flow pubkey
-	// JWTs (the URL of the web authenticator).
-	AuthenticatorURL string
+	// OIDCConfig provides dynamic OIDC configuration from a watched ConfigMap.
+	// The verifier, authenticator URL, and TLS certificate are all read from
+	// this watcher at request time, allowing runtime reconfiguration.
+	OIDCConfig *OIDCConfigWatcher
 }
 
 // NewHTTPSServer creates an HTTPS server with:
-//   - TLS certificate watched from a Kubernetes Secret via controller-runtime cache
-//   - POST /auth/user — OIDC bearer token authentication against the configured issuer
+//   - TLS certificate dynamically provided by the OIDCConfigWatcher
+//   - POST /auth/user — OIDC bearer token authentication with dynamic verifier
 //
-// The informerCache must already be started and synced.
-func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.Cache, kubeWriter client.Client, namespace string) (*http.Server, *tlsCertWatcher, error) {
-	// Start the TLS cert watcher using the shared cache.
-	certWatcher, err := newTLSCertWatcher(ctx, informerCache, cfg.TLSSecretNamespace, cfg.TLSSecretName)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create tls cert watcher: %w", err)
-	}
-
-	// Set up the user OIDC provider and verifier.
-	userProvider, err := oidc.NewProvider(ctx, cfg.OIDCIssuerURL)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create oidc provider for %s: %w", cfg.OIDCIssuerURL, err)
-	}
-	userVerifier := userProvider.Verifier(&oidc.Config{
-		ClientID: cfg.OIDCAudience,
-	})
+// The OIDC verifier and TLS certificate are read from the OIDCConfigWatcher at
+// request time, so configuration changes in the watched ConfigMap take effect
+// immediately without a restart.
+func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, kubeWriter client.Client, namespace string) (*http.Server, error) {
+	oidcCfg := cfg.OIDCConfig
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /auth/user", authHandler(userVerifier, kubeWriter, namespace, certWatcher, cfg.JWTIssuer, cfg.AuthenticatorURL))
+	mux.Handle("POST /auth/user", dynamicAuthHandler(oidcCfg, kubeWriter, namespace, cfg.JWTIssuer))
 
 	tlsCfg := &tls.Config{
 		MinVersion:     tls.VersionTLS12,
-		GetCertificate: certWatcher.GetCertificate,
+		GetCertificate: oidcCfg.GetCertificate,
 	}
 
 	srv := &http.Server{
@@ -95,29 +70,30 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn),
 	}
 
-	return srv, certWatcher, nil
+	return srv, nil
 }
 
-// authHandler returns a handler for POST /auth/user that:
-//  1. Verifies an OIDC bearer token from the Authorization header.
-//  2. Extracts the user ID (subject) and TTL (token expiry) from the token.
-//  3. Reads the "pubkey" form value, which is a JWT originally issued by the
-//     SSH gateway during device-flow auth (via GenerateAuthURL). The JWT is
-//     verified against the gateway's TLS signing key and checked for expiry.
-//     The SSH public key is extracted from the JWT's "pubkey" claim.
-//  4. Creates a session ConfigMap using generateName (prefix "session-") in
-//     the given namespace, storing the public key and labelled with the user
-//     identity. The ConfigMap is annotated with an expiration timestamp
-//     derived from the token's expiry, so the session controller will
-//     garbage-collect it after the token expires. If multiple ConfigMaps
-//     exist for the same user (due to concurrent requests), the session
-//     controller deduplicates them, keeping the one with the latest expiry.
+// dynamicAuthHandler returns a handler for POST /auth/user that reads the
+// OIDC verifier, signing key, and authenticator URL from the OIDCConfigWatcher
+// at request time. This allows runtime reconfiguration via ConfigMap changes.
 //
-// This integrates with the AuthWatcher (which watches ConfigMaps with the
-// blip.azure.com/user label) to dynamically authorize SSH connections for
-// OIDC-authenticated users.
-func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, namespace string, signingKeyProvider *tlsCertWatcher, jwtIssuer, jwtAudience string) http.Handler {
+// The handler:
+//  1. Checks that OIDC is configured (returns 503 if not).
+//  2. Verifies an OIDC bearer token from the Authorization header.
+//  3. Extracts the user ID (subject) and TTL (token expiry) from the token.
+//  4. Reads the "pubkey" form value — a JWT issued by the SSH gateway during
+//     device-flow auth — verifies it against the TLS signing key, and extracts
+//     the SSH public key.
+//  5. Creates a session ConfigMap with the public key for the AuthWatcher.
+func dynamicAuthHandler(oidcCfg *OIDCConfigWatcher, kubeWriter client.Client, namespace string, jwtIssuer string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check that OIDC auth is configured.
+		verifier := oidcCfg.Verifier()
+		if verifier == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "OIDC auth not configured")
+			return
+		}
+
 		idToken, ok := verifyBearerToken(w, r, verifier)
 		if !ok {
 			return
@@ -135,7 +111,7 @@ func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, names
 		// The pubkey form value is a JWT issued by this gateway during the
 		// device-flow auth. Verify its signature against our signing key
 		// and check expiration, then extract the SSH public key from claims.
-		signer := signingKeyProvider.GetSigningKey()
+		signer := oidcCfg.GetSigningKey()
 		if signer == nil {
 			slog.Error("no signing key available to verify pubkey JWT")
 			writeJSONError(w, http.StatusInternalServerError, "server signing key unavailable")
@@ -160,6 +136,8 @@ func authHandler(verifier *oidc.IDTokenVerifier, kubeWriter client.Client, names
 			writeJSONError(w, http.StatusBadRequest, "invalid pubkey token issuer")
 			return
 		}
+		// The audience is the authenticator URL, read dynamically.
+		jwtAudience := oidcCfg.AuthenticatorURL()
 		if aud, _ := claims["aud"].(string); aud != jwtAudience {
 			writeJSONError(w, http.StatusBadRequest, "invalid pubkey token audience")
 			return
@@ -381,17 +359,20 @@ func newTLSCertWatcher(ctx context.Context, informerCache crcache.Cache, namespa
 		return nil, fmt.Errorf("get secret informer: %w", err)
 	}
 
-	// Perform the initial load from the cache. The cache is already synced
-	// (WaitForCacheSync was called during vm.Client creation), so this Get
-	// reads from the local store.
+	// Try initial load from the cache. The secret may not exist yet when
+	// configuration is applied before the TLS secret is created.
 	var secret corev1.Secret
-	if err := informerCache.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
-		return nil, fmt.Errorf("get tls secret %s/%s: %w", namespace, secretName, err)
+	if err := informerCache.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err == nil {
+		if err := w.parseAndCache(&secret); err != nil {
+			slog.Warn("failed to parse tls secret, will retry on update",
+				"namespace", namespace, "secret", secretName, "error", err)
+		} else {
+			slog.Info("tls certificate loaded from secret", "namespace", namespace, "secret", secretName)
+		}
+	} else {
+		slog.Info("tls secret not found, will load when created",
+			"namespace", namespace, "secret", secretName)
 	}
-	if err := w.parseAndCache(&secret); err != nil {
-		return nil, fmt.Errorf("parse tls secret %s/%s: %w", namespace, secretName, err)
-	}
-	slog.Info("tls certificate loaded from secret", "namespace", namespace, "secret", secretName)
 
 	// Register an event handler to update the cached cert on changes.
 	if _, err := secretInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{

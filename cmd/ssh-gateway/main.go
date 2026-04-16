@@ -42,14 +42,9 @@ func newRootCmd() *cobra.Command {
 		// HTTP server for health checks.
 		httpListenAddr string
 
-		// Authenticator URL for device-flow SSH auth (optional).
-		authenticatorURL string
-
-		// HTTPS API server (optional, enabled when --oidc-issuer-url is set).
-		httpsListenAddr string
-		tlsSecretName   string
-		oidcIssuerURL   string
-		oidcAudience    string
+		// HTTPS API server (enabled when OIDC ConfigMap is watched).
+		httpsListenAddr   string
+		oidcConfigMapName string
 
 		// GitHub Actions polling integration (optional).
 		githubPATSecret string
@@ -102,28 +97,19 @@ func newRootCmd() *cobra.Command {
 				KeepAliveInterval:  60 * time.Second,
 				KeepAliveMax:       3,
 				HTTPListenAddr:     httpListenAddr,
-				AuthenticatorURL:   authenticatorURL,
 				KubeWriter:         kubeWriter,
 				KubeCache:          kubeCache,
 			}
 
-			// Enable HTTPS API server if OIDC issuer is configured.
-			if oidcIssuerURL != "" {
-				if tlsSecretName == "" {
-					return fmt.Errorf("--tls-secret-name is required when --oidc-issuer-url is set")
-				}
-				if oidcAudience == "" {
-					return fmt.Errorf("--oidc-audience is required when --oidc-issuer-url is set")
-				}
+			// Enable HTTPS API server with dynamic OIDC config from ConfigMap.
+			if oidcConfigMapName != "" {
 				cfg.HTTPS = &sshgw.HTTPSConfig{
-					Addr:               httpsListenAddr,
-					TLSSecretName:      tlsSecretName,
-					TLSSecretNamespace: vmNamespace,
-					OIDCIssuerURL:      oidcIssuerURL,
-					OIDCAudience:       oidcAudience,
-					JWTIssuer:          externalHost,
-					AuthenticatorURL:   authenticatorURL,
+					Addr:      httpsListenAddr,
+					JWTIssuer: externalHost,
 				}
+				// The OIDCConfigWatcher is created in RunGateway after the
+				// cache is started; we pass the ConfigMap name via a field.
+				cfg.OIDCConfigMapName = oidcConfigMapName
 			}
 
 			// Enable GitHub Actions scale set integration if configured.
@@ -169,13 +155,12 @@ func newRootCmd() *cobra.Command {
 
 	// HTTP server flags.
 	cmd.Flags().StringVar(&httpListenAddr, "http-address", envOrDefault("HTTP_ADDRESS", ":8080"), "HTTP address for health checks (env: HTTP_ADDRESS)")
-	cmd.Flags().StringVar(&authenticatorURL, "authenticator-url", envOrDefault("AUTHENTICATOR_URL", ""), "URL of the web authenticator for device-flow SSH auth (env: AUTHENTICATOR_URL)")
 
-	// HTTPS API server flags (optional, enabled when --oidc-issuer-url is set).
+	// HTTPS API server flags. The OIDC auth configuration (issuer URL,
+	// audience, TLS secret name, authenticator URL) is read from the named
+	// ConfigMap at runtime, allowing reconfiguration without restarting.
 	cmd.Flags().StringVar(&httpsListenAddr, "https-address", envOrDefault("HTTPS_ADDRESS", ":8443"), "HTTPS address for the API server (env: HTTPS_ADDRESS)")
-	cmd.Flags().StringVar(&tlsSecretName, "tls-secret-name", envOrDefault("TLS_SECRET_NAME", "gateway-tls-key"), "Kubernetes Secret containing tls.crt and tls.key (env: TLS_SECRET_NAME)")
-	cmd.Flags().StringVar(&oidcIssuerURL, "oidc-issuer-url", envOrDefault("OIDC_ISSUER_URL", ""), "Trusted OIDC issuer URL for API authentication (env: OIDC_ISSUER_URL)")
-	cmd.Flags().StringVar(&oidcAudience, "oidc-audience", envOrDefault("OIDC_AUDIENCE", ""), "Expected OIDC audience claim (env: OIDC_AUDIENCE)")
+	cmd.Flags().StringVar(&oidcConfigMapName, "oidc-config", envOrDefault("OIDC_CONFIG", ""), "ConfigMap name for OIDC auth configuration (env: OIDC_CONFIG)")
 	// GitHub Actions polling flags (optional).
 	cmd.Flags().StringVar(&githubPATSecret, "github-pat-secret", envOrDefault("GITHUB_PAT_SECRET", ""), "Kubernetes Secret name containing the GitHub PAT in a 'token' key (env: GITHUB_PAT_SECRET)")
 	cmd.Flags().StringSliceVar(&runnerLabels, "runner-labels", envOrDefaultStringSlice("RUNNER_LABELS"), "Runner labels to match against workflow_job labels, comma-separated (env: RUNNER_LABELS)")
