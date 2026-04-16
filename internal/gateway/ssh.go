@@ -18,7 +18,6 @@ import (
 	"github.com/project-unbounded/blip/internal/gateway/server"
 	"github.com/project-unbounded/blip/internal/gateway/session"
 	"github.com/project-unbounded/blip/internal/gateway/vm"
-	"github.com/project-unbounded/blip/internal/ghactions"
 
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -222,103 +221,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		TokenReviewer:      tokenReviewer,
 	})
 
-	// --- Actions poller (optional) ---
-	var actionsPoller *ghactions.Poller
-	var actionsListener *ghactions.Listener
-	if cfg.Actions != nil && cfg.Actions.GitHubAppID > 0 {
-		if cfg.ScaleSet != nil {
-			return fmt.Errorf("cannot use both --github-app-id and --scaleset-config-url; choose one mode")
-		}
-		if len(cfg.ActionsRepos) == 0 {
-			return fmt.Errorf("actions polling requires --actions-repos (comma-separated list of owner/repo)")
-		}
-
-		ghClient, err := ghactions.NewGitHubClient(
-			cfg.Actions.GitHubAppID,
-			cfg.Actions.GitHubInstallID,
-			cfg.Actions.GitHubKeyPath,
-		)
-		if err != nil {
-			return fmt.Errorf("create GitHub client: %w", err)
-		}
-
-		annotator := ghactions.NewVMAnnotator(cfg.KubeWriter, cfg.VMNamespace)
-
-		actionsMaxDuration := cfg.Actions.MaxSessionDuration
-		if actionsMaxDuration <= 0 {
-			actionsMaxDuration = int(ghactions.DefaultActionsTTL.Seconds())
-		}
-
-		actionsPoller = ghactions.NewPoller(ghactions.PollerConfig{
-			VMClaimer:          vmcl,
-			RunnerConfigStore:  annotator,
-			TokenProvider:      ghClient,
-			JobsProvider:       ghClient,
-			RepoProvider:       &staticRepoProvider{repos: cfg.ActionsRepos},
-			VMPoolName:         cfg.VMPoolName,
-			RunnerLabels:       cfg.Actions.RunnerLabels,
-			MaxSessionDuration: actionsMaxDuration,
-			PodName:            cfg.PodName,
-			PollInterval:       cfg.Actions.PollInterval,
-		})
-
-		slog.Info("github actions poller enabled",
-			"runner_labels", cfg.Actions.RunnerLabels,
-			"actions_max_session", actionsMaxDuration,
-			"poll_interval", cfg.Actions.PollInterval,
-			"repos", cfg.ActionsRepos,
-		)
-	}
-
-	// --- Scale set listener (optional, mutually exclusive with poller) ---
-	var tokenWatcher *ghactions.TokenWatcher
-	if cfg.ScaleSet != nil && cfg.ScaleSet.ConfigURL != "" {
-		ssClient := ghactions.NewScaleSetClient(cfg.ScaleSet.ConfigURL)
-
-		// Set up the token watcher to feed registration tokens from the K8s
-		// Secret to the scale set client.
-		var err error
-		tokenWatcher, err = ghactions.NewTokenWatcher(ssClient, cfg.VMNamespace, cfg.ScaleSet.TokenSecretName)
-		if err != nil {
-			return fmt.Errorf("create token watcher: %w", err)
-		}
-		if err := tokenWatcher.Start(ctx); err != nil {
-			return fmt.Errorf("start token watcher: %w", err)
-		}
-
-		// Register or find the scale set. This requires the admin token,
-		// which was bootstrapped by the initial token load above.
-		runnerGroupID := 1 // default runner group
-		if _, err := ssClient.GetOrCreateScaleSet(
-			ctx,
-			cfg.ScaleSet.ScaleSetName,
-			cfg.ScaleSet.RunnerLabels,
-			runnerGroupID,
-		); err != nil {
-			tokenWatcher.Stop()
-			return fmt.Errorf("get or create scale set: %w", err)
-		}
-
-		annotator := ghactions.NewVMAnnotator(cfg.KubeWriter, cfg.VMNamespace)
-
-		actionsListener = ghactions.NewListener(ghactions.ListenerConfig{
-			Client:            ssClient,
-			VMClaimer:         vmcl,
-			RunnerConfigStore: annotator,
-			VMPoolName:        cfg.VMPoolName,
-			PodName:           cfg.PodName,
-			MaxRunners:        cfg.ScaleSet.MaxRunners,
-		})
-
-		slog.Info("github actions scale set listener enabled",
-			"config_url", cfg.ScaleSet.ConfigURL,
-			"scale_set_name", cfg.ScaleSet.ScaleSetName,
-			"token_secret", cfg.ScaleSet.TokenSecretName,
-			"max_runners", cfg.ScaleSet.MaxRunners,
-			"runner_labels", cfg.ScaleSet.RunnerLabels,
-		)
-	}
-
 	httpAddr := cfg.HTTPListenAddr
 	if httpAddr == "" {
 		httpAddr = ":8080"
@@ -327,22 +229,9 @@ func RunGateway(cfg *GatewayConfig) error {
 	// shuttingDown is set to 1 when a shutdown signal is received.
 	var shuttingDown atomic.Int32
 
-	// Determine active session counter for health endpoints. Either the poller
-	// or the listener is active, never both.
-	var activeSessionCounter activeSessionProvider
-	if actionsPoller != nil {
-		activeSessionCounter = actionsPoller
-	} else if actionsListener != nil {
-		activeSessionCounter = actionsListener
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthzHandler(activeSessionCounter))
-	mux.HandleFunc("/readyz", readyzHandler(activeSessionCounter, &shuttingDown))
-
 	httpServer := &http.Server{
 		Addr:         httpAddr,
-		Handler:      mux,
+		Handler:      nil, // TODO
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -354,8 +243,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		"namespace", cfg.VMNamespace,
 		"pool", cfg.VMPoolName,
 		"max_session", cfg.MaxSessionDuration.String(),
-		"actions_enabled", actionsPoller != nil,
-		"scaleset_enabled", actionsListener != nil,
 	)
 
 	// Start HTTP server in background.
@@ -395,20 +282,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		slog.Info("https api server started", "addr", cfg.HTTPS.Addr)
 	}
 
-	// Start actions poller in background.
-	if actionsPoller != nil {
-		go actionsPoller.Run(ctx)
-	}
-
-	// Start scale set listener in background.
-	if actionsListener != nil {
-		go func() {
-			if err := actionsListener.Run(ctx); err != nil && ctx.Err() == nil {
-				slog.Error("scale set listener exited with error", "error", err)
-			}
-		}()
-	}
-
 	const drainTimeout = 30 * time.Second
 
 	sshDone := make(chan struct{})
@@ -427,11 +300,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		// Cancel the main context — stops poller, listener, and SSH listener.
 		cancel()
 
-		// Stop the token watcher informer.
-		if tokenWatcher != nil {
-			tokenWatcher.Stop()
-		}
-
 		mgr.NotifyShutdown()
 
 		httpShutdownCtx, httpShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -442,34 +310,6 @@ func RunGateway(cfg *GatewayConfig) error {
 
 		if httpsServer != nil {
 			ShutdownHTTPSServer(httpsServer)
-		}
-
-		// Drain in-flight poller/listener goroutines.
-		if actionsPoller != nil {
-			pollerDrainDone := make(chan struct{})
-			go func() {
-				actionsPoller.WaitForPending()
-				close(pollerDrainDone)
-			}()
-			select {
-			case <-pollerDrainDone:
-				slog.Info("actions poller goroutines drained")
-			case <-time.After(drainTimeout):
-				slog.Warn("poller drain timeout, some operations may be interrupted")
-			}
-		}
-		if actionsListener != nil {
-			listenerDrainDone := make(chan struct{})
-			go func() {
-				actionsListener.WaitForPending()
-				close(listenerDrainDone)
-			}()
-			select {
-			case <-listenerDrainDone:
-				slog.Info("scale set listener goroutines drained")
-			case <-time.After(drainTimeout):
-				slog.Warn("listener drain timeout, some operations may be interrupted")
-			}
 		}
 
 		select {
