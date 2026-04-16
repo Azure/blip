@@ -2,8 +2,6 @@ package auth
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -11,39 +9,44 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/restmapper"
 	toolscache "k8s.io/client-go/tools/cache"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	blipv1alpha1 "github.com/project-unbounded/blip/api/v1alpha1"
 )
 
-// AuthWatcher watches BlipOwner custom resources for OIDC provider
-// configuration, explicitly allowed SSH public keys, and GitHub Actions
-// repo associations — providing thread-safe access to the current sets.
+const (
+	// PubkeyUserLabel is the label on ConfigMaps that marks them as trusted
+	// pubkeys. The label value is the user identity used by the quota logic.
+	PubkeyUserLabel = "blip.azure.com/user"
+
+	// PubkeyDataKey is the data key in the ConfigMap containing the SSH
+	// public key in authorized_keys format.
+	PubkeyDataKey = "pubkey"
+)
+
+// AuthWatcher watches ConfigMaps with the blip.azure.com/user label for
+// trusted SSH public keys, providing thread-safe access to the current set.
 type AuthWatcher struct {
 	cache     crcache.Cache
 	namespace string
 
-	// k8sClient is a controller-runtime client for creating BlipOwner CRs
-	// during pubkey binding.
-	k8sClient client.Client
-
-	mu            sync.RWMutex
-	oidcProviders []OIDCProviderConfig
-	pubkeys       map[string]string // SHA256 fingerprint -> comment (username)
-	actionsRepos  []string
+	mu      sync.RWMutex
+	pubkeys map[string]pubkeyEntry // SHA256 fingerprint -> entry
 }
 
-// NewAuthWatcher creates an AuthWatcher that watches BlipOwner CRs in the
-// given namespace. It starts the informer cache, waits for the initial sync,
-// loads the current values, and installs an event handler that keeps the
-// in-memory data updated.
+// pubkeyEntry holds the parsed data for a trusted public key.
+type pubkeyEntry struct {
+	// UserIdentity is the value of the blip.azure.com/user label.
+	UserIdentity string
+}
+
+// NewAuthWatcher creates an AuthWatcher that watches ConfigMaps with the
+// blip.azure.com/user label in the given namespace. It starts an informer
+// cache, waits for the initial sync, loads the current values, and installs
+// an event handler that keeps the in-memory data updated.
 func NewAuthWatcher(ctx context.Context, namespace string) (*AuthWatcher, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -51,35 +54,25 @@ func NewAuthWatcher(ctx context.Context, namespace string) (*AuthWatcher, error)
 	}
 
 	s := runtime.NewScheme()
-	if err := blipv1alpha1.AddToScheme(s); err != nil {
-		return nil, fmt.Errorf("register blip.io/v1alpha1: %w", err)
+	if err := corev1.AddToScheme(s); err != nil {
+		return nil, fmt.Errorf("register core/v1: %w", err)
 	}
-
-	mapper := newBlipOwnerRESTMapper()
 
 	informerCache, err := crcache.New(cfg, crcache.Options{
 		Scheme: s,
-		Mapper: mapper,
 		DefaultNamespaces: map[string]crcache.Config{
 			namespace: {},
 		},
 		DefaultTransform: crcache.TransformStripManagedFields(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create blipowner informer cache: %w", err)
-	}
-
-	// Create a controller-runtime client for writing BlipOwner CRs.
-	k8sClient, err := client.New(cfg, client.Options{Scheme: s, Mapper: mapper})
-	if err != nil {
-		return nil, fmt.Errorf("create kubernetes client: %w", err)
+		return nil, fmt.Errorf("create configmap informer cache: %w", err)
 	}
 
 	w := &AuthWatcher{
 		cache:     informerCache,
 		namespace: namespace,
-		k8sClient: k8sClient,
-		pubkeys:   make(map[string]string),
+		pubkeys:   make(map[string]pubkeyEntry),
 	}
 
 	go func() {
@@ -92,13 +85,13 @@ func NewAuthWatcher(ctx context.Context, namespace string) (*AuthWatcher, error)
 		return nil, fmt.Errorf("auth watcher cache sync failed")
 	}
 
-	// Load the initial values from all BlipOwner CRs.
+	// Load the initial values from all matching ConfigMaps.
 	w.reload(ctx)
 
 	// Install an event handler so future updates are picked up automatically.
-	informer, err := informerCache.GetInformer(ctx, &blipv1alpha1.BlipOwner{})
+	informer, err := informerCache.GetInformer(ctx, &corev1.ConfigMap{})
 	if err != nil {
-		return nil, fmt.Errorf("get blipowner informer: %w", err)
+		return nil, fmt.Errorf("get configmap informer: %w", err)
 	}
 
 	reg, err := informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
@@ -107,27 +100,16 @@ func NewAuthWatcher(ctx context.Context, namespace string) (*AuthWatcher, error)
 		DeleteFunc: func(_ interface{}) { w.reload(ctx) },
 	})
 	if err != nil {
-		return nil, fmt.Errorf("add blipowner event handler: %w", err)
+		return nil, fmt.Errorf("add configmap event handler: %w", err)
 	}
 	_ = reg // registration handle; lives as long as the informer
 
 	slog.Info("auth watcher started",
 		"namespace", namespace,
-		"initial_oidc_providers", len(w.OIDCProviders()),
 		"initial_pubkey_count", w.allowedPubkeyCount(),
-		"initial_actions_repos", len(w.ActionsRepos()),
 	)
 
 	return w, nil
-}
-
-// OIDCProviders returns a copy of the current OIDC provider configurations.
-func (w *AuthWatcher) OIDCProviders() []OIDCProviderConfig {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	result := make([]OIDCProviderConfig, len(w.oidcProviders))
-	copy(result, w.oidcProviders)
-	return result
 }
 
 // IsPubkeyAllowed reports whether the given fingerprint (e.g. "SHA256:...")
@@ -139,12 +121,16 @@ func (w *AuthWatcher) IsPubkeyAllowed(fingerprint string) bool {
 	return ok
 }
 
-// PubkeyUsername returns the comment (username) associated with the given
-// fingerprint, or "" if the fingerprint is not in the allowed set.
-func (w *AuthWatcher) PubkeyUsername(fingerprint string) string {
+// PubkeyUserIdentity returns the user identity for the given fingerprint,
+// or "" if the fingerprint is not in the allowed set.
+func (w *AuthWatcher) PubkeyUserIdentity(fingerprint string) string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return w.pubkeys[fingerprint]
+	entry, ok := w.pubkeys[fingerprint]
+	if !ok {
+		return ""
+	}
+	return entry.UserIdentity
 }
 
 // allowedPubkeyCount returns the number of allowed pubkeys for logging.
@@ -154,329 +140,94 @@ func (w *AuthWatcher) allowedPubkeyCount() int {
 	return len(w.pubkeys)
 }
 
-// ActionsRepos returns a copy of the current list of repos to poll for
-// queued GitHub Actions workflow jobs.
-func (w *AuthWatcher) ActionsRepos() []string {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	result := make([]string, len(w.actionsRepos))
-	copy(result, w.actionsRepos)
-	return result
-}
-
-// DeviceFlowProviders returns the subset of OIDC providers that have device
-// flow enabled. Returns nil if none are configured.
-func (w *AuthWatcher) DeviceFlowProviders() []OIDCProviderConfig {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	var result []OIDCProviderConfig
-	for _, p := range w.oidcProviders {
-		if p.DeviceFlow {
-			result = append(result, p)
-		}
-	}
-	return result
-}
-
-// HasDeviceFlowProviders reports whether any OIDC provider has device flow enabled.
-func (w *AuthWatcher) HasDeviceFlowProviders() bool {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	for _, p := range w.oidcProviders {
-		if p.DeviceFlow {
-			return true
-		}
-	}
-	return false
-}
-
-// BindPubkey adds an SSH public key to the allowed set by creating a new
-// BlipOwner CR. The CR name is derived from the key's fingerprint for
-// idempotency — concurrent binds of the same key safely no-op.
-func (w *AuthWatcher) BindPubkey(ctx context.Context, fingerprint, authorizedKeyLine string) error {
-	// Validate the key parses before attempting to create the CR.
-	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(authorizedKeyLine))
-	if err != nil {
-		return fmt.Errorf("invalid key line for binding: %w", err)
-	}
-	computedFP := ssh.FingerprintSHA256(pub)
-
-	// Derive a deterministic CR name from the fingerprint.
-	crName := fingerprintToCRName(computedFP)
-
-	// Extract the comment for the publicKey field.
-	comment := extractPubkeyComment(authorizedKeyLine)
-
-	// Build the authorized_keys line with the comment.
-	pubkeyLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub)))
-	if comment != "" {
-		pubkeyLine += " " + comment
-	}
-
-	bo := &blipv1alpha1.BlipOwner{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      crName,
-			Namespace: w.namespace,
-			Labels: map[string]string{
-				"blip.io/bound-by": "device-flow",
-			},
-		},
-		Spec: blipv1alpha1.BlipOwnerSpec{
-			SSHKey: &blipv1alpha1.SSHKeySpec{
-				PublicKey: pubkeyLine,
-			},
-		},
-	}
-
-	err = w.k8sClient.Create(ctx, bo)
-	if err != nil {
-		if client.IgnoreAlreadyExists(err) == nil {
-			slog.Info("pubkey BlipOwner already exists, skipping",
-				"name", crName,
-				"fingerprint", computedFP,
-			)
-			return nil
-		}
-		return fmt.Errorf("create BlipOwner %s/%s: %w", w.namespace, crName, err)
-	}
-
-	// Update in-memory for immediate effect (the informer will also
-	// eventually pick up the CR change).
-	w.mu.Lock()
-	w.pubkeys[computedFP] = comment
-	w.mu.Unlock()
-
-	slog.Info("pubkey bound via BlipOwner CR",
-		"name", crName,
-		"fingerprint", computedFP,
-	)
-	return nil
-}
-
-// fingerprintToCRName converts a SHA256 fingerprint (e.g. "SHA256:abc123...")
-// to a valid Kubernetes resource name like "bound-<hex>".
-func fingerprintToCRName(fingerprint string) string {
-	// Hash the fingerprint to get a short, deterministic, DNS-safe name.
-	h := sha256.Sum256([]byte(fingerprint))
-	return "bound-" + hex.EncodeToString(h[:12])
-}
-
-// extractPubkeyComment returns the comment field from an authorized_keys line.
-func extractPubkeyComment(line string) string {
-	_, comment, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
-	if err != nil {
-		return ""
-	}
-	return comment
-}
-
-// reload reads all BlipOwner CRs from the cache and replaces the in-memory data.
+// reload reads all matching ConfigMaps from the cache and replaces the in-memory data.
 func (w *AuthWatcher) reload(ctx context.Context) {
-	var owners blipv1alpha1.BlipOwnerList
-	if err := w.cache.List(ctx, &owners, client.InNamespace(w.namespace)); err != nil {
-		// If the context was cancelled (shutdown), don't clear auth data —
-		// in-flight authentication should continue to work during drain.
+	var cms corev1.ConfigMapList
+	if err := w.cache.List(ctx, &cms,
+		client.InNamespace(w.namespace),
+		client.HasLabels{PubkeyUserLabel},
+	); err != nil {
 		if ctx.Err() != nil {
 			return
 		}
-		slog.Warn("auth watcher: failed to list BlipOwner CRs, clearing auth data",
+		slog.Warn("auth watcher: failed to list pubkey ConfigMaps, clearing auth data",
 			"namespace", w.namespace,
 			"error", err,
 		)
 		w.mu.Lock()
-		w.oidcProviders = nil
-		w.pubkeys = make(map[string]string)
-		w.actionsRepos = nil
+		w.pubkeys = make(map[string]pubkeyEntry)
 		w.mu.Unlock()
-		pruneProviderCache(nil)
 		return
 	}
 
-	var providers []OIDCProviderConfig
-	pubkeys := make(map[string]string)
-	var repos []string
-
-	for i := range owners.Items {
-		bo := &owners.Items[i]
-		switch {
-		case bo.Spec.SSHKey != nil:
-			fp, comment := parseSSHKeyFromCR(bo.Spec.SSHKey.PublicKey)
-			if fp != "" {
-				pubkeys[fp] = comment
-			}
-
-		case bo.Spec.OIDC != nil:
-			if p, ok := validateOIDCFromCR(bo.Spec.OIDC); ok {
-				providers = append(providers, p)
-			}
-
-		case bo.Spec.ActionsRepo != nil:
-			repo := strings.TrimSpace(bo.Spec.ActionsRepo.Repo)
-			if repo != "" {
-				repos = append(repos, repo)
-			}
+	pubkeys := make(map[string]pubkeyEntry)
+	for i := range cms.Items {
+		cm := &cms.Items[i]
+		userIdentity := cm.Labels[PubkeyUserLabel]
+		if userIdentity == "" {
+			continue
 		}
+
+		pubkeyStr, ok := cm.Data[PubkeyDataKey]
+		if !ok || strings.TrimSpace(pubkeyStr) == "" {
+			slog.Warn("auth watcher: skipping ConfigMap with missing/empty pubkey data",
+				"configmap", cm.Name,
+			)
+			continue
+		}
+
+		fp, err := parsePubkeyFingerprint(pubkeyStr)
+		if err != nil {
+			slog.Warn("auth watcher: skipping ConfigMap with invalid pubkey",
+				"configmap", cm.Name,
+				"error", err,
+			)
+			continue
+		}
+
+		if existing, dup := pubkeys[fp]; dup {
+			slog.Warn("auth watcher: duplicate pubkey fingerprint, last writer wins",
+				"fingerprint", fp,
+				"configmap", cm.Name,
+				"existing_user", existing.UserIdentity,
+				"new_user", userIdentity,
+			)
+		}
+
+		pubkeys[fp] = pubkeyEntry{UserIdentity: userIdentity}
 	}
 
 	w.mu.Lock()
-	w.oidcProviders = providers
 	w.pubkeys = pubkeys
-	w.actionsRepos = repos
 	w.mu.Unlock()
 
-	// Evict cached OIDC providers that are no longer in the active set.
-	activeIssuers := make(map[string]bool, len(providers))
-	issuers := make([]string, len(providers))
-	for i, p := range providers {
-		activeIssuers[p.Issuer] = true
-		issuers[i] = p.Issuer
-	}
-	pruneProviderCache(activeIssuers)
-
-	slog.Info("auth watcher: config updated from BlipOwner CRs",
-		"blipowner_count", len(owners.Items),
-		"oidc_providers", issuers,
+	slog.Info("auth watcher: config updated from pubkey ConfigMaps",
+		"configmap_count", len(cms.Items),
 		"allowed_pubkey_count", len(pubkeys),
-		"actions_repos_count", len(repos),
 	)
 }
 
-// parseSSHKeyFromCR parses a public key from a BlipOwner SSHKey spec and
-// returns its SHA256 fingerprint and comment. Returns empty fingerprint on error.
-func parseSSHKeyFromCR(publicKey string) (fingerprint string, comment string) {
+// parsePubkeyFingerprint parses an SSH public key in authorized_keys format
+// and returns its SHA256 fingerprint.
+func parsePubkeyFingerprint(publicKey string) (string, error) {
 	line := strings.TrimSpace(publicKey)
 	if line == "" {
-		return "", ""
+		return "", fmt.Errorf("empty key")
 	}
-	pub, c, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
 	if err != nil {
-		slog.Warn("auth watcher: skipping invalid SSH public key from BlipOwner",
-			"error", err,
-			"key", truncate(line, 80),
-		)
-		return "", ""
+		return "", fmt.Errorf("parse SSH public key: %w", err)
 	}
-	fp := ssh.FingerprintSHA256(pub)
-	slog.Debug("auth watcher: loaded allowed pubkey from BlipOwner",
-		"fingerprint", fp,
-		"comment", c,
-	)
-	return fp, c
+	return ssh.FingerprintSHA256(pub), nil
 }
 
-// validateOIDCFromCR validates and normalizes an OIDC spec from a BlipOwner CR.
-// Returns the config and true if valid, or zero-value and false if invalid.
-func validateOIDCFromCR(spec *blipv1alpha1.OIDCSpec) (OIDCProviderConfig, bool) {
-	p := OIDCProviderConfig{
-		Issuer:          strings.TrimSpace(spec.Issuer),
-		Audience:        strings.TrimSpace(spec.Audience),
-		IdentityClaim:   strings.TrimSpace(spec.IdentityClaim),
-		AllowedSubjects: spec.AllowedSubjects,
-		DeviceFlow:      spec.DeviceFlow,
-		ClientID:        strings.TrimSpace(spec.ClientID),
-		DeviceAuthURL:   strings.TrimSpace(spec.DeviceAuthURL),
-		TokenURL:        strings.TrimSpace(spec.TokenURL),
-		Scopes:          spec.Scopes,
+// NewTestAuthWatcher creates an AuthWatcher pre-loaded with the given
+// pubkey fingerprints (fingerprint -> user identity), without starting an
+// informer cache. Intended for use in tests outside of this package.
+func NewTestAuthWatcher(pubkeyFingerprints map[string]string) *AuthWatcher {
+	pubkeys := make(map[string]pubkeyEntry)
+	for fp, user := range pubkeyFingerprints {
+		pubkeys[fp] = pubkeyEntry{UserIdentity: user}
 	}
-
-	if p.Issuer == "" {
-		slog.Warn("auth watcher: skipping OIDC BlipOwner with empty issuer")
-		return OIDCProviderConfig{}, false
-	}
-	if !strings.HasPrefix(p.Issuer, "https://") {
-		slog.Warn("auth watcher: skipping OIDC BlipOwner with non-HTTPS issuer",
-			"issuer", p.Issuer,
-		)
-		return OIDCProviderConfig{}, false
-	}
-	// Normalize trailing slash to prevent duplicate cache entries.
-	p.Issuer = strings.TrimRight(p.Issuer, "/")
-
-	if p.Audience == "" {
-		slog.Warn("auth watcher: skipping OIDC BlipOwner with empty audience",
-			"issuer", p.Issuer,
-		)
-		return OIDCProviderConfig{}, false
-	}
-
-	// Validate device flow configuration.
-	if p.DeviceFlow {
-		if p.ClientID == "" {
-			slog.Warn("auth watcher: skipping device-flow BlipOwner with empty client-id",
-				"issuer", p.Issuer,
-			)
-			return OIDCProviderConfig{}, false
-		}
-		if p.DeviceAuthURL == "" {
-			slog.Warn("auth watcher: skipping device-flow BlipOwner with empty device-auth-url",
-				"issuer", p.Issuer,
-			)
-			return OIDCProviderConfig{}, false
-		}
-		if !strings.HasPrefix(p.DeviceAuthURL, "https://") {
-			slog.Warn("auth watcher: skipping device-flow BlipOwner with non-HTTPS device-auth-url",
-				"issuer", p.Issuer,
-				"device-auth-url", p.DeviceAuthURL,
-			)
-			return OIDCProviderConfig{}, false
-		}
-		if p.TokenURL == "" {
-			slog.Warn("auth watcher: skipping device-flow BlipOwner with empty token-url",
-				"issuer", p.Issuer,
-			)
-			return OIDCProviderConfig{}, false
-		}
-		if !strings.HasPrefix(p.TokenURL, "https://") {
-			slog.Warn("auth watcher: skipping device-flow BlipOwner with non-HTTPS token-url",
-				"issuer", p.Issuer,
-				"token-url", p.TokenURL,
-			)
-			return OIDCProviderConfig{}, false
-		}
-	}
-
-	return p, true
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
-
-// NewTestAuthWatcher creates an AuthWatcher pre-loaded with the given OIDC
-// providers and pubkey fingerprints (fingerprint -> comment), without starting
-// an informer cache. Intended for use in tests outside of this package.
-func NewTestAuthWatcher(providers []OIDCProviderConfig, pubkeyFingerprints map[string]string) *AuthWatcher {
-	if pubkeyFingerprints == nil {
-		pubkeyFingerprints = make(map[string]string)
-	}
-	return &AuthWatcher{oidcProviders: providers, pubkeys: pubkeyFingerprints}
-}
-
-// NewTestAuthWatcherWithRepos is like NewTestAuthWatcher but also sets the
-// actions-repos list.
-func NewTestAuthWatcherWithRepos(providers []OIDCProviderConfig, pubkeyFingerprints map[string]string, repos []string) *AuthWatcher {
-	w := NewTestAuthWatcher(providers, pubkeyFingerprints)
-	w.actionsRepos = repos
-	return w
-}
-
-func newBlipOwnerRESTMapper() meta.RESTMapper {
-	return restmapper.NewDiscoveryRESTMapper([]*restmapper.APIGroupResources{
-		{
-			Group: metav1.APIGroup{
-				Name: "blip.io",
-				Versions: []metav1.GroupVersionForDiscovery{
-					{GroupVersion: "blip.io/v1alpha1", Version: "v1alpha1"},
-				},
-			},
-			VersionedResources: map[string][]metav1.APIResource{
-				"v1alpha1": {
-					{Name: "blipowners", Namespaced: true, Kind: "BlipOwner"},
-				},
-			},
-		},
-	})
+	return &AuthWatcher{pubkeys: pubkeys}
 }

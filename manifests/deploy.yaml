@@ -138,23 +138,15 @@ rules:
 - apiGroups: ["kubevirt.io"]
   resources: ["virtualmachineinstances"]
   verbs: ["get", "list", "watch"]
-# BlipOwner CRDs: the gateway watches BlipOwner CRs for auth configuration
-# (OIDC providers, SSH pubkeys, Actions repos) and creates new CRs when
-# binding SSH pubkeys via device flow.
-- apiGroups: ["blip.io"]
-  resources: ["blipowners"]
-  verbs: ["get", "list", "watch", "create"]
-# BlipOwner status: used to write computed fingerprints and Ready conditions.
-# Not yet implemented — reserved for planned follow-up.
-- apiGroups: ["blip.io"]
-  resources: ["blipowners/status"]
-  verbs: ["update"]
-# Identity store: secrets store refresh tokens linked to SSH pubkeys.
-# The gateway creates/updates/deletes "blip-identity-*" secrets for
-# OIDC identity binding and TTL-based pubkey de-linking.
+# ConfigMaps: the gateway watches ConfigMaps with the blip.azure.com/user
+# label for trusted SSH public keys (pubkey auth).
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+# Secrets: read-only access for TLS certificates and other config.
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["get", "list", "watch", "create", "update", "delete"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -324,43 +316,6 @@ spec:
             port: 8081
           initialDelaySeconds: 5
 ---
-# BlipOwner CRs define authentication entries for the SSH gateway.
-# Each CR represents exactly one of: an SSH public key, an OIDC provider
-# configuration, or a GitHub Actions runner repo association.
-# The gateway watches these CRs in real time — changes take effect without
-# a restart.
-#
-# Examples (uncomment and customize):
-#
-# apiVersion: blip.io/v1alpha1
-# kind: BlipOwner
-# metadata:
-#   name: alice-laptop
-#   namespace: blip
-# spec:
-#   sshKey:
-#     publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop"
-# ---
-# apiVersion: blip.io/v1alpha1
-# kind: BlipOwner
-# metadata:
-#   name: github-actions-oidc
-#   namespace: blip
-# spec:
-#   oidc:
-#     issuer: https://token.actions.githubusercontent.com
-#     audience: blip
-#     allowedSubjects:
-#       - "repo:my-org/my-repo:*"
-# ---
-# apiVersion: blip.io/v1alpha1
-# kind: BlipOwner
-# metadata:
-#   name: myorg-myrepo
-#   namespace: blip
-# spec:
-#   actionsRepo:
-#     repo: my-org/my-repo
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -398,8 +353,6 @@ spec:
           value: ":2222"
         - name: HTTP_ADDRESS
           value: ":8080"
-        - name: ENABLE_AUTH
-          value: "true"
         - name: VM_POOL_NAME
           value: "blip"
         - name: VM_NAMESPACE

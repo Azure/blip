@@ -47,7 +47,7 @@ func newTestHostKey(t *testing.T, dir string) testHostKey {
 // newTestAuthWatcher creates an AuthWatcher with the given pubkey fingerprints allowed.
 // The map value is the comment (username) associated with the fingerprint.
 func newTestAuthWatcher(fingerprints map[string]string) *auth.AuthWatcher {
-	return auth.NewTestAuthWatcher(nil, fingerprints)
+	return auth.NewTestAuthWatcher(fingerprints)
 }
 
 // validConfig returns a Config wired to the given host key with a random listen port.

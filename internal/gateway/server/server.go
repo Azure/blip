@@ -32,17 +32,13 @@ type Config struct {
 
 	MaxAuthTries int
 
-	// AuthWatcher provides the dynamic OIDC providers and SSH public keys
-	// from BlipOwner CRs; nil disables OIDC and explicit pubkey auth.
+	// AuthWatcher provides the dynamic SSH public keys from ConfigMaps;
+	// nil disables explicit pubkey auth.
 	AuthWatcher *auth.AuthWatcher
 
 	// VMKeyResolver resolves VM client key fingerprints to user identities
 	// for recursive blip connections; nil disables VM key auth.
 	VMKeyResolver auth.VMKeyResolver
-
-	// IdentityStore provides OIDC identity lookup for SSH pubkeys linked
-	// to OIDC identities via device flow refresh tokens.
-	IdentityStore *auth.IdentityStore
 
 	// TokenReviewer validates Kubernetes ServiceAccount tokens for
 	// _register connections; nil disables SA token auth for registration.
@@ -75,7 +71,6 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		MaxAuthTries:  cfg.MaxAuthTries,
 		AuthWatcher:   cfg.AuthWatcher,
 		VMKeyResolver: cfg.VMKeyResolver,
-		IdentityStore: cfg.IdentityStore,
 		TokenReviewer: cfg.TokenReviewer,
 	})
 
