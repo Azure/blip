@@ -19,53 +19,48 @@ Blip can act as a GitHub Actions self-hosted runner backend. When configured wit
 
 - A working Blip deployment ([Getting Started]({{% relref "getting-started" %}}))
 - A VM pool whose image includes the GitHub Actions runner agent (see [VM image](#vm-image))
-- A GitHub Personal Access Token (classic or fine-grained) — see [PAT scopes](#pat-scopes) below
+- A GitHub Personal Access Token — fine-grained recommended, see [PAT scopes](#pat-scopes) below
 
 ## Create a GitHub PAT
 
 ### PAT scopes
 
 Blip calls repo-level Actions API endpoints (`generate-jitconfig`, `workflow/runs`,
-`workflow/jobs`). The required permissions depend on the PAT type:
+`workflow/jobs`). A fine-grained PAT is recommended because it can be scoped to
+only the repositories Blip manages:
 
-| PAT type | Required scopes |
-|----------|----------------|
-| Classic | `repo` |
-| Fine-grained | **Repository permissions:** "Administration" read & write, "Actions" read |
+| PAT type | Required permissions |
+|----------|---------------------|
+| Fine-grained (recommended) | **Repository permissions:** "Administration" read & write, "Actions" read — scoped to target repos only |
+| Classic | `repo` (grants access to **all** repos — avoid if possible) |
 
 > `admin:org` is **not** needed — Blip operates on per-repository runners, not
 > organisation-level runners.
 
-### Generate a PAT with the GitHub CLI
+### Generate a fine-grained PAT
 
-```shell
-# Classic PAT — prompts you to select scopes interactively:
-gh auth token          # prints the token for the current session
+Fine-grained PATs must be created in the GitHub UI:
 
-# Or create a new classic PAT with the required scope:
-gh auth refresh --scopes repo
-
-# Fine-grained PAT — must be created in the GitHub UI at:
-#   Settings → Developer settings → Fine-grained tokens
-# Select the target repositories and grant:
-#   "Administration" read & write, "Actions" read
-```
+1. Navigate to **Settings → Developer settings → Fine-grained tokens**
+2. Scope the token to **only** the repositories Blip will poll
+3. Grant the following repository permissions:
+   - **Administration** — read & write (required for `generate-jitconfig`)
+   - **Actions** — read (required for listing queued jobs)
 
 ### Write the PAT to a Kubernetes Secret
 
-```shell
-# Store the current gh CLI token directly into the cluster:
-kubectl create secret generic github-pat \
-  -n blip --from-literal=token="$(gh auth token)"
+This command is idempotent — it creates the Secret on first run and updates it
+on subsequent runs, making it safe for token rotation:
 
-# Or, if you have the token in a variable:
+```shell
 kubectl create secret generic github-pat \
-  -n blip --from-literal=token="$GITHUB_PAT"
+  -n blip \
+  --from-literal=token="$GITHUB_PAT" \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-The gateway watches this Secret via a Kubernetes informer — you can rotate the
-token at any time by updating the Secret, and the gateway picks it up
-immediately without a restart.
+The gateway watches this Secret via a Kubernetes informer — rotations are
+picked up immediately without a pod restart.
 
 ## Configure the gateway
 
