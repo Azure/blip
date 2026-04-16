@@ -68,10 +68,6 @@ type GatewayConfig struct {
 	// HTTPS.OIDCConfig.
 	HTTPS *HTTPSConfig
 
-	// ScaleSet configures the GitHub Actions scale set listener. When nil,
-	// scale set mode is disabled.
-	ScaleSet *ScaleSetConfig
-
 	// KubeWriter is the controller-runtime client used for Kubernetes write
 	// operations. It is created by vm.NewKubeClients in main and shared
 	// across components.
@@ -81,30 +77,6 @@ type GatewayConfig struct {
 	// vm.NewKubeClients in main and shared across components (e.g. the VM
 	// client and the HTTPS API server).
 	KubeCache crcache.Cache
-}
-
-// ScaleSetConfig holds the configuration for the GitHub Actions scale set
-// listener integration. When enabled, the gateway uses the Runner Scale Set
-// protocol to receive job assignments via long-poll from the Actions Service.
-// This does not require a GitHub App -- only a registration token stored in
-// a K8s Secret.
-type ScaleSetConfig struct {
-	// ConfigURL is the GitHub URL (repo or org) for the scale set.
-	// e.g. "https://github.com/my-org/my-repo"
-	ConfigURL string
-
-	// TokenSecretName is the K8s Secret containing the registration token.
-	// The Secret must have a "token" key.
-	TokenSecretName string
-
-	// ScaleSetName is the name for the runner scale set.
-	ScaleSetName string
-
-	// RunnerLabels are the labels for the scale set runners.
-	RunnerLabels []string
-
-	// MaxRunners is the maximum number of concurrent runners.
-	MaxRunners int
 }
 
 func RunGateway(cfg *GatewayConfig) error {
@@ -184,7 +156,6 @@ func RunGateway(cfg *GatewayConfig) error {
 	srv, err := server.New(ctx, server.Config{
 		ListenAddr:         cfg.ListenAddr,
 		HostKeyPath:        cfg.HostKeyPath,
-		PodName:            cfg.PodName,
 		MaxSessionDuration: cfg.MaxSessionDuration,
 		LoginGraceTime:     cfg.LoginGraceTime,
 		MaxAuthTries:       maxAuthTries,

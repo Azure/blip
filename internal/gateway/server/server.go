@@ -22,8 +22,6 @@ type Config struct {
 	// Shared host key (PEM) loaded by all replicas for a stable fingerprint.
 	HostKeyPath string
 
-	PodName string
-
 	// Maximum lifetime of a single session.
 	MaxSessionDuration time.Duration
 

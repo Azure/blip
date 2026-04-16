@@ -49,12 +49,6 @@ func newRootCmd() *cobra.Command {
 		// GitHub Actions polling integration (optional).
 		githubPATSecret string
 		runnerLabels    []string
-
-		// GitHub Actions scale set integration (optional, mutually exclusive with polling).
-		scalesetConfigURL   string
-		scalesetTokenSecret string
-		scalesetName        string
-		scalesetMaxRunners  int
 	)
 
 	cmd := &cobra.Command{
@@ -112,29 +106,6 @@ func newRootCmd() *cobra.Command {
 				cfg.OIDCConfigMapName = oidcConfigMapName
 			}
 
-			// Enable GitHub Actions scale set integration if configured.
-			if scalesetConfigURL != "" {
-				if githubPATSecret != "" {
-					return fmt.Errorf("cannot use both --github-pat-secret and --scaleset-config-url; choose one mode")
-				}
-				if scalesetTokenSecret == "" {
-					return fmt.Errorf("--scaleset-token-secret is required when --scaleset-config-url is set")
-				}
-				ssName := scalesetName
-				if ssName == "" {
-					ssName = "blip"
-				}
-				// Reuse --runner-labels for the scale set labels if provided.
-				ssLabels := runnerLabels
-				cfg.ScaleSet = &sshgw.ScaleSetConfig{
-					ConfigURL:       scalesetConfigURL,
-					TokenSecretName: scalesetTokenSecret,
-					ScaleSetName:    ssName,
-					RunnerLabels:    ssLabels,
-					MaxRunners:      scalesetMaxRunners,
-				}
-			}
-
 			return sshgw.RunGateway(cfg)
 		},
 		SilenceUsage:  true,
@@ -164,12 +135,6 @@ func newRootCmd() *cobra.Command {
 	// GitHub Actions polling flags (optional).
 	cmd.Flags().StringVar(&githubPATSecret, "github-pat-secret", envOrDefault("GITHUB_PAT_SECRET", ""), "Kubernetes Secret name containing the GitHub PAT in a 'token' key (env: GITHUB_PAT_SECRET)")
 	cmd.Flags().StringSliceVar(&runnerLabels, "runner-labels", envOrDefaultStringSlice("RUNNER_LABELS"), "Runner labels to match against workflow_job labels, comma-separated (env: RUNNER_LABELS)")
-
-	// GitHub Actions scale set flags (optional, mutually exclusive with polling).
-	cmd.Flags().StringVar(&scalesetConfigURL, "scaleset-config-url", envOrDefault("SCALESET_CONFIG_URL", ""), "GitHub repo/org URL for scale set mode (env: SCALESET_CONFIG_URL)")
-	cmd.Flags().StringVar(&scalesetTokenSecret, "scaleset-token-secret", envOrDefault("SCALESET_TOKEN_SECRET", ""), "K8s Secret name for registration token (env: SCALESET_TOKEN_SECRET)")
-	cmd.Flags().StringVar(&scalesetName, "scaleset-name", envOrDefault("SCALESET_NAME", "blip"), "Scale set name (env: SCALESET_NAME)")
-	cmd.Flags().IntVar(&scalesetMaxRunners, "scaleset-max-runners", envOrDefaultInt("SCALESET_MAX_RUNNERS", 10), "Maximum concurrent runners for scale set (env: SCALESET_MAX_RUNNERS)")
 
 	return cmd
 }

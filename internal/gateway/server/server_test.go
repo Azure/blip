@@ -55,7 +55,6 @@ func validConfig(hk testHostKey) Config {
 	return Config{
 		ListenAddr:         "127.0.0.1:0",
 		HostKeyPath:        hk.HostKeyPath,
-		PodName:            "test-pod",
 		MaxSessionDuration: 10 * time.Minute,
 		LoginGraceTime:     5 * time.Second,
 		MaxAuthTries:       3,

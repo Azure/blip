@@ -298,10 +298,3 @@ func (w *OIDCConfigWatcher) GetSigningKey() crypto.Signer {
 	}
 	return watcher.GetSigningKey()
 }
-
-// IsConfigured returns true if OIDC auth is fully configured (verifier ready).
-func (w *OIDCConfigWatcher) IsConfigured() bool {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return w.state != nil && w.state.verifier != nil
-}
