@@ -39,10 +39,17 @@ type HTTPSConfig struct {
 	OIDCAudience string
 }
 
+// githubActionsIssuer is the OIDC issuer URL for GitHub Actions tokens.
+const githubActionsIssuer = "https://token.actions.githubusercontent.com"
+
+// githubActionsAudience is the expected audience for GitHub Actions tokens
+// when authenticating to Blip.
+const githubActionsAudience = "blip"
+
 // NewHTTPSServer creates an HTTPS server with:
 //   - TLS certificate watched from a Kubernetes Secret via controller-runtime cache
-//   - OIDC bearer token authentication against a single trusted issuer
-//   - A stub handler that returns 200 OK
+//   - POST /auth/user — OIDC bearer token authentication against the configured issuer
+//   - POST /auth/github — OIDC bearer token authentication for GitHub Actions tokens
 //
 // The informerCache must already be started and synced.
 func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.Cache) (*http.Server, error) {
@@ -52,19 +59,27 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 		return nil, fmt.Errorf("create tls cert watcher: %w", err)
 	}
 
-	// Set up the OIDC provider and verifier. The provider fetches the
-	// issuer's discovery document and JWKS keys (cached internally).
-	provider, err := oidc.NewProvider(ctx, cfg.OIDCIssuerURL)
+	// Set up the user OIDC provider and verifier.
+	userProvider, err := oidc.NewProvider(ctx, cfg.OIDCIssuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("create oidc provider for %s: %w", cfg.OIDCIssuerURL, err)
 	}
-
-	verifier := provider.Verifier(&oidc.Config{
+	userVerifier := userProvider.Verifier(&oidc.Config{
 		ClientID: cfg.OIDCAudience,
 	})
 
+	// Set up the GitHub Actions OIDC provider and verifier.
+	ghProvider, err := oidc.NewProvider(ctx, githubActionsIssuer)
+	if err != nil {
+		return nil, fmt.Errorf("create oidc provider for %s: %w", githubActionsIssuer, err)
+	}
+	ghVerifier := ghProvider.Verifier(&oidc.Config{
+		ClientID: githubActionsAudience,
+	})
+
 	mux := http.NewServeMux()
-	mux.Handle("/", oidcAuthMiddleware(verifier, stubHandler()))
+	mux.Handle("POST /auth/user", authHandler(userVerifier))
+	mux.Handle("POST /auth/github", authHandler(ghVerifier))
 
 	tlsCfg := &tls.Config{
 		MinVersion:     tls.VersionTLS12,
@@ -85,51 +100,37 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, informerCache crcache.
 	return srv, nil
 }
 
-// oidcAuthMiddleware validates the Authorization: Bearer <token> header
-// against the provided OIDC verifier. On success, the request is passed
-// to the next handler. On failure, a 401 response is returned.
-func oidcAuthMiddleware(verifier *oidc.IDTokenVerifier, next http.Handler) http.Handler {
+// authHandler returns a handler that authenticates an OIDC bearer token
+// using the given verifier. On success it returns the verified subject
+// as JSON.
+func authHandler(verifier *oidc.IDTokenVerifier) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, ok := parseBearerToken(r)
+		subject, ok := verifyBearer(w, r, verifier)
 		if !ok {
-			writeJSONError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
 			return
 		}
-
-		idToken, err := verifier.Verify(r.Context(), token)
-		if err != nil {
-			slog.Debug("oidc token verification failed", "error", err)
-			writeJSONError(w, http.StatusUnauthorized, "invalid token")
-			return
-		}
-
-		// Stash the verified token subject in the request context for
-		// downstream handlers to use.
-		ctx := context.WithValue(r.Context(), oidcSubjectKey{}, idToken.Subject)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		writeJSON(w, http.StatusOK, map[string]string{"subject": subject})
 	})
 }
 
-// stubHandler returns a placeholder handler. This will be replaced with
-// real API routes.
-func stubHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status": "ok",
-		})
-	})
-}
+// verifyBearer extracts and verifies a bearer token from the request.
+// On success it returns the token subject. On failure it writes an
+// appropriate error response and returns ok=false.
+func verifyBearer(w http.ResponseWriter, r *http.Request, verifier *oidc.IDTokenVerifier) (subject string, ok bool) {
+	token, found := parseBearerToken(r)
+	if !found {
+		writeJSONError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
+		return "", false
+	}
 
-// oidcSubjectKey is the context key for the verified OIDC subject.
-type oidcSubjectKey struct{}
+	idToken, err := verifier.Verify(r.Context(), token)
+	if err != nil {
+		slog.Debug("oidc token verification failed", "error", err)
+		writeJSONError(w, http.StatusUnauthorized, "invalid token")
+		return "", false
+	}
 
-// OIDCSubject extracts the verified OIDC subject from the request context.
-// Returns empty string if not present.
-func OIDCSubject(ctx context.Context) string {
-	v, _ := ctx.Value(oidcSubjectKey{}).(string)
-	return v
+	return idToken.Subject, true
 }
 
 // parseBearerToken extracts the token from an "Authorization: Bearer <token>"
@@ -146,10 +147,16 @@ func parseBearerToken(r *http.Request) (string, bool) {
 	return token, true
 }
 
-func writeJSONError(w http.ResponseWriter, code int, msg string) {
+func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Error("failed to encode json response", "error", err)
+	}
+}
+
+func writeJSONError(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
 }
 
 // StartHTTPSServer starts the HTTPS server in the background and returns
