@@ -70,9 +70,9 @@ const (
 
 // Config holds the configuration for the runner config controller.
 type Config struct {
-	Namespace    string
-	PATHolder    PATProvider
-	RunnerLabels []string
+	Namespace     string
+	PATHolder     PATProvider
+	ConfigWatcher ConfigProvider
 }
 
 // PATProvider abstracts access to the GitHub PAT for creating JIT configs.
@@ -80,13 +80,18 @@ type PATProvider interface {
 	Token() (string, error)
 }
 
+// ConfigProvider provides dynamic access to runner configuration.
+type ConfigProvider interface {
+	RunnerLabels() []string
+}
+
 // Add registers the runner config controller with the given manager.
 func Add(mgr ctrl.Manager, cfg Config) error {
 	c := &controller{
-		Client:       mgr.GetClient(),
-		pat:          cfg.PATHolder,
-		namespace:    cfg.Namespace,
-		runnerLabels: cfg.RunnerLabels,
+		Client:        mgr.GetClient(),
+		pat:           cfg.PATHolder,
+		namespace:     cfg.Namespace,
+		configWatcher: cfg.ConfigWatcher,
 	}
 
 	if err := ctrl.NewControllerManagedBy(mgr).
@@ -104,10 +109,10 @@ func Add(mgr ctrl.Manager, cfg Config) error {
 }
 
 type controller struct {
-	Client       client.Client
-	pat          PATProvider
-	namespace    string
-	runnerLabels []string
+	Client        client.Client
+	pat           PATProvider
+	namespace     string
+	configWatcher ConfigProvider
 
 	// signerMu protects lazy loading of the SSH client key from the Secret.
 	signerMu sync.Mutex
@@ -205,7 +210,7 @@ func (c *controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 
 	// Create JIT runner config via GitHub API.
 	runnerName := fmt.Sprintf("blip-%d", jobID)
-	labels := c.runnerLabels
+	labels := c.configWatcher.RunnerLabels()
 	if len(labels) == 0 {
 		labels = []string{"self-hosted", "blip"}
 	}

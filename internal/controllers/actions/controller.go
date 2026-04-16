@@ -53,12 +53,9 @@ const (
 
 // Config holds the configuration for the actions runner controller.
 type Config struct {
-	Namespace     string
-	PoolName      string
-	PodName       string
-	PATSecretName string
-	Repos         []string
-	RunnerLabels  []string
+	Namespace string
+	PoolName  string
+	PodName   string
 }
 
 // PATHolder is a thread-safe container for the PAT provider. It is populated
@@ -95,10 +92,11 @@ func (h *PATHolder) Token() (string, error) {
 }
 
 // Add registers the actions runner controller and job poller with the given
-// controller-runtime manager. The PAT provider is created lazily when the
-// manager starts (after the informer cache has synced).
-func Add(mgr ctrl.Manager, cfg Config) (*PATHolder, error) {
+// controller-runtime manager. The PAT provider and config watcher are created
+// lazily when the manager starts (after the informer cache has synced).
+func Add(mgr ctrl.Manager, cfg Config) (*PATHolder, *ActionsConfigHolder, error) {
 	holder := &PATHolder{}
+	configHolder := &ActionsConfigHolder{}
 
 	// Register the completion controller (reconciles runner VMs).
 	c := &completionController{
@@ -113,20 +111,44 @@ func Add(mgr ctrl.Manager, cfg Config) (*PATHolder, error) {
 			predicate.GenerationChangedPredicate{},
 		)).
 		Complete(c); err != nil {
-		return nil, fmt.Errorf("register actions-completion controller: %w", err)
+		return nil, nil, fmt.Errorf("register actions-completion controller: %w", err)
 	}
 
-	// Register the combined runnable that initialises the PAT provider
-	// (requires a synced cache) and then runs the periodic job poller.
+	// Register the combined runnable.
 	if err := mgr.Add(&actionsRunnable{
-		mgr:    mgr,
-		cfg:    cfg,
-		holder: holder,
+		mgr:          mgr,
+		cfg:          cfg,
+		holder:       holder,
+		configHolder: configHolder,
 	}); err != nil {
-		return nil, fmt.Errorf("register actions runnable: %w", err)
+		return nil, nil, fmt.Errorf("register actions runnable: %w", err)
 	}
 
-	return holder, nil
+	return holder, configHolder, nil
+}
+
+// ActionsConfigHolder provides thread-safe access to the ActionsConfigWatcher
+// which is populated lazily after the informer cache starts.
+type ActionsConfigHolder struct {
+	mu      sync.RWMutex
+	watcher *ActionsConfigWatcher
+}
+
+func (h *ActionsConfigHolder) set(w *ActionsConfigWatcher) {
+	h.mu.Lock()
+	h.watcher = w
+	h.mu.Unlock()
+}
+
+// RunnerLabels implements the runnerconfig.ConfigProvider interface.
+func (h *ActionsConfigHolder) RunnerLabels() []string {
+	h.mu.RLock()
+	w := h.watcher
+	h.mu.RUnlock()
+	if w == nil {
+		return nil
+	}
+	return w.RunnerLabels()
 }
 
 // ---------------------------------------------------------------------------
@@ -235,11 +257,14 @@ func (c *completionController) Reconcile(ctx context.Context, req reconcile.Requ
 // ---------------------------------------------------------------------------
 
 // actionsRunnable is a controller-runtime Runnable that creates the PAT
-// provider (which requires a synced cache), then polls GitHub for queued jobs.
+// provider and config watcher, then polls GitHub for queued jobs. Polling
+// only occurs when both the github-actions ConfigMap and github-pat Secret
+// contain valid data — enabling zero-restart configuration.
 type actionsRunnable struct {
-	mgr    ctrl.Manager
-	cfg    Config
-	holder *PATHolder
+	mgr          ctrl.Manager
+	cfg          Config
+	holder       *PATHolder
+	configHolder *ActionsConfigHolder
 }
 
 // NeedLeaderElection returns true so the poller only runs on the leader.
@@ -248,17 +273,21 @@ func (r *actionsRunnable) NeedLeaderElection() bool {
 }
 
 func (r *actionsRunnable) Start(ctx context.Context) error {
-	// Create the PAT provider now that the cache is synced.
-	pat, err := ghactions.NewPATProvider(ctx, r.mgr.GetCache(), r.cfg.Namespace, r.cfg.PATSecretName)
+	// Create the config watcher for the github-actions ConfigMap.
+	configWatcher, err := NewActionsConfigWatcher(ctx, r.mgr.GetCache(), r.cfg.Namespace)
+	if err != nil {
+		return fmt.Errorf("create actions config watcher: %w", err)
+	}
+	r.configHolder.set(configWatcher)
+
+	// Create the PAT provider (tolerates missing Secret).
+	pat, err := ghactions.NewPATProvider(ctx, r.mgr.GetCache(), r.cfg.Namespace, DefaultPATSecretName)
 	if err != nil {
 		return fmt.Errorf("create PAT provider: %w", err)
 	}
 	r.holder.set(pat)
 
-	slog.Info("actions job poller started",
-		"repos", r.cfg.Repos,
-		"labels", r.cfg.RunnerLabels,
-	)
+	slog.Info("actions job poller started (polling activates when github-actions ConfigMap and github-pat Secret are present)")
 
 	poller := &jobPoller{
 		client: r.mgr.GetClient(),
@@ -267,8 +296,14 @@ func (r *actionsRunnable) Start(ctx context.Context) error {
 	}
 
 	for {
-		for _, repo := range r.cfg.Repos {
-			poller.pollRepo(ctx, repo)
+		acfg := configWatcher.Config()
+		if acfg != nil && acfg.Valid() {
+			token, tokenErr := pat.Token()
+			if tokenErr == nil && token != "" {
+				for _, repo := range acfg.Repos {
+					poller.pollRepo(ctx, repo, acfg.RunnerLabels)
+				}
+			}
 		}
 
 		select {
@@ -290,7 +325,7 @@ type jobPoller struct {
 	pat    *ghactions.PATProvider
 }
 
-func (p *jobPoller) pollRepo(ctx context.Context, repo string) {
+func (p *jobPoller) pollRepo(ctx context.Context, repo string, runnerLabels []string) {
 	token, err := p.pat.Token()
 	if err != nil {
 		slog.Error("failed to get PAT", "repo", repo, "error", err)
@@ -305,7 +340,7 @@ func (p *jobPoller) pollRepo(ctx context.Context, repo string) {
 
 	for _, job := range jobs {
 		// Only handle jobs whose labels match our configured runner labels.
-		if !labelsMatch(job.Labels, p.cfg.RunnerLabels) {
+		if !labelsMatch(job.Labels, runnerLabels) {
 			continue
 		}
 
