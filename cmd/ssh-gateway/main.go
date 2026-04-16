@@ -129,6 +129,8 @@ func newRootCmd() *cobra.Command {
 					OIDCIssuerURL:      oidcIssuerURL,
 					OIDCAudience:       oidcAudience,
 					GitHubAllowedOrgs:  githubAllowedOrgs,
+					JWTIssuer:          externalHost,
+					AuthenticatorURL:   authenticatorURL,
 				}
 			}
 
