@@ -134,11 +134,12 @@ func TestReconcile(t *testing.T) {
 			wantRequeue: true,
 		},
 		{
-			name: "no requeue for claimed VM without TTL annotations",
+			name: "requeue for claimed VM without TTL annotations",
 			vm: makeVM("vm1", testPool, map[string]string{
 				"blip.io/session-id": "s1",
 			}),
-			request: req("vm1"),
+			request:     req("vm1"),
+			wantRequeue: true,
 		},
 		{
 			name: "handles already-deleted VM during Delete",
