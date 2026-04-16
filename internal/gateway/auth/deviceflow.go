@@ -57,6 +57,16 @@ type SigningKeyProvider interface {
 	GetSigningKey() crypto.Signer
 }
 
+// DeviceFlowProvider supplies the runtime configuration for device-flow
+// authentication. Implementations must be safe for concurrent use. The
+// OIDCConfigWatcher in the gateway package satisfies this interface.
+type DeviceFlowProvider interface {
+	SigningKeyProvider
+	// AuthenticatorURL returns the current web authenticator URL. An empty
+	// string means device-flow auth is currently disabled.
+	AuthenticatorURL() string
+}
+
 // AuthSessionWatcher watches Kubernetes Secrets with the auth-session label
 // for device-flow authentication sessions. It indexes secrets by pubkey
 // fingerprint for O(1) lookups.

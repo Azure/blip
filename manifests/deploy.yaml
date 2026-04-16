@@ -139,10 +139,11 @@ rules:
   resources: ["virtualmachineinstances"]
   verbs: ["get", "list", "watch"]
 # ConfigMaps: the gateway watches ConfigMaps with the blip.azure.com/user
-# label for trusted SSH public keys (pubkey auth).
+# label for trusted SSH public keys (pubkey auth), and creates session
+# ConfigMaps for OIDC-authenticated users.
 - apiGroups: [""]
   resources: ["configmaps"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get", "list", "watch", "create"]
 # Secrets: read-only access for TLS certificates and other config.
 - apiGroups: [""]
   resources: ["secrets"]
@@ -341,6 +342,21 @@ spec:
           initialDelaySeconds: 5
 ---
 ---
+# OIDC auth configuration for the SSH gateway. Populate the data fields to
+# enable OIDC-authenticated API access and device-flow SSH login. The gateway
+# watches this ConfigMap at runtime; changes take effect without a restart.
+#
+# Supported fields:
+#   oidc-issuer-url    - Trusted OIDC issuer URL (e.g. "https://login.microsoftonline.com/<tenant>/v2.0")
+#   oidc-audience      - Expected "aud" claim in the OIDC token (e.g. "api://blip")
+#   tls-secret-name    - Kubernetes Secret with tls.crt and tls.key for HTTPS
+#   authenticator-url  - URL of the web authenticator for device-flow SSH auth
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ssh-gateway-oidc
+  namespace: blip
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -395,13 +411,8 @@ spec:
           value: "/etc/blip/client-key/client_key"
         - name: VM_REGISTER_SA
           value: "vm-register"
-        # HTTPS API server (optional, uncomment to enable):
-        # - name: OIDC_ISSUER_URL
-        #   value: "https://accounts.google.com"
-        # - name: OIDC_AUDIENCE
-        #   value: "blip"
-        # - name: TLS_SECRET_NAME
-        #   value: "gateway-tls-key"
+        - name: OIDC_CONFIG
+          value: "ssh-gateway-oidc"
         # GitHub Actions polling integration (optional).
         # Uncomment and set these to enable the Actions runner poller:
         # - name: GITHUB_PAT_SECRET

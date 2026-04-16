@@ -2,14 +2,12 @@ package gateway
 
 import (
 	"context"
-	"crypto"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -58,15 +56,16 @@ type GatewayConfig struct {
 	// checks. Default: ":8080".
 	HTTPListenAddr string
 
-	// AuthenticatorURL is the URL of the web authenticator for device-flow
-	// SSH authentication. When set and an unrecognized pubkey connects, the
-	// user is shown a URL to authenticate in their browser. The gateway
-	// blocks until the login workflow creates a matching auth session secret.
-	AuthenticatorURL string
+	// OIDCConfigMapName is the name of the ConfigMap watched for OIDC auth
+	// configuration. When non-empty, the gateway creates an OIDCConfigWatcher
+	// and starts the HTTPS server. The ConfigMap may be empty initially;
+	// OIDC auth activates when valid configuration data is added.
+	OIDCConfigMapName string
 
 	// HTTPS is the optional configuration for the HTTPS API server.
 	// When non-nil, the gateway starts an additional TLS listener with
-	// OIDC-authenticated endpoints.
+	// OIDC-authenticated endpoints. The OIDCConfigWatcher must be set in
+	// HTTPS.OIDCConfig.
 	HTTPS *HTTPSConfig
 
 	// ScaleSet configures the GitHub Actions scale set listener. When nil,
@@ -140,35 +139,45 @@ func RunGateway(cfg *GatewayConfig) error {
 		)
 	}
 
-	// Set up device-flow auth components if authenticator URL is configured.
+	// Create the OIDCConfigWatcher if a ConfigMap name is specified.
+	// This watches the named ConfigMap for OIDC auth settings and manages
+	// the OIDC verifier and TLS certificate watcher dynamically.
+	var oidcConfigWatcher *OIDCConfigWatcher
+	if cfg.OIDCConfigMapName != "" {
+		var err error
+		oidcConfigWatcher, err = NewOIDCConfigWatcher(ctx, cfg.KubeCache, cfg.VMNamespace, cfg.OIDCConfigMapName)
+		if err != nil {
+			return fmt.Errorf("create oidc config watcher: %w", err)
+		}
+	}
+
+	// Set up device-flow auth components. These are always created when an
+	// OIDC ConfigMap is watched so that device-flow auth can be enabled at
+	// runtime. When no OIDC config is present in the ConfigMap, the
+	// keyboard-interactive callback returns an error and the auth session
+	// watcher is idle.
 	var authSessionWatcher *auth.AuthSessionWatcher
 	var pendingFingerprints *auth.PendingFingerprints
-	var jwtSigningKeyProvider *lazySigningKeyProvider
+	var deviceFlowProvider auth.DeviceFlowProvider
 	jwtIssuer := cfg.ExternalHost
 
-	if cfg.AuthenticatorURL != "" {
+	if oidcConfigWatcher != nil {
 		var err error
 		authSessionWatcher, err = auth.NewAuthSessionWatcher(ctx, cfg.KubeCache, cfg.VMNamespace)
 		if err != nil {
 			return fmt.Errorf("create auth session watcher: %w", err)
 		}
 		pendingFingerprints = auth.NewPendingFingerprints(ctx)
-		jwtSigningKeyProvider = &lazySigningKeyProvider{}
+		deviceFlowProvider = oidcConfigWatcher
 
-		if cfg.HTTPS == nil {
-			return fmt.Errorf("--authenticator-url requires HTTPS to be configured (set --oidc-issuer-url)")
-		}
-
-		slog.Info("device flow auth enabled",
-			"authenticator_url", cfg.AuthenticatorURL,
-		)
+		slog.Info("device flow auth infrastructure created (activates when OIDC ConfigMap is configured)")
 	}
 
-	// Increase MaxAuthTries when device flow is enabled, since SSH clients
-	// may try multiple keys from ssh-agent before falling back to
-	// keyboard-interactive.
+	// Increase MaxAuthTries when device flow infrastructure is available,
+	// since SSH clients may try multiple keys from ssh-agent before falling
+	// back to keyboard-interactive.
 	maxAuthTries := cfg.MaxAuthTries
-	if cfg.AuthenticatorURL != "" && maxAuthTries < 6 {
+	if deviceFlowProvider != nil && maxAuthTries < 6 {
 		maxAuthTries = 6
 	}
 
@@ -186,8 +195,7 @@ func RunGateway(cfg *GatewayConfig) error {
 		// Device flow auth parameters.
 		AuthSessionWatcher:  authSessionWatcher,
 		PendingFingerprints: pendingFingerprints,
-		AuthenticatorURL:    cfg.AuthenticatorURL,
-		JWTSigner:           jwtSigningKeyProvider,
+		DeviceFlow:          deviceFlowProvider,
 		JWTIssuer:           jwtIssuer,
 	})
 	if err != nil {
@@ -264,22 +272,28 @@ func RunGateway(cfg *GatewayConfig) error {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	// Start HTTPS API server in background (optional).
+	// Start HTTPS API server in background when OIDC ConfigMap is watched.
 	var httpsServer *http.Server
-	if cfg.HTTPS != nil {
-		var certWatcher *tlsCertWatcher
+	if oidcConfigWatcher != nil {
+		httpsAddr := ":8443"
+		if cfg.HTTPS != nil && cfg.HTTPS.Addr != "" {
+			httpsAddr = cfg.HTTPS.Addr
+		}
+		jwtIss := cfg.ExternalHost
+		if cfg.HTTPS != nil && cfg.HTTPS.JWTIssuer != "" {
+			jwtIss = cfg.HTTPS.JWTIssuer
+		}
+		httpsCfg := HTTPSConfig{
+			Addr:       httpsAddr,
+			JWTIssuer:  jwtIss,
+			OIDCConfig: oidcConfigWatcher,
+		}
 		var err error
-		httpsServer, certWatcher, err = NewHTTPSServer(ctx, *cfg.HTTPS, cfg.KubeCache, cfg.KubeWriter, cfg.VMNamespace)
+		httpsServer, err = NewHTTPSServer(ctx, httpsCfg, cfg.KubeWriter, cfg.VMNamespace)
 		if err != nil {
 			return fmt.Errorf("create HTTPS server: %w", err)
 		}
 
-		// Wire the TLS cert watcher as the JWT signing key provider
-		// for device-flow auth (the SSH server was created before the
-		// HTTPS server, so the lazy provider bridges the gap).
-		if jwtSigningKeyProvider != nil {
-			jwtSigningKeyProvider.SetProvider(certWatcher)
-		}
 		httpsErrCh := StartHTTPSServer(httpsServer)
 		select {
 		case err := <-httpsErrCh:
@@ -292,7 +306,7 @@ func RunGateway(cfg *GatewayConfig) error {
 				slog.Error("https server error", "error", err)
 			}
 		}()
-		slog.Info("https api server started", "addr", cfg.HTTPS.Addr)
+		slog.Info("https api server started", "addr", httpsAddr)
 	}
 
 	// Note: GitHub Actions runner polling is now handled by the actions
@@ -442,27 +456,4 @@ type vmKeyResolverAdapter struct {
 
 func (a *vmKeyResolverAdapter) ResolveRootIdentity(fingerprint string) (string, string, error) {
 	return a.vmClient.ResolveRootIdentity(context.Background(), fingerprint)
-}
-
-// lazySigningKeyProvider wraps a tlsCertWatcher that may not be available at
-// construction time (the HTTPS server starts after the SSH server). The
-// underlying provider is set once the HTTPS server is created.
-type lazySigningKeyProvider struct {
-	mu       sync.Mutex
-	provider auth.SigningKeyProvider
-}
-
-func (l *lazySigningKeyProvider) SetProvider(p auth.SigningKeyProvider) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.provider = p
-}
-
-func (l *lazySigningKeyProvider) GetSigningKey() crypto.Signer {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.provider == nil {
-		return nil
-	}
-	return l.provider.GetSigningKey()
 }

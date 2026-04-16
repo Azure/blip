@@ -62,47 +62,59 @@ When an authenticator service is configured, users with unrecognized SSH keys ar
 
 ### Gateway configuration
 
-Enable device-flow auth by setting these flags (or their environment variable equivalents):
+Enable device-flow auth by adding the `authenticator-url` field to the OIDC ConfigMap (see [OIDC Authentication]({{% relref "oidc-auth" %}})):
 
-| CLI flag | Environment variable | Description |
-|----------|---------------------|-------------|
-| `--authenticator-url` | `AUTHENTICATOR_URL` | URL of the authenticator web service. Enables device-flow auth when set. |
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ssh-gateway-oidc
+  namespace: blip
+data:
+  oidc-issuer-url: "https://login.microsoftonline.com/<tenant-id>/v2.0"
+  oidc-audience: "<app-client-id>"
+  tls-secret-name: "gateway-tls-key"
+  authenticator-url: "https://<authenticator-host>/api/auth"
+```
 
-The authenticator URL is embedded in the JWT-signed link shown to the user during keyboard-interactive auth. The gateway's TLS signing key (from `--tls-secret-name`) is used to sign the JWT.
+The authenticator URL is embedded in the JWT-signed link shown to the user during keyboard-interactive auth. The gateway's TLS signing key (from `tls-secret-name`) signs the JWT.
 
 ### OIDC user endpoint
 
-When the HTTPS API server is enabled (`--oidc-issuer-url` and `--oidc-audience` are set), the gateway exposes a `POST /auth/user` endpoint. This endpoint accepts an OIDC bearer token and a `pubkey` form value (a gateway-signed JWT from the device flow), verifies both, and creates a ConfigMap (`user-<hash>`) with the user's SSH public key. The ConfigMap is labelled with `blip.azure.com/user` and is automatically picked up by the auth watcher — the user can SSH in immediately.
+When the OIDC ConfigMap is populated with `oidc-issuer-url` and `oidc-audience`, the gateway exposes a `POST /auth/user` HTTPS endpoint. This endpoint accepts an OIDC bearer token and a `pubkey` form value (a gateway-signed JWT from the device flow), verifies both, and creates a session ConfigMap with the user's SSH public key. The ConfigMap is labelled with `blip.azure.com/user` and is automatically picked up by the auth watcher — the user can SSH in immediately.
 
-| CLI flag | Environment variable | Description |
-|----------|---------------------|-------------|
-| `--oidc-issuer-url` | `OIDC_ISSUER_URL` | Trusted OIDC issuer URL. Enables the HTTPS API server. |
-| `--oidc-audience` | `OIDC_AUDIENCE` | Expected OIDC audience claim. |
-| `--tls-secret-name` | `TLS_SECRET_NAME` | Kubernetes Secret with `tls.crt` and `tls.key` for the HTTPS server. |
-| `--https-address` | `HTTPS_ADDRESS` | HTTPS listen address (default `:8443`). |
+All OIDC configuration is managed via the `ssh-gateway-oidc` ConfigMap and can be changed at runtime. See [OIDC Authentication]({{% relref "oidc-auth" %}}) for full details.
 
 ### Configuring Entra ID with the Azure Function authenticator
 
 The [`azure-auth`](https://github.com/Azure/blip/tree/main/azure-auth) cloud function is a ready-made authenticator that uses Azure App Service Authentication (EasyAuth) to log users in via Microsoft Entra ID. EasyAuth handles the OIDC login at the platform level and injects the user's Entra ID token in the `X-MS-TOKEN-AAD-ID-TOKEN` header. The function forwards this token to the gateway's `POST /auth/user` endpoint.
 
-To configure the gateway to accept these tokens, set `--oidc-issuer-url` and `--oidc-audience` to match the Entra ID App Registration used by EasyAuth on the Function App:
+To configure the gateway, populate the `ssh-gateway-oidc` ConfigMap to match the Entra ID App Registration used by EasyAuth on the Function App:
 
-```
---oidc-issuer-url=https://login.microsoftonline.com/<tenant-id>/v2.0
---oidc-audience=<easyauth-app-registration-client-id>
---tls-secret-name=gateway-tls-key
---external-host=gateway.example.com
---authenticator-url=https://<function-app-name>.azurewebsites.net/api/auth
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ssh-gateway-oidc
+  namespace: blip
+data:
+  oidc-issuer-url: "https://login.microsoftonline.com/<tenant-id>/v2.0"
+  oidc-audience: "<easyauth-app-registration-client-id>"
+  tls-secret-name: "gateway-tls-key"
+  authenticator-url: "https://<function-app-name>.azurewebsites.net/api/auth"
 ```
 
-| Parameter | Value |
-|-----------|-------|
-| `--oidc-issuer-url` | `https://login.microsoftonline.com/<tenant-id>/v2.0` — the Entra ID v2.0 issuer for your tenant. The gateway fetches the OIDC discovery document at this URL to obtain signing keys for token verification. If your App Registration is configured for v1.0 tokens, use `https://sts.windows.net/<tenant-id>/` instead. |
-| `--oidc-audience` | The **Application (client) ID** of the Entra ID App Registration configured as the EasyAuth identity provider on the Function App. This must match the `aud` claim in the ID tokens that EasyAuth issues. |
-| `--authenticator-url` | The public URL of the Azure Function's `auth` HTTP trigger (e.g. `https://myapp.azurewebsites.net/api/auth`). This is shown to users during device-flow auth and used as the `aud` claim in the gateway-signed pubkey JWT. |
-| `--external-host` | The gateway's public hostname. Used as the `iss` claim in the gateway-signed pubkey JWT. |
+| Field | Value |
+|-------|-------|
+| `oidc-issuer-url` | `https://login.microsoftonline.com/<tenant-id>/v2.0` — the Entra ID v2.0 issuer for your tenant. The gateway fetches the OIDC discovery document at this URL to obtain signing keys for token verification. If your App Registration is configured for v1.0 tokens, use `https://sts.windows.net/<tenant-id>/` instead. |
+| `oidc-audience` | The **Application (client) ID** of the Entra ID App Registration configured as the EasyAuth identity provider on the Function App. This must match the `aud` claim in the ID tokens that EasyAuth issues. |
+| `authenticator-url` | The public URL of the Azure Function's `auth` HTTP trigger (e.g. `https://myapp.azurewebsites.net/api/auth`). This is shown to users during device-flow auth and used as the `aud` claim in the gateway-signed pubkey JWT. |
+
+The `--external-host` CLI flag (or `GATEWAY_EXTERNAL_HOST` env var) must also be set to the gateway's public hostname — it is used as the `iss` claim in the gateway-signed pubkey JWT.
 
 The Azure Function requires the `APISERVER_URL` environment variable set to the Kubernetes API server URL so it can fetch the gateway's TLS certificate from the `gateway-tls-certs` ConfigMap in `kube-public`.
+
+Changes to the ConfigMap take effect immediately — no gateway restart is needed.
 
 ### Auth session Secrets
 

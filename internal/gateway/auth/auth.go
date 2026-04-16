@@ -5,6 +5,7 @@ package auth
 
 import (
 	"context"
+	"crypto"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -62,10 +63,21 @@ type Config struct {
 	// device-flow. When set (along with AuthSessionWatcher and JWTSigner),
 	// users with unrecognized pubkeys are prompted to authenticate via
 	// their browser.
+	//
+	// Deprecated: Use DeviceFlow instead for dynamic configuration.
 	AuthenticatorURL string
 
 	// JWTSigner is the private key used to sign device-flow JWTs.
+	//
+	// Deprecated: Use DeviceFlow instead for dynamic configuration.
 	JWTSigner SigningKeyProvider
+
+	// DeviceFlow provides dynamic device-flow configuration (authenticator
+	// URL and signing key). When non-nil, the keyboard-interactive callback
+	// reads the authenticator URL at runtime, allowing it to be changed via
+	// ConfigMap without restarting the gateway. Takes precedence over the
+	// static AuthenticatorURL and JWTSigner fields.
+	DeviceFlow DeviceFlowProvider
 
 	// JWTIssuer is the issuer claim for device-flow JWTs (typically the
 	// gateway's external hostname).
@@ -92,10 +104,19 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 	}
 
 	// Enable keyboard-interactive for device-flow auth when configured.
-	if cfg.AuthenticatorURL != "" && cfg.AuthSessionWatcher != nil && cfg.JWTSigner != nil && cfg.PendingFingerprints != nil {
+	// When DeviceFlow is set, the callback reads the authenticator URL at
+	// runtime so the keyboard-interactive path activates/deactivates
+	// dynamically as the OIDC ConfigMap changes.
+	if cfg.DeviceFlow != nil && cfg.AuthSessionWatcher != nil && cfg.PendingFingerprints != nil {
 		sshCfg.KeyboardInteractiveCallback = deviceFlowKeyboardInteractive(
-			cfg.AuthenticatorURL,
-			cfg.JWTSigner,
+			cfg.DeviceFlow,
+			cfg.JWTIssuer,
+			cfg.PendingFingerprints,
+		)
+	} else if cfg.AuthenticatorURL != "" && cfg.AuthSessionWatcher != nil && cfg.JWTSigner != nil && cfg.PendingFingerprints != nil {
+		// Legacy static path for backwards compatibility.
+		sshCfg.KeyboardInteractiveCallback = deviceFlowKeyboardInteractive(
+			&staticDeviceFlow{url: cfg.AuthenticatorURL, signer: cfg.JWTSigner},
 			cfg.JWTIssuer,
 			cfg.PendingFingerprints,
 		)
@@ -130,6 +151,16 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 
 	return sshCfg
 }
+
+// staticDeviceFlow is a DeviceFlowProvider backed by static values, used for
+// backwards compatibility with the legacy AuthenticatorURL/JWTSigner fields.
+type staticDeviceFlow struct {
+	url    string
+	signer SigningKeyProvider
+}
+
+func (s *staticDeviceFlow) AuthenticatorURL() string     { return s.url }
+func (s *staticDeviceFlow) GetSigningKey() crypto.Signer { return s.signer.GetSigningKey() }
 
 // pubkeyCallback returns a PublicKeyCallback that checks keys in order:
 // 1. Explicit allowed pubkeys from ConfigMaps with blip.azure.com/user label.
@@ -186,16 +217,20 @@ func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver, sessionWatch
 }
 
 // deviceFlowKeyboardInteractive returns a KeyboardInteractiveCallback that
-// presents a device-flow authentication URL to the user. It succeeds
-// immediately after showing the URL, setting ExtPendingDeviceAuth so the
-// connection handler knows to call WaitForAuth before proxying.
+// presents a device-flow authentication URL to the user. It reads the
+// authenticator URL and signing key from the DeviceFlowProvider at runtime,
+// so the callback activates/deactivates as configuration changes.
 func deviceFlowKeyboardInteractive(
-	authenticatorURL string,
-	signingKeyProvider SigningKeyProvider,
+	deviceFlow DeviceFlowProvider,
 	issuer string,
 	pending *PendingFingerprints,
 ) func(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+		authenticatorURL := deviceFlow.AuthenticatorURL()
+		if authenticatorURL == "" {
+			return nil, fmt.Errorf("device flow auth not configured")
+		}
+
 		pendingKeys := pending.Take(conn.RemoteAddr().String())
 		if len(pendingKeys) == 0 {
 			return nil, fmt.Errorf("no pubkey was offered before keyboard-interactive")
@@ -204,7 +239,7 @@ func deviceFlowKeyboardInteractive(
 		// Use the last key offered (most likely the intended key).
 		lastKey := pendingKeys[len(pendingKeys)-1]
 
-		signer := signingKeyProvider.GetSigningKey()
+		signer := deviceFlow.GetSigningKey()
 		if signer == nil {
 			return nil, fmt.Errorf("device flow auth not available: no signing key")
 		}
@@ -367,6 +402,7 @@ func registerPasswordCallback(reviewer TokenReviewer, limiter *rate.Limiter) fun
 
 		// Derive VM name from the token's bound pod name when available.
 		if result.PodName != "" {
+			// TODO: Remove this, I don't think we ever hit it
 			vmName, err := VMNameFromPodName(result.PodName)
 			if err != nil {
 				slog.Warn("VM registration auth: cannot derive VM name from pod",
