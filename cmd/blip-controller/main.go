@@ -20,6 +20,7 @@ import (
 	"github.com/project-unbounded/blip/internal/controllers/actions"
 	"github.com/project-unbounded/blip/internal/controllers/deallocation"
 	"github.com/project-unbounded/blip/internal/controllers/keygen"
+	"github.com/project-unbounded/blip/internal/controllers/runnerconfig"
 	"github.com/project-unbounded/blip/internal/controllers/sshpubkey"
 	"github.com/project-unbounded/blip/internal/controllers/tlscert"
 )
@@ -148,15 +149,24 @@ func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname string,
 		if len(runnerLabels) == 0 {
 			return fmt.Errorf("--runner-labels is required when --github-pat-secret is set")
 		}
-		if err := actions.Add(mgr, actions.Config{
+		patHolder, err := actions.Add(mgr, actions.Config{
 			Namespace:     namespace,
 			PoolName:      poolName,
 			PodName:       actionsPodName,
 			PATSecretName: actionsPATSecret,
 			Repos:         actionsRepos,
 			RunnerLabels:  runnerLabels,
-		}); err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("adding actions controller: %w", err)
+		}
+
+		if err := runnerconfig.Add(mgr, runnerconfig.Config{
+			Namespace:    namespace,
+			PATHolder:    patHolder,
+			RunnerLabels: runnerLabels,
+		}); err != nil {
+			return fmt.Errorf("adding runnerconfig controller: %w", err)
 		}
 	}
 

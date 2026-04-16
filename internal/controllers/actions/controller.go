@@ -43,9 +43,6 @@ const (
 	// job completion status.
 	jobCheckInterval = 15 * time.Second
 
-	// jitConfigAnnotation is the VM annotation key for the JIT runner config.
-	jitConfigAnnotation = "blip.io/runner-jitconfig"
-
 	// runnerRepoAnnotation stores the repo (owner/repo) for a runner VM,
 	// enabling the reconciler to check job status without external state.
 	runnerRepoAnnotation = "blip.io/runner-repo"
@@ -64,31 +61,44 @@ type Config struct {
 	RunnerLabels  []string
 }
 
-// patHolder is a thread-safe container for the PAT provider. It is populated
+// PATHolder is a thread-safe container for the PAT provider. It is populated
 // by the actionsRunnable after the cache has synced, and read by the
-// completion controller during reconciliation.
-type patHolder struct {
+// completion controller and runner config controller during reconciliation.
+// It implements the Token() method so it can be passed directly to consumers
+// that need a GitHub PAT.
+type PATHolder struct {
 	mu  sync.RWMutex
 	pat *ghactions.PATProvider
 }
 
-func (h *patHolder) set(p *ghactions.PATProvider) {
+func (h *PATHolder) set(p *ghactions.PATProvider) {
 	h.mu.Lock()
 	h.pat = p
 	h.mu.Unlock()
 }
 
-func (h *patHolder) get() *ghactions.PATProvider {
+func (h *PATHolder) get() *ghactions.PATProvider {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.pat
 }
 
+// Token returns the current GitHub PAT. Returns an error if the PAT
+// provider has not been initialised yet or if the underlying Secret has
+// no token.
+func (h *PATHolder) Token() (string, error) {
+	p := h.get()
+	if p == nil {
+		return "", fmt.Errorf("PAT provider not yet initialised")
+	}
+	return p.Token()
+}
+
 // Add registers the actions runner controller and job poller with the given
 // controller-runtime manager. The PAT provider is created lazily when the
 // manager starts (after the informer cache has synced).
-func Add(mgr ctrl.Manager, cfg Config) error {
-	holder := &patHolder{}
+func Add(mgr ctrl.Manager, cfg Config) (*PATHolder, error) {
+	holder := &PATHolder{}
 
 	// Register the completion controller (reconciles runner VMs).
 	c := &completionController{
@@ -103,7 +113,7 @@ func Add(mgr ctrl.Manager, cfg Config) error {
 			predicate.GenerationChangedPredicate{},
 		)).
 		Complete(c); err != nil {
-		return fmt.Errorf("register actions-completion controller: %w", err)
+		return nil, fmt.Errorf("register actions-completion controller: %w", err)
 	}
 
 	// Register the combined runnable that initialises the PAT provider
@@ -113,10 +123,10 @@ func Add(mgr ctrl.Manager, cfg Config) error {
 		cfg:    cfg,
 		holder: holder,
 	}); err != nil {
-		return fmt.Errorf("register actions runnable: %w", err)
+		return nil, fmt.Errorf("register actions runnable: %w", err)
 	}
 
-	return nil
+	return holder, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +138,7 @@ func Add(mgr ctrl.Manager, cfg Config) error {
 // VM when the job completes.
 type completionController struct {
 	Client client.Client
-	pat    *patHolder
+	pat    *PATHolder
 }
 
 func (c *completionController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -229,7 +239,7 @@ func (c *completionController) Reconcile(ctx context.Context, req reconcile.Requ
 type actionsRunnable struct {
 	mgr    ctrl.Manager
 	cfg    Config
-	holder *patHolder
+	holder *PATHolder
 }
 
 // NeedLeaderElection returns true so the poller only runs on the leader.
@@ -347,28 +357,11 @@ func (p *jobPoller) allocateAndProvision(ctx context.Context, repo string, job g
 		"vm", vmName,
 	)
 
-	// Create JIT runner config.
-	runnerName := fmt.Sprintf("blip-%d", job.ID)
-	labels := p.cfg.RunnerLabels
-	if len(labels) == 0 {
-		labels = []string{"self-hosted", "blip"}
-	}
-
-	jitConfig, err := ghactions.CreateJITRunnerConfig(ctx, token, repo, labels, runnerName)
-	if err != nil {
-		slog.Error("failed to create JIT runner config",
-			"repo", repo,
-			"job_id", job.ID,
-			"vm", vmName,
-			"error", err,
-		)
-		p.releaseVM(ctx, vmName)
-		return
-	}
-
-	// Write JIT config and metadata annotations to the VM.
+	// Write repo and job-id annotations to the VM. The runner-config
+	// controller will detect these annotations, create a JIT config via
+	// the GitHub API, and deliver it to the VM over SSH — ensuring no
+	// sensitive values are stored in the VM object.
 	if err := p.patchVMAnnotations(ctx, vmName, map[string]string{
-		jitConfigAnnotation:   jitConfig,
 		runnerRepoAnnotation:  repo,
 		runnerJobIDAnnotation: strconv.FormatInt(job.ID, 10),
 	}); err != nil {
@@ -381,11 +374,10 @@ func (p *jobPoller) allocateAndProvision(ctx context.Context, repo string, job g
 		return
 	}
 
-	slog.Info("provisioned runner VM with JIT config",
+	slog.Info("runner VM annotated, awaiting SSH provisioning",
 		"repo", repo,
 		"job_id", job.ID,
 		"vm", vmName,
-		"runner_name", runnerName,
 	)
 }
 
