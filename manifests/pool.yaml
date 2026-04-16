@@ -25,7 +25,7 @@ spec:
                 storage: 32Gi
           source:
             registry:
-              url: docker://quay.io/containerdisks/ubuntu:24.04
+              url: docker://$REGISTRY/blip-base:$BLIP_TAG
       runStrategy: Always
       template:
         metadata:
