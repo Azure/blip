@@ -404,18 +404,12 @@ spec:
         #   value: "gateway-tls-key"
         # GitHub Actions polling integration (optional).
         # Uncomment and set these to enable the Actions runner poller:
-        # - name: GITHUB_APP_ID
-        #   value: "<app-id>"
-        # - name: GITHUB_INSTALL_ID
-        #   value: "<install-id>"
-        # - name: GITHUB_KEY_PATH
-        #   value: "/etc/blip/github-key/private-key.pem"
+        # - name: GITHUB_PAT_SECRET
+        #   value: "github-pat"
         # - name: RUNNER_LABELS
         #   value: "self-hosted,blip"
-        # - name: ACTIONS_SESSION_DURATION
-        #   value: "3600"
-        # - name: ACTIONS_POLL_INTERVAL
-        #   value: "10"
+        # - name: ACTIONS_REPOS
+        #   value: "my-org/my-repo"
         volumeMounts:
         - name: host-key
           mountPath: /etc/blip/host-key
@@ -423,10 +417,6 @@ spec:
         - name: client-key
           mountPath: /etc/blip/client-key
           readOnly: true
-        # Uncomment when enabling GitHub Actions polling:
-        # - name: github-key
-        #   mountPath: /etc/blip/github-key
-        #   readOnly: true
         readinessProbe:
           httpGet:
             path: /readyz
@@ -459,14 +449,6 @@ spec:
           items:
           - key: client_key
             path: client_key
-      # Uncomment when enabling GitHub Actions polling:
-      # - name: github-key
-      #   secret:
-      #     secretName: github-app-key
-      #     defaultMode: 0440
-      #     items:
-      #     - key: private-key.pem
-      #       path: private-key.pem
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
