@@ -58,7 +58,7 @@ jobs:
           export REGISTRY="${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}"
           export BLIP_TAG
           mkdir -p dist
-          { cat config/crd/blip.io_blipowners.yaml; echo '---'; envsubst '$REGISTRY $BLIP_TAG' < manifests/deploy.yaml; } > dist/manifest.yaml
+          { envsubst '$REGISTRY $BLIP_TAG' < manifests/deploy.yaml; } > dist/manifest.yaml
 
       - name: Copy VM pool manifest
         run: cp manifests/pool.yaml dist/pool.yaml
