@@ -7,7 +7,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/crypto/ssh"
 	"golang.org/x/time/rate"
 )
 
@@ -92,52 +91,37 @@ func TestRegisterPasswordCallback(t *testing.T) {
 
 	unlimitedLimiter := rate.NewLimiter(rate.Inf, 0)
 
-	t.Run("rejects non-register user without original callback", func(t *testing.T) {
-		cb := registerPasswordCallback(reviewer, unlimitedLimiter, nil)
+	t.Run("rejects non-register user", func(t *testing.T) {
+		cb := registerPasswordCallback(reviewer, unlimitedLimiter)
 		_, err := cb(fakeConnMeta{user: "runner"}, []byte("somepassword"))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not supported for user")
 	})
 
-	t.Run("forwards non-register user to original callback", func(t *testing.T) {
-		origCalled := false
-		origCb := func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			origCalled = true
-			return &ssh.Permissions{
-				Extensions: map[string]string{ExtIdentity: "oidc:forwarded"},
-			}, nil
-		}
-		cb := registerPasswordCallback(reviewer, unlimitedLimiter, origCb)
-		perms, err := cb(fakeConnMeta{user: "runner"}, []byte("some-oidc-token"))
-		require.NoError(t, err)
-		assert.True(t, origCalled, "original callback should have been invoked")
-		assert.Equal(t, "oidc:forwarded", perms.Extensions[ExtIdentity])
-	})
-
 	t.Run("rejects empty token for _register", func(t *testing.T) {
-		cb := registerPasswordCallback(reviewer, unlimitedLimiter, nil)
+		cb := registerPasswordCallback(reviewer, unlimitedLimiter)
 		_, err := cb(fakeConnMeta{user: "_register"}, []byte(""))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "ServiceAccount token")
 	})
 
 	t.Run("rejects invalid token for _register", func(t *testing.T) {
-		cb := registerPasswordCallback(reviewer, unlimitedLimiter, nil)
+		cb := registerPasswordCallback(reviewer, unlimitedLimiter)
 		_, err := cb(fakeConnMeta{user: "_register"}, []byte("bad-token"))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "validation failed")
 	})
 
 	t.Run("accepts valid token for _register", func(t *testing.T) {
-		cb := registerPasswordCallback(reviewer, unlimitedLimiter, nil)
+		cb := registerPasswordCallback(reviewer, unlimitedLimiter)
 		perms, err := cb(fakeConnMeta{user: "_register"}, []byte(validToken))
 		require.NoError(t, err)
 		assert.Equal(t, "vm-register", perms.Extensions[ExtIdentity])
 		assert.Equal(t, "blip-abc12", perms.Extensions[ExtVMName])
 	})
 
-	t.Run("rejects non-register user when no original callback", func(t *testing.T) {
-		cb := registerPasswordCallback(reviewer, unlimitedLimiter, nil)
+	t.Run("rejects non-register user alice", func(t *testing.T) {
+		cb := registerPasswordCallback(reviewer, unlimitedLimiter)
 		_, err := cb(fakeConnMeta{user: "alice"}, []byte("some-oidc-token"))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not supported for user")
@@ -153,7 +137,7 @@ func TestRegisterPasswordCallback(t *testing.T) {
 				}, nil
 			},
 		}
-		cb := registerPasswordCallback(badReviewer, unlimitedLimiter, nil)
+		cb := registerPasswordCallback(badReviewer, unlimitedLimiter)
 		// A non-virt-launcher pod name is no longer a hard error; the VM
 		// name will be provided via the exec command instead.  Registration
 		// succeeds but without ExtVMName in the permissions.

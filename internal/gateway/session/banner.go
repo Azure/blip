@@ -129,15 +129,3 @@ func allocErrorBanner(reconnecting bool, err error) string {
 func hostKeyErrorBanner() string {
 	return crlf("\n  >>> Failed to verify blip identity\n\n")
 }
-
-// deviceFlowErrorBanner returns the user-facing banner text shown when
-// device flow authentication fails.
-func deviceFlowErrorBanner(err error) string {
-	return crlf(fmt.Sprintf("\n  >>> Device authentication failed: %s\n\n", err))
-}
-
-// identityVerificationErrorBanner returns the user-facing banner text shown
-// when an identity-linked pubkey's OIDC refresh token verification fails.
-func identityVerificationErrorBanner(err error) string {
-	return crlf(fmt.Sprintf("\n  >>> OIDC identity verification failed: %s\n  >>> Please re-authenticate via device flow.\n\n", err))
-}

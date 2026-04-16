@@ -26,11 +26,7 @@ github-runner:
 .PHONY: manifest
 manifest:
 	mkdir -p dist
-	{ cat config/crd/blip.io_blipowners.yaml; echo '---'; envsubst '$$REGISTRY $$BLIP_TAG' < manifests/deploy.yaml; } > dist/manifest.yaml
-
-.PHONY: generate
-generate:
-	go generate ./api/...
+	envsubst '$$REGISTRY $$BLIP_TAG' < manifests/deploy.yaml > dist/manifest.yaml
 
 .PHONY: pool
 pool:
