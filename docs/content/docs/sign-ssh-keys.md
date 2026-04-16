@@ -81,6 +81,29 @@ When the HTTPS API server is enabled (`--oidc-issuer-url` and `--oidc-audience` 
 | `--tls-secret-name` | `TLS_SECRET_NAME` | Kubernetes Secret with `tls.crt` and `tls.key` for the HTTPS server. |
 | `--https-address` | `HTTPS_ADDRESS` | HTTPS listen address (default `:8443`). |
 
+### Configuring Entra ID with the Azure Function authenticator
+
+The [`azure-auth`](https://github.com/Azure/blip/tree/main/azure-auth) cloud function is a ready-made authenticator that uses Azure App Service Authentication (EasyAuth) to log users in via Microsoft Entra ID. EasyAuth handles the OIDC login at the platform level and injects the user's Entra ID token in the `X-MS-TOKEN-AAD-ID-TOKEN` header. The function forwards this token to the gateway's `POST /auth/user` endpoint.
+
+To configure the gateway to accept these tokens, set `--oidc-issuer-url` and `--oidc-audience` to match the Entra ID App Registration used by EasyAuth on the Function App:
+
+```
+--oidc-issuer-url=https://login.microsoftonline.com/<tenant-id>/v2.0
+--oidc-audience=<easyauth-app-registration-client-id>
+--tls-secret-name=gateway-tls-key
+--external-host=gateway.example.com
+--authenticator-url=https://<function-app-name>.azurewebsites.net/api/auth
+```
+
+| Parameter | Value |
+|-----------|-------|
+| `--oidc-issuer-url` | `https://login.microsoftonline.com/<tenant-id>/v2.0` — the Entra ID v2.0 issuer for your tenant. The gateway fetches the OIDC discovery document at this URL to obtain signing keys for token verification. If your App Registration is configured for v1.0 tokens, use `https://sts.windows.net/<tenant-id>/` instead. |
+| `--oidc-audience` | The **Application (client) ID** of the Entra ID App Registration configured as the EasyAuth identity provider on the Function App. This must match the `aud` claim in the ID tokens that EasyAuth issues. |
+| `--authenticator-url` | The public URL of the Azure Function's `auth` HTTP trigger (e.g. `https://myapp.azurewebsites.net/api/auth`). This is shown to users during device-flow auth and used as the `aud` claim in the gateway-signed pubkey JWT. |
+| `--external-host` | The gateway's public hostname. Used as the `iss` claim in the gateway-signed pubkey JWT. |
+
+The Azure Function requires the `APISERVER_URL` environment variable set to the Kubernetes API server URL so it can fetch the gateway's TLS certificate from the `gateway-tls-certs` ConfigMap in `kube-public`.
+
 ### Auth session Secrets
 
 The authenticator service is responsible for creating auth session Secrets. They must conform to this schema:
