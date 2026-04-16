@@ -16,7 +16,6 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/project-unbounded/blip/internal/gateway/actions"
 	"github.com/project-unbounded/blip/internal/gateway/auth"
 	"github.com/project-unbounded/blip/internal/gateway/server"
 	"github.com/project-unbounded/blip/internal/gateway/session"
@@ -70,12 +69,8 @@ type GatewayConfig struct {
 	// OIDC-authenticated endpoints.
 	HTTPS *HTTPSConfig
 
-	// Actions configures the GitHub Actions polling handler. When nil,
-	// Actions polling is disabled.
-	Actions *ActionsConfig
-
 	// ScaleSet configures the GitHub Actions scale set listener. When nil,
-	// scale set mode is disabled. Mutually exclusive with Actions.
+	// scale set mode is disabled.
 	ScaleSet *ScaleSetConfig
 
 	// KubeWriter is the controller-runtime client used for Kubernetes write
@@ -87,27 +82,6 @@ type GatewayConfig struct {
 	// vm.NewKubeClients in main and shared across components (e.g. the VM
 	// client and the HTTPS API server).
 	KubeCache crcache.Cache
-
-	// ActionsRepos is the static list of GitHub repos to poll for queued
-	// Actions workflow jobs. Each entry is in "owner/repo" format. Used
-	// when Actions polling is enabled.
-	ActionsRepos []string
-}
-
-// ActionsConfig holds the configuration for the GitHub Actions polling
-// integration. When enabled, the gateway polls the GitHub API for queued
-// workflow jobs and allocates Blip VMs as just-in-time self-hosted runners.
-// Authentication is via a GitHub Personal Access Token stored in a Kubernetes
-// Secret and watched via an informer.
-type ActionsConfig struct {
-	// PATSecretName is the name of the Kubernetes Secret containing the
-	// GitHub PAT in a "token" key. The Secret is watched via the shared
-	// informer cache so token rotations are picked up immediately.
-	PATSecretName string
-
-	// RunnerLabels are the self-hosted runner labels to match against
-	// workflow_job labels (e.g. ["self-hosted", "blip"]).
-	RunnerLabels []string
 }
 
 // ScaleSetConfig holds the configuration for the GitHub Actions scale set
@@ -257,8 +231,8 @@ func RunGateway(cfg *GatewayConfig) error {
 	var shuttingDown atomic.Int32
 
 	httpMux := http.NewServeMux()
-	httpMux.HandleFunc("GET /healthz", healthzHandler(nil))
-	httpMux.HandleFunc("GET /readyz", readyzHandler(nil, &shuttingDown))
+	httpMux.HandleFunc("GET /healthz", healthzHandler())
+	httpMux.HandleFunc("GET /readyz", readyzHandler(&shuttingDown))
 
 	httpServer := &http.Server{
 		Addr:         httpAddr,
@@ -321,37 +295,9 @@ func RunGateway(cfg *GatewayConfig) error {
 		slog.Info("https api server started", "addr", cfg.HTTPS.Addr)
 	}
 
-	// Start the Actions runner backend if configured.
-	var actionsRunner *actions.Runner
-	if cfg.Actions != nil && cfg.Actions.PATSecretName != "" && len(cfg.ActionsRepos) > 0 {
-		pat, err := actions.NewPATProvider(ctx, cfg.KubeCache, cfg.VMNamespace, cfg.Actions.PATSecretName)
-		if err != nil {
-			return fmt.Errorf("create PAT provider: %w", err)
-		}
-
-		actionsCfg := actions.Config{
-			VMClient:     vmcl,
-			Namespace:    cfg.VMNamespace,
-			PoolName:     cfg.VMPoolName,
-			PodName:      cfg.PodName,
-			PAT:          pat,
-			Repos:        cfg.ActionsRepos,
-			RunnerLabels: cfg.Actions.RunnerLabels,
-		}
-
-		slog.Info("actions runner configured with PAT",
-			"pat_secret", cfg.Actions.PATSecretName,
-			"repos", cfg.ActionsRepos,
-			"labels", cfg.Actions.RunnerLabels,
-		)
-
-		actionsRunner = actions.New(actionsCfg)
-		go func() {
-			if err := actionsRunner.Start(ctx); err != nil {
-				slog.Error("actions runner backend error", "error", err)
-			}
-		}()
-	}
+	// Note: GitHub Actions runner polling is now handled by the actions
+	// controller in blip-controller. The gateway no longer manages runner
+	// goroutines or in-memory job state.
 
 	const drainTimeout = 30 * time.Second
 
@@ -453,14 +399,8 @@ func RunGateway(cfg *GatewayConfig) error {
 	return err
 }
 
-// activeSessionProvider abstracts session counting for health endpoints.
-// Both Poller and Listener implement this interface.
-type activeSessionProvider interface {
-	ActiveSessionCount() int
-}
-
 // healthzHandler returns an HTTP handler that always reports healthy.
-func healthzHandler(provider activeSessionProvider) http.HandlerFunc {
+func healthzHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -468,15 +408,12 @@ func healthzHandler(provider activeSessionProvider) http.HandlerFunc {
 			"status":    "ok",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 		}
-		if provider != nil {
-			resp["active_actions_sessions"] = provider.ActiveSessionCount()
-		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
 
 // readyzHandler returns an HTTP handler that reports readiness.
-func readyzHandler(provider activeSessionProvider, shuttingDown *atomic.Int32) http.HandlerFunc {
+func readyzHandler(shuttingDown *atomic.Int32) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -493,9 +430,6 @@ func readyzHandler(provider activeSessionProvider, shuttingDown *atomic.Int32) h
 		resp := map[string]any{
 			"status":    "ok",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
-		}
-		if provider != nil {
-			resp["active_actions_sessions"] = provider.ActiveSessionCount()
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}

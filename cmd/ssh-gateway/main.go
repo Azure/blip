@@ -35,7 +35,6 @@ func newRootCmd() *cobra.Command {
 		podName            string
 		maxSessionDuration int
 		maxBlipsPerUser    int
-		actionsRepos       []string
 		hostPrincipals     []string
 		externalHost       string
 		vmRegisterSA       string
@@ -96,7 +95,6 @@ func newRootCmd() *cobra.Command {
 				MaxSessionDuration: time.Duration(maxSessionDuration) * time.Second,
 				MaxBlipsPerUser:    maxBlipsPerUser,
 				HostPrincipals:     hostPrincipals,
-				ActionsRepos:       actionsRepos,
 				ExternalHost:       externalHost,
 				VMRegisterSA:       vmRegisterSA,
 				LoginGraceTime:     30 * time.Second,
@@ -125,20 +123,6 @@ func newRootCmd() *cobra.Command {
 					OIDCAudience:       oidcAudience,
 					JWTIssuer:          externalHost,
 					AuthenticatorURL:   authenticatorURL,
-				}
-			}
-
-			// Enable GitHub Actions polling integration if configured.
-			if githubPATSecret != "" {
-				if len(runnerLabels) == 0 {
-					return fmt.Errorf("--runner-labels is required when --github-pat-secret is set (e.g. 'self-hosted,blip')")
-				}
-				if len(actionsRepos) == 0 {
-					return fmt.Errorf("--actions-repos is required when --github-pat-secret is set (e.g. 'my-org/my-repo')")
-				}
-				cfg.Actions = &sshgw.ActionsConfig{
-					PATSecretName: githubPATSecret,
-					RunnerLabels:  runnerLabels,
 				}
 			}
 
@@ -179,7 +163,6 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "unknown"), "Pod name for identification (env: POD_NAME)")
 	cmd.Flags().IntVar(&maxSessionDuration, "max-session-duration", envOrDefaultInt("MAX_SESSION_DURATION", 43200), "Maximum session duration in seconds (env: MAX_SESSION_DURATION)")
 	cmd.Flags().IntVar(&maxBlipsPerUser, "max-blips-per-user", envOrDefaultInt("MAX_BLIPS_PER_USER", 0), "Per-user blip quota, 0 = unlimited (env: MAX_BLIPS_PER_USER)")
-	cmd.Flags().StringSliceVar(&actionsRepos, "actions-repos", envOrDefaultStringSlice("ACTIONS_REPOS"), "GitHub repos for Actions polling, comma-separated owner/repo (env: ACTIONS_REPOS)")
 	cmd.Flags().StringSliceVar(&hostPrincipals, "host-principals", envOrDefaultStringSlice("GATEWAY_HOST_PRINCIPALS"), "Hostnames/IPs for gateway identification, comma-separated (env: GATEWAY_HOST_PRINCIPALS)")
 	cmd.Flags().StringVar(&externalHost, "external-host", envOrDefault("GATEWAY_EXTERNAL_HOST", ""), "Public hostname for the gateway, shown in reconnect instructions (env: GATEWAY_EXTERNAL_HOST)")
 	cmd.Flags().StringVar(&vmRegisterSA, "vm-register-sa", envOrDefault("VM_REGISTER_SA", "vm-register"), "ServiceAccount name for VM registration token validation (env: VM_REGISTER_SA)")

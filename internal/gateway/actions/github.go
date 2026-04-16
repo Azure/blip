@@ -1,10 +1,7 @@
-// Package actions implements a GitHub Actions runner backend.
-//
-// This file provides a PAT (Personal Access Token) provider that watches a
-// Kubernetes Secret via a controller-runtime cache informer, and GitHub API
-// helpers for:
-//   - Creating JIT (just-in-time) runner configurations
-//   - Checking workflow job completion status
+// Package actions provides GitHub API helpers for the Actions runner backend
+// and a PAT provider that watches a Kubernetes Secret. The polling and job
+// monitoring logic lives in the actions controller
+// (internal/controllers/actions).
 package actions
 
 import (
@@ -190,6 +187,85 @@ func CreateJITRunnerConfig(ctx context.Context, token, repo string, labels []str
 	return jitResp.EncodedJITConfig, nil
 }
 
+// WorkflowJob represents a GitHub Actions workflow job.
+type WorkflowJob struct {
+	ID     int64    `json:"id"`
+	Status string   `json:"status"`
+	Labels []string `json:"labels"`
+}
+
+type jobsResponse struct {
+	Jobs []WorkflowJob `json:"jobs"`
+}
+
+type runsResponse struct {
+	WorkflowRuns []workflowRun `json:"workflow_runs"`
+}
+
+type workflowRun struct {
+	ID int64 `json:"id"`
+}
+
+// ListQueuedJobs returns queued workflow jobs for the given repo.
+func ListQueuedJobs(ctx context.Context, repo, token string) ([]WorkflowJob, error) {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid repo format: %s", repo)
+	}
+	owner, repoName := parts[0], parts[1]
+
+	runsURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs?status=queued&per_page=100", owner, repoName)
+	runs, err := ghGet[runsResponse](ctx, runsURL, token)
+	if err != nil {
+		return nil, fmt.Errorf("list runs: %w", err)
+	}
+
+	var queued []WorkflowJob
+	for _, run := range runs.WorkflowRuns {
+		jobsURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=100", owner, repoName, run.ID)
+		resp, err := ghGet[jobsResponse](ctx, jobsURL, token)
+		if err != nil {
+			slog.Debug("list jobs for run failed", "run_id", run.ID, "error", err)
+			continue
+		}
+		for _, job := range resp.Jobs {
+			if job.Status == "queued" {
+				queued = append(queued, job)
+			}
+		}
+	}
+	return queued, nil
+}
+
+// ghGet performs a GitHub API GET request and decodes the JSON response.
+func ghGet[T any](ctx context.Context, url, token string) (T, error) {
+	var zero T
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return zero, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := githubHTTPClient.Do(req)
+	if err != nil {
+		return zero, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return zero, fmt.Errorf("github api %s: %d %s", url, resp.StatusCode, string(body))
+	}
+
+	var result T
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return zero, fmt.Errorf("decode response: %w", err)
+	}
+	return result, nil
+}
+
 // GetJobStatus returns the status of a workflow job ("queued", "in_progress",
 // "completed", etc.).
 func GetJobStatus(ctx context.Context, token, repo string, jobID int64) (string, error) {
@@ -199,30 +275,12 @@ func GetJobStatus(ctx context.Context, token, repo string, jobID int64) (string,
 	}
 
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/jobs/%d", parts[0], parts[1], jobID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-
-	resp, err := githubHTTPClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request job status: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", fmt.Errorf("job status request failed: %d %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
+	type jobStatusResponse struct {
 		Status string `json:"status"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode job status response: %w", err)
+	result, err := ghGet[jobStatusResponse](ctx, url, token)
+	if err != nil {
+		return "", err
 	}
 	return result.Status, nil
 }

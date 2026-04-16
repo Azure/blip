@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
@@ -16,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	"github.com/project-unbounded/blip/internal/controllers/actions"
 	"github.com/project-unbounded/blip/internal/controllers/deallocation"
 	"github.com/project-unbounded/blip/internal/controllers/keygen"
 	"github.com/project-unbounded/blip/internal/controllers/sshpubkey"
@@ -40,6 +42,12 @@ func newRootCmd() *cobra.Command {
 		leaseNamespace  string
 		leaseName       string
 		gatewayHostname string
+
+		// GitHub Actions runner flags.
+		actionsRepos     []string
+		actionsPATSecret string
+		runnerLabels     []string
+		actionsPodName   string
 	)
 
 	cmd := &cobra.Command{
@@ -50,7 +58,7 @@ func newRootCmd() *cobra.Command {
 			if !cmd.Flags().Changed("lease-namespace") {
 				leaseNamespace = namespace
 			}
-			return run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname)
+			return run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname, actionsRepos, actionsPATSecret, runnerLabels, actionsPodName)
 		},
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -62,6 +70,12 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&leaseName, "lease-name", envOrDefault("LEASE_NAME", "blip-controller"), "Name of the leader election lease (env: LEASE_NAME)")
 	cmd.Flags().StringVar(&gatewayHostname, "gateway-hostname", envOrDefault("GATEWAY_HOSTNAME", ""), "Gateway hostname for TLS certificate generation (env: GATEWAY_HOSTNAME)")
 
+	// GitHub Actions runner flags.
+	cmd.Flags().StringSliceVar(&actionsRepos, "actions-repos", envOrDefaultStringSlice("ACTIONS_REPOS"), "GitHub repos for Actions polling, comma-separated owner/repo (env: ACTIONS_REPOS)")
+	cmd.Flags().StringVar(&actionsPATSecret, "github-pat-secret", envOrDefault("GITHUB_PAT_SECRET", ""), "Kubernetes Secret name containing the GitHub PAT in a 'token' key (env: GITHUB_PAT_SECRET)")
+	cmd.Flags().StringSliceVar(&runnerLabels, "runner-labels", envOrDefaultStringSlice("RUNNER_LABELS"), "Runner labels for JIT runners, comma-separated (env: RUNNER_LABELS)")
+	cmd.Flags().StringVar(&actionsPodName, "pod-name", envOrDefault("POD_NAME", "blip-controller"), "Pod name for identification in VM annotations (env: POD_NAME)")
+
 	return cmd
 }
 
@@ -72,7 +86,7 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname string) error {
+func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname string, actionsRepos []string, actionsPATSecret string, runnerLabels []string, actionsPodName string) error {
 	s, err := newScheme()
 	if err != nil {
 		return fmt.Errorf("create scheme: %w", err)
@@ -129,6 +143,23 @@ func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname string)
 		return fmt.Errorf("adding sshpubkey controller: %w", err)
 	}
 
+	// Register the GitHub Actions runner controller if configured.
+	if actionsPATSecret != "" && len(actionsRepos) > 0 {
+		if len(runnerLabels) == 0 {
+			return fmt.Errorf("--runner-labels is required when --github-pat-secret is set")
+		}
+		if err := actions.Add(mgr, actions.Config{
+			Namespace:     namespace,
+			PoolName:      poolName,
+			PodName:       actionsPodName,
+			PATSecretName: actionsPATSecret,
+			Repos:         actionsRepos,
+			RunnerLabels:  runnerLabels,
+		}); err != nil {
+			return fmt.Errorf("adding actions controller: %w", err)
+		}
+	}
+
 	slog.Info("blip-controller starting")
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
@@ -142,4 +173,19 @@ func newScheme() (*runtime.Scheme, error) {
 		return nil, fmt.Errorf("register kubevirt/v1: %w", err)
 	}
 	return s, nil
+}
+
+func envOrDefaultStringSlice(key string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return nil
+	}
+	var result []string
+	for _, s := range strings.Split(v, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			result = append(result, s)
+		}
+	}
+	return result
 }
