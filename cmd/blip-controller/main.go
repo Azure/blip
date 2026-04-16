@@ -18,6 +18,7 @@ import (
 
 	"github.com/project-unbounded/blip/internal/controllers/deallocation"
 	"github.com/project-unbounded/blip/internal/controllers/keygen"
+	"github.com/project-unbounded/blip/internal/controllers/sshpubkey"
 	"github.com/project-unbounded/blip/internal/controllers/tlscert"
 )
 
@@ -44,7 +45,7 @@ func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "blip-controller",
 		Short: "Kubernetes controller for Blip lifecycle management",
-		Long:  "Manages SSH host key generation and blip deallocation for the Blip platform.",
+		Long:  "Manages SSH host key generation, SSH public key expiration, and blip deallocation for the Blip platform.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !cmd.Flags().Changed("lease-namespace") {
 				leaseNamespace = namespace
@@ -122,6 +123,10 @@ func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname string)
 	err = deallocation.Add(mgr, namespace, poolName)
 	if err != nil {
 		return fmt.Errorf("adding deallocation controller: %w", err)
+	}
+
+	if err := sshpubkey.Add(mgr, namespace); err != nil {
+		return fmt.Errorf("adding sshpubkey controller: %w", err)
 	}
 
 	slog.Info("blip-controller starting")
