@@ -4,53 +4,41 @@ description: "Use Blip VMs as just-in-time self-hosted GitHub Actions runners"
 weight: 6
 ---
 
-Blip can act as a GitHub Actions self-hosted runner backend. When configured with a GitHub Personal Access Token (PAT) and a list of repositories, the gateway polls for queued workflow jobs, claims VMs from the pool, creates JIT (just-in-time) runner configurations via the GitHub API, and releases VMs when jobs complete.
-
 ## How it works
 
-1. A GitHub PAT is stored in a Kubernetes Secret and watched by the gateway via an informer.
-2. The actions runner backend starts a polling loop for each configured repository.
-3. Each loop uses the PAT to list queued workflow jobs and match them against configured runner labels.
-4. For each matched job, the gateway claims a VM, calls the GitHub API to generate a JIT runner config, and patches it onto the VM as the `blip.io/runner-jitconfig` annotation.
+1. A GitHub PAT is stored in a Kubernetes Secret and watched by the gateway.
+2. The actions runner backend polls for queued workflow jobs in configured repositories.
+3. Each poll uses the PAT to list queued jobs and match them against configured runner labels.
+4. For each matched job, the gateway claims a VM, generates a JIT runner config via GitHub API, and patches it onto the VM as the `blip.io/runner-jitconfig` annotation.
 5. The in-VM runner agent polls for this annotation and starts with `./run.sh --jitconfig <config>`.
-6. When the job completes, the VM is released immediately.
+6. On job completion, the VM is released.
 
 ## Prerequisites
 
 - A working Blip deployment ([Getting Started]({{% relref "getting-started" %}}))
 - A VM pool whose image includes the GitHub Actions runner agent (see [VM image](#vm-image))
-- A GitHub Personal Access Token — fine-grained recommended, see [PAT scopes](#pat-scopes) below
+- A GitHub PAT — fine-grained recommended, see [PAT scopes](#pat-scopes)
 
 ## Create a GitHub PAT
 
 ### PAT scopes
-
-Blip calls repo-level Actions API endpoints (`generate-jitconfig`, `workflow/runs`,
-`workflow/jobs`). A fine-grained PAT is recommended because it can be scoped to
-only the repositories Blip manages:
 
 | PAT type | Required permissions |
 |----------|---------------------|
 | Fine-grained (recommended) | **Repository permissions:** "Administration" read & write, "Actions" read — scoped to target repos only |
 | Classic | `repo` (grants access to **all** repos — avoid if possible) |
 
-> `admin:org` is **not** needed — Blip operates on per-repository runners, not
-> organisation-level runners.
+> `admin:org` is **not** needed — Blip uses per-repository runners.
 
 ### Generate a fine-grained PAT
 
-Fine-grained PATs must be created in the GitHub UI:
-
 1. Navigate to **Settings → Developer settings → Fine-grained tokens**
-2. Scope the token to **only** the repositories Blip will poll
-3. Grant the following repository permissions:
-   - **Administration** — read & write (required for `generate-jitconfig`)
-   - **Actions** — read (required for listing queued jobs)
+2. Scope to **only** the repositories Blip will poll
+3. Grant repository permissions:
+   - **Administration** — read & write (for `generate-jitconfig`)
+   - **Actions** — read (for listing queued jobs)
 
 ### Write the PAT to a Kubernetes Secret
-
-This command is idempotent — it creates the Secret on first run and updates it
-on subsequent runs, making it safe for token rotation:
 
 ```shell
 kubectl create secret generic github-pat \
@@ -59,12 +47,9 @@ kubectl create secret generic github-pat \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-The gateway watches this Secret via a Kubernetes informer — rotations are
-picked up immediately without a pod restart.
-
 ## Configure the gateway
 
-Uncomment the GitHub Actions sections in `manifests/deploy.yaml` and fill in your values:
+Uncomment the GitHub Actions sections in `manifests/deploy.yaml`:
 
 ```yaml
 - name: GITHUB_PAT_SECRET
@@ -75,8 +60,6 @@ Uncomment the GitHub Actions sections in `manifests/deploy.yaml` and fill in you
   value: "my-org/my-repo"
 ```
 
-Apply:
-
 ```shell
 kubectl apply -f manifests/deploy.yaml
 ```
@@ -85,7 +68,7 @@ kubectl apply -f manifests/deploy.yaml
 
 | Environment variable | CLI flag | Required | Description |
 |---------------------|----------|----------|-------------|
-| `GITHUB_PAT_SECRET` | `--github-pat-secret` | yes | Name of the Kubernetes Secret containing the GitHub PAT in a `token` key |
+| `GITHUB_PAT_SECRET` | `--github-pat-secret` | yes | Kubernetes Secret containing the GitHub PAT in a `token` key |
 | `RUNNER_LABELS` | `--runner-labels` | yes | Comma-separated runner labels (e.g. `self-hosted,blip`) |
 | `ACTIONS_REPOS` | `--actions-repos` | yes | Comma-separated repos to poll (e.g. `my-org/my-repo`) |
 
@@ -102,7 +85,7 @@ jobs:
       - run: echo "Running on a Blip VM"
 ```
 
-A queued job is picked up only if at least one of the job's labels matches a configured `RUNNER_LABELS` entry. Matching is case-insensitive.
+Matching is case-insensitive. A job is picked up if at least one label matches a `RUNNER_LABELS` entry.
 
 ## VM image
 
@@ -111,16 +94,16 @@ The VM's cloud-init script must:
 1. Poll for the `blip.io/runner-jitconfig` annotation on the VM (via the Kubernetes API using the pod-mounted service account).
 2. When the annotation appears, start the runner with `./run.sh --jitconfig <config>`.
 
-The JIT config is a sealed, ephemeral configuration generated by GitHub. No registration tokens or repository URLs are needed — the config contains everything the runner agent requires.
+The JIT config is sealed and ephemeral — no registration tokens or repository URLs needed.
 
 See `images/github-runner/Containerfile` for a reference implementation.
 
 ## Security
 
-- JIT runner configs are sealed by GitHub and single-use. No persistent runner tokens are stored.
+- JIT runner configs are sealed by GitHub and single-use.
 - Runner VMs are hard-capped at 30 minutes (`runnerMaxTTL`).
-- Duplicate job sightings are deduplicated — only one VM is claimed per job.
-- The PAT Secret is watched via a Kubernetes informer — token rotations are picked up immediately without pod restarts.
+- Duplicate job sightings are deduplicated — only one VM per job.
+- PAT Secret rotations are picked up immediately.
 
 ## Troubleshooting
 
@@ -130,7 +113,7 @@ kubectl logs -n blip -l app=ssh-gateway --tail=200
 
 | Message | Cause |
 |---------|-------|
-| `no PAT available` | The PAT Secret is missing or has no `token` key |
-| `failed to create JIT runner config` | PAT lacks permissions or is not authorized for the repo |
+| `no PAT available` | PAT Secret missing or has no `token` key |
+| `failed to create JIT runner config` | PAT lacks permissions or not authorized for repo |
 | `failed to allocate runner VM` | No VMs available in pool |
 | `job labels do not match runner labels` | `runs-on` labels don't overlap with `RUNNER_LABELS` |
