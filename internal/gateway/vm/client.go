@@ -463,6 +463,26 @@ func (c *Client) RegisterKeys(ctx context.Context, vmName, hostKey, clientKey st
 	return c.writer.Update(ctx, &vm)
 }
 
+// PatchVMAnnotations merges the given annotations into the named VM's existing
+// annotations via a server-side merge patch. This is safe against concurrent
+// updates — only the specified annotations are modified without overwriting
+// other fields. Used by the actions runner backend to set runner configuration
+// annotations (e.g. blip.io/runner-jitconfig) after claiming a VM.
+func (c *Client) PatchVMAnnotations(ctx context.Context, vmName string, annotations map[string]string) error {
+	var vm kubevirtv1.VirtualMachine
+	if err := c.writer.Get(ctx, client.ObjectKey{Namespace: c.namespace, Name: vmName}, &vm); err != nil {
+		return fmt.Errorf("get VM %s: %w", vmName, err)
+	}
+	base := vm.DeepCopy()
+	if vm.Annotations == nil {
+		vm.Annotations = make(map[string]string)
+	}
+	for k, v := range annotations {
+		vm.Annotations[k] = v
+	}
+	return c.writer.Patch(ctx, &vm, client.MergeFrom(base))
+}
+
 // ResolveVMNameByIP looks up the VM name for the given pod IP address by
 // searching VirtualMachineInstances. Falls back to a direct API call if the
 // informer cache doesn't have a match (handles the race where a VMI boots
