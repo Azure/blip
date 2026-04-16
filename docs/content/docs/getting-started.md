@@ -19,7 +19,7 @@ kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEV
 
 ## Install CDI
 
-VM pools require the [Containerized Data Importer](https://kubevirt.io/user-guide/storage/containerized_data_importer/) (CDI) for writable root disks:
+Required for writable root disks. See [CDI docs](https://kubevirt.io/user-guide/storage/containerized_data_importer/).
 
 ```shell
 export CDI_VERSION=$(curl -s -w '%{redirect_url}' https://github.com/kubevirt/containerized-data-importer/releases/latest | xargs basename)
@@ -33,13 +33,7 @@ kubectl apply -f "https://github.com/kubevirt/containerized-data-importer/releas
 kubectl apply -f https://github.com/Azure/blip/releases/latest/download/manifest.yaml
 ```
 
-## Create a VM Pool
-
-```shell
-kubectl apply -f https://github.com/Azure/blip/releases/latest/download/pool.yaml
-```
-
 ## Next steps
 
-- [Customize a VM Pool]({{% relref "create-vm-pool" %}})
+- [Create a VM Pool]({{% relref "create-vm-pool" %}})
 - [User Authentication]({{% relref "sign-ssh-keys" %}})
