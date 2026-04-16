@@ -17,6 +17,7 @@ blip:
 .PHONY: base
 base:
 	$(CONTAINER_ENGINE) build \
+		--build-arg RUNNER_VERSION=$(RUNNER_VERSION) \
 		-t $(REGISTRY)/blip-base:$(BLIP_TAG) \
 		-f images/base/Containerfile .
 	mkdir -p dist
