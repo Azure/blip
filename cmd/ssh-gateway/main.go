@@ -47,19 +47,14 @@ func newRootCmd() *cobra.Command {
 		authenticatorURL string
 
 		// HTTPS API server (optional, enabled when --oidc-issuer-url is set).
-		httpsListenAddr   string
-		tlsSecretName     string
-		oidcIssuerURL     string
-		oidcAudience      string
-		githubAllowedOrgs []string
+		httpsListenAddr string
+		tlsSecretName   string
+		oidcIssuerURL   string
+		oidcAudience    string
 
 		// GitHub Actions polling integration (optional).
-		githubAppID            int64
-		githubInstallID        int64
-		githubKeyPath          string
-		runnerLabels           []string
-		actionsSessionDuration int
-		actionsPollInterval    int
+		githubPATSecret string
+		runnerLabels    []string
 
 		// GitHub Actions scale set integration (optional, mutually exclusive with polling).
 		scalesetConfigURL   string
@@ -128,40 +123,29 @@ func newRootCmd() *cobra.Command {
 					TLSSecretNamespace: vmNamespace,
 					OIDCIssuerURL:      oidcIssuerURL,
 					OIDCAudience:       oidcAudience,
-					GitHubAllowedOrgs:  githubAllowedOrgs,
 					JWTIssuer:          externalHost,
 					AuthenticatorURL:   authenticatorURL,
 				}
 			}
 
 			// Enable GitHub Actions polling integration if configured.
-			if githubAppID > 0 {
-				if githubInstallID <= 0 {
-					return fmt.Errorf("--github-install-id is required when --github-app-id is set")
-				}
-				if githubKeyPath == "" {
-					return fmt.Errorf("--github-key-path is required when --github-app-id is set")
-				}
+			if githubPATSecret != "" {
 				if len(runnerLabels) == 0 {
-					return fmt.Errorf("--runner-labels is required when --github-app-id is set (e.g. 'self-hosted,blip')")
+					return fmt.Errorf("--runner-labels is required when --github-pat-secret is set (e.g. 'self-hosted,blip')")
 				}
 				if len(actionsRepos) == 0 {
-					return fmt.Errorf("--actions-repos is required when --github-app-id is set (e.g. 'my-org/my-repo')")
+					return fmt.Errorf("--actions-repos is required when --github-pat-secret is set (e.g. 'my-org/my-repo')")
 				}
 				cfg.Actions = &sshgw.ActionsConfig{
-					GitHubAppID:        githubAppID,
-					GitHubInstallID:    githubInstallID,
-					GitHubKeyPath:      githubKeyPath,
-					RunnerLabels:       runnerLabels,
-					MaxSessionDuration: actionsSessionDuration,
-					PollInterval:       time.Duration(actionsPollInterval) * time.Second,
+					PATSecretName: githubPATSecret,
+					RunnerLabels:  runnerLabels,
 				}
 			}
 
 			// Enable GitHub Actions scale set integration if configured.
 			if scalesetConfigURL != "" {
-				if githubAppID > 0 {
-					return fmt.Errorf("cannot use both --github-app-id and --scaleset-config-url; choose one mode")
+				if githubPATSecret != "" {
+					return fmt.Errorf("cannot use both --github-pat-secret and --scaleset-config-url; choose one mode")
 				}
 				if scalesetTokenSecret == "" {
 					return fmt.Errorf("--scaleset-token-secret is required when --scaleset-config-url is set")
@@ -209,15 +193,9 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tlsSecretName, "tls-secret-name", envOrDefault("TLS_SECRET_NAME", "gateway-tls-key"), "Kubernetes Secret containing tls.crt and tls.key (env: TLS_SECRET_NAME)")
 	cmd.Flags().StringVar(&oidcIssuerURL, "oidc-issuer-url", envOrDefault("OIDC_ISSUER_URL", ""), "Trusted OIDC issuer URL for API authentication (env: OIDC_ISSUER_URL)")
 	cmd.Flags().StringVar(&oidcAudience, "oidc-audience", envOrDefault("OIDC_AUDIENCE", ""), "Expected OIDC audience claim (env: OIDC_AUDIENCE)")
-	cmd.Flags().StringSliceVar(&githubAllowedOrgs, "github-allowed-orgs", envOrDefaultStringSlice("GITHUB_ALLOWED_ORGS"), "Comma-separated list of GitHub orgs allowed to authenticate via /auth/github (env: GITHUB_ALLOWED_ORGS)")
-
 	// GitHub Actions polling flags (optional).
-	cmd.Flags().Int64Var(&githubAppID, "github-app-id", envOrDefaultInt64("GITHUB_APP_ID", 0), "GitHub App ID for Actions polling integration (env: GITHUB_APP_ID)")
-	cmd.Flags().Int64Var(&githubInstallID, "github-install-id", envOrDefaultInt64("GITHUB_INSTALL_ID", 0), "GitHub App installation ID (env: GITHUB_INSTALL_ID)")
-	cmd.Flags().StringVar(&githubKeyPath, "github-key-path", envOrDefault("GITHUB_KEY_PATH", ""), "Path to GitHub App PEM private key (env: GITHUB_KEY_PATH)")
+	cmd.Flags().StringVar(&githubPATSecret, "github-pat-secret", envOrDefault("GITHUB_PAT_SECRET", ""), "Kubernetes Secret name containing the GitHub PAT in a 'token' key (env: GITHUB_PAT_SECRET)")
 	cmd.Flags().StringSliceVar(&runnerLabels, "runner-labels", envOrDefaultStringSlice("RUNNER_LABELS"), "Runner labels to match against workflow_job labels, comma-separated (env: RUNNER_LABELS)")
-	cmd.Flags().IntVar(&actionsSessionDuration, "actions-session-duration", envOrDefaultInt("ACTIONS_SESSION_DURATION", 3600), "Maximum runner session duration in seconds (env: ACTIONS_SESSION_DURATION)")
-	cmd.Flags().IntVar(&actionsPollInterval, "actions-poll-interval", envOrDefaultInt("ACTIONS_POLL_INTERVAL", 10), "How often to poll for queued jobs in seconds (env: ACTIONS_POLL_INTERVAL)")
 
 	// GitHub Actions scale set flags (optional, mutually exclusive with polling).
 	cmd.Flags().StringVar(&scalesetConfigURL, "scaleset-config-url", envOrDefault("SCALESET_CONFIG_URL", ""), "GitHub repo/org URL for scale set mode (env: SCALESET_CONFIG_URL)")
@@ -241,19 +219,6 @@ func envOrDefaultInt(key string, def int) int {
 		return def
 	}
 	var n int
-	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
-		slog.Error("invalid integer environment variable", "key", key, "value", v)
-		os.Exit(1)
-	}
-	return n
-}
-
-func envOrDefaultInt64(key string, def int64) int64 {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	var n int64
 	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
 		slog.Error("invalid integer environment variable", "key", key, "value", v)
 		os.Exit(1)

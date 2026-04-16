@@ -70,8 +70,8 @@ type GatewayConfig struct {
 	// OIDC-authenticated endpoints.
 	HTTPS *HTTPSConfig
 
-	// Actions configures the GitHub Actions polling handler. When nil (or
-	// GitHubAppID is 0), Actions polling is disabled.
+	// Actions configures the GitHub Actions polling handler. When nil,
+	// Actions polling is disabled.
 	Actions *ActionsConfig
 
 	// ScaleSet configures the GitHub Actions scale set listener. When nil,
@@ -97,27 +97,17 @@ type GatewayConfig struct {
 // ActionsConfig holds the configuration for the GitHub Actions polling
 // integration. When enabled, the gateway polls the GitHub API for queued
 // workflow jobs and allocates Blip VMs as just-in-time self-hosted runners.
+// Authentication is via a GitHub Personal Access Token stored in a Kubernetes
+// Secret and watched via an informer.
 type ActionsConfig struct {
-	// GitHubAppID is the GitHub App ID used for authentication.
-	GitHubAppID int64
-
-	// GitHubInstallID is the GitHub App installation ID.
-	GitHubInstallID int64
-
-	// GitHubKeyPath is the path to the PEM-encoded RSA private key for
-	// the GitHub App.
-	GitHubKeyPath string
+	// PATSecretName is the name of the Kubernetes Secret containing the
+	// GitHub PAT in a "token" key. The Secret is watched via the shared
+	// informer cache so token rotations are picked up immediately.
+	PATSecretName string
 
 	// RunnerLabels are the self-hosted runner labels to match against
 	// workflow_job labels (e.g. ["self-hosted", "blip"]).
 	RunnerLabels []string
-
-	// MaxSessionDuration is the TTL for claimed runner VMs in seconds.
-	// Separate from the SSH session max duration.
-	MaxSessionDuration int
-
-	// PollInterval is how often to poll for queued jobs. Default: 10s.
-	PollInterval time.Duration
 }
 
 // ScaleSetConfig holds the configuration for the GitHub Actions scale set
@@ -142,17 +132,6 @@ type ScaleSetConfig struct {
 
 	// MaxRunners is the maximum number of concurrent runners.
 	MaxRunners int
-}
-
-// staticRepoProvider implements ghactions.RepoProvider with a static list.
-type staticRepoProvider struct {
-	repos []string
-}
-
-func (p *staticRepoProvider) ActionsRepos() []string {
-	result := make([]string, len(p.repos))
-	copy(result, p.repos)
-	return result
 }
 
 func RunGateway(cfg *GatewayConfig) error {
@@ -342,37 +321,29 @@ func RunGateway(cfg *GatewayConfig) error {
 		slog.Info("https api server started", "addr", cfg.HTTPS.Addr)
 	}
 
-	// Start the Actions runner backend if the HTTPS server is enabled
-	// (which means GitHub token secrets may be created via /auth/github).
+	// Start the Actions runner backend if configured.
 	var actionsRunner *actions.Runner
-	if cfg.HTTPS != nil && len(cfg.HTTPS.GitHubAllowedOrgs) > 0 {
-		actionsCfg := actions.Config{
-			VMClient:  vmcl,
-			KubeCache: cfg.KubeCache,
-			Namespace: cfg.VMNamespace,
-			PoolName:  cfg.VMPoolName,
-			PodName:   cfg.PodName,
+	if cfg.Actions != nil && cfg.Actions.PATSecretName != "" && len(cfg.ActionsRepos) > 0 {
+		pat, err := actions.NewPATProvider(ctx, cfg.KubeCache, cfg.VMNamespace, cfg.Actions.PATSecretName)
+		if err != nil {
+			return fmt.Errorf("create PAT provider: %w", err)
 		}
 
-		// If a GitHub App is configured, create the authenticated client
-		// for JIT runner provisioning and job monitoring.
-		if cfg.Actions != nil && cfg.Actions.GitHubAppID > 0 {
-			ghApp, err := actions.NewGitHubApp(
-				cfg.Actions.GitHubAppID,
-				cfg.Actions.GitHubInstallID,
-				cfg.Actions.GitHubKeyPath,
-			)
-			if err != nil {
-				return fmt.Errorf("create github app client: %w", err)
-			}
-			actionsCfg.GitHubApp = ghApp
-			actionsCfg.RunnerLabels = cfg.Actions.RunnerLabels
-			slog.Info("github app configured for actions runner provisioning",
-				"app_id", cfg.Actions.GitHubAppID,
-				"install_id", cfg.Actions.GitHubInstallID,
-				"labels", cfg.Actions.RunnerLabels,
-			)
+		actionsCfg := actions.Config{
+			VMClient:     vmcl,
+			Namespace:    cfg.VMNamespace,
+			PoolName:     cfg.VMPoolName,
+			PodName:      cfg.PodName,
+			PAT:          pat,
+			Repos:        cfg.ActionsRepos,
+			RunnerLabels: cfg.Actions.RunnerLabels,
 		}
+
+		slog.Info("actions runner configured with PAT",
+			"pat_secret", cfg.Actions.PATSecretName,
+			"repos", cfg.ActionsRepos,
+			"labels", cfg.Actions.RunnerLabels,
+		)
 
 		actionsRunner = actions.New(actionsCfg)
 		go func() {

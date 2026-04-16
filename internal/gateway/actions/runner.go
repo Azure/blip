@@ -1,6 +1,6 @@
-// Package actions implements a GitHub Actions runner backend that watches
-// for bootstrap token secrets and polls the GitHub API for queued workflow
-// jobs, allocating ephemeral Blip VMs as self-hosted runners.
+// Package actions implements a GitHub Actions runner backend that polls the
+// GitHub API for queued workflow jobs across a configured set of repositories,
+// allocating ephemeral Blip VMs as self-hosted runners.
 //
 // After claiming a VM, the runner backend creates a JIT (just-in-time)
 // runner configuration via the GitHub API and writes it to a VM annotation.
@@ -20,26 +20,10 @@ import (
 	"sync"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/tools/cache"
-	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
 	"github.com/project-unbounded/blip/internal/gateway/vm"
 )
 
-// TODO: Remove app credentials
-
-// TODO: Store the polling state in the VM annotations, use a controller to poll for completion
-// TODO: Same for installing the runner: ssh from a separate controller (instead of storing sensitive token in annotations)
-
 const (
-	// repoLabel is the label applied to secrets by the /auth/github handler.
-	repoLabel = "blip.azure.com/repo"
-
-	// repoAnnotation stores the original owner/repo value (before sanitization).
-	repoAnnotation = "blip.azure.com/repo"
-
 	// runnerMaxTTL is the maximum TTL for runner VMs (30 minutes).
 	runnerMaxTTL = 1800
 
@@ -53,179 +37,86 @@ const (
 	jitConfigAnnotation = "blip.io/runner-jitconfig"
 )
 
-// githubHTTPClient is used for GitHub API calls that are not made through
-// the GitHubApp (e.g. listQueuedJobs with a token from a K8s Secret).
+// githubHTTPClient is used for GitHub API calls.
 var githubHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // Config holds the configuration for the actions runner backend.
 type Config struct {
 	VMClient  *vm.Client
-	KubeCache crcache.Cache
 	Namespace string
 	PoolName  string
 	PodName   string
 
-	// GitHubApp is the authenticated GitHub App client used for creating
-	// JIT runner configs and checking job status. When nil, the runner
-	// backend only claims VMs but cannot provision them as runners.
-	GitHubApp *GitHubApp
+	// PAT is the provider for GitHub Personal Access Tokens, backed by a
+	// Kubernetes Secret watched via an informer.
+	PAT *PATProvider
+
+	// Repos is the static list of GitHub repositories to poll for queued
+	// workflow jobs. Each entry is in "owner/repo" format.
+	Repos []string
 
 	// RunnerLabels are the labels applied to JIT runners (e.g. ["self-hosted", "blip"]).
 	RunnerLabels []string
 }
 
-// Runner watches for GitHub token secrets and runs per-repo polling loops
-// that discover queued workflow jobs and allocate VMs.
+// Runner polls GitHub for queued workflow jobs across a configured set of
+// repositories and allocates VMs as self-hosted runners.
 type Runner struct {
 	cfg Config
-
-	mu      sync.Mutex
-	cancels map[string]context.CancelFunc // secret name -> cancel
 }
 
-// New creates a Runner. Call Start to begin watching secrets.
+// New creates a Runner. Call Start to begin polling.
 func New(cfg Config) *Runner {
-	return &Runner{cfg: cfg, cancels: make(map[string]context.CancelFunc)}
+	return &Runner{cfg: cfg}
 }
 
-// Start watches secrets with the blip.azure.com/repo label and manages
-// per-repo polling goroutines. It blocks until ctx is cancelled.
+// Start launches per-repo polling goroutines and blocks until ctx is cancelled.
 func (r *Runner) Start(ctx context.Context) error {
-	informer, err := r.cfg.KubeCache.GetInformer(ctx, &corev1.Secret{})
-	if err != nil {
-		return fmt.Errorf("get secret informer: %w", err)
+	if r.cfg.PAT == nil {
+		return fmt.Errorf("PAT provider is required")
+	}
+	if len(r.cfg.Repos) == 0 {
+		return fmt.Errorf("at least one repo is required")
 	}
 
-	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { r.handleSecretEvent(ctx, obj) },
-		UpdateFunc: func(_, obj interface{}) { r.handleSecretEvent(ctx, obj) },
-		DeleteFunc: func(obj interface{}) { r.handleSecretDelete(obj) },
-	}); err != nil {
-		return fmt.Errorf("add secret event handler: %w", err)
-	}
-
-	// Reconcile existing secrets on startup.
-	var secrets corev1.SecretList
-	if err := r.cfg.KubeCache.List(ctx, &secrets,
-		client.InNamespace(r.cfg.Namespace),
-		client.HasLabels{repoLabel},
-	); err != nil {
-		return fmt.Errorf("list existing secrets: %w", err)
-	}
-	for i := range secrets.Items {
-		r.handleSecretEvent(ctx, &secrets.Items[i])
+	var wg sync.WaitGroup
+	for _, repo := range r.cfg.Repos {
+		wg.Add(1)
+		go func(repo string) {
+			defer wg.Done()
+			r.pollLoop(ctx, repo)
+		}(repo)
 	}
 
 	slog.Info("actions runner backend started",
 		"namespace", r.cfg.Namespace,
-		"github_app", r.cfg.GitHubApp != nil,
+		"repos", r.cfg.Repos,
 		"labels", r.cfg.RunnerLabels,
 	)
+
 	<-ctx.Done()
-
-	r.mu.Lock()
-	for name, cancel := range r.cancels {
-		cancel()
-		delete(r.cancels, name)
-	}
-	r.mu.Unlock()
-
+	wg.Wait()
 	return nil
 }
 
-func (r *Runner) handleSecretEvent(ctx context.Context, obj interface{}) {
-	secret, ok := obj.(*corev1.Secret)
-	if !ok {
-		return
-	}
-	if secret.Namespace != r.cfg.Namespace {
-		return
-	}
-	if _, hasLabel := secret.Labels[repoLabel]; !hasLabel {
-		return
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Already tracking this secret.
-	if _, exists := r.cancels[secret.Name]; exists {
-		return
-	}
-
-	repo := secret.Annotations[repoAnnotation]
-	if repo == "" {
-		return
-	}
-
-	pollCtx, cancel := context.WithCancel(ctx)
-	r.cancels[secret.Name] = cancel
-
-	slog.Info("starting actions poll loop",
-		"secret", secret.Name,
-		"repo", repo,
-	)
-	go r.pollLoop(pollCtx, secret.Name, repo)
-}
-
-func (r *Runner) handleSecretDelete(obj interface{}) {
-	secret, ok := obj.(*corev1.Secret)
-	if !ok {
-		// Handle deleted final state unknown (tombstone).
-		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			return
-		}
-		secret, ok = tombstone.Obj.(*corev1.Secret)
-		if !ok {
-			return
-		}
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if cancel, exists := r.cancels[secret.Name]; exists {
-		cancel()
-		delete(r.cancels, secret.Name)
-		slog.Info("stopped actions poll loop", "secret", secret.Name)
-	}
+// ActiveSessionCount returns the number of repos being polled.
+func (r *Runner) ActiveSessionCount() int {
+	return len(r.cfg.Repos)
 }
 
 // pollLoop polls GitHub for queued workflow jobs for a single repo, allocating
-// VMs as needed. It runs until ctx is cancelled (i.e. the secret is deleted or
-// the runner is shutting down).
-func (r *Runner) pollLoop(ctx context.Context, secretName, repo string) {
+// VMs as needed. It runs until ctx is cancelled.
+func (r *Runner) pollLoop(ctx context.Context, repo string) {
 	// Track jobs we've already allocated a VM for to avoid duplicates.
-	// Each entry records when the job was allocated so we can evict stale entries.
 	type allocRecord struct {
 		allocatedAt time.Time
 	}
 	allocated := make(map[int64]allocRecord)
 
-	// Determine which token source to use for listing queued jobs.
-	// Prefer the GitHub App installation token (reliable, long-lived)
-	// over the OIDC token from the secret (short-lived identity token).
-	useAppToken := r.cfg.GitHubApp != nil
-
 	for {
-		var token string
-		var err error
-
-		if useAppToken {
-			token, err = r.cfg.GitHubApp.InstallationToken(ctx)
-		} else {
-			token, err = r.readToken(ctx, secretName)
-		}
+		token, err := r.cfg.PAT.Token()
 		if err != nil {
-			if !useAppToken {
-				slog.Debug("secret gone, stopping poll loop",
-					"secret", secretName,
-					"error", err,
-				)
-				return
-			}
-			slog.Error("failed to get installation token",
+			slog.Error("failed to get PAT",
 				"repo", repo,
 				"error", err,
 			)
@@ -244,8 +135,9 @@ func (r *Runner) pollLoop(ctx context.Context, secretName, repo string) {
 					if _, done := allocated[job.ID]; done {
 						continue
 					}
-					r.allocateAndProvision(ctx, repo, job)
-					allocated[job.ID] = allocRecord{allocatedAt: time.Now()}
+					if r.allocateAndProvision(ctx, repo, job) {
+						allocated[job.ID] = allocRecord{allocatedAt: time.Now()}
+					}
 				}
 			}
 
@@ -270,7 +162,7 @@ func (r *Runner) pollLoop(ctx context.Context, secretName, repo string) {
 // allocateAndProvision claims a VM for the given job, creates a JIT runner
 // config, writes it to the VM's annotations, and starts a background
 // goroutine to monitor job completion for early deallocation.
-func (r *Runner) allocateAndProvision(ctx context.Context, repo string, job workflowJob) {
+func (r *Runner) allocateAndProvision(ctx context.Context, repo string, job workflowJob) bool {
 	sessionID := fmt.Sprintf("actions-%d", job.ID)
 
 	result, err := r.cfg.VMClient.Claim(
@@ -288,7 +180,7 @@ func (r *Runner) allocateAndProvision(ctx context.Context, repo string, job work
 			"job_id", job.ID,
 			"error", err,
 		)
-		return
+		return false
 	}
 	slog.Info("allocated runner VM",
 		"repo", repo,
@@ -296,27 +188,30 @@ func (r *Runner) allocateAndProvision(ctx context.Context, repo string, job work
 		"vm", result.Name,
 	)
 
-	// If no GitHub App is configured, we can only claim VMs but not
-	// provision them as runners. The VM's configure-runner service
-	// will time out waiting for annotations.
-	if r.cfg.GitHubApp == nil {
-		slog.Warn("no github app configured, VM claimed but not provisioned as runner",
-			"vm", result.Name,
+	token, err := r.cfg.PAT.Token()
+	if err != nil {
+		slog.Error("failed to get PAT for JIT config",
+			"repo", repo,
 			"job_id", job.ID,
+			"error", err,
 		)
-		return
+		if releaseErr := r.cfg.VMClient.ReleaseVM(ctx, sessionID); releaseErr != nil {
+			slog.Error("failed to release VM after PAT failure",
+				"vm", result.Name,
+				"error", releaseErr,
+			)
+		}
+		return false
 	}
 
 	// Create a JIT runner config and write it to the VM's annotations.
-	// The in-VM configure-runner service polls for this annotation
-	// and starts the runner agent immediately when it appears.
 	runnerName := fmt.Sprintf("blip-%d", job.ID)
 	labels := r.cfg.RunnerLabels
 	if len(labels) == 0 {
 		labels = []string{"self-hosted", "blip"}
 	}
 
-	jitConfig, err := r.cfg.GitHubApp.CreateJITRunnerConfig(ctx, repo, labels, runnerName)
+	jitConfig, err := CreateJITRunnerConfig(ctx, token, repo, labels, runnerName)
 	if err != nil {
 		slog.Error("failed to create JIT runner config",
 			"repo", repo,
@@ -324,14 +219,13 @@ func (r *Runner) allocateAndProvision(ctx context.Context, repo string, job work
 			"vm", result.Name,
 			"error", err,
 		)
-		// Release the VM since we can't provision it.
 		if releaseErr := r.cfg.VMClient.ReleaseVM(ctx, sessionID); releaseErr != nil {
 			slog.Error("failed to release VM after JIT config failure",
 				"vm", result.Name,
 				"error", releaseErr,
 			)
 		}
-		return
+		return false
 	}
 
 	if err := r.cfg.VMClient.PatchVMAnnotations(ctx, result.Name, map[string]string{
@@ -348,7 +242,7 @@ func (r *Runner) allocateAndProvision(ctx context.Context, repo string, job work
 				"error", releaseErr,
 			)
 		}
-		return
+		return false
 	}
 
 	slog.Info("provisioned runner VM with JIT config",
@@ -358,18 +252,14 @@ func (r *Runner) allocateAndProvision(ctx context.Context, repo string, job work
 		"runner_name", runnerName,
 	)
 
-	// Monitor job completion in the background. When the job finishes,
-	// release the VM for immediate deallocation instead of waiting for
-	// the TTL to expire.
+	// Monitor job completion in the background.
 	go r.monitorJobCompletion(ctx, repo, job.ID, sessionID, result.Name)
+	return true
 }
 
 // monitorJobCompletion polls the GitHub API for job status and releases the
-// VM when the job completes. This provides fast cleanup — VMs are released
-// within seconds of job completion rather than waiting for the 30-minute TTL.
-// Monitoring is capped at runnerMaxTTL + 5 minutes to avoid infinite polling
-// if the GitHub API is unreachable; the deallocation controller's TTL-based
-// cleanup serves as the ultimate safety net.
+// VM when the job completes. Monitoring is capped at runnerMaxTTL + 5 minutes;
+// the deallocation controller's TTL-based cleanup serves as the safety net.
 func (r *Runner) monitorJobCompletion(ctx context.Context, repo string, jobID int64, sessionID, vmName string) {
 	deadline := time.After(time.Duration(runnerMaxTTL+300) * time.Second)
 	for {
@@ -386,7 +276,17 @@ func (r *Runner) monitorJobCompletion(ctx context.Context, repo string, jobID in
 		case <-time.After(jobMonitorInterval):
 		}
 
-		status, err := r.cfg.GitHubApp.GetJobStatus(ctx, repo, jobID)
+		token, err := r.cfg.PAT.Token()
+		if err != nil {
+			slog.Debug("failed to get PAT for job status check",
+				"repo", repo,
+				"job_id", jobID,
+				"error", err,
+			)
+			continue
+		}
+
+		status, err := GetJobStatus(ctx, token, repo, jobID)
 		if err != nil {
 			slog.Debug("failed to check job status",
 				"repo", repo,
@@ -411,24 +311,6 @@ func (r *Runner) monitorJobCompletion(ctx context.Context, repo string, jobID in
 			return
 		}
 	}
-}
-
-func (r *Runner) readToken(ctx context.Context, secretName string) (string, error) {
-	var secret corev1.Secret
-	if err := r.cfg.KubeCache.Get(ctx, client.ObjectKey{
-		Namespace: r.cfg.Namespace,
-		Name:      secretName,
-	}, &secret); err != nil {
-		return "", err
-	}
-	return string(secret.Data["token"]), nil
-}
-
-// ActiveSessionCount returns the number of active polling loops.
-func (r *Runner) ActiveSessionCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.cancels)
 }
 
 // GitHub API types and helpers.
