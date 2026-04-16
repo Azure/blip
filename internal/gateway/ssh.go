@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/project-unbounded/blip/internal/gateway/actions"
 	"github.com/project-unbounded/blip/internal/gateway/auth"
 	"github.com/project-unbounded/blip/internal/gateway/server"
 	"github.com/project-unbounded/blip/internal/gateway/session"
@@ -280,6 +281,24 @@ func RunGateway(cfg *GatewayConfig) error {
 			}
 		}()
 		slog.Info("https api server started", "addr", cfg.HTTPS.Addr)
+	}
+
+	// Start the Actions runner backend if the HTTPS server is enabled
+	// (which means GitHub token secrets may be created via /auth/github).
+	var actionsRunner *actions.Runner
+	if cfg.HTTPS != nil && len(cfg.HTTPS.GitHubAllowedOrgs) > 0 {
+		actionsRunner = actions.New(actions.Config{
+			VMClient:  vmcl,
+			KubeCache: cfg.KubeCache,
+			Namespace: cfg.VMNamespace,
+			PoolName:  cfg.VMPoolName,
+			PodName:   cfg.PodName,
+		})
+		go func() {
+			if err := actionsRunner.Start(ctx); err != nil {
+				slog.Error("actions runner backend error", "error", err)
+			}
+		}()
 	}
 
 	const drainTimeout = 30 * time.Second
