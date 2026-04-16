@@ -19,16 +19,55 @@ Blip can act as a GitHub Actions self-hosted runner backend. When configured wit
 
 - A working Blip deployment ([Getting Started]({{% relref "getting-started" %}}))
 - A VM pool whose image includes the GitHub Actions runner agent (see [VM image](#vm-image))
-- A GitHub Personal Access Token with `repo` and `admin:org` scopes (or fine-grained equivalent)
+- A GitHub Personal Access Token (classic or fine-grained) — see [PAT scopes](#pat-scopes) below
 
-## Configure the gateway
+## Create a GitHub PAT
 
-Create a secret for the GitHub PAT:
+### PAT scopes
+
+Blip calls repo-level Actions API endpoints (`generate-jitconfig`, `workflow/runs`,
+`workflow/jobs`). The required permissions depend on the PAT type:
+
+| PAT type | Required scopes |
+|----------|----------------|
+| Classic | `repo` |
+| Fine-grained | **Repository permissions:** "Administration" read & write, "Actions" read |
+
+> `admin:org` is **not** needed — Blip operates on per-repository runners, not
+> organisation-level runners.
+
+### Generate a PAT with the GitHub CLI
 
 ```shell
-kubectl create secret generic github-pat \
-  -n blip --from-literal=token=ghp_YOUR_PAT_HERE
+# Classic PAT — prompts you to select scopes interactively:
+gh auth token          # prints the token for the current session
+
+# Or create a new classic PAT with the required scope:
+gh auth refresh --scopes repo
+
+# Fine-grained PAT — must be created in the GitHub UI at:
+#   Settings → Developer settings → Fine-grained tokens
+# Select the target repositories and grant:
+#   "Administration" read & write, "Actions" read
 ```
+
+### Write the PAT to a Kubernetes Secret
+
+```shell
+# Store the current gh CLI token directly into the cluster:
+kubectl create secret generic github-pat \
+  -n blip --from-literal=token="$(gh auth token)"
+
+# Or, if you have the token in a variable:
+kubectl create secret generic github-pat \
+  -n blip --from-literal=token="$GITHUB_PAT"
+```
+
+The gateway watches this Secret via a Kubernetes informer — you can rotate the
+token at any time by updating the Secret, and the gateway picks it up
+immediately without a restart.
+
+## Configure the gateway
 
 Uncomment the GitHub Actions sections in `manifests/deploy.yaml` and fill in your values:
 
