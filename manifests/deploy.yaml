@@ -389,10 +389,6 @@ spec:
         env:
         - name: MAX_SESSION_DURATION
           value: "3600"
-        - name: LISTEN_ADDRESS
-          value: ":2222"
-        - name: HTTP_ADDRESS
-          value: ":8080"
         - name: VM_POOL_NAME
           value: "blip"
         - name: VM_NAMESPACE
@@ -405,12 +401,6 @@ spec:
           value: "20"
         - name: GATEWAY_HOST_PRINCIPALS
           value: "ssh-gateway.blip.svc.cluster.local"
-        - name: HOST_KEY_PATH
-          value: "/etc/blip/host-key/host_key"
-        - name: CLIENT_KEY_PATH
-          value: "/etc/blip/client-key/client_key"
-        - name: VM_REGISTER_SA
-          value: "vm-register"
         - name: OIDC_CONFIG
           value: "ssh-gateway-oidc"
         # GitHub Actions polling integration (optional).
