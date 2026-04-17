@@ -670,6 +670,8 @@ func newStaticRESTMapper() meta.RESTMapper {
 				"v1": {
 					{Name: "pods", Namespaced: true, Kind: "Pod"},
 					{Name: "nodes", Namespaced: false, Kind: "Node"},
+					{Name: "configmaps", Namespaced: true, Kind: "ConfigMap"},
+					{Name: "secrets", Namespaced: true, Kind: "Secret"},
 				},
 			},
 		},

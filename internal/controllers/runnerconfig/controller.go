@@ -311,18 +311,26 @@ func (c *controller) provisionRunner(ctx context.Context, vmIP, hostKeyStr strin
 	// with the background process reading the file.
 	script := `#!/bin/sh
 set -e
+mkdir -p /home/runner/actions-runner/_diag
 TMPFILE="$(mktemp /home/runner/actions-runner/.jitconfig.XXXXXX)"
 cat > "$TMPFILE"
 cd /home/runner/actions-runner
-nohup sh -c 'CFG=$(cat "'"$TMPFILE"'"); rm -f "'"$TMPFILE"'"; exec ./run.sh --jitconfig "$CFG"' > /home/runner/actions-runner/_diag/runner.log 2>&1 &
+if [ -x ./run.sh ]; then
+  nohup sh -c 'CFG=$(cat "'"$TMPFILE"'"); rm -f "'"$TMPFILE"'"; exec ./run.sh --jitconfig "$CFG"' > /home/runner/actions-runner/_diag/runner.log 2>&1 &
+else
+  rm -f "$TMPFILE"
+fi
 `
 
 	session.Stdin = strings.NewReader(jitConfig)
+	var stdout, stderr strings.Builder
+	session.Stdout = &stdout
+	session.Stderr = &stderr
 	if err := session.Run(script); err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("SSH session: %w", ctx.Err())
 		}
-		return fmt.Errorf("run provisioning script: %w", err)
+		return fmt.Errorf("run provisioning script: %w (stdout=%s, stderr=%s)", err, stdout.String(), stderr.String())
 	}
 
 	return nil
