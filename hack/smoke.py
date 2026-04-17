@@ -28,7 +28,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 NAMESPACE = "blip"
 POOL_NAME = "blip"
-REPLICAS = 5
+REPLICAS = 3
 SSH_USER = "runner"
 IMAGE_NAME = "localhost/blip:smoke"
 # The base image is served via a local registry accessible from inside kind.
@@ -773,22 +773,11 @@ def setup():
     GATEWAY_HOST = wait_for(resolve_gateway_ip, "gateway LoadBalancer IP", timeout=30)
     log(f"    Gateway: {GATEWAY_HOST}:{GATEWAY_PORT}")
 
-    # 10. Wait for all VMs to be ready up-front.  The test sequence consumes
-    #     VMs faster than the pool controller can replace them (each
-    #     replacement VM takes 60-120s to boot on software-emulated KubeVirt).
-    #     By ensuring all replicas are ready before the first test, every
-    #     subsequent wait_for_pool_ready() is satisfied by VMs that were
-    #     provisioned in this initial (and only) round:
-    #
-    #       Setup TOFU probe : 1 VM (ephemeral, deleted)
-    #       test_ephemeral   : 1 VM (deleted)
-    #       test_retained    : 2 VMs (outer retained + inner recursive)
-    #       test_actions     : 1 VM (actions runner, released+deleted)
-    #                          ----
-    #                          5 VMs consumed sequentially
-    #
-    #     With REPLICAS=5 and all 5 ready here, the pool always has enough
-    #     unclaimed VMs for the next test without a second provisioning round.
+    # 10. Wait for the pool to be ready.  The single-node kind cluster used
+    #     in CI has limited CPU, so we keep REPLICAS=3 — the highest
+    #     concurrent need is 2 (test_retained uses an outer + inner VM).
+    #     Each test calls wait_for_pool_ready() before starting, so the
+    #     pool controller has time to replace consumed VMs between tests.
     log("  Waiting for VMs...")
     wait_for_pool_ready(min_ready=REPLICAS, timeout=600)
 
@@ -1456,8 +1445,8 @@ def test_github_actions():
 
 def main():
     tests = [
-        test_ephemeral_session,   # 1 VM — pool has all replicas ready
-        test_retained_session,    # 2 VMs — pool still has 2+ ready after ephemeral
+        test_ephemeral_session,   # 1 VM — each test waits for pool readiness
+        test_retained_session,    # 2 VMs — highest concurrent need
         test_github_actions,      # 1 VM — tests the Actions runner lifecycle
     ]
 
