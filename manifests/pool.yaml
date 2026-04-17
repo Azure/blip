@@ -35,6 +35,11 @@ spec:
           evictionStrategy: None
           priorityClassName: blip-low-priority
           domain:
+            firmware:
+              bootloader:
+                efi:
+                  persistent: false
+                  secureBoot: false
             cpu:
               cores: 2
               sockets: 1

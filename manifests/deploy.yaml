@@ -231,6 +231,9 @@ rules:
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get", "list", "watch", "create", "update"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -500,7 +503,7 @@ spec:
   #   protocol: TCP
   #   name: http
 ---
-# VM Ingress: only the SSH gateway can connect to VMs.
+# VM Ingress: only the SSH gateway and blip-controller can connect to VMs.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -517,6 +520,9 @@ spec:
     - podSelector:
         matchLabels:
           app: ssh-gateway
+    - podSelector:
+        matchLabels:
+          app: blip-controller
     ports:
     - protocol: TCP
       port: 22

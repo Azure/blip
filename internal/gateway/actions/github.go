@@ -161,7 +161,7 @@ func CreateJITRunnerConfig(ctx context.Context, token, repo string, labels []str
 		return "", fmt.Errorf("marshal JIT config request: %w", err)
 	}
 
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runners/generate-jitconfig", parts[0], parts[1])
+	url := fmt.Sprintf("%s/repos/%s/%s/actions/runners/generate-jitconfig", githubAPIBase, parts[0], parts[1])
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
@@ -222,7 +222,7 @@ func ListQueuedJobs(ctx context.Context, repo, token string) ([]WorkflowJob, err
 	}
 	owner, repoName := parts[0], parts[1]
 
-	runsURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs?status=queued&per_page=100", owner, repoName)
+	runsURL := fmt.Sprintf("%s/repos/%s/%s/actions/runs?status=queued&per_page=100", githubAPIBase, owner, repoName)
 	runs, err := ghGet[runsResponse](ctx, runsURL, token)
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
@@ -230,7 +230,7 @@ func ListQueuedJobs(ctx context.Context, repo, token string) ([]WorkflowJob, err
 
 	var queued []WorkflowJob
 	for _, run := range runs.WorkflowRuns {
-		jobsURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=100", owner, repoName, run.ID)
+		jobsURL := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=100", githubAPIBase, owner, repoName, run.ID)
 		resp, err := ghGet[jobsResponse](ctx, jobsURL, token)
 		if err != nil {
 			slog.Debug("list jobs for run failed", "run_id", run.ID, "error", err)
@@ -282,7 +282,7 @@ func GetJobStatus(ctx context.Context, token, repo string, jobID int64) (string,
 		return "", fmt.Errorf("invalid repo format: %s", repo)
 	}
 
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/jobs/%d", parts[0], parts[1], jobID)
+	url := fmt.Sprintf("%s/repos/%s/%s/actions/jobs/%d", githubAPIBase, parts[0], parts[1], jobID)
 	type jobStatusResponse struct {
 		Status string `json:"status"`
 	}
