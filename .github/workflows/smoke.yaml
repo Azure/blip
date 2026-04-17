@@ -109,6 +109,62 @@ jobs:
           # Wait for CDI to become ready.
           kubectl -n cdi wait cdi cdi --for condition=Available --timeout=300s
 
+      - name: Set up local-storage provisioner
+        run: |
+          set -euo pipefail
+
+          # Create the StorageClass used by VM boot disks.
+          kubectl apply -f - <<'EOF'
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: local-storage
+          provisioner: kubernetes.io/no-provisioner
+          volumeBindingMode: WaitForFirstConsumer
+          EOF
+
+          # Create tmpfs-backed local disks inside the kind node and
+          # corresponding PersistentVolumes.  We need at least as many
+          # PVs as the smoke test replica count (3) plus headroom for
+          # replacements during the test lifecycle.
+          KIND_NODE="kind-control-plane"
+          NUM_DISKS=10
+          for i in $(seq 1 $NUM_DISKS); do
+            docker exec "$KIND_NODE" bash -c "
+              mkdir -p /mnt/disks/disk${i}
+              if ! mountpoint -q /mnt/disks/disk${i} 2>/dev/null; then
+                mount -t tmpfs -o size=35G tmpfs /mnt/disks/disk${i}
+              fi
+            "
+            kubectl apply -f - <<PVEOF
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: local-disk-${i}
+          spec:
+            capacity:
+              storage: 35Gi
+            volumeMode: Filesystem
+            accessModes:
+            - ReadWriteOnce
+            persistentVolumeReclaimPolicy: Delete
+            storageClassName: local-storage
+            local:
+              path: /mnt/disks/disk${i}
+            nodeAffinity:
+              required:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                    - ${KIND_NODE}
+          PVEOF
+          done
+
+          echo "Created $NUM_DISKS local PVs:"
+          kubectl get pv
+
       - name: Install cloud-provider-kind
         run: |
           # cloud-provider-kind assigns external IPs to LoadBalancer services
