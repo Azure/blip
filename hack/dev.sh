@@ -97,6 +97,67 @@ info "Waiting for CDI to become available..."
 kubectl -n cdi wait cdi cdi --for condition=Available --timeout=300s
 
 # ---------------------------------------------------------------------------
+# 3b. Set up local static provisioner for VM boot disks
+# ---------------------------------------------------------------------------
+LOCAL_DISKS_DIR="/mnt/disks"
+NUM_LOCAL_DISKS="${NUM_LOCAL_DISKS:-10}"
+
+if kubectl get storageclass local-storage >/dev/null 2>&1; then
+    info "StorageClass 'local-storage' already exists — skipping provisioner setup"
+else
+    info "Creating StorageClass 'local-storage'..."
+    kubectl apply -f - <<'SC_EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-storage
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+SC_EOF
+fi
+
+# Create fake local disks inside the kind node for development.
+info "Preparing ${NUM_LOCAL_DISKS} local disks in kind node..."
+KIND_NODE="${KIND_CLUSTER_NAME}-control-plane"
+for i in $(seq 1 "$NUM_LOCAL_DISKS"); do
+    "$CONTAINER_ENGINE" exec "$KIND_NODE" bash -c "
+        mkdir -p ${LOCAL_DISKS_DIR}/disk${i}
+        if ! mountpoint -q ${LOCAL_DISKS_DIR}/disk${i} 2>/dev/null; then
+            mount -t tmpfs -o size=35G tmpfs ${LOCAL_DISKS_DIR}/disk${i}
+        fi
+    "
+done
+
+# Create PersistentVolumes for each local disk.
+info "Creating PersistentVolumes for local disks..."
+for i in $(seq 1 "$NUM_LOCAL_DISKS"); do
+    kubectl apply -f - <<PV_EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: local-disk-${i}
+spec:
+  capacity:
+    storage: 35Gi
+  volumeMode: Filesystem
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: local-storage
+  local:
+    path: ${LOCAL_DISKS_DIR}/disk${i}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - ${KIND_NODE}
+PV_EOF
+done
+
+# ---------------------------------------------------------------------------
 # 4. Build the blip container image
 # ---------------------------------------------------------------------------
 info "Building image ${IMAGE_NAME}..."

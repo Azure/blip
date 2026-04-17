@@ -18,6 +18,7 @@ spec:
           name: rootdisk
         spec:
           storage:
+            storageClassName: local-storage
             accessModes:
             - ReadWriteOnce
             resources:
