@@ -6,6 +6,7 @@
   "main": "dist/src/functions/*.js",
   "scripts": {
     "build": "tsc",
+    "build:zip": "npm run build && rm -rf .build && mkdir .build && cp host.json package.json package-lock.json .build/ && cp -r dist .build/ && npm ci --omit=dev --prefix .build && cd .build && zip -r ../deploy.zip . && cd .. && rm -rf .build",
     "prestart": "npm run build",
     "start": "func start"
   },

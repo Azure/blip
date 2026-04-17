@@ -40,8 +40,30 @@ npm start
 2. Enable **Authentication** on the Function App with Microsoft (Entra ID) as the identity provider. Configure it to require authentication.
 3. Set the `APISERVER_URL` application setting to your Kubernetes API server URL.
 4. Ensure the Function App has network access to both the Kubernetes API server and the SSH gateway.
-5. Deploy using the Azure Functions Core Tools:
+5. Deploy using one of the methods below.
+
+### Using Azure Functions Core Tools
 
 ```sh
 func azure functionapp publish <function-app-name>
+```
+
+### Using a zip package
+
+Build a deployment zip containing only the compiled code and production dependencies:
+
+```sh
+npm run build:zip
+```
+
+This produces `deploy.zip` in the project root. Deploy it using the Azure CLI:
+
+```sh
+az webapp deploy --resource-group <group-name> --name <app-name> --src-path deploy.zip --type zip
+```
+
+Or upload it to Azure Blob Storage and deploy from the URL:
+
+```sh
+az webapp deploy --resource-group <group-name> --name <app-name> --src-url <blob-url> --type zip
 ```
