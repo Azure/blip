@@ -31,12 +31,7 @@ POOL_NAME = "blip"
 REPLICAS = 3
 SSH_USER = "runner"
 IMAGE_NAME = "localhost/blip:smoke"
-# The base image is served via a local registry accessible from inside kind.
-# setup() starts a registry container on the kind network at this address.
-# From the host we push to localhost:5000; from inside kind pods resolve
-# the container name "kind-registry" on the shared Docker network.
-LOCAL_REGISTRY_HOST = "localhost:5000"       # host-side address for docker push
-LOCAL_REGISTRY_KIND = "kind-registry:5000"   # in-cluster address for CDI importer
+# The base image is loaded directly into kind as a containerDisk.
 BASE_IMAGE_TAG = "blip-base:smoke"
 
 # Fake GitHub API server port (bound on the host, reachable from kind via
@@ -170,38 +165,6 @@ def vm_name_for_session(session_id):
     return None
 
 
-def pvcs_for_vm(vm_name):
-    """Return a list of (pvc_name, pvc_uid) tuples for PVCs associated with the VM.
-
-    DataVolumeTemplates create the ownership chain VM -> DV -> PVC.
-    We look for DataVolumes owned by the VM, then find PVCs owned by
-    those DataVolumes.  We capture UIDs so that callers can distinguish
-    the original PVC from a replacement created by the pool controller.
-    """
-    # Step 1: Find DataVolumes owned by the VM.
-    dvs = kubectl_json("get", "dv", "-n", NAMESPACE, "--ignore-not-found")
-    dv_names = []
-    for dv in dvs.get("items", []):
-        owners = dv.get("metadata", {}).get("ownerReferences", [])
-        for owner in owners:
-            if owner.get("name") == vm_name:
-                dv_names.append(dv["metadata"]["name"])
-
-    # Step 2: Find PVCs owned by those DataVolumes.
-    if not dv_names:
-        return []
-    pvcs = kubectl_json("get", "pvc", "-n", NAMESPACE, "--ignore-not-found")
-    result = []
-    for pvc in pvcs.get("items", []):
-        owners = pvc.get("metadata", {}).get("ownerReferences", [])
-        for owner in owners:
-            if owner.get("name") in dv_names:
-                name = pvc["metadata"]["name"]
-                uid = pvc["metadata"]["uid"]
-                result.append((name, uid))
-    return result
-
-
 def wait_for_vm_deleted(session_id, timeout=60):
     wait_for(
         lambda: not vm_exists(session_id),
@@ -262,17 +225,6 @@ def wait_for_pool_ready(min_ready=1, timeout=600):
                     reasons.append("vmi-not-ready")
                 if not has_keys:
                     reasons.append("no-keys")
-                # Check DataVolume status for additional context.
-                try:
-                    dvs = kubectl_json("get", "dv", "-n", NAMESPACE,
-                                       "-l", f"kubevirt.io/created-by={item['metadata'].get('uid', '')}")
-                except Exception:
-                    dvs = {"items": []}
-                for dv in dvs.get("items", []):
-                    dv_phase = dv.get("status", {}).get("phase", "?")
-                    if dv_phase != "Succeeded":
-                        progress = dv.get("status", {}).get("progress", "?")
-                        reasons.append(f"dv:{dv_phase}({progress})")
                 vm_states.append(f"{name}:wait({','.join(reasons)})")
 
         elapsed = int(time.time() - start)
@@ -316,27 +268,6 @@ def dump_diagnostics():
     except Exception as e:
         log(f"  VMs: {e}")
         vms = {"items": []}
-
-    # DataVolume and PVC status
-    try:
-        dvs = kubectl_json("get", "dv", "-n", NAMESPACE)
-        for dv in dvs.get("items", []):
-            dv_name = dv["metadata"]["name"]
-            dv_phase = dv.get("status", {}).get("phase", "?")
-            dv_progress = dv.get("status", {}).get("progress", "?")
-            log(f"  DV {dv_name}: phase={dv_phase} progress={dv_progress}")
-    except Exception as e:
-        log(f"  DataVolumes: {e}")
-
-    try:
-        pvcs = kubectl_json("get", "pvc", "-n", NAMESPACE)
-        for pvc in pvcs.get("items", []):
-            pvc_name = pvc["metadata"]["name"]
-            pvc_phase = pvc.get("status", {}).get("phase", "?")
-            pvc_cap = pvc.get("status", {}).get("capacity", {}).get("storage", "?")
-            log(f"  PVC {pvc_name}: phase={pvc_phase} capacity={pvc_cap}")
-    except Exception as e:
-        log(f"  PVCs: {e}")
 
     for item in vms.get("items", []):
         name = item["metadata"]["name"]
@@ -608,41 +539,20 @@ def setup():
     log("  Loading image into kind...")
     run(["kind", "load", "docker-image", IMAGE_NAME], timeout=120, verbose=True)
 
-    # Build and load the base VM image used by the pool's DataVolumeTemplates.
-    # CDI's importer pulls from a container registry, so we run a local registry
-    # on the kind Docker network and push the base image there.
-    log("  Setting up local registry for base image...")
-    # Start registry container if not already running.
-    r = run(["docker", "inspect", "kind-registry"], check=False, timeout=10)
-    if r.returncode != 0:
-        run(["docker", "run", "-d", "--restart=always",
-             "--name", "kind-registry",
-             "--network", "kind",
-             "-p", "127.0.0.1:5000:5000",
-             "registry:2"], timeout=30, verbose=True)
-    else:
-        # Ensure it's on the kind network.
-        run(["docker", "network", "connect", "kind", "kind-registry"],
-            check=False, timeout=10)
-
-    host_image = f"{LOCAL_REGISTRY_HOST}/{BASE_IMAGE_TAG}"
+    # Build and load the base VM image used by the pool's containerDisk.
     log("  Preparing base image...")
+    base_image = f"localhost/{BASE_IMAGE_TAG}"
     r = run(["docker", "image", "inspect", "blip-base:test"], check=False, timeout=10)
     if r.returncode == 0:
         log("    Reusing existing blip-base:test image")
-        run(["docker", "tag", "blip-base:test", host_image], timeout=10)
+        run(["docker", "tag", "blip-base:test", base_image], timeout=10)
     else:
         log("    Building base image from scratch...")
-        run(["docker", "build", "-t", host_image,
+        run(["docker", "build", "-t", base_image,
              "-f", "images/base/Containerfile", "."],
             timeout=600, verbose=True)
-    log("  Pushing base image to local registry...")
-    run(["docker", "push", host_image], timeout=300, verbose=True)
-
-    # Configure CDI to allow pulling from the insecure local registry.
-    log("  Configuring CDI for insecure local registry...")
-    kubectl("patch", "cdi", "cdi", "--type", "merge", "-p",
-            f'{{"spec":{{"config":{{"insecureRegistries":["{LOCAL_REGISTRY_KIND}"]}}}}}}')
+    log("  Loading base image into kind...")
+    run(["kind", "load", "docker-image", base_image], timeout=120, verbose=True)
 
     # 3. Start fake GitHub Actions API and apply manifests.
     global _fake_github_api
@@ -712,8 +622,8 @@ def setup():
     with open("manifests/pool.yaml") as f:
         pool_manifest = f.read()
     pool_manifest = pool_manifest.replace(
-        "docker://$REGISTRY/blip-base:$BLIP_TAG",
-        f"docker://{LOCAL_REGISTRY_KIND}/{BASE_IMAGE_TAG}")
+        "$REGISTRY/blip-base:$BLIP_TAG",
+        f"localhost/{BASE_IMAGE_TAG}")
     run(["kubectl", "apply", "-f", "-"], input=pool_manifest)
     kubectl("patch", "virtualmachinepool", POOL_NAME, "-n", NAMESPACE,
             "--type=merge", "-p",
@@ -856,8 +766,6 @@ def teardown():
     kubectl("delete", "virtualmachinepool", POOL_NAME,
             "-n", NAMESPACE, "--ignore-not-found", check=False)
     kubectl("delete", "vm", "--all", "-n", NAMESPACE, check=False)
-    kubectl("delete", "dv", "--all", "-n", NAMESPACE, check=False)
-    kubectl("delete", "pvc", "--all", "-n", NAMESPACE, check=False)
     if _tmpdir:
         shutil.rmtree(_tmpdir, ignore_errors=True)
     log("=== Teardown complete ===\n")
@@ -868,7 +776,7 @@ def teardown():
 # ---------------------------------------------------------------------------
 
 def test_ephemeral_session():
-    """Connect, verify blip, disconnect -> VM and PVCs deleted."""
+    """Connect, verify blip, disconnect -> VM deleted."""
     wait_for_pool_ready(min_ready=1)
 
     stdout, stderr, rc = ssh_session(SSH_USER, "echo BLIP_OK && hostname")
@@ -878,32 +786,12 @@ def test_ephemeral_session():
     session_id = extract_session_id(stderr)
     log(f"    Session: {session_id}")
 
-    # Capture the VM name before deletion so we can verify PVC cleanup.
     vm_name = vm_name_for_session(session_id)
     assert vm_name, f"Could not find VM for session {session_id}"
-    pvc_info = pvcs_for_vm(vm_name)
-    pvc_names = [name for name, _ in pvc_info]
-    pvc_uids = {uid for _, uid in pvc_info}
-    log(f"    VM: {vm_name}, PVCs: {pvc_names}")
+    log(f"    VM: {vm_name}")
 
     log("    Waiting for VM deletion...")
     wait_for_vm_deleted(session_id)
-
-    # Verify PVCs owned by the VM are also deleted (DataVolumeTemplates
-    # set ownerReferences so the PVC is garbage-collected with the VM).
-    # We check by UID because the pool controller may recreate a replacement
-    # VM with the same name, which creates a new PVC with the same name.
-    if pvc_uids:
-        log("    Verifying PVC cleanup...")
-        def original_pvcs_gone():
-            pvcs = kubectl_json("get", "pvc", "-n", NAMESPACE,
-                                "--ignore-not-found")
-            for pvc in pvcs.get("items", []):
-                if pvc["metadata"]["uid"] in pvc_uids:
-                    return False
-            return True
-        wait_for(original_pvcs_gone, "PVCs deleted with VM", timeout=120)
-        log("    PVCs cleaned up")
 
 
 def test_retained_session():

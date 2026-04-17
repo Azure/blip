@@ -13,20 +13,6 @@ spec:
       labels:
         blip.io/pool: blip
     spec:
-      dataVolumeTemplates:
-      - metadata:
-          name: rootdisk
-        spec:
-          storage:
-            storageClassName: local-storage
-            accessModes:
-            - ReadWriteOnce
-            resources:
-              requests:
-                storage: 32Gi
-          source:
-            registry:
-              url: docker://$REGISTRY/blip-base:$BLIP_TAG
       runStrategy: Always
       template:
         metadata:
@@ -81,8 +67,8 @@ spec:
               port: 22
           terminationGracePeriodSeconds: 5
           volumes:
-          - dataVolume:
-              name: rootdisk
+          - containerDisk:
+              image: $REGISTRY/blip-base:$BLIP_TAG
             name: rootdisk
           - name: gw-client-pubkey
             configMap:

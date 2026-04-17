@@ -11,7 +11,6 @@ permissions:
 
 env:
   KUBEVIRT_VERSION: v1.8.1
-  CDI_VERSION: v1.65.0
   CONTAINERDISK_IMAGE: quay.io/containerdisks/ubuntu:24.04
 
 jobs:
@@ -33,12 +32,12 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Cache KubeVirt, CDI, and containerdisk images
+      - name: Cache KubeVirt and containerdisk images
         id: image-cache
         uses: actions/cache@v4
         with:
           path: /tmp/kubevirt-images.tar
-          key: kubevirt-images-${{ env.KUBEVIRT_VERSION }}-${{ env.CDI_VERSION }}-${{ env.CONTAINERDISK_IMAGE }}
+          key: kubevirt-images-${{ env.KUBEVIRT_VERSION }}-${{ env.CONTAINERDISK_IMAGE }}
 
       - name: Pull images for cache
         if: steps.image-cache.outputs.cache-hit != 'true'
@@ -51,11 +50,6 @@ jobs:
             "quay.io/kubevirt/virt-handler:${KUBEVIRT_VERSION}"
             "quay.io/kubevirt/virt-launcher:${KUBEVIRT_VERSION}"
             "quay.io/kubevirt/virt-exportproxy:${KUBEVIRT_VERSION}"
-            "quay.io/kubevirt/cdi-operator:${CDI_VERSION}"
-            "quay.io/kubevirt/cdi-controller:${CDI_VERSION}"
-            "quay.io/kubevirt/cdi-importer:${CDI_VERSION}"
-            "quay.io/kubevirt/cdi-apiserver:${CDI_VERSION}"
-            "quay.io/kubevirt/cdi-uploadproxy:${CDI_VERSION}"
             "${CONTAINERDISK_IMAGE}"
           )
           pids=()
@@ -99,72 +93,6 @@ jobs:
           # Wait for KubeVirt to become ready.
           kubectl -n kubevirt wait kv kubevirt --for condition=Available --timeout=300s
 
-      - name: Install CDI
-        run: |
-          set -euo pipefail
-
-          kubectl apply -f "https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}/cdi-operator.yaml"
-          kubectl apply -f "https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}/cdi-cr.yaml"
-
-          # Wait for CDI to become ready.
-          kubectl -n cdi wait cdi cdi --for condition=Available --timeout=300s
-
-      - name: Set up local-storage provisioner
-        run: |
-          set -euo pipefail
-
-          # Create the StorageClass used by VM boot disks.
-          kubectl apply -f - <<'EOF'
-          apiVersion: storage.k8s.io/v1
-          kind: StorageClass
-          metadata:
-            name: local-storage
-          provisioner: kubernetes.io/no-provisioner
-          volumeBindingMode: WaitForFirstConsumer
-          EOF
-
-          # Create tmpfs-backed local disks inside the kind node and
-          # corresponding PersistentVolumes.  We need at least as many
-          # PVs as the smoke test replica count (3) plus headroom for
-          # replacements during the test lifecycle.
-          KIND_NODE="kind-control-plane"
-          NUM_DISKS=10
-          for i in $(seq 1 $NUM_DISKS); do
-            docker exec "$KIND_NODE" bash -c "
-              mkdir -p /mnt/disks/disk${i}
-              if ! mountpoint -q /mnt/disks/disk${i} 2>/dev/null; then
-                mount -t tmpfs -o size=35G tmpfs /mnt/disks/disk${i}
-              fi
-            "
-            kubectl apply -f - <<PVEOF
-          apiVersion: v1
-          kind: PersistentVolume
-          metadata:
-            name: local-disk-${i}
-          spec:
-            capacity:
-              storage: 35Gi
-            volumeMode: Filesystem
-            accessModes:
-            - ReadWriteOnce
-            persistentVolumeReclaimPolicy: Delete
-            storageClassName: local-storage
-            local:
-              path: /mnt/disks/disk${i}
-            nodeAffinity:
-              required:
-                nodeSelectorTerms:
-                - matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: In
-                    values:
-                    - ${KIND_NODE}
-          PVEOF
-          done
-
-          echo "Created $NUM_DISKS local PVs:"
-          kubectl get pv
-
       - name: Install cloud-provider-kind
         run: |
           # cloud-provider-kind assigns external IPs to LoadBalancer services
@@ -183,20 +111,11 @@ jobs:
           echo "=== KubeVirt status ==="
           kubectl -n kubevirt get kubevirt kubevirt -o jsonpath='{.status.conditions}' | python3 -m json.tool || true
           echo ""
-          echo "=== CDI status ==="
-          kubectl -n cdi get cdi cdi -o jsonpath='{.status.conditions}' | python3 -m json.tool || true
-          echo ""
           echo "=== VMs ==="
           kubectl get vm -n blip -o wide || true
           echo ""
           echo "=== VMIs ==="
           kubectl get vmi -n blip -o wide || true
-          echo ""
-          echo "=== DataVolumes ==="
-          kubectl get dv -n blip -o wide || true
-          echo ""
-          echo "=== PVCs ==="
-          kubectl get pvc -n blip -o wide || true
           echo ""
           echo "=== Pods in blip namespace ==="
           kubectl get pods -n blip -o wide || true
@@ -206,6 +125,3 @@ jobs:
           echo ""
           echo "=== Events in kubevirt namespace (last 15) ==="
           kubectl get events -n kubevirt --sort-by=.lastTimestamp | tail -15 || true
-          echo ""
-          echo "=== Events in cdi namespace (last 15) ==="
-          kubectl get events -n cdi --sort-by=.lastTimestamp | tail -15 || true
