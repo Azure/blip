@@ -53,7 +53,7 @@ domain:
 
 ### Base image and disk size
 
-Root disk via CDI DataVolume:
+Root disk via CDI DataVolume backed by the [local static provisioner](https://github.com/kubernetes-sigs/sig-storage-local-static-provisioner):
 
 ```yaml
 dataVolumeTemplates:
@@ -61,6 +61,7 @@ dataVolumeTemplates:
       name: rootdisk
     spec:
       storage:
+        storageClassName: local-storage
         resources:
           requests:
             storage: 64Gi
@@ -68,6 +69,8 @@ dataVolumeTemplates:
         registry:
           url: docker://quay.io/containerdisks/fedora:40
 ```
+
+The `storageClassName: local-storage` directs CDI to provision boot disks on pre-allocated local volumes. You must have enough local PVs available on your nodes to satisfy the pool replica count. See [Getting Started]({{% relref "getting-started" %}}) for provisioner installation.
 
 The image must be cloud-init-compatible with `sshd` installed. PVCs are deleted with the VM.
 
