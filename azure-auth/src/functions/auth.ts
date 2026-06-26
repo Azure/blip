@@ -32,10 +32,7 @@ async function fetchGatewayConfig(): Promise<GatewayConfig> {
 	}
 
 	const url = `${APISERVER_URL}/api/v1/namespaces/kube-public/configmaps/gateway-tls-certs`;
-	const headers: Record<string, string> = {};
-
 	const resp = await fetch(url, {
-		headers,
 		signal: AbortSignal.timeout(APISERVER_TIMEOUT_MS),
 	});
 	if (!resp.ok) {
@@ -178,7 +175,6 @@ const HTML_ERROR = `<!DOCTYPE html>
  *
  * Environment variables:
  *   APISERVER_URL   - (Required) Kubernetes API server URL.
- *   APISERVER_TOKEN - (Optional) Bearer token for K8s API authentication.
  */
 async function handler(req: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
 	const pubkeyJWT = req.query.get("u");

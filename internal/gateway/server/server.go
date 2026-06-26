@@ -22,9 +22,6 @@ type Config struct {
 	// Shared host key (PEM) loaded by all replicas for a stable fingerprint.
 	HostKeyPath string
 
-	// Maximum lifetime of a single session.
-	MaxSessionDuration time.Duration
-
 	// Deadline for completing the SSH handshake.
 	LoginGraceTime time.Duration
 
@@ -71,7 +68,7 @@ type Server struct {
 }
 
 // New creates a Server ready to accept SSH connections.
-func New(ctx context.Context, cfg Config) (*Server, error) {
+func New(cfg Config) (*Server, error) {
 	hostSigner, err := LoadSigner(cfg.HostKeyPath, "host key")
 	if err != nil {
 		return nil, err
@@ -81,7 +78,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		"fingerprint", ssh.FingerprintSHA256(hostSigner.PublicKey()),
 	)
 
-	sshConfig := auth.NewServerConfig(ctx, auth.Config{
+	sshConfig := auth.NewServerConfig(auth.Config{
 		HostSigner:          hostSigner,
 		MaxAuthTries:        cfg.MaxAuthTries,
 		AuthWatcher:         cfg.AuthWatcher,
@@ -104,9 +101,6 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		loginGraceTime: cfg.LoginGraceTime,
 	}, nil
 }
-
-// Addr returns the listener's network address.
-func (s *Server) Addr() net.Addr { return s.listener.Addr() }
 
 // Serve runs the accept loop, dispatching authenticated connections to handler.
 func (s *Server) Serve(ctx context.Context, handler ConnHandler) error {
@@ -146,9 +140,6 @@ func (s *Server) Serve(ctx context.Context, handler ConnHandler) error {
 		}()
 	}
 }
-
-// Close immediately closes the listener.
-func (s *Server) Close() error { return s.listener.Close() }
 
 // LoadSigner reads a PEM-encoded SSH private key from path.
 func LoadSigner(path, label string) (ssh.Signer, error) {

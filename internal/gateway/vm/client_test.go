@@ -334,7 +334,7 @@ func TestReconnect(t *testing.T) {
 		vmi := makeReadyVMI("vm-recon", "10.0.0.5", "node-3")
 
 		c := newTestClient(t, vm, vmi)
-		result, err := c.Reconnect(context.Background(), "sess-r1", "SHA256:abc123", "gw-new", 3600)
+		result, err := c.Reconnect(context.Background(), "sess-r1", "SHA256:abc123", "gw-new")
 
 		require.NoError(t, err)
 		assert.Equal(t, "vm-recon", result.Name)
@@ -344,7 +344,7 @@ func TestReconnect(t *testing.T) {
 
 	t.Run("session not found", func(t *testing.T) {
 		c := newTestClient(t)
-		_, err := c.Reconnect(context.Background(), "nonexistent", "fp", "gw-1", 3600)
+		_, err := c.Reconnect(context.Background(), "nonexistent", "fp", "gw-1")
 		assert.ErrorIs(t, err, errSessionNotFound)
 	})
 
@@ -356,7 +356,7 @@ func TestReconnect(t *testing.T) {
 		vmi := makeReadyVMI("vm-auth", "10.0.0.6", "node-4")
 
 		c := newTestClient(t, vm, vmi)
-		_, err := c.Reconnect(context.Background(), "sess-auth", "SHA256:wrong", "gw-1", 3600)
+		_, err := c.Reconnect(context.Background(), "sess-auth", "SHA256:wrong", "gw-1")
 		assert.ErrorIs(t, err, errSessionAuthMismatch)
 	})
 
@@ -368,7 +368,7 @@ func TestReconnect(t *testing.T) {
 		vmi := makeUnreadyVMI("vm-notready", "10.0.0.7")
 
 		c := newTestClient(t, vm, vmi)
-		_, err := c.Reconnect(context.Background(), "sess-nr", "SHA256:fp", "gw-1", 3600)
+		_, err := c.Reconnect(context.Background(), "sess-nr", "SHA256:fp", "gw-1")
 		assert.ErrorIs(t, err, errSessionVMNotReady)
 	})
 
@@ -380,7 +380,7 @@ func TestReconnect(t *testing.T) {
 		vmi := makeReadyVMI("vm-nofp", "10.0.0.8", "node-5")
 
 		c := newTestClient(t, vm, vmi)
-		_, err := c.Reconnect(context.Background(), "sess-nofp", "SHA256:any", "gw-1", 3600)
+		_, err := c.Reconnect(context.Background(), "sess-nofp", "SHA256:any", "gw-1")
 		assert.ErrorIs(t, err, errSessionAuthMismatch)
 	})
 }
@@ -681,13 +681,13 @@ func TestClaimEndToEnd(t *testing.T) {
 		require.NoError(t, err)
 
 		// Step 3: Reconnect with correct fingerprint.
-		result2, err := c.Reconnect(context.Background(), "sess-e2e", "SHA256:e2efp", "gw-new", 3600)
+		result2, err := c.Reconnect(context.Background(), "sess-e2e", "SHA256:e2efp", "gw-new")
 		require.NoError(t, err)
 		assert.Equal(t, "vm-e2e", result2.Name)
 		assert.Equal(t, "10.0.0.99", result2.PodIP)
 
 		// Step 4: Reconnect with wrong fingerprint fails.
-		_, err = c.Reconnect(context.Background(), "sess-e2e", "SHA256:wrong", "gw-new", 3600)
+		_, err = c.Reconnect(context.Background(), "sess-e2e", "SHA256:wrong", "gw-new")
 		assert.ErrorIs(t, err, errSessionAuthMismatch)
 	})
 

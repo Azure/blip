@@ -85,7 +85,6 @@ func TestRegisterPasswordCallback(t *testing.T) {
 	validToken := "valid-sa-token"
 	validResult := &TokenReviewResult{
 		ServiceAccountName: "vm-register",
-		Namespace:          "blip",
 		PodName:            "virt-launcher-blip-abc12-xyz99",
 	}
 
@@ -141,7 +140,6 @@ func TestRegisterPasswordCallback(t *testing.T) {
 			reviewFunc: func(ctx context.Context, token string) (*TokenReviewResult, error) {
 				return &TokenReviewResult{
 					ServiceAccountName: "vm-register",
-					Namespace:          "blip",
 					PodName:            "not-a-virt-launcher",
 				}, nil
 			},

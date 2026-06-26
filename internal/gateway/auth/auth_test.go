@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
@@ -56,7 +55,7 @@ func TestNewServerConfig(t *testing.T) {
 	t.Run("with auth watcher enables pubkey auth", func(t *testing.T) {
 		hostKey := generateHostKey(t)
 
-		cfg := NewServerConfig(context.Background(), Config{
+		cfg := NewServerConfig(Config{
 			HostSigner:   hostKey,
 			MaxAuthTries: 3,
 			AuthWatcher:  NewTestAuthWatcher(map[string]string{"SHA256:test": "alice"}),
@@ -69,7 +68,7 @@ func TestNewServerConfig(t *testing.T) {
 	t.Run("without auth watcher disables all auth", func(t *testing.T) {
 		hostKey := generateHostKey(t)
 
-		cfg := NewServerConfig(context.Background(), Config{
+		cfg := NewServerConfig(Config{
 			HostSigner:   hostKey,
 			MaxAuthTries: 5,
 		})
@@ -151,7 +150,7 @@ func TestPubkeyAuthEndToEnd(t *testing.T) {
 	userPub, _ := generateUserKey(t)
 	fp := ssh.FingerprintSHA256(userPub)
 
-	sshCfg := NewServerConfig(context.Background(), Config{
+	sshCfg := NewServerConfig(Config{
 		HostSigner:   hostKey,
 		MaxAuthTries: 1,
 		AuthWatcher:  NewTestAuthWatcher(map[string]string{fp: "alice"}),

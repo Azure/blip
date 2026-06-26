@@ -71,7 +71,7 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 		close(bufferedReqs)
 	}()
 
-	authFingerprint, authIdentity, _ := extractAuthExtensions(serverConn)
+	authFingerprint, authIdentity := extractAuthExtensions(serverConn)
 
 	slog.Info("client authenticated",
 		"user", serverConn.User(),
@@ -105,8 +105,11 @@ func (m *Manager) HandleConnection(ctx context.Context, serverConn *ssh.ServerCo
 	setupCtx, stopSetupMonitor := contextWithConnClose(ctx, serverConn)
 
 	start := time.Now()
-	ttlSec := int(DefaultTTL.Seconds())
-	sessionTimeout := DefaultTTL
+	sessionTimeout := m.cfg.MaxSessionDuration
+	if sessionTimeout <= 0 {
+		sessionTimeout = DefaultTTL
+	}
+	ttlSec := int(sessionTimeout.Seconds())
 
 	sessionID, alloc, err := m.allocateOrReconnect(setupCtx, serverConn.User(), authFingerprint, authIdentity, reconnecting, ttlSec)
 	if err != nil {
@@ -290,7 +293,7 @@ func (m *Manager) unregister(sessionID string) {
 func (m *Manager) allocateOrReconnect(ctx context.Context, user, authFingerprint, authIdentity string, reconnecting bool, maxDurSec int) (string, *vm.ClaimResult, error) {
 	if reconnecting {
 		sessionID := user
-		alloc, err := m.cfg.VMClient.Reconnect(ctx, sessionID, authFingerprint, m.cfg.PodName, maxDurSec)
+		alloc, err := m.cfg.VMClient.Reconnect(ctx, sessionID, authFingerprint, m.cfg.PodName)
 		return sessionID, alloc, err
 	}
 	sessionID := generateSessionID()
@@ -338,11 +341,10 @@ func (m *Manager) sendGoodbyeBanner(ctx context.Context, sess *proxy.Session, se
 	sess.SendBanner(goodbyeBanner(sessionID, status.Ephemeral, status.RemainingTTL, m.cfg.ExternalHost))
 }
 
-func extractAuthExtensions(conn *ssh.ServerConn) (fingerprint, identity string, isVMClient bool) {
+func extractAuthExtensions(conn *ssh.ServerConn) (fingerprint, identity string) {
 	if conn.Permissions != nil && conn.Permissions.Extensions != nil {
 		fingerprint = conn.Permissions.Extensions[auth.ExtFingerprint]
 		identity = conn.Permissions.Extensions[auth.ExtIdentity]
-		isVMClient = conn.Permissions.Extensions[auth.ExtIsVMClient] == "true"
 	}
 	return
 }

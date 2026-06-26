@@ -53,12 +53,16 @@ func newTestAuthWatcher(fingerprints map[string]string) *auth.AuthWatcher {
 // validConfig returns a Config wired to the given host key with a random listen port.
 func validConfig(hk testHostKey) Config {
 	return Config{
-		ListenAddr:         "127.0.0.1:0",
-		HostKeyPath:        hk.HostKeyPath,
-		MaxSessionDuration: 10 * time.Minute,
-		LoginGraceTime:     5 * time.Second,
-		MaxAuthTries:       3,
+		ListenAddr:     "127.0.0.1:0",
+		HostKeyPath:    hk.HostKeyPath,
+		LoginGraceTime: 5 * time.Second,
+		MaxAuthTries:   3,
 	}
+}
+
+func serverAddr(t *testing.T, srv *Server) string {
+	t.Helper()
+	return srv.listener.Addr().String()
 }
 
 // allowedPubkeyClientConfig creates an SSH client config with a fresh key pair
@@ -128,15 +132,15 @@ func TestNew(t *testing.T) {
 				tt.mutate(&cfg, dir)
 			}
 
-			srv, err := New(context.Background(), cfg)
+			srv, err := New(cfg)
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
 				return
 			}
 			require.NoError(t, err)
-			defer srv.Close()
-			assert.NotNil(t, srv.Addr())
+			defer srv.listener.Close()
+			assert.NotEmpty(t, serverAddr(t, srv))
 		})
 	}
 }
@@ -149,7 +153,7 @@ func TestServe_AuthenticatedClientReceivesCallback(t *testing.T) {
 	clientCfg, fp := allowedPubkeyClientConfig(t)
 	cfg.AuthWatcher = newTestAuthWatcher(map[string]string{fp: "runner@test"})
 
-	srv, err := New(context.Background(), cfg)
+	srv, err := New(cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -173,7 +177,7 @@ func TestServe_AuthenticatedClientReceivesCallback(t *testing.T) {
 		})
 	}()
 
-	conn, err := ssh.Dial("tcp", srv.Addr().String(), clientCfg)
+	conn, err := ssh.Dial("tcp", serverAddr(t, srv), clientCfg)
 	require.NoError(t, err)
 	conn.Close()
 
@@ -191,7 +195,7 @@ func TestServe_OIDCBackedPubkeyReceivesOIDCIdentity(t *testing.T) {
 	clientCfg, fp := allowedPubkeyClientConfig(t)
 	cfg.AuthWatcher = auth.NewTestOIDCAuthWatcher(map[string]string{fp: "runner@example.com"})
 
-	srv, err := New(context.Background(), cfg)
+	srv, err := New(cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -208,7 +212,7 @@ func TestServe_OIDCBackedPubkeyReceivesOIDCIdentity(t *testing.T) {
 		})
 	}()
 
-	conn, err := ssh.Dial("tcp", srv.Addr().String(), clientCfg)
+	conn, err := ssh.Dial("tcp", serverAddr(t, srv), clientCfg)
 	require.NoError(t, err)
 	conn.Close()
 
@@ -225,7 +229,7 @@ func TestServe_GracefulShutdownDrainsConnections(t *testing.T) {
 	clientCfg, fp := allowedPubkeyClientConfig(t)
 	cfg.AuthWatcher = newTestAuthWatcher(map[string]string{fp: "runner@test"})
 
-	srv, err := New(context.Background(), cfg)
+	srv, err := New(cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -242,7 +246,7 @@ func TestServe_GracefulShutdownDrainsConnections(t *testing.T) {
 		})
 	}()
 
-	conn, err := ssh.Dial("tcp", srv.Addr().String(), clientCfg)
+	conn, err := ssh.Dial("tcp", serverAddr(t, srv), clientCfg)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -272,7 +276,7 @@ func TestServe_UnauthenticatedClientRejected(t *testing.T) {
 	// Allow a specific key, then connect with a different one.
 	cfg.AuthWatcher = newTestAuthWatcher(map[string]string{"SHA256:allowed-key": "someone@host"})
 
-	srv, err := New(context.Background(), cfg)
+	srv, err := New(cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -287,7 +291,7 @@ func TestServe_UnauthenticatedClientRejected(t *testing.T) {
 
 	// Try connecting with a random key not in the allowed list.
 	clientCfg, _ := allowedPubkeyClientConfig(t) // generates a key not in the allowed set
-	_, err = ssh.Dial("tcp", srv.Addr().String(), clientCfg)
+	_, err = ssh.Dial("tcp", serverAddr(t, srv), clientCfg)
 	assert.Error(t, err)
 
 	cancel()
@@ -316,7 +320,7 @@ func TestServe_ConcurrentClients(t *testing.T) {
 	}
 	cfg.AuthWatcher = newTestAuthWatcher(fpSet)
 
-	srv, err := New(context.Background(), cfg)
+	srv, err := New(cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -336,7 +340,7 @@ func TestServe_ConcurrentClients(t *testing.T) {
 	}()
 
 	for i := 0; i < numClients; i++ {
-		conn, err := ssh.Dial("tcp", srv.Addr().String(), clients[i].cfg)
+		conn, err := ssh.Dial("tcp", serverAddr(t, srv), clients[i].cfg)
 		require.NoError(t, err)
 		conn.Close()
 	}
@@ -353,7 +357,7 @@ func TestServe_HandshakeTimeout(t *testing.T) {
 	cfg := validConfig(hk)
 	cfg.LoginGraceTime = 200 * time.Millisecond
 
-	srv, err := New(context.Background(), cfg)
+	srv, err := New(cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -368,7 +372,7 @@ func TestServe_HandshakeTimeout(t *testing.T) {
 	}()
 
 	// Open a raw TCP connection but never complete the SSH handshake.
-	conn, err := net.DialTimeout("tcp", srv.Addr().String(), 2*time.Second)
+	conn, err := net.DialTimeout("tcp", serverAddr(t, srv), 2*time.Second)
 	require.NoError(t, err)
 
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -385,12 +389,12 @@ func TestClose(t *testing.T) {
 	hk := newTestHostKey(t, dir)
 	cfg := validConfig(hk)
 
-	srv, err := New(context.Background(), cfg)
+	srv, err := New(cfg)
 	require.NoError(t, err)
 
-	addr := srv.Addr().String()
+	addr := serverAddr(t, srv)
 
-	require.NoError(t, srv.Close())
+	require.NoError(t, srv.listener.Close())
 
 	_, err = net.DialTimeout("tcp", addr, 500*time.Millisecond)
 	assert.Error(t, err)
@@ -401,11 +405,11 @@ func TestAddr(t *testing.T) {
 	hk := newTestHostKey(t, dir)
 	cfg := validConfig(hk)
 
-	srv, err := New(context.Background(), cfg)
+	srv, err := New(cfg)
 	require.NoError(t, err)
-	defer srv.Close()
+	defer srv.listener.Close()
 
-	addr := srv.Addr()
+	addr := srv.listener.Addr()
 	require.NotNil(t, addr)
 
 	assert.IsType(t, &net.TCPAddr{}, addr)
@@ -488,7 +492,7 @@ func TestServe_MultipleSequentialSessions(t *testing.T) {
 	}
 	cfg.AuthWatcher = newTestAuthWatcher(fpSet)
 
-	srv, err := New(context.Background(), cfg)
+	srv, err := New(cfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -511,7 +515,7 @@ func TestServe_MultipleSequentialSessions(t *testing.T) {
 
 	for i := 0; i < numClients; i++ {
 		wg.Add(1)
-		conn, err := ssh.Dial("tcp", srv.Addr().String(), clients[i].cfg)
+		conn, err := ssh.Dial("tcp", serverAddr(t, srv), clients[i].cfg)
 		require.NoError(t, err)
 		conn.Close()
 		wg.Wait()

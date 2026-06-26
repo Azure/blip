@@ -174,11 +174,10 @@ func TestIsSessionID(t *testing.T) {
 
 func TestExtractAuthExtensions(t *testing.T) {
 	tests := []struct {
-		name         string
-		perms        *ssh.Permissions
-		wantFP       string
-		wantID       string
-		wantVMClient bool
+		name   string
+		perms  *ssh.Permissions
+		wantFP string
+		wantID string
 	}{
 		{
 			name: "both extensions present",
@@ -188,23 +187,20 @@ func TestExtractAuthExtensions(t *testing.T) {
 					auth.ExtIdentity:    "user@example.com",
 				},
 			},
-			wantFP:       "SHA256:abc",
-			wantID:       "user@example.com",
-			wantVMClient: false,
+			wantFP: "SHA256:abc",
+			wantID: "user@example.com",
 		},
 		{
-			name:         "nil permissions",
-			perms:        nil,
-			wantFP:       "",
-			wantID:       "",
-			wantVMClient: false,
+			name:   "nil permissions",
+			perms:  nil,
+			wantFP: "",
+			wantID: "",
 		},
 		{
-			name:         "nil extensions map",
-			perms:        &ssh.Permissions{},
-			wantFP:       "",
-			wantID:       "",
-			wantVMClient: false,
+			name:   "nil extensions map",
+			perms:  &ssh.Permissions{},
+			wantFP: "",
+			wantID: "",
 		},
 		{
 			name: "only fingerprint",
@@ -213,9 +209,8 @@ func TestExtractAuthExtensions(t *testing.T) {
 					auth.ExtFingerprint: "SHA256:xyz",
 				},
 			},
-			wantFP:       "SHA256:xyz",
-			wantID:       "",
-			wantVMClient: false,
+			wantFP: "SHA256:xyz",
+			wantID: "",
 		},
 		{
 			name: "VM client key auth",
@@ -226,19 +221,17 @@ func TestExtractAuthExtensions(t *testing.T) {
 					auth.ExtIsVMClient:  "true",
 				},
 			},
-			wantFP:       "SHA256:vm-key",
-			wantID:       "pubkey:alice@laptop",
-			wantVMClient: true,
+			wantFP: "SHA256:vm-key",
+			wantID: "pubkey:alice@laptop",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ep := sshPipe(t)
 			ep.serverConn.Permissions = tt.perms
-			fp, id, isVM := extractAuthExtensions(ep.serverConn)
+			fp, id := extractAuthExtensions(ep.serverConn)
 			assert.Equal(t, tt.wantFP, fp)
 			assert.Equal(t, tt.wantID, id)
-			assert.Equal(t, tt.wantVMClient, isVM)
 		})
 	}
 }
