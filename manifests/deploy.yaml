@@ -60,17 +60,23 @@ stringData:
             chmod 600 ~runner/.ssh/authorized_keys
             chown -R runner:runner ~runner/.ssh
 
-            # Install gateway host pubkey as known_hosts (port 2222 bracket format).
-            if [ -s "$GW_HOST_PUBKEY_DIR/host_key.pub" ]; then
-            	gw_host_pubkey="$(cat "$GW_HOST_PUBKEY_DIR/host_key.pub")"
-            	{
-            		printf '[%s]:%s %s\n' "$GW_HOST" 2222 "$gw_host_pubkey"
-            		printf '[%s]:%s %s\n' blip 2222 "$gw_host_pubkey"
-            		printf '[%s]:%s %s\n' blip-gateway 2222 "$gw_host_pubkey"
-            	} | tee ~runner/.ssh/known_hosts > /etc/ssh/ssh_known_hosts
-            	chmod 644 ~runner/.ssh/known_hosts /etc/ssh/ssh_known_hosts
-            	chown runner:runner ~runner/.ssh/known_hosts
-            fi
+            # Wait for and install gateway host pubkey as known_hosts (port 2222 bracket format).
+            gw_host_pubkey=""
+            for _ in $(seq 1 30); do
+                if [ -s "$GW_HOST_PUBKEY_DIR/host_key.pub" ]; then
+                    gw_host_pubkey="$(cat "$GW_HOST_PUBKEY_DIR/host_key.pub")"
+                    break
+                fi
+                sleep 2
+            done
+            [ -n "$gw_host_pubkey" ] || { echo "[blip-setup] FATAL: no gateway host pubkey" >&2; exit 1; }
+            {
+                printf '[%s]:%s %s\n' "$GW_HOST" 2222 "$gw_host_pubkey"
+                printf '[%s]:%s %s\n' blip 2222 "$gw_host_pubkey"
+                printf '[%s]:%s %s\n' blip-gateway 2222 "$gw_host_pubkey"
+            } | tee ~runner/.ssh/known_hosts > /etc/ssh/ssh_known_hosts
+            chmod 644 ~runner/.ssh/known_hosts /etc/ssh/ssh_known_hosts
+            chown runner:runner ~runner/.ssh/known_hosts
 
             # Restart sshd BEFORE registering keys. The gateway connects
             # immediately after registration, so sshd must be ready first.
@@ -89,17 +95,28 @@ stringData:
             # pod-bound SA tokens are ~1192 bytes, so we pass the token
             # as a --token argument in the exec channel instead.
             ok=false
-            for _ in $(seq 1 10); do
-            	resp=$(ssh \
-            		-o StrictHostKeyChecking=yes \
-            		-o PreferredAuthentications=none \
-            		-o ConnectTimeout=10 \
-            		-p 2222 "_register@${GW_HOST}" \
-            		"register-keys --host-key $host_key --client-key $client_key --vm-name $vm_name --token $sa_token" 2>/dev/null) || true
-            	if printf '%s' "$resp" | grep -q '"ok":true'; then ok=true; break; fi
-            	sleep 2
+            last_resp=""
+            for attempt in $(seq 1 10); do
+                resp=""
+                if resp=$(ssh \
+                    -o BatchMode=yes \
+                    -o StrictHostKeyChecking=yes \
+                    -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts \
+                    -o PreferredAuthentications=none \
+                    -o PubkeyAuthentication=no \
+                    -o PasswordAuthentication=no \
+                    -o KbdInteractiveAuthentication=no \
+                    -o GSSAPIAuthentication=no \
+                    -o ConnectTimeout=10 \
+                    -p 2222 "_register@${GW_HOST}" \
+                    "register-keys --host-key $host_key --client-key $client_key --vm-name $vm_name --token $sa_token" 2>&1); then
+                    if printf '%s' "$resp" | grep -q '"ok":true'; then ok=true; break; fi
+                fi
+                last_resp="$resp"
+                printf '[blip-setup] register attempt %s failed: %s\n' "$attempt" "${resp:-ssh exited without output}" >&2
+                sleep 2
             done
-            [ "$ok" = true ] || { echo "[blip-setup] FATAL: key registration failed" >&2; exit 1; }
+            [ "$ok" = true ] || { echo "[blip-setup] FATAL: key registration failed" >&2; printf '[blip-setup] last response: %s\n' "$last_resp" >&2; exit 1; }
 
             echo "[blip-setup] complete"
         - chmod -x /etc/update-motd.d/*
@@ -363,6 +380,8 @@ kind: ConfigMap
 metadata:
   name: ssh-gateway-oidc
   namespace: blip
+data: {}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
