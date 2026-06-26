@@ -39,9 +39,6 @@ func newRootCmd() *cobra.Command {
 		externalHost       string
 		vmRegisterSA       string
 
-		// HTTP server for health checks.
-		httpListenAddr string
-
 		// HTTPS API server (enabled when OIDC ConfigMap is watched).
 		httpsListenAddr   string
 		oidcConfigMapName string
@@ -86,7 +83,6 @@ func newRootCmd() *cobra.Command {
 				MaxAuthTries:       3,
 				KeepAliveInterval:  60 * time.Second,
 				KeepAliveMax:       3,
-				HTTPListenAddr:     httpListenAddr,
 				KubeWriter:         kubeWriter,
 				KubeCache:          kubeCache,
 			}
@@ -119,9 +115,6 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringSliceVar(&hostPrincipals, "host-principals", envOrDefaultStringSlice("GATEWAY_HOST_PRINCIPALS"), "Hostnames/IPs for gateway identification, comma-separated (env: GATEWAY_HOST_PRINCIPALS)")
 	cmd.Flags().StringVar(&externalHost, "external-host", envOrDefault("GATEWAY_EXTERNAL_HOST", ""), "Public hostname for the gateway, shown in reconnect instructions (env: GATEWAY_EXTERNAL_HOST)")
 	cmd.Flags().StringVar(&vmRegisterSA, "vm-register-sa", envOrDefault("VM_REGISTER_SA", "vm-register"), "ServiceAccount name for VM registration token validation (env: VM_REGISTER_SA)")
-
-	// HTTP server flags.
-	cmd.Flags().StringVar(&httpListenAddr, "http-address", envOrDefault("HTTP_ADDRESS", ":8080"), "HTTP address for health checks (env: HTTP_ADDRESS)")
 
 	// HTTPS API server flags. The OIDC auth configuration (issuer URL,
 	// audience, TLS secret name, authenticator URL) is read from the named

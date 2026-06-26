@@ -42,6 +42,10 @@ type Config struct {
 	// _register connections; nil disables SA token auth for registration.
 	TokenReviewer auth.TokenReviewer
 
+	// OIDCTokenVerifier validates OIDC tokens supplied as SSH passwords;
+	// nil disables OIDC password auth.
+	OIDCTokenVerifier auth.OIDCTokenVerifier
+
 	// PendingFingerprints tracks pubkey fingerprints from failed auth
 	// attempts for the keyboard-interactive device flow fallback.
 	PendingFingerprints *auth.PendingFingerprints
@@ -83,6 +87,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		AuthWatcher:         cfg.AuthWatcher,
 		VMKeyResolver:       cfg.VMKeyResolver,
 		TokenReviewer:       cfg.TokenReviewer,
+		OIDCTokenVerifier:   cfg.OIDCTokenVerifier,
 		PendingFingerprints: cfg.PendingFingerprints,
 		DeviceFlow:          cfg.DeviceFlow,
 		JWTIssuer:           cfg.JWTIssuer,

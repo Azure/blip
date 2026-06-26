@@ -13,6 +13,8 @@ import (
 	toolscache "k8s.io/client-go/tools/cache"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/project-unbounded/blip/internal/gateway/auth"
 )
 
 // ConfigMap data keys for OIDC auth configuration.
@@ -59,6 +61,23 @@ type OIDCConfigWatcher struct {
 
 	// ctx for background operations (OIDC discovery, TLS watcher creation).
 	ctx context.Context
+}
+
+// VerifyOIDCToken validates token against the current OIDC configuration.
+// It implements auth.OIDCTokenVerifier for SSH password authentication.
+func (w *OIDCConfigWatcher) VerifyOIDCToken(ctx context.Context, token string) (*auth.OIDCTokenIdentity, error) {
+	verifier := w.Verifier()
+	if verifier == nil {
+		return nil, fmt.Errorf("OIDC auth not configured")
+	}
+	idToken, err := verifier.Verify(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	return &auth.OIDCTokenIdentity{
+		Subject: idToken.Subject,
+		Expiry:  idToken.Expiry,
+	}, nil
 }
 
 // NewOIDCConfigWatcher creates a watcher on the named ConfigMap. It performs
