@@ -81,9 +81,8 @@ func NewHTTPSServer(ctx context.Context, cfg HTTPSConfig, kubeWriter client.Clie
 //  1. Checks that OIDC is configured (returns 503 if not).
 //  2. Verifies an OIDC bearer token from the Authorization header.
 //  3. Extracts the user ID (subject) and TTL (token expiry) from the token.
-//  4. Reads the "pubkey" form value — a JWT issued by the SSH gateway during
-//     device-flow auth — verifies it against the TLS signing key, and extracts
-//     the SSH public key.
+//  4. Reads the "pubkey" form value. Automation may pass a raw SSH public key;
+//     browser device-flow passes a gateway-signed JWT containing the SSH key.
 //  5. Creates a session ConfigMap with the public key for the AuthWatcher.
 func dynamicAuthHandler(oidcCfg *OIDCConfigWatcher, kubeWriter client.Client, namespace string, jwtIssuer string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -102,62 +101,15 @@ func dynamicAuthHandler(oidcCfg *OIDCConfigWatcher, kubeWriter client.Client, na
 		// Limit request body to 64 KiB to prevent memory exhaustion.
 		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 
-		pubkeyJWT := r.FormValue("pubkey")
-		if pubkeyJWT == "" {
+		pubkeyParam := r.FormValue("pubkey")
+		if pubkeyParam == "" {
 			writeJSONError(w, http.StatusBadRequest, "missing required form value: pubkey")
 			return
 		}
 
-		// The pubkey form value is a JWT issued by this gateway during the
-		// device-flow auth. Verify its signature against our signing key
-		// and check expiration, then extract the SSH public key from claims.
-		signer := oidcCfg.GetSigningKey()
-		if signer == nil {
-			slog.Error("no signing key available to verify pubkey JWT")
-			writeJSONError(w, http.StatusInternalServerError, "server signing key unavailable")
-			return
-		}
-		ecPub, ok := signer.Public().(*ecdsa.PublicKey)
-		if !ok {
-			slog.Error("signing key is not ECDSA", "type", fmt.Sprintf("%T", signer.Public()))
-			writeJSONError(w, http.StatusInternalServerError, "server signing key has unexpected type")
-			return
-		}
-
-		claims, err := gatewayauth.VerifyES256(pubkeyJWT, ecPub)
+		pubkey, _, err := resolvePubkeyFormValue(pubkeyParam, oidcCfg, jwtIssuer)
 		if err != nil {
-			slog.Debug("pubkey JWT verification failed", "error", err)
-			writeJSONError(w, http.StatusBadRequest, "invalid pubkey token")
-			return
-		}
-
-		// Validate issuer and audience claims to prevent token confusion.
-		if iss, _ := claims["iss"].(string); iss != jwtIssuer {
-			writeJSONError(w, http.StatusBadRequest, "invalid pubkey token issuer")
-			return
-		}
-		// The audience is the authenticator URL, read dynamically.
-		jwtAudience := oidcCfg.AuthenticatorURL()
-		if aud, _ := claims["aud"].(string); aud != jwtAudience {
-			writeJSONError(w, http.StatusBadRequest, "invalid pubkey token audience")
-			return
-		}
-
-		pubkey, _ := claims["pubkey"].(string)
-		if pubkey == "" {
-			writeJSONError(w, http.StatusBadRequest, "pubkey token missing pubkey claim")
-			return
-		}
-
-		// Validate the pubkey is a well-formed SSH public key and cross-check
-		// the fingerprint claim against the actual key.
-		fingerprint, err := parsePubkeyString(pubkey)
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid SSH public key in token: %v", err))
-			return
-		}
-		if fpClaim, _ := claims["fingerprint"].(string); fpClaim != "" && fpClaim != fingerprint {
-			writeJSONError(w, http.StatusBadRequest, "pubkey/fingerprint mismatch in token")
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 
@@ -222,6 +174,51 @@ func dynamicAuthHandler(oidcCfg *OIDCConfigWatcher, kubeWriter client.Client, na
 			"expiration": expiration.UTC().Format(time.RFC3339),
 		})
 	})
+}
+
+func resolvePubkeyFormValue(pubkeyParam string, oidcCfg *OIDCConfigWatcher, jwtIssuer string) (pubkey string, fingerprint string, err error) {
+	if fp, err := parsePubkeyString(pubkeyParam); err == nil {
+		return strings.TrimSpace(pubkeyParam), fp, nil
+	}
+
+	// Browser device-flow sends a JWT issued by this gateway. Verify its
+	// signature and issuer/audience before trusting the embedded public key.
+	signer := oidcCfg.GetSigningKey()
+	if signer == nil {
+		slog.Error("no signing key available to verify pubkey JWT")
+		return "", "", fmt.Errorf("server signing key unavailable")
+	}
+	ecPub, ok := signer.Public().(*ecdsa.PublicKey)
+	if !ok {
+		slog.Error("signing key is not ECDSA", "type", fmt.Sprintf("%T", signer.Public()))
+		return "", "", fmt.Errorf("server signing key has unexpected type")
+	}
+
+	claims, err := gatewayauth.VerifyES256(pubkeyParam, ecPub)
+	if err != nil {
+		slog.Debug("pubkey JWT verification failed", "error", err)
+		return "", "", fmt.Errorf("invalid pubkey token")
+	}
+	if iss, _ := claims["iss"].(string); iss != jwtIssuer {
+		return "", "", fmt.Errorf("invalid pubkey token issuer")
+	}
+	jwtAudience := oidcCfg.AuthenticatorURL()
+	if aud, _ := claims["aud"].(string); aud != jwtAudience {
+		return "", "", fmt.Errorf("invalid pubkey token audience")
+	}
+
+	pubkey, _ = claims["pubkey"].(string)
+	if pubkey == "" {
+		return "", "", fmt.Errorf("pubkey token missing pubkey claim")
+	}
+	fingerprint, err = parsePubkeyString(pubkey)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid SSH public key in token: %v", err)
+	}
+	if fpClaim, _ := claims["fingerprint"].(string); fpClaim != "" && fpClaim != fingerprint {
+		return "", "", fmt.Errorf("pubkey/fingerprint mismatch in token")
+	}
+	return pubkey, fingerprint, nil
 }
 
 // verifyBearerToken extracts and verifies a bearer token from the request.

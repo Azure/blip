@@ -42,10 +42,6 @@ type Config struct {
 	// _register connections; nil disables SA token auth for registration.
 	TokenReviewer auth.TokenReviewer
 
-	// AuthSessionWatcher watches auth session Secrets for device-flow auth;
-	// nil disables auth session secret lookups.
-	AuthSessionWatcher *auth.AuthSessionWatcher
-
 	// PendingFingerprints tracks pubkey fingerprints from failed auth
 	// attempts for the keyboard-interactive device flow fallback.
 	PendingFingerprints *auth.PendingFingerprints
@@ -87,7 +83,6 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		AuthWatcher:         cfg.AuthWatcher,
 		VMKeyResolver:       cfg.VMKeyResolver,
 		TokenReviewer:       cfg.TokenReviewer,
-		AuthSessionWatcher:  cfg.AuthSessionWatcher,
 		PendingFingerprints: cfg.PendingFingerprints,
 		DeviceFlow:          cfg.DeviceFlow,
 		JWTIssuer:           cfg.JWTIssuer,

@@ -123,22 +123,15 @@ func RunGateway(cfg *GatewayConfig) error {
 		}
 	}
 
-	// Set up device-flow auth components. These are always created when an
-	// OIDC ConfigMap is watched so that device-flow auth can be enabled at
-	// runtime. When no OIDC config is present in the ConfigMap, the
-	// keyboard-interactive callback returns an error and the auth session
-	// watcher is idle.
-	var authSessionWatcher *auth.AuthSessionWatcher
+	// Set up device-flow auth components. These are created when an OIDC
+	// ConfigMap is watched so that device-flow auth can be enabled at runtime.
+	// Completed OIDC/device-flow auth writes the same ConfigMaps that static
+	// test pubkeys use, so the AuthWatcher is the single user auth backend.
 	var pendingFingerprints *auth.PendingFingerprints
 	var deviceFlowProvider auth.DeviceFlowProvider
 	jwtIssuer := cfg.ExternalHost
 
 	if oidcConfigWatcher != nil {
-		var err error
-		authSessionWatcher, err = auth.NewAuthSessionWatcher(ctx, cfg.KubeCache, cfg.VMNamespace)
-		if err != nil {
-			return fmt.Errorf("create auth session watcher: %w", err)
-		}
 		pendingFingerprints = auth.NewPendingFingerprints(ctx)
 		deviceFlowProvider = oidcConfigWatcher
 
@@ -164,7 +157,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		TokenReviewer:      tokenReviewer,
 
 		// Device flow auth parameters.
-		AuthSessionWatcher:  authSessionWatcher,
 		PendingFingerprints: pendingFingerprints,
 		DeviceFlow:          deviceFlowProvider,
 		JWTIssuer:           jwtIssuer,
@@ -332,10 +324,9 @@ func RunGateway(cfg *GatewayConfig) error {
 		}
 
 		// If this connection came through device-flow keyboard-interactive,
-		// block until the auth session secret appears before proxying.
+		// block until the OIDC flow creates the trusted pubkey ConfigMap.
 		if serverConn.Permissions != nil &&
-			serverConn.Permissions.Extensions[auth.ExtPendingDeviceAuth] == "true" &&
-			authSessionWatcher != nil {
+			serverConn.Permissions.Extensions[auth.ExtPendingDeviceAuth] == "true" {
 
 			fingerprint := serverConn.Permissions.Extensions[auth.ExtDeviceFlowFingerprint]
 			slog.Info("device flow: waiting for browser authentication",
@@ -343,7 +334,7 @@ func RunGateway(cfg *GatewayConfig) error {
 				"fingerprint", fingerprint,
 			)
 
-			subject, err := authSessionWatcher.WaitForAuth(ctx, fingerprint, 5*time.Minute)
+			entry, err := authWatcher.WaitForAuth(ctx, fingerprint, 5*time.Minute)
 			if err != nil {
 				slog.Info("device flow auth failed",
 					"remote", serverConn.RemoteAddr().String(),
@@ -361,14 +352,19 @@ func RunGateway(cfg *GatewayConfig) error {
 			for k, v := range serverConn.Permissions.Extensions {
 				newExts[k] = v
 			}
-			newExts[auth.ExtIdentity] = fmt.Sprintf("device:%s", subject)
+			identity := fmt.Sprintf("pubkey:%s", entry.UserIdentity)
+			if entry.Subject != "" {
+				identity = fmt.Sprintf("oidc:%s", entry.Subject)
+			}
+			newExts[auth.ExtIdentity] = identity
 			delete(newExts, auth.ExtPendingDeviceAuth)
 			serverConn.Permissions.Extensions = newExts
 
 			slog.Info("device flow auth succeeded",
 				"remote", serverConn.RemoteAddr().String(),
 				"fingerprint", fingerprint,
-				"subject", subject,
+				"identity", identity,
+				"subject", entry.Subject,
 			)
 		}
 

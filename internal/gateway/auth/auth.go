@@ -55,21 +55,13 @@ type Config struct {
 	// connections are rejected.
 	TokenReviewer TokenReviewer
 
-	// AuthSessionWatcher watches Kubernetes Secrets for device-flow auth
-	// sessions. When set, pubkey auth also checks auth session secrets.
-	AuthSessionWatcher *AuthSessionWatcher
-
 	// AuthenticatorURL is the URL of the web authenticator for the
-	// device-flow. When set (along with AuthSessionWatcher and JWTSigner),
+	// device-flow. When set (along with AuthWatcher and JWTSigner),
 	// users with unrecognized pubkeys are prompted to authenticate via
 	// their browser.
-	//
-	// Deprecated: Use DeviceFlow instead for dynamic configuration.
 	AuthenticatorURL string
 
 	// JWTSigner is the private key used to sign device-flow JWTs.
-	//
-	// Deprecated: Use DeviceFlow instead for dynamic configuration.
 	JWTSigner SigningKeyProvider
 
 	// DeviceFlow provides dynamic device-flow configuration (authenticator
@@ -99,22 +91,21 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 	sshCfg := &ssh.ServerConfig{MaxAuthTries: cfg.MaxAuthTries}
 	sshCfg.AddHostKey(cfg.HostSigner)
 
-	if cfg.AuthWatcher != nil || cfg.VMKeyResolver != nil || cfg.AuthSessionWatcher != nil {
-		sshCfg.PublicKeyCallback = pubkeyCallback(cfg.AuthWatcher, cfg.VMKeyResolver, cfg.AuthSessionWatcher, cfg.PendingFingerprints)
+	if cfg.AuthWatcher != nil || cfg.VMKeyResolver != nil {
+		sshCfg.PublicKeyCallback = pubkeyCallback(cfg.AuthWatcher, cfg.VMKeyResolver, cfg.PendingFingerprints)
 	}
 
 	// Enable keyboard-interactive for device-flow auth when configured.
 	// When DeviceFlow is set, the callback reads the authenticator URL at
 	// runtime so the keyboard-interactive path activates/deactivates
 	// dynamically as the OIDC ConfigMap changes.
-	if cfg.DeviceFlow != nil && cfg.AuthSessionWatcher != nil && cfg.PendingFingerprints != nil {
+	if cfg.DeviceFlow != nil && cfg.AuthWatcher != nil && cfg.PendingFingerprints != nil {
 		sshCfg.KeyboardInteractiveCallback = deviceFlowKeyboardInteractive(
 			cfg.DeviceFlow,
 			cfg.JWTIssuer,
 			cfg.PendingFingerprints,
 		)
-	} else if cfg.AuthenticatorURL != "" && cfg.AuthSessionWatcher != nil && cfg.JWTSigner != nil && cfg.PendingFingerprints != nil {
-		// Legacy static path for backwards compatibility.
+	} else if cfg.AuthenticatorURL != "" && cfg.AuthWatcher != nil && cfg.JWTSigner != nil && cfg.PendingFingerprints != nil {
 		sshCfg.KeyboardInteractiveCallback = deviceFlowKeyboardInteractive(
 			&staticDeviceFlow{url: cfg.AuthenticatorURL, signer: cfg.JWTSigner},
 			cfg.JWTIssuer,
@@ -152,8 +143,7 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 	return sshCfg
 }
 
-// staticDeviceFlow is a DeviceFlowProvider backed by static values, used for
-// backwards compatibility with the legacy AuthenticatorURL/JWTSigner fields.
+// staticDeviceFlow is a DeviceFlowProvider backed by static values.
 type staticDeviceFlow struct {
 	url    string
 	signer SigningKeyProvider
@@ -163,16 +153,17 @@ func (s *staticDeviceFlow) AuthenticatorURL() string     { return s.url }
 func (s *staticDeviceFlow) GetSigningKey() crypto.Signer { return s.signer.GetSigningKey() }
 
 // pubkeyCallback returns a PublicKeyCallback that checks keys in order:
-// 1. Explicit allowed pubkeys from ConfigMaps with blip.azure.com/user label.
-// 2. Auth session secrets from the device-flow login workflow.
-// 3. VM client keys for recursive blip connections.
+//  1. Allowed pubkeys from ConfigMaps with blip.azure.com/user label. These
+//     include static test keys and dynamic OIDC/device-flow registrations.
+//  2. VM client keys for recursive blip connections.
+//
 // When all checks fail and pending is non-nil, the fingerprint is recorded
 // for use by the keyboard-interactive device flow callback.
-func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver, sessionWatcher *AuthSessionWatcher, pending *PendingFingerprints) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
+func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver, pending *PendingFingerprints) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 		fingerprint := ssh.FingerprintSHA256(key)
 
-		// First, try explicit pubkey auth (user keys from ConfigMaps).
+		// First, try ConfigMap-backed pubkey auth (static and OIDC/device-flow).
 		if watcher != nil {
 			perm, err := verifyExplicitPubkey(conn, key, watcher)
 			if err == nil {
@@ -180,25 +171,7 @@ func pubkeyCallback(watcher *AuthWatcher, vmResolver VMKeyResolver, sessionWatch
 			}
 		}
 
-		// Second, try auth session secrets (device-flow completed sessions).
-		if sessionWatcher != nil {
-			if subject, found := sessionWatcher.LookupByFingerprint(context.Background(), fingerprint); found {
-				slog.Info("auth session secret auth succeeded",
-					"user", conn.User(),
-					"remote", conn.RemoteAddr().String(),
-					"key_fingerprint", fingerprint,
-					"subject", subject,
-				)
-				return &ssh.Permissions{
-					Extensions: map[string]string{
-						ExtFingerprint: fingerprint,
-						ExtIdentity:    fmt.Sprintf("device:%s", subject),
-					},
-				}, nil
-			}
-		}
-
-		// Third, try VM client key auth (for recursive blip connections).
+		// Second, try VM client key auth (for recursive blip connections).
 		if vmResolver != nil {
 			perm, err := verifyVMClientKey(conn, key, vmResolver)
 			if err == nil {
@@ -292,25 +265,30 @@ func deviceFlowKeyboardInteractive(
 // stable identity.
 func verifyExplicitPubkey(conn ssh.ConnMetadata, key ssh.PublicKey, watcher *AuthWatcher) (*ssh.Permissions, error) {
 	fingerprint := ssh.FingerprintSHA256(key)
-	if !watcher.IsPubkeyAllowed(fingerprint) {
+	entry, found := watcher.Lookup(fingerprint)
+	if !found {
 		return nil, fmt.Errorf("public key %s is not in the allowed list", fingerprint)
 	}
-
-	userIdentity := watcher.PubkeyUserIdentity(fingerprint)
-	if userIdentity == "" {
+	if entry.UserIdentity == "" {
 		return nil, fmt.Errorf("public key %s has no user identity (empty blip.azure.com/user label)", fingerprint)
+	}
+
+	identity := fmt.Sprintf("pubkey:%s", entry.UserIdentity)
+	if entry.Subject != "" {
+		identity = fmt.Sprintf("oidc:%s", entry.Subject)
 	}
 
 	slog.Info("explicit pubkey auth succeeded",
 		"user", conn.User(),
 		"remote", conn.RemoteAddr().String(),
 		"key_fingerprint", fingerprint,
-		"user_identity", userIdentity,
+		"user_identity", entry.UserIdentity,
+		"subject", entry.Subject,
 	)
 	return &ssh.Permissions{
 		Extensions: map[string]string{
 			ExtFingerprint: fingerprint,
-			ExtIdentity:    fmt.Sprintf("pubkey:%s", userIdentity),
+			ExtIdentity:    identity,
 		},
 	}, nil
 }

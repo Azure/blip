@@ -4,12 +4,12 @@ An Azure Function that bridges Entra ID (Azure AD) authentication with the blip 
 
 ## How it works
 
-1. A user initiates SSH gateway device-flow authentication, which produces a pubkey JWT and directs the user's browser to this function.
+1. A user initiates SSH gateway device-flow authentication, which produces a gateway-signed pubkey JWT and directs the user's browser to this function.
 2. Azure App Service Authentication (EasyAuth) intercepts the request and requires the user to sign in with Entra ID. After sign-in, EasyAuth injects the user's ID token in the `X-MS-TOKEN-AAD-ID-TOKEN` header.
 3. The function reads the pubkey JWT from the `u` query parameter and the Entra ID token from the EasyAuth header.
 4. It fetches the gateway's TLS certificate and hostname from the `gateway-tls-certs` ConfigMap in `kube-public` via the Kubernetes API.
 5. It POSTs the Entra ID token and pubkey JWT to the gateway's `/auth/user` endpoint over HTTPS, using the gateway's self-signed certificate as the trusted CA.
-6. The user sees a success or failure page and can return to their terminal.
+6. The gateway creates the same trusted pubkey ConfigMap used by static test keys, and the user can return to their terminal.
 
 ## Configuration
 

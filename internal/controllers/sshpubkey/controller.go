@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	// LabelUser identifies session ConfigMaps that hold a user's SSH public key.
+	// LabelUser identifies ConfigMaps that hold a trusted SSH public key.
+	// Static test keys and dynamic OIDC/device-flow registrations use the same
+	// label and pubkey data key so the gateway has one user auth backend.
 	LabelUser = "blip.azure.com/user"
 
 	// AnnotationExpiration holds an RFC 3339 expiration timestamp.

@@ -9,38 +9,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"math/big"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
-
-	corev1 "k8s.io/api/core/v1"
-	toolscache "k8s.io/client-go/tools/cache"
-	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
-	// AuthSessionLabel marks a Secret as a device-flow auth session.
-	AuthSessionLabel = "blip.azure.com/auth-session"
-
-	// AuthSessionFingerprintAnnotation stores the SSH pubkey fingerprint
-	// (e.g. "SHA256:...") on an auth session Secret.
-	AuthSessionFingerprintAnnotation = "blip.azure.com/fingerprint"
-
-	// AuthSessionSubjectAnnotation stores the authenticated user identity
-	// on an auth session Secret, set by the login workflow.
-	AuthSessionSubjectAnnotation = "blip.azure.com/subject"
-
-	// AuthSessionPubkeyKey is the data key in the auth session Secret
-	// containing the SSH public key in authorized_keys format.
-	AuthSessionPubkeyKey = "pubkey"
-
-	// fingerprintIndexKey is the cache index field name for fingerprint lookups.
-	fingerprintIndexKey = ".metadata.annotations.blip.azure.com/fingerprint"
-
 	// ExtPendingDeviceAuth is set to "true" in ssh.Permissions when the
 	// user authenticated via keyboard-interactive device flow and still
 	// needs to complete browser auth. The connection handler must call
@@ -65,143 +41,6 @@ type DeviceFlowProvider interface {
 	// AuthenticatorURL returns the current web authenticator URL. An empty
 	// string means device-flow auth is currently disabled.
 	AuthenticatorURL() string
-}
-
-// AuthSessionWatcher watches Kubernetes Secrets with the auth-session label
-// for device-flow authentication sessions. It indexes secrets by pubkey
-// fingerprint for O(1) lookups.
-type AuthSessionWatcher struct {
-	cache     crcache.Cache
-	namespace string
-}
-
-// NewAuthSessionWatcher creates a watcher for auth session Secrets. It
-// registers a field index on the fingerprint annotation for fast lookups.
-// The informerCache must already be started and synced.
-func NewAuthSessionWatcher(ctx context.Context, informerCache crcache.Cache, namespace string) (*AuthSessionWatcher, error) {
-	// Register a field index on the fingerprint annotation so we can do
-	// indexed lookups by fingerprint via the cache.
-	if err := informerCache.IndexField(ctx, &corev1.Secret{}, fingerprintIndexKey, func(obj client.Object) []string {
-		secret, ok := obj.(*corev1.Secret)
-		if !ok {
-			return nil
-		}
-		// Only index secrets with the auth-session label.
-		if secret.Labels[AuthSessionLabel] != "true" {
-			return nil
-		}
-		fp := secret.Annotations[AuthSessionFingerprintAnnotation]
-		if fp == "" {
-			return nil
-		}
-		return []string{fp}
-	}); err != nil {
-		return nil, fmt.Errorf("register auth session fingerprint index: %w", err)
-	}
-
-	w := &AuthSessionWatcher{
-		cache:     informerCache,
-		namespace: namespace,
-	}
-
-	slog.Info("auth session watcher started", "namespace", namespace)
-	return w, nil
-}
-
-// LookupByFingerprint checks if an auth session Secret exists for the given
-// pubkey fingerprint. Returns the user subject and true if found.
-func (w *AuthSessionWatcher) LookupByFingerprint(ctx context.Context, fingerprint string) (subject string, found bool) {
-	var secrets corev1.SecretList
-	if err := w.cache.List(ctx, &secrets,
-		client.InNamespace(w.namespace),
-		client.MatchingFields{fingerprintIndexKey: fingerprint},
-	); err != nil {
-		slog.Error("auth session watcher: failed to lookup by fingerprint",
-			"fingerprint", fingerprint,
-			"error", err,
-		)
-		return "", false
-	}
-	if len(secrets.Items) == 0 {
-		return "", false
-	}
-	subject = secrets.Items[0].Annotations[AuthSessionSubjectAnnotation]
-	return subject, true
-}
-
-// WaitForAuth blocks until an auth session Secret matching the given
-// fingerprint is created, or until the context is cancelled / timeout expires.
-// Returns the user subject from the Secret.
-func (w *AuthSessionWatcher) WaitForAuth(ctx context.Context, fingerprint string, timeout time.Duration) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// Set up notification channel before checking, to avoid the race where
-	// a Secret is created between the check and the watch registration.
-	notifyCh := make(chan string, 1)
-
-	secretInformer, err := w.cache.GetInformer(ctx, &corev1.Secret{})
-	if err != nil {
-		return "", fmt.Errorf("get secret informer: %w", err)
-	}
-
-	reg, err := secretInformer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			secret, ok := obj.(*corev1.Secret)
-			if !ok {
-				return
-			}
-			if secret.Labels[AuthSessionLabel] != "true" {
-				return
-			}
-			if secret.Annotations[AuthSessionFingerprintAnnotation] != fingerprint {
-				return
-			}
-			subject := secret.Annotations[AuthSessionSubjectAnnotation]
-			select {
-			case notifyCh <- subject:
-			default:
-			}
-		},
-		UpdateFunc: func(_, newObj interface{}) {
-			secret, ok := newObj.(*corev1.Secret)
-			if !ok {
-				return
-			}
-			if secret.Labels[AuthSessionLabel] != "true" {
-				return
-			}
-			if secret.Annotations[AuthSessionFingerprintAnnotation] != fingerprint {
-				return
-			}
-			subject := secret.Annotations[AuthSessionSubjectAnnotation]
-			select {
-			case notifyCh <- subject:
-			default:
-			}
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("add auth session event handler: %w", err)
-	}
-	defer func() {
-		if err := secretInformer.RemoveEventHandler(reg); err != nil {
-			slog.Warn("failed to remove auth session event handler", "error", err)
-		}
-	}()
-
-	// Check if a matching secret already exists (after handler registration).
-	if subject, found := w.LookupByFingerprint(ctx, fingerprint); found {
-		return subject, nil
-	}
-
-	// Block until the secret appears or context expires.
-	select {
-	case subject := <-notifyCh:
-		return subject, nil
-	case <-ctx.Done():
-		return "", fmt.Errorf("device flow auth timed out waiting for browser authentication")
-	}
 }
 
 // pendingKey holds a fingerprint and the corresponding authorized_keys-format

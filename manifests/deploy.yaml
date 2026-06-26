@@ -139,8 +139,8 @@ rules:
   resources: ["virtualmachineinstances"]
   verbs: ["get", "list", "watch"]
 # ConfigMaps: the gateway watches ConfigMaps with the blip.azure.com/user
-# label for trusted SSH public keys (pubkey auth), and creates session
-# ConfigMaps for OIDC-authenticated users.
+# label for trusted SSH public keys. Static test keys, OAuth device-flow
+# registrations, and OIDC automation registrations all use this backend.
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get", "list", "watch", "create"]
@@ -349,13 +349,13 @@ spec:
           initialDelaySeconds: 5
 ---
 ---
-# OIDC auth configuration for the SSH gateway. Populate the data fields to
-# enable OIDC-authenticated API access and device-flow SSH login. The gateway
-# watches this ConfigMap at runtime; changes take effect without a restart.
+# User auth configuration for the SSH gateway. Populate the data fields to
+# enable OIDC API access and OAuth device-flow SSH login. The gateway watches
+# this ConfigMap at runtime; changes take effect without a restart.
 #
 # Supported fields:
-#   oidc-issuer-url    - Trusted OIDC issuer URL (e.g. "https://login.microsoftonline.com/<tenant>/v2.0")
-#   oidc-audience      - Expected "aud" claim in the OIDC token (e.g. "api://blip")
+#   oidc-issuer-url    - Trusted OIDC issuer URL (e.g. "https://token.actions.githubusercontent.com")
+#   oidc-audience      - Expected "aud" claim in the OIDC token
 #   tls-secret-name    - Kubernetes Secret with tls.crt and tls.key for HTTPS
 #   authenticator-url  - URL of the web authenticator for device-flow SSH auth
 apiVersion: v1
