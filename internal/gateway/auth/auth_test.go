@@ -87,7 +87,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		fp := ssh.FingerprintSHA256(userPub)
 
 		watcher := NewTestAuthWatcher(map[string]string{fp: "alice"})
-		cb := pubkeyCallback(watcher, nil, nil, nil)
+		cb := pubkeyCallback(watcher, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		require.NoError(t, err)
@@ -99,7 +99,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
 		watcher := NewTestAuthWatcher(map[string]string{"SHA256:other": "bob"})
-		cb := pubkeyCallback(watcher, nil, nil, nil)
+		cb := pubkeyCallback(watcher, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
@@ -110,7 +110,7 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		userPub, _ := generateUserKey(t)
 
 		watcher := NewTestAuthWatcher(nil)
-		cb := pubkeyCallback(watcher, nil, nil, nil)
+		cb := pubkeyCallback(watcher, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
@@ -122,11 +122,24 @@ func TestExplicitPubkeyAuth(t *testing.T) {
 		fp := ssh.FingerprintSHA256(userPub)
 
 		watcher := NewTestAuthWatcher(map[string]string{fp: ""})
-		cb := pubkeyCallback(watcher, nil, nil, nil)
+		cb := pubkeyCallback(watcher, nil, nil)
 
 		perms, err := cb(conn, userPub)
 		assert.Nil(t, perms)
 		assert.ErrorContains(t, err, "not authorized")
+	})
+
+	t.Run("accepts OIDC-backed pubkey identity", func(t *testing.T) {
+		userPub, _ := generateUserKey(t)
+		fp := ssh.FingerprintSHA256(userPub)
+
+		watcher := NewTestOIDCAuthWatcher(map[string]string{fp: "alice@example.com"})
+		cb := pubkeyCallback(watcher, nil, nil)
+
+		perms, err := cb(conn, userPub)
+		require.NoError(t, err)
+		assert.Equal(t, fp, perms.Extensions[ExtFingerprint])
+		assert.Equal(t, "oidc:alice@example.com", perms.Extensions[ExtIdentity])
 	})
 }
 

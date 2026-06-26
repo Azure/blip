@@ -1,17 +1,65 @@
 ---
 title: "User Authentication"
-description: "How users authenticate to the Blip SSH gateway"
+description: "OAuth device flow, OIDC automation tokens, and static test keys"
 weight: 3
 ---
 
-Two authentication methods, usable independently or together:
+Blip has one user authentication backend: trusted SSH public keys stored in Kubernetes ConfigMaps with the `blip.azure.com/user` label and a `pubkey` data key.
 
-1. **Static public keys** — SSH public keys registered as Kubernetes ConfigMaps.
-2. **Dynamic auth via authenticator service** — device-flow where unrecognized users authenticate via browser, provisioning their key automatically.
+Most users should not create those ConfigMaps by hand. They should connect with SSH, follow the OAuth device-flow URL, and let the authenticator register their key. Automation, especially GitHub Actions, can register a key directly with an OIDC bearer token. Static ConfigMaps are still useful as a simple fallback for tests and local development.
 
-Both produce an SSH public key in a ConfigMap with the `blip.azure.com/user` label.
+## Recommended: OAuth device flow
 
-## Method 1: Static public keys
+When an authenticator service is configured, users with unrecognized SSH keys are prompted to authenticate in a browser.
+
+1. User runs `ssh <gateway>` with an unrecognized key.
+2. Gateway records the SSH public key and shows a browser URL through keyboard-interactive auth.
+3. User opens the URL and authenticates with the identity provider.
+4. The authenticator forwards the identity token and gateway-signed pubkey token to `POST /auth/user`.
+5. The gateway verifies both tokens and creates a trusted pubkey ConfigMap.
+6. The waiting SSH connection continues as `oidc:<subject>`.
+
+The same registered key is accepted immediately until the OIDC token expiry stored on the ConfigMap. Expired dynamic key ConfigMaps are deleted by the controller.
+
+## OIDC API for automation
+
+`POST /auth/user` registers a public key using an OIDC bearer token. This is intended mostly for non-interactive environments such as GitHub Actions.
+
+The request must include:
+
+| Input | Description |
+|-------|-------------|
+| `Authorization: Bearer <token>` | OIDC token issued by the configured provider. |
+| `pubkey` form value | Either a raw SSH public key for automation or a gateway-signed pubkey JWT from device flow. |
+
+For GitHub Actions, configure the gateway with the GitHub Actions issuer and the audience requested by your workflow:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ssh-gateway-oidc
+  namespace: blip
+data:
+  oidc-issuer-url: "https://token.actions.githubusercontent.com"
+  oidc-audience: "blip"
+  tls-secret-name: "gateway-tls-key"
+```
+
+Then a workflow can request an ID token for that audience and post a job-scoped SSH public key to the gateway:
+
+```shell
+curl -fsS -X POST "https://<gateway-host>/auth/user" \
+  -H "Authorization: Bearer $ACTIONS_ID_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "pubkey=$(cat ./id_ed25519.pub)"
+```
+
+Workflows must enable GitHub's OIDC token permission, for example `permissions: id-token: write`.
+
+The gateway uses the OIDC token `sub` as the authenticated subject, stores a Kubernetes-safe form in `blip.azure.com/user`, and records the original subject in `blip.azure.com/subject`.
+
+## Static public keys for tests
 
 Create a ConfigMap with the `blip.azure.com/user` label and your public key in the `pubkey` data key:
 
@@ -41,55 +89,39 @@ kubectl label configmap "$(whoami)-key" \
 
 The `blip.azure.com/user` label value is the user identity for quota tracking. Must be non-empty.
 
-## Method 2: Dynamic auth via authenticator service
+## Gateway configuration
 
-When an authenticator service is configured, users with unrecognized SSH keys are prompted to authenticate via browser.
+The gateway reads OIDC and device-flow settings from the ConfigMap named by `--oidc-config` or `OIDC_CONFIG`.
 
-### How it works
+| Field | Required | Description |
+|-------|----------|-------------|
+| `oidc-issuer-url` | yes | Trusted OIDC issuer URL. Used for OIDC discovery. |
+| `oidc-audience` | yes | Expected `aud` claim in the OIDC token. |
+| `tls-secret-name` | yes | Kubernetes Secret containing `tls.crt` and `tls.key` for the HTTPS API server and device-flow JWT signing. |
+| `authenticator-url` | no | Web authenticator URL for browser device-flow SSH login. Omit this for OIDC automation-only setups. |
 
-1. User runs `ssh <gateway>` with an unrecognized key.
-2. Gateway rejects the key but records the fingerprint and public key.
-3. SSH falls back to keyboard-interactive. Gateway generates a signed JWT containing the SSH public key and presents a URL to the authenticator service.
-4. User opens the URL, authenticates via identity provider.
-5. Authenticator creates a Kubernetes Secret in `blip` namespace with:
-   - Label: `blip.azure.com/auth-session: "true"`
-   - Annotation: `blip.azure.com/fingerprint` — SSH key fingerprint
-   - Annotation: `blip.azure.com/subject` — authenticated user identity
-   - Data key `pubkey` — SSH public key
-6. Gateway detects the Secret and completes the SSH connection as `device:<subject>`.
+When `oidc-issuer-url` and `oidc-audience` are present, the gateway enables `POST /auth/user`. Device-flow SSH login additionally requires `authenticator-url`.
 
-### Gateway configuration
+### Azure Entra ID device-flow example
 
-Enable device-flow auth by setting `authenticator-url` in the OIDC ConfigMap. See [OIDC Authentication]({{% relref "oidc-auth" %}}) for full configuration.
-
-### OIDC user endpoint
-
-The gateway exposes `POST /auth/user` when OIDC is configured. This endpoint accepts an OIDC bearer token and a `pubkey` form value (a gateway-signed JWT from the device flow), verifies both, and creates a session ConfigMap with the user's SSH public key. See [OIDC Authentication]({{% relref "oidc-auth" %}}) for details.
-
-### Configuring Entra ID with the Azure Function authenticator
-
-The [`azure-auth`](https://github.com/Azure/blip/tree/main/azure-auth) cloud function uses Azure App Service Authentication (EasyAuth) to log users in via Entra ID. EasyAuth injects the user's token in `X-MS-TOKEN-AAD-ID-TOKEN`; the function forwards it to the gateway's `POST /auth/user` endpoint.
-
-For ConfigMap configuration, see the [Azure Entra ID example]({{% relref "oidc-auth#azure-entra-id-example" %}}) in the OIDC docs.
-
-### Auth session Secrets
-
-Authenticator services must create Secrets conforming to this schema:
+Using the [`azure-auth`](https://github.com/Azure/blip/tree/main/azure-auth) Function App authenticator:
 
 ```yaml
 apiVersion: v1
-kind: Secret
+kind: ConfigMap
 metadata:
-  name: auth-<unique-id>
+  name: ssh-gateway-oidc
   namespace: blip
-  labels:
-    blip.azure.com/auth-session: "true"
-  annotations:
-    blip.azure.com/fingerprint: "SHA256:..."
-    blip.azure.com/subject: "user@example.com"
 data:
-  pubkey: <base64-encoded SSH public key>
+  oidc-issuer-url: "https://login.microsoftonline.com/<tenant-id>/v2.0"
+  oidc-audience: "<easyauth-app-registration-client-id>"
+  tls-secret-name: "gateway-tls-key"
+  authenticator-url: "https://<function-app-name>.azurewebsites.net/api/auth"
 ```
+
+The `--external-host` flag or `GATEWAY_EXTERNAL_HOST` environment variable must be set to the gateway's public hostname. The device-flow JWT uses it as the `iss` claim.
+
+The Azure Function requires `APISERVER_URL` set to the Kubernetes API server URL so it can fetch the gateway TLS certificate from the `gateway-tls-certs` ConfigMap in `kube-public`.
 
 ## Connect
 
@@ -99,7 +131,7 @@ GATEWAY=$(kubectl get svc ssh-gateway -n blip -o jsonpath='{.status.loadBalancer
 ssh $GATEWAY
 ```
 
-With static keys, authentication succeeds immediately. With device-flow, the terminal displays a URL; authenticate there, then the SSH session proceeds.
+With a registered static or OIDC key, authentication succeeds immediately. With device flow, the terminal displays a URL; authenticate there, then the SSH session proceeds.
 
 ## Session lifecycle
 
@@ -108,7 +140,12 @@ Default max session duration: 12 hours (`--max-session-duration`). VMs are ephem
 - **`blip retain`** — keeps the VM alive, prints a session ID for reconnection.
 - **`blip release`** — destroys the VM immediately.
 
+## Runtime notes
+
+- OIDC discovery runs asynchronously on issuer URL changes. Requests can return 503 briefly until the verifier is ready.
+- Removing `authenticator-url` disables browser device flow but keeps OIDC API registration enabled.
+- Removing `oidc-issuer-url` or `oidc-audience` disables OIDC API registration. Static pubkey ConfigMaps continue to work.
+
 ## Next steps
 
-- [OIDC Authentication]({{% relref "oidc-auth" %}})
 - [Nested Blips]({{% relref "nested-blips" %}})

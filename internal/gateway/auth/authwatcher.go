@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -25,6 +26,10 @@ const (
 	// PubkeyDataKey is the data key in the session ConfigMap containing the
 	// SSH public key in authorized_keys format.
 	PubkeyDataKey = "pubkey"
+
+	// PubkeySubjectAnnotation stores the original OIDC subject for dynamic
+	// auth ConfigMaps. Static pubkey ConfigMaps leave this unset.
+	PubkeySubjectAnnotation = "blip.azure.com/subject"
 )
 
 // AuthWatcher watches session ConfigMaps with the blip.azure.com/user label
@@ -41,6 +46,9 @@ type AuthWatcher struct {
 type pubkeyEntry struct {
 	// UserIdentity is the value of the blip.azure.com/user label.
 	UserIdentity string
+
+	// Subject is the original authenticated subject, when provided by OIDC.
+	Subject string
 }
 
 // NewAuthWatcher creates an AuthWatcher that watches session ConfigMaps with
@@ -112,25 +120,52 @@ func NewAuthWatcher(ctx context.Context, namespace string) (*AuthWatcher, error)
 	return w, nil
 }
 
-// IsPubkeyAllowed reports whether the given fingerprint (e.g. "SHA256:...")
-// is in the current allowed set.
-func (w *AuthWatcher) IsPubkeyAllowed(fingerprint string) bool {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	_, ok := w.pubkeys[fingerprint]
-	return ok
-}
-
-// PubkeyUserIdentity returns the user identity for the given fingerprint,
-// or "" if the fingerprint is not in the allowed set.
-func (w *AuthWatcher) PubkeyUserIdentity(fingerprint string) string {
+// Lookup returns the trusted public key entry for a fingerprint.
+func (w *AuthWatcher) Lookup(fingerprint string) (pubkeyEntry, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	entry, ok := w.pubkeys[fingerprint]
-	if !ok {
-		return ""
+	return entry, ok
+}
+
+// WaitForAuth blocks until a trusted public key ConfigMap matching the given
+// fingerprint exists, or until the context is cancelled / timeout expires.
+func (w *AuthWatcher) WaitForAuth(ctx context.Context, fingerprint string, timeout time.Duration) (pubkeyEntry, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	notifyCh := make(chan pubkeyEntry, 1)
+
+	informer, err := w.cache.GetInformer(ctx, &corev1.ConfigMap{})
+	if err != nil {
+		return pubkeyEntry{}, fmt.Errorf("get configmap informer: %w", err)
 	}
-	return entry.UserIdentity
+
+	reg, err := informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) { w.notifyIfFingerprintMatches(obj, fingerprint, notifyCh) },
+		UpdateFunc: func(_, newObj interface{}) {
+			w.notifyIfFingerprintMatches(newObj, fingerprint, notifyCh)
+		},
+	})
+	if err != nil {
+		return pubkeyEntry{}, fmt.Errorf("add auth configmap event handler: %w", err)
+	}
+	defer func() {
+		if err := informer.RemoveEventHandler(reg); err != nil {
+			slog.Warn("failed to remove auth configmap event handler", "error", err)
+		}
+	}()
+
+	if entry, found := w.Lookup(fingerprint); found {
+		return entry, nil
+	}
+
+	select {
+	case entry := <-notifyCh:
+		return entry, nil
+	case <-ctx.Done():
+		return pubkeyEntry{}, fmt.Errorf("device flow auth timed out waiting for browser authentication")
+	}
 }
 
 // allowedPubkeyCount returns the number of allowed pubkeys for logging.
@@ -194,7 +229,10 @@ func (w *AuthWatcher) reload(ctx context.Context) {
 			)
 		}
 
-		pubkeys[fp] = pubkeyEntry{UserIdentity: userIdentity}
+		pubkeys[fp] = pubkeyEntry{
+			UserIdentity: userIdentity,
+			Subject:      cm.Annotations[PubkeySubjectAnnotation],
+		}
 	}
 
 	w.mu.Lock()
@@ -205,6 +243,29 @@ func (w *AuthWatcher) reload(ctx context.Context) {
 		"configmap_count", len(cms.Items),
 		"allowed_pubkey_count", len(pubkeys),
 	)
+}
+
+func (w *AuthWatcher) notifyIfFingerprintMatches(obj interface{}, fingerprint string, notifyCh chan<- pubkeyEntry) {
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok {
+		return
+	}
+	if cm.Namespace != w.namespace || cm.Labels[PubkeyUserLabel] == "" {
+		return
+	}
+	pubkeyStr := cm.Data[PubkeyDataKey]
+	fp, err := parsePubkeyFingerprint(pubkeyStr)
+	if err != nil || fp != fingerprint {
+		return
+	}
+	entry := pubkeyEntry{
+		UserIdentity: cm.Labels[PubkeyUserLabel],
+		Subject:      cm.Annotations[PubkeySubjectAnnotation],
+	}
+	select {
+	case notifyCh <- entry:
+	default:
+	}
 }
 
 // parsePubkeyFingerprint parses an SSH public key in authorized_keys format
@@ -228,6 +289,16 @@ func NewTestAuthWatcher(pubkeyFingerprints map[string]string) *AuthWatcher {
 	pubkeys := make(map[string]pubkeyEntry)
 	for fp, user := range pubkeyFingerprints {
 		pubkeys[fp] = pubkeyEntry{UserIdentity: user}
+	}
+	return &AuthWatcher{pubkeys: pubkeys}
+}
+
+// NewTestOIDCAuthWatcher creates an AuthWatcher pre-loaded with OIDC-backed
+// pubkey entries. Intended for use in tests outside of this package.
+func NewTestOIDCAuthWatcher(pubkeyFingerprints map[string]string) *AuthWatcher {
+	pubkeys := make(map[string]pubkeyEntry)
+	for fp, subject := range pubkeyFingerprints {
+		pubkeys[fp] = pubkeyEntry{UserIdentity: subject, Subject: subject}
 	}
 	return &AuthWatcher{pubkeys: pubkeys}
 }

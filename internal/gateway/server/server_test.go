@@ -183,6 +183,40 @@ func TestServe_AuthenticatedClientReceivesCallback(t *testing.T) {
 	assert.True(t, handlerCalled.Load())
 }
 
+func TestServe_OIDCBackedPubkeyReceivesOIDCIdentity(t *testing.T) {
+	dir := t.TempDir()
+	hk := newTestHostKey(t, dir)
+	cfg := validConfig(hk)
+
+	clientCfg, fp := allowedPubkeyClientConfig(t)
+	cfg.AuthWatcher = auth.NewTestOIDCAuthWatcher(map[string]string{fp: "runner@example.com"})
+
+	srv, err := New(context.Background(), cfg)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	handlerDone := make(chan struct{})
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.Serve(ctx, func(_ context.Context, sc *ssh.ServerConn, _ <-chan ssh.NewChannel, _ <-chan *ssh.Request) {
+			defer close(handlerDone)
+			assert.Equal(t, fp, sc.Permissions.Extensions["auth-fingerprint"])
+			assert.Equal(t, "oidc:runner@example.com", sc.Permissions.Extensions["auth-identity"])
+			sc.Close()
+		})
+	}()
+
+	conn, err := ssh.Dial("tcp", srv.Addr().String(), clientCfg)
+	require.NoError(t, err)
+	conn.Close()
+
+	<-handlerDone
+	cancel()
+	require.NoError(t, <-serveErr)
+}
+
 func TestServe_GracefulShutdownDrainsConnections(t *testing.T) {
 	dir := t.TempDir()
 	hk := newTestHostKey(t, dir)
