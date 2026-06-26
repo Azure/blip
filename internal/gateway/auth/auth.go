@@ -1,6 +1,6 @@
 // Package auth implements SSH server authentication for the gateway,
-// supporting static pubkey auth from ConfigMaps and VM registration
-// via Kubernetes ServiceAccount tokens.
+// supporting static pubkey auth from ConfigMaps, OIDC token password auth,
+// and VM registration via Kubernetes ServiceAccount tokens.
 package auth
 
 import (
@@ -55,6 +55,11 @@ type Config struct {
 	// connections are rejected.
 	TokenReviewer TokenReviewer
 
+	// OIDCTokenVerifier validates OIDC tokens supplied as SSH passwords.
+	// This supports non-interactive environments that can obtain an OIDC
+	// token directly, such as GitHub Actions.
+	OIDCTokenVerifier OIDCTokenVerifier
+
 	// AuthenticatorURL is the URL of the web authenticator for the
 	// device-flow. When set (along with AuthWatcher and JWTSigner),
 	// users with unrecognized pubkeys are prompted to authenticate via
@@ -84,6 +89,17 @@ type Config struct {
 // user identity and auth fingerprint of the session that owns the VM.
 type VMKeyResolver interface {
 	ResolveRootIdentity(fingerprint string) (identity string, authFingerprint string, err error)
+}
+
+// OIDCTokenIdentity is the authenticated identity extracted from an OIDC token.
+type OIDCTokenIdentity struct {
+	Subject string
+	Expiry  time.Time
+}
+
+// OIDCTokenVerifier validates an OIDC token and returns its subject.
+type OIDCTokenVerifier interface {
+	VerifyOIDCToken(ctx context.Context, token string) (*OIDCTokenIdentity, error)
 }
 
 // NewServerConfig builds an ssh.ServerConfig with auth callbacks from cfg.
@@ -124,10 +140,13 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 	// _register connections. In that case, the VM must pass the token via
 	// the exec command's --token flag, and the session handler validates
 	// it post-connect.
-	if cfg.TokenReviewer != nil {
+	if cfg.TokenReviewer != nil || cfg.OIDCTokenVerifier != nil {
 		registerLimiter := rate.NewLimiter(20, 40) // 20/s with burst of 40
-		sshCfg.PasswordCallback = registerPasswordCallback(cfg.TokenReviewer, registerLimiter)
+		oidcLimiter := rate.NewLimiter(20, 40)     // 20/s with burst of 40
+		sshCfg.PasswordCallback = passwordCallback(cfg.TokenReviewer, cfg.OIDCTokenVerifier, registerLimiter, oidcLimiter)
+	}
 
+	if cfg.TokenReviewer != nil {
 		// Allow none-auth for _register so VMs can pass full-length
 		// tokens via the exec command instead of truncated passwords.
 		// NoClientAuth must be true for NoClientAuthCallback to fire;
@@ -141,6 +160,22 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 	}
 
 	return sshCfg
+}
+
+func passwordCallback(reviewer TokenReviewer, oidcVerifier OIDCTokenVerifier, registerLimiter, oidcLimiter *rate.Limiter) func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
+	return func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		if conn.User() == "_register" {
+			if reviewer == nil {
+				return nil, fmt.Errorf("_register password auth is not configured")
+			}
+			return registerPasswordCallback(reviewer, registerLimiter)(conn, password)
+		}
+
+		if oidcVerifier == nil {
+			return nil, fmt.Errorf("password auth not supported for user %q", conn.User())
+		}
+		return oidcPasswordCallback(oidcVerifier, oidcLimiter)(conn, password)
+	}
 }
 
 // staticDeviceFlow is a DeviceFlowProvider backed by static values.
@@ -353,7 +388,7 @@ func registerPasswordCallback(reviewer TokenReviewer, limiter *rate.Limiter) fun
 		}
 
 		// Rate-limit _register connections to prevent abuse.
-		if !limiter.Allow() {
+		if limiter != nil && !limiter.Allow() {
 			return nil, fmt.Errorf("too many registration attempts, please try again later")
 		}
 
@@ -401,6 +436,53 @@ func registerPasswordCallback(reviewer TokenReviewer, limiter *rate.Limiter) fun
 
 		return &ssh.Permissions{
 			Extensions: extensions,
+		}, nil
+	}
+}
+
+// oidcPasswordCallback authenticates regular SSH users with an OIDC token
+// supplied as the SSH password. The token subject becomes both the stable
+// identity for quota tracking and the reconnect verifier for retained blips.
+func oidcPasswordCallback(verifier OIDCTokenVerifier, limiter *rate.Limiter) func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
+	return func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		if limiter != nil && !limiter.Allow() {
+			return nil, fmt.Errorf("too many OIDC password auth attempts, please try again later")
+		}
+
+		token := string(password)
+		if token == "" {
+			return nil, fmt.Errorf("OIDC password auth requires a token")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		identity, err := verifier.VerifyOIDCToken(ctx, token)
+		if err != nil {
+			slog.Warn("OIDC password auth: token verification failed",
+				"user", conn.User(),
+				"remote", conn.RemoteAddr().String(),
+				"error", err,
+			)
+			return nil, fmt.Errorf("OIDC token validation failed")
+		}
+		if identity == nil || identity.Subject == "" {
+			return nil, fmt.Errorf("OIDC token has empty subject claim")
+		}
+
+		authIdentity := fmt.Sprintf("oidc:%s", identity.Subject)
+		slog.Info("OIDC password auth succeeded",
+			"user", conn.User(),
+			"remote", conn.RemoteAddr().String(),
+			"subject", identity.Subject,
+			"expiry", identity.Expiry.UTC().Format(time.RFC3339),
+		)
+
+		return &ssh.Permissions{
+			Extensions: map[string]string{
+				ExtFingerprint: authIdentity,
+				ExtIdentity:    authIdentity,
+			},
 		}, nil
 	}
 }

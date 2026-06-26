@@ -6,7 +6,7 @@ weight: 3
 
 Blip has one user authentication backend: trusted SSH public keys stored in Kubernetes ConfigMaps with the `blip.azure.com/user` label and a `pubkey` data key.
 
-Most users should not create those ConfigMaps by hand. They should connect with SSH, follow the OAuth device-flow URL, and let the authenticator register their key. Automation, especially GitHub Actions, can register a key directly with an OIDC bearer token. Static ConfigMaps are still useful as a simple fallback for tests and local development.
+Most users should not create those ConfigMaps by hand. They should connect with SSH, follow the OAuth device-flow URL, and let the authenticator register their key. Automation, especially GitHub Actions, can connect directly by passing an OIDC token as the SSH password. Static ConfigMaps are still useful as a simple fallback for tests and local development.
 
 ## Recommended: OAuth device flow
 
@@ -21,16 +21,9 @@ When an authenticator service is configured, users with unrecognized SSH keys ar
 
 The same registered key is accepted immediately until the OIDC token expiry stored on the ConfigMap. Expired dynamic key ConfigMaps are deleted by the controller.
 
-## OIDC API for automation
+## OIDC password auth for automation
 
-`POST /auth/user` registers a public key using an OIDC bearer token. This is intended mostly for non-interactive environments such as GitHub Actions.
-
-The request must include:
-
-| Input | Description |
-|-------|-------------|
-| `Authorization: Bearer <token>` | OIDC token issued by the configured provider. |
-| `pubkey` form value | Either a raw SSH public key for automation or a gateway-signed pubkey JWT from device flow. |
+SSH password auth accepts an OIDC token directly. This is intended mostly for non-interactive environments such as GitHub Actions.
 
 For GitHub Actions, configure the gateway with the GitHub Actions issuer and the audience requested by your workflow:
 
@@ -46,7 +39,45 @@ data:
   tls-secret-name: "gateway-tls-key"
 ```
 
-Then a workflow can request an ID token for that audience and post a job-scoped SSH public key to the gateway:
+Then a workflow can request an ID token for that audience and pass it as the SSH password:
+
+```shell
+sshpass -p "$ACTIONS_ID_TOKEN" ssh \
+  -o PreferredAuthentications=password \
+  -o PubkeyAuthentication=no \
+  runner@<gateway-host>
+```
+
+Workflows must enable GitHub's OIDC token permission, for example `permissions: id-token: write`.
+
+The gateway uses the OIDC token `sub` as the authenticated subject, with `oidc:<subject>` as the user identity for quota tracking and retained-session reconnects.
+
+## OIDC API key registration
+
+`POST /auth/user` registers a public key using an OIDC bearer token. This remains available for clients that need key registration instead of password auth.
+
+The request must include:
+
+| Input | Description |
+|-------|-------------|
+| `Authorization: Bearer <token>` | OIDC token issued by the configured provider. |
+| `pubkey` form value | Either a raw SSH public key for automation or a gateway-signed pubkey JWT from device flow. |
+
+For example:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ssh-gateway-oidc
+  namespace: blip
+data:
+  oidc-issuer-url: "https://token.actions.githubusercontent.com"
+  oidc-audience: "blip"
+  tls-secret-name: "gateway-tls-key"
+```
+
+A workflow can post a job-scoped SSH public key to the gateway:
 
 ```shell
 curl -fsS -X POST "https://<gateway-host>/auth/user" \
@@ -54,8 +85,6 @@ curl -fsS -X POST "https://<gateway-host>/auth/user" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   --data-urlencode "pubkey=$(cat ./id_ed25519.pub)"
 ```
-
-Workflows must enable GitHub's OIDC token permission, for example `permissions: id-token: write`.
 
 The gateway uses the OIDC token `sub` as the authenticated subject, stores a Kubernetes-safe form in `blip.azure.com/user`, and records the original subject in `blip.azure.com/subject`.
 

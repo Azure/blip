@@ -2,13 +2,11 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -51,10 +49,6 @@ type GatewayConfig struct {
 	MaxAuthTries      int
 	KeepAliveInterval time.Duration
 	KeepAliveMax      int
-
-	// HTTPListenAddr is the address for the HTTP server that serves health
-	// checks. Default: ":8080".
-	HTTPListenAddr string
 
 	// OIDCConfigMapName is the name of the ConfigMap watched for OIDC auth
 	// configuration. When non-empty, the gateway creates an OIDCConfigWatcher
@@ -155,6 +149,7 @@ func RunGateway(cfg *GatewayConfig) error {
 		AuthWatcher:        authWatcher,
 		VMKeyResolver:      vmKeyResolver,
 		TokenReviewer:      tokenReviewer,
+		OIDCTokenVerifier:  oidcConfigWatcher,
 
 		// Device flow auth parameters.
 		PendingFingerprints: pendingFingerprints,
@@ -193,47 +188,12 @@ func RunGateway(cfg *GatewayConfig) error {
 		TokenReviewer:      tokenReviewer,
 	})
 
-	httpAddr := cfg.HTTPListenAddr
-	if httpAddr == "" {
-		httpAddr = ":8080"
-	}
-
-	// shuttingDown is set to 1 when a shutdown signal is received.
-	var shuttingDown atomic.Int32
-
-	httpMux := http.NewServeMux()
-	httpMux.HandleFunc("GET /healthz", healthzHandler())
-	httpMux.HandleFunc("GET /readyz", readyzHandler(&shuttingDown))
-
-	httpServer := &http.Server{
-		Addr:         httpAddr,
-		Handler:      httpMux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
 	slog.Info("ssh-gateway starting",
 		"listen", cfg.ListenAddr,
-		"http_listen", httpAddr,
 		"namespace", cfg.VMNamespace,
 		"pool", cfg.VMPoolName,
 		"max_session", cfg.MaxSessionDuration.String(),
 	)
-
-	// Start HTTP server in background.
-	httpErrCh := make(chan error, 1)
-	go func() {
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			httpErrCh <- err
-		}
-	}()
-
-	select {
-	case err := <-httpErrCh:
-		return fmt.Errorf("HTTP server failed to start: %w", err)
-	case <-time.After(50 * time.Millisecond):
-	}
 
 	// Start HTTPS API server in background when OIDC ConfigMap is watched.
 	var httpsServer *http.Server
@@ -285,18 +245,10 @@ func RunGateway(cfg *GatewayConfig) error {
 			"drain_timeout", drainTimeout.String(),
 		)
 
-		shuttingDown.Store(1)
-
 		// Cancel the main context — stops poller, listener, and SSH listener.
 		cancel()
 
 		mgr.NotifyShutdown()
-
-		httpShutdownCtx, httpShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer httpShutdownCancel()
-		if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
-			slog.Error("HTTP server shutdown error", "error", err)
-		}
 
 		if httpsServer != nil {
 			ShutdownHTTPSServer(httpsServer)
@@ -374,42 +326,6 @@ func RunGateway(cfg *GatewayConfig) error {
 	err = srv.Serve(ctx, connHandler)
 	close(sshDone)
 	return err
-}
-
-// healthzHandler returns an HTTP handler that always reports healthy.
-func healthzHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		resp := map[string]any{
-			"status":    "ok",
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}
-}
-
-// readyzHandler returns an HTTP handler that reports readiness.
-func readyzHandler(shuttingDown *atomic.Int32) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		if shuttingDown.Load() != 0 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status":    "shutting_down",
-				"timestamp": time.Now().UTC().Format(time.RFC3339),
-			})
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		resp := map[string]any{
-			"status":    "ok",
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}
 }
 
 // vmKeyResolverAdapter adapts vm.Client to the auth.VMKeyResolver interface.

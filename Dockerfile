@@ -18,5 +18,5 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build-ssh-gateway /out/ssh-gateway /usr/local/bin/ssh-gateway
 COPY --from=build-blip-controller /out/blip-controller /usr/local/bin/blip-controller
 
-EXPOSE 2222 8080
+EXPOSE 2222 8443
 ENTRYPOINT ["/usr/local/bin/ssh-gateway"]

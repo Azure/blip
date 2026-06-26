@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -70,6 +71,14 @@ type mockTokenReviewer struct {
 
 func (m *mockTokenReviewer) Review(ctx context.Context, token string) (*TokenReviewResult, error) {
 	return m.reviewFunc(ctx, token)
+}
+
+type mockOIDCTokenVerifier struct {
+	verifyFunc func(ctx context.Context, token string) (*OIDCTokenIdentity, error)
+}
+
+func (m *mockOIDCTokenVerifier) VerifyOIDCToken(ctx context.Context, token string) (*OIDCTokenIdentity, error) {
+	return m.verifyFunc(ctx, token)
 }
 
 func TestRegisterPasswordCallback(t *testing.T) {
@@ -144,5 +153,38 @@ func TestRegisterPasswordCallback(t *testing.T) {
 		perms, err := cb(fakeConnMeta{user: "_register"}, []byte("some-token"))
 		require.NoError(t, err)
 		assert.Empty(t, perms.Extensions[ExtVMName], "should not set ExtVMName for bad pod name")
+	})
+}
+
+func TestOIDCPasswordCallback(t *testing.T) {
+	verifier := &mockOIDCTokenVerifier{
+		verifyFunc: func(ctx context.Context, token string) (*OIDCTokenIdentity, error) {
+			if token != "valid-oidc-token" {
+				return nil, fmt.Errorf("invalid token")
+			}
+			return &OIDCTokenIdentity{Subject: "repo:owner/name:ref:refs/heads/main", Expiry: time.Now().Add(time.Hour)}, nil
+		},
+	}
+
+	t.Run("accepts valid OIDC token", func(t *testing.T) {
+		cb := oidcPasswordCallback(verifier, nil)
+		perms, err := cb(fakeConnMeta{user: "runner"}, []byte("valid-oidc-token"))
+		require.NoError(t, err)
+		assert.Equal(t, "oidc:repo:owner/name:ref:refs/heads/main", perms.Extensions[ExtIdentity])
+		assert.Equal(t, "oidc:repo:owner/name:ref:refs/heads/main", perms.Extensions[ExtFingerprint])
+	})
+
+	t.Run("rejects empty token", func(t *testing.T) {
+		cb := oidcPasswordCallback(verifier, nil)
+		_, err := cb(fakeConnMeta{user: "runner"}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "requires a token")
+	})
+
+	t.Run("rejects invalid token", func(t *testing.T) {
+		cb := oidcPasswordCallback(verifier, nil)
+		_, err := cb(fakeConnMeta{user: "runner"}, []byte("bad-token"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "validation failed")
 	})
 }
