@@ -71,7 +71,7 @@ func (c *controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// keep only the one with the latest expiration and delete the rest.
 	// This handles races where generateName creates multiple ConfigMaps
 	// for the same user (e.g. concurrent auth requests).
-	if err := c.deduplicateUserSessions(ctx, &cm, user); err != nil {
+	if err := c.deduplicateUserSessions(ctx, user); err != nil {
 		return reconcile.Result{}, fmt.Errorf("deduplicate sessions for user %s: %w", user, err)
 	}
 
@@ -138,7 +138,7 @@ func (c *controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 // without an expiration annotation are considered to have the lowest priority
 // (deleted first). Among ConfigMaps with equal expiration, the one with the
 // latest creation timestamp wins (most recently created).
-func (c *controller) deduplicateUserSessions(ctx context.Context, triggered *corev1.ConfigMap, user string) error {
+func (c *controller) deduplicateUserSessions(ctx context.Context, user string) error {
 	var cms corev1.ConfigMapList
 	if err := c.Client.List(ctx, &cms,
 		client.InNamespace(c.Namespace),

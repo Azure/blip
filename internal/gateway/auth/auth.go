@@ -5,7 +5,6 @@ package auth
 
 import (
 	"context"
-	"crypto"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -60,20 +59,10 @@ type Config struct {
 	// token directly, such as GitHub Actions.
 	OIDCTokenVerifier OIDCTokenVerifier
 
-	// AuthenticatorURL is the URL of the web authenticator for the
-	// device-flow. When set (along with AuthWatcher and JWTSigner),
-	// users with unrecognized pubkeys are prompted to authenticate via
-	// their browser.
-	AuthenticatorURL string
-
-	// JWTSigner is the private key used to sign device-flow JWTs.
-	JWTSigner SigningKeyProvider
-
 	// DeviceFlow provides dynamic device-flow configuration (authenticator
 	// URL and signing key). When non-nil, the keyboard-interactive callback
 	// reads the authenticator URL at runtime, allowing it to be changed via
-	// ConfigMap without restarting the gateway. Takes precedence over the
-	// static AuthenticatorURL and JWTSigner fields.
+	// ConfigMap without restarting the gateway.
 	DeviceFlow DeviceFlowProvider
 
 	// JWTIssuer is the issuer claim for device-flow JWTs (typically the
@@ -103,7 +92,7 @@ type OIDCTokenVerifier interface {
 }
 
 // NewServerConfig builds an ssh.ServerConfig with auth callbacks from cfg.
-func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
+func NewServerConfig(cfg Config) *ssh.ServerConfig {
 	sshCfg := &ssh.ServerConfig{MaxAuthTries: cfg.MaxAuthTries}
 	sshCfg.AddHostKey(cfg.HostSigner)
 
@@ -118,12 +107,6 @@ func NewServerConfig(ctx context.Context, cfg Config) *ssh.ServerConfig {
 	if cfg.DeviceFlow != nil && cfg.AuthWatcher != nil && cfg.PendingFingerprints != nil {
 		sshCfg.KeyboardInteractiveCallback = deviceFlowKeyboardInteractive(
 			cfg.DeviceFlow,
-			cfg.JWTIssuer,
-			cfg.PendingFingerprints,
-		)
-	} else if cfg.AuthenticatorURL != "" && cfg.AuthWatcher != nil && cfg.JWTSigner != nil && cfg.PendingFingerprints != nil {
-		sshCfg.KeyboardInteractiveCallback = deviceFlowKeyboardInteractive(
-			&staticDeviceFlow{url: cfg.AuthenticatorURL, signer: cfg.JWTSigner},
 			cfg.JWTIssuer,
 			cfg.PendingFingerprints,
 		)
@@ -177,15 +160,6 @@ func passwordCallback(reviewer TokenReviewer, oidcVerifier OIDCTokenVerifier, re
 		return oidcPasswordCallback(oidcVerifier, oidcLimiter)(conn, password)
 	}
 }
-
-// staticDeviceFlow is a DeviceFlowProvider backed by static values.
-type staticDeviceFlow struct {
-	url    string
-	signer SigningKeyProvider
-}
-
-func (s *staticDeviceFlow) AuthenticatorURL() string     { return s.url }
-func (s *staticDeviceFlow) GetSigningKey() crypto.Signer { return s.signer.GetSigningKey() }
 
 // pubkeyCallback returns a PublicKeyCallback that checks keys in order:
 //  1. Allowed pubkeys from ConfigMaps with blip.azure.com/user label. These

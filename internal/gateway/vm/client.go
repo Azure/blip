@@ -221,7 +221,7 @@ func (c *Client) Claim(ctx context.Context, poolName, sessionID, gatewayPodName 
 }
 
 // Reconnect verifies the auth fingerprint and returns connection details for a previously claimed VM.
-func (c *Client) Reconnect(ctx context.Context, sessionID, authFingerprint, gatewayPodName string, maxDuration int) (*ClaimResult, error) {
+func (c *Client) Reconnect(ctx context.Context, sessionID, authFingerprint, gatewayPodName string) (*ClaimResult, error) {
 	allocs, err := c.listAllocationsBySession(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("list VMs: %w", err)
@@ -517,11 +517,9 @@ func (c *Client) GetNodeLabel(ctx context.Context, nodeName, label string) strin
 }
 
 type allocation struct {
-	Name            string
-	ResourceVersion string
-	Labels          map[string]string
-	Annotations     map[string]string
-	raw             client.Object
+	Name        string
+	Annotations map[string]string
+	raw         client.Object
 }
 
 type allocationInstance struct {
@@ -618,11 +616,9 @@ func setClaimAnnotations(a *allocation, sessionID, gatewayPodName string, maxDur
 
 func allocationFromObject(obj client.Object) allocation {
 	return allocation{
-		Name:            obj.GetName(),
-		ResourceVersion: obj.GetResourceVersion(),
-		Labels:          obj.GetLabels(),
-		Annotations:     maps.Clone(obj.GetAnnotations()),
-		raw:             obj,
+		Name:        obj.GetName(),
+		Annotations: maps.Clone(obj.GetAnnotations()),
+		raw:         obj,
 	}
 }
 

@@ -15,8 +15,6 @@ import (
 type TokenReviewResult struct {
 	// ServiceAccountName is the name of the ServiceAccount.
 	ServiceAccountName string
-	// Namespace is the namespace of the ServiceAccount.
-	Namespace string
 	// PodName is the name of the pod the token is bound to (from
 	// authentication.kubernetes.io/pod-name in the extra fields).
 	PodName string
@@ -102,7 +100,6 @@ func (r *KubeTokenReviewer) Review(ctx context.Context, token string) (*TokenRev
 
 	return &TokenReviewResult{
 		ServiceAccountName: saName,
-		Namespace:          saNamespace,
 		PodName:            podName,
 	}, nil
 }

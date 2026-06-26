@@ -140,16 +140,15 @@ func RunGateway(cfg *GatewayConfig) error {
 		maxAuthTries = 6
 	}
 
-	srv, err := server.New(ctx, server.Config{
-		ListenAddr:         cfg.ListenAddr,
-		HostKeyPath:        cfg.HostKeyPath,
-		MaxSessionDuration: cfg.MaxSessionDuration,
-		LoginGraceTime:     cfg.LoginGraceTime,
-		MaxAuthTries:       maxAuthTries,
-		AuthWatcher:        authWatcher,
-		VMKeyResolver:      vmKeyResolver,
-		TokenReviewer:      tokenReviewer,
-		OIDCTokenVerifier:  oidcConfigWatcher,
+	srv, err := server.New(server.Config{
+		ListenAddr:        cfg.ListenAddr,
+		HostKeyPath:       cfg.HostKeyPath,
+		LoginGraceTime:    cfg.LoginGraceTime,
+		MaxAuthTries:      maxAuthTries,
+		AuthWatcher:       authWatcher,
+		VMKeyResolver:     vmKeyResolver,
+		TokenReviewer:     tokenReviewer,
+		OIDCTokenVerifier: oidcConfigWatcher,
 
 		// Device flow auth parameters.
 		PendingFingerprints: pendingFingerprints,
