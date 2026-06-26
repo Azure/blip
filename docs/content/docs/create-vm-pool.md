@@ -67,3 +67,4 @@ The image must be cloud-init-compatible with `sshd` installed.
 ## Next steps
 
 - [User Authentication]({{% relref "sign-ssh-keys" %}})
+- [Connecting to a Blip]({{% relref "connecting-to-a-blip" %}})
