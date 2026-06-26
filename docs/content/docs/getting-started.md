@@ -27,3 +27,4 @@ kubectl apply -f https://github.com/Azure/blip/releases/latest/download/manifest
 
 - [Create a VM Pool]({{% relref "create-vm-pool" %}})
 - [User Authentication]({{% relref "sign-ssh-keys" %}})
+- [Connecting to a Blip]({{% relref "connecting-to-a-blip" %}})
