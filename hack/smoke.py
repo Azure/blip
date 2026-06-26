@@ -7,8 +7,6 @@ Verifies:
                         nested retain with identity propagation (retain inner
                         blip, direct reconnect bypassing outer, independence
                         after outer deleted), TTL expiry
-  3. GitHub Actions:     fake API server, job discovery, VM allocation,
-                        runner provisioning, job completion, VM release
 """
 
 import json
@@ -16,15 +14,12 @@ import os
 import re
 import shutil
 import socket
-import ssl
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import traceback
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 NAMESPACE = "blip"
 POOL_NAME = "blip"
@@ -33,10 +28,6 @@ SSH_USER = "runner"
 IMAGE_NAME = "localhost/blip:smoke"
 # The base image is loaded directly into kind as a containerDisk.
 BASE_IMAGE_TAG = "blip-base:smoke"
-
-# Fake GitHub API server port (bound on the host, reachable from kind via
-# the Docker bridge gateway IP).
-FAKE_GITHUB_API_PORT = 18443
 
 # Resolved at runtime from the LoadBalancer service.
 GATEWAY_HOST = None
@@ -554,36 +545,11 @@ def setup():
     log("  Loading base image into kind...")
     run(["kind", "load", "docker-image", base_image], timeout=120, verbose=True)
 
-    # 3. Start fake GitHub Actions API and apply manifests.
-    global _fake_github_api
-    log("  Starting fake GitHub Actions API...")
-    _fake_github_api = FakeGitHubAPI(FAKE_GITHUB_API_PORT)
-    _fake_github_api.start(_tmpdir)
-
-    # Determine the host IP accessible from inside kind (Docker bridge gateway).
-    r = run(["docker", "network", "inspect", "kind", "-f",
-             "{{range .IPAM.Config}}{{.Gateway}} {{end}}"], timeout=10)
-    # Pick the IPv4 gateway (skip IPv6).
-    host_ip = None
-    for gw in r.stdout.strip().split():
-        if "." in gw and ":" not in gw:
-            host_ip = gw
-            break
-    if not host_ip:
-        raise RuntimeError(f"Could not find IPv4 gateway for kind network: {r.stdout}")
-    fake_api_url = f"https://{host_ip}:{FAKE_GITHUB_API_PORT}"
-    log(f"    Fake API: {fake_api_url}")
-
+    # 3. Apply manifests.
     log("  Applying deploy manifest...")
     with open("manifests/deploy.yaml") as f:
         deploy = f.read()
     manifest = deploy.replace("${REGISTRY}/blip:${BLIP_TAG}", IMAGE_NAME)
-    # Inject GITHUB_API_URL env var into the blip-controller container.
-    manifest = manifest.replace(
-        '        - name: VM_NAMESPACE\n',
-        f'        - name: GITHUB_API_URL\n'
-        f'          value: "{fake_api_url}"\n'
-        f'        - name: VM_NAMESPACE\n')
     run(["kubectl", "apply", "-f", "-"], input=manifest)
 
     # Restart controller to pick up the new image (kind reuses the tag
@@ -648,30 +614,6 @@ def setup():
         f"  pubkey: \"{pub_key}\"\n"
     )
     run(["kubectl", "apply", "-f", "-"], input=cm_yaml)
-
-    # 7b. Create GitHub Actions ConfigMap and PAT Secret for the Actions test.
-    log("  Creating GitHub Actions config...")
-    import base64
-    pat_b64 = base64.b64encode(_fake_github_api.token.encode()).decode()
-    actions_resources = (
-        f"apiVersion: v1\n"
-        f"kind: ConfigMap\n"
-        f"metadata:\n"
-        f"  name: github-actions\n"
-        f"  namespace: {NAMESPACE}\n"
-        f"data:\n"
-        f'  runner-labels: "self-hosted,blip"\n'
-        f'  repos: "test-org/test-repo"\n'
-        f"---\n"
-        f"apiVersion: v1\n"
-        f"kind: Secret\n"
-        f"metadata:\n"
-        f"  name: github-pat\n"
-        f"  namespace: {NAMESPACE}\n"
-        f"data:\n"
-        f'  token: "{pat_b64}"\n'
-    )
-    run(["kubectl", "apply", "-f", "-"], input=actions_resources)
 
     # 8. Wait for gateway rollout
     log("  Waiting for ssh-gateway...")
@@ -761,8 +703,6 @@ def resolve_gateway_ip():
 
 def teardown():
     log("\n=== Teardown ===")
-    if _fake_github_api:
-        _fake_github_api.stop()
     kubectl("delete", "virtualmachinepool", POOL_NAME,
             "-n", NAMESPACE, "--ignore-not-found", check=False)
     kubectl("delete", "vm", "--all", "-n", NAMESPACE, check=False)
@@ -1067,267 +1007,6 @@ def test_retained_session():
 
 
 # ---------------------------------------------------------------------------
-# Fake GitHub Actions API
-# ---------------------------------------------------------------------------
-
-class FakeGitHubAPI:
-    """Minimal fake GitHub Actions API for smoke testing.
-
-    Manages a set of fake workflow runs/jobs. The controller polls for queued
-    jobs, claims a VM, creates a JIT config, provisions the runner via SSH,
-    then polls job status until completion.
-
-    The fake server transitions jobs through states:
-      queued -> in_progress (after JIT config is created) -> completed (on demand)
-
-    Thread-safe: the HTTP handler runs in a background thread.
-    """
-
-    def __init__(self, port, token="smoke-test-token"):
-        self.port = port
-        self.token = token
-        self._lock = threading.Lock()
-        self._runs = {}       # run_id -> {"jobs": {job_id -> status}}
-        self._next_run_id = 1000
-        self._next_job_id = 5000
-        self._jit_created = set()  # job IDs that received JIT configs
-        self._server = None
-        self._thread = None
-        self._certfile = None
-        self._keyfile = None
-
-    def add_queued_job(self, labels=None):
-        """Add a queued workflow run with one job. Returns (run_id, job_id)."""
-        with self._lock:
-            run_id = self._next_run_id
-            job_id = self._next_job_id
-            self._next_run_id += 1
-            self._next_job_id += 1
-            self._runs[run_id] = {
-                "jobs": {
-                    job_id: {
-                        "status": "queued",
-                        "labels": labels or ["self-hosted", "blip"],
-                    }
-                }
-            }
-            return run_id, job_id
-
-    def complete_job(self, job_id):
-        """Mark a job as completed."""
-        with self._lock:
-            for run in self._runs.values():
-                if job_id in run["jobs"]:
-                    run["jobs"][job_id]["status"] = "completed"
-                    return
-        raise ValueError(f"job {job_id} not found")
-
-    def get_job_status(self, job_id):
-        """Get the current status of a job."""
-        with self._lock:
-            for run in self._runs.values():
-                if job_id in run["jobs"]:
-                    return run["jobs"][job_id]["status"]
-        return None
-
-    def start(self, tmpdir):
-        """Start the HTTPS server in a background thread."""
-        # Generate a self-signed cert for HTTPS.
-        self._certfile = os.path.join(tmpdir, "fake-gh.crt")
-        self._keyfile = os.path.join(tmpdir, "fake-gh.key")
-        run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
-             "-keyout", self._keyfile, "-out", self._certfile,
-             "-days", "1", "-nodes", "-subj", "/CN=fake-github-api"],
-            timeout=10)
-
-        api = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args):
-                pass  # suppress request logs
-
-            def _check_auth(self):
-                auth = self.headers.get("Authorization", "")
-                if auth != f"Bearer {api.token}":
-                    self.send_error(401, "Unauthorized")
-                    return False
-                return True
-
-            def _json_response(self, code, data):
-                body = json.dumps(data).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self):
-                if not self._check_auth():
-                    return
-                path = self.path.split("?")[0]
-
-                # GET /repos/{owner}/{repo}/actions/runs?status=queued
-                if path.endswith("/actions/runs"):
-                    with api._lock:
-                        runs = []
-                        for rid, rdata in api._runs.items():
-                            # Include run if it has any queued jobs.
-                            if any(j["status"] == "queued"
-                                   for j in rdata["jobs"].values()):
-                                runs.append({"id": rid})
-                        self._json_response(200, {"workflow_runs": runs})
-                    return
-
-                # GET /repos/{owner}/{repo}/actions/runs/{id}/jobs
-                m = re.match(r".*/actions/runs/(\d+)/jobs", path)
-                if m:
-                    run_id = int(m.group(1))
-                    with api._lock:
-                        rdata = api._runs.get(run_id, {"jobs": {}})
-                        jobs = []
-                        for jid, jdata in rdata["jobs"].items():
-                            jobs.append({
-                                "id": jid,
-                                "status": jdata["status"],
-                                "labels": jdata.get("labels", []),
-                            })
-                    self._json_response(200, {"jobs": jobs})
-                    return
-
-                # GET /repos/{owner}/{repo}/actions/jobs/{id}
-                m = re.match(r".*/actions/jobs/(\d+)", path)
-                if m:
-                    job_id = int(m.group(1))
-                    status = api.get_job_status(job_id)
-                    if status is None:
-                        self.send_error(404, "Job not found")
-                        return
-                    self._json_response(200, {"status": status})
-                    return
-
-                self.send_error(404, "Not found")
-
-            def do_POST(self):
-                if not self._check_auth():
-                    return
-                path = self.path.split("?")[0]
-
-                # POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig
-                if path.endswith("/actions/runners/generate-jitconfig"):
-                    length = int(self.headers.get("Content-Length", 0))
-                    body = json.loads(self.rfile.read(length)) if length else {}
-                    runner_name = body.get("name", "unknown")
-
-                    # Transition all queued jobs to in_progress (the real API
-                    # doesn't do this, but we use it as a signal that the
-                    # controller picked up the job).
-                    with api._lock:
-                        for rdata in api._runs.values():
-                            for jid, jdata in rdata["jobs"].items():
-                                if jdata["status"] == "queued":
-                                    jdata["status"] = "in_progress"
-                                    api._jit_created.add(jid)
-
-                    self._json_response(201, {
-                        "encoded_jit_config": "eyJmYWtlIjogdHJ1ZX0=",
-                        "runner": {
-                            "id": 42,
-                            "name": runner_name,
-                        },
-                    })
-                    return
-
-                self.send_error(404, "Not found")
-
-        self._server = HTTPServer(("0.0.0.0", self.port), Handler)
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(self._certfile, self._keyfile)
-        self._server.socket = ctx.wrap_socket(
-            self._server.socket, server_side=True)
-
-        self._thread = threading.Thread(target=self._server.serve_forever,
-                                        daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        if self._server:
-            self._server.shutdown()
-            self._thread.join(timeout=5)
-
-
-# Global fake API instance, started during setup if Actions test is included.
-_fake_github_api = None
-
-
-def test_github_actions():
-    """GitHub Actions flow: job discovery, VM allocation, provisioning, completion.
-
-    This test verifies the end-to-end Actions runner lifecycle:
-      1. A queued job appears in the fake GitHub API
-      2. The actions controller discovers it and claims a VM
-      3. The runner-config controller creates a JIT config and SSHes into the VM
-      4. The job is marked completed in the fake API
-      5. The actions-completion controller releases the VM
-    """
-    global _fake_github_api
-    wait_for_pool_ready(min_ready=1)
-
-    # Add a queued job to the fake API.
-    run_id, job_id = _fake_github_api.add_queued_job(
-        labels=["self-hosted", "blip"])
-    log(f"    Queued fake job: run={run_id}, job={job_id}")
-
-    # Wait for the controller to claim a VM for this job.
-    session_id = f"actions-{job_id}"
-    log("    Waiting for VM allocation...")
-    wait_for(
-        lambda: vm_exists(session_id),
-        f"VM with session-id {session_id}",
-        timeout=60,
-    )
-    log(f"    VM allocated for {session_id}")
-
-    # Verify the VM has the runner annotations.
-    wait_for(
-        lambda: vm_annotation(session_id, "blip.io/runner-repo") is not None,
-        "runner-repo annotation",
-        timeout=30,
-    )
-    repo = vm_annotation(session_id, "blip.io/runner-repo")
-    assert repo == "test-org/test-repo", \
-        f"Expected repo test-org/test-repo, got {repo!r}"
-    log(f"    Runner repo: {repo}")
-
-    # Wait for the runner-config controller to provision the VM (it creates
-    # a JIT config via the fake API and SSHes into the VM).
-    log("    Waiting for runner provisioning...")
-    wait_for(
-        lambda: vm_annotation(session_id, "blip.io/runner-provisioned") == "true",
-        "runner-provisioned annotation",
-        timeout=120,
-    )
-    log("    Runner provisioned")
-
-    # Mark the job as completed in the fake API.
-    log("    Marking job as completed...")
-    _fake_github_api.complete_job(job_id)
-
-    # Wait for the actions-completion controller to release the VM.
-    log("    Waiting for VM release...")
-    wait_for(
-        lambda: vm_annotation(session_id, "blip.io/release") == "true",
-        "release annotation",
-        timeout=60,
-    )
-    log("    VM marked for release")
-
-    # Wait for VM deletion.
-    log("    Waiting for VM deletion...")
-    wait_for_vm_deleted(session_id, timeout=60)
-    log("    VM deleted")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1335,7 +1014,6 @@ def main():
     tests = [
         test_ephemeral_session,   # 1 VM — each test waits for pool readiness
         test_retained_session,    # 2 VMs — highest concurrent need
-        test_github_actions,      # 1 VM — tests the Actions runner lifecycle
     ]
 
     try:

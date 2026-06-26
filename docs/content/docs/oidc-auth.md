@@ -88,4 +88,3 @@ The Azure Function requires `APISERVER_URL` set to the Kubernetes API server URL
 
 - [User Authentication]({{% relref "sign-ssh-keys" %}}) — static keys and device-flow details
 - [Nested Blips]({{% relref "nested-blips" %}})
-- [GitHub Actions Runner]({{% relref "github-actions-runner" %}})

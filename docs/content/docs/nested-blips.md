@@ -20,5 +20,3 @@ The gateway resolves the original user's identity through the VM client key. Nes
 - `blip retain` on a nested VM produces a session ID the original user can reconnect to directly.
 
 ## Next steps
-
-- [GitHub Actions Runner]({{% relref "github-actions-runner" %}})

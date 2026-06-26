@@ -1,6 +1,5 @@
 REGISTRY ?= stargatetmedev.azurecr.io
 BLIP_TAG ?= latest
-RUNNER_VERSION ?= 2.321.0
 CONTAINER_ENGINE ?= docker
 
 export REGISTRY BLIP_TAG
@@ -17,7 +16,6 @@ blip:
 .PHONY: base
 base:
 	$(CONTAINER_ENGINE) build \
-		--build-arg RUNNER_VERSION=$(RUNNER_VERSION) \
 		-t $(REGISTRY)/blip-base:$(BLIP_TAG) \
 		-f images/base/Containerfile .
 	mkdir -p dist
