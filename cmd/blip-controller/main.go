@@ -16,10 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/project-unbounded/blip/internal/controllers/actions"
 	"github.com/project-unbounded/blip/internal/controllers/deallocation"
 	"github.com/project-unbounded/blip/internal/controllers/keygen"
-	"github.com/project-unbounded/blip/internal/controllers/runnerconfig"
 	"github.com/project-unbounded/blip/internal/controllers/sshpubkey"
 	"github.com/project-unbounded/blip/internal/controllers/tlscert"
 )
@@ -42,7 +40,6 @@ func newRootCmd() *cobra.Command {
 		leaseNamespace  string
 		leaseName       string
 		gatewayHostname string
-		podName         string
 	)
 
 	cmd := &cobra.Command{
@@ -53,7 +50,7 @@ func newRootCmd() *cobra.Command {
 			if !cmd.Flags().Changed("lease-namespace") {
 				leaseNamespace = namespace
 			}
-			return run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname, podName)
+			return run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname)
 		},
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -64,7 +61,6 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&leaseNamespace, "lease-namespace", envOrDefault("LEASE_NAMESPACE", ""), "Namespace for leader election lease; defaults to --namespace (env: LEASE_NAMESPACE)")
 	cmd.Flags().StringVar(&leaseName, "lease-name", envOrDefault("LEASE_NAME", "blip-controller"), "Name of the leader election lease (env: LEASE_NAME)")
 	cmd.Flags().StringVar(&gatewayHostname, "gateway-hostname", envOrDefault("GATEWAY_HOSTNAME", ""), "Gateway hostname for TLS certificate generation (env: GATEWAY_HOSTNAME)")
-	cmd.Flags().StringVar(&podName, "pod-name", envOrDefault("POD_NAME", "blip-controller"), "Pod name for identification in VM annotations (env: POD_NAME)")
 
 	return cmd
 }
@@ -76,7 +72,7 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname, podName string) error {
+func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname string) error {
 	s, err := newScheme()
 	if err != nil {
 		return fmt.Errorf("create scheme: %w", err)
@@ -131,26 +127,6 @@ func run(namespace, poolName, leaseNamespace, leaseName, gatewayHostname, podNam
 
 	if err := sshpubkey.Add(mgr, namespace); err != nil {
 		return fmt.Errorf("adding sshpubkey controller: %w", err)
-	}
-
-	// Always register the GitHub Actions runner controller. It watches the
-	// github-actions ConfigMap and github-pat Secret dynamically — no env
-	// vars or restart needed to enable/configure.
-	patHolder, configHolder, err := actions.Add(mgr, actions.Config{
-		Namespace: namespace,
-		PoolName:  poolName,
-		PodName:   podName,
-	})
-	if err != nil {
-		return fmt.Errorf("adding actions controller: %w", err)
-	}
-
-	if err := runnerconfig.Add(mgr, runnerconfig.Config{
-		Namespace:     namespace,
-		PATHolder:     patHolder,
-		ConfigWatcher: configHolder,
-	}); err != nil {
-		return fmt.Errorf("adding runnerconfig controller: %w", err)
 	}
 
 	slog.Info("blip-controller starting")

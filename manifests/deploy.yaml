@@ -363,21 +363,6 @@ kind: ConfigMap
 metadata:
   name: ssh-gateway-oidc
   namespace: blip
----
-# GitHub Actions runner configuration (optional). To enable the Actions runner
-# backend, populate this ConfigMap with runner-labels and repos, then create a
-# github-pat Secret with a PAT token. The blip-controller watches both
-# resources at runtime; changes take effect without a restart.
-#
-# Supported fields:
-#   runner-labels  - Comma-separated runner labels (e.g. "self-hosted,blip")
-#   repos          - Comma-separated repos to poll (e.g. "my-org/my-repo")
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: github-actions
-  namespace: blip
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:

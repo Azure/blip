@@ -112,4 +112,3 @@ Default max session duration: 12 hours (`--max-session-duration`). VMs are ephem
 
 - [OIDC Authentication]({{% relref "oidc-auth" %}})
 - [Nested Blips]({{% relref "nested-blips" %}})
-- [GitHub Actions Runner]({{% relref "github-actions-runner" %}})

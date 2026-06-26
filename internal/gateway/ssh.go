@@ -280,10 +280,6 @@ func RunGateway(cfg *GatewayConfig) error {
 		slog.Info("https api server started", "addr", httpsAddr)
 	}
 
-	// Note: GitHub Actions runner polling is now handled by the actions
-	// controller in blip-controller. The gateway no longer manages runner
-	// goroutines or in-memory job state.
-
 	const drainTimeout = 30 * time.Second
 
 	sshDone := make(chan struct{})
