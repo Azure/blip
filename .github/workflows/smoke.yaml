@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  KUBEVIRT_VERSION: v1.8.1
+  KUBEVIRT_VERSION: v1.9.0
   CONTAINERDISK_IMAGE: quay.io/containerdisks/ubuntu:24.04
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Enable KVM
         run: |
@@ -28,13 +28,13 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Cache KubeVirt and containerdisk images
         id: image-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/kubevirt-images.tar
           key: kubevirt-images-${{ env.KUBEVIRT_VERSION }}-${{ env.CONTAINERDISK_IMAGE }}
@@ -98,7 +98,7 @@ jobs:
           # cloud-provider-kind assigns external IPs to LoadBalancer services
           # inside kind clusters, which the smoke tests need to reach the
           # ssh-gateway service.
-          go install sigs.k8s.io/cloud-provider-kind@latest
+          go install sigs.k8s.io/cloud-provider-kind@v0.11.1
           nohup cloud-provider-kind &>/tmp/cloud-provider-kind.log &
 
       - name: Run smoke tests

@@ -1,4 +1,4 @@
-FROM docker.io/golang:1.26.1-alpine AS deps
+FROM docker.io/golang:1.26.5-alpine AS deps
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
