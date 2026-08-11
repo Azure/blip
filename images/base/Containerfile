@@ -23,7 +23,7 @@ RUN cd /work && \
         SHA256SUMS.gpg SHA256SUMS && \
     curl -fsSL -o noble-server-cloudimg-amd64.img \
         "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img" && \
-    grep ' noble-server-cloudimg-amd64.img$' SHA256SUMS | sha256sum -c - && \
+    grep 'noble-server-cloudimg-amd64.img$' SHA256SUMS | sha256sum -c - && \
     mv noble-server-cloudimg-amd64.img disk.qcow2 && \
     rm SHA256SUMS SHA256SUMS.gpg
 
