@@ -11,7 +11,7 @@ GATEWAY=$(kubectl get svc ssh-gateway -n blip -o jsonpath='{.status.loadBalancer
 ssh $GATEWAY
 ```
 
-Registered static or OIDC keys connect immediately. Device flow prints a URL; sign in, then SSH continues.
+Registered SSH public keys connect immediately.
 
 ## Session lifecycle
 
