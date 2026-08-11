@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Configuration (override via environment)
 # ---------------------------------------------------------------------------
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
-KUBEVIRT_VERSION="${KUBEVIRT_VERSION:-v1.8.1}"
+KUBEVIRT_VERSION="${KUBEVIRT_VERSION:-v1.9.0}"
 REGISTRY="${REGISTRY:-localhost/blip}"
 BLIP_TAG="${BLIP_TAG:-dev}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"

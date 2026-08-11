@@ -68,7 +68,7 @@ spec:
           terminationGracePeriodSeconds: 5
           volumes:
           - containerDisk:
-              image: $REGISTRY/blip-base:$BLIP_TAG
+              image: ${REGISTRY}/blip-base:${BLIP_TAG}
             name: rootdisk
           - name: gw-client-pubkey
             configMap:

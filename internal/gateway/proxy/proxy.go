@@ -72,21 +72,37 @@ func RunKeepalive(ctx context.Context, conn *ssh.ServerConn, sessionID string, c
 	defer ticker.Stop()
 
 	misses := 0
+	var result <-chan error
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_, _, err := conn.SendRequest("keepalive@openssh.com", true, nil)
-			if err != nil {
-				misses++
-				if misses >= cfg.MaxMiss {
-					slog.Info("client keepalive timeout", "session_id", sessionID, "misses", misses)
-					session.Close()
-					return
+			if result == nil {
+				ch := make(chan error, 1)
+				result = ch
+				go func() {
+					_, _, err := conn.SendRequest("keepalive@openssh.com", true, nil)
+					ch <- err
+				}()
+				continue
+			}
+
+			select {
+			case err := <-result:
+				result = nil
+				if err == nil {
+					misses = 0
+					continue
 				}
-			} else {
-				misses = 0
+				misses++
+			default:
+				misses++
+			}
+			if misses >= cfg.MaxMiss {
+				slog.Info("client keepalive timeout", "session_id", sessionID, "misses", misses)
+				session.Close()
+				return
 			}
 		}
 	}

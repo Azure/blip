@@ -12,7 +12,7 @@ weight: 1
 ## Install KubeVirt
 
 ```shell
-export KUBEVIRT_VERSION=v1.8.1
+export KUBEVIRT_VERSION=v1.9.0
 kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml"
 kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml"
 ```
