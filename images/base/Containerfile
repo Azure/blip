@@ -10,23 +10,34 @@ FROM docker.io/library/ubuntu:24.04 AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libguestfs-tools linux-image-virtual qemu-utils \
-        ca-certificates curl \
+        ca-certificates curl ubuntu-cloudimage-keyring \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /work
 
 # Download official Ubuntu 24.04 cloud image.
-RUN curl -fsSL -o /work/disk.qcow2 \
-    "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+RUN cd /work && \
+    curl -fsSLO "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS" && \
+    curl -fsSLO "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg" && \
+    gpgv --keyring /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg \
+        SHA256SUMS.gpg SHA256SUMS && \
+    curl -fsSL -o noble-server-cloudimg-amd64.img \
+        "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img" && \
+    grep ' noble-server-cloudimg-amd64.img$' SHA256SUMS | sha256sum -c - && \
+    mv noble-server-cloudimg-amd64.img disk.qcow2 && \
+    rm SHA256SUMS SHA256SUMS.gpg
 
 # Pre-download Go and opencode binary (guest has no network).
-ARG GO_VERSION=1.24.2
+ARG GO_VERSION=1.26.5
+ARG GO_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
+ARG OPENCODE_VERSION=1.18.16
+ARG OPENCODE_SHA256=286e07355df06738c1905955be15b7fbc10a7b12d931de9394a6f7597246750b
 RUN curl -fsSL -o /work/go.tar.gz \
         "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" && \
-    curl -fsSL -o /work/install-opencode.sh \
-        "https://opencode.ai/install" && \
     curl -fsSL -L -o /work/opencode.tar.gz \
-        "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-x64.tar.gz"
+        "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" && \
+    echo "${GO_SHA256}  /work/go.tar.gz" | sha256sum -c - && \
+    echo "${OPENCODE_SHA256}  /work/opencode.tar.gz" | sha256sum -c -
 
 # Expand the disk so there is room to install packages, then customise.
 # We use virt-resize to grow sda1 and its filesystem in one step.
@@ -59,10 +70,9 @@ cat > /etc/profile.d/golang.sh <<'EOF'
 export PATH="/usr/local/go/bin:$PATH"
 EOF
 
-# Install opencode using the install script with --binary flag.
-bash /tmp/install-opencode.sh --binary /tmp/opencode --no-modify-path
-ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode
-rm -f /tmp/opencode /tmp/install-opencode.sh /tmp/opencode.tar.gz
+# Install opencode.
+install -m 0755 /tmp/opencode /usr/local/bin/opencode
+rm -f /tmp/opencode /tmp/opencode.tar.gz
 
 # Create the default SSH user for blip sessions.
 useradd -m -s /bin/bash runner
@@ -72,7 +82,6 @@ RUN export LIBGUESTFS_BACKEND=direct && \
     virt-customize -a /work/disk.qcow2 \
         --copy-in /work/debs:/tmp \
         --copy-in /work/go.tar.gz:/tmp \
-        --copy-in /work/install-opencode.sh:/tmp \
         --copy-in /work/opencode.tar.gz:/tmp \
         --run-command 'tar -xzf /tmp/opencode.tar.gz -C /tmp && rm /tmp/opencode.tar.gz' \
         --run /work/setup.sh

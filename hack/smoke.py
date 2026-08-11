@@ -588,7 +588,7 @@ def setup():
     with open("manifests/pool.yaml") as f:
         pool_manifest = f.read()
     pool_manifest = pool_manifest.replace(
-        "$REGISTRY/blip-base:$BLIP_TAG",
+        "${REGISTRY}/blip-base:${BLIP_TAG}",
         f"localhost/{BASE_IMAGE_TAG}")
     run(["kubectl", "apply", "-f", "-"], input=pool_manifest)
     kubectl("patch", "virtualmachinepool", POOL_NAME, "-n", NAMESPACE,
