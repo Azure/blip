@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Enable KVM
         run: |
@@ -28,13 +28,13 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
       - name: Cache KubeVirt and containerdisk images
         id: image-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/kubevirt-images.tar
           key: kubevirt-images-${{ env.KUBEVIRT_VERSION }}-${{ env.CONTAINERDISK_IMAGE }}
