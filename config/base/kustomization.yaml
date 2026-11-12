@@ -1,0 +1,8 @@
+resources:
+- namespace.yaml
+- crd
+- policy
+- rbac
+- controller.yaml
+- node.yaml
+- storage-configmap.yaml

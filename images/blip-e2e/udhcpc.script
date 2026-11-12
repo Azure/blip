@@ -1,0 +1,46 @@
+#!/bin/sh
+# busybox udhcpc script: configure the leased address, routes, MTU and DNS.
+# The Blip slot's DHCP server leases the slot pod IP for 24h.
+# shellcheck disable=SC2154 # variables come from udhcpc
+event=$1
+case $event in
+deconfig)
+	ip -4 addr flush dev "$interface"
+	ip link set "$interface" up
+	;;
+bound | renew)
+	[ -n "$mtu" ] && ip link set "$interface" mtu "$mtu"
+	if [ "$(ip -4 -o addr show dev "$interface" | awk '{print $4}')" != "$ip/${mask:-32}" ]; then
+		ip -4 addr flush dev "$interface"
+		ip addr add "$ip/${mask:-32}" ${broadcast:+broadcast "$broadcast"} dev "$interface"
+	fi
+	ip -4 route flush dev "$interface" proto static 2>/dev/null
+	if [ -n "$staticroutes" ]; then
+		# shellcheck disable=SC2086
+		set -- $staticroutes
+		while [ $# -ge 2 ]; do
+			case $2 in
+			0.0.0.0) ip route replace "$1" dev "$interface" proto static ;;
+			*) ip route replace "$1" via "$2" dev "$interface" onlink proto static ;;
+			esac
+			shift 2
+		done
+	else
+		for r in $router; do
+			ip route replace default via "$r" dev "$interface" onlink proto static
+			break
+		done
+	fi
+	{
+		[ -n "$search" ] && echo "search $search"
+		[ -z "$search" ] && [ -n "$domain" ] && echo "search $domain"
+		for d in $dns; do echo "nameserver $d"; done
+		echo "options ndots:5"
+	} >/etc/resolv.conf.new && mv /etc/resolv.conf.new /etc/resolv.conf
+	echo "E2E dhcp $event ip=$ip/${mask:-32} router=$router dns=$dns lease=$lease" >/dev/console
+	;;
+leasefail | nak)
+	echo "E2E dhcp $event ${message:-}" >/dev/console
+	;;
+esac
+exit 0

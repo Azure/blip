@@ -1,0 +1,15 @@
+# Slot pool for SKU "default": 2 vCPU, 2Gi guest memory (design 6.1). The
+# controller creates the slot pods; their resources follow from cpus,
+# memory and its --slot-* flags. It keeps between minFree and maxFree free
+# slots, more while Blips are being scheduled.
+apiVersion: blip.example.com/v1alpha1
+kind: BlipPool
+metadata:
+  name: default
+spec:
+  sku: default
+  cpus: 2
+  memory: 2Gi
+  hypervisor: kvm
+  minFree: 2
+  maxFree: 20

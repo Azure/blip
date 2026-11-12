@@ -1,0 +1,5 @@
+.git
+bin/tools/
+bin/envtest/
+_output/guest/dl/
+.cache/

@@ -1,0 +1,269 @@
+# Design section 3.4.
+# 1. Only the controller may set blip.example.com/ labels (lineage, ...) on
+# BlipVols.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-blipvol-controller-fields
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [blip.example.com]
+      apiVersions: ["*"]
+      operations: [CREATE, UPDATE]
+      resources: [blipvols]
+  matchConditions:
+  - name: not-controller
+    expression: request.userInfo.username != 'system:serviceaccount:blip-system:blip-controller'
+  variables:
+  - name: newLabels
+    expression: "has(object.metadata.labels) ? object.metadata.labels : {}"
+  - name: oldLabels
+    expression: "oldObject != null && has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}"
+  validations:
+  - expression: >-
+      variables.newLabels.all(k, !k.startsWith('blip.example.com/') ||
+        (k in variables.oldLabels && variables.oldLabels[k] == variables.newLabels[k])) &&
+      variables.oldLabels.all(k, !k.startsWith('blip.example.com/') || k in variables.newLabels)
+    message: only the Blip controller may add, change or remove blip.example.com/ labels
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-blipvol-controller-fields
+spec:
+  policyName: blip-blipvol-controller-fields
+  validationActions: [Deny]
+---
+# 2. A cross-namespace parent requires get on that BlipVol.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-blipvol-parent-access
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [blip.example.com]
+      apiVersions: ["*"]
+      operations: [CREATE]
+      resources: [blipvols]
+  matchConditions:
+  - name: cross-namespace-parent
+    expression: >-
+      has(object.spec.parent) && has(object.spec.parent.namespace) &&
+      object.spec.parent.namespace != '' && object.spec.parent.namespace != request.namespace
+  validations:
+  - expression: >-
+      authorizer.group('blip.example.com').resource('blipvols')
+        .namespace(object.spec.parent.namespace).name(object.spec.parent.name)
+        .check('get').allowed()
+    messageExpression: "'no get access to blipvol ' + object.spec.parent.namespace + '/' + object.spec.parent.name"
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-blipvol-parent-access
+spec:
+  policyName: blip-blipvol-parent-access
+  validationActions: [Deny]
+---
+# 3. The garbage collector may not delete assigned slot pods. Free slot pods
+# are owned by their BlipPool; claiming one strips that owner reference, so
+# deleting a pool never deletes a running Blip's pod. This guards against a
+# claimed pod that still carries an owner reference (for example one the
+# controller failed to strip). Slot pods live in tenant namespaces, so this
+# applies to all namespaces.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-protect-assigned-slots
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: [v1]
+      operations: [DELETE]
+      resources: [pods]
+  matchConditions:
+  - name: garbage-collector
+    expression: request.userInfo.username == 'system:serviceaccount:kube-system:generic-garbage-collector'
+  validations:
+  - expression: >-
+      !(has(oldObject.metadata.labels) && 'blip.example.com/slot' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['blip.example.com/slot'] == 'assigned')
+    message: assigned Blip slot pods are not deleted by the garbage collector
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-protect-assigned-slots
+spec:
+  policyName: blip-protect-assigned-slots
+  validationActions: [Deny]
+---
+# 4. Only the controller changes the blip.example.com/ labels and
+# annotations of an existing slot pod (claiming it), so tenants who may edit
+# pods in their namespace cannot free, steal or relabel a slot, or turn one
+# of their own pods into a slot by adding the blip.example.com/slot label
+# (policy 6 covers creating one).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-slot-pod-fields
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: [v1]
+      operations: [UPDATE]
+      resources: [pods]
+  matchConditions:
+  - name: slot-pod
+    expression: >-
+      (has(oldObject.metadata.labels) && 'blip.example.com/slot' in oldObject.metadata.labels) ||
+      (has(object.metadata.labels) && 'blip.example.com/slot' in object.metadata.labels)
+  - name: not-controller
+    expression: request.userInfo.username != 'system:serviceaccount:blip-system:blip-controller'
+  variables:
+  - name: oldMeta
+    expression: >-
+      (has(oldObject.metadata.labels) ? oldObject.metadata.labels.filter(k, k.startsWith('blip.example.com/')).map(k, 'l/' + k + '=' + oldObject.metadata.labels[k]) : []) +
+      (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations.filter(k, k.startsWith('blip.example.com/')).map(k, 'a/' + k + '=' + oldObject.metadata.annotations[k]) : [])
+  - name: newMeta
+    expression: >-
+      (has(object.metadata.labels) ? object.metadata.labels.filter(k, k.startsWith('blip.example.com/')).map(k, 'l/' + k + '=' + object.metadata.labels[k]) : []) +
+      (has(object.metadata.annotations) ? object.metadata.annotations.filter(k, k.startsWith('blip.example.com/')).map(k, 'a/' + k + '=' + object.metadata.annotations[k]) : [])
+  validations:
+  - expression: "variables.oldMeta.all(x, x in variables.newMeta) && variables.newMeta.all(x, x in variables.oldMeta)"
+    message: only the Blip controller may change blip.example.com/ labels and annotations of slot pods
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-slot-pod-fields
+spec:
+  policyName: blip-slot-pod-fields
+  validationActions: [Deny]
+---
+# 5. Outside blip-system the controller creates and deletes only token
+# binding Secrets (labeled blip.example.com/allocation), so its cluster-wide
+# Secret permissions cannot touch tenants' other Secrets.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-controller-secrets
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: [v1]
+      operations: [CREATE, DELETE]
+      resources: [secrets]
+  matchConditions:
+  - name: controller
+    expression: request.userInfo.username == 'system:serviceaccount:blip-system:blip-controller'
+  - name: tenant-namespace
+    expression: request.namespace != 'blip-system'
+  variables:
+  - name: obj
+    expression: "request.operation == 'DELETE' ? oldObject : object"
+  validations:
+  - expression: >-
+      has(variables.obj.metadata.labels) && 'blip.example.com/allocation' in variables.obj.metadata.labels &&
+      variables.obj.type == 'blip.example.com/token-binding'
+    message: the Blip controller may only create and delete token binding Secrets in tenant namespaces
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-controller-secrets
+spec:
+  policyName: blip-controller-secrets
+  validationActions: [Deny]
+---
+# 6. Slot pods are created only by the controller, for a BlipPool, so no one
+# else can offer a pod for Blips to claim. The controller's cluster-wide pod
+# create permission is limited to free slot pods of a fixed, unprivileged
+# shape: one slot container with at most NET_ADMIN, no volumes, no host
+# namespaces and no service account token.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-slot-pod-create
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: [v1]
+      operations: [CREATE]
+      resources: [pods]
+  matchConditions:
+  - name: slot-pod-or-controller
+    expression: >-
+      (has(object.metadata.labels) && 'blip.example.com/slot' in object.metadata.labels) ||
+      request.userInfo.username == 'system:serviceaccount:blip-system:blip-controller'
+  variables:
+  - name: labels
+    expression: "has(object.metadata.labels) ? object.metadata.labels : {}"
+  - name: owners
+    expression: "has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []"
+  validations:
+  - expression: request.userInfo.username == 'system:serviceaccount:blip-system:blip-controller'
+    message: only the Blip controller may create slot pods
+    reason: Forbidden
+  - expression: >-
+      'blip.example.com/slot' in variables.labels && variables.labels['blip.example.com/slot'] == 'free' &&
+      'blip.example.com/sku' in variables.labels && 'blip.example.com/pool' in variables.labels
+    message: the Blip controller may only create free slot pods with sku and pool labels
+    reason: Forbidden
+  - expression: >-
+      size(variables.owners) == 1 &&
+      variables.owners[0].apiVersion == 'blip.example.com/v1alpha1' && variables.owners[0].kind == 'BlipPool' &&
+      has(variables.owners[0].controller) && variables.owners[0].controller
+    message: slot pods must have exactly one owner, their BlipPool as controller
+    reason: Forbidden
+  - expression: >-
+      size(object.spec.containers) == 1 &&
+      (!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) &&
+      (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)
+    message: slot pods have exactly one container and no init or ephemeral containers
+    reason: Forbidden
+  - expression: "!has(object.spec.volumes) || size(object.spec.volumes) == 0"
+    message: slot pods have no volumes
+    reason: Forbidden
+  - expression: >-
+      !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+      !(has(object.spec.hostPID) && object.spec.hostPID) &&
+      !(has(object.spec.hostIPC) && object.spec.hostIPC)
+    message: slot pods do not use host namespaces
+    reason: Forbidden
+  - expression: >-
+      object.spec.containers.all(c, !has(c.securityContext) || (
+        !(has(c.securityContext.privileged) && c.securityContext.privileged) &&
+        !(has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation) &&
+        (!has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) ||
+          c.securityContext.capabilities.add.all(x, x == 'NET_ADMIN'))))
+    message: slot pods are not privileged and may add only the NET_ADMIN capability
+    reason: Forbidden
+  - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+    message: slot pods do not mount a service account token
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-slot-pod-create
+spec:
+  policyName: blip-slot-pod-create
+  validationActions: [Deny]

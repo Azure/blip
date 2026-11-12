@@ -1,0 +1,11 @@
+namespace: blip-demo
+resources:
+- namespace.yaml
+- ../common
+# Kind has 6 hypervisor devices in total; leave most to blip-e2e.
+patches:
+- target: {kind: BlipPool, name: default}
+  patch: |
+    - {op: replace, path: /spec/minFree, value: 1}
+    - {op: replace, path: /spec/maxFree, value: 1}
+    - {op: replace, path: /spec/maxSlots, value: 1}

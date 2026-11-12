@@ -1,0 +1,103 @@
+# Design section 13.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blip-controller
+  namespace: blip-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blip-controller
+rules:
+- apiGroups: [blip.example.com]
+  resources: [blips, blipvols]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [blip.example.com]
+  resources: [blips/status, blipvols/status, blips/finalizers, blipvols/finalizers]
+  verbs: [get, update, patch]
+# BlipPools are written by operators; the controller reads them, writes
+# status, and sets them as the blockOwnerDeletion owner of the free slot
+# pods it creates (which needs update on blippools/finalizers).
+- apiGroups: [blip.example.com]
+  resources: [blippools]
+  verbs: [get, list, watch, update, patch]
+- apiGroups: [blip.example.com]
+  resources: [blippools/status]
+  verbs: [get, update, patch]
+- apiGroups: [blip.example.com]
+  resources: [blippools/finalizers]
+  verbs: [update]
+# Nodes: fencing (node.kubernetes.io/out-of-service taint).
+- apiGroups: [""]
+  resources: [namespaces, nodes]
+  verbs: [get, list, watch]
+# Slot pods live in tenant namespaces (create for pools, claim, release,
+# delete). The controller watches only pods with the blip.example.com/slot
+# label; policy 6 limits what it may create.
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch, create, update, patch, delete]
+# Blip service accounts: existence check and tokens for guests.
+- apiGroups: [""]
+  resources: [serviceaccounts]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [serviceaccounts/token]
+  verbs: [create]
+# Image pull secrets in tenant namespaces, and the per-allocation Secrets
+# that guest service account tokens are bound to (policy 5 limits create and
+# delete to those).
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [get, list, create, delete]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch]
+- apiGroups: [authentication.k8s.io]
+  resources: [tokenreviews]
+  verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: blip-controller
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: blip-controller}
+subjects:
+- {kind: ServiceAccount, name: blip-controller, namespace: blip-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blip-controller
+  namespace: blip-system
+rules:
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, list, watch, create, update, patch]
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [create]
+- apiGroups: [""]
+  resources: [configmaps]
+  resourceNames: [blip-ca]
+  verbs: [update, patch]
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [get, list, watch, create]
+- apiGroups: [""]
+  resources: [secrets]
+  resourceNames: [blip-ca, blip-nvme-psk]
+  verbs: [update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blip-controller
+  namespace: blip-system
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: blip-controller}
+subjects:
+- {kind: ServiceAccount, name: blip-controller, namespace: blip-system}

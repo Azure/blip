@@ -1,0 +1,34 @@
+resources:
+- ../../base
+# Each namespace is its own pool of slots (the e2e namespaces and a demo).
+- slots/blip-e2e
+- slots/blip-e2e-quota
+- slots/blip-demo
+images:
+- {name: blipd, newName: blip/blipd, newTag: dev}
+patches:
+# Short timers so hack/e2e runs fast (kind only, see docs/e2e.md):
+# --snapshot-interval-scale=60 divides BlipVol snapshot intervals, so the
+# 5m API minimum takes an interval snapshot every 5s. --heartbeat=3s drops
+# a silent session after 9s (3 heartbeats, both sides). A node is lost
+# after --node-lost-timeout=40s disconnected: this must exceed the node
+# daemon's longest reconnect backoff (30s), or a controller restart could
+# declare connected nodes lost. --token-ttl=10m (the API server minimum)
+# makes guest tokens rotate every 8 minutes. Slot pods use the locally
+# loaded blip-slot image.
+- target: {kind: Deployment, name: blip-controller}
+  patch: |
+    - {op: add, path: /spec/template/spec/containers/0/imagePullPolicy, value: IfNotPresent}
+    - {op: replace, path: /spec/template/spec/containers/0/args, value: [controller, --slot-image=blip/blip-slot:dev, --snapshot-interval-scale=60, --heartbeat=3s, --node-lost-timeout=40s, --token-ttl=10m]}
+- target: {kind: DaemonSet, name: blip-node}
+  patch: |
+    - {op: add, path: /spec/template/spec/containers/0/imagePullPolicy, value: IfNotPresent}
+    - {op: add, path: /spec/template/spec/containers/1/imagePullPolicy, value: IfNotPresent}
+- target: {kind: ConfigMap, name: blip-storage}
+  patch: |
+    - op: replace
+      path: /data/config.yaml
+      value: |
+        groups:
+        - name: sg-1
+          nodes: [blip-worker, blip-worker2, blip-worker3]

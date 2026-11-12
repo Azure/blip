@@ -1,0 +1,784 @@
+// Controller-node protocol. See README.md in this directory for the flows.
+syntax = "proto3";
+
+package blip.node.v1;
+
+option go_package = "github.com/example/blip/internal/proto/nodepb";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// Controller is served by the controller on blip-controller.blip-system.svc:8443
+// over TLS. The node dials it. Every RPC carries the node's projected
+// service-account token (audience "blip") in the "authorization: Bearer <token>"
+// metadata. The controller checks it with TokenReview and confirms the pod runs
+// on the node named in Hello.
+service Controller {
+  // Session is the long-lived link. The first NodeMessage is Hello, the first
+  // ControllerMessage is Welcome. After that the controller sends commands and
+  // the node sends command results and its full NodeState whenever it
+  // changes. A node has at most one session; a new session from the same
+  // node replaces the old one.
+  rpc Session(stream NodeMessage) returns (stream ControllerMessage);
+
+}
+
+// ---------------------------------------------------------------------------
+// Envelopes
+
+message NodeMessage {
+  oneof msg {
+    Hello hello = 1;
+    CommandResult result = 2;
+    Heartbeat heartbeat = 4;
+    // The full state, sent whenever it changed. Every state replaces the
+    // previous one: the node coalesces changes and never sends a partial
+    // state. A change made before a command result is queued is sent
+    // before that result.
+    NodeState state = 6;
+  }
+  // Event (Started, Exited, SlotLost, Capacity, SlotsChanged), replaced by state.
+  reserved 3, 5;
+  reserved "event", "certificate_request";
+}
+
+message ControllerMessage {
+  oneof msg {
+    Welcome welcome = 1;
+    Command command = 2;
+    Heartbeat heartbeat = 3;
+  }
+  reserved 4;
+  reserved "certificate_issued";
+}
+
+message Heartbeat {
+  google.protobuf.Timestamp time = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Handshake
+
+message Hello {
+  string node_name = 1;
+  // Kernel boot ID. A change means all local compute state is gone.
+  string boot_id = 2;
+  Capabilities capabilities = 4;
+  Capacity capacity = 5;
+  // Full state, so the controller can rebuild after either side restarts.
+  NodeState state = 6;
+  reserved 3, 7, 8;
+  reserved "version", "csr", "xfer_address";
+}
+
+message Capabilities {
+  bool storage = 1;              // has storage.vg in node config
+  bool compute = 2;              // slots > 0
+  string hypervisor = 3;         // "kvm" or "mshv"
+  int32 slots = 4;
+  string storage_address = 5;    // IP for NVMe/TCP traffic
+  uint32 storage_port = 6;       // nvmet TCP port this node uses
+  string vg = 7;
+  int64 chunk_size_bytes = 8;
+  int32 max_lvs = 9;
+  reserved 10;
+  reserved "disks_per_slot"; // see ComputeCapacity.disks_per_slot
+}
+
+message Welcome {
+  // This node's NVMe host NQN, nqn.2026-01.com.example.blip:host:<node>.
+  string host_nqn = 1;
+  // 32-byte PSK for host_nqn: HMAC-SHA256(clusterKey, hostNQN).
+  bytes host_psk = 2;
+  // Allocations the controller considers finished. The node tears down any
+  // it still has and rejects later commands for them.
+  repeated string finished_allocation_ids = 3;
+  google.protobuf.Duration heartbeat_interval = 4;
+  reserved 5, 6, 7, 8;
+  reserved "controller_epoch", "certificate", "ca_certificates", "certificate_error";
+}
+
+// ---------------------------------------------------------------------------
+// Shared types
+
+// ObjectRef identifies a Kubernetes object. UIDs prevent acting on a reused name.
+message ObjectRef {
+  string namespace = 1;
+  string name = 2;
+  string uid = 3;
+}
+
+// Path is one NVMe/TCP path to an export on one replica.
+message Path {
+  string node = 1;            // storage node name
+  string subsystem_nqn = 2;
+  string address = 3;
+  uint32 port = 4;
+}
+
+// Extent is a byte range. Offsets and lengths are multiples of the chunk size.
+message Extent {
+  int64 offset_bytes = 1;
+  int64 length_bytes = 2;
+}
+
+enum ContentKind {
+  CONTENT_KIND_UNSPECIFIED = 0;
+  CONTENT_KIND_ROOT = 1;      // image or empty import
+  CONTENT_KIND_CLONE = 2;     // snapshot or full copy of a parent
+  reserved 3;                 // CONTENT_KIND_SEED, removed
+  CONTENT_KIND_REPAIR = 4;    // rebuild in progress
+  CONTENT_KIND_SNAPSHOT = 5;  // received captured snapshot (PrepareReceive)
+}
+
+enum ExportMode {
+  EXPORT_MODE_UNSPECIFIED = 0;
+  EXPORT_MODE_READ_ONLY = 1;
+  EXPORT_MODE_READ_WRITE = 2;
+}
+
+// TargetResult is the outcome of writing to one replica.
+message TargetResult {
+  string node = 1;
+  bool ok = 2;
+  string error = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Commands, controller to node
+
+// Rules: every command is idempotent (the node checks LVs and devices before
+// acting) and carries an operation ID. Re-sending the same operation ID returns
+// the result of the first attempt, or IN_PROGRESS. The node rejects commands
+// for allocations it was told are finished.
+message Command {
+  string operation_id = 1;
+  // Give up after this time. The node reports DEADLINE_EXCEEDED and cleans up
+  // what it created for this operation.
+  google.protobuf.Timestamp deadline = 2;
+  oneof op {
+    Export export = 11;
+    Unexport unexport = 12;
+    AssignSlot assign_slot = 13;
+    StartWorkload start_workload = 14;
+    Kill kill = 15;
+    Seal seal = 17;
+    DeleteContent delete_content = 18;
+    CreateContent create_content = 19;
+    Import import = 20;
+    Clone clone = 21;
+    Repair repair = 22;
+    Scrub scrub = 23;
+    ListState list_state = 24;
+    Release release = 25;
+    AttachVolume attach_volume = 29;
+    DetachVolume detach_volume = 30;
+    CaptureLocal capture_local = 31;
+    DropLocalSnapshot drop_local_snapshot = 32;
+    PrepareReceive prepare_receive = 33;
+    ReleaseAttachment release_attachment = 35;
+    UpdateCredentials update_credentials = 36;
+    WriteSnapshot write_snapshot = 37;
+  }
+  // SendSnapshot (custom transfer protocol), removed.
+  reserved 34;
+  reserved "send_snapshot";
+  // Log commands, removed.
+  reserved 26, 27, 28;
+  reserved "open_log_stream", "close_log_stream", "delete_logs";
+  // Seed commands, removed.
+  reserved 10, 16;
+  reserved "prepare_seed", "save_extents";
+}
+
+// ---------------------------------------------------------------------------
+// Attachments
+//
+// An attachment is one BlipVol attached to one allocation: a private
+// writable dm-thin overlay on the compute node whose read-only external
+// origin is the BlipVol's sealed content (exported read-only by its
+// replicas, assembled with dm-multipath). attachment_id is 16 hex characters
+// chosen by the controller, new for every attach. generation is the BlipVol
+// claim generation (status.claim.generation).
+//
+// Generation rules, enforced by the node daemon (before any side effect)
+// for every command that carries attachment_id + generation:
+// - The node remembers, per BlipVol UID, the highest generation it has seen
+//   (boot-scoped, survives daemon restarts). A command whose generation is
+//   lower than that is REJECTED with ERROR_CODE_STALE_GENERATION.
+// - A command naming an attachment_id the node has with a different
+//   generation is REJECTED with ERROR_CODE_STALE_GENERATION (lower) or
+//   ERROR_CODE_CONFLICT (higher).
+// - Commands for an unknown attachment_id: AttachVolume creates it;
+//   DetachVolume, DropLocalSnapshot and ReleaseAttachment succeed (nothing
+//   to do); CaptureLocal and WriteSnapshot fail with ERROR_CODE_NOT_FOUND.
+
+// AttachmentRef names one attachment and its claim generation.
+message AttachmentRef {
+  string attachment_id = 1;
+  int64 generation = 2;
+}
+
+// AttachVolume (compute node): connect origin_paths, build the origin
+// multipath device, create the overlay (thin with the origin as external
+// origin), point slot disk slot_disk at it, create the host link
+// /dev/blip/volumes/<uid> and the slot link <slotDir>/volumes/<uid>, and
+// hot-plug it into Cloud Hypervisor (disk ID "blip-"+attachment_id, virtio
+// serial = name, so the guest sees /dev/disk/by-id/virtio-<name>). Requires
+// AssignSlot done. Initial volumes are attached before StartWorkload.
+// Idempotent: every step checks before acting. REJECTED with
+// ERROR_CODE_CONFLICT if slot_disk or the UID is used by another attachment
+// of this node.
+message AttachVolume {
+  string allocation_id = 1;
+  string attachment_id = 2;
+  int64 generation = 3;
+  // BlipVol UID; names the guest and host links.
+  string uid = 4;
+  // Attachment name (spec.volumes[].name), at most 20 bytes: the virtio
+  // serial of the disk.
+  string name = 5;
+  // Sealed content of the BlipVol: the overlay's read-only origin.
+  string content_id = 6;
+  int64 size_bytes = 7;
+  // One per replica with a read-only export of content_id for this node.
+  // The node uses its host NQN and PSK from Welcome.
+  repeated Path origin_paths = 8;
+  // Index N of /dev/blip/disks/N in the slot. 0 <= N < disks_per_slot.
+  int32 slot_disk = 9;
+  // BlipVol, for logs and dm names.
+  ObjectRef blipvol = 10;
+}
+
+message AttachVolumeResult {
+  string guest_path = 1;        // /dev/disk/by-id/virtio-<name>
+  string host_path = 3;         // /dev/blip/volumes/<uid> on the host
+  reserved 2;
+  reserved "by_name_path";
+}
+
+// DetachVolume (compute node): Cloud Hypervisor remove-device (forced; the
+// guest is not asked), then wait until the hypervisor no longer has the
+// device open, then point the slot disk back at the error target. The
+// overlay and the origin paths stay (needed for the final capture) until
+// ReleaseAttachment. If the VM is not running, only the unplug bookkeeping
+// is done and the result is OK. Refused (REJECTED) for the root attachment
+// while the VM runs.
+message DetachVolume {
+  string allocation_id = 1;
+  string attachment_id = 2;
+  int64 generation = 3;
+}
+
+// CaptureLocal (compute node): local snapshot of a set of attachments of
+// one allocation. Suspends all overlays (drains in-flight I/O),
+// create_snap of each, resumes all, activates the snapshots read-only. If
+// the suspended window exceeds 2s everything is resumed, the partial
+// snapshots are deleted and the result is FAILED with
+// ERROR_CODE_SUSPEND_TIMEOUT. Guest CPUs are never paused. Works with the
+// VM running or stopped (final capture).
+//
+// The snapshot is crash-consistent: ext4 replays its journal when it is
+// mounted. A stopped VM (final capture) is as consistent as its shutdown.
+//
+// Idempotent per (allocation_id, seq): a repeat returns the existing
+// snapshots; a repeat with a different attachment set is REJECTED. seq is
+// chosen by the controller: unique in the allocation among the captures
+// that still have a local snapshot, and increasing per attachment (the
+// controller captures one attachment at a time and uses the BlipVol
+// snapshot sequence * 1024 + the slot disk).
+// Local retention: per attachment at most the last committed baseline plus
+// one in-flight capture; the node fails with ERROR_CODE_CONFLICT if that
+// would be exceeded (the controller must DropLocalSnapshot first).
+message CaptureLocal {
+  string allocation_id = 1;
+  int64 seq = 2;
+  repeated AttachmentRef attachments = 3;
+  reserved 4, 5;
+  reserved "freeze", "freeze_timeout";
+}
+
+message CaptureLocalResult {
+  repeated LocalSnapshotInfo snapshots = 1;
+  google.protobuf.Duration suspended = 2;   // length of the suspended window
+  reserved 3, 4;
+  reserved "consistency", "freeze_message";
+}
+
+// DropLocalSnapshot (compute node): delete local snapshot seq of an
+// attachment. Idempotent; unknown snapshots succeed.
+message DropLocalSnapshot {
+  string allocation_id = 1;
+  string attachment_id = 2;
+  int64 generation = 3;
+  int64 seq = 4;
+}
+
+// PrepareReceive (storage node): create unsealed, unexported content
+// c-<content_id> to receive a captured snapshot: an LVM thin snapshot of
+// base_content_id on this replica, or a blank thin of size_bytes when
+// base_content_id is empty. The controller then exports it read-write to
+// the compute node, which writes the snapshot with WriteSnapshot.
+// Idempotent: unsealed content prepared for the same generation is kept
+// as is; content prepared for an older generation is recreated; a newer
+// generation is REJECTED with ERROR_CODE_STALE_GENERATION. Sealed content
+// is REJECTED.
+message PrepareReceive {
+  string content_id = 1;
+  string base_content_id = 2;   // empty: blank thin of size_bytes
+  int64 size_bytes = 3;
+  ObjectRef owner = 4;          // snapshot BlipVol, recorded in an LV tag
+  int64 generation = 5;         // claim generation of the source attachment
+  string allocation_id = 9;     // source allocation, for logs
+  string attachment_id = 10;    // source attachment, for logs
+  reserved 6, 7, 8;
+  reserved "token", "source_node", "expiry";
+}
+
+message PrepareReceiveResult {
+  bool ok = 1;
+  reserved 2, 3;
+  reserved "committed", "xfer_address";
+}
+
+// WriteSnapshot (compute node): write local snapshot seq of an attachment
+// to every target in parallel. Each target is a read-write export, for
+// this node, of content prepared by PrepareReceive. The written ranges
+// are the thin delta of snapshot seq against snapshot base_seq (base_seq
+// 0: all blocks mapped in the overlay, i.e. changes since the origin).
+// With full set, or when the delta is impossible, the whole device is
+// written (reading through the origin), for a target whose base is empty.
+// The node connects over NVMe/TCP with TLS (its host NQN and PSK from
+// Welcome), copies with direct I/O, flushes and disconnects. Result
+// status is OK if at least one target succeeded; per-target results tell
+// which. Idempotent per operation; writing the same ranges again is safe.
+message WriteSnapshot {
+  string allocation_id = 1;
+  string attachment_id = 2;
+  int64 generation = 3;
+  int64 seq = 4;
+  int64 base_seq = 5;           // 0: since the origin
+  bool full = 6;                // write the whole device
+  string content_id = 7;        // content prepared on the targets, for logs
+  repeated Path targets = 8;    // read-write exports on the replicas
+}
+
+message WriteSnapshotResult {
+  int64 changed_bytes = 1;      // size of the written ranges
+  bool full_resend = 2;         // delta was impossible; the whole device was written
+  repeated TargetResult targets = 3;
+}
+
+// ReleaseAttachment (compute node): remove the overlay, its local
+// snapshots, the origin multipath and paths, the slot disk mapping and the
+// host and slot links. Requires the attachment detached (DetachVolume OK)
+// or the VM stopped; otherwise REJECTED. Idempotent; unknown attachments
+// succeed. After OK the controller may release the claim.
+message ReleaseAttachment {
+  string allocation_id = 1;
+  string attachment_id = 2;
+  int64 generation = 3;
+}
+
+// Export (storage node): export c-<content_id> over NVMe/TCP with TLS,
+// allowing only host_nqn. The node inserts the PSK into the .nvme keyring.
+// Read-write exports are refused for sealed content unless repair_sealed is set.
+message Export {
+  string content_id = 1;
+  ExportMode mode = 2;
+  string host_node = 3;
+  string host_nqn = 4;
+  bytes host_psk = 5;
+  string allocation_id = 6;      // empty for import, clone and repair
+  // Allow a read-write export of sealed content, for scrub repair only.
+  bool repair_sealed = 7;
+}
+
+// Unexport (storage node): remove the export of content_id for host_nqn, and
+// its key. Empty host_nqn removes all exports of the content.
+message Unexport {
+  string content_id = 1;
+  string host_nqn = 2;
+}
+
+// AssignSlot (compute node): bind the allocation to the claimed slot pod:
+// write assignment.json and the assigned marker in the slot directory. The
+// slot boots the VM with no data disks; all disks (including the root
+// volume) are hot-plugged by AttachVolume. Replaces the old Attach, which
+// also attached the seed.
+message AssignSlot {
+  string allocation_id = 1;
+  ObjectRef blip = 2;
+  ObjectRef pod = 3;            // claimed slot pod, in the Blip's namespace
+  google.protobuf.Timestamp deadline = 7;
+  // blipd slot kills Cloud Hypervisor at deadline + kill_grace. The
+  // controller sends a graceful Kill at the deadline; the grace lets that
+  // finish first, so the slot kill is only a backstop.
+  google.protobuf.Duration kill_grace = 9;
+  // Guest ports that blipd slot forwards from the pod's loopback to the
+  // same guest vsock port (Blip spec.ports), for kubectl port-forward.
+  repeated uint32 ports = 8;
+  reserved 4, 5, 6;
+  reserved "seed_content_id", "size_bytes", "paths";
+}
+
+// RunParams are the boot parameters the node writes to the metadata disk.
+message RunParams {
+  // argv the boot stub execs as PID 1 after it mounts the root (Blip
+  // spec.init; never empty, default ["/sbin/init"]).
+  repeated string init = 1;
+  // ext4 mount options of the root volume (Blip spec.rootMountOptions).
+  string root_mount_options = 2;
+  string hostname = 5;          // Blip name
+  // Ports reach blipd slot through AssignSlot.ports; the deadline through
+  // AssignSlot.deadline.
+  reserved 3, 4, 6, 7, 8, 9;
+  reserved "command", "env", "working_dir", "restart_policy", "completion_mode", "deadline", "ports";
+}
+
+// StartWorkload (compute node): write the boot parameters, identity and
+// credentials to the metadata disk (host slot). The boot stub, waiting in
+// the warm VM, then mounts the root volume and execs init. Result OK once
+// the metadata is written; AllocationInfo.boot_count becomes 1 when the
+// stub reports EXEC. Every initial volume must be attached (AttachVolume OK)
+// first.
+message StartWorkload {
+  string allocation_id = 1;
+  // Identity of the guest: Blip namespace, name and UID.
+  ObjectRef blip = 2;
+  RunParams params = 3;
+  // The attachment the stub mounts as / (ext4).
+  string root_attachment_id = 4;
+  // All attachments currently attached, written to the metadata disk.
+  repeated VolumeRef volumes = 5;
+  // Service account credentials, written to the metadata disk. Never
+  // stored elsewhere on disk by the node.
+  Credentials credentials = 6;
+  reserved 7;
+  reserved "root_volume";
+}
+
+// Credentials are the service account files given to the guest, as in a pod:
+// <dir>/token, <dir>/ca.crt and <dir>/namespace. The token is a TokenRequest
+// token bound to the Secret blip-token-<allocation>.
+message Credentials {
+  bytes token = 1;
+  bytes ca_crt = 2;
+  string namespace = 3;
+  google.protobuf.Timestamp expiration = 4;
+}
+
+// UpdateCredentials (compute node): rewrite the credentials in the
+// metadata disk host slot (token rotation). Result OK once written. Guest
+// helpers (blip-meta creds --watch) pick them up. Before StartWorkload the
+// node keeps them for StartWorkload.
+message UpdateCredentials {
+  string allocation_id = 1;
+  Credentials credentials = 2;
+}
+
+// VolumeRef describes an attached volume in the metadata disk.
+message VolumeRef {
+  string attachment_id = 1;
+  string uid = 2;
+  string name = 3;              // virtio serial
+}
+
+// Kill (compute node): stop the VM. With graceful, the node first presses
+// the ACPI power button (Cloud Hypervisor vm.power-button), so the guest
+// OS shuts down by itself, and waits up to graceful_timeout (default 30s)
+// for Cloud Hypervisor to exit, then kills it. Without graceful it kills Cloud Hypervisor at once.
+// Attachments (overlays) stay until ReleaseAttachment / Release, so a final
+// CaptureLocal is possible after Kill. Result OK once Cloud Hypervisor has
+// exited.
+message Kill {
+  string allocation_id = 1;
+  string reason = 2;            // for logs, e.g. Cancelled, TTLExceeded
+  bool graceful = 3;
+  google.protobuf.Duration graceful_timeout = 4;
+}
+
+// Seal (storage node): tag c-<content_id> sealed. Requires no exports.
+message Seal {
+  string content_id = 1;
+  ObjectRef blipvol = 2;        // owner, recorded in an LV tag
+}
+
+// DeleteContent (storage node): remove all exports of each content, then the LVs.
+message DeleteContent {
+  repeated string content_ids = 1;
+}
+
+// CreateContent (storage node): create an empty unsealed thin LV. Used as a
+// write target for import, full-copy clone and repair with no base.
+message CreateContent {
+  string content_id = 1;
+  int64 size_bytes = 2;
+  ContentKind kind = 3;
+  ObjectRef blipvol = 4;
+}
+
+// Import (storage node, one group member): create c-<content_id>, fill it
+// from the image and run mkfs.ext4, or leave it zero-filled with no
+// filesystem when image_reference is empty (raw block device), then copy
+// the mapped ranges to every target.
+message Import {
+  string content_id = 1;
+  ObjectRef blipvol = 2;
+  int64 size_bytes = 3;
+  string image_reference = 4;
+  // Contents of a kubernetes.io/dockerconfigjson Secret, or empty.
+  bytes pull_secret_dockerconfigjson = 5;
+  repeated Path targets = 6;    // read-write exports on the other replicas
+}
+
+enum CloneMode {
+  CLONE_MODE_UNSPECIFIED = 0;
+  CLONE_MODE_SNAPSHOT = 1;      // run on every replica of the parent's group
+  CLONE_MODE_COPY = 2;          // run on one parent replica; copies to targets
+}
+
+// Clone (storage node).
+message Clone {
+  string content_id = 1;
+  string parent_content_id = 2;
+  ObjectRef blipvol = 3;
+  CloneMode mode = 4;
+  repeated Path targets = 5;    // COPY only: read-write exports in the new group
+}
+
+// Repair (storage node, healthy source replica): copy content_id to the
+// target. With base_content_id set, copy thin_delta(base, content); the target
+// was prepared as a snapshot of the base. With extents set, copy only those
+// (scrub repair). Otherwise copy all mapped ranges.
+message Repair {
+  string content_id = 1;
+  string base_content_id = 2;
+  repeated Extent extents = 3;
+  Path target = 4;
+}
+
+// Scrub (storage node): hash c-<content_id> with SHA-256. Each hash covers
+// blocks_per_hash chunks, starting at start_chunk, for chunk_count chunks.
+// The controller first scrubs with large groups, then narrows mismatches.
+message Scrub {
+  string content_id = 1;
+  int64 start_chunk = 2;
+  int64 chunk_count = 3;        // 0 means to the end
+  int64 blocks_per_hash = 4;
+}
+
+// ListState: report NodeState in the result.
+message ListState {}
+
+// Release (compute node): kill the guest if still running, release every
+// remaining attachment (as ReleaseAttachment, without generation checks),
+// and mark the allocation finished. The controller normally releases
+// attachments one by one first; Release is the final cleanup.
+message Release {
+  string allocation_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Results and state, node to controller
+
+enum ResultStatus {
+  RESULT_STATUS_UNSPECIFIED = 0;
+  RESULT_STATUS_OK = 1;
+  RESULT_STATUS_FAILED = 2;
+  RESULT_STATUS_IN_PROGRESS = 3;
+  RESULT_STATUS_REJECTED = 4;    // e.g. allocation finished, wrong content ID
+  RESULT_STATUS_DEADLINE_EXCEEDED = 5;
+  reserved 6;
+  reserved "RESULT_STATUS_BUSY";
+}
+
+// ErrorCode lets the controller pick a Blip or BlipVol reason.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_NO_SPACE = 1;          // pool full
+  ERROR_CODE_NOT_FOUND = 2;         // content or allocation missing
+  ERROR_CODE_IMAGE_PULL = 3;
+  ERROR_CODE_TLS = 4;
+  ERROR_CODE_NOT_ENOUGH_REPLICAS = 5; // fewer than 2 targets succeeded
+  reserved 6;                       // ERROR_CODE_AGENT, removed
+  reserved 7;                      // ERROR_CODE_SLOT_NOT_READY, removed
+  ERROR_CODE_STALE_GENERATION = 8; // attachment generation lower than known
+  ERROR_CODE_CONFLICT = 9;         // slot disk, UID or local snapshot limit in use
+  ERROR_CODE_SUSPEND_TIMEOUT = 10; // CaptureLocal exceeded the suspend budget
+  ERROR_CODE_TRANSFER = 11;        // WriteSnapshot failed on every target
+  reserved 12;                     // ERROR_CODE_VERIFY, removed
+  ERROR_CODE_HOTPLUG = 13;         // Cloud Hypervisor add/remove device failed
+}
+
+message CommandResult {
+  string operation_id = 1;
+  ResultStatus status = 2;
+  ErrorCode code = 3;
+  string error = 4;
+  oneof result {
+    ExportResult export = 11;
+    ImportResult import = 20;
+    CopyResult copy = 21;       // Clone COPY and Repair
+    ScrubResult scrub = 23;
+    NodeState state = 24;       // ListState
+    AttachVolumeResult attach_volume = 29;
+    CaptureLocalResult capture_local = 31;
+    PrepareReceiveResult prepare_receive = 33;
+    WriteSnapshotResult write_snapshot = 37;
+  }
+  reserved 10, 16, 30, 34;
+  reserved "prepare_seed", "save_extents", "detach_volume", "send_snapshot";
+}
+
+message ExportResult {
+  Path path = 1;
+}
+
+message ImportResult {
+  string image_digest = 1;
+  int64 size_bytes = 2;
+  repeated TargetResult targets = 3;
+}
+
+message CopyResult {
+  int64 bytes_copied = 1;
+  repeated TargetResult targets = 2;
+}
+
+message ScrubResult {
+  int64 start_chunk = 1;
+  int64 blocks_per_hash = 2;
+  repeated bytes hashes = 3;    // 32 bytes each
+}
+
+// Exited describes the end of the VM (AllocationInfo.exit). Terminal for
+// the allocation. The overlays stay for a final CaptureLocal until
+// ReleaseAttachment. blipd slot classifies the end once; the node passes
+// reason and message on unchanged. A guest reboot is not an exit: the VM
+// continues and AllocationInfo.boot_count goes up.
+message Exited {
+  string allocation_id = 1;
+  // The Blip condition reason: Succeeded, Error, GuestPanic, InitExited,
+  // BootFailed, TTLExceeded or HypervisorExited.
+  string reason = 8;
+  // Human readable result for the Blip condition.
+  string message = 6;
+  // Guest exit code: from `blip-meta exit <code>` in the guest area, else
+  // the init exit status for InitExited. Unset when unknown.
+  optional int32 exit_code = 3;
+  // Number of guest reboots (boot_count - 1).
+  int32 restart_count = 4;
+  reserved 2, 5, 7;
+  reserved "boot_reason", "hypervisor_exit_status";
+}
+
+message StorageCapacity {
+  string vg = 1;
+  int64 pool_size_bytes = 2;
+  double data_percent = 3;
+  double metadata_percent = 4;
+  int32 lv_count = 5;
+  int32 max_lvs = 6;
+}
+
+message ComputeCapacity {
+  int32 slots = 1;
+  int32 assigned_slots = 3;
+  double data_percent = 5;
+  bool memory_pressure = 6;     // stop claiming on this node
+  int32 disks_per_slot = 7;     // max attachments per allocation
+  reserved 2, 4;
+  reserved "ready_slots", "pool_size_bytes";
+}
+
+message Capacity {
+  StorageCapacity storage = 1;
+  ComputeCapacity compute = 2;
+}
+
+// SlotInfo is the state of one slot pod on this node.
+message SlotInfo {
+  string device_id = 1;
+  ObjectRef pod = 2;
+  string allocation_id = 4;
+  reserved 3;
+  reserved "ready";
+}
+
+// NodeState is everything the node knows. Sent in Hello, whenever it
+// changes, and for ListState.
+message NodeState {
+  repeated ContentInfo contents = 1;
+  repeated AllocationInfo allocations = 3;
+  repeated SlotInfo slots = 5;
+  Capacity capacity = 6;
+  reserved 2, 4;
+  reserved "exports", "operations";
+}
+
+message ContentInfo {
+  string content_id = 1;
+  ContentKind kind = 2;
+  bool sealed = 3;
+  int64 size_bytes = 5;
+  google.protobuf.Timestamp created = 6;
+  reserved 4, 7, 8, 9;
+  reserved "owner_uid", "origin_content_id", "receiving", "committed";
+}
+
+message AllocationInfo {
+  string allocation_id = 1;
+  ObjectRef blip = 2;
+  ObjectRef pod = 3;
+  bool assigned = 5;            // AssignSlot done
+  // Boots that reached EXEC (the boot stub is about to exec init); 0
+  // until the first. A guest reboot reruns the stub.
+  int32 boot_count = 8;
+  // Set once the VM exited. Never cleared.
+  Exited exit = 12;
+  google.protobuf.Timestamp deadline = 13;
+  // Set when the slot pod or Cloud Hypervisor was lost: the slot
+  // container restarted, the pod is gone, or the API socket is unreachable.
+  string slot_lost = 15;
+  string root_attachment_id = 18;
+  repeated AttachmentInfo attachments = 19;
+  reserved 4, 6, 7, 9, 10, 11, 14, 16, 17, 20, 21;
+  reserved "start_requested", "seed_content_id", "detached", "sealed", "connected_nodes",
+    "agent_phase", "has_exit_code", "last_exit_code", "agent_message",
+    "released", "agent_reason", "release_reason", "restart_count", "hypervisor_exit";
+}
+
+enum AttachmentState {
+  ATTACHMENT_STATE_UNSPECIFIED = 0;
+  ATTACHMENT_STATE_ATTACHING = 1;   // AttachVolume in progress
+  ATTACHMENT_STATE_ATTACHED = 2;    // plugged and linked in the guest
+  ATTACHMENT_STATE_DETACHED = 3;    // unplugged (or VM stopped); overlay kept
+  ATTACHMENT_STATE_RELEASING = 4;   // ReleaseAttachment in progress
+}
+
+message AttachmentInfo {
+  string attachment_id = 1;
+  string uid = 2;               // BlipVol UID
+  string name = 3;
+  int64 generation = 4;
+  string content_id = 5;        // input (origin) content
+  int32 slot_disk = 6;
+  AttachmentState state = 7;
+  reserved 8, 9;
+  reserved "local_snapshots", "connected_nodes";
+}
+
+enum LocalSnapshotState {
+  LOCAL_SNAPSHOT_STATE_UNSPECIFIED = 0;
+  LOCAL_SNAPSHOT_STATE_CREATING = 1;
+  LOCAL_SNAPSHOT_STATE_READY = 2;   // activated read-only
+  LOCAL_SNAPSHOT_STATE_DELETING = 3;
+}
+
+message LocalSnapshotInfo {
+  string attachment_id = 1;
+  int64 seq = 2;
+  LocalSnapshotState state = 3;
+  google.protobuf.Timestamp created = 4;
+}

@@ -1,0 +1,8 @@
+# The node daemon has no Kubernetes API permissions. Its token is used only
+# to authenticate to the controller (audience "blip").
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blip-node
+  namespace: blip-system
+automountServiceAccountToken: false

@@ -1,0 +1,34 @@
+# Design section 3.5. Edit and admin also get read access through blip-view.
+# BlipPools are read-only for tenants: operators create and edit them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blip-view
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+- apiGroups: [blip.example.com]
+  resources: [blips, blipvols, blippools]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blip-edit
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+- apiGroups: [blip.example.com]
+  resources: [blips, blipvols]
+  verbs: [create, delete, patch, update]
+# Slot pods run in the tenant namespace: kubectl port-forward to a Blip's
+# slot pod reaches the guest ports listed in spec.ports.
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [pods/portforward]
+  verbs: [get, create]

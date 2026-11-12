@@ -1,0 +1,523 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: blips.blip.example.com
+spec:
+  group: blip.example.com
+  names:
+    kind: Blip
+    listKind: BlipList
+    plural: blips
+    singular: blip
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.sku
+      name: SKU
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.restartCount
+      name: Restarts
+      type: integer
+    - jsonPath: .status.rescheduleCount
+      name: Reschedules
+      type: integer
+    - jsonPath: .spec.rootVolume
+      name: Root
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Blip boots a guest OS from its root volume in a microVM.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BlipSpec is the desired run. All fields except volumes (non-root entries
+              can be added and removed) and ttlSecondsAfterFinished are immutable.
+            properties:
+              init:
+                default:
+                - /sbin/init
+                description: |-
+                  Init is the argv the boot stub execs as PID 1 after it mounts the
+                  root volume (ext4) as /. The first element must be an absolute path.
+                items:
+                  maxLength: 1024
+                  type: string
+                maxItems: 32
+                minItems: 1
+                type: array
+                x-kubernetes-validations:
+                - message: init[0] must be an absolute path
+                  rule: self[0].startsWith('/')
+              maxTTLSeconds:
+                default: 3600
+                description: MaxTTLSeconds limits the run, counted from slot claim.
+                format: int64
+                maximum: 604800
+                minimum: 1
+                type: integer
+              ports:
+                description: |-
+                  Ports are guest ports reachable on the slot pod's loopback, so
+                  `kubectl port-forward pod/<status.allocation.podName> <port>` connects
+                  to the guest's AF_VSOCK listener on port <port>.
+                items:
+                  description: BlipPort exposes one guest TCP port for port forwarding.
+                  properties:
+                    name:
+                      maxLength: 15
+                      type: string
+                    port:
+                      format: int32
+                      maximum: 65535
+                      minimum: 1
+                      type: integer
+                  required:
+                  - port
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - port
+                x-kubernetes-list-type: map
+              reschedule:
+                description: |-
+                  Reschedule, when set, gives the workload another attempt in a new VM
+                  (possibly on another node) after a retryable failure, with
+                  exponential backoff, until it succeeds, the limit is reached or the
+                  deadline (maxTTLSeconds from the first slot claim) passes. Each
+                  volume is snapshotted when an attempt fails, and the next attempt
+                  starts from each volume's newest Ready snapshot.
+                  Immutable.
+                properties:
+                  initialBackoffSeconds:
+                    default: 10
+                    description: |-
+                      InitialBackoffSeconds is the wait before the first reschedule. It
+                      doubles with each further reschedule.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  limit:
+                    description: |-
+                      Limit is the maximum number of reschedules. Unset means no limit
+                      other than the deadline.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  maxBackoffSeconds:
+                    default: 300
+                    description: MaxBackoffSeconds caps the wait.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  nodeLoss:
+                    default: Fence
+                    description: |-
+                      NodeLoss says what happens when the salvage timeout expires. Fence
+                      waits until the node returns or is fenced (out-of-service taint or
+                      deleted). Abandon reschedules from each volume's newest Ready
+                      snapshot without waiting; writes since then are lost.
+                    enum:
+                    - Fence
+                    - Abandon
+                    type: string
+                  salvageTimeout:
+                    default: 5m
+                    description: |-
+                      SalvageTimeout is how long, from the end of a failed attempt, to wait
+                      for an unreachable node to return so the volumes can be snapshotted
+                      before the next attempt.
+                    maxLength: 32
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: maxBackoffSeconds must be at least initialBackoffSeconds
+                  rule: self.maxBackoffSeconds >= self.initialBackoffSeconds
+              rootMountOptions:
+                description: |-
+                  RootMountOptions are the ext4 mount options of the root volume
+                  (comma separated, as for mount -o).
+                maxLength: 256
+                type: string
+              rootVolume:
+                description: |-
+                  RootVolume names the entry of volumes that the boot stub mounts
+                  (ext4) as / before it execs init. Immutable.
+                maxLength: 20
+                minLength: 1
+                type: string
+              serviceAccountName:
+                default: default
+                description: |-
+                  ServiceAccountName is the ServiceAccount in the Blip's namespace whose
+                  token the guest gets at /run/secrets/kubernetes.io/serviceaccount
+                  (token, ca.crt, namespace). The token is bound to a Secret of the allocation and
+                  rotated before it expires. The Blip waits with ServiceAccountNotFound
+                  until the ServiceAccount exists.
+                maxLength: 253
+                minLength: 1
+                type: string
+              sku:
+                default: default
+                description: |-
+                  SKU selects the kind of slot: the Blip runs in a free slot pod of
+                  this SKU in its own namespace.
+                type: string
+              ttlSecondsAfterFinished:
+                default: 300
+                description: TTLSecondsAfterFinished is how long the finished Blip
+                  is kept. Mutable.
+                format: int64
+                minimum: 0
+                type: integer
+              volumes:
+                description: |-
+                  Volumes are the BlipVols attached to the VM as raw block devices. Each
+                  attachment starts from the BlipVol's newest Ready snapshot and writes
+                  to a private overlay that is saved back as new snapshots of the
+                  BlipVol according to its snapshotPolicy. Entries are immutable; entries
+                  other than the root volume can be added and removed while the Blip runs
+                  (live attach/detach).
+                items:
+                  description: |-
+                    BlipVolume attaches one BlipVol to the Blip. The guest sees it as the raw
+                    virtio block device with serial <name>, /dev/disk/by-id/virtio-<name>.
+                    Immutable: remove and re-add the entry to change it.
+                  properties:
+                    blipVolRef:
+                      description: BlipVolRef names a BlipVol in the same namespace.
+                      properties:
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    name:
+                      description: |-
+                        Name is a DNS label, unique within the Blip, and the virtio serial of
+                        the disk (at most 20 bytes). blip-meta is reserved.
+                      maxLength: 20
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                      x-kubernetes-validations:
+                      - message: the volume name blip-meta is reserved
+                        rule: self != 'blip-meta'
+                  required:
+                  - blipVolRef
+                  - name
+                  type: object
+                  x-kubernetes-validations:
+                  - message: a volume entry is immutable; remove and re-add it to
+                      change it
+                    rule: self == oldSelf
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+            required:
+            - rootVolume
+            - volumes
+            type: object
+            x-kubernetes-validations:
+            - message: spec fields are immutable except volumes and ttlSecondsAfterFinished
+              rule: self.sku == oldSelf.sku && self.rootVolume == oldSelf.rootVolume
+                && self.maxTTLSeconds == oldSelf.maxTTLSeconds && has(self.reschedule)
+                == has(oldSelf.reschedule) && (!has(self.reschedule) || self.reschedule
+                == oldSelf.reschedule) && self.serviceAccountName == oldSelf.serviceAccountName
+                && has(self.init) == has(oldSelf.init) && (!has(self.init) || self.init
+                == oldSelf.init) && has(self.rootMountOptions) == has(oldSelf.rootMountOptions)
+                && (!has(self.rootMountOptions) || self.rootMountOptions == oldSelf.rootMountOptions)
+                && has(self.ports) == has(oldSelf.ports) && (!has(self.ports) || self.ports
+                == oldSelf.ports)
+            - message: rootVolume must name an entry in volumes
+              rule: self.volumes.exists(v, v.name == self.rootVolume)
+            - message: the root volume entry cannot be removed
+              rule: oldSelf.volumes.filter(o, o.name == oldSelf.rootVolume).all(o,
+                self.volumes.exists(v, v.name == o.name))
+          status:
+            description: BlipStatus is written only by the controller.
+            properties:
+              allocation:
+                description: Allocation is the slot claimed for a run.
+                properties:
+                  id:
+                    type: string
+                  node:
+                    type: string
+                  podName:
+                    type: string
+                  podUID:
+                    type: string
+                required:
+                - id
+                type: object
+              completionTime:
+                format: date-time
+                type: string
+              conditions:
+                description: |-
+                  Conditions: Scheduled, Started, VolumesReady, SnapshotsBehind,
+                  Rescheduling, Finished, Complete, Failed. Complete/Failed describe the workload
+                  only; Finished is set once every shutdown snapshot is settled and
+                  every claim is released.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              deadline:
+                format: date-time
+                type: string
+              lastExitCode:
+                format: int32
+                type: integer
+              lastFailure:
+                description: LastFailure is why the last rescheduled attempt ended.
+                properties:
+                  message:
+                    type: string
+                  reason:
+                    description: Reason is a Failed condition reason, e.g. NodeLost
+                      or Error.
+                    type: string
+                  time:
+                    format: date-time
+                    type: string
+                required:
+                - reason
+                - time
+                type: object
+              message:
+                description: Message says why the run failed.
+                type: string
+              nextScheduleTime:
+                description: |-
+                  NextScheduleTime is the end of the reschedule backoff: the next
+                  attempt claims a slot no earlier.
+                format: date-time
+                type: string
+              phase:
+                description: |-
+                  Phase summarizes the workload: Pending, Running, Saving, Succeeded,
+                  Failed.
+                type: string
+              podIP:
+                description: |-
+                  PodIP is the IP address of the guest. The guest takes over the
+                  network identity of its slot pod, so this is the slot pod's IP.
+                type: string
+              rescheduleCount:
+                description: |-
+                  RescheduleCount is the number of times the Blip was given a new
+                  attempt (spec.reschedule).
+                format: int32
+                type: integer
+              restartCount:
+                description: RestartCount is the number of guest reboots in the current
+                  attempt.
+                format: int32
+                type: integer
+              startTime:
+                format: date-time
+                type: string
+              stopRequestedTime:
+                description: |-
+                  StopRequestedTime is when the controller first asked the node to
+                  stop the VM gracefully (Kill). The graceful timeout counts from
+                  here, also after a controller restart.
+                format: date-time
+                type: string
+              volumes:
+                description: |-
+                  Volumes is the observed state of each attachment, including entries
+                  that were removed from spec and are still being released.
+                items:
+                  description: BlipVolumeStatus is the observed state of one attachment.
+                  properties:
+                    attachmentID:
+                      description: AttachmentID is 16 hex characters, new for every
+                        attach.
+                      type: string
+                    blipVolRef:
+                      description: BlipVolRef is the resolved input BlipVol.
+                      properties:
+                        name:
+                          type: string
+                        uid:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    devicePath:
+                      description: DevicePath is /dev/disk/by-id/virtio-<name> in
+                        the guest.
+                      type: string
+                    generation:
+                      description: Generation is the BlipVol claim generation of this
+                        attachment.
+                      format: int64
+                      type: integer
+                    message:
+                      type: string
+                    name:
+                      description: Name of the spec.volumes entry.
+                      type: string
+                    resumedFrom:
+                      description: |-
+                        ResumedFrom is set when this attempt started from an older snapshot
+                        than where the previous attempt stopped.
+                      properties:
+                        captureTime:
+                          format: date-time
+                          type: string
+                        sequence:
+                          format: int64
+                          type: integer
+                      required:
+                      - sequence
+                      type: object
+                    shutdownSnapshot:
+                      description: |-
+                        ShutdownSnapshot is the snapshot taken when the attachment is
+                        released (also for a reschedule).
+                      properties:
+                        message:
+                          type: string
+                        reason:
+                          description: ReleaseReason says why an attachment was released.
+                          type: string
+                        sequence:
+                          description: Sequence is the BlipVol snapshot sequence,
+                            once allocated.
+                          format: int64
+                          type: integer
+                        state:
+                          description: |-
+                            ShutdownSnapshotState is the state of the snapshot taken when an
+                            attachment is released.
+                          enum:
+                          - Pending
+                          - Ready
+                          - Skipped
+                          - Unavailable
+                          - Failed
+                          type: string
+                      type: object
+                    slotDisk:
+                      description: |-
+                        SlotDisk is the index N of /dev/blip/disks/N in the slot used by
+                        this attachment.
+                      format: int32
+                      type: integer
+                    snapshot:
+                      description: |-
+                        Snapshot is the BlipVol snapshot sequence this attachment started
+                        from.
+                      format: int64
+                      type: integer
+                    state:
+                      description: VolumeState is the state of one attachment.
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+            type: object
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: Blip names must be at most 57 characters
+          rule: size(self.metadata.name) <= 57
+    served: true
+    storage: true
+    subresources:
+      status: {}

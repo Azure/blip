@@ -1,0 +1,4 @@
+namespace: blip-e2e
+resources:
+- namespace.yaml
+- ../common

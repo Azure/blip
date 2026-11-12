@@ -1,0 +1,23 @@
+#!/bin/bash
+# Run by blip-identity.service early at boot, see there.
+set -euo pipefail
+install -d -m 0755 /run/blip
+id=$(/usr/local/bin/blip-meta identity)
+printf '%s\n' "$id" >/run/blip/identity.json
+for f in name namespace uid allocationID; do
+  jq -r --arg f "$f" '.[$f] // empty' <<<"$id" >"/run/blip/$f"
+done
+uid=$(</run/blip/uid)
+h=$(/usr/local/bin/blip-meta get hostname || true)
+[[ -n $h ]] && hostname "$h"
+
+# One machine-id per Blip: derived from the Blip UID, so a root volume moved
+# to another slot keeps it and a clone booted by another Blip gets a new one.
+if [[ -n $uid ]]; then
+  want=$(printf '%s' "$uid" | md5sum | cut -c1-32)
+  if [[ $(cat /etc/machine-id 2>/dev/null) != "$want" ]]; then
+    echo "blip-identity: machine-id for Blip $uid: $want" >&2
+    printf '%s\n' "$want" >/etc/machine-id.new && mv -f /etc/machine-id.new /etc/machine-id
+  fi
+fi
+echo "blip-identity: $(jq -c . /run/blip/identity.json)" >&2
