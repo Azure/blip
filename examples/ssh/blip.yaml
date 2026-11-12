@@ -1,0 +1,30 @@
+# Root volume imported from the ubuntu image. Replace REGISTRY with the
+# address printed by hack/registry/up.sh (for example 172.18.0.5:5000).
+apiVersion: blip.example.com/v1alpha1
+kind: BlipVol
+metadata:
+  name: ubuntu-ssh
+  namespace: blip-demo
+spec:
+  image:
+    reference: REGISTRY/blip-ubuntu:dev
+---
+# Replace the authorized-keys annotation with your public key(s).
+apiVersion: blip.example.com/v1alpha1
+kind: Blip
+metadata:
+  name: ssh
+  namespace: blip-demo
+  annotations:
+    blip.example.com/ssh-authorized-keys: "ssh-ed25519 AAAA... you@example"
+spec:
+  serviceAccountName: blip-ssh
+  # init defaults to [/sbin/init]: the image's own init (systemd) boots.
+  rootVolume: root
+  volumes:
+    - name: root
+      blipVolRef:
+        name: ubuntu-ssh
+  ports:
+    - port: 22
+      name: ssh

@@ -1,0 +1,15 @@
+# Any Ethernet NIC, matched by type (never by MAC: the MAC is the slot pod's
+# and changes whenever the root volume boots in another slot). The slot's
+# DHCP server leases the pod IP.
+[Match]
+Type=ether
+
+[Network]
+DHCP=ipv4
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPv4]
+UseHostname=yes
+UseDomains=yes
+UseMTU=yes

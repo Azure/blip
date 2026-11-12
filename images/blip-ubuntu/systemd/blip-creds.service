@@ -1,0 +1,15 @@
+# Keep the Blip's service account credentials (token, ca.crt, namespace) in
+# the kubelet layout, read from the blip-meta disk; rotations are picked up.
+[Unit]
+Description=Blip service account credentials
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target blip-ssh-bootstrap.service
+
+[Service]
+ExecStart=/usr/local/bin/blip-meta creds --dir /run/secrets/kubernetes.io/serviceaccount --watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=sysinit.target

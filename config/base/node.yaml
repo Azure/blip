@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: blip-node
+  namespace: blip-system
+  labels: {app.kubernetes.io/name: blip-node}
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: blip-node}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: blip-node}
+    spec:
+      serviceAccountName: blip-node
+      automountServiceAccountToken: false
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 30
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - {key: blip.example.com/storage, operator: In, values: ["true"]}
+            - matchExpressions:
+              - {key: blip.example.com/hypervisor, operator: Exists}
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: node
+        image: blipd
+        # Flags: --disks-per-slot (default 8, hot-pluggable disks per slot,
+        # the most volumes a Blip can have).
+        args: [node]
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        # Storage address when node.yaml has none.
+        - name: NODE_IP
+          valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+        - name: POD_NAME
+          valueFrom: {fieldRef: {fieldPath: metadata.name}}
+        - name: POD_UID
+          valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+        - name: BLIP_CONTROLLER_ADDR
+          value: blip-controller.blip-system.svc:8443
+        - name: BLIP_TOKEN_FILE
+          value: /var/run/secrets/blip/token
+        - name: BLIP_CA_FILE
+          value: /etc/blip-ca/ca.crt
+        securityContext: {privileged: true}
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+        volumeMounts:
+        - {name: dev, mountPath: /dev}
+        - {name: configfs, mountPath: /sys/kernel/config}
+        - {name: run-blip, mountPath: /run/blip, mountPropagation: Bidirectional}
+        - {name: work, mountPath: /var/lib/blip/work}
+        - {name: etc-blip, mountPath: /etc/blip, readOnly: true}
+        - {name: ca, mountPath: /etc/blip-ca, readOnly: true}
+        - {name: device-plugins, mountPath: /var/lib/kubelet/device-plugins}
+        - {name: pod-resources, mountPath: /var/lib/kubelet/pod-resources}
+        - {name: modules, mountPath: /lib/modules, readOnly: true}
+        - {name: token, mountPath: /var/run/secrets/blip, readOnly: true}
+      # tlshd serves TLS handshakes of NVMe/TCP for this network namespace
+      # (the host one, as hostNetwork is set), target and host side. Its
+      # config links the .nvme keyring into its own session keyring, which
+      # the container runtime creates per container.
+      - name: tlshd
+        image: blipd
+        command: [tlshd, -s, -c, /etc/tlshd.conf]
+        securityContext: {privileged: true}
+        resources:
+          requests: {cpu: 10m, memory: 16Mi}
+      volumes:
+      - {name: dev, hostPath: {path: /dev}}
+      - {name: configfs, hostPath: {path: /sys/kernel/config}}
+      - {name: run-blip, hostPath: {path: /run/blip, type: DirectoryOrCreate}}
+      - {name: work, hostPath: {path: /var/lib/blip/work, type: DirectoryOrCreate}}
+      - {name: etc-blip, hostPath: {path: /etc/blip, type: DirectoryOrCreate}}
+      # CA of the controller's serving certificate, published by the
+      # controller in ConfigMap blip-ca.
+      - name: ca
+        configMap: {name: blip-ca, items: [{key: ca.crt, path: ca.crt}]}
+      - {name: device-plugins, hostPath: {path: /var/lib/kubelet/device-plugins}}
+      - {name: pod-resources, hostPath: {path: /var/lib/kubelet/pod-resources}}
+      - {name: modules, hostPath: {path: /lib/modules, type: Directory}}
+      - name: token
+        projected:
+          sources:
+          - serviceAccountToken: {path: token, audience: blip, expirationSeconds: 3600}

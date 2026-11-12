@@ -1,0 +1,8 @@
+# Slots for one tenant namespace (design 6.1). Each namespace is its own
+# pool: Blips only claim slot pods in their own namespace. Include this
+# component from a kustomization that sets `namespace:`.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+- pool.yaml
+- networkpolicy.yaml

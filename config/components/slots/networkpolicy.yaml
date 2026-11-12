@@ -1,0 +1,32 @@
+# Design section 9. The guest owns the slot pod IP, so these rules apply to
+# guest traffic directly. No ingress: nothing can connect to a guest
+# (kubectl port-forward enters through the kubelet and the pod's loopback,
+# which NetworkPolicy does not filter). Egress: DNS and the public
+# internet, but not the metadata service. Operators adjust the excluded CIDRs (pod,
+# service, node) and the API server rule for their cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: blip-slots
+spec:
+  podSelector:
+    matchExpressions:
+    - {key: blip.example.com/slot, operator: Exists}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+  - to:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+      podSelector: {matchLabels: {k8s-app: kube-dns}}
+    ports:
+    - {protocol: UDP, port: 53}
+    - {protocol: TCP, port: 53}
+  # The API server (guests use their service account token) is reachable
+  # here only if its endpoints are public. Policies match after service
+  # DNAT, so a private API server needs a rule for its endpoint addresses
+  # and port (for example the kind overlay allows tcp/6443 to the kind
+  # node network).
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.169.254/32]

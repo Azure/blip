@@ -1,0 +1,145 @@
+#!/bin/sh
+# PID 1 of the Blip e2e guest image. The Blip boot stub execs it with the
+# Blip's spec.init argv:
+#
+#   /sbin/blip-e2e-init MODE [ARGS...]
+#
+# It mounts the API filesystems, links /dev/disk/by-id/virtio-<name>, starts
+# DHCP on the first Ethernet interface, the service account credential
+# writer (blip-meta creds --watch) and a power button watcher, then runs
+# MODE:
+#
+#   ok                 exit 0
+#   fail CODE          exit CODE
+#   sh SCRIPT          run SCRIPT with sh (lib.sh sourced); its exit code
+#   sleep [SECS]       sleep (forever by default), then exit 0
+#   panic              kernel panic (sysrq c)
+#   initexit CODE      PID 1 exits with CODE (kernel: Attempted to kill init!)
+#   reboot [BOOTS]     reboot until this is boot BOOTS (default 2), then exit 0
+#                      (boot counter on the root fs: /var/lib/blip-e2e/boots)
+#   net                print NET ip=/mac= and check cluster DNS
+#   creds              authenticate to the API server with the SA token
+#   vsock PORT [SECS]  answer "PONG <hostname>" on AF_VSOCK PORT for SECS
+#                      (default forever)
+#
+# The exit code is recorded with `blip-meta exit CODE`, the root is
+# remounted read-only and the VM powers off. A power button press writes
+# /e2e-power.txt, records exit code 0 and powers off the same way.
+# Console lines start with "E2E " (or NET/CREDS/...); run.sh greps them.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[ -c /dev/console ] && exec </dev/console >/dev/console 2>&1
+# shellcheck source=lib.sh
+. /usr/lib/blip-e2e/lib.sh
+
+mnt() { # TYPE DIR [OPTS]
+	mountpoint -q "$2" && return 0
+	mkdir -p "$2"
+	mount -t "$1" ${3:+-o "$3"} "$1" "$2"
+}
+
+# shutdown_vm WHY [CODE]: record CODE, stop everything, power off.
+shutdown_vm() {
+	: >/run/e2e-shutdown
+	log "shutdown: $1${2:+ code $2}"
+	[ -n "${2:-}" ] && { blip-meta exit "$2" || log "blip-meta exit failed"; }
+	kill -TERM -1 2>/dev/null
+	sleep 1
+	sync
+	umount -a -r -t vfat 2>/dev/null
+	mount -o remount,ro / 2>/dev/null
+	sync
+	poweroff -f
+}
+
+# powerwatch: wait for one event on the ACPI power button input device.
+powerwatch() {
+	ev=
+	for e in /sys/class/input/event*; do
+		[ "$(cat "$e/device/name" 2>/dev/null)" = "Power Button" ] && ev=/dev/input/${e##*/}
+	done
+	[ -n "$ev" ] || { log "no power button input device"; return; }
+	dd if="$ev" of=/dev/null bs=24 count=1 2>/dev/null || return
+	log "power-button"
+	echo "power-button $(date +%s)" >/e2e-power.txt
+	sync
+	shutdown_vm power-button 0
+}
+
+mnt proc /proc
+mnt sysfs /sys
+mnt devtmpfs /dev
+mnt devpts /dev/pts gid=5,mode=620,ptmxmode=666
+mnt tmpfs /dev/shm mode=1777
+mnt tmpfs /run mode=0755
+mnt tmpfs /tmp mode=1777
+mount -o remount,rw / 2>/dev/null
+link_disks
+(while sleep 1; do link_disks; done) &
+powerwatch &
+
+h=$(blip-meta get hostname 2>/dev/null)
+[ -n "$h" ] && hostname "$h"
+ip link set lo up
+if i=$(iface); then
+	ip link set "$i" up
+	# Background renewals keep the 24h lease; -b goes on without a lease.
+	udhcpc -i "$i" -s /usr/lib/blip-e2e/udhcpc.script -b -t 20 -T 1 -A 2 \
+		-x hostname:"${h:-blip}" -O search -O staticroutes -O mtu >/dev/null 2>&1
+	log "dhcp on $i: $(ip -4 -o addr show dev "$i" | awk '{print $4}')"
+else
+	log "no ethernet interface"
+fi
+blip-meta creds --dir "$SA" --watch &
+
+mode=${1:-ok}
+[ $# -gt 0 ] && shift
+log "boot mode=$mode args=$*"
+rc=0
+case $mode in
+ok) ;;
+fail) rc=${1:-1} ;;
+sh) sh -c ". /usr/lib/blip-e2e/lib.sh; $1"; rc=$? ;;
+sleep)
+	if [ -n "${1:-}" ]; then sleep "$1"; else while :; do sleep 3600; done; fi
+	;;
+panic)
+	sync
+	log "panic"
+	echo c >/proc/sysrq-trigger
+	sleep 60
+	rc=99
+	;;
+initexit)
+	log "init exits ${1:-1}"
+	sync
+	exit "${1:-1}"
+	;;
+reboot)
+	mkdir -p /var/lib/blip-e2e
+	boots=$(($(cat /var/lib/blip-e2e/boots 2>/dev/null || echo 0) + 1))
+	echo "$boots" >/var/lib/blip-e2e/boots
+	sync
+	if [ "$boots" -lt "${1:-2}" ]; then
+		log "rebooting (boot $boots)"
+		kill -TERM -1 2>/dev/null
+		mount -o remount,ro / 2>/dev/null
+		sync
+		reboot -f
+		sleep 60
+	fi
+	log "boot $boots done"
+	;;
+net) net_report; rc=$? ;;
+creds) creds_check; rc=$? ;;
+vsock)
+	port=${1:?vsock PORT}
+	socat "VSOCK-LISTEN:$port,fork,reuseaddr" SYSTEM:"echo PONG \$(hostname)" &
+	log "vsock listening on $port"
+	if [ -n "${2:-}" ]; then sleep "$2"; else while :; do sleep 3600; done; fi
+	;;
+*) log "unknown mode $mode"; rc=2 ;;
+esac
+# A power button press may have killed the mode; the watcher shuts down.
+[ -e /run/e2e-shutdown ] && while :; do sleep 60; done
+log "exit $rc"
+shutdown_vm "mode $mode done" "$rc"

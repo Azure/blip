@@ -1,0 +1,83 @@
+#!/bin/bash
+# Bootstrap sshd from the Blip object, using the Blip's service account:
+#   annotation blip.example.com/ssh-authorized-keys -> /root/.ssh/authorized_keys
+#   ed25519 host pubkey -> annotation blip.example.com/ssh-host-key
+# Host keys are per Blip: a root cloned from another Blip (for example a
+# snapshot of a running session) gets new ones.
+set -euo pipefail
+
+SA=/run/secrets/kubernetes.io/serviceaccount
+GROUP_VERSION=blip.example.com/v1alpha1
+AUTH_ANN=blip.example.com/ssh-authorized-keys
+HOST_ANN=blip.example.com/ssh-host-key
+DEADLINE=$((SECONDS + ${BLIP_BOOTSTRAP_TIMEOUT:-60}))
+
+log() { echo "blip-ssh-bootstrap: $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+if [[ -n ${KUBERNETES_SERVICE_HOST:-} ]]; then
+  host=$KUBERNETES_SERVICE_HOST
+  [[ $host == *:* ]] && host="[$host]"
+  API="https://$host:${KUBERNETES_SERVICE_PORT:-443}"
+else
+  API=https://kubernetes.default.svc
+fi
+
+# Wait for the credentials (blip-creds.service) and the Blip identity
+# (blip-identity.service), both read from the blip-meta disk.
+until [[ -s $SA/token && -s $SA/ca.crt && -s $SA/namespace && -s /run/blip/name ]]; do
+  ((SECONDS < DEADLINE)) || die "service account files in $SA or /run/blip/name missing"
+  sleep 1
+done
+NS=$(<"$SA/namespace")
+NAME=$(</run/blip/name)
+URL="$API/apis/$GROUP_VERSION/namespaces/$NS/blips/$NAME"
+log "using $URL"
+
+# kube METHOD [curl args...]: call the Blip URL, re-reading the token (rotation).
+kube() {
+  local method=$1; shift
+  curl -sS --fail-with-body --max-time 10 --cacert "$SA/ca.crt" \
+    -H "Authorization: Bearer $(<"$SA/token")" -H 'Accept: application/json' \
+    -X "$method" "$@" "$URL"
+}
+
+# retry: run a command with exponential backoff until the deadline.
+retry() {
+  local delay=1 out
+  while :; do
+    if out=$("$@" 2>&1); then printf '%s' "$out"; return 0; fi
+    ((SECONDS < DEADLINE)) || { log "giving up: $out"; return 1; }
+    log "retrying in ${delay}s: $out"
+    sleep "$delay"
+    delay=$((delay < 8 ? delay * 2 : 8))
+  done
+}
+
+blip=$(retry kube GET) || die "cannot GET blip $NS/$NAME"
+keys=$(jq -r --arg a "$AUTH_ANN" '.metadata.annotations[$a] // empty' <<<"$blip")
+[[ -n $keys ]] || die "blip $NS/$NAME has no $AUTH_ANN annotation"
+
+install -d -m 0700 /root/.ssh
+tmp=$(mktemp /root/.ssh/.authorized_keys.XXXXXX)
+printf '%s\n' "$keys" >"$tmp"
+chmod 0600 "$tmp"
+mv -f "$tmp" /root/.ssh/authorized_keys
+log "installed $(grep -c . /root/.ssh/authorized_keys) authorized key(s) for root"
+
+# New host keys when the root was last booted by another Blip.
+uid=$(cat /run/blip/uid 2>/dev/null || true)
+stamp=/etc/ssh/blip-host-keys.uid
+if [[ -n $uid && $(cat "$stamp" 2>/dev/null) != "$uid" ]]; then
+  if compgen -G '/etc/ssh/ssh_host_*' >/dev/null; then
+    log "new host keys for Blip $uid"
+    rm -f /etc/ssh/ssh_host_*
+  fi
+  printf '%s\n' "$uid" >"$stamp"
+fi
+ssh-keygen -A >&2
+hostkey=$(</etc/ssh/ssh_host_ed25519_key.pub)
+patch=$(jq -cn --arg a "$HOST_ANN" --arg v "$hostkey" '{metadata: {annotations: {($a): $v}}}')
+retry kube PATCH -H 'Content-Type: application/merge-patch+json' --data "$patch" >/dev/null ||
+  die "cannot patch $HOST_ANN on blip $NS/$NAME"
+log "published host key: $hostkey"

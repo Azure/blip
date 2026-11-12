@@ -1,0 +1,32 @@
+# Service account for SSH Blips: blip-ssh-bootstrap in the guest reads the
+# ssh-authorized-keys annotation and writes the ssh-host-key annotation.
+# `kubectl blip setup` applies this file (embedded) in the chosen namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blip-ssh
+  namespace: blip-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blip-ssh
+  namespace: blip-demo
+rules:
+  - apiGroups: [blip.example.com]
+    resources: [blips]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blip-ssh
+  namespace: blip-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blip-ssh
+subjects:
+  - kind: ServiceAccount
+    name: blip-ssh
+    namespace: blip-demo

@@ -1,0 +1,19 @@
+# Write the Blip identity to /run/blip (identity.json, name, namespace, uid),
+# set the hostname, and give the guest a new machine-id when the root volume
+# now belongs to a different Blip (cloned or snapshot roots). The new
+# machine-id applies to everything started after this unit (networkd's
+# DHCP client id, sshd, ...); PID 1 and journald keep the old one until the
+# next boot.
+[Unit]
+Description=Blip identity and machine-id
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target systemd-networkd.service systemd-resolved.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/blip-identity
+
+[Install]
+WantedBy=sysinit.target

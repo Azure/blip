@@ -1,0 +1,15 @@
+[Unit]
+Description=Bootstrap SSH keys from the Blip annotations
+Wants=network-online.target blip-creds.service blip-identity.service
+After=network-online.target blip-creds.service blip-identity.service
+Before=ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/blip-ssh-bootstrap
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

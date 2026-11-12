@@ -1,0 +1,4 @@
+# Blip root: mounted by the boot stub (ext4, spec.rootMountOptions).
+# Data volumes: refer to them by name, never by /dev/vdX:
+#   /dev/disk/by-id/virtio-<volume name>  /data  ext4  defaults,nofail  0 2
+# or by filesystem UUID=...

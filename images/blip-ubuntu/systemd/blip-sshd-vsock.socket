@@ -1,0 +1,12 @@
+# sshd on AF_VSOCK port 22: Blip port forwarding (spec.ports: [{port: 22}])
+# connects to the guest vsock port with the same number. Connections that
+# arrive before blip-ssh-bootstrap finished wait for it (see the service).
+[Unit]
+Description=OpenSSH on vsock port 22
+
+[Socket]
+ListenStream=vsock::22
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

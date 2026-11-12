@@ -1,0 +1,291 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: blippools.blip.example.com
+spec:
+  group: blip.example.com
+  names:
+    kind: BlipPool
+    listKind: BlipPoolList
+    plural: blippools
+    shortNames:
+    - bpool
+    singular: blippool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.sku
+      name: SKU
+      type: string
+    - jsonPath: .spec.cpus
+      name: CPUs
+      type: integer
+    - jsonPath: .spec.memory
+      name: Memory
+      type: string
+    - jsonPath: .status.free
+      name: Free
+      type: integer
+    - jsonPath: .status.assigned
+      name: Assigned
+      type: integer
+    - jsonPath: .status.desiredFree
+      name: Desired
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: BlipPool keeps a buffer of free slot pods for one SKU in its
+          namespace.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BlipPoolSpec is the VM shape, placement and scaling of a pool of slot
+              pods for one SKU in a namespace. The controller builds the pods; there is
+              no pod template.
+            properties:
+              cpus:
+                description: CPUs is the number of guest vCPUs.
+                format: int32
+                minimum: 1
+                type: integer
+              demandWindow:
+                default: 5m
+                description: DemandWindow is how far back scheduled Blips count as
+                  demand.
+                type: string
+              hypervisor:
+                description: |-
+                  Hypervisor restricts slot pods to nodes of this hypervisor kind
+                  (node label blip.example.com/hypervisor). Unset means any.
+                enum:
+                - kvm
+                - mshv
+                type: string
+              maxFree:
+                description: MaxFree caps the demand-driven free buffer.
+                format: int32
+                minimum: 0
+                type: integer
+              maxSlots:
+                description: MaxSlots caps free + booting + assigned slot pods of
+                  the pool.
+                format: int32
+                minimum: 0
+                type: integer
+              memory:
+                anyOf:
+                - type: integer
+                - type: string
+                description: Memory is the guest memory, at least 256Mi and a whole
+                  number of MiB.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+              minFree:
+                default: 1
+                description: MinFree is the number of free (booted, unclaimed) slots
+                  kept at all times.
+                format: int32
+                minimum: 0
+                type: integer
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: NodeSelector is merged with the built-in selector.
+                type: object
+              scaleDownDelay:
+                default: 10m
+                description: |-
+                  ScaleDownDelay is how long the target must stay lower before free
+                  slots are deleted.
+                type: string
+              sku:
+                default: default
+                description: |-
+                  SKU is the slot kind Blips select with spec.sku. One pool per
+                  namespace and SKU; the oldest pool wins a duplicate. Immutable.
+                maxLength: 63
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: sku is immutable
+                  rule: self == oldSelf
+              tolerations:
+                description: Tolerations of the slot pods.
+                items:
+                  description: |-
+                    The pod this Toleration is attached to tolerates any taint that matches
+                    the triple <key,value,effect> using the matching operator <operator>.
+                  properties:
+                    effect:
+                      description: |-
+                        Effect indicates the taint effect to match. Empty means match all taint effects.
+                        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                      type: string
+                    key:
+                      description: |-
+                        Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                      type: string
+                    operator:
+                      description: |-
+                        Operator represents a key's relationship to the value.
+                        Valid operators are Exists and Equal. Defaults to Equal.
+                        Exists is equivalent to wildcard for value, so that a pod can
+                        tolerate all taints of a particular category.
+                      type: string
+                    tolerationSeconds:
+                      description: |-
+                        TolerationSeconds represents the period of time the toleration (which must be
+                        of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                        it is not set, which means tolerate the taint forever (do not evict). Zero and
+                        negative values will be treated as 0 (evict immediately) by the system.
+                      format: int64
+                      type: integer
+                    value:
+                      description: |-
+                        Value is the taint value the toleration matches to.
+                        If the operator is Exists, the value should be empty, otherwise just a regular string.
+                      type: string
+                  type: object
+                type: array
+            required:
+            - cpus
+            - maxFree
+            - memory
+            type: object
+            x-kubernetes-validations:
+            - message: minFree must not exceed maxFree
+              rule: self.minFree <= self.maxFree
+            - message: maxSlots must be at least maxFree
+              rule: '!has(self.maxSlots) || self.maxSlots >= self.maxFree'
+            - message: memory must be at least 256Mi
+              rule: quantity(string(self.memory)).compareTo(quantity('256Mi')) >=
+                0
+            - message: memory must be a whole number of MiB
+              rule: quantity(string(self.memory)).isInteger() && quantity(string(self.memory)).asInteger()
+                % 1048576 == 0
+          status:
+            description: BlipPoolStatus is the observed state of a pool.
+            properties:
+              assigned:
+                description: Assigned counts claimed slot pods that came from the
+                  pool.
+                format: int32
+                type: integer
+              booting:
+                description: Booting counts unclaimed slot pods that are not Ready
+                  yet.
+                format: int32
+                type: integer
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              desiredFree:
+                description: DesiredFree is the current free buffer target.
+                format: int32
+                type: integer
+              free:
+                description: Free counts Ready, unclaimed slot pods owned by the pool.
+                format: int32
+                type: integer
+              lastScaleTime:
+                description: LastScaleTime is when the pool last created or deleted
+                  slot pods.
+                format: date-time
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              templateHash:
+                description: TemplateHash is the hash of the pod the controller currently
+                  builds.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenSSH per-connection server on vsock
+Requires=blip-ssh-bootstrap.service
+After=blip-ssh-bootstrap.service
+
+[Service]
+ExecStart=-/usr/sbin/sshd -i
+StandardInput=socket
+StandardError=journal
+RuntimeDirectory=sshd
+RuntimeDirectoryPreserve=yes

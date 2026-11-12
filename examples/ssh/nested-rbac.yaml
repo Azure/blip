@@ -1,0 +1,42 @@
+# Optional extra permissions for blip-ssh (apply on top of rbac.yaml). With
+# them, kubectl and kubectl-blip inside a Blip can derive BlipVols from its
+# volumes (`kubectl blip derive --volume root`), start Blips from them, shell
+# into them, and attach volumes back. Blips get/patch is for attach and detach;
+# blipvols create is for derive. `kubectl blip setup --nested` applies this
+# file (embedded) in the chosen namespace.
+#
+# Every Blip in the namespace that uses blip-ssh gets these permissions,
+# including the ability to delete other Blips and BlipVols in the namespace.
+# Use a dedicated namespace for them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blip-ssh-nested
+  namespace: blip-demo
+rules:
+  - apiGroups: [blip.example.com]
+    resources: [blips]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [blip.example.com]
+    resources: [blipvols]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/portforward]
+    verbs: [get, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blip-ssh-nested
+  namespace: blip-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blip-ssh-nested
+subjects:
+  - kind: ServiceAccount
+    name: blip-ssh
+    namespace: blip-demo

@@ -1,0 +1,4 @@
+resources:
+- blip.example.com_blips.yaml
+- blip.example.com_blipvols.yaml
+- blip.example.com_blippools.yaml

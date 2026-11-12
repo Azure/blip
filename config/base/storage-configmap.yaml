@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blip-storage
+  namespace: blip-system
+data:
+  config.yaml: |
+    groups:
+    - name: sg-1
+      nodes: [s1, s2, s3]
