@@ -136,6 +136,96 @@ func TestFlattenSymlinkedParent(t *testing.T) {
 	}
 }
 
+// A higher layer can replace a lower layer's symlink with a real directory.
+// The shadowed symlink must not move the higher layer's children to its old
+// target.
+func TestFlattenSymlinkShadowedByDirectory(t *testing.T) {
+	// writeTarTo sees the top layer first: the real directory and its child
+	// come before the lower layer that still has the old symlink.
+	entries := flattenStream(t, bytes.NewReader(tarBytes(t,
+		entry{hdr: tar.Header{Name: "bin/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "bin/app", Typeflag: tar.TypeReg, Mode: 0o755}, body: "app"},
+		entry{hdr: tar.Header{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "usr/bin/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "bin", Typeflag: tar.TypeSymlink, Linkname: "usr/bin"}},
+	)))
+
+	if n := countEntry(entries, "bin"); n != 1 {
+		t.Errorf("tar has %d entries for bin, want 1: %v", n, names(entries))
+	}
+	bin, _ := findEntry(entries, "bin")
+	if bin.hdr.Typeflag != tar.TypeDir {
+		t.Errorf("bin = type %c, want a directory", bin.hdr.Typeflag)
+	}
+	if n := countEntry(entries, "usr/bin/app"); n != 0 {
+		t.Errorf("tar has %d entries for usr/bin/app, want 0: %v", n, names(entries))
+	}
+	app, i := findEntry(entries, "bin/app")
+	if i < 0 {
+		t.Fatalf("tar lacks bin/app, the higher layer's path: %v", names(entries))
+	}
+	if app.hdr.Typeflag != tar.TypeReg || app.body != "app" {
+		t.Errorf("bin/app = type %c body %q, want regular file %q", app.hdr.Typeflag, app.body, "app")
+	}
+	checkParents(t, entries)
+}
+
+// Without a bin entry of its own, the higher layer does not shadow the lower
+// layer's symlink, so its child is still resolved through it.
+func TestFlattenSymlinkFromLowerLayer(t *testing.T) {
+	// The higher layer has no bin entry of its own, so the lower layer's
+	// symlink is still the winner for bin.
+	entries := flattenStream(t, bytes.NewReader(tarBytes(t,
+		entry{hdr: tar.Header{Name: "bin/app", Typeflag: tar.TypeReg, Mode: 0o755}, body: "app"},
+		entry{hdr: tar.Header{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "usr/bin/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "bin", Typeflag: tar.TypeSymlink, Linkname: "usr/bin"}},
+	)))
+
+	bin, _ := findEntry(entries, "bin")
+	if bin.hdr.Typeflag != tar.TypeSymlink || bin.hdr.Linkname != "usr/bin" {
+		t.Errorf("bin = type %c link %q, want symlink to usr/bin", bin.hdr.Typeflag, bin.hdr.Linkname)
+	}
+	if n := countEntry(entries, "bin/app"); n != 0 {
+		t.Errorf("tar has %d entries for bin/app, want 0: %v", n, names(entries))
+	}
+	app, i := findEntry(entries, "usr/bin/app")
+	if i < 0 {
+		t.Fatalf("tar lacks usr/bin/app, the resolved path: %v", names(entries))
+	}
+	if app.hdr.Typeflag != tar.TypeReg || app.body != "app" {
+		t.Errorf("usr/bin/app = type %c body %q, want regular file %q", app.hdr.Typeflag, app.body, "app")
+	}
+	checkParents(t, entries)
+}
+
+// A higher layer can replace a lower layer's directory tree with a regular
+// file. Children under that path cannot exist, so they must be dropped rather
+// than emitted as orphans mke2fs would reject.
+func TestFlattenChildOfRegularFileParent(t *testing.T) {
+	entries := flattenStream(t, bytes.NewReader(tarBytes(t,
+		entry{hdr: tar.Header{Name: "bin", Typeflag: tar.TypeReg, Mode: 0o644}, body: "file"},
+		entry{hdr: tar.Header{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "usr/bin/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "bin", Typeflag: tar.TypeSymlink, Linkname: "usr/bin"}},
+		entry{hdr: tar.Header{Name: "bin/app", Typeflag: tar.TypeReg, Mode: 0o755}, body: "app"},
+	)))
+
+	bin, i := findEntry(entries, "bin")
+	if i < 0 {
+		t.Fatalf("tar lacks bin: %v", names(entries))
+	}
+	if bin.hdr.Typeflag != tar.TypeReg || bin.body != "file" {
+		t.Errorf("bin = type %c body %q, want regular file %q", bin.hdr.Typeflag, bin.body, "file")
+	}
+	for _, name := range []string{"bin/app", "usr/bin/app"} {
+		if n := countEntry(entries, name); n != 0 {
+			t.Errorf("tar has %d entries for %s, want 0: %v", n, name, names(entries))
+		}
+	}
+	checkParents(t, entries)
+}
+
 // A hardlink in a higher layer points at a file in a lower layer. mutate.Extract
 // emits the link first; mke2fs needs the target first.
 func TestFlattenHardlinkAcrossLayers(t *testing.T) {

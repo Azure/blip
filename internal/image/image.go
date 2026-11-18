@@ -156,9 +156,8 @@ func writeTarTo(w io.Writer, r io.Reader, dir string) error {
 	defer os.Remove(spool.Name())
 
 	var (
-		items []tarItem
-		syms  []tarSymlink
-		seen  = map[string]bool{}
+		winning = map[string]*tarItem{}
+		order   []string
 	)
 	tr := tar.NewReader(r)
 	for {
@@ -187,14 +186,24 @@ func writeTarTo(w io.Writer, r io.Reader, dir string) error {
 		if _, err := io.Copy(spool, tr); err != nil {
 			return err
 		}
-		if hdr.Typeflag == tar.TypeSymlink && !seen[hdr.Name] {
-			// The first entry for a name wins: the input is top layer first.
-			seen[hdr.Name] = true
-			syms = append(syms, tarSymlink{name: hdr.Name, target: hdr.Linkname})
+		if _, ok := winning[hdr.Name]; ok {
+			// The first entry for a path wins: the input is top layer first.
+			continue
 		}
-		items = append(items, tarItem{hdr: &hdr, off: off})
+		winning[hdr.Name] = &tarItem{hdr: &hdr, off: off}
+		order = append(order, hdr.Name)
 	}
 
+	// Only the winning entry for a path decides whether it is a symlink. If a
+	// higher layer replaces a lower layer's symlink with a real directory or
+	// file, the lower symlink is shadowed: following it would put the higher
+	// layer's children at the old target instead of under the new entry.
+	var syms []tarSymlink
+	for _, name := range order {
+		if h := winning[name].hdr; h.Typeflag == tar.TypeSymlink {
+			syms = append(syms, tarSymlink{name: name, target: h.Linkname})
+		}
+	}
 	links := resolveLinks(syms)
 	final := map[string]*tarEntry{}
 	// addParents synthesises the directories mke2fs needs but an image layer
@@ -214,15 +223,16 @@ func writeTarTo(w io.Writer, r io.Reader, dir string) error {
 			}
 		}
 	}
-	for _, it := range items {
+	for _, raw := range order {
+		it := winning[raw]
 		h := it.hdr
-		parent, ok := resolvePath(parentName(h.Name), links)
+		parent, ok := resolvePath(parentName(raw), links)
 		if !ok {
 			// The path goes through a symlink loop, so the kernel could not
 			// reach it either.
 			continue
 		}
-		name := joinName(parent, path.Base(h.Name))
+		name := joinName(parent, path.Base(raw))
 		h.Name = name
 		if h.Typeflag == tar.TypeLink {
 			target := cleanTarName(h.Linkname)
@@ -241,6 +251,20 @@ func writeTarTo(w io.Writer, r io.Reader, dir string) error {
 			final[name] = e
 		}
 		addParents(name)
+	}
+
+	// A path whose parent is not a directory cannot exist in the merged
+	// filesystem: the kernel cannot create a child under a regular file, and
+	// mke2fs rejects an orphaned entry. Drop such entries, including any
+	// synthetic parents created for them. A symlinked parent was already
+	// resolved through links, so it appears here as its target.
+	for name := range final {
+		for p := parentName(name); p != ""; p = parentName(p) {
+			if e, ok := final[p]; ok && e.hdr.Typeflag != tar.TypeDir {
+				delete(final, name)
+				break
+			}
+		}
 	}
 
 	tw := tar.NewWriter(w)
