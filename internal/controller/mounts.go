@@ -81,6 +81,9 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, pod *corev1
 		pathSame := inSpec && sm.Path == m.Path
 		same := pathSame && sm.Writable == m.Writable
 		switchTo := pathSame && !same && !stop
+		// A failed save stays visible even after its mount leaves the spec;
+		// a mount that merely never attached is forgotten with it.
+		saveFailure := strings.HasPrefix(m.Message, "save failed:")
 		if !pathSame && m.Switching {
 			// Removing the mount or changing its path cancels a switch in
 			// progress. A writable mount still goes through the normal
@@ -216,6 +219,7 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, pod *corev1
 				case !done:
 				case msg != "":
 					m.Phase, m.Message = v1.MountFailed, "save failed: "+msg
+					saveFailure = true
 					if !same {
 						// The mount was removed from the spec, but the
 						// failure must stay visible (and fail the Blip)
@@ -227,10 +231,15 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, pod *corev1
 				}
 			}
 		}
+		if m.Phase == v1.MountFailed && !same && !m.Switching && !saveFailure {
+			// The mount never attached and is gone from the spec: drop it
+			// so it no longer blocks unmounting or remounting the state.
+			continue
+		}
 		out = append(out, m)
-		// A failed removed mount is kept for the CLI but must not stop
-		// the same state from being mounted again. A switch keeps its
-		// entry while it is in progress or failed.
+		// Keep an in-progress switch visible and a failed save visible after
+		// its mount leaves the spec; a failed attach that was removed is
+		// dropped above.
 		if m.Phase != v1.MountFailed || same || m.Switching {
 			present[m.State] = true
 		}

@@ -34,6 +34,45 @@ func (e *env) storeSeal(state string, sr v1.SealResult) {
 	e.must(patchStatus(e.ctx, e.c, st, base))
 }
 
+// TestRemovedFailedMountIsForgotten covers a mount that failed before it
+// attached: removing it from the spec drops its failed status entry so the
+// Blip can mount the state again at another path.
+func TestRemovedFailedMountIsForgotten(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("data", "n1")
+	e.startBlip("b", "n1", withImage("reg/img:v1"))
+
+	e.updateBlip("b", func(b *v1.Blip) {
+		b.Spec.Mounts = []v1.Mount{{State: "data", Path: "data"}}
+	})
+	e.run(e.blip, ns, "b")
+	b := e.getBlip("b")
+	m := mountOf(b, "data")
+	if m == nil || m.Phase != v1.MountFailed || m.AttachmentID != "" || !strings.Contains(m.Message, "not absolute") {
+		t.Fatalf("failed attach %+v", m)
+	}
+
+	// Dropping the failed mount from the spec drops its status entry.
+	e.updateBlip("b", func(b *v1.Blip) { b.Spec.Mounts = nil })
+	e.run(e.blip, ns, "b")
+	b = e.getBlip("b")
+	expectPhase(t, b, v1.BlipRunning, "")
+	if m = mountOf(b, "data"); m != nil {
+		t.Fatalf("removed failed mount stayed visible: %+v", m)
+	}
+
+	// The same state can be mounted at a different, valid path.
+	e.updateBlip("b", func(b *v1.Blip) {
+		b.Spec.Mounts = []v1.Mount{{State: "data", Path: "/data"}}
+	})
+	e.run(e.blip, ns, "b")
+	if m = mountOf(e.getBlip("b"), "data"); m == nil || m.Phase != v1.MountPending || m.Path != "/data" {
+		t.Fatalf("remounted state %+v", m)
+	}
+}
+
 // TestRemovedMountSaveFailureStaysVisible covers A: a save failure of a mount
 // that was removed from the spec keeps its status entry and fails the Blip.
 func TestRemovedMountSaveFailureStaysVisible(t *testing.T) {

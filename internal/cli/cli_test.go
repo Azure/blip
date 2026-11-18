@@ -329,6 +329,40 @@ func TestUnmountBusy(t *testing.T) {
 	}
 }
 
+func TestUnmountFailedMountClearsState(t *testing.T) {
+	h := newHarness(t, runningBlip("agent"), readyState("repo"))
+	h.ctrl.set(func(c *fakeController) { c.mountFail = "no space left on device" })
+	code, _, errOut := h.run("", "mount", "repo", "--blip", "agent", "--path", "/work")
+	if code != 1 || !strings.Contains(errOut, "no space left on device") {
+		t.Fatalf("mount code %d err %q", code, errOut)
+	}
+	if b := h.blip("agent"); len(b.Status.Mounts) != 1 || b.Status.Mounts[0].Phase != v1alpha1.MountFailed {
+		t.Fatalf("failed mount: %+v", b.Status.Mounts)
+	}
+
+	// Removing a mount that never attached drops its failed entry, so the
+	// unmount completes instead of reporting the old attach error forever.
+	h.ctrl.set(func(c *fakeController) { c.mountFail = "" })
+	code, out, errOut := h.run("", "unmount", "repo", "--blip", "agent")
+	if code != 0 {
+		t.Fatalf("unmount code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state repo unmounted from blip agent")
+	if b := h.blip("agent"); len(b.Spec.Mounts) != 0 || len(b.Status.Mounts) != 0 {
+		t.Fatalf("mounts after unmount: %+v %+v", b.Spec.Mounts, b.Status.Mounts)
+	}
+
+	// The state can now be mounted again at another path.
+	code, out, errOut = h.run("", "mount", "repo", "--blip", "agent", "--path", "/other")
+	if code != 0 {
+		t.Fatalf("remount code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state repo mounted on blip agent at /other")
+	if b := h.blip("agent"); len(b.Spec.Mounts) != 1 || b.Spec.Mounts[0].Path != "/other" {
+		t.Fatalf("remounted spec: %+v", b.Spec.Mounts)
+	}
+}
+
 // TestGitWorkflow runs the fan-out/fan-in Git workflow against fakes,
 // creating states the way kubectl apply would.
 func TestGitWorkflow(t *testing.T) {

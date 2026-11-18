@@ -277,6 +277,9 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 			m.Message = c.unmountFail
 		case !inSpec && m.Phase == v1alpha1.MountUnmounting && m.Writable:
 			m.Phase = v1alpha1.MountSaving
+		case !inSpec && m.Phase == v1alpha1.MountFailed && !strings.Contains(m.Message, "save failed"):
+			// A mount that never attached is forgotten with its spec entry.
+			st.Mounts = append(st.Mounts[:i], st.Mounts[i+1:]...)
 		case !inSpec && (m.Phase == v1alpha1.MountUnmounting || m.Phase == v1alpha1.MountSaving):
 			st.Mounts = append(st.Mounts[:i], st.Mounts[i+1:]...)
 		default:
