@@ -79,6 +79,22 @@ func TestCollectFiles(t *testing.T) {
 		assertCollectReleased(t, h, "alice.box", "alice.w1")
 	})
 
+	t.Run("relative parent destination", func(t *testing.T) {
+		base := t.TempDir()
+		child := filepath.Join(base, "child")
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(child)
+		if code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/a.log:../out/a.log"); code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if got := readFile(t, filepath.Join(base, "out/a.log")); got != "hello\n" {
+			t.Fatalf("content = %q", got)
+		}
+		assertCollectReleased(t, h, "alice.box", "alice.w1")
+	})
+
 	t.Run("directory", func(t *testing.T) {
 		dst := filepath.Join(t.TempDir(), "artifacts")
 		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out:"+dst)
@@ -141,6 +157,37 @@ func TestCollectFiles(t *testing.T) {
 		}
 		t.Cleanup(func() { os.Chmod(dst, 0o755) })
 		t.Cleanup(func() { os.Chmod(filepath.Join(dst, "sub"), 0o755) })
+		assertCollectReleased(t, h, "alice.box", "alice.w1")
+	})
+
+	t.Run("destination parent symlink cannot escape", func(t *testing.T) {
+		base := t.TempDir()
+		outside := filepath.Join(base, "outside")
+		dest := filepath.Join(base, "dest")
+		if err := os.MkdirAll(outside, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(dest, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(dest, "sub")); err != nil {
+			t.Fatal(err)
+		}
+		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/a.log:"+filepath.Join(dest, "sub/x"))
+		if code != 1 || !strings.Contains(errOut, "symlink") {
+			t.Fatalf("code %d stderr %q", code, errOut)
+		}
+		if _, err := os.Stat(filepath.Join(outside, "x")); !os.IsNotExist(err) {
+			t.Fatalf("wrote through destination symlink: %v", err)
+		}
+		// A file copied to a symlinked directory follows it when stat'ing
+		// the destination, so the parent check has to run after that.
+		if code, _, _ := h.run("", "collect", "w1", "/home/dev/out/a.log:"+filepath.Join(dest, "sub")); code != 1 {
+			t.Fatalf("code %d, want 1", code)
+		}
+		if _, err := os.Stat(filepath.Join(outside, "a.log")); !os.IsNotExist(err) {
+			t.Fatalf("wrote into symlinked destination directory: %v", err)
+		}
 		assertCollectReleased(t, h, "alice.box", "alice.w1")
 	})
 

@@ -450,6 +450,18 @@ func underDir(root, p string) bool {
 	return err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator))
 }
 
+// commonDir returns the deepest ancestor of a that also contains b.
+func commonDir(a, b string) string {
+	for !underDir(a, b) {
+		parent := filepath.Dir(a)
+		if parent == a {
+			return a
+		}
+		a = parent
+	}
+	return a
+}
+
 // collectMountsAnnotation counts, per state, the collect commands using a
 // mount they added to the blip they run in. The last one to finish removes
 // it. A blip mounts a state at most once, so concurrent collects share it.
@@ -515,12 +527,65 @@ func copyPath(src, dst string) error {
 		return err
 	}
 	if info.IsDir() {
+		if err := checkDestParents(dst); err != nil {
+			return err
+		}
 		return copyTree(src, dst, info)
 	}
 	if di, err := os.Stat(dst); err == nil && di.IsDir() {
 		dst = filepath.Join(dst, filepath.Base(src))
 	}
+	if err := checkDestParents(dst); err != nil {
+		return err
+	}
 	return copyEntry(src, dst, info)
+}
+
+// checkDestParents rejects a destination whose existing parent directories
+// traverse a symlink. Only the final component is replaced by copyEntry; a
+// symlink above it could redirect writes outside the destination the user
+// named, for example a link created by an earlier collect.
+func checkDestParents(dst string) error {
+	abs, err := filepath.Abs(dst)
+	if err != nil {
+		return err
+	}
+	// A relative destination is trusted up to its common ancestor with the
+	// working directory, so "../out" keeps working. An absolute one is
+	// checked from /.
+	root := string(filepath.Separator)
+	if !filepath.IsAbs(dst) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		root = commonDir(cwd, abs)
+	}
+	rel, err := filepath.Rel(root, abs)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	// The last component is the destination itself, which copyEntry replaces
+	// rather than writes through.
+	cur := root
+	for _, part := range parts[:len(parts)-1] {
+		if part == "" || part == "." {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("destination %s has a symlink at %s; refusing to write through it", abs, cur)
+		}
+	}
+	return nil
 }
 
 func copyTree(src, dst string, info os.FileInfo) error {
