@@ -1,3 +1,5 @@
-bin/
-_output/
-.cache/
+/bin/
+/build/
+/blip
+/blip-*
+*.test

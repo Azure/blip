@@ -1,0 +1,381 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: blipstates.blip.dev
+spec:
+  group: blip.dev
+  names:
+    kind: BlipState
+    listKind: BlipStateList
+    plural: blipstates
+    shortNames:
+    - bst
+    singular: blipstate
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.committed.generation
+      name: Gen
+      type: integer
+    - jsonPath: .status.writer.blipName
+      name: Writer
+      type: string
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BlipStateSpec is one durable ext4 filesystem. A state can be a blip's root
+              filesystem or an auxiliary mount. All fields are immutable.
+            properties:
+              copyFrom:
+                description: |-
+                  CopyFrom names a state in the same namespace. The copy pins the
+                  source when created: its committed version, or a live snapshot of an
+                  active writer's disk. Later source changes or
+                  deletion do not affect it.
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                type: string
+              image:
+                description: |-
+                  Image initializes the filesystem from a container image, which each
+                  node converts to ext4 itself. Every eligible node (matching
+                  nodeSelector) holds an image state. Without image or copyFrom the
+                  state starts as an empty ext4 filesystem.
+                type: string
+              imagePullSecrets:
+                description: ImagePullSecrets authenticate the image pull when Image
+                  is set.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: NodeSelector limits which nodes may hold the state.
+                type: object
+              replicas:
+                description: |-
+                  Replicas is the number of nodes that hold every committed version.
+                  Default 3. Must not be set for image states.
+                format: int32
+                maximum: 3
+                minimum: 1
+                type: integer
+              size:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  Size is the filesystem size. Defaults to the source state's size for
+                  copies and to 10Gi otherwise. An image state fails if the converted
+                  image does not fit.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+            type: object
+            x-kubernetes-validations:
+            - message: set at most one of image and copyFrom
+              rule: '!(has(self.image) && has(self.copyFrom))'
+            - message: replicas cannot be set for image states; they are held by every
+                eligible node
+              rule: '!(has(self.image) && has(self.replicas))'
+            - message: spec is immutable
+              rule: self == oldSelf
+          status:
+            properties:
+              committed:
+                description: Commit identifies one immutable, committed version of
+                  a state.
+                properties:
+                  attachmentID:
+                    description: |-
+                      AttachmentID is the writer that produced this version; empty for
+                      the initial version.
+                    type: string
+                  generation:
+                    format: int64
+                    type: integer
+                  id:
+                    description: ID is unique across all states and versions.
+                    type: string
+                  sizeBytes:
+                    format: int64
+                    type: integer
+                  time:
+                    format: date-time
+                    type: string
+                required:
+                - generation
+                - id
+                - sizeBytes
+                - time
+                type: object
+              copiedFrom:
+                description: CopySource is the exact version a copy was created from.
+                properties:
+                  attachmentID:
+                    description: |-
+                      AttachmentID is set for a live copy: a snapshot of the source's
+                      running writer attachment, taken on Nodes[0] while the guest keeps
+                      the filesystem frozen.
+                    type: string
+                  commitID:
+                    description: CommitID is the source's committed version, or empty
+                      for a live copy.
+                    type: string
+                  nodes:
+                    description: Nodes held the source version when the copy was resolved.
+                    items:
+                      type: string
+                    type: array
+                  stateUID:
+                    type: string
+                required:
+                - nodes
+                - stateUID
+                type: object
+              imageConfig:
+                description: |-
+                  ImageConfig is the container image metadata resolved when the state
+                  was created. It is copied into copies and remains valid after the
+                  original image or source state is gone.
+                properties:
+                  cmd:
+                    items:
+                      type: string
+                    type: array
+                  entrypoint:
+                    items:
+                      type: string
+                    type: array
+                  env:
+                    items:
+                      type: string
+                    type: array
+                  user:
+                    type: string
+                  workingDir:
+                    type: string
+                type: object
+              imageDigest:
+                description: |-
+                  ImageDigest is the resolved container image (digest reference
+                  repo@sha256:...) for image-initialized states.
+                type: string
+              lastError:
+                description: LastError is the latest node-side preparation error for
+                  this state.
+                type: string
+              message:
+                type: string
+              nodes:
+                items:
+                  description: NodeObservation is written only by the node agent named
+                    by Node.
+                  properties:
+                    commits:
+                      description: Commits are the commit IDs this node durably holds
+                        for this state.
+                      items:
+                        type: string
+                      type: array
+                    error:
+                      type: string
+                    fetching:
+                      description: Fetching is the commit being copied to this node,
+                        with progress.
+                      properties:
+                        commitID:
+                          type: string
+                        doneBytes:
+                          format: int64
+                          type: integer
+                        totalBytes:
+                          format: int64
+                          type: integer
+                      required:
+                      - commitID
+                      - doneBytes
+                      - totalBytes
+                      type: object
+                    incarnation:
+                      description: |-
+                        Incarnation must equal BlipNode.status.incarnation, otherwise the
+                        entry is ignored (the node lost its storage).
+                      type: string
+                    node:
+                      type: string
+                    sealed:
+                      description: |-
+                        Sealed reports the outcome of ending a writable attachment on this
+                        node. CommitID is empty when the data could not be saved.
+                      items:
+                        properties:
+                          attachmentID:
+                            type: string
+                          commitID:
+                            type: string
+                          error:
+                            type: string
+                          sizeBytes:
+                            format: int64
+                            type: integer
+                        required:
+                        - attachmentID
+                        type: object
+                      type: array
+                  required:
+                  - incarnation
+                  - node
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - node
+                x-kubernetes-list-type: map
+              pending:
+                description: |-
+                  PendingCommit is a new version that is being replicated. It becomes
+                  status.committed once every node in Replicas reports holding it.
+                properties:
+                  attachmentID:
+                    description: |-
+                      AttachmentID is the writer that produced it; empty for the initial
+                      version.
+                    type: string
+                  commitID:
+                    type: string
+                  generation:
+                    format: int64
+                    type: integer
+                  replicas:
+                    description: Replicas are the nodes that must hold the version
+                      before commit.
+                    items:
+                      type: string
+                    type: array
+                  sourceNode:
+                    description: SourceNode builds or already holds the version.
+                    type: string
+                required:
+                - commitID
+                - generation
+                - replicas
+                - sourceNode
+                type: object
+              phase:
+                type: string
+              placements:
+                description: |-
+                  Placements are the nodes that hold (or are being given) the
+                  committed version.
+                items:
+                  type: string
+                type: array
+              seals:
+                description: |-
+                  Seals records the outcome of ended writer attachments, keyed by
+                  attachment ID. The controller keeps entries long enough for the Blip
+                  that wrote them to observe the result, so a later save cannot hide an
+                  earlier failure.
+                items:
+                  properties:
+                    attachmentID:
+                      type: string
+                    commitID:
+                      type: string
+                    error:
+                      type: string
+                    sizeBytes:
+                      format: int64
+                      type: integer
+                  required:
+                  - attachmentID
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - attachmentID
+                x-kubernetes-list-type: map
+              sizeBytes:
+                format: int64
+                type: integer
+              writer:
+                description: Writer is the single writable attachment of a state.
+                properties:
+                  attachmentID:
+                    description: AttachmentID is unique per acquisition.
+                    type: string
+                  baseCommit:
+                    description: BaseCommit is the committed version the writer started
+                      from.
+                    type: string
+                  blipName:
+                    type: string
+                  blipUID:
+                    type: string
+                  node:
+                    type: string
+                  podName:
+                    description: PodName/PodUID/Node are the claimed VM pod.
+                    type: string
+                  podUID:
+                    type: string
+                required:
+                - attachmentID
+                - baseCommit
+                - blipName
+                - blipUID
+                - node
+                - podName
+                - podUID
+                type: object
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

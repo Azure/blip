@@ -1,3 +1,0 @@
-#!/bin/sh
-# kubectl runs kubectl_complete-<plugin> to complete `kubectl blip ...`.
-exec kubectl-blip __complete "$@"

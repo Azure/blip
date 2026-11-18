@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blip-node
+  namespace: blip-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blip-node
+rules:
+  - apiGroups: [blip.dev]
+    resources: [blips, blipstates, blippools, blipnodes]
+    verbs: [get, list, watch]
+  - apiGroups: [blip.dev]
+    resources: [blipnodes]
+    verbs: [create, update]
+  - apiGroups: [blip.dev]
+    resources: [blipnodes/status, blipstates/status]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [namespaces, services]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list]
+  - apiGroups: ["", events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: blip-node
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: blip-node
+subjects:
+  - kind: ServiceAccount
+    name: blip-node
+    namespace: blip-system
+---
+# Runs on nodes enrolled by the controller because a BlipPool selects them.
+# VM pods select the same label plus a hypervisor capability label.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: blip-node
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blip-node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blip-node
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blip-node
+    spec:
+      serviceAccountName: blip-node
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        blip.dev/enrolled: "true"
+      # Pool selectors decide where the agent runs; taints on a selected node
+      # must not keep it from starting and draining safely.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node
+          image: ghcr.io/azure/blip-node:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # The namespace of the disk key Secret.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/blip
+            - name: dev
+              mountPath: /dev
+            - name: modules
+              mountPath: /lib/modules
+              readOnly: true
+            - name: configfs
+              mountPath: /sys/kernel/config
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/lib/blip
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
+        # nvmet exports are configured through configfs.
+        - name: configfs
+          hostPath:
+            path: /sys/kernel/config
+            type: Directory

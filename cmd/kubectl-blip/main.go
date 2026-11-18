@@ -1,11 +1,31 @@
-// Command kubectl-blip is a kubectl plugin to create and SSH into Blip
-// sessions. See docs/kubectl-plugin.md.
+// Command kubectl-blip is the Blip kubectl plugin, run as `kubectl blip`.
 package main
 
 import (
+	"context"
+	"flag"
+	"io"
 	"os"
 
-	"github.com/example/blip/internal/kubectlblip/cmd"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/klog/v2"
+
+	"github.com/Azure/blip/internal/cli"
 )
 
-func main() { os.Exit(cmd.Main(os.Args[1:])) }
+func main() {
+	// client-go logs connection teardown noise (closed websockets, ping
+	// failures) that is expected when a session ends. Errors that matter are
+	// returned to the CLI and printed there.
+	fs := flag.NewFlagSet("klog", flag.ContinueOnError)
+	klog.InitFlags(fs)
+	_ = fs.Set("logtostderr", "false")
+	_ = fs.Set("alsologtostderr", "false")
+	_ = fs.Set("stderrthreshold", "FATAL")
+	klog.SetOutput(io.Discard)
+	utilruntime.ErrorHandlers = nil
+	if cli.IsGitRemoteHelper(os.Args[0]) {
+		os.Exit(cli.GitRemoteMain(context.Background(), cli.DefaultEnv(), os.Args[1:]))
+	}
+	os.Exit(cli.Main(context.Background(), cli.DefaultEnv(), os.Args[1:]))
+}

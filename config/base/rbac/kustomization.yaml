@@ -1,4 +1,0 @@
-resources:
-- tenant.yaml
-- controller.yaml
-- node.yaml

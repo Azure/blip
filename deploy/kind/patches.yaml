@@ -1,0 +1,59 @@
+# Images are pulled from the plain-HTTP registry container blip-registry on the
+# kind docker network (localhost:5001 from the host).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blip-controller
+  namespace: blip-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          args:
+            - --leader-elect
+            - --runtime-image=$(RUNTIME_IMAGE)
+            - --insecure-registry=blip-registry:5000
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: blip-node
+  namespace: blip-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: node
+          args:
+            - --insecure-registry=blip-registry:5000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blip-gateway
+  namespace: blip-ssh
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          args:
+            - --namespace=blip-ssh
+            - --image=blip-registry:5000/blip/dev:latest
+            - --identity-header=X-Forwarded-User
+            - --tls-cert=/etc/blip/tls/tls.crt
+            - --tls-key=/etc/blip/tls/tls.key
+            - --tls-client-ca=/etc/blip/tls/client-ca.crt
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blip-gateway
+  namespace: blip-ssh
+spec:
+  type: NodePort
+  ports:
+    - name: ssh
+      port: 22
+      nodePort: 30022

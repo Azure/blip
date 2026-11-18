@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# blip-auth requests a short-lived Blip SSH certificate. OpenSSH runs it from
+# ~/.ssh/config before connecting. The Envoy gateway in front of the
+# certificate API authenticates the request.
+set -euo pipefail
+umask 077
+
+# Edit this setting, or set BLIP_ENDPOINT.
+endpoint="${BLIP_ENDPOINT:-https://blip.example.com}"
+endpoint="${endpoint%/}"
+dir="$HOME/.ssh/blip"
+key="$dir/id_ed25519"
+mkdir -p "$dir"
+
+if [[ ! -f "$key.pub" ]]; then
+  echo "blip-auth: missing $key.pub; run: ssh-keygen -t ed25519 -N '' -f $key" >&2
+  exit 1
+fi
+
+cert_tmp="$dir/.cert.$$"
+hosts_tmp="$dir/.known_hosts.$$"
+trap 'rm -f "$cert_tmp" "$hosts_tmp"' EXIT
+
+# The Envoy gateway validates a bearer token before it sets the identity
+# header. Provide it in BLIP_TOKEN, or fetch it with BLIP_TOKEN_COMMAND (for
+# example: BLIP_TOKEN_COMMAND='az account get-access-token --query accessToken -o tsv').
+token="${BLIP_TOKEN:-}"
+if [[ -z "$token" && -n "${BLIP_TOKEN_FILE:-}" ]]; then
+  token=$(<"$BLIP_TOKEN_FILE")
+fi
+if [[ -z "$token" && -n "${BLIP_TOKEN_COMMAND:-}" ]]; then
+  token=$(eval "$BLIP_TOKEN_COMMAND")
+fi
+if [[ -z "$token" ]]; then
+  echo "blip-auth: no token; set BLIP_TOKEN, BLIP_TOKEN_FILE, or BLIP_TOKEN_COMMAND" >&2
+  exit 1
+fi
+
+response=$(curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 \
+  -H "Authorization: Bearer $token" \
+  --data-binary @"$key.pub" \
+  "$endpoint/v1/ssh/certificate") || {
+  echo "blip-auth: certificate request to $endpoint failed" >&2
+  exit 1
+}
+
+jq -er '.certificate' <<<"$response" >"$cert_tmp"
+host_key=$(jq -er '.host_key' <<<"$response")
+new_line="blip $host_key"
+
+# Trust on first use, then refuse a changed host key until the user re-pins.
+if [[ -f "$dir/known_hosts" ]] && ! grep -qxF "$new_line" "$dir/known_hosts"; then
+  if [[ "${BLIP_REPIN:-}" != "1" ]]; then
+    echo "blip-auth: gateway host key changed; set BLIP_REPIN=1 to accept it" >&2
+    exit 1
+  fi
+fi
+printf '%s\n' "$new_line" >"$hosts_tmp"
+[[ -s "$cert_tmp" && -s "$hosts_tmp" ]] || {
+  echo "blip-auth: incomplete certificate response" >&2
+  exit 1
+}
+
+mv -f "$cert_tmp" "$key-cert.pub"
+mv -f "$hosts_tmp" "$dir/known_hosts"

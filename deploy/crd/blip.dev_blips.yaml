@@ -1,0 +1,539 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: blips.blip.dev
+spec:
+  group: blip.dev
+  names:
+    kind: Blip
+    listKind: BlipList
+    plural: blips
+    singular: blip
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.state
+      name: Root
+      type: string
+    - jsonPath: .spec.image
+      name: Image
+      priority: 1
+      type: string
+    - jsonPath: .status.exitCode
+      name: Exit
+      type: integer
+    - jsonPath: .status.node
+      name: Node
+      type: string
+    - jsonPath: .status.reason
+      name: Reason
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BlipSpec is one VM lifetime: either one command, or an interactive
+              sandbox that lives while sessions or processes are active.
+            properties:
+              command:
+                description: |-
+                  Command runs as the primary session. The blip ends when it exits.
+                  Without a command the blip is an interactive sandbox that stops after
+                  IdleTimeout without sessions or running processes.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-validations:
+                - message: command is immutable
+                  rule: self == oldSelf
+              env:
+                items:
+                  properties:
+                    name:
+                      type: string
+                    value:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              idleTimeout:
+                description: IdleTimeout applies to interactive blips. Default 30s.
+                type: string
+              image:
+                description: |-
+                  Image gives the blip a throwaway root filesystem from a container
+                  image, converted to ext4 on the node. The root is 10Gi, or the
+                  converted image's size if larger.
+                type: string
+                x-kubernetes-validations:
+                - message: image is immutable
+                  rule: self == oldSelf
+              imagePullSecrets:
+                description: ImagePullSecrets authenticate image pulls for this blip's
+                  image root.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+              mounts:
+                items:
+                  description: Mount attaches a state's filesystem inside a running
+                    blip.
+                  properties:
+                    path:
+                      description: Path is an absolute path inside the guest root.
+                      pattern: ^/.+
+                      type: string
+                    state:
+                      description: State names a BlipState in the blip's namespace.
+                      pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                      type: string
+                    writable:
+                      description: |-
+                        Writable mounts take the state's single writer slot and save a new
+                        version when unmounted. Read-only mounts pin the committed version.
+                      type: boolean
+                  required:
+                  - path
+                  - state
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - state
+                x-kubernetes-list-type: map
+              network:
+                description: |-
+                  Network narrows the pool's egress policy. Omitted inherits the pool;
+                  explicitly empty denies all. Changes apply to running blips.
+                properties:
+                  egress:
+                    items:
+                      description: NetworkEgressRule allows the intersection of its
+                        destinations and ports.
+                      properties:
+                        ports:
+                          description: |-
+                            Ports allows numeric TCP/UDP destination ports. Omitted or empty means
+                            all IP protocols and ports. Service ports are not translated here.
+                          items:
+                            description: NetworkPort is a numeric destination port
+                              or inclusive port range.
+                            properties:
+                              endPort:
+                                format: int32
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              port:
+                                format: int32
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              protocol:
+                                default: TCP
+                                description: Protocol defines network protocols supported
+                                  for things like container ports.
+                                enum:
+                                - TCP
+                                - UDP
+                                type: string
+                            required:
+                            - port
+                            type: object
+                            x-kubernetes-validations:
+                            - message: endPort must be at least port
+                              rule: '!has(self.endPort) || self.endPort >= self.port'
+                          maxItems: 64
+                          type: array
+                        to:
+                          description: To selects destinations. Omitted or empty means
+                            all IPv4 destinations.
+                          items:
+                            description: |-
+                              NetworkPeer selects an IP block, pods, or services. Pod and namespace
+                              selectors are ANDed; service and namespace selectors are ANDed. Without a
+                              namespace selector, selectors are scoped to the Blip's namespace.
+                            properties:
+                              ipBlock:
+                                description: IPBlock allows an IPv4 CIDR minus its
+                                  strictly smaller exception CIDRs.
+                                properties:
+                                  cidr:
+                                    description: CIDR is an IPv4 destination range,
+                                      for example 192.0.2.0/24.
+                                    maxLength: 18
+                                    type: string
+                                  except:
+                                    description: Except removes IPv4 subranges from
+                                      CIDR.
+                                    items:
+                                      maxLength: 18
+                                      type: string
+                                    maxItems: 32
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - cidr
+                                type: object
+                                x-kubernetes-validations:
+                                - message: cidr must be a valid IPv4 CIDR
+                                  rule: isCIDR(self.cidr) && cidr(self.cidr).ip().family()
+                                    == 4
+                                - message: exceptions must be IPv4 CIDRs strictly
+                                    inside cidr
+                                  rule: '!has(self.except) || self.except.all(c, isCIDR(c)
+                                    && cidr(c).ip().family() == 4 && cidr(self.cidr).containsCIDR(cidr(c))
+                                    && cidr(c).prefixLength() > cidr(self.cidr).prefixLength())'
+                              namespaceSelector:
+                                description: NamespaceSelector selects namespaces
+                                  by label; alone it selects pods.
+                                properties:
+                                  matchExpressions:
+                                    description: matchExpressions is a list of label
+                                      selector requirements. The requirements are
+                                      ANDed.
+                                    items:
+                                      description: |-
+                                        A label selector requirement is a selector that contains values, a key, and an operator that
+                                        relates the key and values.
+                                      properties:
+                                        key:
+                                          description: key is the label key that the
+                                            selector applies to.
+                                          type: string
+                                        operator:
+                                          description: |-
+                                            operator represents a key's relationship to a set of values.
+                                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                                          type: string
+                                        values:
+                                          description: |-
+                                            values is an array of string values. If the operator is In or NotIn,
+                                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                            the values array must be empty. This array is replaced during a strategic
+                                            merge patch.
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    description: |-
+                                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              podSelector:
+                                description: |-
+                                  PodSelector selects direct PodIPs, excluding host-networked, terminal,
+                                  and deleting pods whose old addresses may have been reassigned.
+                                properties:
+                                  matchExpressions:
+                                    description: matchExpressions is a list of label
+                                      selector requirements. The requirements are
+                                      ANDed.
+                                    items:
+                                      description: |-
+                                        A label selector requirement is a selector that contains values, a key, and an operator that
+                                        relates the key and values.
+                                      properties:
+                                        key:
+                                          description: key is the label key that the
+                                            selector applies to.
+                                          type: string
+                                        operator:
+                                          description: |-
+                                            operator represents a key's relationship to a set of values.
+                                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                                          type: string
+                                        values:
+                                          description: |-
+                                            values is an array of string values. If the operator is In or NotIn,
+                                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                            the values array must be empty. This array is replaced during a strategic
+                                            merge patch.
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    description: |-
+                                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              serviceSelector:
+                                description: |-
+                                  ServiceSelector selects ClusterIPs, or EndpointSlice IPv4 addresses for
+                                  headless services. ExternalName services have no selectable address.
+                                properties:
+                                  matchExpressions:
+                                    description: matchExpressions is a list of label
+                                      selector requirements. The requirements are
+                                      ANDed.
+                                    items:
+                                      description: |-
+                                        A label selector requirement is a selector that contains values, a key, and an operator that
+                                        relates the key and values.
+                                      properties:
+                                        key:
+                                          description: key is the label key that the
+                                            selector applies to.
+                                          type: string
+                                        operator:
+                                          description: |-
+                                            operator represents a key's relationship to a set of values.
+                                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                                          type: string
+                                        values:
+                                          description: |-
+                                            values is an array of string values. If the operator is In or NotIn,
+                                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                            the values array must be empty. This array is replaced during a strategic
+                                            merge patch.
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    description: |-
+                                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                            type: object
+                            x-kubernetes-validations:
+                            - message: a peer must select an IP block, pods, namespaces,
+                                or services
+                              rule: has(self.ipBlock) || has(self.podSelector) ||
+                                has(self.namespaceSelector) || has(self.serviceSelector)
+                            - message: ipBlock cannot be combined with selectors
+                              rule: '!has(self.ipBlock) || !(has(self.podSelector)
+                                || has(self.namespaceSelector) || has(self.serviceSelector))'
+                            - message: podSelector and serviceSelector cannot be combined
+                              rule: '!(has(self.podSelector) && has(self.serviceSelector))'
+                          maxItems: 64
+                          type: array
+                      type: object
+                    maxItems: 64
+                    type: array
+                type: object
+              pool:
+                default: default
+                description: Pool names a BlipPool in the blip's namespace.
+                type: string
+                x-kubernetes-validations:
+                - message: pool is immutable
+                  rule: self == oldSelf
+              state:
+                description: |-
+                  State gives the blip a durable root filesystem. A new version is
+                  saved when the blip stops.
+                type: string
+                x-kubernetes-validations:
+                - message: state is immutable
+                  rule: self == oldSelf
+              stop:
+                description: Stop asks the blip to shut down gracefully and save.
+                type: boolean
+              tty:
+                description: TTY gives the primary command a terminal.
+                type: boolean
+              user:
+                type: string
+                x-kubernetes-validations:
+                - message: user is immutable
+                  rule: self == oldSelf
+              workingDir:
+                type: string
+                x-kubernetes-validations:
+                - message: workingDir is immutable
+                  rule: self == oldSelf
+            type: object
+            x-kubernetes-validations:
+            - message: set exactly one of image and state
+              rule: has(self.image) != has(self.state)
+            - message: image, state, and command are immutable
+              rule: has(self.image) == has(oldSelf.image) && has(self.command) ==
+                has(oldSelf.command)
+            - message: env is immutable
+              rule: (has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env
+                == oldSelf.env)
+            - message: workingDir is immutable
+              rule: (has(self.workingDir) == has(oldSelf.workingDir)) && (!has(self.workingDir)
+                || self.workingDir == oldSelf.workingDir)
+            - message: user is immutable
+              rule: (has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user
+                == oldSelf.user)
+            - message: tty and idleTimeout are immutable
+              rule: (has(self.tty) && self.tty) == (has(oldSelf.tty) && oldSelf.tty)
+                && (has(self.idleTimeout) == has(oldSelf.idleTimeout)) && (!has(self.idleTimeout)
+                || self.idleTimeout == oldSelf.idleTimeout)
+          status:
+            properties:
+              exitCode:
+                format: int32
+                type: integer
+              finishTime:
+                format: date-time
+                type: string
+              imageDigest:
+                description: |-
+                  ImageDigest is the resolved container image (digest reference
+                  repo@sha256:...) for image roots.
+                type: string
+              locality:
+                description: |-
+                  Locality is where a pending Blip's durable data lives. The pool
+                  boots a VM pinned to that node so the Blip does not start on a
+                  remote clone.
+                properties:
+                  fallback:
+                    description: Fallback means the Blip stopped waiting and claims
+                      any warm VM.
+                    type: boolean
+                  node:
+                    description: Node holds the root state (or the most writable mount
+                      states).
+                    type: string
+                  since:
+                    description: |-
+                      Since is when the Blip, with all its states usable, started waiting
+                      for a VM on Node.
+                    format: date-time
+                    type: string
+                required:
+                - node
+                type: object
+              message:
+                type: string
+              mounts:
+                items:
+                  properties:
+                    attachmentID:
+                      description: AttachmentID is unique per mount operation.
+                      type: string
+                    commitID:
+                      type: string
+                    message:
+                      type: string
+                    path:
+                      type: string
+                    phase:
+                      type: string
+                    state:
+                      type: string
+                    stateUID:
+                      description: |-
+                        StateUID and CommitID pin the version: the mounted version for
+                        read-only mounts, the base version for writable mounts.
+                      type: string
+                    writable:
+                      type: boolean
+                  required:
+                  - path
+                  - phase
+                  - state
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - state
+                x-kubernetes-list-type: map
+              node:
+                type: string
+              phase:
+                type: string
+              pod:
+                type: string
+              podUID:
+                type: string
+              reason:
+                type: string
+              rootAttachmentID:
+                description: RootAttachmentID is the writer attachment of a durable
+                  root.
+                type: string
+              sessions:
+                format: int32
+                type: integer
+              startTime:
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

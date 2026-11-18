@@ -1,0 +1,905 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	v1 "github.com/Azure/blip/api/v1alpha1"
+)
+
+const (
+	defaultStateSize = 10 << 30
+	// retryAfter paces retries of failures that no watch event resolves
+	// (registry errors).
+	retryAfter = 30 * time.Second
+	// AnnotationForceRecoverWriter clears a writer that cannot be
+	// confirmed stopped (for example after its Kubernetes Node was
+	// deleted) and records a failed seal so the Blip does not report a
+	// successful save. The controller removes it after using it.
+	AnnotationForceRecoverWriter = "blip.dev/force-recover-writer"
+	// maxSeals is the API limit for BlipState.status.seals.
+	maxSeals = 32
+	// recentSeals is how many seal results are kept even when no Blip
+	// references them.
+	recentSeals = 8
+)
+
+// imageConfigResolver is implemented by registries that can also report an
+// image's runtime configuration. The controller copies it into state status
+// so copies do not depend on the original image or source state.
+type imageConfigResolver interface {
+	ImageConfig(ctx context.Context, ref string) (*v1.ImageConfig, error)
+}
+
+// StateReconciler drives BlipState versions: initial version, commits,
+// seals, repair, and deletion. It never writes status.nodes.
+type StateReconciler struct {
+	client.Client
+	// Live is an uncached reader used to confirm destructive decisions.
+	Live client.Reader
+	Config
+}
+
+func (r *StateReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	allStates := handler.EnqueueRequestsFromMapFunc(r.allStates)
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&v1.BlipState{}).
+		Watches(&v1.BlipNode{}, allStates, builder.WithPredicates(predicate.Funcs{
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				a, b := e.ObjectOld.(*v1.BlipNode), e.ObjectNew.(*v1.BlipNode)
+				now := r.now()
+				return a.Spec != b.Spec || a.Status.Incarnation != b.Status.Incarnation ||
+					healthy(a, now) != healthy(b, now)
+			},
+		})).
+		Watches(&corev1.Node{}, allStates, builder.WithPredicates(predicate.Funcs{
+			UpdateFunc: func(event.UpdateEvent) bool { return false },
+		})).
+		Watches(&v1.Blip{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
+			var out []reconcile.Request
+			for _, s := range stateRefs(o.(*v1.Blip)) {
+				out = append(out, req(o.GetNamespace(), s))
+				// Live copies wait for the writer's VM to run.
+				out = append(out, r.copiesOf(ctx, o.GetNamespace(), s)...)
+			}
+			return out
+		})).
+		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.copies)).
+		Named("blipstate").
+		// Live copies and seals of independent states do not share locks
+		// in the controller; a single worker made parallel forks queue
+		// behind each other while waiting for node status.
+		WithOptions(controller.Options{MaxConcurrentReconciles: 4}).
+		Complete(r)
+}
+
+func (r *StateReconciler) allStates(ctx context.Context, _ client.Object) []reconcile.Request {
+	var states v1.BlipStateList
+	if err := r.List(ctx, &states); err != nil {
+		return nil
+	}
+	out := make([]reconcile.Request, len(states.Items))
+	for i, st := range states.Items {
+		out[i] = req(st.Namespace, st.Name)
+	}
+	return out
+}
+
+// copies maps a state to states copying from it.
+func (r *StateReconciler) copies(ctx context.Context, o client.Object) []reconcile.Request {
+	return r.copiesOf(ctx, o.GetNamespace(), o.GetName())
+}
+
+func (r *StateReconciler) copiesOf(ctx context.Context, namespace, name string) []reconcile.Request {
+	var states v1.BlipStateList
+	if err := r.List(ctx, &states, client.InNamespace(namespace), client.MatchingFields{indexCopyFrom: name}); err != nil {
+		return nil
+	}
+	var out []reconcile.Request
+	for _, st := range states.Items {
+		out = append(out, req(st.Namespace, st.Name))
+	}
+	return out
+}
+
+func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (reconcile.Result, error) {
+	st := &v1.BlipState{}
+	if err := r.Get(ctx, rq.NamespacedName, st); err != nil {
+		return reconcile.Result{}, client.IgnoreNotFound(err)
+	}
+	deleting := st.DeletionTimestamp != nil
+	if !deleting && !controllerutil.ContainsFinalizer(st, Finalizer) {
+		base := st.DeepCopy()
+		controllerutil.AddFinalizer(st, Finalizer)
+		if err := patchObject(ctx, r.Client, st, base); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+	cl, err := loadCluster(ctx, r.Client, r.now())
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	base := st.DeepCopy()
+	var msgs []string
+	var result reconcile.Result
+	var forceRecovered bool
+	if st.Status.Writer != nil {
+		orphan, err := r.unpublishedWriter(ctx, st)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if orphan {
+			w := st.Status.Writer
+			st.Status.Writer = nil
+			err := r.recordSeal(ctx, st, v1.SealResult{
+				AttachmentID: w.AttachmentID,
+				Error:        "writer released before any blip published the attachment",
+			})
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			msgs = append(msgs, fmt.Sprintf("released unpublished writer of %s", w.BlipName))
+		} else {
+			msg, recovered, err := r.writer(ctx, st, cl)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			forceRecovered = recovered
+			msgs = append(msgs, msg)
+		}
+	}
+	if cf := st.Status.CopiedFrom; cf != nil && cf.AttachmentID != "" && st.Status.Committed == nil && !deleting {
+		stale, err := r.liveCopyStale(ctx, st, cl)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if stale {
+			st.Status.CopiedFrom = nil
+			st.Status.Pending = nil
+			if st.Status.Committed == nil {
+				// A failed live copy can still fall back to the source's
+				// committed version, so it is a retry, not a dead end.
+				st.Status.Phase = v1.StatePending
+				st.Status.LastError = ""
+			}
+			if st.Spec.Size == nil {
+				st.Status.SizeBytes = 0
+			}
+			msgs = append(msgs, "copy source writer changed; replanning")
+		}
+	}
+	switch {
+	case st.Status.Pending != nil:
+		msg, err := r.pending(ctx, st, cl)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		msgs = append(msgs, msg)
+	case st.Status.Committed == nil && st.Status.Phase == v1.StateFailed:
+		msgs = append(msgs, st.Status.Message)
+	case st.Status.Committed == nil && !deleting:
+		msg, retry, err := r.initialize(ctx, st, cl)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		msgs = append(msgs, msg)
+		if retry {
+			result.RequeueAfter = retryAfter
+		}
+		if st.Status.Pending != nil {
+			msg, err := r.pending(ctx, st, cl)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			msgs = append(msgs, msg)
+		}
+	case st.Status.Committed != nil:
+		msgs = append(msgs, r.repair(st, cl))
+	}
+
+	var blockers []string
+	if deleting {
+		if blockers, err = r.deletionBlockers(ctx, st); err != nil {
+			return reconcile.Result{}, err
+		}
+		if len(blockers) > 0 {
+			msgs = append(msgs, "deleting: waiting for "+strings.Join(blockers, ", "))
+		}
+	}
+	if st.Status.Phase != v1.StateFailed || st.Status.Committed != nil {
+		st.Status.Phase = statePhase(st)
+	}
+	st.Status.Message = joinMessages(msgs)
+	if !semanticEqual(base.Status, st.Status) {
+		if err := patchStatus(ctx, r.Client, st, base); err != nil {
+			return reconcile.Result{}, client.IgnoreNotFound(err)
+		}
+	}
+	if deleting && len(blockers) == 0 && controllerutil.ContainsFinalizer(st, Finalizer) {
+		base := st.DeepCopy()
+		controllerutil.RemoveFinalizer(st, Finalizer)
+		return reconcile.Result{}, client.IgnoreNotFound(patchObject(ctx, r.Client, st, base))
+	}
+	if forceRecovered || (st.Status.Writer == nil && st.Annotations[AnnotationForceRecoverWriter] != "") {
+		// Remove the one-shot annotation after its writer change is
+		// persisted. A later writer must not be recovered silently. The
+		// no-writer case also clears it after a conflicted status patch
+		// already removed the writer.
+		if err := r.clearForceRecover(ctx, st); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	nodes := slices.Clone(st.Status.Placements)
+	if p := st.Status.Pending; p != nil {
+		nodes = append(nodes, p.SourceNode)
+		nodes = append(nodes, p.Replicas...)
+	}
+	if next := cl.nextCheck(nodes); next > 0 && (result.RequeueAfter == 0 || next < result.RequeueAfter) {
+		result.RequeueAfter = next
+	}
+	return result, nil
+}
+
+func statePhase(st *v1.BlipState) string {
+	switch s := st.Status; {
+	case s.Committed == nil:
+		return v1.StatePending
+	case s.Pending != nil:
+		return v1.StateSaving
+	case s.Writer != nil:
+		return v1.StateInUse
+	default:
+		return v1.StateReady
+	}
+}
+
+func joinMessages(msgs []string) string {
+	var out []string
+	for _, m := range msgs {
+		if m != "" {
+			out = append(out, m)
+		}
+	}
+	return strings.Join(out, "; ")
+}
+
+// initialize resolves the source and plans the initial version.
+func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *cluster) (msg string, retry bool, err error) {
+	s := &st.Status
+	var minSize int64
+	var prefer []string
+	switch {
+	case st.Spec.Image != "":
+		if s.ImageDigest == "" {
+			d, err := digestImage(ctx, r.Registry, st.Spec.Image, st.Namespace, st.Spec.ImagePullSecrets)
+			if errors.Is(err, ErrImageNotFound) {
+				s.Phase = v1.StateFailed
+				return err.Error(), false, nil
+			}
+			if err != nil {
+				return fmt.Sprintf("resolve image %s: %v", st.Spec.Image, err), true, nil
+			}
+			s.ImageDigest = d
+		}
+		if s.ImageConfig == nil {
+			cfg, err := imageConfigFor(ctx, r.Registry, s.ImageDigest, st.Namespace, st.Spec.ImagePullSecrets)
+			if err != nil {
+				return fmt.Sprintf("resolve image config %s: %v", st.Spec.Image, err), true, nil
+			}
+			s.ImageConfig = cfg
+		}
+	case st.Spec.CopyFrom != "":
+		// A live copy is replanned from scratch: its source node must be
+		// the writer's node.
+		if s.CopiedFrom == nil || s.CopiedFrom.AttachmentID != "" {
+			s.CopiedFrom = nil
+			src := &v1.BlipState{}
+			err := r.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: st.Spec.CopyFrom}, src)
+			if apierrors.IsNotFound(err) {
+				s.Phase = v1.StateFailed
+				return fmt.Sprintf("copy source %q not found", st.Spec.CopyFrom), false, nil
+			}
+			if err != nil {
+				return "", false, err
+			}
+			switch {
+			case src.DeletionTimestamp != nil:
+				return fmt.Sprintf("copy source %q is being deleted", src.Name), false, nil
+			case src.Status.Committed == nil:
+				return fmt.Sprintf("waiting for copy source %q to commit", src.Name), false, nil
+			case src.Status.Pending != nil:
+				return fmt.Sprintf("copy source %q is saving", src.Name), false, nil
+			}
+			if w := src.Status.Writer; w != nil {
+				if msg, err := r.liveWriter(ctx, st, src, cl); err != nil || msg != "" {
+					return msg, false, err
+				}
+				s.CopiedFrom = &v1.CopySource{StateUID: string(src.UID), AttachmentID: w.AttachmentID, Nodes: []string{w.Node}}
+			} else {
+				var holders []string
+				for _, n := range src.Status.Placements {
+					if cl.holds(src, n, src.Status.Committed.ID) {
+						holders = append(holders, n)
+					}
+				}
+				if len(holders) == 0 {
+					return fmt.Sprintf("no node holds copy source %q", src.Name), false, nil
+				}
+				s.CopiedFrom = &v1.CopySource{StateUID: string(src.UID), CommitID: src.Status.Committed.ID, Nodes: holders}
+			}
+			if s.ImageConfig == nil && src.Status.ImageConfig != nil {
+				s.ImageConfig = src.Status.ImageConfig.DeepCopy()
+			}
+			minSize = src.Status.SizeBytes
+		}
+		prefer = s.CopiedFrom.Nodes
+	}
+	if s.SizeBytes == 0 {
+		s.SizeBytes = defaultStateSize
+		if st.Spec.Size != nil {
+			s.SizeBytes = st.Spec.Size.Value()
+		} else if minSize > 0 {
+			s.SizeBytes = minSize
+		}
+		s.SizeBytes = max(s.SizeBytes, minSize)
+	}
+
+	nodes := cl.choose(replicas(st), st.Spec.NodeSelector, prefer, nil)
+	if len(nodes) == 0 {
+		return "no healthy node can hold the state", false, nil
+	}
+	s.Pending = &v1.PendingCommit{CommitID: newID(), Generation: 1, SourceNode: nodes[0], Replicas: nodes}
+	return "", false, nil
+}
+
+// liveWriter returns why the copy cannot snapshot the source's writer
+// attachment now, or "" when it is attached to a running VM on a node that
+// can hold the copy (the copy's source node).
+func (r *StateReconciler) liveWriter(ctx context.Context, st, src *v1.BlipState, cl *cluster) (string, error) {
+	w := src.Status.Writer
+	busy := fmt.Sprintf("copy source %q has a writer (%s) that is not running", src.Name, w.BlipName)
+	if w.PodUID == "" || w.Node == "" {
+		return busy, nil
+	}
+	b := &v1.Blip{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: src.Namespace, Name: w.BlipName}, b)
+	if apierrors.IsNotFound(err) {
+		return busy, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if string(b.UID) != w.BlipUID || finished(b) || stopping(b) || b.Status.Phase == v1.BlipSaving {
+		return busy, nil
+	}
+	if b.Status.RootAttachmentID != w.AttachmentID {
+		attached := false
+		for _, m := range b.Status.Mounts {
+			if m.AttachmentID == w.AttachmentID && (m.Phase == v1.MountPending || m.Phase == v1.MountMounted) {
+				attached = true
+			}
+		}
+		if !attached {
+			return fmt.Sprintf("copy source %q has a writer (%s) that is unmounting it", src.Name, w.BlipName), nil
+		}
+	}
+	if !cl.usable(w.Node, st.Spec.NodeSelector) {
+		return fmt.Sprintf("copy source %q has a writer (%s) on %s, which cannot hold the copy", src.Name, w.BlipName, w.Node), nil
+	}
+	return "", nil
+}
+
+// liveCopyStale reports whether a live copy lost its source attachment
+// before the source node built the copy's commit.
+func (r *StateReconciler) liveCopyStale(ctx context.Context, st *v1.BlipState, cl *cluster) (bool, error) {
+	cf := st.Status.CopiedFrom
+	if p := st.Status.Pending; p != nil && cl.holds(st, p.SourceNode, p.CommitID) {
+		return false, nil
+	}
+	src := &v1.BlipState{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: st.Spec.CopyFrom}, src)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	w := src.Status.Writer
+	if string(src.UID) != cf.StateUID || w == nil || w.AttachmentID != cf.AttachmentID {
+		return true, nil
+	}
+	if w.BlipName == "" {
+		return true, nil
+	}
+	// A live copy needs the writer's pod to freeze. If its Blip finished or
+	// is being deleted, the pod is gone or going; replan from the version the
+	// source saves instead of waiting for a freeze that cannot happen.
+	srcBlip := &v1.Blip{}
+	err = r.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: w.BlipName}, srcBlip)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if finished(srcBlip) || srcBlip.DeletionTimestamp != nil || (w.BlipUID != "" && string(srcBlip.UID) != w.BlipUID) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// replicas is how many nodes should hold the state. Every eligible node
+// holds an image state, and each builds generation 1 from the image itself.
+func replicas(st *v1.BlipState) int {
+	switch {
+	case st.Spec.Image != "":
+		return math.MaxInt
+	case st.Spec.Replicas <= 0:
+		return 3
+	}
+	return int(st.Spec.Replicas)
+}
+
+// pending replaces failed replicas of the pending version and commits it
+// once every replica holds it.
+func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *cluster) (string, error) {
+	s := &st.Status
+	p := s.Pending
+	if stop, msg, err := r.pendingSource(ctx, st, cl); err != nil {
+		return "", err
+	} else if stop {
+		return msg, nil
+	}
+	for i, n := range p.Replicas {
+		if n == p.SourceNode || !cl.bad(n) || cl.holds(st, n, p.CommitID) {
+			continue
+		}
+		if repl := cl.choose(1, st.Spec.NodeSelector, nil, p.Replicas); len(repl) == 1 {
+			p.Replicas[i] = repl[0]
+		}
+	}
+	if st.Spec.Image != "" {
+		// Every eligible node is already a replica of an image state, so a
+		// failed one has no stand-in: drop it. Generation 1 is built from
+		// the image on each node, so its source is not special.
+		p.Replicas = slices.DeleteFunc(p.Replicas, func(n string) bool {
+			return (n != p.SourceNode || p.Generation == 1) && cl.bad(n) && !cl.holds(st, n, p.CommitID)
+		})
+		if p.Generation == 1 && !slices.Contains(p.Replicas, p.SourceNode) {
+			if len(p.Replicas) == 0 {
+				s.Pending = nil
+				return "no eligible node can build generation 1; replanning", nil
+			}
+			p.SourceNode = p.Replicas[0]
+		}
+	}
+	var waiting, errs []string
+	for _, n := range p.Replicas {
+		if !cl.holds(st, n, p.CommitID) {
+			waiting = append(waiting, n)
+		}
+		for _, o := range st.Status.Nodes {
+			if o.Node == n && o.Error != "" {
+				errs = append(errs, fmt.Sprintf("%s: %s", n, o.Error))
+			}
+		}
+	}
+	switch {
+	case len(errs) > 0:
+		s.LastError = strings.Join(errs, "; ")
+	default:
+		s.LastError = ""
+	}
+	if len(waiting) > 0 {
+		msg := fmt.Sprintf("saving generation %d: waiting for %s", p.Generation, strings.Join(waiting, ", "))
+		if p.Generation == 1 && len(errs) > 0 {
+			// Keep pending so a retry or a recovered node can still
+			// complete it, but surface a failing initial build (for
+			// example an image larger than the requested size).
+			s.Phase = v1.StateFailed
+			return "initial version failed: " + s.LastError, nil
+		}
+		return joinMessages(append([]string{msg}, errs...)), nil
+	}
+	s.Committed = &v1.Commit{
+		ID:           p.CommitID,
+		Generation:   p.Generation,
+		SizeBytes:    s.SizeBytes,
+		Time:         metav1.NewTime(cl.now),
+		AttachmentID: p.AttachmentID,
+	}
+	s.Placements = p.Replicas
+	s.Pending = nil
+	s.LastError = ""
+	return "", nil
+}
+
+// pendingSource keeps Pending.SourceNode on a node that can serve the
+// pending commit. Generation 1 may be replanned when its source is unusable;
+// later generations switch to any healthy replica that holds the commit.
+func (r *StateReconciler) pendingSource(ctx context.Context, st *v1.BlipState, cl *cluster) (stop bool, msg string, err error) {
+	s := &st.Status
+	p := s.Pending
+	selector := st.Spec.NodeSelector
+	if p.Generation == 1 {
+		if cl.usable(p.SourceNode, selector) {
+			return false, "", nil
+		}
+		if n := usableHolder(st, cl, p, p.Replicas); n != "" {
+			p.SourceNode = n
+			return false, "", nil
+		}
+		if st.Spec.Image == "" {
+			s.Pending = nil
+			return true, fmt.Sprintf("initial source node %s failed; replanning", p.SourceNode), nil
+		}
+		if n := firstUsable(st, cl, p.Replicas); n != "" {
+			p.SourceNode = n
+		}
+		// Without an eligible replica the image branch below drops the
+		// failed ones and replans when none remains.
+		return false, "", nil
+	}
+	if cl.usable(p.SourceNode, selector) && cl.holds(st, p.SourceNode, p.CommitID) {
+		return false, "", nil
+	}
+	if n := usableHolder(st, cl, p, p.Replicas); n != "" {
+		p.SourceNode = n
+		return false, "", nil
+	}
+	if !cl.bad(p.SourceNode) {
+		// The source may simply not have reported the commit yet.
+		return false, "", nil
+	}
+	// The node that sealed the pending version is gone and no replica
+	// holds it. The committed version stays current; report the lost save
+	// instead of waiting forever.
+	if p.AttachmentID != "" {
+		sr := v1.SealResult{
+			AttachmentID: p.AttachmentID,
+			Error:        fmt.Sprintf("pending generation %d lost: no replica holds commit %s", p.Generation, p.CommitID),
+		}
+		if err := r.recordSeal(ctx, st, sr); err != nil {
+			return false, "", err
+		}
+	}
+	s.Pending = nil
+	return true, fmt.Sprintf("pending generation %d lost: no node holds %s", p.Generation, p.CommitID), nil
+}
+
+// usableHolder returns a usable replica that holds the pending commit.
+func usableHolder(st *v1.BlipState, cl *cluster, p *v1.PendingCommit, replicas []string) string {
+	for _, n := range replicas {
+		if cl.usable(n, st.Spec.NodeSelector) && cl.holds(st, n, p.CommitID) {
+			return n
+		}
+	}
+	return ""
+}
+
+// firstUsable returns the first usable node in names.
+func firstUsable(st *v1.BlipState, cl *cluster, names []string) string {
+	for _, n := range names {
+		if cl.usable(n, st.Spec.NodeSelector) {
+			return n
+		}
+	}
+	return ""
+}
+
+// writer turns a seal report into a pending version, or keeps a writer
+// reserved when it cannot be confirmed stopped.
+func (r *StateReconciler) writer(ctx context.Context, st *v1.BlipState, cl *cluster) (string, bool, error) {
+	s := &st.Status
+	w := s.Writer
+	live := r.Live
+	if live == nil {
+		live = r.Client
+	}
+	if w.PodUID == "" {
+		// Not claimed yet: release if the Blip is gone.
+		b := &v1.Blip{}
+		err := live.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: w.BlipName}, b)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return "", false, err
+		}
+		if apierrors.IsNotFound(err) || string(b.UID) != w.BlipUID || finished(b) {
+			s.Writer = nil
+		}
+		return "", false, nil
+	}
+	for _, o := range s.Nodes {
+		if o.Node != w.Node {
+			continue
+		}
+		for _, sr := range o.Sealed {
+			if sr.AttachmentID != w.AttachmentID {
+				continue
+			}
+			s.Writer = nil
+			if err := r.recordSeal(ctx, st, sr); err != nil {
+				return "", false, err
+			}
+			if sr.CommitID == "" {
+				return fmt.Sprintf("save of %s by %s failed: %s", w.AttachmentID, w.BlipName, sr.Error), false, nil
+			}
+			if s.Committed == nil {
+				return "", false, errors.New("seal without committed version")
+			}
+			prefer := append([]string{w.Node}, s.Placements...)
+			nodes := cl.choose(replicas(st), st.Spec.NodeSelector, prefer, nil)
+			if len(nodes) == 0 {
+				nodes = []string{w.Node}
+			}
+			if sr.SizeBytes > 0 {
+				s.SizeBytes = sr.SizeBytes
+			}
+			s.Pending = &v1.PendingCommit{
+				CommitID:     sr.CommitID,
+				Generation:   s.Committed.Generation + 1,
+				SourceNode:   w.Node,
+				AttachmentID: w.AttachmentID,
+				Replicas:     nodes,
+			}
+			return "", false, nil
+		}
+	}
+	if v, ok := st.Annotations[AnnotationForceRecoverWriter]; ok && v != "" {
+		// The operator confirmed that the VM can no longer write. Report a
+		// failed seal so the Blip fails instead of reporting success.
+		s.Writer = nil
+		sr := v1.SealResult{
+			AttachmentID: w.AttachmentID,
+			Error:        "writer cleared by force-recover annotation",
+		}
+		if err := r.recordSeal(ctx, st, sr); err != nil {
+			return "", false, err
+		}
+		return fmt.Sprintf("writer of %s on %s cleared by force-recover annotation; unsaved changes are lost", w.BlipName, w.Node), true, nil
+	}
+	// A deleted Kubernetes Node does not prove that the VM stopped writing.
+	// Keep the writer reserved (so nobody else can take it) until the node
+	// reports a seal or an operator forces recovery.
+	if cl.k8s[w.Node] == nil {
+		err := live.Get(ctx, types.NamespacedName{Name: w.Node}, &corev1.Node{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return "", false, err
+		}
+		if apierrors.IsNotFound(err) {
+			return fmt.Sprintf("writer %s on deleted node %s cannot be confirmed stopped; annotate the state %s=%q after checking the node to recover", w.BlipName, w.Node, AnnotationForceRecoverWriter, "true"), false, nil
+		}
+	}
+	return "", false, nil
+}
+
+// unpublishedWriter reports whether a writer with a pod was persisted before
+// its Blip published the attachment, for example when the controller
+// crashed between setting writer.podUID and writing Blip.status. The node
+// only prepares attachments named by the Blip, so such a writer guards no
+// disk and can be released. A Blip whose spec still needs the state keeps
+// the writer: it publishes the attachment on its next reconcile.
+func (r *StateReconciler) unpublishedWriter(ctx context.Context, st *v1.BlipState) (bool, error) {
+	w := st.Status.Writer
+	if w == nil || w.PodUID == "" {
+		return false, nil
+	}
+	live := r.Live
+	if live == nil {
+		live = r.Client
+	}
+	var blips v1.BlipList
+	if err := live.List(ctx, &blips, client.InNamespace(st.Namespace)); err != nil {
+		return false, err
+	}
+	for _, b := range blips.Items {
+		if b.Status.RootAttachmentID == w.AttachmentID {
+			return false, nil
+		}
+		for _, m := range b.Status.Mounts {
+			if m.AttachmentID == w.AttachmentID {
+				return false, nil
+			}
+		}
+		if finished(&b) {
+			continue
+		}
+		if b.Spec.State == st.Name {
+			return false, nil
+		}
+		for _, m := range b.Spec.Mounts {
+			if m.Writable && m.State == st.Name {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+// recordSeal appends sr to status.seals, replacing any entry for the same
+// attachment, and prunes old entries.
+func (r *StateReconciler) recordSeal(ctx context.Context, st *v1.BlipState, sr v1.SealResult) error {
+	seals := slices.DeleteFunc(st.Status.Seals, func(old v1.SealResult) bool {
+		return old.AttachmentID == sr.AttachmentID
+	})
+	seals = append(seals, sr)
+	refs, err := r.sealRefs(ctx, st.Namespace)
+	if err != nil {
+		return err
+	}
+	st.Status.Seals = pruneSeals(seals, refs)
+	return nil
+}
+
+// sealRefs returns the attachment IDs that Blips in namespace still name in
+// status. Those seal results must survive pruning so a Blip can report the
+// outcome after the node stops reporting it.
+func (r *StateReconciler) sealRefs(ctx context.Context, namespace string) (map[string]bool, error) {
+	var blips v1.BlipList
+	if err := r.List(ctx, &blips, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+	refs := map[string]bool{}
+	for _, b := range blips.Items {
+		if b.Status.RootAttachmentID != "" {
+			refs[b.Status.RootAttachmentID] = true
+		}
+		for _, m := range b.Status.Mounts {
+			if m.AttachmentID != "" {
+				refs[m.AttachmentID] = true
+			}
+		}
+	}
+	return refs, nil
+}
+
+// pruneSeals keeps every seal a Blip still references plus the most recent
+// recentSeals, capped at maxSeals. seals is oldest first.
+func pruneSeals(seals []v1.SealResult, refs map[string]bool) []v1.SealResult {
+	seen := map[string]bool{}
+	keep := make([]v1.SealResult, 0, min(len(seals), maxSeals))
+	add := func(sr v1.SealResult) {
+		if len(keep) >= maxSeals || seen[sr.AttachmentID] {
+			return
+		}
+		seen[sr.AttachmentID] = true
+		keep = append(keep, sr)
+	}
+	for i := len(seals) - 1; i >= 0; i-- {
+		if refs[seals[i].AttachmentID] {
+			add(seals[i])
+		}
+	}
+	recent := 0
+	for i := len(seals) - 1; i >= 0 && recent < recentSeals; i-- {
+		if !seen[seals[i].AttachmentID] {
+			add(seals[i])
+			recent++
+		}
+	}
+	slices.Reverse(keep)
+	return keep
+}
+
+// clearForceRecover removes the force-recover annotation after it was used.
+func (r *StateReconciler) clearForceRecover(ctx context.Context, st *v1.BlipState) error {
+	live := r.Live
+	if live == nil {
+		live = r.Client
+	}
+	fresh := &v1.BlipState{}
+	if err := live.Get(ctx, client.ObjectKeyFromObject(st), fresh); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if _, ok := fresh.Annotations[AnnotationForceRecoverWriter]; !ok {
+		return nil
+	}
+	base := fresh.DeepCopy()
+	delete(fresh.Annotations, AnnotationForceRecoverWriter)
+	return client.IgnoreNotFound(patchObject(ctx, r.Client, fresh, base))
+}
+
+// repair replaces placements on draining, unhealthy, or deleted nodes and
+// tops up missing replicas. Old placements are dropped once every remaining
+// placement holds the committed version.
+func (r *StateReconciler) repair(st *v1.BlipState, cl *cluster) string {
+	s := &st.Status
+	id := s.Committed.ID
+	var good, bad []string
+	for _, n := range s.Placements {
+		if cl.bad(n) {
+			bad = append(bad, n)
+		} else {
+			good = append(good, n)
+		}
+	}
+	if missing := replicas(st) - len(good); missing > 0 {
+		var holders []string
+		for _, n := range cl.names {
+			if cl.holds(st, n, id) {
+				holders = append(holders, n)
+			}
+		}
+		add := cl.choose(missing, st.Spec.NodeSelector, holders, s.Placements)
+		s.Placements = append(s.Placements, add...)
+		good = append(good, add...)
+	}
+	var waiting []string
+	for _, n := range good {
+		if !cl.holds(st, n, id) {
+			waiting = append(waiting, n)
+		}
+	}
+	if len(bad) > 0 && len(good) > 0 && len(waiting) == 0 {
+		s.Placements = good
+		return ""
+	}
+	if len(waiting) > 0 {
+		return "replicating to " + strings.Join(waiting, ", ")
+	}
+	if len(good) < replicas(st) && st.Spec.Image == "" {
+		msg := fmt.Sprintf("%d of %d replicas; no other node can take one", len(good), replicas(st))
+		if len(bad) > 0 {
+			msg += " (" + strings.Join(bad, ", ") + " is draining or unhealthy)"
+		}
+		return msg
+	}
+	return ""
+}
+
+// deletionBlockers lists what keeps a deleted state alive.
+func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState) ([]string, error) {
+	var out []string
+	if w := st.Status.Writer; w != nil {
+		out = append(out, "writer "+w.BlipName)
+	}
+	if st.Status.Pending != nil {
+		if st.Status.Writer == nil {
+			// Nothing is using the in-flight build or fetch yet. Nodes
+			// finish it harmlessly; waiting for it would keep a failed
+			// initial version alive forever.
+			st.Status.Pending = nil
+		} else {
+			out = append(out, "pending version")
+		}
+	}
+	var blips v1.BlipList
+	if err := r.List(ctx, &blips, client.InNamespace(st.Namespace), client.MatchingFields{indexStates: st.Name}); err != nil {
+		return nil, err
+	}
+	for _, b := range blips.Items {
+		if !finished(&b) {
+			out = append(out, "blip "+b.Name)
+		}
+	}
+	var copies v1.BlipStateList
+	if err := r.List(ctx, &copies, client.InNamespace(st.Namespace), client.MatchingFields{indexCopyFrom: st.Name}); err != nil {
+		return nil, err
+	}
+	for _, c := range copies.Items {
+		if c.Status.Committed == nil && c.Status.CopiedFrom != nil && c.Status.CopiedFrom.StateUID == string(st.UID) {
+			out = append(out, "copy "+c.Name)
+		}
+	}
+	return out, nil
+}
