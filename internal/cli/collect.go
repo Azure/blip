@@ -25,6 +25,11 @@ import (
 // blip.
 var collectMountRoot = "/run/blip-collect"
 
+// collectSelfRoot is the calling blip's own root filesystem. A state that is
+// the caller's root is already in use by the caller, so it cannot be mounted;
+// its contents are here instead.
+var collectSelfRoot = "/"
+
 // collectCommand copies files out of a finished blip's state and fetches
 // git commits into the repository in the caller's working directory.
 func (a *app) collectCommand() *cobra.Command {
@@ -239,6 +244,12 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 	b, err := a.getBlip(ctx, self)
 	if err != nil {
 		return "", nil, err
+	}
+	// The caller's root state is this blip's own root filesystem. The caller
+	// holds its writer, so waiting for it to become ready would never return,
+	// and it is already mounted at /.
+	if state == b.Spec.State {
+		return collectSelfRoot, func() {}, nil
 	}
 	// A writable mount means this blip holds the writer; waiting for the
 	// state to become ready would never return. Its contents are current.

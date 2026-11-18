@@ -158,6 +158,43 @@ func TestCollectFiles(t *testing.T) {
 	})
 }
 
+func TestCollectOwnRootState(t *testing.T) {
+	root := withCollectMountRoot(t)
+	defer func(r string) { collectSelfRoot = r }(collectSelfRoot)
+	collectSelfRoot = filepath.Join(root, "alice.home")
+
+	// The worker's root is the same state the caller runs on, and the caller
+	// is writing it: collect must use / instead of waiting for a mount.
+	worker := ownedBlip("alice.w1", "alice.home")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	own := readyState("alice.home")
+	own.Status.Phase = v1alpha1.StateInUse
+	own.Status.Writer = &v1alpha1.Writer{BlipName: "alice.box"}
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, own)
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.home", "/home/dev/x", "self\n", 0o644)
+
+	dst := filepath.Join(t.TempDir(), "x")
+	env := h.env(strings.NewReader(""), io.Discard, io.Discard)
+	var errOut strings.Builder
+	env.Err = &errOut
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if code := Main(ctx, env, []string{"collect", "w1", "/home/dev/x:" + dst}); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut.String())
+	}
+	if got := readFile(t, dst); got != "self\n" {
+		t.Fatalf("content = %q", got)
+	}
+	b := h.blip("alice.box")
+	if m := findSpecMount(b.Spec.Mounts, "alice.home"); m != nil {
+		t.Fatalf("collect mounted the caller's root state: %+v", m)
+	}
+	if v := b.Annotations[collectMountsAnnotation]; v != "" {
+		t.Fatalf("annotation = %q, want cleared", v)
+	}
+}
+
 func TestCollectMultipleStatesAndOps(t *testing.T) {
 	root := withCollectMountRoot(t)
 	worker := ownedBlip("alice.w1", "alice.w1", v1alpha1.Mount{State: "alice.repo", Path: "/work"})
