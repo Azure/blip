@@ -3,7 +3,7 @@
 # Hypervisor binary in build/images/.
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 nftables \
+    && apt-get install -y --no-install-recommends iproute2 nftables ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY build/images/cloud-hypervisor /usr/local/bin/cloud-hypervisor
 COPY build/guest/vmlinuz build/guest/initramfs.gz /opt/blip/

@@ -22,6 +22,7 @@ type apiStream interface {
 // apiForwarder carries byte streams so HTTP watches and upgraded connections
 // need no special handling. It never sees the runtime's API credentials.
 type apiForwarder struct {
+	name     string // log label, e.g. "Kubernetes API" or "gateway"
 	listener net.Listener
 	dial     func() (apiStream, error)
 	mu       sync.Mutex
@@ -31,11 +32,20 @@ type apiForwarder struct {
 
 // startAPIForwarder binds only IPv4 loopback, including when tests use port 0.
 func startAPIForwarder(port int, dial func() (apiStream, error)) (*apiForwarder, error) {
+	return startForwarder("Kubernetes API", port, dial)
+}
+
+// startGatewayForwarder exposes the host's gateway proxy on guest loopback.
+func startGatewayForwarder(port int, dial func() (apiStream, error)) (*apiForwarder, error) {
+	return startForwarder("gateway", port, dial)
+}
+
+func startForwarder(name string, port int, dial func() (apiStream, error)) (*apiForwarder, error) {
 	l, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}
-	p := &apiForwarder{listener: l, dial: dial, conns: map[apiStream]struct{}{}}
+	p := &apiForwarder{name: name, listener: l, dial: dial, conns: map[apiStream]struct{}{}}
 	go p.serve()
 	return p, nil
 }
@@ -51,7 +61,7 @@ func (p *apiForwarder) serve() {
 		conn, err := p.listener.Accept()
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				log.Printf("Kubernetes API accept: %v", err)
+				log.Printf("%s accept: %v", p.name, err)
 			}
 			p.Close()
 			return
@@ -86,7 +96,7 @@ func (p *apiForwarder) forward(client apiStream) {
 	defer p.release(client)
 	host, err := p.dial()
 	if err != nil {
-		log.Printf("Kubernetes API dial: %v", err)
+		log.Printf("%s dial: %v", p.name, err)
 		return
 	}
 	if !p.track(host) {
@@ -135,6 +145,10 @@ func (p *apiForwarder) Close() {
 
 func dialHostAPI() (apiStream, error) {
 	return dialAPISocket(unix.AF_VSOCK, &unix.SockaddrVM{CID: unix.VMADDR_CID_HOST, Port: wire.APIPort})
+}
+
+func dialHostGateway() (apiStream, error) {
+	return dialAPISocket(unix.AF_VSOCK, &unix.SockaddrVM{CID: unix.VMADDR_CID_HOST, Port: wire.GatewayPort})
 }
 
 // dialAPISocket leaves the descriptor nonblocking before os.NewFile adopts

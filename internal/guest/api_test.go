@@ -140,6 +140,68 @@ func TestAPIForwarderDialFailureClosesClient(t *testing.T) {
 	}
 }
 
+func TestGatewayForwarderStream(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := &apiSocket{File: os.NewFile(uintptr(fds[0]), "host")}
+	peer := &apiSocket{File: os.NewFile(uintptr(fds[1]), "peer")}
+	defer peer.Close()
+	p, err := startGatewayForwarder(0, func() (apiStream, error) { return host, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if p.name != "gateway" {
+		t.Fatalf("forwarder label = %q", p.name)
+	}
+	if addr := p.listener.Addr().(*net.TCPAddr); !addr.IP.Equal(net.IPv4(127, 0, 0, 1)) {
+		t.Fatalf("gateway listener is not loopback-only: %v", addr)
+	}
+	c, err := net.Dial("tcp4", p.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write([]byte("GET / HTTP/1.1\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	req := make([]byte, len("GET / HTTP/1.1\r\n\r\n"))
+	if _, err := io.ReadFull(peer, req); err != nil || string(req) != "GET / HTTP/1.1\r\n\r\n" {
+		t.Fatalf("upstream request = %q, %v", req, err)
+	}
+	if _, err := peer.Write([]byte("HTTP/1.1 200 OK\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	resp := make([]byte, len("HTTP/1.1 200 OK\r\n\r\n"))
+	if _, err := io.ReadFull(c, resp); err != nil || string(resp) != "HTTP/1.1 200 OK\r\n\r\n" {
+		t.Fatalf("downstream response = %q, %v", resp, err)
+	}
+}
+
+func TestGatewayForwarderFailureBlocksClaim(t *testing.T) {
+	g := &Guest{}
+	claim := wire.Claim{ID: "root"}
+	if err := g.doClaim(claim); err != errNotInit {
+		t.Fatalf("claim without gateway = %v, want %v", err, errNotInit)
+	}
+	p, err := startGatewayForwarder(0, func() (apiStream, error) { return nil, errors.New("unused") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.gateway = p
+	p.Close()
+	if err := g.doClaim(claim); err == nil || !strings.Contains(err.Error(), "gateway forwarding is unavailable") {
+		t.Fatalf("claim with closed gateway = %v", err)
+	}
+	if g.claim != nil {
+		t.Fatal("claim accepted without a working gateway listener")
+	}
+}
+
 func TestAPIForwarderCloseInterruptsStreams(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {

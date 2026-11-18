@@ -42,13 +42,21 @@ const (
 	annotationTemplateHash = "blip.dev/template-hash"
 	// Bump when pod topology changes without a pool spec change, so warm
 	// pods cannot retain the old credential or socket layout.
-	podTopologyVersion = "api-proxy-v1"
+	podTopologyVersion = "api-proxy-v2"
 
 	apiProxyName             = "api-proxy"
 	apiTokenVolume           = "api-token"
 	serviceAccountPath       = "/var/run/secrets/kubernetes.io/serviceaccount"
 	vsockMountPath           = podapi.MountPath + "/vsock"
 	apiProxyUID        int64 = 65532
+
+	gatewayTokenVolume = "gateway-token"
+	gatewayTokenPath   = "/var/run/secrets/blip.dev/gateway"
+	gatewayCAVolume    = "gateway-ca"
+	gatewayCAPath      = "/etc/blip/gateway-ca"
+
+	defaultGatewayAudience           = "blip-gateway"
+	defaultGatewayLoopbackPort int32 = 8002
 
 	// terminationGracePeriod covers the runtime's 60s guest shutdown
 	// budget, so the kubelet does not SIGKILL the VMM mid-shutdown.
@@ -580,12 +588,22 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 	}
 	if pool.Spec.ServiceAccountName != "" {
 		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, fieldEnv("BLIP_KUBE_NAMESPACE", "metadata.namespace"))
-		addAPIProxy(pod, r.RuntimeImage)
+		var gateway *v1.GatewaySpec
+		if pool.Spec.Gateway != nil {
+			gateway = pool.Spec.Gateway
+			port := gateway.LoopbackPort
+			if port == 0 {
+				port = defaultGatewayLoopbackPort
+			}
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
+				corev1.EnvVar{Name: "BLIP_GATEWAY_LOOPBACK_PORT", Value: strconv.Itoa(int(port))})
+		}
+		addAPIProxy(pod, r.RuntimeImage, gateway)
 	}
 	return pod
 }
 
-func addAPIProxy(pod *corev1.Pod, image string) {
+func addAPIProxy(pod *corev1.Pod, image string, gateway *v1.GatewaySpec) {
 	uid := apiProxyUID
 	enabled, disabled := true, false
 	restart := corev1.ContainerRestartPolicyAlways
@@ -644,6 +662,53 @@ func addAPIProxy(pod *corev1.Pod, image string) {
 			},
 		}},
 	})
+	if gateway == nil {
+		return
+	}
+	// The gateway credential is a separate projection: its audience keeps it
+	// from authenticating to the API server, and it is mounted only in the
+	// sidecar so it never reaches the guest.
+	proxy := &pod.Spec.InitContainers[0]
+	proxy.Env = append(proxy.Env,
+		corev1.EnvVar{Name: "BLIP_GATEWAY_ADDRESS", Value: gateway.Address})
+	if gateway.ServerName != "" {
+		proxy.Env = append(proxy.Env, corev1.EnvVar{Name: "BLIP_GATEWAY_SERVER_NAME", Value: gateway.ServerName})
+	}
+	proxy.Env = append(proxy.Env, corev1.EnvVar{Name: "BLIP_GATEWAY_TOKEN_FILE", Value: gatewayTokenPath + "/token"})
+	if gateway.CAConfigMap != "" {
+		proxy.Env = append(proxy.Env, corev1.EnvVar{Name: "BLIP_GATEWAY_CA_FILE", Value: gatewayCAPath + "/ca.crt"})
+	}
+	audience := gateway.Audience
+	if audience == "" {
+		audience = defaultGatewayAudience
+	}
+	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+		Name: gatewayTokenVolume,
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			DefaultMode: &mode,
+			Sources: []corev1.VolumeProjection{{
+				ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+					Path:              "token",
+					ExpirationSeconds: &expiration,
+					Audience:          audience,
+				},
+			}},
+		}},
+	})
+	proxy.VolumeMounts = append(proxy.VolumeMounts,
+		corev1.VolumeMount{Name: gatewayTokenVolume, MountPath: gatewayTokenPath, ReadOnly: true})
+	if gateway.CAConfigMap != "" {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: gatewayCAVolume,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: gateway.CAConfigMap},
+				Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+				DefaultMode:          &mode,
+			}},
+		})
+		proxy.VolumeMounts = append(proxy.VolumeMounts,
+			corev1.VolumeMount{Name: gatewayCAVolume, MountPath: gatewayCAPath, ReadOnly: true})
+	}
 }
 
 // poolShape returns the effective VM shape of pool.
@@ -674,6 +739,7 @@ func templateHash(pool *v1.BlipPool) string {
 		Memory             resource.Quantity
 		Hypervisor         string
 		ServiceAccountName string
+		Gateway            *v1.GatewaySpec
 		NodeSelector       map[string]string
 		Tolerations        []corev1.Toleration
 		ImagePullSecrets   []corev1.LocalObjectReference
@@ -683,6 +749,7 @@ func templateHash(pool *v1.BlipPool) string {
 		Memory:             memory,
 		Hypervisor:         hypervisor,
 		ServiceAccountName: pool.Spec.ServiceAccountName,
+		Gateway:            pool.Spec.Gateway,
 		NodeSelector:       pool.Spec.NodeSelector,
 		Tolerations:        pool.Spec.Tolerations,
 		ImagePullSecrets:   pool.Spec.ImagePullSecrets,

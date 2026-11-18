@@ -322,6 +322,166 @@ func TestPoolPodCredentials(t *testing.T) {
 	}
 }
 
+func TestPoolPodGateway(t *testing.T) {
+	e := newEnv(t)
+	tests := []struct {
+		name         string
+		gateway      v1.GatewaySpec
+		wantAudience string
+		wantPort     string
+		wantCA       bool
+	}{
+		{
+			name:         "defaults",
+			gateway:      v1.GatewaySpec{Address: "gw.gateway-system.svc:443"},
+			wantAudience: defaultGatewayAudience,
+			wantPort:     "8002",
+		},
+		{
+			name: "explicit",
+			gateway: v1.GatewaySpec{
+				Address: "10.0.0.1:443", ServerName: "gw.example", CAConfigMap: "gw-ca",
+				Audience: "custom-audience", LoopbackPort: 9000,
+			},
+			wantAudience: "custom-audience",
+			wantPort:     "9000",
+			wantCA:       true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gateway := tt.gateway
+			pool := &v1.BlipPool{ObjectMeta: metadata("p"), Spec: v1.BlipPoolSpec{
+				ServiceAccountName: "agent", Gateway: &gateway,
+			}}
+			p := e.pool.podFor(pool, "p-vm")
+			if len(p.Spec.InitContainers) != 1 {
+				t.Fatalf("want one sidecar, got %+v", p.Spec.InitContainers)
+			}
+			vm, proxy := p.Spec.Containers[0], p.Spec.InitContainers[0]
+			vmEnv := map[string]string{}
+			for _, v := range vm.Env {
+				vmEnv[v.Name] = v.Value
+			}
+			if got := vmEnv["BLIP_GATEWAY_LOOPBACK_PORT"]; got != tt.wantPort {
+				t.Errorf("vm gateway port %q, want %q", got, tt.wantPort)
+			}
+			proxyEnv := map[string]string{}
+			for _, v := range proxy.Env {
+				proxyEnv[v.Name] = v.Value
+			}
+			wantEnv := map[string]string{
+				"BLIP_GATEWAY_ADDRESS":    gateway.Address,
+				"BLIP_GATEWAY_TOKEN_FILE": gatewayTokenPath + "/token",
+			}
+			if gateway.ServerName != "" {
+				wantEnv["BLIP_GATEWAY_SERVER_NAME"] = gateway.ServerName
+			} else if _, ok := proxyEnv["BLIP_GATEWAY_SERVER_NAME"]; ok {
+				t.Error("empty server name must not set an env var")
+			}
+			if tt.wantCA {
+				wantEnv["BLIP_GATEWAY_CA_FILE"] = gatewayCAPath + "/ca.crt"
+			} else if _, ok := proxyEnv["BLIP_GATEWAY_CA_FILE"]; ok {
+				t.Error("missing CA configmap must not set a CA file env var")
+			}
+			for k, v := range wantEnv {
+				if proxyEnv[k] != v {
+					t.Errorf("proxy env %s=%q, want %q", k, proxyEnv[k], v)
+				}
+			}
+			if len(proxyEnv) != len(wantEnv) {
+				t.Errorf("unexpected proxy env: %+v", proxy.Env)
+			}
+
+			volumes := map[string]corev1.Volume{}
+			for _, v := range p.Spec.Volumes {
+				volumes[v.Name] = v
+			}
+			// The API token stays audience-free so it can authenticate to
+			// the API server.
+			apiToken := volumes[apiTokenVolume].Projected
+			if apiToken == nil || len(apiToken.Sources) == 0 || apiToken.Sources[0].ServiceAccountToken == nil {
+				t.Fatalf("missing API token projection: %+v", volumes[apiTokenVolume])
+			}
+			if got := apiToken.Sources[0].ServiceAccountToken.Audience; got != "" {
+				t.Errorf("API token audience %q, want none", got)
+			}
+
+			token := volumes[gatewayTokenVolume].Projected
+			if token == nil || len(token.Sources) != 1 || token.Sources[0].ServiceAccountToken == nil {
+				t.Fatalf("missing gateway token projection: %+v", volumes[gatewayTokenVolume])
+			}
+			sat := token.Sources[0].ServiceAccountToken
+			if sat.Path != "token" || sat.Audience != tt.wantAudience || sat.ExpirationSeconds == nil || *sat.ExpirationSeconds != 3600 {
+				t.Errorf("gateway token %+v, want audience %q", sat, tt.wantAudience)
+			}
+			if token.DefaultMode == nil || *token.DefaultMode != 0644 {
+				t.Errorf("gateway token mode %v", token.DefaultMode)
+			}
+			if !mounted(proxy, gatewayTokenVolume, gatewayTokenPath) {
+				t.Errorf("sidecar does not mount the gateway token: %+v", proxy.VolumeMounts)
+			}
+			if hasMount(vm, gatewayTokenVolume, gatewayTokenPath) {
+				t.Error("gateway token must not be mounted in the guest's VM container")
+			}
+
+			if !tt.wantCA {
+				if _, ok := volumes[gatewayCAVolume]; ok {
+					t.Error("unexpected CA volume without a CA configmap")
+				}
+				return
+			}
+			ca := volumes[gatewayCAVolume].ConfigMap
+			if ca == nil || ca.Name != gateway.CAConfigMap || len(ca.Items) != 1 ||
+				ca.Items[0].Key != "ca.crt" || ca.Items[0].Path != "ca.crt" ||
+				ca.DefaultMode == nil || *ca.DefaultMode != 0644 {
+				t.Errorf("gateway CA volume %+v", ca)
+			}
+			if !mounted(proxy, gatewayCAVolume, gatewayCAPath) {
+				t.Errorf("sidecar does not mount the gateway CA: %+v", proxy.VolumeMounts)
+			}
+			if hasMount(vm, gatewayCAVolume, gatewayCAPath) {
+				t.Error("gateway CA must not be mounted in the guest's VM container")
+			}
+		})
+	}
+}
+
+// TestPoolPodGatewayRequiresServiceAccount checks that a gateway without a
+// service account is inert: there is no credential and no sidecar.
+func TestPoolPodGatewayRequiresServiceAccount(t *testing.T) {
+	e := newEnv(t)
+	pool := &v1.BlipPool{ObjectMeta: metadata("p"), Spec: v1.BlipPoolSpec{
+		Gateway: &v1.GatewaySpec{Address: "gw.gateway-system.svc:443"},
+	}}
+	p := e.pool.podFor(pool, "p-vm")
+	if len(p.Spec.InitContainers) != 0 {
+		t.Errorf("gateway without a service account started a sidecar: %+v", p.Spec.InitContainers)
+	}
+	for _, v := range p.Spec.Containers[0].Env {
+		if v.Name == "BLIP_GATEWAY_LOOPBACK_PORT" {
+			t.Errorf("gateway without a service account set the loopback port")
+		}
+	}
+	for _, v := range p.Spec.Volumes {
+		if v.Name == gatewayTokenVolume || v.Name == gatewayCAVolume {
+			t.Errorf("gateway without a service account has volume %s", v.Name)
+		}
+	}
+}
+
+func mounted(c corev1.Container, name, path string) bool {
+	return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+		return m.Name == name && m.MountPath == path && m.ReadOnly
+	})
+}
+
+func hasMount(c corev1.Container, name, path string) bool {
+	return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+		return m.Name == name && m.MountPath == path
+	})
+}
+
 // TestPoolPodResources checks the memory arithmetic: the request covers the
 // guest plus the VMM's baseline overhead, the limit allows for growth.
 func TestPoolPodResources(t *testing.T) {
@@ -375,6 +535,7 @@ func TestTemplateHashTracksPoolShape(t *testing.T) {
 		return &v1.BlipPool{Spec: v1.BlipPoolSpec{
 			Hypervisor: "kvm", CPUs: 2, Memory: resource.MustParse("2Gi"),
 			ServiceAccountName: "vm", NodeSelector: map[string]string{"zone": "a", "rack": "r1"},
+			Gateway: &v1.GatewaySpec{Address: "gw.gateway-system.svc:443", Audience: "blip-gateway", LoopbackPort: 8002},
 		}}
 	}
 	ref := templateHash(base())
@@ -396,6 +557,10 @@ func TestTemplateHashTracksPoolShape(t *testing.T) {
 		{"image pull secrets", func(p *v1.BlipPool) {
 			p.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "reg"}}
 		}},
+		{"gateway address", func(p *v1.BlipPool) { p.Spec.Gateway.Address = "other.gateway-system.svc:443" }},
+		{"gateway audience", func(p *v1.BlipPool) { p.Spec.Gateway.Audience = "other" }},
+		{"gateway CA configmap", func(p *v1.BlipPool) { p.Spec.Gateway.CAConfigMap = "gw-ca" }},
+		{"gateway loopback port", func(p *v1.BlipPool) { p.Spec.Gateway.LoopbackPort = 9000 }},
 	}
 	for _, m := range mutations {
 		p := base()

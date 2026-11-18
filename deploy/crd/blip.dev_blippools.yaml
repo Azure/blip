@@ -58,6 +58,54 @@ spec:
                 format: int32
                 minimum: 1
                 type: integer
+              gateway:
+                description: |-
+                  Gateway configures a fixed-upstream HTTPS proxy from the guest loopback
+                  to a cluster gateway. It requires ServiceAccountName. The gateway
+                  credential never enters the guest.
+                properties:
+                  address:
+                    description: |-
+                      Address is the gateway host and port, for example
+                      envoy.envoy-gateway-system.svc:443. It is dialed from the sidecar's pod
+                      network namespace.
+                    minLength: 3
+                    type: string
+                  audience:
+                    default: blip-gateway
+                    description: |-
+                      Audience is the audience of the projected gateway token. Envoy should
+                      validate this audience. The token cannot authenticate to the API server.
+                    minLength: 1
+                    type: string
+                  caConfigMap:
+                    description: |-
+                      CAConfigMap names a ConfigMap in the pool namespace with a ca.crt key.
+                      When omitted, the system trust store verifies the gateway.
+                    type: string
+                  loopbackPort:
+                    default: 8002
+                    description: |-
+                      LoopbackPort is the guest loopback TCP port for this gateway. 8001 is
+                      reserved for the Kubernetes API proxy.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  serverName:
+                    description: |-
+                      ServerName is the TLS server name used for verification and SNI. It
+                      defaults to the host part of Address. Set it when Address is an IP or
+                      the certificate name differs from the dialed host.
+                    type: string
+                required:
+                - address
+                type: object
+                x-kubernetes-validations:
+                - message: address must be host:port
+                  rule: self.address.contains(':')
+                - message: 8001 is reserved for the Kubernetes API proxy
+                  rule: '!has(self.loopbackPort) || self.loopbackPort != 8001'
               hypervisor:
                 default: kvm
                 enum:
@@ -404,6 +452,10 @@ spec:
             required:
             - nodeSelector
             type: object
+            x-kubernetes-validations:
+            - message: gateway requires serviceAccountName
+              rule: '!has(self.gateway) || (has(self.serviceAccountName) && size(self.serviceAccountName)
+                > 0)'
           status:
             properties:
               claimed:

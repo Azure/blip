@@ -36,10 +36,23 @@ type Config struct {
 	APIAddress string
 	TokenFile  string
 	CAFile     string
+	// Gateway, when non-nil, adds a second listener that proxies to a fixed
+	// cluster gateway and injects its own projected service account token.
+	Gateway *GatewayConfig
+}
+
+// GatewayConfig configures the guest-to-gateway HTTPS proxy.
+type GatewayConfig struct {
+	SocketPath string
+	Address    string // host:port
+	ServerName string // optional TLS server name; default host part of Address
+	CAFile     string // optional; empty means system roots
+	TokenFile  string
 }
 
 // ConfigFromEnv uses the in-cluster API endpoint and explicitly projected
-// service account files. BLIP_DIR defaults to /run/blip.
+// service account files. BLIP_DIR defaults to /run/blip. The gateway listener
+// is enabled when BLIP_GATEWAY_ADDRESS is non-empty.
 func ConfigFromEnv() (Config, error) {
 	host := os.Getenv("KUBERNETES_SERVICE_HOST")
 	port := os.Getenv("KUBERNETES_SERVICE_PORT")
@@ -51,70 +64,166 @@ func ConfigFromEnv() (Config, error) {
 	if dir == "" {
 		dir = podapi.MountPath
 	}
-	return Config{
+	cfg := Config{
 		SocketPath: filepath.Join(dir, podapi.VsockSocket) + "_" + strconv.FormatUint(uint64(wire.APIPort), 10),
 		APIAddress: address,
 		TokenFile:  filepath.Join(serviceAccountDir, "token"),
 		CAFile:     filepath.Join(serviceAccountDir, "ca.crt"),
-	}, nil
+	}
+	if gatewayAddress := os.Getenv("BLIP_GATEWAY_ADDRESS"); gatewayAddress != "" {
+		gatewayToken := os.Getenv("BLIP_GATEWAY_TOKEN_FILE")
+		if gatewayToken == "" {
+			return Config{}, errors.New("gateway address is set but BLIP_GATEWAY_TOKEN_FILE is empty")
+		}
+		cfg.Gateway = &GatewayConfig{
+			SocketPath: filepath.Join(dir, podapi.VsockSocket) + "_" + strconv.FormatUint(uint64(wire.GatewayPort), 10),
+			Address:    gatewayAddress,
+			ServerName: os.Getenv("BLIP_GATEWAY_SERVER_NAME"),
+			CAFile:     os.Getenv("BLIP_GATEWAY_CA_FILE"),
+			TokenFile:  gatewayToken,
+		}
+	}
+	return cfg, nil
 }
 
 func apiAddress(host, port string) (string, error) {
 	// An address is a hostname/IP and a numeric port, not a URL or proxy.
 	if host == "" || strings.ContainsAny(host, "/\\@?#[] \t\r\n") || (strings.Contains(host, ":") && net.ParseIP(host) == nil) {
-		return "", errors.New("invalid Kubernetes service host")
+		return "", errors.New("invalid service host")
 	}
 	n, err := strconv.ParseUint(port, 10, 16)
 	if err != nil || n == 0 {
-		return "", errors.New("invalid Kubernetes service port")
+		return "", errors.New("invalid service port")
 	}
 	return net.JoinHostPort(host, port), nil
 }
 
-// Run serves only cfg.SocketPath, with mode 0600. Cancellation stops new
-// requests, cancels upstream requests, and closes all streams, including
-// hijacked upgrade connections. A normal context cancellation returns nil.
+// Run serves cfg.SocketPath, and cfg.Gateway.SocketPath when a gateway is
+// configured, with mode 0600. Cancellation stops new requests, cancels
+// upstream requests, and closes all streams, including hijacked upgrade
+// connections. A normal context cancellation returns nil.
 func Run(ctx context.Context, cfg Config) error {
 	if ctx.Err() != nil {
 		return nil
+	}
+	type listenerConfig struct {
+		socket  string
+		handler http.Handler
 	}
 	proxy, transport, err := newProxy(cfg)
 	if err != nil {
 		return err
 	}
 	defer transport.CloseIdleConnections()
-	listener, cleanup, err := listenUnix(cfg.SocketPath)
-	if err != nil {
-		return err
+	listeners := []listenerConfig{{socket: cfg.SocketPath, handler: proxy}}
+	if cfg.Gateway != nil {
+		gatewayProxy, gatewayTransport, err := newGatewayProxy(*cfg.Gateway)
+		if err != nil {
+			return err
+		}
+		defer gatewayTransport.CloseIdleConnections()
+		listeners = append(listeners, listenerConfig{socket: cfg.Gateway.SocketPath, handler: gatewayProxy})
 	}
-	defer cleanup()
-	tracked := &trackedListener{Listener: listener, connections: make(map[*trackedConn]struct{})}
-	defer tracked.closeConnections()
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	server := &http.Server{
-		Handler:           proxy,
-		ReadHeaderTimeout: 10 * time.Second,
-		BaseContext:       func(net.Listener) context.Context { return serveCtx },
-		ErrorLog:          log.New(io.Discard, "", 0),
+	servers := make([]*proxyServer, 0, len(listeners))
+	for _, listener := range listeners {
+		server, err := newProxyServer(serveCtx, listener.socket, listener.handler)
+		if err != nil {
+			for _, started := range servers {
+				started.close()
+			}
+			return err
+		}
+		servers = append(servers, server)
 	}
-	defer server.Close()
-	done := make(chan error, 1)
-	go func() { done <- server.Serve(tracked) }()
+	defer func() {
+		for _, server := range servers {
+			server.close()
+		}
+	}()
+	done := make(chan error, len(servers))
+	for _, server := range servers {
+		go func(server *proxyServer) { done <- server.server.Serve(server.tracked) }(server)
+	}
+	var firstErr error
+	cancelled := false
 	select {
-	case err := <-done:
-		return err
+	case firstErr = <-done:
 	case <-ctx.Done():
-		shutdownCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
-		defer stop()
-		// BaseContext cancellation ends watches and upstream upgrades. Shutdown
-		// gives handlers a bounded opportunity to finish their responses.
-		_ = server.Shutdown(shutdownCtx)
-		tracked.closeConnections()
-		_ = server.Close()
-		<-done
+		cancelled = true
+	}
+	// Stop both listeners when either one fails and cancel handlers so that
+	// watches and upstream upgrades on the healthy listener also end.
+	cancel()
+	for _, server := range servers {
+		server.shutdown()
+	}
+	received := 0
+	if !cancelled {
+		received = 1
+	}
+	for ; received < len(servers); received++ {
+		if err := <-done; firstErr == nil && err != nil {
+			firstErr = err
+		}
+	}
+	if cancelled {
 		return nil
 	}
+	return firstErr
+}
+
+type proxyServer struct {
+	server  *http.Server
+	tracked *trackedListener
+	cleanup func()
+}
+
+func newProxyServer(ctx context.Context, socketPath string, handler http.Handler) (*proxyServer, error) {
+	listener, cleanup, err := listenUnix(socketPath)
+	if err != nil {
+		return nil, err
+	}
+	tracked := &trackedListener{Listener: listener, connections: make(map[*trackedConn]struct{})}
+	server := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+		ErrorLog:          log.New(io.Discard, "", 0),
+	}
+	return &proxyServer{server: server, tracked: tracked, cleanup: cleanup}, nil
+}
+
+func (s *proxyServer) shutdown() {
+	shutdownCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	// BaseContext cancellation ends watches and upstream upgrades. Shutdown
+	// gives handlers a bounded opportunity to finish their responses.
+	_ = s.server.Shutdown(shutdownCtx)
+	s.tracked.closeConnections()
+	_ = s.server.Close()
+	s.cleanup()
+}
+
+func (s *proxyServer) close() {
+	_ = s.server.Close()
+	s.tracked.closeConnections()
+	s.cleanup()
+}
+
+// upstreamOptions describes a fixed HTTPS upstream. Both the Kubernetes API
+// proxy and the gateway proxy use it so their transport, rewrite, token and
+// error behavior cannot drift apart.
+type upstreamOptions struct {
+	address     string // validated host:port
+	serverName  string // TLS SNI; empty means the URL host
+	hostHeader  string // outbound Host header
+	caFile      string
+	caLabel     string // error text for CA read/parse failures
+	systemRoots bool   // use system roots when caFile is empty
+	tokenFile   string
+	errorBody   string
 }
 
 func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
@@ -126,15 +235,74 @@ func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	ca, err := os.ReadFile(cfg.CAFile)
+	return newUpstreamProxy(upstreamOptions{
+		address:    address,
+		serverName: host,
+		hostHeader: address,
+		caFile:     cfg.CAFile,
+		caLabel:    "Kubernetes CA",
+		tokenFile:  cfg.TokenFile,
+		errorBody:  "Kubernetes API unavailable",
+	})
+}
+
+func newGatewayProxy(cfg GatewayConfig) (http.Handler, *http.Transport, error) {
+	host, port, err := net.SplitHostPort(cfg.Address)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read Kubernetes CA: %w", err)
+		return nil, nil, errors.New("invalid gateway address")
 	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(ca) {
-		return nil, nil, errors.New("Kubernetes CA contains no certificates")
+	address, err := apiAddress(host, port)
+	if err != nil {
+		return nil, nil, err
 	}
-	if _, err := projectedToken(cfg.TokenFile); err != nil {
+	serverName := cfg.ServerName
+	if serverName == "" {
+		serverName = host
+	}
+	if err := validateServerName(serverName); err != nil {
+		return nil, nil, err
+	}
+	return newUpstreamProxy(upstreamOptions{
+		address:     address,
+		serverName:  serverName,
+		hostHeader:  gatewayHostHeader(serverName, port),
+		caFile:      cfg.CAFile,
+		caLabel:     "gateway CA",
+		systemRoots: true,
+		tokenFile:   cfg.TokenFile,
+		errorBody:   "gateway unavailable",
+	})
+}
+
+func validateServerName(name string) error {
+	if name == "" || strings.ContainsAny(name, "/\\@?#[]") || (strings.Contains(name, ":") && net.ParseIP(name) == nil) {
+		return errors.New("invalid gateway server name")
+	}
+	for _, r := range name {
+		if r <= ' ' || r > '~' {
+			return errors.New("invalid gateway server name")
+		}
+	}
+	return nil
+}
+
+func gatewayHostHeader(serverName, port string) string {
+	host := serverName
+	if ip := net.ParseIP(serverName); ip != nil && ip.To4() == nil {
+		host = "[" + serverName + "]"
+	}
+	if port == "443" {
+		return host
+	}
+	return net.JoinHostPort(serverName, port)
+}
+
+func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error) {
+	roots, err := certPool(cfg.caFile, cfg.caLabel, cfg.systemRoots)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := projectedToken(cfg.tokenFile); err != nil {
 		return nil, nil, err
 	}
 	transport := &http.Transport{
@@ -142,6 +310,7 @@ func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
 		DialContext: (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSClientConfig: &tls.Config{
 			RootCAs:    roots,
+			ServerName: cfg.serverName,
 			MinVersion: tls.VersionTLS12,
 			NextProtos: []string{"http/1.1"},
 		},
@@ -158,22 +327,22 @@ func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
 			// Build an origin-form URL from only the incoming path and query.
 			// In particular, discard authority, userinfo, Opaque and fragments.
 			r.Out.URL = &url.URL{
-				Scheme: "https", Host: address,
+				Scheme: "https", Host: cfg.address,
 				Path: r.In.URL.Path, RawPath: r.In.URL.RawPath,
 				RawQuery: r.In.URL.RawQuery, ForceQuery: r.In.URL.ForceQuery,
 			}
-			r.Out.Host = address
+			r.Out.Host = cfg.hostHeader
 			// Rewrite runs AFTER ReverseProxy's hop-by-hop cleanup. A caller
 			// cannot nominate Authorization in Connection to remove our token.
 			stripIdentity(r.Out.Header)
 			stripIdentity(r.Out.Trailer)
 		},
-		Transport:     tokenTransport{base: transport, tokenFile: cfg.TokenFile},
+		Transport:     tokenTransport{base: transport, tokenFile: cfg.tokenFile},
 		FlushInterval: -1, // Flush watches and logs as bytes arrive.
 		ErrorLog:      log.New(io.Discard, "", 0),
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
 			// Transport errors can contain request details; never expose them.
-			http.Error(w, "Kubernetes API unavailable", http.StatusBadGateway)
+			http.Error(w, cfg.errorBody, http.StatusBadGateway)
 		},
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -184,6 +353,26 @@ func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
 		proxy.ServeHTTP(w, r)
 	})
 	return handler, transport, nil
+}
+
+func certPool(caFile, label string, systemRoots bool) (*x509.CertPool, error) {
+	if caFile == "" && systemRoots {
+		roots, err := x509.SystemCertPool()
+		if err != nil || roots == nil {
+			// A nil or unreadable system pool is still a safe, empty trust store.
+			return x509.NewCertPool(), nil
+		}
+		return roots, nil
+	}
+	ca, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", label, err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca) {
+		return nil, fmt.Errorf("%s contains no certificates", label)
+	}
+	return roots, nil
 }
 
 func stripIdentity(headers http.Header) {
