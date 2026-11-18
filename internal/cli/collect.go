@@ -131,6 +131,9 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 	}
 
 	for _, op := range ops {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		src := filepath.Join(mounts[op.state], op.rel)
 		if op.git {
 			if err := a.checkGitSource(ctx, mounts[op.state], src, op.source, op.state); err != nil {
@@ -144,7 +147,7 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 		if err := a.checkParentInsideMount(mounts[op.state], src, op.source, op.state); err != nil {
 			return err
 		}
-		if err := copyPath(src, op.dest); err != nil {
+		if err := copyPath(ctx, src, op.dest); err != nil {
 			return fmt.Errorf("collect %s: %w", op.source, err)
 		}
 	}
@@ -521,7 +524,10 @@ func (a *app) releaseMount(ctx context.Context, self, state, mountPath string) {
 	})
 }
 
-func copyPath(src, dst string) error {
+func copyPath(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	info, err := os.Lstat(src)
 	if err != nil {
 		return err
@@ -537,7 +543,7 @@ func copyPath(src, dst string) error {
 		if err := checkDestParents(dst); err != nil {
 			return err
 		}
-		return copyTree(src, dst, info)
+		return copyTree(ctx, src, dst, info)
 	}
 	if di, err := os.Stat(dst); err == nil && di.IsDir() {
 		dst = filepath.Join(dst, filepath.Base(src))
@@ -552,7 +558,7 @@ func copyPath(src, dst string) error {
 	if err := checkDestParents(dst); err != nil {
 		return err
 	}
-	return copyEntry(src, dst, info)
+	return copyEntry(ctx, src, dst, info)
 }
 
 // sameFile reports whether src and dst are the same existing file, including
@@ -656,7 +662,10 @@ func checkDestParents(dst string) error {
 	return nil
 }
 
-func copyTree(src, dst string, info os.FileInfo) error {
+func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if di, err := os.Lstat(dst); err == nil {
 		if !di.IsDir() {
 			return fmt.Errorf("cannot copy directory %s onto %s: not a directory", src, dst)
@@ -679,6 +688,9 @@ func copyTree(src, dst string, info os.FileInfo) error {
 		return err
 	}
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		s := filepath.Join(src, e.Name())
 		d := filepath.Join(dst, e.Name())
 		ei, err := os.Lstat(s)
@@ -686,12 +698,12 @@ func copyTree(src, dst string, info os.FileInfo) error {
 			return err
 		}
 		if ei.IsDir() {
-			if err := copyTree(s, d, ei); err != nil {
+			if err := copyTree(ctx, s, d, ei); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := copyEntry(s, d, ei); err != nil {
+		if err := copyEntry(ctx, s, d, ei); err != nil {
 			return err
 		}
 	}
@@ -703,10 +715,13 @@ func copyTree(src, dst string, info os.FileInfo) error {
 
 // copyEntry copies a regular file or a symlink. It never follows a source
 // symlink, so a link in a state cannot make collect read outside its mount.
-func copyEntry(src, dst string, info os.FileInfo) error {
+func copyEntry(ctx context.Context, src, dst string, info os.FileInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	switch {
 	case info.Mode().IsRegular():
-		return copyFile(src, dst, info)
+		return copyFile(ctx, src, dst, info)
 	case info.Mode()&os.ModeSymlink != 0:
 		target, err := os.Readlink(src)
 		if err != nil {
@@ -724,7 +739,10 @@ func copyEntry(src, dst string, info os.FileInfo) error {
 	}
 }
 
-func copyFile(src, dst string, info os.FileInfo) error {
+func copyFile(ctx context.Context, src, dst string, info os.FileInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -743,7 +761,7 @@ func copyFile(src, dst string, info os.FileInfo) error {
 	if err != nil {
 		return err
 	}
-	_, cerr := io.Copy(out, in)
+	_, cerr := io.Copy(out, ctxReader{ctx: ctx, r: in})
 	if err := out.Close(); err != nil && cerr == nil {
 		cerr = err
 	}
@@ -754,6 +772,19 @@ func copyFile(src, dst string, info os.FileInfo) error {
 		return err
 	}
 	return os.Chtimes(dst, info.ModTime(), info.ModTime())
+}
+
+// ctxReader stops a copy when its context is canceled.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r ctxReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }
 
 func findSpecMount(list []v1alpha1.Mount, state string) *v1alpha1.Mount {

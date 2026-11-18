@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -254,7 +255,7 @@ func TestCopyPathRejectsOverlap(t *testing.T) {
 		if err := os.WriteFile(src, []byte("keep\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		err := copyPath(src, src)
+		err := copyPath(context.Background(), src, src)
 		if err == nil || !strings.Contains(err.Error(), "same file") {
 			t.Fatalf("err = %v", err)
 		}
@@ -272,7 +273,7 @@ func TestCopyPathRejectsOverlap(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, dst := range []string{src, filepath.Join(src, "out")} {
-			err := copyPath(src, dst)
+			err := copyPath(context.Background(), src, dst)
 			if err == nil || !strings.Contains(err.Error(), "into itself") {
 				t.Fatalf("copy to %s: err = %v", dst, err)
 			}
@@ -281,6 +282,43 @@ func TestCopyPathRejectsOverlap(t *testing.T) {
 			t.Fatalf("destination was created before rejecting: %v", err)
 		}
 	})
+}
+
+func TestCopyPathCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	file := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(file, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "dst")
+	if err := copyPath(ctx, file, dst); !errors.Is(err, context.Canceled) {
+		t.Fatalf("file err = %v", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("file was written after cancellation: %v", err)
+	}
+
+	dir := filepath.Join(t.TempDir(), "d")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dirDst := filepath.Join(t.TempDir(), "dd")
+	if err := copyPath(ctx, dir, dirDst); !errors.Is(err, context.Canceled) {
+		t.Fatalf("dir err = %v", err)
+	}
+	if _, err := os.Stat(dirDst); !os.IsNotExist(err) {
+		t.Fatalf("directory was created after cancellation: %v", err)
+	}
+
+	// A copy in progress stops at the next chunk.
+	if _, err := io.ReadAll(ctxReader{ctx: ctx, r: strings.NewReader("data")}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("reader err = %v", err)
+	}
 }
 
 func TestCollectOwnRootState(t *testing.T) {
