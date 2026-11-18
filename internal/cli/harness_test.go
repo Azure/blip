@@ -209,7 +209,15 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 	}
 	for _, m := range b.Spec.Mounts {
 		if findMount(st.Mounts, m.State) == nil {
-			st.Mounts = append(st.Mounts, v1alpha1.MountStatus{State: m.State, Path: m.Path, Writable: m.Writable, Phase: v1alpha1.MountPending})
+			ms := v1alpha1.MountStatus{State: m.State, Path: m.Path, Writable: m.Writable, Phase: v1alpha1.MountPending}
+			if !m.Writable {
+				// Read-only mounts pin the committed version.
+				var s v1alpha1.BlipState
+				if err := c.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: m.State}, &s); err == nil && s.Status.Committed != nil {
+					ms.CommitID = s.Status.Committed.ID
+				}
+			}
+			st.Mounts = append(st.Mounts, ms)
 			return true
 		}
 	}

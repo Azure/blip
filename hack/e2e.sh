@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end tests against the kind cluster from hack/kind-up.sh. The Git
 # fan-out runs the way users run it: from an SSH sandbox through the gateway,
-# forking workers from the live sandbox and fetching their commits with
-# `blip git-fetch`. A second user checks that the ownership policy keeps the
-# two apart.
+# forking workers from the live sandbox and collecting their commits and files
+# with `blip collect`. A second user checks that the ownership policy keeps
+# the two apart.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -105,7 +105,7 @@ setsid sleep 100000 </dev/null >/dev/null 2>&1 &
 echo $! > ~/sleeper
 EOF
 
-step "$A: fork two workers from / and fetch their branches"
+step "$A: fork two workers from / and collect their branches and files"
 as "$A" <<'EOF'
 cd ~/src
 pids=
@@ -121,7 +121,7 @@ for i in 1 2; do
 done
 for p in $pids; do wait "$p"; done
 for i in 1 2; do
-	blip git-fetch w$i w$i:w$i
+	blip collect w$i "git:$PWD:w$i"
 	test "$(git show w$i:tasks.txt)" = "task $i"
 	ms=$((($(git log -1 --format=%s w$i) - $(cat ~/start.w$i)) / 1000000))
 	rm ~/start.w$i
@@ -130,10 +130,17 @@ for i in 1 2; do
 done
 test ! -e tasks.txt
 test "$(git status --porcelain)" = "?? notes.txt"
+# Collect a file and a directory out of a worker's state.
+blip collect w1 "$PWD/tasks.txt:./tasks.w1.txt"
+test "$(cat tasks.w1.txt)" = "task 1"
+mkdir -p collected
+blip collect w1 "$PWD/task.sh:./collected/task.sh"
+test -x collected/task.sh
+rm -rf tasks.w1.txt collected
 git log --oneline --all
 kill -0 "$(cat ~/sleeper)"
 touch ~/thawed && rm ~/thawed
-if blip git-fetch w9 w9 2>/dev/null; then echo "fetch from a missing worker succeeded"; exit 1; fi
+if blip collect w9 "git:$PWD:w9" 2>/dev/null; then echo "collect from a missing worker succeeded"; exit 1; fi
 EOF
 
 b_checks() {
@@ -162,7 +169,7 @@ denied POST "$states" -d "{\"apiVersion\":\"blip.dev/v1alpha1\",\"kind\":\"BlipS
 denied POST "$states" -d "{\"apiVersion\":\"blip.dev/v1alpha1\",\"kind\":\"BlipState\",\"metadata\":{\"name\":\"$A.planted\",\"labels\":{\"blip.dev/owner\":\"$A\"}},\"spec\":{\"size\":\"1Gi\"}}"
 denied DELETE "/apis/blip.dev/v1alpha1/namespaces/$SSH_NS/blips/$A.default"
 denied POST "/api/v1/namespaces/$SSH_NS/pods/$APOD/exec?command=true&stdout=true"
-if blip git-fetch w1 w1 2>/dev/null; then echo "$B fetched $A's worker"; exit 1; fi
+if blip collect w1 "git:$PWD:w1" 2>/dev/null; then echo "$B collected $A's worker"; exit 1; fi
 blip run bw --fork / -- true
 EOF
 echo "$B checks passed"
@@ -179,7 +186,7 @@ mkdir /work/repo && cd /work/repo
 git init -q && git config user.email a@example.com && git config user.name a
 cp ~/src/task.sh . && git add task.sh && git commit -qm init
 blip run w3 --fork /work -- sh -c 'git switch -qc w3 && ./task.sh 3 && git add tasks.txt && git commit -qm w3'
-blip git-fetch w3 w3:w3
+blip collect w3 git:/work/repo:w3
 test "$(git show w3:tasks.txt)" = "task 3"
 cd / && blip unmount repo
 EOF

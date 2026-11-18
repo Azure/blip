@@ -303,7 +303,7 @@ func TestUnmountBusy(t *testing.T) {
 // creating states the way kubectl apply would.
 func TestGitWorkflow(t *testing.T) {
 	requireGit(t)
-	withGitMountRoot(t)
+	withCollectMountRoot(t)
 	h := newHarness(t, runningBlip("agent"))
 	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
 	repo := state("repo")
@@ -331,20 +331,20 @@ func TestGitWorkflow(t *testing.T) {
 		}
 	}
 
-	// Fetch the worker's changes with blip git-fetch: the worker has its
-	// state mounted at /work, so /work/repo is the repository in it.
+	// Collect the worker's changes: the worker has its state mounted at
+	// /work, so /work/repo is the repository in it.
 	dst := filepath.Join(t.TempDir(), "dst")
 	gitInit(t, dst)
-	commit := gitRepo(t, filepath.Join(gitMountRoot, "worker-1", "repo"))
+	commit := gitRepo(t, filepath.Join(collectMountRoot, "worker-1", "repo"))
 	h.self = "agent"
 	t.Chdir(dst)
-	if code, _, errOut := h.run("", "git-fetch", "worker-1:/work/repo", "w1:fetched"); code != 0 {
-		t.Fatalf("git-fetch: code %d: %s", code, errOut)
+	if code, _, errOut := h.run("", "collect", "worker-1", "git:/work/repo:w1"); code != 0 {
+		t.Fatalf("collect: code %d: %s", code, errOut)
 	}
-	if got := gitRun(t, dst, "rev-parse", "fetched"); got != commit {
-		t.Fatalf("fetched = %s, want %s", got, commit)
+	if got := gitRun(t, dst, "rev-parse", "w1"); got != commit {
+		t.Fatalf("w1 = %s, want %s", got, commit)
 	}
-	assertFetchReleased(t, h, "agent", "worker-1")
+	assertCollectReleased(t, h, "agent", "worker-1")
 
 	if w := h.blip("worker-1"); w.Status.Phase != v1alpha1.BlipSucceeded {
 		t.Fatalf("worker phase = %s", w.Status.Phase)
