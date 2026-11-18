@@ -114,8 +114,15 @@ spec:
                   Size is the filesystem size. Defaults to the source state's size for
                   copies and to 10Gi otherwise. An image state fails if the converted
                   image does not fit.
+
+                  Size is an int-or-string in the schema, so the rule checks the string
+                  form as a quantity and the integer form numerically.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: size must be greater than 0
+                  rule: 'type(self) == string ? quantity(self).isGreaterThan(quantity(''0''))
+                    : self > 0'
             type: object
             x-kubernetes-validations:
             - message: set at most one of image and copyFrom

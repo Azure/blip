@@ -130,3 +130,18 @@ func TestBlipRootImageOrStateCRDRules(t *testing.T) {
 		t.Errorf("immutability rule %q, want %q", rule, immutable)
 	}
 }
+
+// TestBlipStateSizeCRDRule guards the admission rule that rejects a zero or
+// negative BlipState.spec.size, which otherwise reached the node agent and
+// failed with an internal storage error.
+func TestBlipStateSizeCRDRule(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipstates.yaml")
+	size, ok := spec.Properties["size"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.size property")
+	}
+	const want = "type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0"
+	if rule := ruleFor(t, size.XValidations, "size must be greater than 0"); rule != want {
+		t.Errorf("size rule %q, want %q", rule, want)
+	}
+}

@@ -329,6 +329,13 @@ func joinMessages(msgs []string) string {
 // initialize resolves the source and plans the initial version.
 func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *cluster) (msg string, retry bool, err error) {
 	s := &st.Status
+	// Admission rejects this, but a client that bypasses the CRD schema (or
+	// an object created before the rule) must not reach the node with a
+	// zero or negative filesystem size.
+	if st.Spec.Size != nil && st.Spec.Size.Sign() <= 0 {
+		s.Phase = v1.StateFailed
+		return fmt.Sprintf("size %s must be greater than 0", st.Spec.Size.String()), false, nil
+	}
 	var minSize int64
 	var prefer []string
 	switch {

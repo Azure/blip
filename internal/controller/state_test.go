@@ -33,6 +33,8 @@ func (e *env) safeToRemove(node string) bool {
 
 func TestStateInitialization(t *testing.T) {
 	size20G := resource.MustParse("20Gi")
+	zeroSize := resource.MustParse("0")
+	negativeSize := resource.MustParse("-1Gi")
 	tests := []struct {
 		name    string
 		spec    v1.BlipStateSpec
@@ -42,6 +44,9 @@ func TestStateInitialization(t *testing.T) {
 		phase   string
 	}{
 		{name: "empty", spec: v1.BlipStateSpec{Replicas: 2}, size: 10 << 30},
+		{name: "empty size", spec: v1.BlipStateSpec{Replicas: 2, Size: &size20G}, size: 20 << 30},
+		{name: "zero size", spec: v1.BlipStateSpec{Replicas: 2, Size: &zeroSize}, message: "size 0 must be greater than 0", phase: v1.StateFailed},
+		{name: "negative size", spec: v1.BlipStateSpec{Replicas: 2, Size: &negativeSize}, message: "size -1Gi must be greater than 0", phase: v1.StateFailed},
 		{name: "image", spec: v1.BlipStateSpec{Image: "reg/img:v1"}, size: 10 << 30, nodes: 2},
 		{name: "image size", spec: v1.BlipStateSpec{Image: "reg/img:v1", Size: &size20G}, size: 20 << 30, nodes: 2},
 		{name: "missing image", spec: v1.BlipStateSpec{Image: "reg/nope:v1"}, message: "image reg/nope:v1: not found", phase: v1.StateFailed},

@@ -156,6 +156,10 @@ type BlipStateSpec struct {
 	// Size is the filesystem size. Defaults to the source state's size for
 	// copies and to 10Gi otherwise. An image state fails if the converted
 	// image does not fit.
+	//
+	// Size is an int-or-string in the schema, so the rule checks the string
+	// form as a quantity and the integer form numerically.
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="size must be greater than 0"
 	Size *resource.Quantity `json:"size,omitempty"`
 	// Replicas is the number of nodes that hold every committed version.
 	// Default 3. Must not be set for image states.
