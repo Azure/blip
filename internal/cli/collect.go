@@ -675,6 +675,7 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	created := false
 	if di, err := os.Lstat(dst); err == nil {
 		if !di.IsDir() {
 			return fmt.Errorf("cannot copy directory %s onto %s: not a directory", src, dst)
@@ -688,8 +689,12 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return err
 		}
-		if err := os.Mkdir(dst, 0o700); err != nil && !os.IsExist(err) {
-			return err
+		if err := os.Mkdir(dst, 0o700); err != nil {
+			if !os.IsExist(err) {
+				return err
+			}
+		} else {
+			created = true
 		}
 	}
 	entries, err := os.ReadDir(src)
@@ -715,6 +720,11 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 		if err := copyEntry(ctx, s, d, ei); err != nil {
 			return err
 		}
+	}
+	// An existing destination directory belongs to the caller: keep its
+	// mode and mtime. Only a directory created here takes the source's.
+	if !created {
+		return nil
 	}
 	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
 		return err

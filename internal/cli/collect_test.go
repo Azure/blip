@@ -284,6 +284,57 @@ func TestCopyPathRejectsOverlap(t *testing.T) {
 	})
 }
 
+func TestCopyTreePreservesExistingDestination(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcTime := time.Date(2019, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := os.Chtimes(src, srcTime, srcTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// A destination the user already has keeps its mode and mtime.
+	dst := filepath.Join(base, "existing")
+	if err := os.Mkdir(dst, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dstTime := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(dst, dstTime, dstTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyPath(context.Background(), src, dst); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("existing destination mode = %o, want 700", info.Mode().Perm())
+	}
+	if !info.ModTime().Equal(dstTime) {
+		t.Fatalf("existing destination mtime = %v, want %v", info.ModTime(), dstTime)
+	}
+
+	// A destination this call creates takes the source's mode and mtime.
+	created := filepath.Join(base, "created")
+	if err := copyPath(context.Background(), src, created); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("created destination mode = %o, want 755", info.Mode().Perm())
+	}
+	if !info.ModTime().Equal(srcTime) {
+		t.Fatalf("created destination mtime = %v, want %v", info.ModTime(), srcTime)
+	}
+}
+
 func TestCopyPathCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
