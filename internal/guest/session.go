@@ -84,7 +84,11 @@ func newSession(g *Guest, id string, argv []string, tty bool) *session {
 // startSession starts a process and registers its session. base is the
 // environment applied before s.env.
 func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bool) (*session, error) {
-	p, argv, err := g.startProc(s, base)
+	start := g.startProc
+	if g.startProcess != nil {
+		start = g.startProcess
+	}
+	p, argv, err := start(s, base)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +417,6 @@ func (s *session) info() wire.SessionInfo {
 
 // serve attaches a client until it disconnects or the session ends.
 func (s *session) serve(c *wire.Conn, conn io.Closer) {
-	s.releasePumps()
 	cl := &client{}
 	s.mu.Lock()
 	s.clients++
@@ -424,6 +427,10 @@ func (s *session) serve(c *wire.Conn, conn io.Closer) {
 	s.readers[cl] = struct{}{}
 	s.mu.Unlock()
 	s.g.addClients(1)
+	// Register the reader before releasing held pumps. pinLocked must see
+	// it, or output produced during the handshake could overflow the replay
+	// ring before write starts draining it.
+	s.releasePumps()
 	defer func() {
 		conn.Close()
 		s.mu.Lock()

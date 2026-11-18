@@ -66,6 +66,16 @@ func blipFromFlags(name, namespace string, f *runFlags, command []string) (*v1al
 	if f.idle > 0 {
 		b.Spec.IdleTimeout = &metav1.Duration{Duration: f.idle}
 	}
+	if !f.detach {
+		// The CLI is about to attach. Tell the guest to hold the primary
+		// command's output so a fast command cannot outrun the caller and
+		// overflow the replay ring. A detached run must not wait for a client
+		// that will never come.
+		if b.Annotations == nil {
+			b.Annotations = map[string]string{}
+		}
+		b.Annotations[v1alpha1.AnnotationWaitForClient] = "true"
+	}
 	return b, nil
 }
 

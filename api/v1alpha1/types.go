@@ -545,6 +545,11 @@ type Locality struct {
 	Fallback bool `json:"fallback,omitempty"`
 }
 
+// AnnotationWaitForClient on a Blip asks the guest to hold the primary
+// command's output until a client attaches. `kubectl blip run` sets it when it
+// will attach; a detached run leaves it unset so the command starts itself.
+const AnnotationWaitForClient = "blip.dev/wait-for-client"
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`

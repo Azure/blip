@@ -589,6 +589,7 @@ func (r *runtime) reconcile() {
 			Env:                c.Env,
 			WorkingDir:         c.WorkingDir,
 			User:               c.User,
+			WaitForClient:      c.WaitForClient,
 			IdleTimeoutSeconds: c.IdleTimeoutSeconds,
 			Mounts:             mounts,
 		})

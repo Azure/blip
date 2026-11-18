@@ -250,13 +250,14 @@ func disk(id string, readOnly bool) podapi.Disk {
 
 func claimFor(b *v1alpha1.Blip, root podapi.Disk, cfg *image.Config) *podapi.Claim {
 	c := &podapi.Claim{
-		BlipName:   b.Name,
-		BlipUID:    string(b.UID),
-		Root:       root,
-		Command:    b.Spec.Command,
-		TTY:        b.Spec.TTY,
-		WorkingDir: b.Spec.WorkingDir,
-		User:       b.Spec.User,
+		BlipName:      b.Name,
+		BlipUID:       string(b.UID),
+		Root:          root,
+		Command:       b.Spec.Command,
+		TTY:           b.Spec.TTY,
+		WorkingDir:    b.Spec.WorkingDir,
+		User:          b.Spec.User,
+		WaitForClient: b.Annotations[v1alpha1.AnnotationWaitForClient] == "true",
 	}
 	if cfg != nil {
 		c.Env = append(c.Env, cfg.Env...)

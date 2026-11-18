@@ -24,6 +24,12 @@ const (
 	stopGrace = 10 * time.Second
 )
 
+// waitForClientTimeout bounds how long a primary command's output pumps stay
+// held waiting for the caller. If the client never arrives, the command must
+// still run instead of filling its output pipe forever. It is a variable so
+// tests can shorten it.
+var waitForClientTimeout = 60 * time.Second
+
 // Guest is the state of the VM's init process.
 type Guest struct {
 	root          string
@@ -33,6 +39,10 @@ type Guest struct {
 	kubeNamespace string
 	api           *apiForwarder
 	gateway       *apiForwarder
+
+	// startProcess replaces startProc in tests, which run outside the guest
+	// and cannot chroot or start a workload. Production leaves it nil.
+	startProcess func(procSpec, []string) (*proc, []string, error)
 
 	mu         sync.Mutex
 	ctl        *wire.Conn
@@ -440,9 +450,17 @@ func (g *Guest) startPrimary() {
 		return
 	}
 	spec := procSpec{argv: claim.Command, dir: claim.WorkingDir, user: claim.User, tty: claim.TTY}
-	if _, err := g.startSession(wire.PrimarySession, spec, claim.Env, false); err != nil {
+	hold := claim.WaitForClient
+	s, err := g.startSession(wire.PrimarySession, spec, claim.Env, hold)
+	if err != nil {
 		log.Printf("start primary: %v", err)
 		g.failedSession(wire.PrimarySession, claim.Command, err)
+		return
+	}
+	if hold {
+		// A client that never arrives must not leave the command blocked on
+		// its output pipe forever.
+		time.AfterFunc(waitForClientTimeout, s.releasePumps)
 	}
 }
 
@@ -534,6 +552,12 @@ func (g *Guest) shutdown() {
 		return
 	}
 	g.stopping = true
+	// Held output pumps must not keep a process blocked when the VM is
+	// going away; stopWork below would otherwise wait on a process that
+	// cannot write its output anywhere.
+	for _, s := range g.sessions {
+		s.releasePumps()
+	}
 	// Frozen filesystems would block the workload's exit and the unmounts.
 	if err := g.thawAll(); err != nil {
 		log.Printf("shutdown: %v", err)

@@ -99,6 +99,10 @@ type Claim struct {
 	Env        []string `json:"env,omitempty"`
 	WorkingDir string   `json:"workingDir,omitempty"`
 	User       string   `json:"user,omitempty"`
+	// WaitForClient asks the guest to hold the command's output until a
+	// client attaches. Without it the pumps start immediately, so a fast
+	// command can overflow the replay ring before the caller connects.
+	WaitForClient bool `json:"waitForClient,omitempty"`
 	// IdleTimeoutSeconds applies when Command is empty.
 	IdleTimeoutSeconds int64 `json:"idleTimeoutSeconds,omitempty"`
 	// Mounts are mounted before Command starts. The guest answers each with

@@ -35,6 +35,9 @@ func TestRunDetachedCreatesBlipFromFlags(t *testing.T) {
 	if s.IdleTimeout == nil || s.IdleTimeout.Duration != 5*time.Minute {
 		t.Fatalf("idle = %v", s.IdleTimeout)
 	}
+	if _, ok := b.Annotations[v1alpha1.AnnotationWaitForClient]; ok {
+		t.Fatalf("detached run waits for a client: %v", b.Annotations)
+	}
 }
 
 func TestRunRejectsBadFlags(t *testing.T) {
@@ -77,6 +80,9 @@ func TestRunAttachesToCommandAndExitsWithItsCode(t *testing.T) {
 	}
 	if b := h.blip("job"); b.Status.Phase != v1alpha1.BlipFailed {
 		t.Fatalf("run returned before the blip finished: %s", b.Status.Phase)
+	}
+	if b := h.blip("job"); b.Annotations[v1alpha1.AnnotationWaitForClient] != "true" {
+		t.Fatalf("attached run does not wait for the client: %v", b.Annotations)
 	}
 }
 

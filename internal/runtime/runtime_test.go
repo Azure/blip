@@ -166,12 +166,12 @@ func TestClaimMountUnmountLifecycle(t *testing.T) {
 	}
 
 	root := podapi.Disk{ID: "00000000000000aa", Serial: "00000000000000aa", Device: "/dev/root"}
-	r.desired = podapi.Desired{Claim: &podapi.Claim{BlipName: "b", Root: root, Command: []string{"true"}}}
+	r.desired = podapi.Desired{Claim: &podapi.Claim{BlipName: "b", Root: root, Command: []string{"true"}, WaitForClient: true}}
 	r.reconcile()
 	r.writeObserved()
 	var claim wire.Claim
 	g.expect(wire.TClaim, &claim)
-	if claim.ID != root.ID || claim.Hostname != "b" {
+	if claim.ID != root.ID || claim.Hostname != "b" || !claim.WaitForClient {
 		t.Fatalf("claim %+v", claim)
 	}
 	if d := ch.disk(root.ID); d == nil || d["pci_segment"].(float64) != 1 || d["serial"] != root.ID || d["readonly"] != false {

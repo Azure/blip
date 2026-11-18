@@ -67,6 +67,9 @@ type Claim struct {
 	Env        []string `json:"env,omitempty"` // KEY=VALUE, image env first
 	WorkingDir string   `json:"workingDir,omitempty"`
 	User       string   `json:"user,omitempty"`
+	// WaitForClient holds the command's output until a client attaches, so a
+	// fast command cannot outrun a caller that is about to connect.
+	WaitForClient bool `json:"waitForClient,omitempty"`
 	// IdleTimeoutSeconds applies when Command is empty.
 	IdleTimeoutSeconds int64 `json:"idleTimeoutSeconds,omitempty"`
 }
