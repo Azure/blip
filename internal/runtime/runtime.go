@@ -155,6 +155,9 @@ type runtime struct {
 	networkRetryAt  time.Time
 
 	lastObserved []byte
+
+	// secureSockets is a test seam for boot; nil means secureCHSockets.
+	secureSockets func() error
 }
 
 // Run supervises one VM until the VMM exits.
@@ -253,10 +256,19 @@ func (r *runtime) boot() (*podNet, error) {
 	if err := os.WriteFile(configDisk, img, 0o600); err != nil {
 		return nil, err
 	}
+	// The pod directory is mounted only into this privileged (root) container,
+	// so it can be root-only; tighten it from an older release's 0755.
+	if err := podapi.EnsureDir(r.o.Dir); err != nil {
+		return nil, err
+	}
+	// The vsock directory is an emptyDir shared with the non-root API-proxy
+	// sidecar, which binds vsock.sock_<port> there (kubelet fsGroup makes it
+	// group-writable). Leave its mode alone; only the CH-owned socket is
+	// restricted below.
+	if err := os.MkdirAll(filepath.Dir(r.o.path(podapi.VsockSocket)), 0o755); err != nil {
+		return nil, err
+	}
 	for _, s := range []string{podapi.APISocket, podapi.VsockSocket} {
-		if err := os.MkdirAll(filepath.Dir(r.o.path(s)), 0o755); err != nil {
-			return nil, err
-		}
 		_ = os.Remove(r.o.path(s))
 	}
 	tap, mac := "", ""
@@ -277,6 +289,17 @@ func (r *runtime) boot() (*podNet, error) {
 		log.Printf("cloud-hypervisor exited: %v", r.vmErr)
 		close(r.vmDone)
 	}()
+	// Cloud Hypervisor binds its sockets with the runtime's umask, so restrict
+	// them once they appear, before anything connects to the VM.
+	secure := r.secureSockets
+	if secure == nil {
+		secure = r.secureCHSockets
+	}
+	if err := secure(); err != nil {
+		started = false // tear down the network, we killed the VMM
+		_ = cmd.Process.Kill()
+		return nil, fmt.Errorf("secure cloud-hypervisor sockets: %w", err)
+	}
 	return pn, nil
 }
 

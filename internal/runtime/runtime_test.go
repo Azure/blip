@@ -456,10 +456,15 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 		t.Fatalf("gateway loopback port %d", got)
 	}
 	dir := t.TempDir()
+	// An older release created the pod directory 0755; boot must tighten it.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	o := Options{Dir: dir, SkipNetwork: true, KubeNamespace: "tenant", GatewayLoopbackPort: 8123, CH: "/bin/true"}
 	// The API sidecar can bind its suffix socket before the VMM starts.
 	suffix := o.path(podapi.VsockSocket) + "_1026"
-	if err := os.MkdirAll(filepath.Dir(suffix), 0o755); err != nil {
+	vsockDir := filepath.Dir(suffix)
+	if err := os.MkdirAll(vsockDir, 0o770); err != nil { // kubelet fsGroup mode
 		t.Fatal(err)
 	}
 	listener, err := net.Listen("unix", suffix)
@@ -467,7 +472,9 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	r := &runtime{o: o, vmDone: make(chan struct{})}
+	// /bin/true never binds CH's sockets; secureCHSockets is covered by its
+	// own test.
+	r := &runtime{o: o, vmDone: make(chan struct{}), secureSockets: func() error { return nil }}
 	if _, err := r.boot(); err != nil {
 		t.Fatal(err)
 	}
@@ -483,6 +490,13 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 	if _, err := os.Stat(suffix); err != nil {
 		t.Fatalf("sidecar socket removed: %v", err)
 	}
+	if got := modeOf(t, dir); got != 0o700 {
+		t.Fatalf("pod directory mode %#o, want 0700", got)
+	}
+	// The vsock emptyDir is shared with the non-root API proxy (fsGroup).
+	if got := modeOf(t, vsockDir); got != 0o770 {
+		t.Fatalf("vsock directory mode %#o, want 0770 preserved", got)
+	}
 	// Also check the empty-directory case, without a sidecar to create it.
 	r.o.Dir = t.TempDir()
 	r.vmDone = make(chan struct{})
@@ -492,6 +506,77 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 	<-r.vmDone
 	if st, err := os.Stat(filepath.Dir(r.o.path(podapi.VsockSocket))); err != nil || !st.IsDir() {
 		t.Fatalf("missing vsock directory: %v", err)
+	}
+}
+
+func modeOf(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Mode().Perm()
+}
+
+func TestWaitSocketChmodsExistingSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), podapi.APISocket)
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := os.Chmod(path, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitSocket(path, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := modeOf(t, path); got != 0o600 {
+		t.Fatalf("socket mode %#o, want 0600", got)
+	}
+}
+
+func TestWaitSocketWaitsForCreation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vsock", "vsock.sock")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(50 * time.Millisecond)
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			t.Errorf("listen: %v", err)
+			return
+		}
+		t.Cleanup(func() { l.Close() })
+	}()
+	if err := waitSocket(path, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if got := modeOf(t, path); got != 0o600 {
+		t.Fatalf("socket mode %#o, want 0600", got)
+	}
+}
+
+func TestWaitSocketFailsWhenAbsent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), podapi.APISocket)
+	err := waitSocket(path, 30*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "did not appear") {
+		t.Fatalf("got %v, want missing-socket error", err)
+	}
+}
+
+func TestWaitSocketRejectsNonSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), podapi.APISocket)
+	if err := os.WriteFile(path, []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := waitSocket(path, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "not a unix socket") {
+		t.Fatalf("got %v, want not-a-socket error", err)
 	}
 }
 

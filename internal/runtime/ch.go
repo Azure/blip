@@ -4,15 +4,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/Azure/blip/internal/podapi"
 )
+
+// chSocketTimeout bounds the wait for Cloud Hypervisor to bind its sockets.
+// It binds them during VM setup, well before the guest boots, so this only
+// covers process startup.
+const chSocketTimeout = 10 * time.Second
+
+// chSocketPoll is the interval between socket appearance checks.
+const chSocketPoll = 10 * time.Millisecond
 
 // chArgs returns the Cloud Hypervisor command line.
 func chArgs(o Options, configDisk, tap, mac string) []string {
@@ -37,6 +47,47 @@ func chArgs(o Options, configDisk, tap, mac string) []string {
 		args = append(args, "--net", net)
 	}
 	return args
+}
+
+// secureCHSockets waits for Cloud Hypervisor to bind its API and vsock
+// sockets, then restricts both to root. CH creates them with the runtime's
+// umask, so without this a host-local user could connect to the CH API
+// (pause/shutdown/add-disk on another tenant's VM) whenever the umask allowed
+// group or other writes.
+func (r *runtime) secureCHSockets() error {
+	for _, name := range []string{podapi.APISocket, podapi.VsockSocket} {
+		if err := waitSocket(r.o.path(name), chSocketTimeout); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// waitSocket waits up to timeout for path to appear as a unix socket and then
+// chmods it 0600. The socket is bound by another process, so the chmod races
+// its creation; the caller must not connect before this returns. A missing
+// socket is retried, any other failure is reported immediately.
+func waitSocket(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		info, err := os.Lstat(path)
+		switch {
+		case err == nil:
+			if info.Mode()&os.ModeSocket == 0 {
+				return fmt.Errorf("%s exists and is not a unix socket", path)
+			}
+			if err := os.Chmod(path, 0o600); err != nil {
+				return fmt.Errorf("set %s permissions: %w", path, err)
+			}
+			return nil
+		case !errors.Is(err, os.ErrNotExist):
+			return fmt.Errorf("check socket %s: %w", path, err)
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("socket %s did not appear within %s", path, timeout)
+		}
+		time.Sleep(chSocketPoll)
+	}
 }
 
 // chClient talks to the Cloud Hypervisor REST API on its unix socket.

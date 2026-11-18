@@ -41,7 +41,7 @@ var errPodGone = errors.New("VM pod is gone")
 func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
 	for key, d := range p.desired {
 		path := filepath.Join(a.podDirFor(key), podapi.DesiredFile)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := podapi.EnsurePodDir(filepath.Dir(path)); err != nil {
 			slog.Error("write desired", "pod", key, "err", err)
 			continue
 		}

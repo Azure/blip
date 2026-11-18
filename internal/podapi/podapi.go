@@ -32,6 +32,14 @@ const (
 	ObservedFile = "observed.json"
 	// DevDir holds block device nodes the node agent creates for the VM.
 	DevDir = "dev"
+
+	// DirMode is the mode of a pod directory and of its namespace parent.
+	// They hold documents with user-supplied environment (and command output)
+	// and must not be traversable by other node-local users.
+	DirMode os.FileMode = 0o700
+	// FileMode is the mode of every document written by WriteJSON. The node
+	// agent and the runtime both run as root on the node.
+	FileMode os.FileMode = 0o600
 	// VsockSocket is the Cloud Hypervisor vsock unix socket. Clients
 	// connect and write "CONNECT <port>\n" to reach a guest port.
 	VsockSocket = "vsock/vsock.sock"
@@ -154,7 +162,49 @@ func PodDir(namespace, name string) string {
 	return filepath.Join(PodsDir, namespace, name)
 }
 
-// WriteJSON atomically replaces path with v encoded as JSON.
+// EnsurePodDir creates a pod directory with DirMode and tightens it and its
+// namespace parent to DirMode if they already exist with broader permissions.
+// The node agent calls it before writing Desired, so a directory created by
+// an older version (or by kubelet's DirectoryOrCreate) becomes root-only on
+// upgrade. It never widens a mode and never follows a symlink.
+func EnsurePodDir(dir string) error {
+	if err := EnsureDir(dir); err != nil {
+		return err
+	}
+	return tightenDir(filepath.Dir(dir))
+}
+
+// EnsureDir creates dir with DirMode and tightens it if it already exists
+// with broader permissions. It does not touch the parent: the runtime mounts
+// the pod directory below /run, whose parent is not a namespace directory.
+func EnsureDir(dir string) error {
+	if err := os.MkdirAll(dir, DirMode); err != nil {
+		return err
+	}
+	return tightenDir(dir)
+}
+
+// tightenDir removes group and other permissions from an existing directory.
+// It refuses to follow symlinks, so a planted link cannot redirect the chmod.
+func tightenDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		if err := os.Chmod(dir, perm&^0o077); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WriteJSON atomically replaces path with v encoded as JSON. The result is
+// FileMode (root-only): Desired carries the claim environment and Observed
+// carries command output.
 func WriteJSON(path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -176,7 +226,7 @@ func WriteJSON(path string, v any) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+	if err := os.Chmod(tmp.Name(), FileMode); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
