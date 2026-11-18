@@ -457,6 +457,8 @@ type BlipSpec struct {
 	// +kubebuilder:validation:MaxItems=16
 	Mounts []Mount `json:"mounts,omitempty"`
 	// IdleTimeout applies to interactive blips. Default 30s.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`
 	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
 	// Stop asks the blip to shut down gracefully and save.
 	Stop bool `json:"stop,omitempty"`

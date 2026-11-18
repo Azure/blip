@@ -87,6 +87,7 @@ spec:
                 type: array
               idleTimeout:
                 description: IdleTimeout applies to interactive blips. Default 30s.
+                pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
                 type: string
               image:
                 description: |-
