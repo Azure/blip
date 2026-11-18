@@ -227,6 +227,15 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 		switch {
 		case sm != nil && m.Phase == v1alpha1.MountMounted && (sm.Path != m.Path || sm.Writable != m.Writable):
 			m.Phase, m.Switching = v1alpha1.MountUnmounting, true
+		case sm != nil && m.Phase == v1alpha1.MountFailed && strings.Contains(m.Message, "busy") &&
+			sm.Path == m.Path && sm.Writable == m.Writable:
+			// The switch failed and the spec was reverted: the old mount is
+			// still usable.
+			m.Phase, m.Message, m.Switching = v1alpha1.MountMounted, "", false
+		case sm != nil && m.Phase == v1alpha1.MountUnmounting && m.Message != "" && sm.Path == m.Path && sm.Writable == m.Writable:
+			// The unmount failed but the spec was restored: the mount never
+			// left, so it is usable again.
+			m.Phase, m.Message, m.Switching = v1alpha1.MountMounted, "", false
 		case sm != nil && m.Phase == v1alpha1.MountUnmounting && m.Switching:
 			if c.unmountFail != "" {
 				m.Phase, m.Message = v1alpha1.MountFailed, c.unmountFail
@@ -265,7 +274,7 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 		case !inSpec && m.Phase == v1alpha1.MountMounted:
 			m.Phase = v1alpha1.MountUnmounting
 		case !inSpec && m.Phase == v1alpha1.MountUnmounting && c.unmountFail != "":
-			m.Phase, m.Message = v1alpha1.MountFailed, c.unmountFail
+			m.Message = c.unmountFail
 		case !inSpec && m.Phase == v1alpha1.MountUnmounting && m.Writable:
 			m.Phase = v1alpha1.MountSaving
 		case !inSpec && (m.Phase == v1alpha1.MountUnmounting || m.Phase == v1alpha1.MountSaving):

@@ -291,11 +291,41 @@ func TestUnmountWaitsUntilSaved(t *testing.T) {
 }
 
 func TestUnmountBusy(t *testing.T) {
-	h := newHarness(t, runningBlip("agent", v1alpha1.Mount{State: "repo", Path: "/work", Writable: true}), readyState("repo"))
-	h.ctrl.set(func(c *fakeController) { c.unmountFail = "target is busy" })
-	code, _, errOut := h.run("", "unmount", "repo", "--blip", "agent")
-	if code != 1 || !strings.Contains(errOut, `could not unmount state "repo" from blip "agent": processes are still using /work`) {
-		t.Fatalf("code %d err %q", code, errOut)
+	for _, writable := range []bool{true, false} {
+		t.Run(modeName(writable), func(t *testing.T) {
+			h := newHarness(t, runningBlip("agent", v1alpha1.Mount{State: "repo", Path: "/work", Writable: writable}), readyState("repo"))
+			h.ctrl.set(func(c *fakeController) { c.unmountFail = "target is busy" })
+			code, _, errOut := h.run("", "unmount", "repo", "--blip", "agent")
+			if code != 1 || !strings.Contains(errOut, `could not unmount state "repo" from blip "agent": processes are still using /work`) {
+				t.Fatalf("code %d err %q", code, errOut)
+			}
+
+			// The failed unmount must leave the original mount in the spec
+			// and usable, not just report the error.
+			b := h.blip("agent")
+			if len(b.Spec.Mounts) != 1 || b.Spec.Mounts[0].State != "repo" ||
+				b.Spec.Mounts[0].Path != "/work" || b.Spec.Mounts[0].Writable != writable {
+				t.Fatalf("spec after busy unmount: %+v", b.Spec.Mounts)
+			}
+			if len(b.Status.Mounts) != 1 {
+				t.Fatalf("status after busy unmount: %+v", b.Status.Mounts)
+			}
+			m := b.Status.Mounts[0]
+			if m.Phase != v1alpha1.MountMounted || m.Path != "/work" || m.Writable != writable || m.Message != "" {
+				t.Fatalf("mount after busy unmount: %+v", m)
+			}
+
+			// Once the holder stops, unmounting removes it again.
+			h.ctrl.set(func(c *fakeController) { c.unmountFail = "" })
+			code, out, errOut := h.run("", "unmount", "repo", "--blip", "agent")
+			if code != 0 {
+				t.Fatalf("retry code %d: %s", code, errOut)
+			}
+			mustContain(t, out, "state repo unmounted from blip agent")
+			if b = h.blip("agent"); len(b.Spec.Mounts) != 0 || len(b.Status.Mounts) != 0 {
+				t.Fatalf("mounts after retry: %+v %+v", b.Spec.Mounts, b.Status.Mounts)
+			}
+		})
 	}
 }
 

@@ -65,6 +65,10 @@ var errUnchanged = errors.New("unchanged")
 // using the old mount before it gives up and leaves the mount as it was.
 var switchBusyTimeout = 30 * time.Second
 
+// unmountRestoreTimeout is how long a failed unmount waits for the restored
+// mount to become usable again.
+var unmountRestoreTimeout = 30 * time.Second
+
 func (a *app) mountState(ctx context.Context, state, blip, mountPath string, target *bool) error {
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return fmt.Errorf("invalid path %q: must be a clean absolute path other than /", mountPath)
@@ -259,14 +263,16 @@ func (a *app) unmountState(ctx context.Context, state, blip string) error {
 		}
 	}
 	var before *v1alpha1.MountStatus
+	var removed *v1alpha1.Mount
 	inSpec := false
 	b, err := a.updateBlip(ctx, blip, func(b *v1alpha1.Blip) error {
 		before = findMount(b.Status.Mounts, state)
-		inSpec = false
+		removed, inSpec = nil, false
 		var keep []v1alpha1.Mount
 		for _, m := range b.Spec.Mounts {
 			if m.State == state {
 				inSpec = true
+				removed = &m
 			} else {
 				keep = append(keep, m)
 			}
@@ -286,11 +292,39 @@ func (a *app) unmountState(ctx context.Context, state, blip string) error {
 	r := &reporter{a: a}
 	defer r.stop()
 	start := time.Now()
+	restoring := false
+	var restoreStart time.Time
+	busyErr := func() error {
+		return fmt.Errorf("could not unmount state %q from blip %q: processes are still using %s (stop them, then run the command again)", state, blip, removed.Path)
+	}
+	restoreErr := func(reason error) error {
+		return fmt.Errorf("could not unmount state %q from blip %q: processes are still using %s, but the mount could not be restored: %v", state, blip, removed.Path, reason)
+	}
 	err = a.waitBlip(ctx, blip, func(b *v1alpha1.Blip) (bool, error) {
 		if b == nil {
 			return true, nil
 		}
 		m := findMount(b.Status.Mounts, state)
+		if restoring {
+			switch {
+			case m == nil:
+				return false, restoreErr(errors.New("it was already detached"))
+			case m.Path != removed.Path || m.Writable != removed.Writable:
+				return false, restoreErr(errors.New("it changed concurrently"))
+			case m.Phase == v1alpha1.MountSaving:
+				return false, restoreErr(errors.New("it was already detached and is being saved"))
+			case m.Phase == v1alpha1.MountFailed && strings.HasPrefix(m.Message, "save failed:"):
+				return false, restoreErr(fmt.Errorf("it was already detached (%s)", m.Message))
+			case m.Phase == v1alpha1.MountMounted:
+				return false, busyErr()
+			case m.Phase == v1alpha1.MountFailed:
+				return false, restoreErr(errors.New(m.Message))
+			case time.Since(restoreStart) > unmountRestoreTimeout:
+				return false, fmt.Errorf("could not unmount state %q from blip %q: processes are still using %s; the mount was restored but did not become usable within %s, check the blip before using it", state, blip, removed.Path, unmountRestoreTimeout)
+			}
+			r.say("restoring %s on %s...", state, blip)
+			return false, nil
+		}
 		if m == nil {
 			return true, nil
 		}
@@ -300,7 +334,18 @@ func (a *app) unmountState(ctx context.Context, state, blip string) error {
 			(before == nil || before.Message != m.Message || time.Since(start) > 5*time.Second) {
 			msg := m.Message
 			if strings.Contains(msg, "busy") {
-				msg = fmt.Sprintf("processes are still using %s (stop them, then run the command again)", m.Path)
+				// Put the mount back before reporting the error: leaving
+				// it out of the spec lets the controller detach it later,
+				// and writes to the path would silently land outside it.
+				if removed == nil {
+					return false, fmt.Errorf("could not unmount state %q from blip %q: %s", state, blip, msg)
+				}
+				if err := a.restoreUnmountedMount(ctx, blip, *removed); err != nil {
+					return false, restoreErr(err)
+				}
+				restoring, restoreStart = true, time.Now()
+				r.say("restoring %s on %s...", state, blip)
+				return false, nil
 			}
 			return false, fmt.Errorf("could not unmount state %q from blip %q: %s", state, blip, msg)
 		}
@@ -316,6 +361,49 @@ func (a *app) unmountState(ctx context.Context, state, blip string) error {
 	}
 	fmt.Fprintf(a.env.Out, "state %s unmounted from blip %s\n", a.short(state), a.short(blip))
 	return nil
+}
+
+// restoreUnmountedMount puts a mount back into the spec after a busy unmount
+// so its path stays usable. It refuses to restore a mount that was already
+// detached or saved, or to overwrite a concurrent spec change.
+func (a *app) restoreUnmountedMount(ctx context.Context, blip string, m v1alpha1.Mount) error {
+	_, err := a.updateBlip(ctx, blip, func(b *v1alpha1.Blip) error {
+		if finished(b) || b.DeletionTimestamp != nil || b.Spec.Stop {
+			return errors.New("the blip is stopping")
+		}
+		for i := range b.Spec.Mounts {
+			cur := &b.Spec.Mounts[i]
+			if cur.State != m.State {
+				continue
+			}
+			if cur.Path == m.Path && cur.Writable == m.Writable {
+				return errUnchanged
+			}
+			return errors.New("the spec changed concurrently")
+		}
+		cur := findMount(b.Status.Mounts, m.State)
+		switch {
+		case cur == nil:
+			return errors.New("it was already detached")
+		case cur.Path != m.Path || cur.Writable != m.Writable:
+			return errors.New("it changed concurrently")
+		case cur.Phase == v1alpha1.MountSaving:
+			return errors.New("it was already detached and is being saved")
+		case cur.Phase == v1alpha1.MountFailed && strings.HasPrefix(cur.Message, "save failed:"):
+			return fmt.Errorf("it was already detached (%s)", cur.Message)
+		}
+		for _, cur := range b.Spec.Mounts {
+			if cur.Path == m.Path {
+				return fmt.Errorf("path %s is now used by state %s", m.Path, cur.State)
+			}
+		}
+		b.Spec.Mounts = append(b.Spec.Mounts, m)
+		return nil
+	})
+	if errors.Is(err, errUnchanged) {
+		return nil
+	}
+	return err
 }
 
 // mountTarget scopes the state and blip names; the blip defaults to the
