@@ -263,7 +263,7 @@ func (a *app) run(ctx context.Context, name string, command []string, f *runFlag
 
 	var sessErr error
 	if b.Status.Phase == v1alpha1.BlipRunning {
-		s, err := a.openPrimary(ctx, b.Status.Pod)
+		s, err := a.openPrimary(ctx, name, b.Status.Pod)
 		if err == nil {
 			sessErr = a.stream(ctx, s, streamOpts{blip: name, sendEOF: true})
 		} else {

@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -31,8 +33,20 @@ func (a *app) getBlip(ctx context.Context, name string) (*v1alpha1.Blip, error) 
 	return &b, nil
 }
 
+// finishedError explains that a blip can no longer be attached to. It names
+// the reason (for example "Stopped" or "Idle") so a teardown race looks
+// different from a blip that never existed.
+func finishedError(b *v1alpha1.Blip) error {
+	detail := string(b.Status.Phase)
+	if b.Status.Reason != "" {
+		detail += ": " + b.Status.Reason
+	}
+	return fmt.Errorf("blip %q has finished (%s)", b.Name, detail)
+}
+
 // runningPod returns the VM pod of a running blip. It waits while the
-// blip is still starting.
+// blip is still starting and reports a terminal blip instead of opening a
+// session in a pod that is already gone.
 func (a *app) runningPod(ctx context.Context, name string) (string, error) {
 	b, err := a.getBlip(ctx, name)
 	if err != nil {
@@ -42,6 +56,9 @@ func (a *app) runningPod(ctx context.Context, name string) (string, error) {
 		if b, err = a.waitRunning(ctx, name); err != nil {
 			return "", err
 		}
+	}
+	if b.Status.Phase == v1alpha1.BlipSucceeded || b.Status.Phase == v1alpha1.BlipFailed {
+		return "", finishedError(b)
 	}
 	return session.PodFor(b)
 }
@@ -54,23 +71,88 @@ func (a *app) open(ctx context.Context, pod string, o wire.Open) (*session.Sessi
 	return c.Sessions.Open(ctx, c.Namespace, pod, o)
 }
 
-// openPrimary attaches to a command blip's main session. The VM can report
-// Running just before its command session is registered, and a very fast
-// command can finish in that window; retry briefly so its replayed output is
-// not lost.
-func (a *app) openPrimary(ctx context.Context, pod string) (*session.Session, error) {
-	deadline := time.Now().Add(5 * time.Second)
+// Attach and list opens are idempotent, so a VM that is still starting or
+// already shutting down can be retried. Exec must never use these: without a
+// stable OpenID a retry could start the command twice.
+var (
+	openRetryWindow = 10 * time.Second
+	openRetryFirst  = 50 * time.Millisecond
+	openRetryMax    = 500 * time.Millisecond
+)
+
+// transientOpenError reports whether err describes a VM lifecycle race: the
+// vsock bridge or OCI exec setup failed, the VM went away mid-open, or the
+// guest is tearing the blip down. Any definitive answer from the guest (such
+// as "no session") is not transient.
+func transientOpenError(err error) bool {
+	if errors.Is(err, session.ErrUnreachable) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := err.Error()
+	for _, s := range []string{
+		"connection reset",
+		"connect: no such file or directory",
+		"unexpected EOF",
+		"has finished",
+		"OCI runtime exec failed",
+		"setns",
+		"command terminated with exit code 137",
+		"container not found",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func openRetryable(err error, retryNoSession bool) bool {
+	if retryNoSession && strings.Contains(err.Error(), "no session") {
+		return true
+	}
+	return transientOpenError(err)
+}
+
+// openRetrying opens a session, retrying transient startup/teardown failures
+// for a bounded time. Only attach and list opens may use it. With
+// retryNoSession it also covers the gap between a blip reporting Running and
+// its command session registering; a session that never appears still ends
+// with the guest's "no session" error.
+func (a *app) openRetrying(ctx context.Context, name, pod string, o wire.Open, retryNoSession bool) (*session.Session, error) {
+	deadline := time.Now().Add(openRetryWindow)
+	delay := openRetryFirst
 	for {
-		s, err := a.open(ctx, pod, wire.Open{Mode: wire.OpenAttach, Session: wire.PrimarySession})
-		if err == nil || !strings.Contains(err.Error(), "no session") || time.Now().After(deadline) {
-			return s, err
+		s, err := a.open(ctx, pod, o)
+		if err == nil {
+			return s, nil
+		}
+		if !openRetryable(err, retryNoSession) {
+			return nil, err
+		}
+		// The open may have failed because the blip just stopped. Report
+		// that clearly instead of retrying a VM that no longer exists.
+		if b, gerr := a.getBlip(ctx, name); gerr == nil &&
+			(b.Status.Phase == v1alpha1.BlipSucceeded || b.Status.Phase == v1alpha1.BlipFailed) {
+			return nil, finishedError(b)
+		}
+		if time.Now().After(deadline) {
+			return nil, err
 		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(delay):
 		}
+		delay = min(2*delay, openRetryMax)
 	}
+}
+
+// openPrimary attaches to a command blip's main session. The VM can report
+// Running just before its command session is registered, and a very fast
+// command can finish in that window; retry briefly so its replayed output is
+// not lost.
+func (a *app) openPrimary(ctx context.Context, name, pod string) (*session.Session, error) {
+	return a.openRetrying(ctx, name, pod, wire.Open{Mode: wire.OpenAttach, Session: wire.PrimarySession}, true)
 }
 
 // execSession starts argv (a login shell when empty) in a running blip and
@@ -153,7 +235,7 @@ func (a *app) attachCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			s, err := a.open(cmd.Context(), pod, wire.Open{Mode: wire.OpenAttach, Session: id})
+			s, err := a.openRetrying(cmd.Context(), args[0], pod, wire.Open{Mode: wire.OpenAttach, Session: id}, id == "" || id == wire.PrimarySession)
 			if err != nil {
 				return err
 			}
@@ -177,11 +259,15 @@ func (a *app) sessionsCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			c, _ := a.clients()
-			list, err := c.Sessions.List(cmd.Context(), c.Namespace, pod)
+			s, err := a.openRetrying(cmd.Context(), args[0], pod, wire.Open{Mode: wire.OpenList}, false)
 			if err != nil {
+				if strings.Contains(err.Error(), "exit code 137") {
+					return fmt.Errorf("blip %q is stopping (the VM is shutting down): %w", a.short(args[0]), err)
+				}
 				return err
 			}
+			list := s.Opened.Sessions
+			s.Close()
 			w := tabwriter.NewWriter(a.env.Out, 0, 4, 3, ' ', 0)
 			fmt.Fprintln(w, "ID\tSTATUS\tTTY\tCLIENTS\tCOMMAND")
 			for _, s := range list {
