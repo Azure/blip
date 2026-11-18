@@ -234,6 +234,16 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 
 	hash := templateHash(pool, r.RuntimeImage)
 	created, createdOn, deleted := r.expectations(rq.NamespacedName, pods.Items)
+	// del records pods deleted in this pass. The cached list still shows
+	// them (and the deletion expectation hides them only on the next
+	// reconcile), so later phases must not act on them again.
+	del := func(p *corev1.Pod) error {
+		if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			return err
+		}
+		deleted[p.Name] = true
+		return nil
+	}
 	total := len(pods.Items) + created
 	// used holds the nodes that host a pod of this pool; it bounds the
 	// self-requeue that notices an agent dying without an event.
@@ -267,7 +277,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 				total--
 			}
 		case podTerminated(p) || unusable || p.Annotations[annotationTemplateHash] != hash:
-			if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
 			if unusable {
@@ -308,7 +318,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	kept := vacant[:0]
 	for _, p := range vacant {
 		if !reserved[p.Name] && p.Annotations[AnnotationPinnedNode] != "" && unschedulable(p) {
-			if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
 			continue
@@ -385,7 +395,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			return spare[j].CreationTimestamp.Before(&spare[i].CreationTimestamp)
 		})
 		for _, p := range spare[:max(0, min(have-target, len(spare)))] {
-			if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
 			have--
@@ -412,10 +422,10 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		})
 		for _, p := range spare {
 			node := pickWarmNode(hot, warm, blocked)
-			if node == "" {
+			if node == "" || !room() {
 				break
 			}
-			if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
 			warm[podNode(p)]--

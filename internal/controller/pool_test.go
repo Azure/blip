@@ -195,6 +195,50 @@ func TestPoolRetiresCapacityOnStaleNodes(t *testing.T) {
 	}
 }
 
+// TestAuditPoolChurnAtWarmZero reproduces the shrink+relocate interaction: a
+// warmCount=0 pool deletes its spares, then relocation acted on the same
+// stale vacancy entries and booted fresh spares on the hot node. Pods deleted
+// in this pass must not be relocated, and relocation must respect maxCount.
+func TestAuditPoolChurnAtWarmZero(t *testing.T) {
+	for _, maxCount := range []int32{0, 2} {
+		t.Run(fmt.Sprintf("maxCount=%d", maxCount), func(t *testing.T) {
+			e := newEnv(t)
+			e.addNodes("n1", "n2")
+			e.newPool("default", 0, maxCount)
+			pool := e.getPool("default")
+
+			claimed := e.pool.podFor(pool, "default-claimed")
+			claimed.Spec.NodeName = "n1"
+			claimed.Status.Phase = corev1.PodRunning
+			claimed.Labels[LabelBlipUID] = "uid-claimed"
+			spare := e.pool.podFor(pool, "default-spare1")
+			spare.Spec.NodeName = "n2"
+			spare.Status.Phase = corev1.PodRunning
+			spare.Labels[LabelWarm] = "true"
+			spare2 := spare.DeepCopy()
+			spare2.Name = "default-spare2"
+			e.create(claimed, spare, spare2)
+
+			for pass := range 3 {
+				e.run(e.pool, ns, "default")
+				live := 0
+				for _, p := range e.pods() {
+					if p.DeletionTimestamp != nil {
+						continue
+					}
+					live++
+					if isVacant(&p) {
+						t.Fatalf("pass %d: shrink+relocate re-created spare %s", pass, p.Name)
+					}
+				}
+				if maxCount > 0 && live > int(maxCount) {
+					t.Fatalf("pass %d: %d live pods exceed maxCount %d", pass, live, maxCount)
+				}
+			}
+		})
+	}
+}
+
 func TestPoolPodSpec(t *testing.T) {
 	e := newEnv(t)
 	e.create(&v1.BlipPool{
