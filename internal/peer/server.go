@@ -235,6 +235,11 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.leases[l.ID] = l
 	err := s.saveLocked()
+	if err != nil {
+		// The lease was never persisted, so it must not linger in memory:
+		// nothing else would export, release, or later save it.
+		delete(s.leases, l.ID)
+	}
 	s.mu.Unlock()
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())

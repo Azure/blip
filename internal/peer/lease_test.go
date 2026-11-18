@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Azure/blip/internal/storage"
 )
 
 type leaseTestServer struct {
@@ -57,6 +59,21 @@ func newLeaseTestServer(t *testing.T, authorize Authorizer) *leaseTestServer {
 
 func (ts *leaseTestServer) add(id, node string) {
 	ts.srv.leases[id] = &lease{ID: id, Node: node, Req: ExportRequest{CommitID: "c1"}, LastRenewed: ts.now}
+}
+
+func (ts *leaseTestServer) requestExport(t *testing.T, node, commit string) *httptest.ResponseRecorder {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/export", ts.srv.handleExport)
+	body, err := json.Marshal(ExportRequest{CommitID: commit, HostNQN: HostNQN(node)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/export", strings.NewReader(string(body)))
+	req.TLS = &tls.ConnectionState{Version: tls.VersionTLS13, PeerCertificates: []*x509.Certificate{ts.certs[node]}}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
 }
 
 func (ts *leaseTestServer) renew(t *testing.T, id, node string) *httptest.ResponseRecorder {
@@ -253,5 +270,49 @@ func TestLeaseReleaseWaitsForActivation(t *testing.T) {
 	}
 	if ts.srv.Pinned(l.Req.CommitID) {
 		t.Fatal("released lease still pins the commit")
+	}
+}
+
+func TestHandleExportDropsLeaseWhenSaveFails(t *testing.T) {
+	ts := newLeaseTestServer(t, allow)
+	// A zero store reports ErrNotFound, exercising the ordinary export error
+	// path on the retry below.
+	ts.srv.cfg.Store = &storage.Store{}
+	ts.srv.activateExport = func(*lease) (string, error) { return "nqn", nil }
+	good := ts.srv.path
+	ts.srv.path = filepath.Join(t.TempDir(), "missing", "leases.json")
+
+	if rec := ts.requestExport(t, "n1", "c1"); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("export with unwritable state: %d %s", rec.Code, rec.Body)
+	}
+	if len(ts.srv.leases) != 0 {
+		t.Fatalf("failed export left leases: %+v", ts.srv.leases)
+	}
+	if ts.srv.Pinned("c1") {
+		t.Fatal("failed export still pins its commit")
+	}
+	if len(ts.released) != 0 {
+		t.Fatalf("failed export touched kernel/store state: %v", ts.released)
+	}
+
+	// Persistence works again: a later export proceeds normally and the
+	// dropped lease does not reappear in the saved state.
+	ts.srv.path = good
+	if rec := ts.requestExport(t, "n1", "c2"); rec.Code != http.StatusNotFound {
+		t.Fatalf("subsequent export: %d %s", rec.Code, rec.Body)
+	}
+	b, err := os.ReadFile(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var leases []lease
+	if err := json.Unmarshal(b, &leases); err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 0 {
+		t.Fatalf("persisted leases = %+v, want none", leases)
+	}
+	if len(ts.released) != 3 || !strings.HasPrefix(ts.released[2], "unpin:c2:"+leasePinPrefix) {
+		t.Fatalf("subsequent export did not release normally: %v", ts.released)
 	}
 }
