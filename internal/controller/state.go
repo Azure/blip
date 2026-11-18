@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -354,6 +355,11 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 			minSize = src.Status.SizeBytes
 		}
 		prefer = s.CopiedFrom.Nodes
+	}
+	if minSize > 0 && st.Spec.Size != nil && st.Spec.Size.Value() < minSize {
+		s.Phase = v1.StateFailed
+		return fmt.Sprintf("size %s is smaller than copy source %q (%s)",
+			st.Spec.Size.String(), st.Spec.CopyFrom, resource.NewQuantity(minSize, resource.BinarySI).String()), false, nil
 	}
 	if s.SizeBytes == 0 {
 		s.SizeBytes = defaultStateSize

@@ -80,6 +80,70 @@ func TestStateInitialization(t *testing.T) {
 	}
 }
 
+func TestCopySizeValidation(t *testing.T) {
+	const sourceSize = 10 << 30
+	srcSize := resource.MustParse("10Gi")
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.newState("src", func(st *v1.BlipState) {
+		st.Spec.Replicas = 1
+		st.Spec.Size = &srcSize
+	})
+	e.run(e.state, ns, "src")
+	src := e.getState("src")
+	if src.Status.Pending == nil {
+		t.Fatalf("source pending %+v", src.Status)
+	}
+	e.hold("src", src.Status.Pending.CommitID, src.Status.Pending.Replicas...)
+	e.run(e.state, ns, "src")
+	if src = e.getState("src"); src.Status.Phase != v1.StateReady || src.Status.SizeBytes != sourceSize {
+		t.Fatalf("source not committed at the expected size: %+v", src.Status)
+	}
+
+	// A requested size smaller than the source is rejected instead of being
+	// silently raised to the source size.
+	smallSize := resource.MustParse("1Gi")
+	e.newState("small", func(st *v1.BlipState) {
+		st.Spec.Replicas = 1
+		st.Spec.CopyFrom = "src"
+		st.Spec.Size = &smallSize
+	})
+	e.run(e.state, ns, "small")
+	small := e.getState("small")
+	if small.Status.Phase != v1.StateFailed || small.Status.Pending != nil {
+		t.Fatalf("small copy not rejected: %+v", small.Status)
+	}
+	for _, want := range []string{"1Gi", `"src"`, "10Gi", "smaller than copy source"} {
+		if !strings.Contains(small.Status.Message, want) {
+			t.Fatalf("message %q does not contain %q", small.Status.Message, want)
+		}
+	}
+
+	// An omitted size still inherits the source size.
+	e.newState("inherit", func(st *v1.BlipState) {
+		st.Spec.Replicas = 1
+		st.Spec.CopyFrom = "src"
+	})
+	e.run(e.state, ns, "inherit")
+	inherit := e.getState("inherit")
+	if inherit.Status.Pending == nil || inherit.Status.SizeBytes != sourceSize {
+		t.Fatalf("copy did not inherit the source size: %+v", inherit.Status)
+	}
+
+	// A requested size larger than the source is honored.
+	largeSize := resource.MustParse("20Gi")
+	e.newState("large", func(st *v1.BlipState) {
+		st.Spec.Replicas = 1
+		st.Spec.CopyFrom = "src"
+		st.Spec.Size = &largeSize
+	})
+	e.run(e.state, ns, "large")
+	large := e.getState("large")
+	if large.Status.Pending == nil || large.Status.SizeBytes != 20<<30 {
+		t.Fatalf("larger copy size not honored: %+v", large.Status)
+	}
+}
+
 func TestInitialReplicaWaitsForSource(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2")
