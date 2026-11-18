@@ -248,6 +248,41 @@ func TestCollectFiles(t *testing.T) {
 	})
 }
 
+func TestCopyPathRejectsOverlap(t *testing.T) {
+	t.Run("file onto itself is not truncated", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "f")
+		if err := os.WriteFile(src, []byte("keep\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := copyPath(src, src)
+		if err == nil || !strings.Contains(err.Error(), "same file") {
+			t.Fatalf("err = %v", err)
+		}
+		if got := readFile(t, src); got != "keep\n" {
+			t.Fatalf("source was modified: %q", got)
+		}
+	})
+
+	t.Run("directory into itself", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "d")
+		if err := os.MkdirAll(filepath.Join(src, "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, "sub", "f"), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, dst := range []string{src, filepath.Join(src, "out")} {
+			err := copyPath(src, dst)
+			if err == nil || !strings.Contains(err.Error(), "into itself") {
+				t.Fatalf("copy to %s: err = %v", dst, err)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(src, "out")); !os.IsNotExist(err) {
+			t.Fatalf("destination was created before rejecting: %v", err)
+		}
+	})
+}
+
 func TestCollectOwnRootState(t *testing.T) {
 	root := withCollectMountRoot(t)
 	defer func(r string) { collectSelfRoot = r }(collectSelfRoot)

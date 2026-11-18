@@ -527,6 +527,13 @@ func copyPath(src, dst string) error {
 		return err
 	}
 	if info.IsDir() {
+		inside, err := pathInside(src, dst)
+		if err != nil {
+			return err
+		}
+		if inside {
+			return fmt.Errorf("cannot copy directory %s into itself at %s", src, dst)
+		}
 		if err := checkDestParents(dst); err != nil {
 			return err
 		}
@@ -535,10 +542,71 @@ func copyPath(src, dst string) error {
 	if di, err := os.Stat(dst); err == nil && di.IsDir() {
 		dst = filepath.Join(dst, filepath.Base(src))
 	}
+	same, err := sameFile(src, dst)
+	if err != nil {
+		return err
+	}
+	if same {
+		return fmt.Errorf("source and destination are the same file: %s", src)
+	}
 	if err := checkDestParents(dst); err != nil {
 		return err
 	}
 	return copyEntry(src, dst, info)
+}
+
+// sameFile reports whether src and dst are the same existing file, including
+// a hard link. dst may be missing.
+func sameFile(src, dst string) (bool, error) {
+	si, err := os.Lstat(src)
+	if err != nil {
+		return false, err
+	}
+	di, err := os.Lstat(dst)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return os.SameFile(si, di), nil
+}
+
+// pathInside reports whether p is dir or below it, with symlinks in the
+// existing part of either path resolved.
+func pathInside(dir, p string) (bool, error) {
+	d, err := resolvePath(dir)
+	if err != nil {
+		return false, err
+	}
+	q, err := resolvePath(p)
+	if err != nil {
+		return false, err
+	}
+	return underDir(d, q), nil
+}
+
+// resolvePath makes p absolute and resolves symlinks in its longest existing
+// prefix, so a destination that does not exist yet can be compared too.
+func resolvePath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	cur, rest := abs, ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(resolved, rest), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
 }
 
 // checkDestParents rejects a destination whose existing parent directories
