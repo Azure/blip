@@ -286,59 +286,86 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 	var writable, shared bool
 	var token string
 	var oldAttachment string
-	_, err = a.updateState(ctx, root.Name, func(s *v1alpha1.BlipState) error {
-		if s.UID != root.UID {
-			return errors.New("the calling blip's root state was replaced")
-		}
-		writer, err := a.rootWriter(ctx, s)
-		if err != nil {
-			return err
-		}
-		if writer == nil || writer.UID != b.UID {
-			return fmt.Errorf("blip %q no longer owns root state %q", b.Name, root.Name)
-		}
-		users := mountUsers(s)
-		shared = false
-		oldAttachment = ""
-		if m := findSpecMount(s.Spec.Mounts, state); m != nil {
-			mountPath, writable = m.Path, m.Writable
-			if m.BlipUID != "" && m.BlipUID != string(b.UID) {
-				return fmt.Errorf("temporary mount of state %q belongs to an earlier execution; wait for cleanup", state)
+	for {
+		_, err = a.updateState(ctx, root.Name, func(s *v1alpha1.BlipState) error {
+			if s.UID != root.UID {
+				return errors.New("the calling blip's root state was replaced")
 			}
+			writer, err := a.rootWriter(ctx, s)
+			if err != nil {
+				return err
+			}
+			if writer == nil || writer.UID != b.UID {
+				return fmt.Errorf("blip %q no longer owns root state %q", b.Name, root.Name)
+			}
+			users := mountUsers(s)
+			shared = false
+			oldAttachment = ""
+			if m := findSpecMount(s.Spec.Mounts, state); m != nil {
+				mountPath, writable = m.Path, m.Writable
+				if m.BlipUID != "" && m.BlipUID != string(b.UID) {
+					return fmt.Errorf("temporary mount of state %q belongs to an earlier execution; wait for cleanup", state)
+				}
+				u := users[state]
+				tracked := m.BlipUID != "" && u.BlipUID == m.BlipUID && u.Path == m.Path && u.Token != "" && u.Users > 0
+				if tracked {
+					oldAttachment = u.PreviousAttachment
+				}
+				if !writable && (oldAttachment == "" || mountedAttachment(writer, state) != oldAttachment) {
+					if err := a.checkMountCurrent(ctx, writer, state, mountPath); err != nil {
+						return err
+					}
+				}
+				if !tracked {
+					// Durable user mounts, and temporary mounts whose bookkeeping
+					// was lost, are left in place until their owner's lifetime ends.
+					return errUnchanged
+				}
+			} else {
+				// Back-to-back collects of the same state find its old
+				// read-only attachment still detaching. Adding the mount now
+				// would let the controller revive that attachment instead of
+				// attaching a fresh one, so wait for it to leave status.
+				oldAttachment = mountedAttachment(writer, state)
+				if oldAttachment != "" {
+					return errStaleAttach
+				}
+				mountPath, writable = path.Join(collectMountRoot, state), false
+				for _, m := range s.Spec.Mounts {
+					if m.Path == mountPath {
+						return fmt.Errorf("collect path %s is already used by state %q", mountPath, m.State)
+					}
+				}
+				s.Spec.Mounts = append(s.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath, BlipUID: string(b.UID)})
+				users[state] = collectMountUse{BlipUID: string(b.UID), Path: mountPath, Token: rand.Text(),
+					PreviousAttachment: mountedAttachment(writer, state)}
+			}
+			shared = true
 			u := users[state]
-			tracked := m.BlipUID != "" && u.BlipUID == m.BlipUID && u.Path == m.Path && u.Token != "" && u.Users > 0
-			if tracked {
-				oldAttachment = u.PreviousAttachment
+			u.Users++
+			users[state], token = u, u.Token
+			oldAttachment = u.PreviousAttachment
+			return setMountUsers(s, users)
+		})
+		if errors.Is(err, errStaleAttach) {
+			stale := oldAttachment
+			latest, err := a.getState(ctx, root.Name)
+			if err != nil {
+				return "", nil, err
 			}
-			if !writable && (oldAttachment == "" || mountedAttachment(writer, state) != oldAttachment) {
-				if err := a.checkMountCurrent(ctx, writer, state, mountPath); err != nil {
-					return err
-				}
+			writer, err := a.rootWriter(ctx, latest)
+			if err != nil {
+				return "", nil, err
 			}
-			if !tracked {
-				// Durable user mounts, and temporary mounts whose bookkeeping
-				// was lost, are left in place until their owner's lifetime ends.
-				return errUnchanged
+			if err := a.waitDetached(ctx, writer, root.Name, state, stale); err != nil {
+				return "", nil, err
 			}
-		} else {
-			mountPath, writable = path.Join(collectMountRoot, state), false
-			for _, m := range s.Spec.Mounts {
-				if m.Path == mountPath {
-					return fmt.Errorf("collect path %s is already used by state %q", mountPath, m.State)
-				}
-			}
-			s.Spec.Mounts = append(s.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath, BlipUID: string(b.UID)})
-			users[state] = collectMountUse{BlipUID: string(b.UID), Path: mountPath, Token: rand.Text(), PreviousAttachment: mountedAttachment(writer, state)}
+			continue
 		}
-		shared = true
-		u := users[state]
-		u.Users++
-		users[state], token = u, u.Token
-		oldAttachment = u.PreviousAttachment
-		return setMountUsers(s, users)
-	})
-	if err != nil && !errors.Is(err, errUnchanged) {
-		return "", nil, err
+		if err != nil && !errors.Is(err, errUnchanged) {
+			return "", nil, err
+		}
+		break
 	}
 	cleanup := func() {}
 	if shared {
@@ -615,8 +642,9 @@ type collectMountUse struct {
 	Path    string `json:"path"`
 	Token   string `json:"token"`
 	Users   int    `json:"users"`
-	// Concurrent collectors must wait for the same fresh attachment when
-	// an old Mounted status remained after the previous mount was removed.
+	// PreviousAttachment is the attachment visible when the mount was
+	// added. Adds wait for it to detach first, so it is normally empty;
+	// concurrent reuse still inherits the wait if one slips through.
 	PreviousAttachment string `json:"previousAttachment,omitempty"`
 }
 

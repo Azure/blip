@@ -217,7 +217,7 @@ func TestMountAddsSpecAndWaitsMounted(t *testing.T) {
 	}
 }
 
-func TestMountWaitsForFreshAttachment(t *testing.T) {
+func TestMountWaitsForOldAttachmentDetach(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"), readyState("repo"))
 	// Keep the status where the test puts it: no controller progress.
 	h.ctrl.set(func(c *fakeController) { c.paused = true })
@@ -233,25 +233,29 @@ func TestMountWaitsForFreshAttachment(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- a.mountState(ctx, "repo", "agent-root", "/work", nil) }()
 
-	// The stale Mounted entry from the previous attach is not accepted.
+	// Re-adding the mount while the old attachment is still visible would
+	// let the controller revive it instead of attaching a fresh disk.
 	select {
 	case err := <-done:
-		t.Fatalf("mountState returned while the old attachment was still current: %v", err)
+		t.Fatalf("mountState returned while the old attachment was still visible: %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
-
-	b = h.blip("agent")
-	b.Status.Mounts = []v1alpha1.MountStatus{{State: "repo", Path: "/work", Phase: v1alpha1.MountMounted, AttachmentID: "new"}}
-	if err := h.kube.Status().Update(context.Background(), b); err != nil {
-		t.Fatal(err)
+	if s := h.rootState("agent"); len(s.Spec.Mounts) != 0 {
+		t.Fatalf("mount was re-added before the old attachment detached: %+v", s.Spec.Mounts)
 	}
+
+	// Let the controller detach the old mount and attach the new one.
+	h.ctrl.set(func(c *fakeController) { c.paused = false })
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("mountState failed after the fresh attachment: %v", err)
+			t.Fatalf("mountState failed after the old attachment detached: %v", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("mountState did not return after the fresh attachment")
+	}
+	if s := h.rootState("agent"); len(s.Spec.Mounts) != 1 {
+		t.Fatalf("mounts %+v", s.Spec.Mounts)
 	}
 }
 

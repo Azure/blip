@@ -168,3 +168,177 @@ func TestMountGuestRootAndSharedImport(t *testing.T) {
 		t.Fatalf("shared base not unmounted: %+v", s.Spec.Mounts)
 	}
 }
+
+func TestMountedAttachmentCapturesUnmounting(t *testing.T) {
+	b := runningBlip("writer")
+	b.Status.Mounts = []v1alpha1.MountStatus{
+		{State: "mounted", Path: "/mounted", Phase: v1alpha1.MountMounted, AttachmentID: "mounted-id"},
+		{State: "unmounting", Path: "/unmounting", Phase: v1alpha1.MountUnmounting, AttachmentID: "unmounting-id"},
+		{State: "saving", Path: "/saving", Phase: v1alpha1.MountSaving, AttachmentID: "saving-id"},
+		{State: "failed", Path: "/failed", Phase: v1alpha1.MountFailed, AttachmentID: "failed-id"},
+		{State: "pending", Path: "/pending", Phase: v1alpha1.MountPending, AttachmentID: "pending-id"},
+		{State: "empty", Path: "/empty", Phase: v1alpha1.MountUnmounting},
+	}
+	for state, want := range map[string]string{
+		"mounted":    "mounted-id",
+		"unmounting": "unmounting-id",
+		"saving":     "saving-id",
+		"failed":     "failed-id",
+		"pending":    "", // a new acquisition, not an old attachment
+		"empty":      "",
+		"missing":    "",
+	} {
+		if got := mountedAttachment(b, state); got != want {
+			t.Errorf("%s: captured %q, want %q", state, got, want)
+		}
+	}
+	if got := mountedAttachment(nil, "mounted"); got != "" {
+		t.Errorf("nil blip: captured %q", got)
+	}
+}
+
+// TestMountExistingMountedReturnsImmediately keeps re-running a mount that is
+// already attached fast: only a re-added mount waits for a fresh attachment.
+func TestMountExistingMountedReturnsImmediately(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "current-attachment",
+	}}
+	a := mountTestApp(t, b, root, readyState("data"))
+	a.env.ProgressDelay = 0
+	var progress bytes.Buffer
+	a.env.Err = &progress
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := a.mountState(ctx, "data", root.Name, "/data", nil); err != nil {
+		t.Fatalf("unchanged mount waited: %v (%s)", err, progress.String())
+	}
+	if strings.Contains(progress.String(), "detaching") {
+		t.Fatalf("unchanged mount reported a detach wait: %s", progress.String())
+	}
+	s, err := a.getState(ctx, root.Name)
+	if err != nil || len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0] != (v1alpha1.Mount{State: "data", Path: "/data"}) {
+		t.Fatalf("mounts changed: %+v %v", s, err)
+	}
+}
+
+func TestWaitDetachedStopsForFreshOrReusedAttachment(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "new-attachment",
+	}}
+	a := mountTestApp(t, b, root)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Another collector's fresh attachment is not the stale one.
+	if err := a.waitDetached(ctx, b, root.Name, "data", "old-attachment"); err != nil {
+		t.Fatal(err)
+	}
+
+	// If desired intent reappeared while the old attachment is still
+	// visible, the caller reuses it and must not wait for a detach.
+	cur, err := a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.Status.Mounts[0].AttachmentID = "old-attachment"
+	if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+		t.Fatal(err)
+	}
+	s, err := a.getState(ctx, root.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+	if err := a.c.Kube.Update(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.waitDetached(ctx, cur, root.Name, "data", "old-attachment"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWaitMountIgnoresRevivedAttachment reproduces the back-to-back collect
+// race: the pre-add status is Unmounting with the old attachment, and the
+// controller revives that same attachment to Mounted after the spec returns.
+// The revived entry must not satisfy the wait; only a different attachment
+// may.
+func TestWaitMountIgnoresRevivedAttachment(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Phase: v1alpha1.MountUnmounting, AttachmentID: "old-attachment",
+	}}
+	a := mountTestApp(t, b, root)
+	a.env.ProgressDelay = 0
+	progress := make(chan string, 16)
+	a.env.Err = writerFunc(func(p []byte) (int, error) {
+		select {
+		case progress <- string(p):
+		default:
+		}
+		return len(p), nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	old := mountedAttachment(b, "data")
+	if old != "old-attachment" {
+		t.Fatalf("pre-add attachment %q", old)
+	}
+	setStatus := func(phase, attachment string) {
+		t.Helper()
+		var cur v1alpha1.Blip
+		if err := a.c.Kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: b.Name}, &cur); err != nil {
+			t.Fatal(err)
+		}
+		cur.Status.Mounts = []v1alpha1.MountStatus{{State: "data", Path: "/data", Phase: phase, AttachmentID: attachment}}
+		if err := a.c.Kube.Status().Update(ctx, &cur); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.waitMount(ctx, b, "data", "/data", false, 0, old) }()
+	select {
+	case err := <-done:
+		t.Fatalf("waitMount returned while the old attachment was unmounting: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The controller revives the old attachment: same ID, phase Mounted.
+	setStatus(v1alpha1.MountMounted, old)
+	waiting := false
+	for !waiting {
+		select {
+		case err := <-done:
+			t.Fatalf("waitMount accepted the revived attachment: %v", err)
+		case msg := <-progress:
+			waiting = strings.Contains(msg, "finish detaching")
+		case <-time.After(2 * time.Second):
+			t.Fatal("waitMount did not report waiting for a fresh attachment")
+		}
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("waitMount accepted the revived attachment: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Only a different attachment is fresh.
+	setStatus(v1alpha1.MountMounted, "new-attachment")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitMount failed after a fresh attachment: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitMount did not accept the fresh attachment")
+	}
+}
