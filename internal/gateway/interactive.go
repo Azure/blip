@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -47,7 +48,7 @@ func (c *sessionChannel) runInteractive(ctx context.Context, req *ssh.Request) {
 		c.mu.Lock()
 		o := c.open
 		c.mu.Unlock()
-		sess, err := c.srv.openState(ctx, c.owner, *entry, o)
+		sess, err := c.srv.openState(ctx, c.guestCtx, c.owner, *entry, o)
 		if err != nil {
 			notice = err.Error()
 			continue
@@ -148,12 +149,13 @@ func terminalType(env []string) string {
 
 func (c *sessionChannel) relayInteractive(ctx context.Context, input *channelInput, sess *session.Session, o wire.Open) string {
 	c.mu.Lock()
+	c.sess = sess
 	if c.closing || ctx.Err() != nil {
 		c.mu.Unlock()
-		hangupSession(c.srv.Log, sess)
+		c.hangup()
+		sess.Close()
 		return ""
 	}
-	c.sess = sess
 	c.mu.Unlock()
 	stopResize := c.resizeGuest(ctx, sess, o)
 	reader := input.reader()
@@ -170,6 +172,12 @@ func (c *sessionChannel) relayInteractive(ctx context.Context, input *channelInp
 	// Revoke input before starting the next menu. Close also unblocks a stdin
 	// write to a guest that stopped consuming input; join that copier first.
 	reader.Close()
+	if err != nil && !errors.Is(err, session.ErrDisconnected) {
+		// The SSH channel died under a still-running shell. Signal it over
+		// the independent guest transport before closing that transport;
+		// hangupOnce keeps the channel teardown from signalling it again.
+		c.hangup()
+	}
 	sess.Close()
 	stopResize()
 	<-done

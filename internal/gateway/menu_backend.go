@@ -233,7 +233,10 @@ func (b *catalogBackend) Delete(ctx context.Context, entry menu.Entry) error {
 // openState never calls ensureState: a selection pins an existing state, and
 // cannot silently recreate it after deletion. Startup waits use the shared
 // catalog's events rather than adding a watch or polling loop per SSH session.
-func (s *Server) openState(ctx context.Context, owner string, entry menu.Entry, o wire.Open) (*session.Session, error) {
+//
+// guestCtx owns the guest transport and may outlive ctx: the gateway's hangup
+// path uses it to deliver HUP and KILL after the SSH connection is gone.
+func (s *Server) openState(ctx, guestCtx context.Context, owner string, entry menu.Entry, o wire.Open) (*session.Session, error) {
 	if o.OpenID == "" {
 		o.OpenID = newOpenID()
 	}
@@ -247,7 +250,7 @@ func (s *Server) openState(ctx context.Context, owner string, entry menu.Entry, 
 		if _, err := s.selectedState(ctx, owner, entry, false); err != nil {
 			return nil, err
 		}
-		sess, err := s.Sessions.Open(ctx, s.Namespace, pod, o)
+		sess, err := s.Sessions.Open(guestCtx, s.Namespace, pod, o)
 		if err == nil || attempt > 0 || !errors.Is(err, session.ErrUnreachable) {
 			return sess, err
 		}
