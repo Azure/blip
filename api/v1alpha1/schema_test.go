@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strings"
@@ -163,7 +164,96 @@ func TestBlipStateSizeCRDRule(t *testing.T) {
 	}
 }
 
-// TestMountPathCRDRules guards admission of BlipState.spec.mounts paths. Paths used
+// TestGatewayAddressAndServerNameCRDRules guards admission of
+// BlipPool.spec.gateway.address and serverName. Values such as
+// "host:notaport" or "https://host:443" used to pass only a
+// contains(':') check, so the api-proxy sidecar crash-looped while the Blip
+// waited for a VM forever.
+func TestGatewayAddressAndServerNameCRDRules(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blippools.yaml")
+	gateway, ok := spec.Properties["gateway"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.gateway property")
+	}
+
+	address, ok := gateway.Properties["address"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.gateway.address property")
+	}
+	const addressPattern = `^(\[[0-9A-Fa-f:.]+\]|([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*[.]?):([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$`
+	if address.Pattern != addressPattern {
+		t.Errorf("gateway address pattern %q, want %q", address.Pattern, addressPattern)
+	}
+	if address.MaxLength != 259 {
+		t.Errorf("gateway address maxLength %d, want 259", address.MaxLength)
+	}
+	addressRE, err := regexp.Compile(address.Pattern)
+	if err != nil {
+		t.Fatalf("compile gateway address pattern %q: %v", address.Pattern, err)
+	}
+	for _, value := range []string{
+		"gw.gateway-system.svc:443", "localhost:8443", "10.0.0.1:443",
+		"[::1]:443", "GATEWAY.Test.:443", "gateway.test:65535",
+	} {
+		if !addressRE.MatchString(value) {
+			t.Errorf("gateway address pattern rejects valid address %q", value)
+		}
+	}
+	for _, value := range []string{
+		"host:notaport", "https://host:443", "https://host:443/path", "host",
+		":443", "host:", "host:0", "host:65536", "host:0443", "host:+443",
+		"host: 443", "user@host:443", "host/path:443", "::1:443", "[::1]443",
+		"[]:443", "[fe80::1%eth0]:443", "bad_host:443", "a..b:443",
+	} {
+		if addressRE.MatchString(value) {
+			t.Errorf("gateway address pattern accepts invalid address %q", value)
+		}
+	}
+
+	serverName, ok := gateway.Properties["serverName"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.gateway.serverName property")
+	}
+	if serverName.MaxLength != 253 {
+		t.Errorf("gateway serverName maxLength %d, want 253", serverName.MaxLength)
+	}
+	rule := ruleFor(t, serverName.XValidations, "serverName must be a DNS name or IP address")
+	const namePrefix = "self.serverName.matches('"
+	i := strings.Index(rule, namePrefix)
+	if i < 0 {
+		t.Fatalf("serverName rule %q has no DNS matches() expression", rule)
+	}
+	i += len(namePrefix)
+	j := strings.Index(rule[i:], "')")
+	if j < 0 {
+		t.Fatalf("serverName rule %q has no terminated DNS expression", rule)
+	}
+	nameRE, err := regexp.Compile(rule[i : i+j])
+	if err != nil {
+		t.Fatalf("compile serverName pattern: %v", err)
+	}
+	valid := func(name string) bool {
+		return name == "" || net.ParseIP(name) != nil || nameRE.MatchString(name)
+	}
+	for _, value := range []string{
+		"", "gateway.test", "gateway.test.", "GATEWAY.TEST", "localhost",
+		"10.0.0.1", "::1", "fd00::1", "gw.gateway-system.svc",
+	} {
+		if !valid(value) {
+			t.Errorf("gateway serverName validation rejects valid name %q", value)
+		}
+	}
+	for _, value := range []string{
+		"bad/name", "https://gateway.test", "gateway.test:443", "[::1]",
+		"bad name", "*", "-bad", "bad-", "a..b", "bad_name", ".",
+	} {
+		if valid(value) {
+			t.Errorf("gateway serverName validation accepts invalid name %q", value)
+		}
+	}
+}
+
+// TestMountPathCRDRules guards admission of Blip.spec.mounts paths. Paths used
 // to be validated only by the controller after it had claimed a VM.
 func TestMountPathCRDRules(t *testing.T) {
 	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipstates.yaml")

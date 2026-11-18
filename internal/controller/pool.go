@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"iter"
 	"maps"
 	"slices"
@@ -164,6 +165,12 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	}
 	if pool.DeletionTimestamp != nil {
 		return reconcile.Result{}, nil
+	}
+	// Refuse to create pods whose api-proxy sidecar would exit immediately.
+	// The error is visible on the controller and in events; the alternative is
+	// a Blip that waits for a VM that can never become ready.
+	if err := validateGatewaySpec(pool.Spec.Gateway); err != nil {
+		return reconcile.Result{}, fmt.Errorf("invalid gateway for pool %s/%s: %w", pool.Namespace, pool.Name, err)
 	}
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels{LabelPool: pool.Name}); err != nil {

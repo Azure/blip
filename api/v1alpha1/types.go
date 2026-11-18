@@ -77,17 +77,23 @@ type BlipPoolSpec struct {
 
 // GatewaySpec configures a gateway reachable from the pod network.
 //
-// +kubebuilder:validation:XValidation:rule="self.address.contains(':')",message="address must be host:port"
 // +kubebuilder:validation:XValidation:rule="!has(self.loopbackPort) || self.loopbackPort != 8001",message="8001 is reserved for the Kubernetes API proxy"
 type GatewaySpec struct {
 	// Address is the gateway host and port, for example
 	// envoy.envoy-gateway-system.svc:443. It is dialed from the sidecar's pod
-	// network namespace.
+	// network namespace. The host is a DNS name, an IPv4 address, or a
+	// bracketed IPv6 address; the port must be between 1 and 65535. Schemes,
+	// paths, user info, and whitespace are rejected.
 	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=259
+	// +kubebuilder:validation:Pattern=`^(\[[0-9A-Fa-f:.]+\]|([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*[.]?):([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$`
 	Address string `json:"address"`
 	// ServerName is the TLS server name used for verification and SNI. It
-	// defaults to the host part of Address. Set it when Address is an IP or
-	// the certificate name differs from the dialed host.
+	// defaults to the host part of Address. It must be a DNS name or an IP
+	// address, without a scheme, port, path, or brackets. Set it when Address
+	// is an IP or the certificate name differs from the dialed host.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:XValidation:rule="!has(self.serverName) || size(self.serverName) == 0 || isIP(self.serverName) || self.serverName.matches('^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*[.]?$')",message="serverName must be a DNS name or IP address"
 	ServerName string `json:"serverName,omitempty"`
 	// CAConfigMap names a ConfigMap in the pool namespace with a ca.crt key.
 	// When omitted, the system trust store verifies the gateway.
