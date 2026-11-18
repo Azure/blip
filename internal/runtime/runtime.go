@@ -43,6 +43,9 @@ type Options struct {
 	SkipNetwork bool
 	// KubeNamespace enables the guest's tokenless Kubernetes API connection.
 	KubeNamespace string
+	// GatewayLoopbackPort enables the guest's loopback forwarder to the
+	// gateway proxy.
+	GatewayLoopbackPort int
 }
 
 func (o Options) path(name string) string { return filepath.Join(o.Dir, name) }
@@ -75,6 +78,7 @@ func OptionsFromEnv() Options {
 	str("BLIP_KUBE_NAMESPACE", &o.KubeNamespace)
 	num("BLIP_CPUS", &o.CPUs)
 	num("BLIP_MEMORY_MB", &o.MemoryMB)
+	num("BLIP_GATEWAY_LOOPBACK_PORT", &o.GatewayLoopbackPort)
 	o.SkipNetwork = os.Getenv("BLIP_SKIP_NETWORK") == "1"
 	return o
 }
@@ -225,7 +229,7 @@ func Run(o Options) error {
 // boot writes the config disk, sets up networking and starts the VMM.
 func (r *runtime) boot() (*podNet, error) {
 	hostname, _ := os.Hostname()
-	cfg := guest.Config{Hostname: hostname, KubeNamespace: r.o.KubeNamespace}
+	cfg := guest.Config{Hostname: hostname, KubeNamespace: r.o.KubeNamespace, GatewayLoopbackPort: r.o.GatewayLoopbackPort}
 	var pn *podNet
 	started := false
 	defer func() {

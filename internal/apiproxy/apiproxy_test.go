@@ -90,6 +90,10 @@ func startProxy(t *testing.T, cfg Config) *runningProxy {
 		transport.CloseIdleConnections()
 		p.stop(t)
 	})
+	sockets := []string{cfg.SocketPath}
+	if cfg.Gateway != nil {
+		sockets = append(sockets, cfg.Gateway.SocketPath)
+	}
 	deadline := time.After(5 * time.Second)
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
@@ -100,9 +104,16 @@ func startProxy(t *testing.T, cfg Config) *runningProxy {
 		case <-deadline:
 			t.Fatal("proxy did not start listening")
 		case <-ticker.C:
-			conn, err := net.Dial("unix", cfg.SocketPath)
-			if err == nil {
+			ready := true
+			for _, socket := range sockets {
+				conn, err := net.Dial("unix", socket)
+				if err != nil {
+					ready = false
+					break
+				}
 				_ = conn.Close()
+			}
+			if ready {
 				return p
 			}
 		}

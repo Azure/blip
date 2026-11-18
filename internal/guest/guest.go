@@ -32,6 +32,7 @@ type Guest struct {
 	reaper        *reaper
 	kubeNamespace string
 	api           *apiForwarder
+	gateway       *apiForwarder
 
 	mu         sync.Mutex
 	ctl        *wire.Conn
@@ -104,6 +105,13 @@ func Main() {
 		g.api, err = startAPIForwarder(8001, dialHostAPI)
 		if err != nil {
 			log.Printf("listen Kubernetes API: %v", err)
+			powerOff()
+		}
+	}
+	if cfg.GatewayLoopbackPort > 0 {
+		g.gateway, err = startGatewayForwarder(cfg.GatewayLoopbackPort, dialHostGateway)
+		if err != nil {
+			log.Printf("listen gateway: %v", err)
 			powerOff()
 		}
 	}
@@ -296,6 +304,9 @@ func (g *Guest) doClaim(m wire.Claim) error {
 	}
 	if g.kubeNamespace != "" && (g.api == nil || !g.api.ready()) {
 		return errors.New("Kubernetes API forwarding is unavailable")
+	}
+	if g.gateway != nil && !g.gateway.ready() {
+		return errors.New("gateway forwarding is unavailable")
 	}
 	if !isInit() {
 		return errNotInit
@@ -532,6 +543,9 @@ func (g *Guest) shutdown() {
 	stopWork(g.cgroup, stopGrace)
 	if g.api != nil {
 		g.api.Close()
+	}
+	if g.gateway != nil {
+		g.gateway.Close()
 	}
 	g.mu.Lock()
 	err := g.unmountAllLocked()

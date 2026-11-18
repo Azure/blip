@@ -36,6 +36,8 @@ func init() {
 
 // BlipPoolSpec describes a VM shape and how many warm VMs to keep. Pools are
 // image independent: a warm VM has no root disk until it is claimed.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.gateway) || (has(self.serviceAccountName) && size(self.serviceAccountName) > 0)",message="gateway requires serviceAccountName"
 type BlipPoolSpec struct {
 	// +kubebuilder:validation:Enum=kvm
 	// +kubebuilder:default=kvm
@@ -67,6 +69,40 @@ type BlipPoolSpec struct {
 	// non-public ranges denied, and cluster DNS (kube-dns) allowed. An
 	// explicitly empty policy denies all egress. Changes apply to running blips.
 	Network *NetworkPolicy `json:"network,omitempty"`
+	// Gateway configures a fixed-upstream HTTPS proxy from the guest loopback
+	// to a cluster gateway. It requires ServiceAccountName. The gateway
+	// credential never enters the guest.
+	Gateway *GatewaySpec `json:"gateway,omitempty"`
+}
+
+// GatewaySpec configures a gateway reachable from the pod network.
+//
+// +kubebuilder:validation:XValidation:rule="self.address.contains(':')",message="address must be host:port"
+// +kubebuilder:validation:XValidation:rule="!has(self.loopbackPort) || self.loopbackPort != 8001",message="8001 is reserved for the Kubernetes API proxy"
+type GatewaySpec struct {
+	// Address is the gateway host and port, for example
+	// envoy.envoy-gateway-system.svc:443. It is dialed from the sidecar's pod
+	// network namespace.
+	// +kubebuilder:validation:MinLength=3
+	Address string `json:"address"`
+	// ServerName is the TLS server name used for verification and SNI. It
+	// defaults to the host part of Address. Set it when Address is an IP or
+	// the certificate name differs from the dialed host.
+	ServerName string `json:"serverName,omitempty"`
+	// CAConfigMap names a ConfigMap in the pool namespace with a ca.crt key.
+	// When omitted, the system trust store verifies the gateway.
+	CAConfigMap string `json:"caConfigMap,omitempty"`
+	// Audience is the audience of the projected gateway token. Envoy should
+	// validate this audience. The token cannot authenticate to the API server.
+	// +kubebuilder:default=blip-gateway
+	// +kubebuilder:validation:MinLength=1
+	Audience string `json:"audience,omitempty"`
+	// LoopbackPort is the guest loopback TCP port for this gateway. 8001 is
+	// reserved for the Kubernetes API proxy.
+	// +kubebuilder:default=8002
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	LoopbackPort int32 `json:"loopbackPort,omitempty"`
 }
 
 type BlipPoolStatus struct {

@@ -448,11 +448,15 @@ func TestClaimEnvironmentIsNotPodEnvironment(t *testing.T) {
 
 func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 	t.Setenv("BLIP_KUBE_NAMESPACE", "tenant")
+	t.Setenv("BLIP_GATEWAY_LOOPBACK_PORT", "8123")
 	if got := OptionsFromEnv().KubeNamespace; got != "tenant" {
 		t.Fatalf("namespace %q", got)
 	}
+	if got := OptionsFromEnv().GatewayLoopbackPort; got != 8123 {
+		t.Fatalf("gateway loopback port %d", got)
+	}
 	dir := t.TempDir()
-	o := Options{Dir: dir, SkipNetwork: true, KubeNamespace: "tenant", CH: "/bin/true"}
+	o := Options{Dir: dir, SkipNetwork: true, KubeNamespace: "tenant", GatewayLoopbackPort: 8123, CH: "/bin/true"}
 	// The API sidecar can bind its suffix socket before the VMM starts.
 	suffix := o.path(podapi.VsockSocket) + "_1026"
 	if err := os.MkdirAll(filepath.Dir(suffix), 0o755); err != nil {
@@ -473,7 +477,7 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, err := guest.DecodeConfig(img)
-	if err != nil || cfg.KubeNamespace != "tenant" {
+	if err != nil || cfg.KubeNamespace != "tenant" || cfg.GatewayLoopbackPort != 8123 {
 		t.Fatalf("config %+v: %v", cfg, err)
 	}
 	if _, err := os.Stat(suffix); err != nil {

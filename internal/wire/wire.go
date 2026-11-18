@@ -12,6 +12,9 @@
 // APIPort is a host listener for credential-free Kubernetes API streams from
 // the guest. The runtime authenticates those requests on the host side.
 //
+// GatewayPort is a host listener for streams from the guest to a configured
+// cluster gateway. The sidecar adds the gateway credential on the host side.
+//
 // The guest accepts connections only from the host CID (2). Anyone who can
 // reach the Cloud Hypervisor vsock socket already controls the VM, so there
 // is no further authentication.
@@ -35,6 +38,7 @@ const (
 	ControlPort        = 1024
 	SessionPort        = 1025
 	APIPort     uint32 = 1026
+	GatewayPort uint32 = 1027
 	// MaxFrame bounds one frame payload.
 	MaxFrame = 1 << 20
 )
