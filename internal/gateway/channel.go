@@ -53,7 +53,7 @@ func (s *Server) handleSession(ctx context.Context, owner, sandbox, name string,
 	sess, exited := c.sess, c.exited
 	c.mu.Unlock()
 	if sess != nil && !exited {
-		hangupSession(sess)
+		hangupSession(c.srv.Log, sess)
 	}
 	ch.Close()
 }
@@ -199,7 +199,7 @@ func (c *sessionChannel) run(ctx context.Context, req *ssh.Request, o wire.Open)
 	c.mu.Lock()
 	if c.closing || ctx.Err() != nil {
 		c.mu.Unlock()
-		hangupSession(sess)
+		hangupSession(c.srv.Log, sess)
 		return
 	}
 	c.sess = sess
@@ -273,13 +273,51 @@ func (c *sessionChannel) resizeGuest(ctx context.Context, sess *session.Session,
 	})
 }
 
-// A stalled guest must not prevent SSH channel teardown. Give HUP a chance
-// before closing its transport (closing alone only detaches the process).
-func hangupSession(sess *session.Session) {
-	timer := time.AfterFunc(time.Second, func() { sess.Close() })
-	sess.Signal("HUP")
-	timer.Stop()
-	sess.Close()
+// hangupGrace is how long a hung-up guest gets to exit after HUP before the
+// gateway kills it. Tests shorten it.
+var hangupGrace = time.Second
+
+// hangupSignalTimeout bounds one signal write. A transport blocked behind an
+// earlier frame must not hold up teardown; Close unblocks the write.
+var hangupSignalTimeout = time.Second
+
+// hangupSession ends a guest session whose SSH client went away. Closing the
+// transport alone only detaches the process, so ask the guest to exit and then
+// force it: the guest starts sessions in their own process group and may
+// inherit an ignored HUP/TERM disposition, which makes HUP advisory only.
+// Close waits for the KILL frame unless the transport stopped draining.
+func hangupSession(log *slog.Logger, sess *session.Session) {
+	start := time.Now()
+	if !signalSession(log, sess, "HUP", hangupGrace, "hangup: HUP") {
+		sess.Close()
+		return
+	}
+	// Let the guest use the rest of its grace period before escalating. A
+	// shell that inherited SIG_IGN will still be alive here.
+	if wait := hangupGrace - time.Since(start); wait > 0 {
+		time.Sleep(wait)
+	}
+	signalSession(log, sess, "KILL", hangupSignalTimeout, "hangup: KILL")
+	if err := sess.Close(); err != nil {
+		log.Debug("hangup: close failed", "error", err)
+	}
+}
+
+// signalSession writes one signal frame, giving up if the transport does not
+// drain within timeout. It reports whether the write completed.
+func signalSession(log *slog.Logger, sess *session.Session, name string, timeout time.Duration, what string) bool {
+	done := make(chan error, 1)
+	go func() { done <- sess.Signal(name) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Debug(what+" failed", "error", err)
+		}
+		return true
+	case <-time.After(timeout):
+		log.Debug(what + " write stalled")
+		return false
+	}
 }
 
 func (s *Server) handleDirectTCPIP(ctx context.Context, owner, sandbox string, nch ssh.NewChannel, log *slog.Logger) {

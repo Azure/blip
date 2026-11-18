@@ -150,7 +150,7 @@ func (c *sessionChannel) relayInteractive(ctx context.Context, input *channelInp
 	c.mu.Lock()
 	if c.closing || ctx.Err() != nil {
 		c.mu.Unlock()
-		hangupSession(sess)
+		hangupSession(c.srv.Log, sess)
 		return ""
 	}
 	c.sess = sess
