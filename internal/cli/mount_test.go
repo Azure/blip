@@ -264,6 +264,112 @@ func TestWaitDetachedStopsForFreshOrReusedAttachment(t *testing.T) {
 	}
 }
 
+func TestMountBusy(t *testing.T) {
+	for _, tc := range []struct {
+		name, msg, state, want string
+	}{
+		{
+			name:  "acquire rejection",
+			msg:   `mount data: state "data" is in use by blip other`,
+			state: "data",
+			want:  `mount data: state "data" is in use by blip other`,
+		},
+		{
+			name:  "promotion rejection",
+			msg:   `state "data" is in use by blip other`,
+			state: "data",
+			want:  `state "data" is in use by blip other`,
+		},
+		{
+			name:  "joined waits pick the matching state",
+			msg:   `mount other: state "other" is in use by blip elsewhere; mount data: state "data" is in use by blip other`,
+			state: "data",
+			want:  `mount data: state "data" is in use by blip other`,
+		},
+		{
+			name:  "another state's failure",
+			msg:   `mount other: state "other" is in use by blip elsewhere`,
+			state: "data",
+		},
+		{
+			name:  "unrelated wait",
+			msg:   `mount data: state "data" has no committed version yet`,
+			state: "data",
+		},
+		{
+			name:  "empty",
+			state: "data",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mountBusy(tc.msg, tc.state); got != tc.want {
+				t.Fatalf("mountBusy(%q, %q) = %q, want %q", tc.msg, tc.state, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMountWritableBusyStateFailsFast reproduces a writable root mount that
+// the controller rejects because another Blip holds the source state's writer.
+// The rejection is a top-level status message with no mount status entry;
+// waiting for status.mounts would never finish.
+func TestMountWritableBusyStateFailsFast(t *testing.T) {
+	b := runningBlip("writer")
+	data := readyState("data")
+	data.Status.Writer = &v1alpha1.Writer{BlipName: "other", BlipUID: "uid-other"}
+	data.Status.Phase = v1alpha1.StateInUse
+	h := newHarness(t, b, data)
+	h.ctrl.set(func(c *fakeController) { c.paused = true })
+
+	cur := h.blip(b.Name)
+	cur.Status.Mounts = nil
+	cur.Status.Message = `mount data: state "data" is in use by blip other`
+	if err := h.kube.Status().Update(context.Background(), cur); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	code, _, errOut := h.run("", "mount", "data", b.Spec.State, "--path", "/data", "--write")
+	if code == 0 {
+		t.Fatalf("busy writable mount succeeded: %s", errOut)
+	}
+	mustContain(t, errOut, `"data"`, "is in use by blip", "other")
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("busy writable mount took %s to fail: %s", elapsed, errOut)
+	}
+}
+
+// TestMountWritableUnrelatedMessageKeepsWaiting keeps top-level messages that
+// do not describe this mount's state out of the fail-fast path.
+func TestMountWritableUnrelatedMessageKeepsWaiting(t *testing.T) {
+	b := runningBlip("writer")
+	h := newHarness(t, b, readyState("data"))
+	h.ctrl.set(func(c *fakeController) { c.paused = true })
+
+	cur := h.blip(b.Name)
+	cur.Status.Mounts = nil
+	cur.Status.Message = `mount other: state "other" is in use by blip elsewhere; mount data: state "data" has no committed version yet`
+	if err := h.kube.Status().Update(context.Background(), cur); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	env := h.env(strings.NewReader(""), &out, &errOut)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	code := Main(ctx, env, []string{"mount", "data", b.Spec.State, "--path", "/data", "--write"})
+	if code == 0 {
+		t.Fatal("mount succeeded")
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Fatalf("mount returned after %s instead of waiting: %s", elapsed, errOut.String())
+	}
+	if strings.Contains(errOut.String(), "in use by blip") {
+		t.Fatalf("unrelated status message treated as busy: %s", errOut.String())
+	}
+}
+
 // TestWaitMountIgnoresRevivedAttachment reproduces the back-to-back collect
 // race: the pre-add status is Unmounting with the old attachment, and the
 // controller revives that same attachment to Mounted after the spec returns.

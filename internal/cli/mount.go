@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -244,6 +245,22 @@ func (a *app) waitDetached(ctx context.Context, writer *v1alpha1.Blip, rootName,
 	})
 }
 
+// mountBusy reports the part of a top-level Blip status message that says the
+// wanted state is already written by another Blip. The controller records a
+// writable mount rejected for that reason on the Blip itself, not as a mount
+// status entry, so a wait keyed on status.mounts would never finish. Only a
+// segment that both names this state and reports the holder matches; unrelated
+// waits and failures for other mounts stay out of the way.
+func mountBusy(msg, state string) string {
+	quoted := strconv.Quote(state)
+	for _, part := range strings.Split(msg, "; ") {
+		if strings.Contains(part, "is in use by blip") && strings.Contains(part, quoted) {
+			return strings.TrimSpace(part)
+		}
+	}
+	return ""
+}
+
 // waitMount observes the runtime attachment without editing desired intent.
 // oldAttachment identifies a previous mount that was still visible when the
 // desired mount was re-added, and must not be accepted as the new attachment.
@@ -271,6 +288,15 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 		}
 		m := findMount(b.Status.Mounts, state)
 		if m == nil || m.Path != mountPath {
+			// A writable mount can be rejected before any status entry
+			// exists: the controller leaves the reason on the Blip. Report
+			// that as final instead of waiting for an attachment that will
+			// never appear.
+			if m == nil && want {
+				if busy := mountBusy(b.Status.Message, state); busy != "" {
+					return false, fmt.Errorf("mount of state %q on blip %q failed: %s; desired mount remains applied", state, b.Name, busy)
+				}
+			}
 			r.say("mounting %s on %s...", state, b.Name)
 			return false, nil
 		}
