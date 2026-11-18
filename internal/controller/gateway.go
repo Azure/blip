@@ -32,6 +32,9 @@ func validateGatewaySpec(g *v1.GatewaySpec) error {
 	if err := validateGatewayServerName(name); err != nil {
 		return fmt.Errorf("gateway.serverName %q: %w", g.ServerName, err)
 	}
+	if err := validateGatewayAudience(g.Audience); err != nil {
+		return fmt.Errorf("gateway.audience %q: %w", g.Audience, err)
+	}
 	return nil
 }
 
@@ -96,4 +99,41 @@ func validateGatewayServerName(name string) error {
 		return errors.New("must be a DNS name or IP address without a scheme, port, or path")
 	}
 	return nil
+}
+
+// apiServerAudiences are the audiences a default Kubernetes API server
+// accepts. A token projected for one of them is a valid API credential.
+var apiServerAudiences = map[string]struct{}{
+	"kubernetes.default.svc":               {},
+	"kubernetes.default.svc.cluster.local": {},
+}
+
+// validateGatewayAudience keeps a gateway token from being accepted by the API
+// server. The gateway receives the token, so its audience is the boundary that
+// prevents a compromised or third-party gateway from holding an API credential
+// for the pod's service account.
+func validateGatewayAudience(audience string) error {
+	if audience == "" {
+		// Omitted or explicitly empty uses the default blip-gateway audience.
+		return nil
+	}
+	if isAPIServerAudience(audience) {
+		return errors.New("must not be a Kubernetes API server audience; the gateway token would authenticate to the API server")
+	}
+	return nil
+}
+
+func isAPIServerAudience(audience string) bool {
+	s := strings.ToLower(strings.TrimSpace(audience))
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimSuffix(s, "/")
+	s = strings.TrimSuffix(s, ".")
+	// Accept an explicit port even though the default API audiences have none.
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	s = strings.TrimSuffix(s, ".")
+	_, ok := apiServerAudiences[s]
+	return ok
 }

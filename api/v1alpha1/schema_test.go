@@ -253,6 +253,74 @@ func TestGatewayAddressAndServerNameCRDRules(t *testing.T) {
 	}
 }
 
+// TestGatewayAudienceCRDRule guards admission of BlipPool.spec.gateway.audience.
+// The API server accepts tokens whose audience is its own audience, so a pool
+// author could otherwise point the gateway token at the API server.
+func TestGatewayAudienceCRDRule(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blippools.yaml")
+	gateway, ok := spec.Properties["gateway"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.gateway property")
+	}
+	audience, ok := gateway.Properties["audience"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.gateway.audience property")
+	}
+	if audience.MaxLength != 1024 {
+		t.Errorf("gateway audience maxLength %d, want 1024", audience.MaxLength)
+	}
+	const rule = "!self.audience.trim().lowerAscii().matches('^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$')"
+	if got := ruleFor(t, audience.XValidations, "audience must not be a Kubernetes API server audience"); got != rule {
+		t.Fatalf("gateway audience rule %q, want %q", got, rule)
+	}
+
+	const prefix = "self.audience.trim().lowerAscii().matches('"
+	i := strings.Index(rule, prefix)
+	if i < 0 {
+		t.Fatalf("audience rule %q has no matches() expression", rule)
+	}
+	i += len(prefix)
+	j := strings.Index(rule[i:], "')")
+	if j < 0 {
+		t.Fatalf("audience rule %q has no terminated expression", rule)
+	}
+	apiAudienceRE, err := regexp.Compile(rule[i : i+j])
+	if err != nil {
+		t.Fatalf("compile audience pattern: %v", err)
+	}
+	rejected := func(value string) bool {
+		return apiAudienceRE.MatchString(strings.ToLower(strings.TrimSpace(value)))
+	}
+	for _, value := range []string{
+		"", "blip-gateway", "custom-audience", "https://gateway.example/audience",
+		"kubernetes.default.svc.example.com", "not-kubernetes.default.svc",
+		"https://other.default.svc.cluster.local",
+	} {
+		if rejected(value) {
+			t.Errorf("audience validation rejects non-API audience %q", value)
+		}
+	}
+	for _, value := range []string{
+		"https://kubernetes.default.svc",
+		"https://kubernetes.default.svc.",
+		"HTTPS://KUBERNETES.DEFAULT.SVC",
+		"https://kubernetes.default.svc.cluster.local",
+		"https://kubernetes.default.svc.cluster.local.",
+		"HTTPS://KUBERNETES.DEFAULT.SVC.CLUSTER.LOCAL",
+		"https://kubernetes.default.svc:443",
+		"https://kubernetes.default.svc.cluster.local:443/",
+		"kubernetes.default.svc",
+		"kubernetes.default.svc.",
+		"kubernetes.default.svc.cluster.local",
+		"kubernetes.default.svc.cluster.local.",
+		" kubernetes.default.svc.cluster.local ",
+	} {
+		if !rejected(value) {
+			t.Errorf("audience validation accepts API server audience %q", value)
+		}
+	}
+}
+
 // TestMountPathCRDRules guards admission of Blip.spec.mounts paths. Paths used
 // to be validated only by the controller after it had claimed a VM.
 func TestMountPathCRDRules(t *testing.T) {

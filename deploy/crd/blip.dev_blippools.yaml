@@ -78,10 +78,17 @@ spec:
                   audience:
                     default: blip-gateway
                     description: |-
-                      Audience is the audience of the projected gateway token. Envoy should
-                      validate this audience. The token cannot authenticate to the API server.
+                      Audience is the audience of the projected gateway token. The gateway
+                      should validate this audience. Kubernetes API server audiences are
+                      rejected: a gateway token with one of them would authenticate to the API
+                      server. Non-API audiences are allowed. Custom API audiences remain the
+                      cluster admin's responsibility, so do not add them here.
+                    maxLength: 1024
                     minLength: 1
                     type: string
+                    x-kubernetes-validations:
+                    - message: audience must not be a Kubernetes API server audience
+                      rule: '!self.audience.trim().lowerAscii().matches(''^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$'')'
                   caConfigMap:
                     description: |-
                       CAConfigMap names a ConfigMap in the pool namespace with a ca.crt key.

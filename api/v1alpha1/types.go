@@ -98,10 +98,15 @@ type GatewaySpec struct {
 	// CAConfigMap names a ConfigMap in the pool namespace with a ca.crt key.
 	// When omitted, the system trust store verifies the gateway.
 	CAConfigMap string `json:"caConfigMap,omitempty"`
-	// Audience is the audience of the projected gateway token. Envoy should
-	// validate this audience. The token cannot authenticate to the API server.
+	// Audience is the audience of the projected gateway token. The gateway
+	// should validate this audience. Kubernetes API server audiences are
+	// rejected: a gateway token with one of them would authenticate to the API
+	// server. Non-API audiences are allowed. Custom API audiences remain the
+	// cluster admin's responsibility, so do not add them here.
 	// +kubebuilder:default=blip-gateway
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:XValidation:rule="!self.audience.trim().lowerAscii().matches('^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$')",message="audience must not be a Kubernetes API server audience"
 	Audience string `json:"audience,omitempty"`
 	// LoopbackPort is the guest loopback TCP port for this gateway. 8001 is
 	// reserved for the Kubernetes API proxy.

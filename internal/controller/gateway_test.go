@@ -68,9 +68,50 @@ func TestValidateGatewaySpecAddressAndServerName(t *testing.T) {
 	}
 }
 
+// TestValidateGatewayAudience checks that the gateway token cannot be projected
+// for an audience the Kubernetes API server accepts, while ordinary custom
+// audiences keep working.
+func TestValidateGatewayAudience(t *testing.T) {
+	tests := []struct {
+		audience string
+		ok       bool
+	}{
+		{audience: "", ok: true},
+		{audience: defaultGatewayAudience, ok: true},
+		{audience: "custom-audience", ok: true},
+		{audience: "https://gateway.example/audience", ok: true},
+		{audience: "kubernetes.default.svc.example.com", ok: true},
+		{audience: "not-kubernetes.default.svc", ok: true},
+		{audience: "https://other.default.svc.cluster.local", ok: true},
+
+		{audience: "https://kubernetes.default.svc", ok: false},
+		{audience: "https://kubernetes.default.svc.", ok: false},
+		{audience: "HTTPS://KUBERNETES.DEFAULT.SVC", ok: false},
+		{audience: "https://kubernetes.default.svc.cluster.local", ok: false},
+		{audience: "https://kubernetes.default.svc.cluster.local.", ok: false},
+		{audience: "HTTPS://KUBERNETES.DEFAULT.SVC.CLUSTER.LOCAL", ok: false},
+		{audience: "https://kubernetes.default.svc:443", ok: false},
+		{audience: "https://kubernetes.default.svc.cluster.local:443/", ok: false},
+		{audience: "kubernetes.default.svc", ok: false},
+		{audience: "kubernetes.default.svc.", ok: false},
+		{audience: "kubernetes.default.svc.cluster.local", ok: false},
+		{audience: "kubernetes.default.svc.cluster.local.", ok: false},
+		{audience: " kubernetes.default.svc.cluster.local ", ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.audience, func(t *testing.T) {
+			gateway := &v1.GatewaySpec{Address: "gw.gateway-system.svc:443", Audience: tt.audience}
+			err := validateGatewaySpec(gateway)
+			if (err == nil) != tt.ok {
+				t.Fatalf("validateGatewaySpec(audience=%q) = %v, want ok=%v", tt.audience, err, tt.ok)
+			}
+		})
+	}
+}
+
 // TestPoolReconcileRejectsInvalidGateway checks that a pool already stored in
 // etcd with an unusable gateway fails reconciliation before it creates a VM
-// pod whose api-proxy sidecar would crash-loop.
+// pod whose api-proxy sidecar would crash-loop or carry an API-valid token.
 func TestPoolReconcileRejectsInvalidGateway(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -86,6 +127,11 @@ func TestPoolReconcileRejectsInvalidGateway(t *testing.T) {
 			name:    "server name",
 			gateway: &v1.GatewaySpec{Address: "gw.gateway-system.svc:443", ServerName: "bad/name"},
 			want:    "gateway.serverName",
+		},
+		{
+			name:    "audience",
+			gateway: &v1.GatewaySpec{Address: "gw.gateway-system.svc:443", Audience: "https://kubernetes.default.svc.cluster.local"},
+			want:    "gateway.audience",
 		},
 	}
 	for _, tt := range tests {
