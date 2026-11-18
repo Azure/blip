@@ -19,7 +19,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -176,6 +175,9 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	if err := r.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels{LabelPool: pool.Name}); err != nil {
 		return reconcile.Result{}, err
 	}
+	// API list order is not a placement or deletion preference. This also
+	// breaks equal creation-time ties in the stable sorts below.
+	sort.Slice(pods.Items, func(i, j int) bool { return pods.Items[i].Name < pods.Items[j].Name })
 	var blips v1.BlipList
 	if err := r.List(ctx, &blips, client.InNamespace(pool.Namespace), client.MatchingFields{indexPool: pool.Name}); err != nil {
 		return reconcile.Result{}, err
@@ -522,7 +524,7 @@ func (r *PoolReconciler) expectations(pool types.NamespacedName, pods []corev1.P
 	for i := range pods {
 		present[pods[i].Name] = &pods[i]
 	}
-	now := time.Now()
+	now := r.now()
 	createdOn := map[string]int{}
 	for name, x := range r.created[pool] {
 		if present[name] != nil || now.Sub(x.at) > expectTimeout {
@@ -551,13 +553,13 @@ func (r *PoolReconciler) expect(m *map[types.NamespacedName]map[string]expectati
 	if (*m)[pool] == nil {
 		(*m)[pool] = map[string]expectation{}
 	}
-	(*m)[pool][name] = expectation{at: time.Now(), node: node}
+	(*m)[pool][name] = expectation{at: r.now(), node: node}
 }
 
 // createPod creates a VM pod. A pod for a node is pinned to it; others avoid
 // nodes that cannot run one, including draining and unhealthy ones.
 func (r *PoolReconciler) createPod(ctx context.Context, pool *v1.BlipPool, avoid map[string]bool, node string) error {
-	pod := r.podFor(pool, pool.Name+"-"+utilrand.String(5))
+	pod := r.podFor(pool, r.newPodName(pool.Name))
 	var match *corev1.NodeSelectorRequirement
 	switch {
 	case node != "":

@@ -29,6 +29,8 @@ func (v *view) imageRefs() []imageSource {
 			if r == nil {
 				r = &imageSource{Ref: ref}
 				byID[id] = r
+			} else if ref < r.Ref {
+				r.Ref = ref
 			}
 			for _, s := range secrets {
 				ps := pullSecret{Namespace: namespace, Name: s.Name}

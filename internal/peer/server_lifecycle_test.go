@@ -146,9 +146,6 @@ func TestServerServeFailureCancelsAndJoinsHandlers(t *testing.T) {
 }
 
 func TestServerShutdownJoinsRecheck(t *testing.T) {
-	oldInterval := RecheckInterval
-	RecheckInterval = time.Millisecond
-	t.Cleanup(func() { RecheckInterval = oldInterval })
 	entered, finish := make(chan struct{}), make(chan struct{})
 	defer close(finish)
 	ts := newLeaseTestServer(t, func(string, ExportRequest) error {
@@ -157,6 +154,7 @@ func TestServerShutdownJoinsRecheck(t *testing.T) {
 		return nil
 	})
 	ts.add("L1", "n1")
+	ts.srv.cfg.RecheckInterval = time.Millisecond
 	s := startLifecycleServer(t, ts, http.NotFoundHandler(), time.Second)
 	awaitSignal(t, entered)
 	s.cancel()

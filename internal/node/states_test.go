@@ -415,7 +415,7 @@ func TestCommitGC(t *testing.T) {
 	for _, id := range []string{"c1", "c2", "c3", "lease", "rom"} {
 		v.volumes[id] = commit(id, "uid-s")
 	}
-	v.pinned = func(id string) bool { return id == "lease" }
+	v.pinned = map[string]bool{"lease": true}
 	b := blip("b")
 	b.Status.Node = "n9"
 	b.Status.Mounts = []v1alpha1.MountStatus{{State: "s", StateUID: "uid-s", CommitID: "rom"}}
@@ -513,7 +513,7 @@ func TestImageRetention(t *testing.T) {
 	a := &Agent{imageUsed: map[string]time.Time{}}
 	v := newView()
 	v.volumes[imageID] = storage.Volume{ID: imageID, Kind: storage.KindImage}
-	t0 := time.Now()
+	t0 := testNow
 
 	s := state("s")
 	s.Status.ImageDigest = imageRef
@@ -552,7 +552,7 @@ func TestHolderFailover(t *testing.T) {
 		damage func(*view)
 	}{
 		{"stale heartbeat", func(v *view) {
-			old := metav1.NewTime(time.Now().Add(-2 * nodeHeartbeatTTL))
+			old := metav1.NewTime(testNow.Add(-2 * nodeHeartbeatTTL))
 			v.blipNodes["n2"].Status.Heartbeat = &old
 		}},
 		{"draining", func(v *view) { v.blipNodes["n2"].Spec.Drain = true }},
@@ -702,7 +702,7 @@ func TestCopySourceRequiresHealthyPeer(t *testing.T) {
 		{"draining", func(n *v1alpha1.BlipNode) { n.Spec.Drain = true }},
 		{"missing heartbeat", func(n *v1alpha1.BlipNode) { n.Status.Heartbeat = nil }},
 		{"stale heartbeat", func(n *v1alpha1.BlipNode) {
-			old := metav1.NewTime(time.Now().Add(-2 * nodeHeartbeatTTL))
+			old := metav1.NewTime(testNow.Add(-2 * nodeHeartbeatTTL))
 			n.Status.Heartbeat = &old
 		}},
 	} {

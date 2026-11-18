@@ -474,7 +474,7 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 	if len(nodes) == 0 {
 		return "no healthy node can hold the state", false, nil
 	}
-	s.Pending = &v1.PendingCommit{CommitID: newID(), Generation: 1, SourceNode: nodes[0], Replicas: nodes}
+	s.Pending = &v1.PendingCommit{CommitID: r.newID(), Generation: 1, SourceNode: nodes[0], Replicas: nodes}
 	return "", false, nil
 }
 

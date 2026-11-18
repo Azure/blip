@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Azure/blip/internal/atomicfile"
 	"github.com/Azure/blip/internal/network"
 )
 
@@ -202,34 +203,17 @@ func tightenDir(dir string) error {
 	return nil
 }
 
-// WriteJSON atomically replaces path with v encoded as JSON. The result is
-// FileMode (root-only): Desired carries the claim environment and Observed
-// carries command output.
+// WriteJSON atomically and durably replaces path with v encoded as JSON. The
+// result is FileMode (root-only): Desired carries the claim environment and
+// Observed carries command output. The parent directory must already exist
+// durably. An error after rename may leave the new document visible; it does
+// not imply rollback (see atomicfile.Error).
 func WriteJSON(path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp.Name(), FileMode); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return atomicfile.Replace(path, append(data, '\n'), FileMode)
 }
 
 // ErrMissing is returned by ReadJSON when the file does not exist.

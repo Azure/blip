@@ -1,7 +1,7 @@
 BINARIES := blip-controller blip-node blip-runtime blip-gateway blip-guest kubectl-blip
 CONTROLLER_GEN ?= $(shell go env GOPATH)/bin/controller-gen
 
-.PHONY: build generate test guest images kind-up kind-down
+.PHONY: build generate test test-sim guest images kind-up kind-down
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/ $(addprefix ./cmd/,$(BINARIES))
@@ -12,6 +12,11 @@ generate:
 
 test:
 	go test ./...
+
+# Production-machine simulations and their concurrent adapters. Ordinary
+# `make test` also runs these tests; this target adds the race detector.
+test-sim:
+	go test -race ./internal/sim ./internal/simlive ./internal/simapp ./internal/atomicfile ./internal/storage ./internal/peer ./internal/nvme ./internal/node ./internal/controller ./internal/runtime ./internal/guest ./internal/session ./internal/wire ./internal/podapi
 
 guest:
 	hack/guest/build.sh

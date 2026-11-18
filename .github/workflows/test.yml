@@ -44,6 +44,9 @@ jobs:
             cpio e2fsprogs kmod xz-utils zstd
       - name: Run tests
         run: go test ./...
+      - name: Race-check simulation and production adapters
+        if: matrix.arch == 'amd64'
+        run: make test-sim
       # Check that the published guest kernel source is available and provides
       # the drivers the guest needs, before images are built on main.
       - name: Build guest assets

@@ -40,9 +40,9 @@ func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (
 	conn := wire.NewConn(rwc)
 	if err := conn.WriteJSON(wire.TOpen, o); err != nil {
 		rwc.Close()
-		// The open request never reached the guest, so no process can have
-		// started. A pod that stopped between ensure and exec closes the
-		// pipe here; let the gateway recreate it and try once more.
+		// A pod that stopped between ensure and exec can close the pipe
+		// here. A transport error does not prove the guest saw no bytes:
+		// retries must preserve OpenID even when the request write failed.
 		return nil, fmt.Errorf("%w: %v", ErrUnreachable, err)
 	}
 	t, payload, err := conn.Read()

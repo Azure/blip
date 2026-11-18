@@ -217,16 +217,15 @@ func (g *Guest) openExec(o wire.Open) (*session, error) {
 func (g *Guest) lookupOpen(openID string) (*session, error, bool) {
 	for {
 		g.mu.Lock()
-		rec, ok := g.openIDs[openID]
-		if !ok {
+		rec := g.openIDs[openID]
+		switch rec.disposition() {
+		case openStart:
 			g.mu.Unlock()
 			return nil, nil, false
-		}
-		if rec.completed {
+		case openCompleted:
 			g.mu.Unlock()
 			return nil, errOpenCompleted, true
-		}
-		if rec.session != nil {
+		case openReuse:
 			s := rec.session
 			g.mu.Unlock()
 			return s, nil, true
@@ -246,12 +245,12 @@ func (g *Guest) startExec(openID, id string, spec procSpec, base []string) (*ses
 	}
 	for {
 		g.mu.Lock()
-		if rec, ok := g.openIDs[openID]; ok {
-			switch {
-			case rec.completed:
+		if rec := g.openIDs[openID]; rec.disposition() != openStart {
+			switch rec.disposition() {
+			case openCompleted:
 				g.mu.Unlock()
 				return nil, errOpenCompleted
-			case rec.session != nil:
+			case openReuse:
 				s := rec.session
 				g.mu.Unlock()
 				return s, nil
@@ -266,26 +265,27 @@ func (g *Guest) startExec(openID, id string, spec procSpec, base []string) (*ses
 		g.mu.Unlock()
 
 		s, err := g.startSessionOpen(id, openID, spec, base, true)
-
-		g.mu.Lock()
-		if err != nil {
-			// No process started, so a retry may safely try again.
-			delete(g.openIDs, openID)
-		} else {
-			rec.session = s
-			if g.sessions[s.id] != s {
-				// The command exited and was removed before the open could
-				// link it. Tombstone it now instead of leaving a session
-				// pointer that no one can attach to.
-				rec.session = nil
-				rec.completed = true
-				g.rememberOpenLocked(openID)
-			}
-		}
-		close(rec.done)
-		g.mu.Unlock()
+		g.finishOpen(openID, rec, s, err)
 		return s, err
 	}
+}
+
+// finishOpen links a resolved start and wakes duplicates. A fast process can
+// finish and leave the session list before startSessionOpen returns; finalize
+// against that list under the same lock used by removal.
+func (g *Guest) finishOpen(openID string, rec *openRecord, s *session, err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err != nil {
+		// No process started, so a retry may safely try again.
+		delete(g.openIDs, openID)
+	} else {
+		rec.session = s
+		if g.sessions[s.id] != s && rec.complete() {
+			g.rememberOpenLocked(openID)
+		}
+	}
+	close(rec.done)
 }
 
 // rememberOpenLocked keeps a completed OpenID as a bounded tombstone.
@@ -320,21 +320,25 @@ func (s *session) pump(f *os.File, t wire.Type) {
 			// The read buffer is reused; a ring frame must own its bytes
 			// until every reader has consumed it.
 			data := append([]byte(nil), buf[:n]...)
-			s.mu.Lock()
-			s.out.addPinned(t, data, s.pinLocked())
-			s.cond.Broadcast()
-			// A client that is not keeping up pins its unsent frames.
-			// Stop reading until it makes room; the process then blocks
-			// on its output pipe, which is the backpressure we want.
-			for s.out.size > s.out.max && len(s.readers) > 0 && !s.exited {
-				s.cond.Wait()
-				s.out.trim(s.pinLocked())
-			}
-			s.mu.Unlock()
+			s.appendOutput(t, data)
 		}
 		if err != nil {
 			return
 		}
+	}
+}
+
+// appendOutput accepts an owned frame from an output pump. A slow attached
+// client pins unsent frames; waiting here propagates backpressure to the
+// process's output pipe without coupling it to session control/input frames.
+func (s *session) appendOutput(t wire.Type, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.out.addPinned(t, data, s.pinLocked())
+	s.cond.Broadcast()
+	for s.out.size > s.out.max && len(s.readers) > 0 && !s.exited {
+		s.cond.Wait()
+		s.out.trim(s.pinLocked())
 	}
 }
 
@@ -472,6 +476,11 @@ func (s *session) queueInput(payload []byte) error {
 			s.inCond.Broadcast()
 		}
 	}
+	// closeInput may have woken a writer waiting for queue space. Do not
+	// resurrect the queue after EOF or process exit.
+	if s.inDone {
+		return nil
+	}
 	if s.inStalled {
 		s.dropInputLocked()
 		return nil
@@ -520,7 +529,7 @@ func (s *session) closeInput() {
 // is called when the last client detaches; a session that no client ever
 // attached to keeps its output (bounded by the ring) for a late caller.
 func (s *session) clearReplayLocked() {
-	if s.exited && s.clients == 0 && s.id != wire.PrimarySession {
+	if clear, _ := sessionRetention(s.id == wire.PrimarySession, s.exited, s.attached, s.clients); clear {
 		s.out.clear()
 	}
 }
@@ -531,10 +540,8 @@ func (s *session) finish(st wire.Exit) {
 	s.exited, s.status = true, st
 	// A command that fails or finishes before its caller attaches keeps its
 	// output: only a client that has already consumed the session may drop it.
-	if s.attached {
-		s.clearReplayLocked()
-	}
-	drop := s.clients == 0
+	s.clearReplayLocked()
+	_, drop := sessionRetention(s.id == wire.PrimarySession, s.exited, s.attached, s.clients)
 	s.cond.Broadcast()
 	s.mu.Unlock()
 	if drop {
@@ -557,9 +564,7 @@ func (g *Guest) removeSession(s *session) {
 		delete(g.sessions, s.id)
 	}
 	if s.openID != "" {
-		if rec := g.openIDs[s.openID]; rec != nil && rec.session == s && !rec.completed {
-			rec.session = nil
-			rec.completed = true
+		if rec := g.openIDs[s.openID]; rec != nil && rec.session == s && rec.complete() {
 			g.rememberOpenLocked(s.openID)
 		}
 	}
@@ -648,7 +653,7 @@ func (s *session) serve(c *wire.Conn, conn io.Closer) {
 		s.clients--
 		delete(s.readers, cl)
 		s.clearReplayLocked()
-		drop := s.exited && s.clients == 0
+		_, drop := sessionRetention(s.id == wire.PrimarySession, s.exited, s.attached, s.clients)
 		s.cond.Broadcast()
 		s.mu.Unlock()
 		s.g.addClients(-1)
@@ -776,6 +781,10 @@ func (s *session) input(t wire.Type, payload []byte) error {
 
 // serveSession handles one connection on the session port.
 func (g *Guest) serveSession(f *os.File) {
+	g.serveSessionStream(f)
+}
+
+func (g *Guest) serveSessionStream(f io.ReadWriteCloser) {
 	c := wire.NewConn(f)
 	t, payload, err := c.Read()
 	if err != nil || t != wire.TOpen {
@@ -852,7 +861,7 @@ func reject(c *wire.Conn, f io.Closer, err error) {
 
 // dial relays a TCP connection opened from inside the guest. When the remote
 // side closes, the guest sends Exited and closes the stream.
-func (g *Guest) dial(c *wire.Conn, f *os.File, o wire.Open) {
+func (g *Guest) dial(c *wire.Conn, f io.ReadWriteCloser, o wire.Open) {
 	g.mu.Lock()
 	stopping := g.stopping
 	g.mu.Unlock()

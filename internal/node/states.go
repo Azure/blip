@@ -224,7 +224,7 @@ func (v *view) copySource(cf *v1alpha1.CopySource) *source {
 	// The source state may be gone. Fall back to the nodes captured when the
 	// copy was resolved, validating each BlipNode that still exists so a
 	// re-created node with a new incarnation is not trusted.
-	for _, n := range cf.Nodes {
+	for _, n := range sortedUnique(cf.Nodes) {
 		if n == v.node {
 			continue
 		}

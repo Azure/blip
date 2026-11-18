@@ -486,7 +486,7 @@ func (r *BlipReconciler) newMount(b *v1.Blip, m v1.Mount, st *v1.BlipState, writ
 		ms.AttachmentID = writerID
 		ms.CommitID = st.Status.Writer.BaseCommit
 	} else {
-		ms.AttachmentID = newID()
+		ms.AttachmentID = r.newID()
 		for _, old := range b.Status.Mounts {
 			if old.State == m.State && !old.Writable && old.Phase == v1.MountPending {
 				ms.AttachmentID = old.AttachmentID

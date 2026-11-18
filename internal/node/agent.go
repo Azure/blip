@@ -70,13 +70,11 @@ type Agent struct {
 	pinned func(commitID string) bool
 	peers  func([]peer.Peer) error // update the firewall after publishing trust
 	wake   chan struct{}
-	images chan struct{} // bounds concurrent image imports and builds
-	seals  chan struct{} // bounds concurrent state saves (disk sync)
 
 	mu           sync.Mutex
-	busy         map[string]bool
+	workers      sync.WaitGroup
+	operations   Scheduler
 	freezes      map[string][]string // podKey -> disk IDs to keep frozen
-	retry        map[string]*retry
 	sealErrs     map[string]string
 	stateErrs    map[string]string
 	progress     map[string]*v1alpha1.Transfer
@@ -91,11 +89,6 @@ type Agent struct {
 	lastPeers    string
 }
 
-type retry struct {
-	fails int
-	next  time.Time
-}
-
 func newAgent(cfg Config, c client.Client, live client.Reader, st Store) *Agent {
 	a := &Agent{
 		cfg:        cfg,
@@ -106,11 +99,8 @@ func newAgent(cfg Config, c client.Client, live client.Reader, st Store) *Agent 
 		pinned:     func(string) bool { return false },
 		peers:      func([]peer.Peer) error { return nil },
 		wake:       make(chan struct{}, 1),
-		images:     make(chan struct{}, imageConcurrency),
-		seals:      make(chan struct{}, sealConcurrency),
-		busy:       map[string]bool{},
+		operations: *NewScheduler(map[string]int{"image": imageConcurrency, "seal": sealConcurrency}),
 		freezes:    map[string][]string{},
-		retry:      map[string]*retry{},
 		sealErrs:   map[string]string{},
 		stateErrs:  map[string]string{},
 		progress:   map[string]*v1alpha1.Transfer{},
@@ -177,6 +167,10 @@ func Run(ctx context.Context, cfg Config, restCfg *rest.Config, st *storage.Stor
 		return err
 	}
 	a := newAgent(cfg, c, live, st)
+	defer func() {
+		cancel()
+		a.workers.Wait()
+	}()
 	if err := a.registerNode(ctx); err != nil {
 		return err
 	}
@@ -256,16 +250,36 @@ func Run(ctx context.Context, cfg Config, restCfg *rest.Config, st *storage.Stor
 		if err := a.sync(ctx); err != nil && ctx.Err() == nil {
 			slog.Error("sync", "err", err)
 		}
+		now := time.Now()
+		a.mu.Lock()
+		deadline, retry := a.operations.Deadline(now)
+		a.mu.Unlock()
+		var timer *time.Timer
+		var retryC <-chan time.Time
+		if retry {
+			timer = time.NewTimer(deadline.Sub(now))
+			retryC = timer.C
+		}
 		select {
 		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
 			return nil
 		case err := <-errc:
+			if timer != nil {
+				timer.Stop()
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
 			return fmt.Errorf("export server: %w", err)
 		case <-a.wake:
 		case <-tick.C:
+		case <-retryC:
+		}
+		if timer != nil {
+			timer.Stop()
 		}
 	}
 }
@@ -449,60 +463,56 @@ func (a *Agent) watchPodDirs(ctx context.Context) {
 	}
 }
 
-// spawn runs fn in the background unless one of keys is busy or the first
-// key is backing off after a failure.
-func (a *Agent) spawn(ctx context.Context, what string, keys []string, fn func(context.Context) error) {
-	a.mu.Lock()
-	for _, k := range keys {
-		if a.busy[k] {
-			a.mu.Unlock()
-			return
-		}
-	}
-	if r := a.retry[keys[0]]; r != nil && time.Now().Before(r.next) {
-		a.mu.Unlock()
+type operationJob struct {
+	what string
+	run  func(context.Context) error
+}
+
+// runOperations is the I/O adapter for Scheduler. Admission happens for the
+// whole pass before goroutines start, so completion order cannot change which
+// jobs this pass admits or let cleanup overtake a reserved source.
+func (a *Agent) runOperations(ctx context.Context, ops []Operation, jobs map[string]operationJob) {
+	if ctx.Err() != nil {
 		return
 	}
-	for _, k := range keys {
-		a.busy[k] = true
-	}
+	a.mu.Lock()
+	attempts := a.operations.Schedule(time.Now(), ops)
 	a.mu.Unlock()
-	go func() {
-		start := time.Now()
-		slog.Info(what, "key", keys[0])
-		err := fn(ctx)
-		a.mu.Lock()
-		for _, k := range keys {
-			delete(a.busy, k)
-		}
-		if err != nil {
-			r := a.retry[keys[0]]
-			if r == nil {
-				r = &retry{}
-				a.retry[keys[0]] = r
+	for _, attempt := range attempts {
+		job := jobs[attempt.Operation.Key]
+		a.workers.Add(1)
+		go func() {
+			defer a.workers.Done()
+			start := time.Now()
+			slog.Info(job.what, "key", attempt.Operation.Key)
+			err := ctx.Err()
+			if err == nil {
+				err = job.run(ctx)
 			}
-			r.fails++
-			r.next = time.Now().Add(min(time.Second<<min(r.fails, 7), 2*time.Minute))
-		} else {
-			delete(a.retry, keys[0])
-		}
-		a.mu.Unlock()
-		if err != nil && ctx.Err() == nil {
-			slog.Error(what, "key", keys[0], "err", err, "elapsed", time.Since(start).Round(time.Millisecond))
-		} else if err == nil {
-			slog.Info(what+" done", "key", keys[0], "elapsed", time.Since(start).Round(time.Millisecond))
-		}
-		a.kick()
-	}()
+			outcome := Succeeded
+			if err != nil {
+				outcome = Failed
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+					outcome = Canceled
+				}
+			}
+			a.mu.Lock()
+			a.operations.Complete(time.Now(), attempt, outcome)
+			a.mu.Unlock()
+			if err != nil && ctx.Err() == nil {
+				slog.Error(job.what, "key", attempt.Operation.Key, "err", err, "elapsed", time.Since(start).Round(time.Millisecond))
+			} else if err == nil {
+				slog.Info(job.what+" done", "key", attempt.Operation.Key, "elapsed", time.Since(start).Round(time.Millisecond))
+			}
+			a.kick()
+		}()
+	}
 }
 
 func (a *Agent) failures(key string) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if r := a.retry[key]; r != nil {
-		return r.fails
-	}
-	return 0
+	return a.operations.Failures(key)
 }
 
 func (a *Agent) setStateErr(uid string, err error) {
@@ -529,5 +539,6 @@ func referencedPodKeys(dirs map[string]*podDir, states []*v1alpha1.BlipState, no
 			}
 		}
 	}
+	slices.Sort(keys)
 	return keys
 }

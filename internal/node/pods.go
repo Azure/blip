@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"time"
 
@@ -172,7 +173,8 @@ func desiredFor(v *view, p *plan, pod *corev1.Pod, dir *podDir) (podapi.Desired,
 	}
 	if claim != nil && (claim == prev.Claim || allReady) {
 		d.Claim = claim
-		d.Freeze = v.freezes[key]
+		d.Freeze = slices.Clone(v.freezes[key])
+		slices.Sort(d.Freeze)
 	} else {
 		d.Mounts = nil
 	}

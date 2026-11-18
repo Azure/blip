@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,8 +24,11 @@ const (
 	imageID  = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 )
 
+var testNow = time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+
 func newView() *view {
 	v := &view{
+		now:         testNow,
 		node:        self,
 		incarnation: "inc-n1",
 		blipNodes:   map[string]*v1alpha1.BlipNode{},
@@ -44,7 +48,7 @@ func newView() *view {
 		blipsGone:   map[string]bool{},
 	}
 	v.pools[ns+"/default"] = &v1alpha1.BlipPool{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "default"}}
-	now := metav1.Now()
+	now := metav1.NewTime(testNow)
 	for i, n := range []string{"n1", "n2", "n3"} {
 		v.blipNodes[n] = &v1alpha1.BlipNode{
 			ObjectMeta: metav1.ObjectMeta{Name: n},

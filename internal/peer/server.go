@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,7 +27,7 @@ const leasePinPrefix = "lease:"
 
 // RecheckInterval is how often leases are re-authorized and checked for
 // expiry.
-var RecheckInterval = time.Minute
+const RecheckInterval = time.Minute
 
 // LeaseTTL is how long a lease survives without a renewal. A client renews
 // every five minutes, so a crashed client's lease is reclaimed well within
@@ -45,7 +46,7 @@ type lease struct {
 // HostIP:ExportPort using TLS 1.3 and registered Ed25519 key pins.
 type Server struct {
 	cfg    ServerConfig
-	target *nvme.Target
+	target ExportTarget
 	path   string
 
 	// Hooks, overridable in tests, perform kernel and store operations while
@@ -65,9 +66,19 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Store == nil || cfg.Identity == nil || cfg.Peers == nil || cfg.Authorize == nil || cfg.DataDir == "" || cfg.NodeName == "" || net.ParseIP(cfg.HostIP).To4() == nil {
 		return nil, errors.New("peer: incomplete server config")
 	}
-	t, err := nvme.NewTarget(cfg.NodeName, cfg.HostIP, NVMePort, cfg.DiskKey)
-	if err != nil {
-		return nil, err
+	t := cfg.Target
+	if t == nil {
+		var err error
+		t, err = nvme.NewTarget(cfg.NodeName, cfg.HostIP, NVMePort, cfg.DiskKey)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Clock == nil {
+		cfg.Clock = realClock{}
+	}
+	if cfg.NewLeaseID == nil {
+		cfg.NewLeaseID = newLeaseID
 	}
 	s := &Server{
 		cfg:         cfg,
@@ -78,16 +89,19 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		closeExport: cfg.Store.CloseExport,
 		pin:         cfg.Store.Pin,
 		unpin:       cfg.Store.Unpin,
-		now:         time.Now,
+		now:         cfg.Clock.Now,
 	}
 	s.activateExport = s.pinAndExport
-	b, err := os.ReadFile(s.path)
+	b, err := s.persistence().Load()
 	if err == nil {
 		var ls []*lease
 		if err := json.Unmarshal(b, &ls); err != nil {
 			return nil, fmt.Errorf("peer: %s: %w", s.path, err)
 		}
 		for _, l := range ls {
+			if l == nil || !validLeaseID(l.ID) || l.Node == "" || l.Req.CommitID == "" || s.leases[l.ID] != nil {
+				return nil, fmt.Errorf("peer: %s: invalid or duplicate lease", s.path)
+			}
 			s.leases[l.ID] = l
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -105,10 +119,7 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-s.cfg.Peers.Ready():
 	}
 	s.restore()
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/export", s.handleExport)
-	mux.HandleFunc("POST /v1/release", s.handleRelease)
-	mux.HandleFunc("POST /v1/leases/{id}/renew", s.handleRenew)
+	mux := s.Handler()
 	var ln net.Listener
 	for {
 		var err error
@@ -117,13 +128,28 @@ func (s *Server) Run(ctx context.Context) error {
 			break
 		}
 		log.Printf("peer: export service: %v (retrying)", err)
-		select {
-		case <-ctx.Done():
+		if s.clock().Wait(ctx, 2*time.Second) != nil {
 			return nil
-		case <-time.After(2 * time.Second):
 		}
 	}
 	return s.serve(ctx, ln, mux, 5*time.Second)
+}
+
+// Handler exposes the same authenticated protocol handlers used by Run. TLS
+// termination must supply the authenticated connection state in Request.TLS.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/export", s.handleExport)
+	mux.HandleFunc("POST /v1/release", s.handleRelease)
+	mux.HandleFunc("POST /v1/leases/{id}/renew", s.handleRenew)
+	return mux
+}
+
+func (s *Server) clock() Clock {
+	if s.cfg.Clock != nil {
+		return s.cfg.Clock
+	}
+	return realClock{}
 }
 
 // serve owns all work that may access the store. Shutdown closes admission
@@ -158,18 +184,15 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, handler http.Handle
 	recheckDone := make(chan struct{})
 	go func() {
 		defer close(recheckDone)
-		t := time.NewTicker(RecheckInterval)
-		defer t.Stop()
+		interval := s.cfg.RecheckInterval
+		if interval <= 0 {
+			interval = RecheckInterval
+		}
 		for {
-			select {
-			case <-ctx.Done():
+			if s.clock().Wait(ctx, interval) != nil {
 				return
-			case <-t.C:
-				if ctx.Err() != nil {
-					return
-				}
-				s.recheck()
 			}
+			s.recheck()
 		}
 	}()
 	var serveErr error
@@ -249,7 +272,17 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, err.Error())
 		return
 	}
-	l := &lease{ID: newLeaseID(), Node: node, Req: req, LastRenewed: s.now()}
+	var id string
+	if s.cfg.NewLeaseID != nil {
+		id = s.cfg.NewLeaseID()
+	} else {
+		id = newLeaseID()
+	}
+	if !validLeaseID(id) {
+		httpError(w, http.StatusInternalServerError, "invalid lease ID")
+		return
+	}
+	l := &lease{ID: id, Node: node, Req: req, LastRenewed: s.now()}
 	// Pin before the lease becomes visible. Otherwise a GC pass that already
 	// planned to delete the commit could race the lease insert and drop the
 	// volume before pinAndExport runs, leaving a live lease that pins nothing
@@ -258,28 +291,12 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	// lease is ever published. The pin is released below if persisting the
 	// lease fails; a crash in between leaves an orphan pin that restore (which
 	// unpins lease pins without a lease) cleans up.
-	if err := s.pinCommit(l); err != nil {
+	if err := s.prepare(l); err != nil {
 		code := http.StatusInternalServerError
 		if errors.Is(err, storage.ErrNotFound) {
 			code = http.StatusNotFound
 		}
 		httpError(w, code, err.Error())
-		return
-	}
-	s.mu.Lock()
-	s.leases[l.ID] = l
-	err := s.saveLocked()
-	if err != nil {
-		// The lease was never persisted, so it must not linger in memory or
-		// hold a pin: nothing else would export, release, or later save it.
-		delete(s.leases, l.ID)
-	}
-	s.mu.Unlock()
-	if err != nil {
-		if uerr := s.unpinCommit(l); uerr != nil {
-			log.Printf("peer: unpin failed export %s: %v", l.ID, uerr)
-		}
-		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	resp, err := s.export(r.Context(), l)
@@ -296,6 +313,42 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) prepare(l *lease) error {
+	// Reserve the ID before touching its pin. A colliding request must never
+	// pin a second commit under an existing lease's holder or roll it back.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.leases[l.ID] != nil {
+		return errors.New("peer: duplicate lease ID")
+	}
+	err := runLeaseEffects(PrepareLease, func(effect LeaseEffect) error {
+		switch effect {
+		case LeasePin:
+			return s.pinCommit(l)
+		case LeasePersist:
+			s.leases[l.ID] = l
+			return s.saveLocked()
+		}
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	// A failed pin may still have taken effect. Retain a revoked cleanup
+	// owner until rollback succeeds, so ordinary recheck can retry it without
+	// requiring a restart. An ambiguous journal save must be revoked durably
+	// before dropping even its pin.
+	l.Revoked = true
+	s.leases[l.ID] = l
+	if !ambiguousSave(err) {
+		if uerr := s.unpinCommit(l); uerr != nil {
+			return errors.Join(err, uerr)
+		}
+		delete(s.leases, l.ID)
+	}
+	return err
 }
 
 func (s *Server) export(ctx context.Context, l *lease) (ExportResponse, error) {
@@ -327,7 +380,7 @@ func (s *Server) export(ctx context.Context, l *lease) (ExportResponse, error) {
 func (s *Server) activate(l *lease) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.leases[l.ID] != l || l.Revoked {
+	if s.leases[l.ID] != l || s.mustRelease(l, s.now()) {
 		return "", errors.New("peer: lease is no longer active")
 	}
 	return s.activateExport(l)
@@ -335,14 +388,19 @@ func (s *Server) activate(l *lease) (string, error) {
 
 func (s *Server) pinAndExport(l *lease) (string, error) {
 	st := s.cfg.Store
-	if err := st.Pin(l.Req.CommitID, leasePinPrefix+l.ID); err != nil {
-		return "", err
-	}
-	dev, err := st.OpenExport(l.Req.CommitID, l.ID)
-	if err != nil {
-		return "", err
-	}
-	return s.target.Export(l.ID, dev, l.Req.HostNQN)
+	var dev, nqn string
+	err := runLeaseEffects(ActivateLease, func(effect LeaseEffect) (err error) {
+		switch effect {
+		case LeasePin:
+			err = s.pinCommit(l)
+		case LeaseOpenDevice:
+			dev, err = st.OpenExport(l.Req.CommitID, l.ID)
+		case LeasePublish:
+			nqn, err = s.target.Export(l.ID, dev, l.Req.HostNQN)
+		}
+		return err
+	})
+	return nqn, err
 }
 
 func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
@@ -394,14 +452,25 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, "lease belongs to another node")
 		return
 	}
-	if l.Revoked || s.cfg.Authorize(node, l.Req) != nil {
+	now := s.now()
+	if s.mustRelease(l, now) {
+		l.Revoked = true
+		if err := s.saveLocked(); err != nil {
+			logf("persist rejected renewal %s: %v", id, err)
+		}
 		s.mu.Unlock()
 		httpError(w, http.StatusForbidden, "lease is no longer authorized")
 		return
 	}
-	l.LastRenewed = s.now()
+	previous := l.LastRenewed
+	l.LastRenewed = now
 	err := s.saveLocked()
 	renewed := l.LastRenewed
+	if err != nil {
+		// Even an ambiguous save cannot promise a renewal. Retaining the old
+		// deadline is conservative and permits an ordinary client retry.
+		l.LastRenewed = previous
+	}
 	s.mu.Unlock()
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
@@ -414,8 +483,9 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	}{id, renewed})
 }
 
-// release unexports and unpins a lease. On failure the lease stays (still
-// pinning its commit) marked revoked, and the recheck loop retries.
+// release unexports and unpins a lease. On failure cleanup ownership stays
+// marked revoked, and the recheck loop retries. A pin may already be gone when
+// the only remaining effect is durably forgetting the revoked lease.
 func (s *Server) release(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -423,88 +493,174 @@ func (s *Server) release(id string) error {
 	if l == nil {
 		return nil
 	}
-	l.Revoked = true
-	s.saveLocked()
-	err := s.unexport(id)
-	if err == nil {
-		err = s.closeExport(id)
-	}
-	if err == nil {
-		err = s.unpin(l.Req.CommitID, leasePinPrefix+id)
-	}
-	if err != nil {
-		return err
-	}
-	delete(s.leases, id)
-	return s.saveLocked()
+	return runLeaseEffects(ReleaseLease, func(effect LeaseEffect) error {
+		switch effect {
+		case LeasePersistRevocation:
+			l.Revoked = true
+			return s.saveLocked()
+		case LeaseUnpublish:
+			return s.unexport(id)
+		case LeaseCloseDevice:
+			return s.closeExport(id)
+		case LeaseUnpin:
+			return s.unpinCommit(l)
+		case LeaseForget:
+			delete(s.leases, id)
+			if err := s.saveLocked(); err != nil {
+				// A failed deletion must remain retryable, whether or not the
+				// replacement reached disk. The durable old record is revoked.
+				s.leases[id] = l
+				return err
+			}
+		}
+		return nil
+	})
 }
+
+func (s *Server) mustRelease(l *lease, now time.Time) bool {
+	_, registered := s.cfg.Peers.Lookup(l.Node)
+	// Avoid consulting an authorizer unnecessarily for terminal leases.
+	authorized := !LeaseMustRelease(now, l.LastRenewed, l.Revoked, registered, true) && s.cfg.Authorize(l.Node, l.Req) == nil
+	return LeaseMustRelease(now, l.LastRenewed, l.Revoked, registered, authorized)
+}
+
+// Recheck performs one expiry/authorization pass and retries orphan cleanup.
+// Run schedules the same pass.
+func (s *Server) Recheck() error { return s.recheck() }
 
 // recheck releases leases that are revoked, no longer authorized, or were not
 // renewed within LeaseTTL.
-func (s *Server) recheck() {
+func (s *Server) recheck() error {
 	now := s.now()
 	s.mu.Lock()
+	ids := make([]string, 0, len(s.leases))
+	for id := range s.leases {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
 	var drop []string
-	for _, l := range s.leases {
-		_, registered := s.cfg.Peers.Lookup(l.Node)
-		if l.Revoked || !registered || now.Sub(l.LastRenewed) > LeaseTTL || s.cfg.Authorize(l.Node, l.Req) != nil {
+	for _, id := range ids {
+		l := s.leases[id]
+		if s.mustRelease(l, now) {
+			// Commit the terminal decision while renewal is excluded. Once
+			// cleanup is selected, a later authorization change cannot allow
+			// an acknowledged renewal that this pass then tears down.
+			l.Revoked = true
 			drop = append(drop, l.ID)
 		}
 	}
 	s.mu.Unlock()
+	var errs []error
 	for _, id := range drop {
 		if err := s.release(id); err != nil {
 			log.Printf("peer: release lease %s: %v", id, err)
+			errs = append(errs, err)
 		}
 	}
+	if s.target != nil {
+		if err := s.cleanupOrphans(); err != nil {
+			logf("orphan cleanup: %v", err)
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // restore re-creates persisted exports after a restart and removes kernel
 // and store state that no lease accounts for.
 func (s *Server) restore() {
+	if err := s.Recover(); err != nil {
+		log.Printf("peer: recovery: %v", err)
+	}
+}
+
+// Recover restores live leases and removes orphan resources in dependency
+// order. Call before admitting requests, after the first registry snapshot.
+// A failed orphan cleanup is safe to retry by calling Recover again.
+func (s *Server) Recover() error {
 	s.mu.Lock()
 	var ls []*lease
 	for _, l := range s.leases {
 		ls = append(ls, l)
 	}
 	s.mu.Unlock()
+	sort.Slice(ls, func(i, j int) bool { return ls[i].ID < ls[j].ID })
+	var errs []error
 	for _, l := range ls {
-		_, registered := s.cfg.Peers.Lookup(l.Node)
-		if l.Revoked || !registered || s.now().Sub(l.LastRenewed) > LeaseTTL || s.cfg.Authorize(l.Node, l.Req) != nil {
+		if s.mustRelease(l, s.now()) {
 			continue
 		}
 		if _, err := s.activate(l); err != nil {
 			log.Printf("peer: restore lease %s: %v", l.ID, err)
+			errs = append(errs, err)
 			s.mu.Lock()
 			l.Revoked = true
 			s.mu.Unlock()
 		}
 	}
-	s.recheck()
+	if err := s.recheck(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
 
+// cleanupOrphans also runs after startup: a busy device or a lost cleanup
+// result must not require another process restart to reclaim its resources.
+// Holding mu through discovery and cleanup excludes preparations/activations
+// that would otherwise be mistaken for orphan state between their effects.
+func (s *Server) cleanupOrphans() error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	known := map[string]bool{}
 	for id := range s.leases {
 		known[id] = true
 	}
-	s.mu.Unlock()
+	orphans := map[string][]string{}
 	for _, id := range s.target.Leases() {
 		if !known[id] {
-			s.target.Unexport(id)
+			orphans[id] = nil
 		}
 	}
 	for id := range s.cfg.Store.Exports() {
 		if !known[id] {
-			s.cfg.Store.CloseExport(id)
+			orphans[id] = nil
 		}
 	}
 	for _, v := range s.cfg.Store.List() {
 		for _, p := range v.Pins {
 			if id, ok := strings.CutPrefix(p, leasePinPrefix); ok && !known[id] {
-				s.cfg.Store.Unpin(v.ID, p)
+				orphans[id] = append(orphans[id], v.ID)
 			}
 		}
 	}
+	ids := make([]string, 0, len(orphans))
+	for id := range orphans {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var errs []error
+	for _, id := range ids {
+		err := runLeaseEffects(ReleaseLease, func(effect LeaseEffect) error {
+			switch effect {
+			case LeaseUnpublish:
+				return s.unexport(id)
+			case LeaseCloseDevice:
+				return s.closeExport(id)
+			case LeaseUnpin:
+				sort.Strings(orphans[id])
+				for _, commit := range orphans[id] {
+					if err := s.unpin(commit, leasePinPrefix+id); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("orphan lease %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Server) saveLocked() error {
@@ -512,15 +668,19 @@ func (s *Server) saveLocked() error {
 	for _, l := range s.leases {
 		ls = append(ls, l)
 	}
+	sort.Slice(ls, func(i, j int) bool { return ls[i].ID < ls[j].ID })
 	b, err := json.Marshal(ls)
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
+	return s.persistence().Save(b)
+}
+
+func (s *Server) persistence() LeasePersistence {
+	if s.cfg.Persistence != nil {
+		return s.cfg.Persistence
 	}
-	return os.Rename(tmp, s.path)
+	return leaseFile{path: s.path}
 }
 
 // caller authenticates each request against the current registry, including

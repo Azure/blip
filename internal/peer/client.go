@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -40,16 +41,43 @@ type Client struct {
 	// Kernel operations are replaceable in unprivileged lifecycle tests.
 	connect    func(context.Context, string, int, string, string, []byte) (string, error)
 	disconnect func(string) error
+	clock      Clock
+	transport  func(*http.Transport) http.RoundTripper
+}
+
+// ClientOptions replaces instance boundaries without bypassing discovery,
+// request encoding, response validation, or the production TLS configuration.
+// Transport may wrap the freshly configured transport (for example to inject
+// a connection failure after the server committed a response).
+type ClientOptions struct {
+	Clock      Clock
+	Transport  func(*http.Transport) http.RoundTripper
+	Connect    func(context.Context, string, int, string, string, []byte) (string, error)
+	Disconnect func(string) error
 }
 
 type leaseKey struct{ node, id string }
 type renewal struct{ cancel context.CancelFunc }
 
 func NewClient(identity *Identity, peers *Registry, diskKey []byte) *Client {
+	return NewClientWithOptions(identity, peers, diskKey, ClientOptions{})
+}
+
+func NewClientWithOptions(identity *Identity, peers *Registry, diskKey []byte, opts ClientOptions) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
+	if opts.Clock == nil {
+		opts.Clock = realClock{}
+	}
+	if opts.Connect == nil {
+		opts.Connect = nvme.Connect
+	}
+	if opts.Disconnect == nil {
+		opts.Disconnect = nvme.Disconnect
+	}
 	return &Client{
 		identity: identity, peers: peers, diskKey: bytes.Clone(diskKey), ctx: ctx, cancel: cancel,
-		released: make(map[leaseKey]struct{}), connect: nvme.Connect, disconnect: nvme.Disconnect,
+		released: make(map[leaseKey]struct{}), connect: opts.Connect, disconnect: opts.Disconnect,
+		clock: opts.Clock, transport: opts.Transport,
 	}
 }
 
@@ -68,6 +96,8 @@ func (c *Client) Open(ctx context.Context, node string, req ExportRequest) (stor
 	}
 	var resp ExportResponse
 	if err := c.post(ctx, node, "/v1/export", req, &resp); err != nil {
+		// Export is not idempotent. A lost response can leave an unknown
+		// durable lease, reclaimed by server expiry; never retry it here.
 		return storage.Remote{}, err
 	}
 	id := node + "/" + resp.LeaseID + "/" + resp.NQN
@@ -163,31 +193,35 @@ func (c *Client) startRenewal(node, leaseID string, recovered bool) func() {
 		if recovered {
 			delay = 0
 		}
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
 		for {
-			select {
-			case <-ctx.Done():
+			if c.clock.Wait(ctx, delay) != nil {
 				return
-			case <-timer.C:
 			}
-			rctx, rcancel := context.WithTimeout(ctx, 30*time.Second)
+			rctx, rcancel := c.clock.WithTimeout(ctx, 30*time.Second)
 			err := c.post(rctx, node, "/v1/leases/"+url.PathEscape(leaseID)+"/renew", struct{}{}, nil)
 			rcancel()
 			if err != nil && ctx.Err() == nil {
 				logf("renew lease %s/%s: %v", node, leaseID, err)
 			}
-			if e, ok := err.(*responseError); ok && (e.status == http.StatusNotFound || e.status == http.StatusForbidden) {
-				c.endLease(key, recovered)
+			status := 0
+			var response *responseError
+			if errors.As(err, &response) {
+				status = response.status
+			}
+			decision := RenewalRetry(status, err != nil, ctx.Err() != nil)
+			if decision.Stop {
+				// An older request completing after replacement must never
+				// terminate the newly installed renewal.
+				c.mu.Lock()
+				if c.active.CompareAndDelete(key, r) && recovered && ctx.Err() == nil {
+					c.released[key] = struct{}{}
+				}
+				c.mu.Unlock()
 				return
 			}
 			// Retry transient startup failures promptly rather than waiting a
 			// full interval while a recovered lease approaches expiry.
-			delay = leaseRenewInterval
-			if err != nil {
-				delay = releaseMaxBackoff
-			}
-			timer.Reset(delay)
+			delay = decision.Delay
 		}
 	}()
 	return func() {
@@ -239,7 +273,10 @@ func (c *Client) waitReady(ctx context.Context) error {
 	case <-c.ctx.Done():
 		return c.ctx.Err()
 	case <-c.peers.Ready():
-		return nil
+		if err := c.ctx.Err(); err != nil {
+			return err
+		}
+		return ctx.Err()
 	}
 }
 
@@ -248,26 +285,22 @@ func (c *Client) releaseWithRetry(ctx context.Context, node, leaseID, id string)
 	if c.waitReady(ctx) != nil {
 		return
 	}
-	backoff := releaseMinBackoff
 	for attempt := 0; attempt < releaseMaxAttempts; attempt++ {
-		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		rctx, cancel := c.clock.WithTimeout(ctx, 30*time.Second)
 		err := c.post(rctx, node, "/v1/release", map[string]string{"leaseID": leaseID}, nil)
 		cancel()
-		if err == nil || ctx.Err() != nil {
+		decision := ReleaseRetry(attempt+1, err == nil, ctx.Err() != nil)
+		if decision.Stop {
+			if err != nil && ctx.Err() == nil {
+				logf("release %s: giving up; the lease expires on the server", id)
+			}
 			return
 		}
-		if attempt == releaseMaxAttempts-1 {
-			break
-		}
-		logf("release %s: %v (retrying in %s)", id, err, backoff)
-		select {
-		case <-ctx.Done():
+		logf("release %s: %v (retrying in %s)", id, err, decision.Delay)
+		if c.clock.Wait(ctx, decision.Delay) != nil {
 			return
-		case <-time.After(backoff):
 		}
-		backoff = min(2*backoff, releaseMaxBackoff)
 	}
-	logf("release %s: giving up; the lease expires on the server", id)
 }
 
 type responseError struct {
@@ -285,6 +318,9 @@ func (c *Client) post(ctx context.Context, node, path string, body, out any) err
 	if err := c.waitReady(ctx); err != nil {
 		return err
 	}
+	// Initial discovery has its caller's deadline, not the HTTP deadline.
+	ctx, requestCancel := c.clock.WithTimeout(ctx, 2*time.Minute)
+	defer requestCancel()
 	p, ok := c.peers.Lookup(node)
 	if !ok {
 		return fmt.Errorf("peer: unknown node %q", node)
@@ -309,8 +345,12 @@ func (c *Client) post(ctx context.Context, node, path string, body, out any) err
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 	defer transport.CloseIdleConnections()
+	var roundTripper http.RoundTripper = transport
+	if c.transport != nil {
+		roundTripper = c.transport(transport)
+	}
 	httpClient := &http.Client{
-		Transport: transport, Timeout: 2 * time.Minute,
+		Transport:     roundTripper,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	resp, err := httpClient.Do(req)

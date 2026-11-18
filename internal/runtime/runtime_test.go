@@ -84,13 +84,8 @@ func newTestRuntime(t *testing.T) (*runtime, *fakeCH, *fakeGuest) {
 	dir := t.TempDir()
 	o := Options{Dir: dir, SkipNetwork: true}
 	ch := startFakeCH(t, o.path(podapi.APISocket))
-	r := &runtime{
-		o:         o,
-		ch:        newCHClient(o.path(podapi.APISocket)),
-		disks:     map[string]*disk{},
-		ctlEvents: make(chan ctlEvent, 16),
-		removed:   make(chan removeResult, 16),
-	}
+	r := newRuntime(o)
+	t.Cleanup(r.close)
 	r.resetFreeze()
 	a, b := net.Pipe()
 	t.Cleanup(func() { a.Close(); b.Close() })
@@ -378,7 +373,7 @@ func TestObservedWrittenOnlyOnChange(t *testing.T) {
 func TestWatchDesiredKeepsLastValid(t *testing.T) {
 	r, _, _ := newTestRuntime(t)
 	ch := make(chan podapi.Desired, 4)
-	go r.watchDesired(ch)
+	r.start(func() { r.watchDesired(ch) })
 	path := r.o.path(podapi.DesiredFile)
 	if err := podapi.WriteJSON(path, podapi.Desired{Stop: true}); err != nil {
 		t.Fatal(err)

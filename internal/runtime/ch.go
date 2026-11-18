@@ -92,8 +92,22 @@ func waitSocket(path string, timeout time.Duration) error {
 
 // chClient talks to the Cloud Hypervisor REST API on its unix socket.
 type chClient struct {
-	hc *http.Client
+	hc  *http.Client
+	ctx context.Context
+	// clock only controls detach polling. Tests execute the real multi-step
+	// workflow with a logical clock and a scripted HTTP transport.
+	clock detachClock
 }
+
+type detachClock interface {
+	Now() time.Time
+	Sleep(time.Duration)
+}
+
+type realDetachClock struct{}
+
+func (realDetachClock) Now() time.Time        { return time.Now() }
+func (realDetachClock) Sleep(d time.Duration) { time.Sleep(d) }
 
 func newCHClient(sock string) *chClient {
 	return &chClient{hc: &http.Client{
@@ -114,7 +128,7 @@ func (c *chClient) call(method, path string, body any) ([]byte, error) {
 		}
 		rd = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, "http://localhost/api/v1/"+path, rd)
+	req, err := http.NewRequestWithContext(c.context(), method, "http://localhost/api/v1/"+path, rd)
 	if err != nil {
 		return nil, err
 	}
@@ -126,11 +140,21 @@ func (c *chClient) call(method, path string, body any) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, fmt.Errorf("%s: read response: %w", path, err)
+	}
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("%s: %s: %s", path, resp.Status, strings.TrimSpace(string(data)))
 	}
 	return data, nil
+}
+
+func (c *chClient) context() context.Context {
+	if c.ctx != nil {
+		return c.ctx
+	}
+	return context.Background()
 }
 
 // addDisk hot-adds d on PCI segment 1 with id and serial set.
@@ -148,11 +172,27 @@ func (c *chClient) addDisk(d podapi.Disk) error {
 		"direct":      true,
 		"pci_segment": 1,
 	})
+	if err != nil {
+		// The request may have committed before its reply was lost. Attachment
+		// confirmation must match the device, not just a reused ID or an old
+		// device-tree entry whose eject is still pending.
+		if info, checkErr := c.info(); checkErr == nil {
+			for _, attached := range info.Config.Disks {
+				if attached.ID == d.ID && attached.Path == d.Device && attached.Serial == serial && attached.ReadOnly == d.ReadOnly {
+					return nil
+				}
+			}
+		}
+	}
 	return err
 }
 
 // removeDisk removes a device and waits until vm.info no longer lists it.
 func (c *chClient) removeDisk(id string, timeout time.Duration) error {
+	clock := c.clock
+	if clock == nil {
+		clock = realDetachClock{}
+	}
 	if _, err := c.call(http.MethodPut, "vm.remove-device", map[string]any{"id": id}); err != nil {
 		// Already gone (e.g. after a runtime retry) is success.
 		if ok, ierr := c.hasDisk(id); ierr == nil && !ok {
@@ -160,36 +200,59 @@ func (c *chClient) removeDisk(id string, timeout time.Duration) error {
 		}
 		return err
 	}
-	deadline := time.Now().Add(timeout)
+	deadline := clock.Now().Add(timeout)
 	for {
 		ok, err := c.hasDisk(id)
 		if err == nil && !ok {
 			return nil
 		}
-		if time.Now().After(deadline) {
+		if !clock.Now().Before(deadline) {
 			if err == nil {
 				err = fmt.Errorf("device %s still present", id)
 			}
 			return fmt.Errorf("remove %s: %w", id, err)
 		}
-		time.Sleep(50 * time.Millisecond)
+		if c.clock != nil {
+			clock.Sleep(50 * time.Millisecond)
+		} else {
+			timer := time.NewTimer(50 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-c.context().Done():
+				timer.Stop()
+				return c.context().Err()
+			}
+		}
 	}
 }
 
-func (c *chClient) hasDisk(id string) (bool, error) {
+type chInfo struct {
+	Config struct {
+		Disks []struct {
+			ID       string `json:"id"`
+			Path     string `json:"path"`
+			Serial   string `json:"serial"`
+			ReadOnly bool   `json:"readonly"`
+		} `json:"disks"`
+	} `json:"config"`
+	DeviceTree map[string]json.RawMessage `json:"device_tree"`
+}
+
+func (c *chClient) info() (chInfo, error) {
+	var info chInfo
 	data, err := c.call(http.MethodGet, "vm.info", nil)
 	if err != nil {
-		return false, err
-	}
-	var info struct {
-		Config struct {
-			Disks []struct {
-				ID string `json:"id"`
-			} `json:"disks"`
-		} `json:"config"`
-		DeviceTree map[string]json.RawMessage `json:"device_tree"`
+		return info, err
 	}
 	if err := json.Unmarshal(data, &info); err != nil {
+		return info, err
+	}
+	return info, nil
+}
+
+func (c *chClient) hasDisk(id string) (bool, error) {
+	info, err := c.info()
+	if err != nil {
 		return false, err
 	}
 	for _, d := range info.Config.Disks {

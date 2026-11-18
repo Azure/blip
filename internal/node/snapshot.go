@@ -47,6 +47,7 @@ func (a *Agent) snapshot(ctx context.Context) (*view, error) {
 		}
 	}
 	v := &view{
+		now:         time.Now(),
 		node:        a.cfg.NodeName,
 		incarnation: a.store.Incarnation(),
 		blipNodes:   map[string]*v1alpha1.BlipNode{},
@@ -59,7 +60,7 @@ func (a *Agent) snapshot(ctx context.Context) (*view, error) {
 		volumes:     map[string]storage.Volume{},
 		devices:     map[string]uint64{},
 		configs:     map[string]*image.Config{},
-		pinned:      a.pinned,
+		pinned:      map[string]bool{},
 		destinations: network.Destinations{
 			Pods: pods.Items, Namespaces: namespaces.Items,
 			Services: services.Items, EndpointSlices: endpoints.Items,
@@ -83,6 +84,9 @@ func (a *Agent) snapshot(ctx context.Context) (*view, error) {
 	}
 	for _, vol := range a.store.List() {
 		v.volumes[vol.ID] = vol
+		if a.pinned != nil && a.pinned(vol.ID) {
+			v.pinned[vol.ID] = true
+		}
 		if vol.Device != "" {
 			var st unix.Stat_t
 			if unix.Stat(vol.Device, &st) == nil && st.Mode&unix.S_IFMT == unix.S_IFBLK {
@@ -99,7 +103,7 @@ func (a *Agent) snapshot(ctx context.Context) (*view, error) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	v.busy = clone(a.busy)
+	v.busy = a.operations.Busy()
 	v.freezes = clone(a.freezes)
 	v.sealErrs = clone(a.sealErrs)
 	v.stateErrs = clone(a.stateErrs)
@@ -107,7 +111,7 @@ func (a *Agent) snapshot(ctx context.Context) (*view, error) {
 	v.podsGone = clone(a.podsGone)
 	v.statesGone = clone(a.statesGone)
 	v.blipsGone = clone(a.blipsGone)
-	v.idleImages = a.idleImages(v, time.Now())
+	v.idleImages = a.idleImages(v, v.now)
 	return v, nil
 }
 

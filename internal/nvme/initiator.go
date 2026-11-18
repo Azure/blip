@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,6 +19,75 @@ const fabricsDev = "/dev/nvme-fabrics"
 
 var nsName = regexp.MustCompile(`^nvme\d+n\d+$`)
 
+// InitiatorSystem is the low-level fabrics/sysfs boundary. It deliberately
+// sits below connect: command encoding, DHCHAP secrets, result parsing,
+// controller discovery, namespace readiness, and cleanup run unchanged.
+type InitiatorSystem interface {
+	ReadFile(string) ([]byte, error)
+	ReadDir(string) ([]os.DirEntry, error)
+	Glob(string) ([]string, error)
+	OpenFabrics() (io.ReadWriteCloser, error)
+	EnsureNode(path, devnum string, mode uint32) error
+	WriteFile(string, []byte, os.FileMode) error
+}
+
+type InitiatorClock interface {
+	Wait(context.Context, time.Duration) error
+	WithTimeout(context.Context, time.Duration) (context.Context, context.CancelFunc)
+}
+
+type InitiatorOptions struct {
+	System InitiatorSystem
+	Clock  InitiatorClock
+}
+
+type Initiator struct {
+	system InitiatorSystem
+	clock  InitiatorClock
+}
+
+func NewInitiator(opts InitiatorOptions) *Initiator {
+	if opts.System == nil {
+		opts.System = kernelInitiator{}
+	}
+	if opts.Clock == nil {
+		opts.Clock = initiatorClock{}
+	}
+	return &Initiator{system: opts.System, clock: opts.Clock}
+}
+
+type kernelInitiator struct{}
+
+func (kernelInitiator) ReadFile(p string) ([]byte, error)       { return os.ReadFile(p) }
+func (kernelInitiator) ReadDir(p string) ([]os.DirEntry, error) { return os.ReadDir(p) }
+func (kernelInitiator) Glob(p string) ([]string, error)         { return filepath.Glob(p) }
+func (kernelInitiator) OpenFabrics() (io.ReadWriteCloser, error) {
+	return os.OpenFile(fabricsDev, os.O_RDWR, 0)
+}
+func (kernelInitiator) EnsureNode(p, d string, mode uint32) error { return ensureNode(p, d, mode) }
+func (kernelInitiator) WriteFile(p string, b []byte, mode os.FileMode) error {
+	return os.WriteFile(p, b, mode)
+}
+
+type initiatorClock struct{}
+
+func (initiatorClock) WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, d)
+}
+func (initiatorClock) Wait(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return ctx.Err()
+	}
+}
+
 // HostID is the host identifier sent with hostNQN. The kernel rejects one
 // host ID with two NQNs, and kind nodes share a kernel, so it is derived
 // from the NQN.
@@ -27,36 +97,48 @@ func HostID(hostNQN string) string { return uuidFrom("hostid:" + hostNQN) }
 // secrets derived from key (the cluster disk key), and returns the block
 // device of its first namespace.
 func Connect(ctx context.Context, addr string, port int, nqn, hostNQN string, key []byte) (string, error) {
+	return NewInitiator(InitiatorOptions{}).Connect(ctx, addr, port, nqn, hostNQN, key)
+}
+
+func (i *Initiator) Connect(ctx context.Context, addr string, port int, nqn, hostNQN string, key []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := checkKey(key); err != nil {
 		return "", err
 	}
-	ctrl := controllerFor(nqn)
+	ctrl, err := i.controllerFor(nqn)
+	if err != nil {
+		return "", err
+	}
 	if ctrl == "" {
-		var err error
-		if ctrl, err = connect(addr, port, nqn, hostNQN, key); err != nil {
-			return "", err
+		if ctrl, err = i.connect(addr, port, nqn, hostNQN, key); err != nil {
+			// The kernel may have accepted the write before the result read
+			// failed. Discover by NQN and clean up that ambiguous controller.
+			return "", errors.Join(err, i.Disconnect(nqn))
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := i.clock.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		if dev, err := namespaceDevice(ctrl); err == nil {
+		if err := ctx.Err(); err != nil {
+			return "", errors.Join(fmt.Errorf("nvme: namespace of %s did not appear: %w", nqn, err), i.Disconnect(nqn))
+		}
+		if dev, err := i.namespaceDevice(ctrl); err == nil {
+			if err := ctx.Err(); err != nil {
+				return "", errors.Join(err, i.Disconnect(nqn))
+			}
 			return dev, nil
 		}
-		select {
-		case <-ctx.Done():
-			Disconnect(nqn)
-			return "", fmt.Errorf("nvme: namespace of %s did not appear: %w", nqn, ctx.Err())
-		case <-time.After(100 * time.Millisecond):
-		}
+		i.clock.Wait(ctx, 100*time.Millisecond)
 	}
 }
 
-func connect(addr string, port int, nqn, hostNQN string, key []byte) (string, error) {
-	if err := ensureFabricsDev(); err != nil {
+func (i *Initiator) connect(addr string, port int, nqn, hostNQN string, key []byte) (string, error) {
+	if err := i.ensureFabricsDev(); err != nil {
 		return "", err
 	}
-	f, err := os.OpenFile(fabricsDev, os.O_RDWR, 0)
+	f, err := i.system.OpenFabrics()
 	if err != nil {
 		return "", err
 	}
@@ -67,7 +149,10 @@ func connect(addr string, port int, nqn, hostNQN string, key []byte) (string, er
 	hostKey, ctrlKey := secrets(key, hostNQN)
 	opts := fmt.Sprintf("transport=tcp,traddr=%s,trsvcid=%d,nqn=%s,hostnqn=%s,hostid=%s,ctrl_loss_tmo=60,reconnect_delay=2,dhchap_secret=%s,dhchap_ctrl_secret=%s",
 		addr, port, nqn, hostNQN, HostID(hostNQN), hostKey, ctrlKey)
-	if _, err := f.WriteString(opts); err != nil {
+	if n, err := f.Write([]byte(opts)); err != nil || n != len(opts) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
 		return "", fmt.Errorf("nvme: connect %s at %s:%d: %w", nqn, addr, port, err)
 	}
 	buf := make([]byte, 256)
@@ -77,44 +162,51 @@ func connect(addr string, port int, nqn, hostNQN string, key []byte) (string, er
 	}
 	for _, kv := range strings.Split(strings.TrimSpace(string(buf[:n])), ",") {
 		if v, ok := strings.CutPrefix(kv, "instance="); ok {
-			return "nvme" + v, nil
+			if _, err := strconv.ParseUint(v, 10, 32); err == nil {
+				return "nvme" + v, nil
+			}
 		}
 	}
 	return "", fmt.Errorf("nvme: unexpected connect result %q", buf[:n])
 }
 
-func ensureFabricsDev() error {
-	b, err := os.ReadFile("/sys/class/misc/nvme-fabrics/dev")
+func (i *Initiator) ensureFabricsDev() error {
+	b, err := i.system.ReadFile("/sys/class/misc/nvme-fabrics/dev")
 	if err != nil {
 		return errors.New("nvme: nvme-fabrics is not available (load nvme_tcp)")
 	}
-	return ensureNode(fabricsDev, strings.TrimSpace(string(b)), unix.S_IFCHR)
+	return i.system.EnsureNode(fabricsDev, strings.TrimSpace(string(b)), unix.S_IFCHR)
 }
 
 // namespaceDevice finds the namespace block device of a controller, with or
 // without native multipath, and makes sure /dev has its node.
-func namespaceDevice(ctrl string) (string, error) {
+func (i *Initiator) namespaceDevice(ctrl string) (string, error) {
 	dirs := []string{filepath.Join("/sys/class/nvme", ctrl)}
-	subs, _ := filepath.Glob("/sys/class/nvme-subsystem/*/" + ctrl)
+	subs, _ := i.system.Glob("/sys/class/nvme-subsystem/*/" + ctrl)
 	for _, s := range subs {
 		dirs = append(dirs, filepath.Dir(s))
 	}
 	for _, d := range dirs {
-		entries, _ := os.ReadDir(d)
+		entries, _ := i.system.ReadDir(d)
 		for _, e := range entries {
 			if !nsName.MatchString(e.Name()) {
 				continue
 			}
 			blk := filepath.Join("/sys/class/block", e.Name())
-			if size, _ := os.ReadFile(filepath.Join(blk, "size")); strings.TrimSpace(string(size)) == "0" {
+			size, err := i.system.ReadFile(filepath.Join(blk, "size"))
+			if err != nil {
 				continue
 			}
-			devnum, err := os.ReadFile(filepath.Join(blk, "dev"))
+			sectors, err := strconv.ParseUint(strings.TrimSpace(string(size)), 10, 64)
+			if err != nil || sectors == 0 {
+				continue
+			}
+			devnum, err := i.system.ReadFile(filepath.Join(blk, "dev"))
 			if err != nil {
 				continue
 			}
 			dev := "/dev/" + e.Name()
-			if err := ensureNode(dev, strings.TrimSpace(string(devnum)), unix.S_IFBLK); err != nil {
+			if err := i.system.EnsureNode(dev, strings.TrimSpace(string(devnum)), unix.S_IFBLK); err != nil {
 				return "", err
 			}
 			return dev, nil
@@ -123,38 +215,63 @@ func namespaceDevice(ctrl string) (string, error) {
 	return "", errors.New("no namespace yet")
 }
 
-func controllerFor(nqn string) string {
-	ctrls := controllers(nqn)
-	if len(ctrls) == 0 {
-		return ""
+func (i *Initiator) controllerFor(nqn string) (string, error) {
+	ctrls, err := i.controllers(nqn)
+	if err != nil {
+		return "", err
 	}
-	return ctrls[0]
+	if len(ctrls) == 0 {
+		return "", nil
+	}
+	return ctrls[0], nil
 }
 
-func controllers(nqn string) []string {
-	paths, _ := filepath.Glob("/sys/class/nvme/nvme*")
+func (i *Initiator) controllers(nqn string) ([]string, error) {
+	paths, err := i.system.Glob("/sys/class/nvme/nvme*")
+	if err != nil {
+		return nil, fmt.Errorf("nvme: list controllers: %w", err)
+	}
 	var out []string
 	for _, p := range paths {
-		b, err := os.ReadFile(filepath.Join(p, "subsysnqn"))
+		b, err := i.system.ReadFile(filepath.Join(p, "subsysnqn"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("nvme: identify controller %s: %w", p, err)
+		}
 		if err == nil && strings.TrimSpace(string(b)) == nqn {
 			out = append(out, filepath.Base(p))
 		}
 	}
-	return out
+	return out, nil
 }
 
 // Disconnect deletes every controller connected to nqn.
 func Disconnect(nqn string) error {
-	for _, c := range controllers(nqn) {
-		if err := os.WriteFile(filepath.Join("/sys/class/nvme", c, "delete_controller"), []byte("1"), 0); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("nvme: disconnect %s: %w", c, err)
+	return NewInitiator(InitiatorOptions{}).Disconnect(nqn)
+}
+
+func (i *Initiator) Disconnect(nqn string) error {
+	ctrls, err := i.controllers(nqn)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, c := range ctrls {
+		if err := i.system.WriteFile(filepath.Join("/sys/class/nvme", c, "delete_controller"), []byte("1"), 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("nvme: disconnect %s: %w", c, err))
 		}
 	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
 	for range 100 {
-		if len(controllers(nqn)) == 0 {
+		ctrls, err := i.controllers(nqn)
+		if err != nil {
+			return err
+		}
+		if len(ctrls) == 0 {
 			return nil
 		}
-		time.Sleep(100 * time.Millisecond)
+		i.clock.Wait(context.Background(), 100*time.Millisecond)
 	}
 	return fmt.Errorf("nvme: %s still connected", nqn)
 }

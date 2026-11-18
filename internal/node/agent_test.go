@@ -211,7 +211,7 @@ func settle(t *testing.T, a *Agent) {
 	idle := func() bool {
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		return len(a.busy) == 0
+		return len(a.operations.Busy()) == 0
 	}
 	for {
 		if err := a.sync(context.Background()); err != nil {
@@ -508,7 +508,7 @@ func waitIdle(t *testing.T, a *Agent) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		a.mu.Lock()
-		busy := len(a.busy)
+		busy := len(a.operations.Busy())
 		a.mu.Unlock()
 		if busy == 0 {
 			return

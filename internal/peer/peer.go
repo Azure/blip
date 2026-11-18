@@ -4,6 +4,9 @@
 package peer
 
 import (
+	"context"
+	"time"
+
 	"github.com/Azure/blip/internal/storage"
 )
 
@@ -50,9 +53,28 @@ type ExportResponse struct {
 // cached cluster state.
 type Authorizer func(node string, req ExportRequest) error
 
+// ExportStore is the storage boundary used by the production lease service.
+// Operations must be idempotent, including when their previous result was lost.
+type ExportStore interface {
+	Pin(commitID, holder string) error
+	Unpin(commitID, holder string) error
+	OpenExport(commitID, leaseID string) (string, error)
+	CloseExport(leaseID string) error
+	Get(string) (storage.Volume, bool)
+	Diff(context.Context, string, []string, map[string]string) (string, []storage.Region, error)
+	Exports() map[string]string
+	List() []storage.Volume
+}
+
+type ExportTarget interface {
+	Export(leaseID, device, hostNQN string) (string, error)
+	Unexport(leaseID string) error
+	Leases() []string
+}
+
 // ServerConfig configures the export service.
 type ServerConfig struct {
-	Store     *storage.Store
+	Store     ExportStore
 	NodeName  string
 	HostIP    string
 	DiskKey   []byte // cluster disk key; NVMe authentication secrets derive from it
@@ -60,6 +82,13 @@ type ServerConfig struct {
 	Peers     *Registry
 	Authorize Authorizer
 	DataDir   string // lease persistence
+	// Optional instance dependencies; production defaults use the kernel,
+	// fsync-backed lease file, cryptographic lease IDs, and real time.
+	Target          ExportTarget
+	Persistence     LeasePersistence
+	Clock           Clock
+	NewLeaseID      func() string
+	RecheckInterval time.Duration
 }
 
 // HostNQN returns this node's NVMe host NQN.

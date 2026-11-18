@@ -10,20 +10,27 @@ import (
 
 // planGC deletes volumes, device nodes, and pod directories nobody needs.
 func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
+	reserved := clone(v.busy)
+	for _, op := range p.operations() {
+		for _, id := range append(slices.Clone(op.Reads), op.Writes...) {
+			reserved[id] = true
+		}
+	}
 	// A delete that failed after its phase was recorded is hidden from List,
 	// so it never enters v.volumes. Retry it here until teardown succeeds.
 	pending := map[string]bool{}
-	for _, id := range v.pending {
-		if v.busy[id] {
+	for _, id := range sortedUnique(v.pending) {
+		if reserved[id] {
 			continue
 		}
 		pending[id] = true
 		p.deletes = append(p.deletes, id)
 	}
-	owner := map[string]string{} // attachment ID -> pod dir holding its device node
-	for name, dir := range v.dirs {
+	owners := map[string][]string{} // an old and replacement pod can both have a device node
+	for _, name := range sortedKeys(v.dirs) {
+		dir := v.dirs[name]
 		for id := range dir.devs {
-			owner[id] = name
+			owners[id] = append(owners[id], name)
 		}
 	}
 	ids := make([]string, 0, len(v.volumes))
@@ -36,12 +43,12 @@ func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
 			continue
 		}
 		vol := v.volumes[id]
-		if v.busy[id] {
+		if reserved[id] {
 			continue
 		}
 		switch vol.Kind {
 		case storage.KindWorking:
-			if v.workingUnneeded(vol, owner[id], p.needed) {
+			if v.workingUnneeded(vol, owners[id], p.needed) {
 				p.deletes = append(p.deletes, id)
 			}
 		case storage.KindCommit:
@@ -62,12 +69,12 @@ func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
 	sort.Strings(names)
 	for _, name := range names {
 		dir := v.dirs[name]
-		for id := range dir.devs {
-			if _, ok := v.volumes[id]; !ok && !v.busy[id] && v.fenced(name, "", id) {
+		for _, id := range sortedKeys(dir.devs) {
+			if _, ok := v.volumes[id]; !ok && !reserved[id] && v.fenced(name, "", id) {
 				p.rmDevs = append(p.rmDevs, devRef{pod: name, id: id})
 			}
 		}
-		if v.pods[name] == nil && v.podsGone[name] && len(dir.devs) == 0 {
+		if v.pods[name] == nil && v.podsGone[name] && len(dir.devs) == 0 && !reserved[podDirectoryKey(name)] {
 			p.rmDirs = append(p.rmDirs, name)
 		}
 	}
@@ -78,8 +85,8 @@ func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
 // commit (or the controller released the slot). Everything else goes once
 // its VM can no longer use it. A failed volume (remote clone lost in a
 // restart) that no VM has seen is deleted so it can be recreated.
-func (v *view) workingUnneeded(vol storage.Volume, ownerPod string, needed map[string]bool) bool {
-	if vol.Failed != "" && ownerPod == "" {
+func (v *view) workingUnneeded(vol storage.Volume, ownerPods []string, needed map[string]bool) bool {
+	if vol.Failed != "" && len(ownerPods) == 0 {
 		return true // never handed to a VM; recreate it
 	}
 	if vol.StateUID != "" && !vol.ReadOnly {
@@ -89,8 +96,13 @@ func (v *view) workingUnneeded(vol storage.Volume, ownerPod string, needed map[s
 			}
 		}
 	}
-	if ownerPod != "" {
-		return v.fenced(ownerPod, "", vol.ID)
+	if len(ownerPods) != 0 {
+		for _, pod := range ownerPods {
+			if !v.fenced(pod, "", vol.ID) {
+				return false
+			}
+		}
+		return true
 	}
 	return !needed[vol.ID]
 }
@@ -103,7 +115,7 @@ func (v *view) workingUnneeded(vol storage.Volume, ownerPod string, needed map[s
 // a version newer than the committed one is never deleted.
 func (v *view) keepCommit(c storage.Volume, sealed map[string][]v1alpha1.SealResult) bool {
 	id := c.ID
-	if v.pinned(id) {
+	if v.pinned[id] {
 		return true
 	}
 	for _, b := range v.blips {
@@ -145,4 +157,10 @@ func (v *view) keepCommit(c storage.Volume, sealed map[string][]v1alpha1.SealRes
 			(st.Pending != nil && slices.Contains(st.Pending.Replicas, v.node))
 	}
 	return false
+}
+
+func sortedUnique(in []string) []string {
+	out := slices.Clone(in)
+	slices.Sort(out)
+	return slices.Compact(out)
 }

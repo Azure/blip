@@ -307,7 +307,7 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 				// If the spec was changed back to writable while the
 				// save was in flight, the next reconcile promotes the
 				// read-only mount once the saved version lands.
-				m.Writable, m.CommitID, m.AttachmentID = false, sr.CommitID, newID()
+				m.Writable, m.CommitID, m.AttachmentID = false, sr.CommitID, r.newID()
 				m.Phase, m.Message, m.Switching = v1.MountPending, "", false
 			case m.Switching && same:
 				// The switch was cancelled before anything was torn

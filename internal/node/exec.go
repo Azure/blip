@@ -39,7 +39,8 @@ const freezeTimeout = 60 * time.Second
 var errPodGone = errors.New("VM pod is gone")
 
 func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
-	for key, d := range p.desired {
+	for _, key := range sortedKeys(p.desired) {
+		d := p.desired[key]
 		path := filepath.Join(a.podDirFor(key), podapi.DesiredFile)
 		if err := podapi.EnsurePodDir(filepath.Dir(path)); err != nil {
 			slog.Error("write desired", "pod", key, "err", err)
@@ -59,18 +60,58 @@ func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
 			slog.Error("update prepare error", "pod", e.pod, "err", err)
 		}
 	}
+	jobs := map[string]operationJob{}
+	add := func(key, what string, run func(context.Context) error) {
+		if _, exists := jobs[key]; !exists {
+			jobs[key] = operationJob{what: what, run: run}
+		}
+	}
 	for _, pr := range p.prepares {
-		a.spawn(ctx, "prepare disk", []string{pr.req.AttachmentID}, func(ctx context.Context) error {
+		add(pr.req.AttachmentID, "prepare disk", func(ctx context.Context) error {
 			err := a.prepare(ctx, v, pr)
 			a.reportPrepare(ctx, pr, err)
 			return err
 		})
 	}
 	for _, s := range p.seals {
-		a.spawn(ctx, "seal", []string{s.attachmentID, s.commitID}, func(ctx context.Context) error {
+		add(s.attachmentID, "seal", func(ctx context.Context) error {
 			return a.seal(ctx, s)
 		})
 	}
+	for _, imp := range p.imports {
+		id, _ := image.DigestOf(imp.ref)
+		add(id, "import image", func(ctx context.Context) error {
+			err := a.importImage(ctx, imp.ref, id, imp.secrets)
+			a.setStateErr(imageKey(id), err)
+			return err
+		})
+	}
+	for _, b := range p.builds {
+		add(stateKey(b.req.StateUID), "build commit", func(ctx context.Context) error {
+			err := a.store.CreateCommit(ctx, b.req)
+			a.setStateErr(b.req.StateUID, err)
+			return err
+		})
+	}
+	for _, id := range p.digests {
+		add(digestKey(id), "digest commit", func(ctx context.Context) error {
+			_, err := a.store.Digest(ctx, id)
+			return err
+		})
+	}
+	for _, lc := range p.liveCopies {
+		add(stateKey(lc.stateUID), "live copy", func(ctx context.Context) error {
+			err := a.liveCopy(ctx, lc)
+			a.setStateErr(lc.stateUID, err)
+			return err
+		})
+	}
+	for _, f := range p.fetches {
+		add(stateKey(f.owner), "fetch commit", func(ctx context.Context) error {
+			return a.fetch(ctx, f)
+		})
+	}
+	a.runOperations(ctx, p.operations(), jobs)
 	deleted := false
 	for _, id := range p.deletes {
 		err := a.store.Delete(ctx, id)
@@ -94,45 +135,6 @@ func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
 			slog.Error("remove pod directory", "pod", key, "err", err)
 		}
 	}
-	for _, imp := range p.imports {
-		id, _ := image.DigestOf(imp.ref)
-		a.spawn(ctx, "import image", []string{id}, func(ctx context.Context) error {
-			err := a.withImageSlot(ctx, func() error {
-				return a.importImage(ctx, imp.ref, id, imp.secrets)
-			})
-			a.setStateErr(imageKey(id), err)
-			return err
-		})
-	}
-	for _, b := range p.builds {
-		a.spawn(ctx, "build commit", []string{stateKey(b.req.StateUID), b.req.CommitID}, func(ctx context.Context) error {
-			err := a.withImageSlot(ctx, func() error {
-				return a.store.CreateCommit(ctx, b.req)
-			})
-			a.setStateErr(b.req.StateUID, err)
-			return err
-		})
-	}
-	for _, id := range p.digests {
-		a.spawn(ctx, "digest commit", []string{digestKey(id)}, func(ctx context.Context) error {
-			return a.withImageSlot(ctx, func() error {
-				_, err := a.store.Digest(ctx, id)
-				return err
-			})
-		})
-	}
-	for _, lc := range p.liveCopies {
-		a.spawn(ctx, "live copy", []string{stateKey(lc.stateUID), lc.attachmentID, lc.commitID}, func(ctx context.Context) error {
-			err := a.liveCopy(ctx, lc)
-			a.setStateErr(lc.stateUID, err)
-			return err
-		})
-	}
-	for _, f := range p.fetches {
-		a.spawn(ctx, "fetch commit", []string{stateKey(f.owner), f.src.commitID}, func(ctx context.Context) error {
-			return a.fetch(ctx, f)
-		})
-	}
 	for _, e := range p.entries {
 		if err := a.applyEntry(ctx, e); err != nil && !apierrors.IsNotFound(err) {
 			slog.Error("report state", "state", e.namespace+"/"+e.name, "err", err)
@@ -142,18 +144,6 @@ func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
 	if deleted || len(p.rmDevs) > 0 {
 		a.kick()
 	}
-}
-
-// withImageSlot runs fn while holding one of the node's image slots, bounding
-// concurrent imports and builds.
-func (a *Agent) withImageSlot(ctx context.Context, fn func() error) error {
-	select {
-	case a.images <- struct{}{}:
-		defer func() { <-a.images }()
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	return fn()
 }
 
 // reportPrepare records the outcome of preparing a pod's disk: a failure is
@@ -245,13 +235,14 @@ func (a *Agent) pruneErrors(v *view, p *plan) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	busy := a.operations.Busy()
 	for uid := range a.stateErrs {
-		if !relevant[uid] && !a.busy[stateKey(uid)] {
+		if !relevant[uid] && !busy[stateKey(uid)] {
 			delete(a.stateErrs, uid)
 		}
 	}
 	for id := range a.sealErrs {
-		if !writers[id] && !a.busy[id] {
+		if !writers[id] && !busy[id] {
 			delete(a.sealErrs, id)
 		}
 	}
@@ -370,16 +361,13 @@ func (a *Agent) prepare(ctx context.Context, v *view, pr prepare) error {
 }
 
 func (a *Agent) seal(ctx context.Context, s seal) error {
-	select {
-	case a.seals <- struct{}{}:
-		defer func() { <-a.seals }()
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 	size, err := a.store.Seal(ctx, s.attachmentID, s.commitID)
 	if err == nil {
 		slog.Info("sealed", "attachment", s.attachmentID, "commit", s.commitID, "size", size)
 		return nil
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return err
 	}
 	// A disk that is still open means the VMM may still write: never
 	// give up on it, keep the writer reserved and retry.

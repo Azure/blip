@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 
@@ -63,7 +64,7 @@ func (r *BlipReconciler) acquire(ctx context.Context, b *v1.Blip, states map[str
 		}
 		base := st.DeepCopy()
 		st.Status.Writer = &v1.Writer{
-			AttachmentID: newID(),
+			AttachmentID: r.newID(),
 			BlipName:     b.Name,
 			BlipUID:      string(b.UID),
 			BaseCommit:   st.Status.Committed.ID,
@@ -221,7 +222,8 @@ func (r *BlipReconciler) ensureWriterPods(ctx context.Context, b *v1.Blip) error
 			atts[m.State] = m.AttachmentID
 		}
 	}
-	for name, id := range atts {
+	for _, name := range slices.Sorted(maps.Keys(atts)) {
+		id := atts[name]
 		st := &v1.BlipState{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, st); err != nil {
 			if client.IgnoreNotFound(err) != nil {

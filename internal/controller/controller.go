@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -51,6 +52,12 @@ type Config struct {
 	Registry     Registry
 	// Now defaults to time.Now.
 	Now func() time.Time
+	// NewID generates attachment and commit IDs: 16 lowercase hex characters.
+	// It defaults to cryptographic randomness. Hooks are per instance and must
+	// be safe for concurrent reconciles when used with a manager.
+	NewID func() string
+	// NewPodName defaults to the pool name plus a random five-character suffix.
+	NewPodName func(pool string) string
 }
 
 func (c *Config) now() time.Time {
@@ -58,6 +65,20 @@ func (c *Config) now() time.Time {
 		return c.Now()
 	}
 	return time.Now()
+}
+
+func (c *Config) newID() string {
+	if c.NewID != nil {
+		return c.NewID()
+	}
+	return newID()
+}
+
+func (c *Config) newPodName(pool string) string {
+	if c.NewPodName != nil {
+		return c.NewPodName(pool)
+	}
+	return pool + "-" + utilrand.String(5)
 }
 
 // Indexes lists the field indexes the reconcilers rely on.

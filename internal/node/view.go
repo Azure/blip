@@ -8,6 +8,7 @@
 package node
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -84,6 +85,7 @@ func SealCommitID(attachmentID string) string {
 
 // view is one consistent-enough snapshot of everything a pass decides from.
 type view struct {
+	now         time.Time
 	node        string
 	incarnation string
 	blipNodes   map[string]*v1alpha1.BlipNode
@@ -97,9 +99,9 @@ type view struct {
 	pending     []string                 // volume IDs whose teardown failed and must be retried
 	devices     map[string]uint64        // volume ID -> rdev of its active device
 	configs     map[string]*image.Config // image ID -> artifact config
-	pinned      func(commitID string) bool
-	busy        map[string]bool     // volume IDs and stateKey(uid) with running operations
-	freezes     map[string][]string // podKey -> disk IDs a live copy wants frozen
+	pinned      map[string]bool          // export pins captured before planning
+	busy        map[string]bool          // volume IDs and stateKey(uid) with running operations
+	freezes     map[string][]string      // podKey -> disk IDs a live copy wants frozen
 	sealErrs    map[string]string
 	stateErrs   map[string]string
 	progress    map[string]*v1alpha1.Transfer // state UID -> running fetch
@@ -134,9 +136,6 @@ func (v *view) index() {
 	}
 	for _, b := range v.blips {
 		v.blipByUID[string(b.UID)] = b
-	}
-	if v.pinned == nil {
-		v.pinned = func(string) bool { return false }
 	}
 }
 
@@ -224,7 +223,8 @@ func nodePeer(n *v1alpha1.BlipNode) peer.Peer {
 // consistently by both source selection and the live trust registry.
 func (v *view) registeredPeers() []peer.Peer {
 	peers := make([]peer.Peer, 0, len(v.blipNodes))
-	for _, n := range v.blipNodes {
+	for _, key := range sortedKeys(v.blipNodes) {
+		n := v.blipNodes[key]
 		peers = append(peers, nodePeer(n))
 	}
 	return peers
@@ -248,7 +248,7 @@ func (v *view) healthyNode(name, incarnation string) *v1alpha1.BlipNode {
 		return nil
 	}
 	hb := bn.Status.Heartbeat
-	if hb == nil || time.Since(hb.Time) > nodeHeartbeatTTL {
+	if hb == nil || v.now.Sub(hb.Time) > nodeHeartbeatTTL {
 		return nil
 	}
 	return bn
@@ -281,7 +281,7 @@ func (v *view) holder(s *v1alpha1.BlipState, commitID, prefer string) *source {
 		}
 		return 2
 	}
-	slices.SortStableFunc(candidates, func(a, b string) int { return rank(a) - rank(b) })
+	slices.SortFunc(candidates, func(a, b string) int { return cmp.Or(rank(a)-rank(b), cmp.Compare(a, b)) })
 	if len(candidates) == 0 {
 		return nil
 	}

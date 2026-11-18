@@ -341,10 +341,8 @@ func TestHandleExportPinsBeforePublishingLease(t *testing.T) {
 		if commit != "c1" || !strings.HasPrefix(holder, leasePinPrefix) {
 			t.Errorf("pin(%q, %q)", commit, holder)
 		}
-		// The lease must not be published before its pin is taken.
-		if ts.srv.Pinned(commit) {
-			t.Error("lease published before its pin")
-		}
+		// prepare holds mu while pinning; inspect its protected state here
+		// rather than re-entering Pinned from the store boundary.
 		if len(ts.srv.leases) != 0 {
 			t.Errorf("leases published before pin: %+v", ts.srv.leases)
 		}

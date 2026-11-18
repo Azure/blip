@@ -3,6 +3,7 @@ package guest
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -49,10 +50,11 @@ type Guest struct {
 	// startProcess replaces startProc in tests, which run outside the guest
 	// and cannot chroot or start a workload. Production leaves it nil.
 	startProcess func(procSpec, []string) (*proc, []string, error)
+	filesystem   *filesystemEffects
 
 	mu         sync.Mutex
-	ctl        *wire.Conn
-	ctlFile    *os.File
+	ctl        *controlConn
+	ctlFile    io.ReadWriteCloser
 	ctlGone    chan struct{} // closed when ctl disconnects
 	claim      *wire.Claim
 	rootDev    string
@@ -178,19 +180,29 @@ func (g *Guest) helloLocked() wire.Hello {
 // serveControl serves the runtime. A new connection replaces the previous
 // one; Hello tells the runtime the current state.
 func (g *Guest) serveControl(f *os.File) {
-	c := wire.NewConn(f)
+	g.serveControlStream(f)
+}
+
+func (g *Guest) serveControlStream(f io.ReadWriteCloser) {
+	c := &controlConn{Conn: wire.NewConn(f), stream: f}
 	gone := make(chan struct{})
+	// Reserve the first output slot before publishing c so asynchronous
+	// notifications cannot precede Hello. Never hold mu across stream I/O.
+	c.mu.Lock()
 	g.mu.Lock()
-	if g.ctlFile != nil {
-		g.ctlFile.Close()
-	}
+	old := g.ctlFile
 	g.ctl, g.ctlFile, g.ctlGone = c, f, gone
 	hello := g.helloLocked()
-	err := c.WriteJSON(wire.THello, hello)
-	if err == nil {
-		err = c.WriteJSON(wire.TStatus, wire.Status{Sessions: g.clients})
-	}
+	status := wire.Status{Sessions: g.clients}
 	g.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	err := c.writeLocked(wire.THello, hello)
+	if err == nil {
+		err = c.writeLocked(wire.TStatus, status)
+	}
+	c.mu.Unlock()
 	defer func() {
 		g.mu.Lock()
 		if g.ctl == c {
@@ -256,10 +268,7 @@ func (g *Guest) serveControl(f *os.File) {
 					err = g.doThaw(m.ID)
 				}
 			}
-			g.fmu.Lock()
-			frozen := g.frozen[m.ID] != nil
-			g.fmu.Unlock()
-			_ = c.WriteJSON(wire.TFreezeResult, wire.FreezeResult{ID: m.ID, Frozen: frozen, Error: errString(err)})
+			c.freezeResult(g, m.ID, err, t == wire.TFreeze)
 		case wire.TShutdown:
 			go g.shutdown()
 		}

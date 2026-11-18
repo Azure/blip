@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -83,17 +85,6 @@ func OptionsFromEnv() Options {
 	return o
 }
 
-type disk struct {
-	d        podapi.Disk
-	phase    string
-	message  string
-	inVM     bool // attached in Cloud Hypervisor
-	mounted  bool // mounted in the guest
-	waiting  bool // Mount or Unmount sent, no result yet
-	removing bool // device removal in progress
-	retryAt  time.Time
-}
-
 type ctlEvent struct {
 	gen     int
 	conn    net.Conn // set on connect
@@ -103,119 +94,140 @@ type ctlEvent struct {
 }
 
 type removeResult struct {
-	id  string
-	err error
+	id    string
+	err   error
+	token uint64
 }
 
+type policyNetwork interface {
+	apply(*network.Policy, bool) error
+}
+
+// runtime is the effect runner. All lifecycle state and decisions live in the
+// embedded Machine; only the runner owns live host/guest resources and time.
 type runtime struct {
-	o      Options
-	ch     *chClient
-	vm     *exec.Cmd
-	vmDone chan struct{}
-	vmErr  error
-
-	desired podapi.Desired
-
-	ctlEvents chan ctlEvent
-	removed   chan removeResult
-	gen       int
-	conn      *wire.Conn
-	raw       net.Conn
-
-	hello        bool // a guest Hello was ever received
-	claimID      string
-	claimWaiting bool
-	claimRetryAt time.Time
-	rootInVM     bool
-	disks        map[string]*disk
-	order        []string
-	sessions     int
-	exit         *podapi.Exit
-	errMsg       string
-	sigterm      bool
-	shutdownSent bool
-	shutdownDone bool
-	stopSince    time.Time
-	exited       bool
-
-	// frozen holds disk IDs the guest reports frozen; freezeWaiting those
-	// with a Freeze or Thaw in flight; thawing those whose in-flight request
-	// is a Thaw; freezeSkip those whose freeze failed or timed out, not
-	// retried until they leave Desired.Freeze.
-	frozen        map[string]bool
-	freezeWaiting map[string]bool
-	thawing       map[string]bool
-	freezeSkip    map[string]bool
-
-	network         policyNetwork
-	networkReady    bool
-	networkRevision string
-	networkError    string
-	networkKey      string
-	networkRetryAt  time.Time
-
-	lastObserved []byte
-
+	Machine
+	o             Options
+	ch            *chClient
+	vm            *exec.Cmd
+	vmDone        chan struct{}
+	vmErr         error
+	ctlEvents     chan ctlEvent
+	removed       chan removeResult
+	conn          *wire.Conn
+	raw           net.Conn
+	rawGeneration int
+	network       policyNetwork
+	lastObserved  []byte
+	ctx           context.Context
+	cancel        context.CancelFunc
+	workers       sync.WaitGroup
+	clockEpoch    time.Time
+	// elapsed is a test seam; nil uses time.Since's monotonic clock.
+	elapsed func(time.Time) time.Duration
 	// secureSockets is a test seam for boot; nil means secureCHSockets.
 	secureSockets func() error
 }
 
 // Run supervises one VM until the VMM exits.
 func Run(o Options) error {
+	r := newRuntime(o)
+	defer r.close()
+	return r.run()
+}
+
+func newRuntime(o Options) *runtime {
+	ctx, cancel := context.WithCancel(context.Background())
 	r := &runtime{
-		o:         o,
-		ch:        newCHClient(o.path(podapi.APISocket)),
-		vmDone:    make(chan struct{}),
-		ctlEvents: make(chan ctlEvent, 16),
-		removed:   make(chan removeResult, 16),
-		disks:     map[string]*disk{},
+		Machine:    *NewMachine(o.SkipNetwork),
+		o:          o,
+		ch:         newCHClient(o.path(podapi.APISocket)),
+		vmDone:     make(chan struct{}),
+		ctlEvents:  make(chan ctlEvent, 16),
+		removed:    make(chan removeResult, 16),
+		ctx:        ctx,
+		cancel:     cancel,
+		clockEpoch: time.Now(),
 	}
-	r.resetFreeze()
-	desiredCh := make(chan podapi.Desired, 1)
-	go r.watchDesired(desiredCh)
+	r.ch.ctx = ctx
+	return r
+}
+
+// now projects monotonic elapsed time onto a fixed wall epoch. The machine can
+// strip Go's monotonic metadata for canonical keys without making its deadlines
+// sensitive to later wall-clock corrections. Calls are serialized by the runner.
+func (r *runtime) now() time.Time {
+	if r.clockEpoch.IsZero() {
+		r.clockEpoch = time.Now() // support runtime literals in tests
+	}
+	elapsed := r.elapsed
+	if elapsed == nil {
+		elapsed = time.Since
+	}
+	return r.clockEpoch.Add(elapsed(r.clockEpoch))
+}
+
+func (r *runtime) start(f func()) {
+	r.workers.Add(1)
+	go func() {
+		defer r.workers.Done()
+		f()
+	}()
+}
+
+func (r *runtime) close() {
+	r.cancel()
+	if r.raw != nil {
+		r.raw.Close()
+	}
+	r.workers.Wait()
+	r.ch.hc.CloseIdleConnections()
+}
+
+func (r *runtime) run() error {
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sig)
 	r.writeObserved()
-
 	pn, err := r.boot()
 	if err != nil {
-		r.errMsg = err.Error()
-		r.exited = true
+		r.errMsg, r.exited = err.Error(), true
 		r.writeObserved()
 		return err
 	}
 	if pn != nil {
 		defer pn.teardown()
 	}
-	go r.connect(r.gen)
-
+	desiredCh := make(chan podapi.Desired, 1)
+	r.start(func() { r.watchDesired(desiredCh) })
+	gen := r.gen
+	r.start(func() { r.connect(gen) })
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
 		select {
 		case d := <-desiredCh:
-			r.desired = d
-			for _, e := range r.disks {
-				e.retryAt = time.Time{}
-			}
-			r.claimRetryAt = time.Time{}
+			r.execute(r.Apply(r.now(), Event{Kind: EventDesired, Desired: d}))
 		case ev := <-r.ctlEvents:
 			r.handleControl(ev)
 		case res := <-r.removed:
 			r.handleRemoved(res)
 		case <-sig:
 			log.Printf("received stop signal")
-			r.sigterm = true
+			r.execute(r.Apply(r.now(), Event{Kind: EventStop}))
 		case <-r.vmDone:
 			r.vmExited()
 			r.writeObserved()
 			return nil
 		case <-tick.C:
 		}
-		// Apply everything already queued before the (fsynced) observed
-		// write, so bursts of guest messages coalesce into one write.
+		// Coalesce queued frames before the fsynced observed write.
 		for drained := false; !drained; {
 			select {
+			case <-r.vmDone:
+				r.vmExited()
+				r.writeObserved()
+				return nil
 			case ev := <-r.ctlEvents:
 				r.handleControl(ev)
 			case res := <-r.removed:
@@ -227,6 +239,130 @@ func Run(o Options) error {
 		r.reconcile()
 		r.writeObserved()
 	}
+}
+
+// execute returns whether a synchronous operation completed, in which case the
+// caller reconciles again. Device removal retains the complete CH confirmation
+// workflow in a goroutine so a busy detach cannot block Stop or policy updates.
+func (r *runtime) execute(effects []Effect) bool {
+	completed := false
+	for _, e := range effects {
+		// A synchronous completion can kill the VM while later effects from
+		// the same batch are still queued. Only close/kill may run afterward.
+		if (r.killSent || r.exited) && e.Kind != EffectKill && e.Kind != EffectClose {
+			continue
+		}
+		var err error
+		unsafe := false
+		switch e.Kind {
+		case EffectAddDisk:
+			err = r.ch.addDisk(e.Disk)
+		case EffectNetwork:
+			if r.network == nil {
+				err = fmt.Errorf("network is not initialized")
+			} else {
+				err = r.network.apply(e.Policy, e.Active)
+			}
+			if pn, ok := r.network.(*podNet); ok {
+				unsafe = pn.unsafe
+			}
+		case EffectRemoveDisk:
+			r.start(func() {
+				res := removeResult{id: e.Disk.ID, token: e.Token, err: r.ch.removeDisk(e.Disk.ID, removeTimeout)}
+				select {
+				case r.removed <- res:
+				case <-r.ctx.Done():
+				}
+			})
+			continue
+		case EffectSend:
+			if r.conn != nil && e.Generation == r.gen {
+				if err := r.conn.WriteJSON(e.Type, e.Payload); err != nil {
+					log.Printf("control write: %v", err)
+					r.execute(r.Apply(r.now(), Event{Kind: EventDisconnected, Generation: e.Generation, Error: err.Error()}))
+				}
+			}
+			continue
+		case EffectClose:
+			if r.raw != nil && e.Generation == r.rawGeneration {
+				r.raw.Close()
+				r.conn, r.raw = nil, nil
+			}
+			continue
+		case EffectConnect:
+			r.start(func() { r.connect(e.Generation) })
+			continue
+		case EffectKill:
+			if r.vm != nil && r.vm.Process != nil {
+				_ = r.vm.Process.Kill()
+			}
+			continue
+		default:
+			continue
+		}
+		result := Event{Kind: EventResult, Token: e.Token, Unsafe: unsafe}
+		if err != nil {
+			result.Error = err.Error()
+		}
+		r.execute(r.Apply(r.now(), result))
+		completed = true
+	}
+	return completed
+}
+
+func (r *runtime) handleControl(ev ctlEvent) {
+	if ev.gen != r.gen {
+		if ev.conn != nil {
+			ev.conn.Close()
+		}
+		return
+	}
+	if ev.conn != nil {
+		if r.raw != nil {
+			r.raw.Close()
+		}
+		r.raw, r.conn, r.rawGeneration = ev.conn, wire.NewConn(ev.conn), ev.gen
+		r.execute(r.Apply(r.now(), Event{Kind: EventConnected, Generation: ev.gen}))
+		return
+	}
+	r.connected = r.conn != nil
+	evMachine := Event{Kind: EventControl, Generation: ev.gen, Type: ev.t, Payload: ev.payload}
+	if ev.err != nil {
+		evMachine.Kind, evMachine.Error = EventDisconnected, ev.err.Error()
+	}
+	r.execute(r.Apply(r.now(), evMachine))
+}
+
+func (r *runtime) handleRemoved(res removeResult) {
+	ev := Event{Kind: EventResult, Token: res.token}
+	if res.err != nil {
+		ev.Error = res.err.Error()
+	}
+	r.execute(r.Apply(r.now(), ev))
+}
+
+func (r *runtime) reconcile() {
+	r.skipNetwork, r.connected = r.o.SkipNetwork, r.conn != nil
+	for r.execute(r.Reconcile(r.now())) {
+	}
+}
+
+func (r *runtime) vmExited() {
+	r.execute(r.Apply(r.now(), Event{Kind: EventVMExited, Error: fmt.Sprint(r.vmErr)}))
+}
+
+func (r *runtime) writeObserved() {
+	o := r.Observed()
+	data, _ := json.Marshal(o)
+	if bytes.Equal(data, r.lastObserved) {
+		return
+	}
+	if err := podapi.WriteJSON(r.o.path(podapi.ObservedFile), o); err != nil {
+		log.Printf("write observed: %v", err)
+		return
+	}
+	r.lastObserved = data
+	log.Printf("observed: %s", data)
 }
 
 // boot writes the config disk, sets up networking and starts the VMM.
@@ -298,585 +434,78 @@ func (r *runtime) boot() (*podNet, error) {
 	if err := secure(); err != nil {
 		started = false // tear down the network, we killed the VMM
 		_ = cmd.Process.Kill()
+		<-r.vmDone
 		return nil, fmt.Errorf("secure cloud-hypervisor sockets: %w", err)
 	}
 	return pn, nil
 }
 
-// connect dials the guest control port until it answers, then forwards
-// frames to the main loop.
+// connect dials the guest control port until it answers, then forwards frames.
 func (r *runtime) connect(gen int) {
 	for {
 		select {
+		case <-r.ctx.Done():
+			return
 		case <-r.vmDone:
 			return
 		default:
 		}
 		c, err := wire.DialVsock(r.o.path(podapi.VsockSocket), wire.ControlPort, 2*time.Second)
 		if err != nil {
-			time.Sleep(20 * time.Millisecond)
+			timer := time.NewTimer(20 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-r.ctx.Done():
+				timer.Stop()
+				return
+			case <-r.vmDone:
+				timer.Stop()
+				return
+			}
 			continue
 		}
-		r.ctlEvents <- ctlEvent{gen: gen, conn: c}
+		defer c.Close()
+		stop := context.AfterFunc(r.ctx, func() { c.Close() })
+		defer stop()
+		if !r.deliverControl(ctlEvent{gen: gen, conn: c}) {
+			return
+		}
 		wc := wire.NewConn(c)
 		for {
 			t, p, err := wc.Read()
-			r.ctlEvents <- ctlEvent{gen: gen, t: t, payload: p, err: err}
-			if err != nil {
+			if !r.deliverControl(ctlEvent{gen: gen, t: t, payload: p, err: err}) || err != nil {
 				return
 			}
 		}
 	}
 }
 
-func (r *runtime) send(t wire.Type, v any) {
-	if r.conn == nil {
-		return
-	}
-	if err := r.conn.WriteJSON(t, v); err != nil {
-		log.Printf("control write: %v", err)
-		r.raw.Close()
-	}
-}
-
-func (r *runtime) handleControl(ev ctlEvent) {
-	if ev.gen != r.gen {
-		if ev.conn != nil {
-			ev.conn.Close()
-		}
-		return
-	}
-	if ev.conn != nil {
-		r.raw, r.conn = ev.conn, wire.NewConn(ev.conn)
-		return
-	}
-	if ev.err != nil {
-		log.Printf("control connection lost: %v", ev.err)
-		r.raw.Close()
-		r.conn, r.raw = nil, nil
-		if !r.shutdownDone && !r.exited {
-			r.gen++
-			go r.connect(r.gen)
-		}
-		return
-	}
-	switch ev.t {
-	case wire.THello:
-		var h wire.Hello
-		if err := wire.Decode(ev.payload, &h); err != nil {
-			log.Printf("bad hello: %v", err)
-			return
-		}
-		r.resync(h)
-	case wire.TClaimResult:
-		var res wire.Result
-		_ = wire.Decode(ev.payload, &res)
-		r.claimWaiting = false
-		if res.Error != "" {
-			for _, e := range r.disks {
-				e.waiting = false
-			}
-			log.Printf("claim failed: %s", res.Error)
-			r.errMsg = "claim: " + res.Error
-			r.claimRetryAt = time.Now().Add(retryInterval)
-			return
-		}
-		r.claimID, r.errMsg = res.ID, ""
-		log.Printf("claimed %s", res.ID)
-	case wire.TMountResult:
-		var res wire.Result
-		_ = wire.Decode(ev.payload, &res)
-		if e := r.disks[res.ID]; e != nil && e.waiting {
-			e.waiting = false
-			if res.Error != "" {
-				e.phase, e.message, e.retryAt = podapi.DiskFailed, res.Error, time.Now().Add(retryInterval)
-			} else {
-				e.phase, e.message, e.mounted = podapi.DiskMounted, "", true
-			}
-		}
-	case wire.TUnmountResult:
-		var res wire.Result
-		_ = wire.Decode(ev.payload, &res)
-		if e := r.disks[res.ID]; e != nil && e.waiting {
-			e.waiting = false
-			if res.Error != "" {
-				e.phase, e.message, e.retryAt = podapi.DiskFailed, res.Error, time.Now().Add(unmountRetryInterval)
-			} else {
-				e.mounted, e.message = false, ""
-				delete(r.frozen, res.ID)
-			}
-		}
-	case wire.TFreezeResult:
-		var res wire.FreezeResult
-		_ = wire.Decode(ev.payload, &res)
-		delete(r.freezeWaiting, res.ID)
-		if r.thawing[res.ID] {
-			// Only a freeze confirmed after this thaw counts as frozen.
-			delete(r.thawing, res.ID)
-			if res.Error != "" {
-				log.Printf("thaw %s: %s", res.ID, res.Error)
-			}
-			break
-		}
-		if res.Frozen {
-			r.frozen[res.ID] = true
-		} else {
-			delete(r.frozen, res.ID)
-		}
-		if res.Error != "" {
-			log.Printf("freeze %s: %s", res.ID, res.Error)
-			if !res.Frozen {
-				r.freezeSkip[res.ID] = true
-			}
-		}
-	case wire.TStatus:
-		var st wire.Status
-		_ = wire.Decode(ev.payload, &st)
-		r.sessions = st.Sessions
-	case wire.TExit:
-		var ex wire.Exit
-		_ = wire.Decode(ev.payload, &ex)
-		r.recordExit(ex)
-	case wire.TShutdownDone:
-		var sd wire.ShutdownDone
-		_ = wire.Decode(ev.payload, &sd)
-		log.Printf("guest shutdown done (clean=%v %s)", sd.Clean, sd.Error)
-		if !sd.Clean {
-			r.errMsg = "guest shutdown: " + sd.Error
-		}
-		r.shutdownDone = true
-		r.raw.Close()
-	}
-}
-
-func (r *runtime) recordExit(ex wire.Exit) {
-	if r.exit != nil {
-		return
-	}
-	r.exit = &podapi.Exit{Code: ex.Code, Signal: ex.Signal, Reason: ex.Reason, Output: ex.Output}
-	if r.stopSince.IsZero() {
-		r.stopSince = time.Now()
-	}
-	log.Printf("guest exit: %+v", *r.exit)
-}
-
-// resync adopts the guest's view after a (re)connect.
-func (r *runtime) resync(h wire.Hello) {
-	log.Printf("guest hello: claim=%q mounts=%v", h.ClaimID, h.Mounts)
-	if h.ClaimID == "" && r.claimID != "" {
-		// The guest kernel panicked and rebooted (panic=-1) after the claim.
-		r.errMsg = "the VM guest crashed and restarted"
-		log.Print(r.errMsg)
-		_ = r.vm.Process.Kill()
-		return
-	}
-	r.hello = true
-	if h.Exit != nil {
-		r.recordExit(*h.Exit)
-	}
-	if h.ClaimID != "" {
-		r.claimID, r.rootInVM = h.ClaimID, true
-	}
-	r.claimWaiting = false
-	r.shutdownSent = false
-	r.frozen, r.freezeWaiting, r.thawing = map[string]bool{}, map[string]bool{}, map[string]bool{}
-	for _, id := range h.Frozen {
-		r.frozen[id] = true
-	}
-	mounted := map[string]bool{}
-	for _, id := range h.Mounts {
-		mounted[id] = true
-	}
-	for _, e := range r.disks {
-		e.waiting = false
-		e.mounted = mounted[e.d.ID]
-		if e.mounted && e.phase != podapi.DiskFailed {
-			e.phase = podapi.DiskMounted
-		}
-	}
-}
-
-func (r *runtime) handleRemoved(res removeResult) {
-	e := r.disks[res.id]
-	if e == nil {
-		return
-	}
-	e.removing = false
-	if res.err != nil {
-		e.phase, e.message, e.retryAt = podapi.DiskFailed, res.err.Error(), time.Now().Add(retryInterval)
-		return
-	}
-	if r.wanted(res.id) && !r.stopRequested() && r.exit == nil {
-		// The ID was re-added while the asynchronous removal was in
-		// flight. Do not record Detached: forget the removal state and let
-		// reconcileMounts run the normal attach path again. (While the VM
-		// is stopping there is nothing to attach for.)
-		e.inVM, e.mounted, e.waiting, e.phase, e.message = false, false, false, podapi.DiskAttaching, ""
-		e.retryAt = time.Time{}
-		log.Printf("disk %s removed; wanted again, reattaching", res.id)
-		return
-	}
-	e.inVM, e.phase, e.message = false, podapi.DiskDetached, ""
-	log.Printf("disk %s detached", res.id)
-}
-
-// wanted reports whether the attachment ID is in the current desired mounts.
-func (r *runtime) wanted(id string) bool {
-	for _, d := range r.desired.Mounts {
-		if d.ID == id {
-			return true
-		}
+func (r *runtime) deliverControl(ev ctlEvent) bool {
+	select {
+	case r.ctlEvents <- ev:
+		return true
+	case <-r.ctx.Done():
+	case <-r.vmDone:
 	}
 	return false
 }
 
-func (r *runtime) stopRequested() bool { return r.desired.Stop || r.sigterm }
-
-func (r *runtime) reconcile() {
-	if r.exited {
-		return
-	}
-	now := time.Now()
-	// Policy updates and revocations do not depend on the guest control link.
-	r.reconcileNetwork(now)
-	if r.stopRequested() && r.stopSince.IsZero() {
-		r.stopSince = now
-	}
-	if !r.stopSince.IsZero() && now.Sub(r.stopSince) > stopTimeout {
-		log.Printf("VM did not stop within %v; killing it", stopTimeout)
-		_ = r.vm.Process.Kill()
-		return
-	}
-	if r.conn == nil || !r.hello {
-		return
-	}
-	if r.stopRequested() {
-		if !r.shutdownSent && !r.shutdownDone {
-			log.Printf("sending shutdown")
-			r.send(wire.TShutdown, wire.Shutdown{Reason: "Stop"})
-			r.shutdownSent = true
-		}
-		return
-	}
-	if r.exit != nil {
-		return // the guest is shutting itself down
-	}
-	c := r.desired.Claim
-	if c == nil {
-		return
-	}
-	if r.claimID == "" {
-		if !r.networkReady || r.claimWaiting || now.Before(r.claimRetryAt) {
-			return
-		}
-		if !r.rootInVM {
-			if err := r.ch.addDisk(c.Root); err != nil {
-				r.errMsg = "attach root: " + err.Error()
-				r.claimRetryAt = now.Add(retryInterval)
-				return
-			}
-			r.rootInVM = true
-		}
-		serial := c.Root.Serial
-		if serial == "" {
-			serial = c.Root.ID
-		}
-		// Mounts known at claim time are mounted before the command starts.
-		var mounts []wire.Mount
-		for _, d := range r.desired.Mounts {
-			e := r.disks[d.ID]
-			if e == nil {
-				e = &disk{d: d, phase: podapi.DiskAttaching}
-				r.disks[d.ID] = e
-				r.order = append(r.order, d.ID)
-			}
-			if !e.inVM {
-				if err := r.ch.addDisk(d); err != nil {
-					r.errMsg = "attach " + d.Path + ": " + err.Error()
-					r.claimRetryAt = now.Add(retryInterval)
-					return
-				}
-				e.inVM = true
-			}
-			mounts = append(mounts, wire.Mount{ID: d.ID, Serial: diskSerial(d), Path: d.Path, ReadOnly: d.ReadOnly})
-		}
-		for _, m := range mounts {
-			r.disks[m.ID].waiting = true
-		}
-		r.send(wire.TClaim, wire.Claim{
-			ID:                 c.Root.ID,
-			Serial:             serial,
-			Hostname:           c.BlipName,
-			Command:            c.Command,
-			TTY:                c.TTY,
-			Env:                c.Env,
-			WorkingDir:         c.WorkingDir,
-			User:               c.User,
-			WaitForClient:      c.WaitForClient,
-			IdleTimeoutSeconds: c.IdleTimeoutSeconds,
-			Mounts:             mounts,
-		})
-		r.claimWaiting = true
-		return
-	}
-	r.reconcileMounts(now)
-	r.reconcileFreeze()
-}
-
-type policyNetwork interface {
-	apply(*network.Policy, bool) error
-}
-
-func (r *runtime) reconcileNetwork(now time.Time) {
-	p := r.desired.Network
-	if r.o.SkipNetwork {
-		r.networkReady, r.networkError, r.networkRevision = true, "", ""
-		if p != nil {
-			r.networkRevision = p.Revision
-		}
-		return
-	}
-	// Warm VMs can validate/preinstall policy during disk preparation, but
-	// only a desired claim opens the forwarding path.
-	active := r.desired.Claim != nil
-	data, _ := json.Marshal(struct {
-		Policy *network.Policy
-		Active bool
-	}{p, active})
-	key := string(data)
-	if key == r.networkKey && (r.networkError == "" || now.Before(r.networkRetryAt)) {
-		return
-	}
-	r.networkKey = key
-	r.networkReady, r.networkRevision, r.networkError = false, "", ""
-	var err error
-	if r.network == nil {
-		err = fmt.Errorf("network is not initialized")
-	} else {
-		err = r.network.apply(p, active)
-	}
-	if err != nil {
-		r.networkError = err.Error()
-		r.networkRetryAt = now.Add(retryInterval)
-		log.Printf("network policy: %v", err)
-		// If neither nftables nor disabling the TAP worked, the only safe
-		// fallback is to stop the VM. Normal policy errors do not stop disks
-		// or the guest's shutdown protocol.
-		if pn, ok := r.network.(*podNet); ok && pn.unsafe && r.vm != nil {
-			_ = r.vm.Process.Kill()
-		}
-		return
-	}
-	if p != nil {
-		r.networkReady, r.networkRevision = true, p.Revision
-	}
-}
-
-func (r *runtime) resetFreeze() {
-	r.frozen, r.freezeWaiting, r.thawing, r.freezeSkip = map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
-}
-
-func (r *runtime) reconcileFreeze() {
-	want := map[string]bool{}
-	for _, id := range r.desired.Freeze {
-		want[id] = true
-		if r.frozen[id] || r.freezeWaiting[id] || r.freezeSkip[id] {
-			continue
-		}
-		r.send(wire.TFreeze, wire.Freeze{ID: id})
-		r.freezeWaiting[id] = true
-	}
-	for id := range r.freezeSkip {
-		if !want[id] {
-			delete(r.freezeSkip, id)
-		}
-	}
-	for id := range r.frozen {
-		if !want[id] && !r.freezeWaiting[id] {
-			r.send(wire.TThaw, wire.Freeze{ID: id})
-			// Not frozen from here on: a re-desired ID waits for this
-			// thaw's result and then sends a fresh Freeze.
-			delete(r.frozen, id)
-			r.freezeWaiting[id], r.thawing[id] = true, true
-		}
-	}
-}
-
-func (r *runtime) reconcileMounts(now time.Time) {
-	want := map[string]bool{}
-	for _, d := range r.desired.Mounts {
-		want[d.ID] = true
-		e := r.disks[d.ID]
-		if e == nil {
-			e = &disk{d: d, phase: podapi.DiskAttaching}
-			r.disks[d.ID] = e
-			r.order = append(r.order, d.ID)
-		} else if e.phase == podapi.DiskDetached {
-			// Wanted again after a detach: reset the entry and run the
-			// normal attach path below. Reusing the entry keeps order (and
-			// observed.json) free of duplicate records for the ID.
-			*e = disk{d: d, phase: podapi.DiskAttaching}
-		}
-		if e.waiting || e.removing || e.mounted || now.Before(e.retryAt) {
-			continue
-		}
-		e.d = d
-		if !e.inVM {
-			if err := r.ch.addDisk(d); err != nil {
-				e.phase, e.message, e.retryAt = podapi.DiskFailed, "attach: "+err.Error(), now.Add(retryInterval)
-				continue
-			}
-			e.inVM = true
-		}
-		r.send(wire.TMount, wire.Mount{ID: d.ID, Serial: diskSerial(d), Path: d.Path, ReadOnly: d.ReadOnly})
-		e.waiting = true
-		if e.phase != podapi.DiskFailed {
-			e.phase = podapi.DiskAttaching
-		}
-	}
-	var stale []string
-	for _, id := range r.order {
-		e := r.disks[id]
-		if want[id] || e.waiting || e.removing || now.Before(e.retryAt) {
-			continue
-		}
-		if e.phase == podapi.DiskDetached {
-			// A genuine removal has finished. A read-only disk is done
-			// with, so stop tracking it: the node has dropped the mount
-			// from Desired and keeping the record only accumulates stale
-			// entries in order/observed.json. Writable attachments stay
-			// visible because the node uses their Detached status to
-			// fence the final seal of the writer.
-			if e.d.ReadOnly {
-				stale = append(stale, id)
-			}
-			continue
-		}
-		switch {
-		case e.mounted:
-			r.send(wire.TUnmount, wire.Unmount{ID: id})
-			e.waiting = true
-			if e.phase != podapi.DiskFailed {
-				e.phase = podapi.DiskUnmounting
-			}
-		case e.inVM:
-			e.removing = true
-			e.phase = podapi.DiskUnmounting
-			go func() { r.removed <- removeResult{id, r.ch.removeDisk(id, removeTimeout)} }()
-		default:
-			e.phase = podapi.DiskDetached
-		}
-	}
-	for _, id := range stale {
-		r.dropDisk(id)
-	}
-}
-
-// dropDisk forgets a fully detached mount that is no longer desired.
-func (r *runtime) dropDisk(id string) {
-	delete(r.disks, id)
-	delete(r.frozen, id)
-	delete(r.freezeSkip, id)
-	for i, oid := range r.order {
-		if oid == id {
-			r.order = append(r.order[:i], r.order[i+1:]...)
-			break
-		}
-	}
-}
-
-func diskSerial(d podapi.Disk) string {
-	if d.Serial != "" {
-		return d.Serial
-	}
-	return d.ID
-}
-
-func (r *runtime) vmExited() {
-	r.exited = true
-	r.conn = nil
-	r.resetFreeze()
-	if r.raw != nil {
-		r.raw.Close()
-	}
-	if r.exit == nil {
-		switch {
-		case r.stopRequested():
-			r.exit = &podapi.Exit{Reason: "Stopped"}
-		default:
-			r.exit = &podapi.Exit{Code: 255, Reason: "GuestCrashed"}
-			if r.errMsg == "" {
-				r.errMsg = fmt.Sprintf("VM exited unexpectedly (cloud-hypervisor: %v)", r.vmErr)
-			}
-		}
-	}
-	for _, e := range r.disks {
-		if e.inVM || e.mounted {
-			e.inVM, e.mounted, e.phase = false, false, podapi.DiskDetached
-		}
-	}
-}
-
-func (r *runtime) phase() string {
-	switch {
-	case r.exited:
-		return podapi.PhaseExited
-	case r.shutdownSent || r.shutdownDone || r.exit != nil || (r.stopRequested() && r.hello):
-		return podapi.PhaseStopping
-	case r.claimID != "":
-		return podapi.PhaseRunning
-	case r.desired.Claim != nil && r.hello:
-		return podapi.PhaseClaiming
-	case r.hello:
-		return podapi.PhaseWarm
-	}
-	return podapi.PhaseBooting
-}
-
-func (r *runtime) writeObserved() {
-	o := podapi.Observed{
-		Phase:           r.phase(),
-		ClaimID:         r.claimID,
-		Sessions:        r.sessions,
-		Exit:            r.exit,
-		Error:           r.errMsg,
-		NetworkRevision: r.networkRevision,
-		NetworkError:    r.networkError,
-	}
-	for _, id := range r.desired.Freeze {
-		if r.frozen[id] {
-			o.Frozen = append(o.Frozen, id)
-		}
-	}
-	for _, id := range r.order {
-		e := r.disks[id]
-		o.Mounts = append(o.Mounts, podapi.DiskStatus{ID: id, State: e.d.State, Phase: e.phase, Message: e.message})
-	}
-	data, _ := json.Marshal(o)
-	if bytes.Equal(data, r.lastObserved) {
-		return
-	}
-	if err := podapi.WriteJSON(r.o.path(podapi.ObservedFile), o); err != nil {
-		log.Printf("write observed: %v", err)
-		return
-	}
-	r.lastObserved = data
-	log.Printf("observed: %s", data)
-}
-
-// watchDesired polls desired.json and delivers every new valid version. A
-// missing or malformed file keeps the last valid one.
+// watchDesired keeps the last valid desired file. inotify wakes it promptly;
+// polling is the fallback when inotify is unavailable.
 func (r *runtime) watchDesired(ch chan<- podapi.Desired) {
 	path := r.o.path(podapi.DesiredFile)
-	// inotify wakes the loop as soon as the node renames a new version into
-	// place; the 100ms poll is the fallback.
 	wake := make(chan struct{}, 1)
-	if fd, err := unix.InotifyInit1(unix.IN_CLOEXEC); err == nil {
+	if fd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK); err == nil {
+		// A nonblocking os.File uses Go's poller, so Close interrupts Read.
+		f := os.NewFile(uintptr(fd), "inotify")
 		if _, err := unix.InotifyAddWatch(fd, r.o.Dir, unix.IN_MOVED_TO|unix.IN_CLOSE_WRITE); err == nil {
+			done := make(chan struct{})
+			defer func() { f.Close(); <-done }()
 			go func() {
+				defer close(done)
 				buf := make([]byte, 4096)
 				for {
-					if _, err := unix.Read(fd, buf); err != nil && err != unix.EINTR {
+					if _, err := f.Read(buf); err != nil {
 						return
 					}
 					select {
@@ -885,10 +514,13 @@ func (r *runtime) watchDesired(ch chan<- podapi.Desired) {
 					}
 				}
 			}()
+		} else {
+			f.Close()
 		}
 	}
 	var last, bad []byte
 	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
 	for {
 		data, err := os.ReadFile(path)
 		if err == nil && !bytes.Equal(data, last) && !bytes.Equal(data, bad) {
@@ -898,10 +530,16 @@ func (r *runtime) watchDesired(ch chan<- podapi.Desired) {
 				bad = data
 			} else {
 				last = data
-				ch <- d
+				select {
+				case ch <- d:
+				case <-r.ctx.Done():
+					return
+				}
 			}
 		}
 		select {
+		case <-r.ctx.Done():
+			return
 		case <-t.C:
 		case <-wake:
 		}

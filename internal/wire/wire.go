@@ -22,6 +22,7 @@ package wire
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -122,7 +123,8 @@ type Unmount struct {
 }
 
 // Freeze names a disk (the claim ID or a mount ID) whose filesystem is
-// frozen (TFreeze) or thawed (TThaw). The guest thaws on its own after 30s.
+// frozen (TFreeze) or thawed (TThaw). The guest bounds the freeze with an
+// automatic thaw timeout.
 type Freeze struct {
 	ID string `json:"id"`
 }
@@ -233,9 +235,10 @@ type Notice struct {
 
 // Conn frames a stream. Writes are safe for concurrent use; reads are not.
 type Conn struct {
-	rw io.ReadWriter
-	br *bufio.Reader
-	mu sync.Mutex
+	rw   io.ReadWriter
+	br   *bufio.Reader
+	mu   sync.Mutex
+	werr error // a failed frame write makes further framing unsafe
 }
 
 func NewConn(rw io.ReadWriter) *Conn {
@@ -252,10 +255,15 @@ func (c *Conn) Write(t Type, payload []byte) error {
 	binary.BigEndian.PutUint32(hdr[1:], uint32(len(payload)))
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, err := c.rw.Write(append(hdr[:], payload...)); err != nil {
-		return err
+	if c.werr != nil {
+		return c.werr
 	}
-	return nil
+	n, err := c.rw.Write(append(hdr[:], payload...))
+	if err == nil && n != len(hdr)+len(payload) {
+		err = io.ErrShortWrite
+	}
+	c.werr = err
+	return err
 }
 
 // WriteJSON sends one frame with v encoded as JSON.
@@ -287,10 +295,12 @@ func (c *Conn) Read() (Type, []byte, error) {
 	return Type(hdr[0]), payload, nil
 }
 
-// Decode unmarshals a JSON payload.
+// Decode unmarshals a control payload, which must be a JSON object. Empty or
+// null payloads must not silently turn into zero-valued success/exit results.
 func Decode(payload []byte, v any) error {
-	if len(payload) == 0 {
-		return nil
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 || payload[0] != '{' {
+		return errors.New("expected a JSON object")
 	}
 	return json.Unmarshal(payload, v)
 }
