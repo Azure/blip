@@ -114,6 +114,28 @@ func (r *BlipReconciler) releaseHeld(ctx context.Context, b *v1.Blip, keep ...st
 	return nil
 }
 
+// releaseUnattachedWriter clears the writer slot of an attachment that never
+// attached, even if ensureWriterPods already recorded the pod. The node stops
+// a VM whose desired mount loses its writer slot (writerLost), so a release
+// that races an actual attachment fences the VM instead of letting a second
+// writer mount the same state.
+func (r *BlipReconciler) releaseUnattachedWriter(ctx context.Context, b *v1.Blip, state, attachmentID string) error {
+	st := &v1.BlipState{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: state}, st); err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			return err
+		}
+		return nil
+	}
+	w := st.Status.Writer
+	if w == nil || w.BlipUID != string(b.UID) || w.AttachmentID != attachmentID {
+		return nil
+	}
+	base := st.DeepCopy()
+	st.Status.Writer = nil
+	return client.IgnoreNotFound(patchStatus(ctx, r.Client, st, base))
+}
+
 // releaseSwitchWriter returns a writer slot pre-acquired for a promotion that
 // was cancelled before the writable mount appeared.
 func (r *BlipReconciler) releaseSwitchWriter(ctx context.Context, b *v1.Blip, state string) error {
