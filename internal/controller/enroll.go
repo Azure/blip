@@ -184,7 +184,23 @@ func (r *EnrollReconciler) unenroll(ctx context.Context, node *corev1.Node, bn *
 		return reconcile.Result{}, err
 	}
 	if !bn.Status.SafeToRemove {
-		return reconcile.Result{RequeueAfter: enrollmentRetry}, nil
+		// The cached verdict can be stale: the pod delete that freed the last
+		// Blip may have arrived while the Blip was still running, so nothing
+		// wakes NodeReconciler when it finishes. Recompute from the live
+		// objects instead of waiting forever for a pass that may never come,
+		// and persist the result so later retries and watchers agree.
+		safe, err := nodeSafeToRemove(ctx, r.Client, node.Name)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if !safe {
+			return reconcile.Result{RequeueAfter: enrollmentRetry}, nil
+		}
+		base := bn.DeepCopy()
+		bn.Status.SafeToRemove = true
+		if err := patchStatus(ctx, r.Client, bn, base); err != nil {
+			return reconcile.Result{}, client.IgnoreNotFound(err)
+		}
 	}
 	if err := r.patchLabels(ctx, node, nil); err != nil {
 		return reconcile.Result{}, err

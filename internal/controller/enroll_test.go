@@ -109,38 +109,19 @@ func TestEnrollDrainsUnselectedNode(t *testing.T) {
 		p.Spec.NodeSelector = map[string]string{"zone": "b"}
 	})
 
-	// Starting the drain immediately removes the hypervisor label, so no new
-	// VM pods select the node.
+	// Starting the drain removes the hypervisor label and stops new VM pods
+	// from selecting the node. The node is idle, so the same pass proves the
+	// drain safe and unenrolls it instead of waiting for another status pass.
 	e.run(e.enroll, "", "n1")
 
 	n1 := e.getNode("n1")
-	if n1.Labels[LabelEnrolled] != "true" {
-		t.Errorf("draining node lost its agent label: %v", n1.Labels)
-	}
-	if n1.Labels[LabelHypervisorPrefix+"kvm"] != "" {
-		t.Errorf("draining node still accepts VM pods: %v", n1.Labels)
-	}
-	bn := e.getBlipNode("n1")
-	if !bn.Spec.Drain || bn.Annotations[AnnotationEnrollmentDrain] != "true" {
-		t.Fatalf("node not marked for enrollment drain: %+v", bn)
-	}
-
-	// The agent label stays until the node reports the drain safe.
-	e.run(e.enroll, "", "n1")
-	if e.getNode("n1").Labels[LabelEnrolled] != "true" {
-		t.Error("agent unenrolled before the drain was safe")
-	}
-
-	bn = e.getBlipNode("n1")
-	bn.Status.SafeToRemove = true
-	e.must(e.c.Status().Update(e.ctx, bn))
-	e.run(e.enroll, "", "n1")
-
-	n1 = e.getNode("n1")
 	for _, k := range []string{LabelEnrolled, LabelHypervisorPrefix + "kvm"} {
 		if _, ok := n1.Labels[k]; ok {
 			t.Errorf("label %s not removed after drain: %v", k, n1.Labels)
 		}
+	}
+	if n1.Labels["zone"] != "a" {
+		t.Errorf("enrollment changed an unrelated label: %v", n1.Labels)
 	}
 	err := e.c.Get(e.ctx, types.NamespacedName{Name: "n1"}, &v1.BlipNode{})
 	if !apierrors.IsNotFound(err) {
@@ -275,10 +256,7 @@ func TestEnrollAgainAfterUnenroll(t *testing.T) {
 	e.updatePool("default", func(p *v1.BlipPool) {
 		p.Spec.NodeSelector = map[string]string{"zone": "b"}
 	})
-	e.run(e.enroll, "", "n1")
-	bn := e.getBlipNode("n1")
-	bn.Status.SafeToRemove = true
-	e.must(e.c.Status().Update(e.ctx, bn))
+	// The idle node drains and is proven safe in the same retry.
 	e.run(e.enroll, "", "n1")
 	if e.getNode("n1").Labels[LabelEnrolled] != "" {
 		t.Fatal("node still enrolled after unenroll")
@@ -294,7 +272,7 @@ func TestEnrollAgainAfterUnenroll(t *testing.T) {
 
 	// The agent registers a new BlipNode after its pod restarts; its
 	// hypervisor capability comes back with it.
-	bn = &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	bn := &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
 	e.create(bn)
 	hb := metav1.NewTime(e.now)
 	bn.Status = v1.BlipNodeStatus{Incarnation: "inc-n1", Heartbeat: &hb, Hypervisors: []string{"kvm"}}
