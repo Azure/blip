@@ -101,6 +101,49 @@ func TestCollectFiles(t *testing.T) {
 		assertCollectReleased(t, h, "alice.box", "alice.w1")
 	})
 
+	t.Run("read-only source directory", func(t *testing.T) {
+		roSrc := filepath.Join(root, "alice.w1", "home/dev/ro")
+		sub := filepath.Join(roSrc, "sub")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(roSrc, "f"), []byte("f\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sub, "g"), []byte("g\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(sub, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(roSrc, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(sub, 0o755) })
+		t.Cleanup(func() { os.Chmod(roSrc, 0o755) })
+
+		dst := filepath.Join(t.TempDir(), "ro")
+		code, _, errOut := h.run("", "collect", "w1", "/home/dev/ro:"+dst)
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if got := readFile(t, filepath.Join(dst, "f")); got != "f\n" {
+			t.Fatalf("f = %q", got)
+		}
+		if got := readFile(t, filepath.Join(dst, "sub/g")); got != "g\n" {
+			t.Fatalf("sub/g = %q", got)
+		}
+		if info, err := os.Stat(dst); err != nil || info.Mode().Perm() != 0o555 {
+			t.Fatalf("mode = %v %v", info, err)
+		}
+		if info, err := os.Stat(filepath.Join(dst, "sub")); err != nil || info.Mode().Perm() != 0o500 {
+			t.Fatalf("sub mode = %v %v", info, err)
+		}
+		t.Cleanup(func() { os.Chmod(dst, 0o755) })
+		t.Cleanup(func() { os.Chmod(filepath.Join(dst, "sub"), 0o755) })
+		assertCollectReleased(t, h, "alice.box", "alice.w1")
+	})
+
 	t.Run("symlinked parent cannot escape", func(t *testing.T) {
 		if err := os.Symlink("/etc", filepath.Join(root, "alice.w1", "home/dev/evil")); err != nil {
 			t.Fatal(err)

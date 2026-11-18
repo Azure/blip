@@ -530,9 +530,16 @@ func copyTree(src, dst string, info os.FileInfo) error {
 		}
 	} else if !os.IsNotExist(err) {
 		return err
-	}
-	if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
-		return err
+	} else {
+		// Create the directory writable so its children can be written even
+		// when the source directory is read-only. The source mode is applied
+		// after the tree is populated.
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		if err := os.Mkdir(dst, 0o700); err != nil && !os.IsExist(err) {
+			return err
+		}
 	}
 	entries, err := os.ReadDir(src)
 	if err != nil {
