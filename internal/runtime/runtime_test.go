@@ -567,3 +567,148 @@ func TestMissingPolicyBlocksClaimButNotStopOrMounts(t *testing.T) {
 	r.reconcile()
 	g.expect(wire.TShutdown, nil)
 }
+
+// mountedRuntime returns a running runtime with d mounted in the guest.
+func mountedRuntime(t *testing.T, d podapi.Disk) (*runtime, *fakeCH, *fakeGuest) {
+	t.Helper()
+	r, ch, g := newTestRuntime(t)
+	r.writeObserved()
+	g.reply(wire.THello, wire.Hello{Version: wire.Version})
+	root := podapi.Disk{ID: "root", Serial: "root", Device: "/dev/root"}
+	r.desired = podapi.Desired{Claim: &podapi.Claim{BlipName: "b", Root: root, Command: []string{"true"}}}
+	r.reconcile()
+	g.expect(wire.TClaim, nil)
+	g.reply(wire.TClaimResult, wire.Result{ID: root.ID})
+	r.desired.Mounts = []podapi.Disk{d}
+	r.reconcile()
+	g.expect(wire.TMount, nil)
+	g.reply(wire.TMountResult, wire.Result{ID: d.ID})
+	return r, ch, g
+}
+
+// detach removes d from Desired and drives unmount and device removal until
+// the runtime reports it Detached.
+func detach(t *testing.T, r *runtime, g *fakeGuest, id string) {
+	t.Helper()
+	r.desired.Mounts = nil
+	r.reconcile()
+	g.expect(wire.TUnmount, nil)
+	g.reply(wire.TUnmountResult, wire.Result{ID: id})
+	r.handleRemoved(<-r.removed)
+	r.writeObserved()
+	if o := observed(t, r); len(o.Mounts) != 1 || o.Mounts[0].Phase != podapi.DiskDetached {
+		t.Fatalf("observed %+v", o)
+	}
+}
+
+// The same attachment ID can be mounted again after its disk was detached.
+func TestReattachDetachedDisk(t *testing.T) {
+	data := podapi.Disk{ID: "data", Serial: "data", Device: "/dev/data", Path: "/data"}
+	r, ch, g := mountedRuntime(t, data)
+	detach(t, r, g, data.ID)
+	if ch.disk(data.ID) != nil {
+		t.Fatal("disk still attached")
+	}
+
+	r.desired.Mounts = []podapi.Disk{data}
+	r.reconcile()
+	var m wire.Mount
+	g.expect(wire.TMount, &m)
+	if m.ID != data.ID || m.Path != data.Path || ch.disk(data.ID) == nil {
+		t.Fatalf("reattach %+v disk %v", m, ch.disk(data.ID))
+	}
+	e := r.disks[data.ID]
+	if !e.inVM || !e.waiting || e.mounted || e.phase != podapi.DiskAttaching {
+		t.Fatalf("entry after reattach %+v", e)
+	}
+	g.reply(wire.TMountResult, wire.Result{ID: data.ID})
+	if o := observed(t, r); len(o.Mounts) != 1 || o.Mounts[0].Phase != podapi.DiskMounted {
+		t.Fatalf("observed %+v", o)
+	}
+	if len(r.order) != 1 || r.order[0] != data.ID {
+		t.Fatalf("order %v", r.order)
+	}
+}
+
+// A re-add that arrives while the asynchronous device removal is in flight
+// must not be lost to the removal result.
+func TestReaddedWhileRemovalInFlight(t *testing.T) {
+	data := podapi.Disk{ID: "data", Serial: "data", Device: "/dev/data", Path: "/data"}
+	r, ch, g := mountedRuntime(t, data)
+
+	r.desired.Mounts = nil
+	r.reconcile()
+	g.expect(wire.TUnmount, nil)
+	g.reply(wire.TUnmountResult, wire.Result{ID: data.ID})
+	if e := r.disks[data.ID]; !e.removing {
+		t.Fatalf("removal not started: %+v", e)
+	}
+
+	// Desired wants the ID again before the remove result is delivered: the
+	// device must not be re-added while remove-device is already in flight.
+	r.desired.Mounts = []podapi.Disk{data}
+	r.reconcile()
+	g.none()
+
+	r.handleRemoved(<-r.removed)
+	r.reconcile()
+	var m wire.Mount
+	g.expect(wire.TMount, &m)
+	if m.ID != data.ID || ch.disk(data.ID) == nil {
+		t.Fatalf("mount %+v disk %v", m, ch.disk(data.ID))
+	}
+	g.reply(wire.TMountResult, wire.Result{ID: data.ID})
+	if o := observed(t, r); len(o.Mounts) != 1 || o.Mounts[0].Phase != podapi.DiskMounted {
+		t.Fatalf("observed %+v", o)
+	}
+	if e := r.disks[data.ID]; e.removing || !e.inVM || !e.mounted {
+		t.Fatalf("entry %+v", e)
+	}
+}
+
+// Genuine removal still ends Detached without attaching the device again.
+func TestRemovedDiskStaysDetached(t *testing.T) {
+	data := podapi.Disk{ID: "data", Serial: "data", Device: "/dev/data", Path: "/data"}
+	r, ch, g := mountedRuntime(t, data)
+	detach(t, r, g, data.ID)
+
+	r.reconcile()
+	g.none()
+	if ch.disk(data.ID) != nil {
+		t.Fatal("disk reattached")
+	}
+	if len(r.order) != 1 || r.order[0] != data.ID {
+		t.Fatalf("order %v", r.order)
+	}
+	if o := observed(t, r); len(o.Mounts) != 1 || o.Mounts[0].Phase != podapi.DiskDetached {
+		t.Fatalf("observed %+v", o)
+	}
+}
+
+// A detached read-only disk that is no longer wanted is forgotten instead of
+// lingering in order/observed.json, and re-adding it still attaches once.
+func TestDetachedReadOnlyDiskIsForgotten(t *testing.T) {
+	data := podapi.Disk{ID: "data", Serial: "data", Device: "/dev/data", Path: "/data", ReadOnly: true}
+	r, ch, g := mountedRuntime(t, data)
+
+	r.desired.Mounts = nil
+	r.reconcile()
+	g.expect(wire.TUnmount, nil)
+	g.reply(wire.TUnmountResult, wire.Result{ID: data.ID})
+	r.handleRemoved(<-r.removed)
+	r.reconcile() // the main loop reconciles before writing observed
+	r.writeObserved()
+	if o := observed(t, r); len(o.Mounts) != 0 {
+		t.Fatalf("stale detached mount: %+v", o.Mounts)
+	}
+	if len(r.order) != 0 || r.disks[data.ID] != nil {
+		t.Fatalf("order %v disk %+v", r.order, r.disks[data.ID])
+	}
+
+	r.desired.Mounts = []podapi.Disk{data}
+	r.reconcile()
+	g.expect(wire.TMount, nil)
+	if len(r.order) != 1 || r.order[0] != data.ID || ch.disk(data.ID) == nil {
+		t.Fatalf("order %v disk %v", r.order, ch.disk(data.ID))
+	}
+}

@@ -483,8 +483,28 @@ func (r *runtime) handleRemoved(res removeResult) {
 		e.phase, e.message, e.retryAt = podapi.DiskFailed, res.err.Error(), time.Now().Add(retryInterval)
 		return
 	}
+	if r.wanted(res.id) && !r.stopRequested() && r.exit == nil {
+		// The ID was re-added while the asynchronous removal was in
+		// flight. Do not record Detached: forget the removal state and let
+		// reconcileMounts run the normal attach path again. (While the VM
+		// is stopping there is nothing to attach for.)
+		e.inVM, e.mounted, e.waiting, e.phase, e.message = false, false, false, podapi.DiskAttaching, ""
+		e.retryAt = time.Time{}
+		log.Printf("disk %s removed; wanted again, reattaching", res.id)
+		return
+	}
 	e.inVM, e.phase, e.message = false, podapi.DiskDetached, ""
 	log.Printf("disk %s detached", res.id)
+}
+
+// wanted reports whether the attachment ID is in the current desired mounts.
+func (r *runtime) wanted(id string) bool {
+	for _, d := range r.desired.Mounts {
+		if d.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *runtime) stopRequested() bool { return r.desired.Stop || r.sigterm }
@@ -667,8 +687,13 @@ func (r *runtime) reconcileMounts(now time.Time) {
 			e = &disk{d: d, phase: podapi.DiskAttaching}
 			r.disks[d.ID] = e
 			r.order = append(r.order, d.ID)
+		} else if e.phase == podapi.DiskDetached {
+			// Wanted again after a detach: reset the entry and run the
+			// normal attach path below. Reusing the entry keeps order (and
+			// observed.json) free of duplicate records for the ID.
+			*e = disk{d: d, phase: podapi.DiskAttaching}
 		}
-		if e.waiting || e.removing || e.mounted || e.phase == podapi.DiskDetached || now.Before(e.retryAt) {
+		if e.waiting || e.removing || e.mounted || now.Before(e.retryAt) {
 			continue
 		}
 		e.d = d
@@ -685,9 +710,22 @@ func (r *runtime) reconcileMounts(now time.Time) {
 			e.phase = podapi.DiskAttaching
 		}
 	}
+	var stale []string
 	for _, id := range r.order {
 		e := r.disks[id]
-		if want[id] || e.waiting || e.removing || e.phase == podapi.DiskDetached || now.Before(e.retryAt) {
+		if want[id] || e.waiting || e.removing || now.Before(e.retryAt) {
+			continue
+		}
+		if e.phase == podapi.DiskDetached {
+			// A genuine removal has finished. A read-only disk is done
+			// with, so stop tracking it: the node has dropped the mount
+			// from Desired and keeping the record only accumulates stale
+			// entries in order/observed.json. Writable attachments stay
+			// visible because the node uses their Detached status to
+			// fence the final seal of the writer.
+			if e.d.ReadOnly {
+				stale = append(stale, id)
+			}
 			continue
 		}
 		switch {
@@ -703,6 +741,22 @@ func (r *runtime) reconcileMounts(now time.Time) {
 			go func() { r.removed <- removeResult{id, r.ch.removeDisk(id, removeTimeout)} }()
 		default:
 			e.phase = podapi.DiskDetached
+		}
+	}
+	for _, id := range stale {
+		r.dropDisk(id)
+	}
+}
+
+// dropDisk forgets a fully detached mount that is no longer desired.
+func (r *runtime) dropDisk(id string) {
+	delete(r.disks, id)
+	delete(r.frozen, id)
+	delete(r.freezeSkip, id)
+	for i, oid := range r.order {
+		if oid == id {
+			r.order = append(r.order[:i], r.order[i+1:]...)
+			break
 		}
 	}
 }
