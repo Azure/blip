@@ -93,7 +93,7 @@ type GatewaySpec struct {
 	// address, without a scheme, port, path, or brackets. Set it when Address
 	// is an IP or the certificate name differs from the dialed host.
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:XValidation:rule="!has(self.serverName) || size(self.serverName) == 0 || isIP(self.serverName) || self.serverName.matches('^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*[.]?$')",message="serverName must be a DNS name or IP address"
+	// +kubebuilder:validation:XValidation:rule="size(self) == 0 || isIP(self) || self.matches('^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*[.]?$')",message="serverName must be a DNS name or IP address"
 	ServerName string `json:"serverName,omitempty"`
 	// CAConfigMap names a ConfigMap in the pool namespace with a ca.crt key.
 	// When omitted, the system trust store verifies the gateway.
@@ -106,7 +106,7 @@ type GatewaySpec struct {
 	// +kubebuilder:default=blip-gateway
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=1024
-	// +kubebuilder:validation:XValidation:rule="!self.audience.trim().lowerAscii().matches('^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$')",message="audience must not be a Kubernetes API server audience"
+	// +kubebuilder:validation:XValidation:rule="!self.trim().lowerAscii().matches('^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$')",message="audience must not be a Kubernetes API server audience"
 	Audience string `json:"audience,omitempty"`
 	// LoopbackPort is the guest loopback TCP port for this gateway. 8001 is
 	// reserved for the Kubernetes API proxy.

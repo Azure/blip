@@ -88,7 +88,7 @@ spec:
                     type: string
                     x-kubernetes-validations:
                     - message: audience must not be a Kubernetes API server audience
-                      rule: '!self.audience.trim().lowerAscii().matches(''^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$'')'
+                      rule: '!self.trim().lowerAscii().matches(''^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$'')'
                   caConfigMap:
                     description: |-
                       CAConfigMap names a ConfigMap in the pool namespace with a ca.crt key.
@@ -113,8 +113,7 @@ spec:
                     type: string
                     x-kubernetes-validations:
                     - message: serverName must be a DNS name or IP address
-                      rule: '!has(self.serverName) || size(self.serverName) == 0 ||
-                        isIP(self.serverName) || self.serverName.matches(''^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*[.]?$'')'
+                      rule: size(self) == 0 || isIP(self) || self.matches('^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*[.]?$')
                 required:
                 - address
                 type: object

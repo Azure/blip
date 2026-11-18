@@ -20,7 +20,9 @@ import (
 var ErrUnreachable = errors.New("the VM is not reachable; it may have stopped or crashed")
 
 // Connector opens a byte stream to the guest session port of a VM pod. The
-// stream lives until it is closed or ctx is done.
+// stream lives until it is closed or ctx is done. Callers that must still
+// signal a guest after their own request is gone (the SSH gateway's hangup
+// path) have to pass a context that outlives that request.
 type Connector func(ctx context.Context, namespace, pod string) (io.ReadWriteCloser, error)
 
 // Client opens guest sessions.

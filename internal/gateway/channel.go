@@ -30,13 +30,22 @@ type sessionChannel struct {
 	name    string // short sandbox name, for messages
 	ch      ssh.Channel
 
+	// guestCtx owns the guest transport for this channel. It deliberately
+	// ignores the SSH connection's cancellation: after an abrupt disconnect
+	// the gateway still has to deliver HUP and then KILL over a live
+	// transport. handleSession cancels it once teardown is complete.
+	guestCtx context.Context
+
 	mu      sync.Mutex
 	open    wire.Open
 	sess    *session.Session
 	started bool
 	exited  bool
 	closing bool
-	resized chan struct{} // coalesced menu window changes
+	// hangupOnce makes the relay and the channel teardown agree on one
+	// HUP/grace/KILL sequence for the channel's current guest session.
+	hangupOnce sync.Once
+	resized    chan struct{} // coalesced menu window changes
 }
 
 func (s *Server) handleSession(ctx context.Context, owner, sandbox, name string, nch ssh.NewChannel) {
@@ -46,18 +55,35 @@ func (s *Server) handleSession(ctx context.Context, owner, sandbox, name string,
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	c := &sessionChannel{srv: s, owner: owner, sandbox: sandbox, name: name, ch: ch, open: wire.Open{Mode: wire.OpenExec}, resized: make(chan struct{}, 1)}
+	// The guest transport outlives the SSH connection, but only until this
+	// hangup path has finished. context.WithoutCancel also keeps its values.
+	guestCtx, guestCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer guestCancel()
+	c := &sessionChannel{srv: s, owner: owner, sandbox: sandbox, name: name, ch: ch, guestCtx: guestCtx, open: wire.Open{Mode: wire.OpenExec}, resized: make(chan struct{}, 1)}
 	for req := range reqs {
 		c.handle(ctx, req)
 	}
 	c.mu.Lock()
 	c.closing = true
+	c.mu.Unlock()
+	c.hangup()
+	ch.Close()
+}
+
+// hangup ends the channel's guest session when the SSH side went away before
+// the guest exited. The relay and the channel teardown can both observe that
+// loss; hangupOnce lets exactly one of them send HUP, wait out the grace
+// period and send KILL while the transport is still open. A nil session (no
+// guest opened yet, or already handed back to the menu) leaves the guard
+// untouched so a later open can still use it.
+func (c *sessionChannel) hangup() {
+	c.mu.Lock()
 	sess, exited := c.sess, c.exited
 	c.mu.Unlock()
-	if sess != nil && !exited {
-		hangupSession(c.srv.Log, sess)
+	if sess == nil || exited {
+		return
 	}
-	ch.Close()
+	c.hangupOnce.Do(func() { hangupSession(c.srv.Log, sess) })
 }
 
 func (c *sessionChannel) handle(ctx context.Context, req *ssh.Request) {
@@ -176,9 +202,17 @@ func newOpenID() string {
 // before pod exec reaches it, often when a user reconnects during the idle
 // save window. ErrUnreachable means no process reported an outcome, so
 // recreate the sandbox and try once more.
+//
+// Starting the sandbox follows ctx, which ends with the SSH request, but the
+// transport itself uses c.guestCtx so a hangup can still signal the guest
+// after the SSH connection has disappeared.
 func (c *sessionChannel) openSession(ctx context.Context, o wire.Open, nl string) (*session.Session, error) {
 	if o.OpenID == "" {
 		o.OpenID = newOpenID()
+	}
+	guestCtx := c.guestCtx
+	if guestCtx == nil {
+		guestCtx = ctx
 	}
 	for attempt := 0; ; attempt++ {
 		startCtx, cancel := context.WithTimeout(ctx, startTimeout)
@@ -187,7 +221,7 @@ func (c *sessionChannel) openSession(ctx context.Context, o wire.Open, nl string
 		if err != nil {
 			return nil, err
 		}
-		sess, err := c.srv.Sessions.Open(ctx, c.srv.Namespace, pod, o)
+		sess, err := c.srv.Sessions.Open(guestCtx, c.srv.Namespace, pod, o)
 		if err == nil || attempt > 0 || !errors.Is(err, session.ErrUnreachable) {
 			return sess, err
 		}
@@ -209,16 +243,18 @@ func (c *sessionChannel) run(ctx context.Context, req *ssh.Request, o wire.Open)
 		req.Reply(false, nil)
 		return
 	}
-	defer sess.Close()
 	c.mu.Lock()
+	c.sess = sess
 	if c.closing || ctx.Err() != nil {
 		c.mu.Unlock()
-		hangupSession(c.srv.Log, sess)
+		c.hangup()
+		sess.Close()
 		return
 	}
-	c.sess = sess
 	c.mu.Unlock()
 	stopResize := c.resizeGuest(ctx, sess, o)
+	// Close only after the hangup path below has had a chance to signal the
+	// guest. hangupSession closes the transport itself; Close is idempotent.
 	defer func() {
 		sess.Close()
 		stopResize()
@@ -233,12 +269,22 @@ func (c *sessionChannel) run(ctx context.Context, req *ssh.Request, o wire.Open)
 	exit, err := sess.Copy(c.ch, c.ch.Stderr(), func(m string) {
 		fmt.Fprintf(c.ch.Stderr(), "blip: %s%s", m, nl)
 	})
-	c.mu.Lock()
-	c.exited = true
-	c.mu.Unlock()
 	if err != nil {
+		// A write to the (now dead) SSH channel failed: the guest may still
+		// be running, so HUP/KILL it over the independent transport before
+		// this function closes that transport. ErrDisconnected instead means
+		// the guest stream itself ended; there is nothing left to signal.
+		if !errors.Is(err, session.ErrDisconnected) {
+			c.hangup()
+		}
 		fmt.Fprintf(c.ch.Stderr(), "blip: %v%s", err, nl)
 		exit = &wire.Exit{Code: 255}
+	} else {
+		// Only a real exit status means the guest is gone and teardown must
+		// not signal it.
+		c.mu.Lock()
+		c.exited = true
+		c.mu.Unlock()
 	}
 	if exit.Reason == wire.ReasonStopped {
 		fmt.Fprintf(c.ch.Stderr(), "blip: %q stopped; reconnect to resume.%s", c.name, nl)

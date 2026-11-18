@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -643,15 +644,22 @@ func TestCollectConcurrentWaitsForFreshAttachment(t *testing.T) {
 	a, root, b := collectFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	b.Status.Mounts[0].AttachmentID = "old-attachment"
-	b.Status.Mounts[0].CommitID = "old-version"
+	mountPath := filepath.Join(collectMountRoot, "data")
+	b.Status.Mounts[0] = v1alpha1.MountStatus{
+		State: "data", Path: mountPath, Phase: v1alpha1.MountUnmounting,
+		AttachmentID: "old-attachment", CommitID: "old-version",
+	}
 	if err := a.c.Kube.Status().Update(ctx, b); err != nil {
 		t.Fatal(err)
 	}
 	waiting := make(chan struct{}, 2)
+	a.env.ProgressDelay = 0
 	a.env.Err = writerFunc(func(p []byte) (int, error) {
 		if strings.Contains(string(p), "finish detaching") {
-			waiting <- struct{}{}
+			select {
+			case waiting <- struct{}{}:
+			default:
+			}
 		}
 		return len(p), nil
 	})
@@ -665,33 +673,60 @@ func TestCollectConcurrentWaitsForFreshAttachment(t *testing.T) {
 			_, cleanup, err := a.collectMount(ctx, "data")
 			done <- result{cleanup, err}
 		}()
-		// Start the second collector after the first publishes the temporary
-		// mount. Reuse must inherit its pending-attachment requirement.
+		// Neither collector may add the mount while the old attachment is
+		// visible, or the controller could revive that attachment.
 		select {
 		case <-waiting:
 		case r := <-done:
-			t.Fatalf("collect returned before the old attachment was replaced: %v", r.err)
+			t.Fatalf("collect returned before the old attachment detached: %v", r.err)
 		case <-ctx.Done():
-			t.Fatal("collect did not wait for a fresh attachment")
+			t.Fatal("collect did not wait for the old attachment to detach")
 		}
 	}
 	s, err := a.getState(ctx, root.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u := mountUsers(s)["data"]; u.Users != 2 || u.PreviousAttachment != "old-attachment" {
-		t.Fatalf("shared attachment metadata: %+v", u)
+	if len(s.Spec.Mounts) != 0 {
+		t.Fatalf("mount was re-added while the old attachment was visible: %+v", s.Spec.Mounts)
 	}
+
+	// The old mount detaches, then both collectors add and share one mount.
 	b, err = a.getBlip(ctx, b.Name)
 	if err != nil {
 		t.Fatal(err)
+	}
+	b.Status.Mounts = nil
+	if err := a.c.Kube.Status().Update(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	for shared := false; !shared; {
+		s, err = a.getState(ctx, root.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shared = mountUsers(s)["data"].Users == 2
+		select {
+		case r := <-done:
+			t.Fatalf("collect returned before a new mount attached: %v", r.err)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if u := mountUsers(s)["data"]; u.PreviousAttachment != "" {
+		t.Fatalf("stale attachment was carried into the new mount: %+v", u)
 	}
 	data, err := a.getState(ctx, "data")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b.Status.Mounts[0].AttachmentID = "new-attachment"
-	b.Status.Mounts[0].CommitID = data.Status.Committed.ID
+	b, err = a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: mountPath, Phase: v1alpha1.MountMounted,
+		AttachmentID: "new-attachment", CommitID: data.Status.Committed.ID,
+	}}
 	if err := a.c.Kube.Status().Update(ctx, b); err != nil {
 		t.Fatal(err)
 	}
@@ -709,6 +744,112 @@ func TestCollectConcurrentWaitsForFreshAttachment(t *testing.T) {
 	}
 	for _, cleanup := range cleanups {
 		cleanup()
+	}
+	s, err = a.getState(ctx, root.Name)
+	if err != nil || len(s.Spec.Mounts) != 0 || len(mountUsers(s)) != 0 {
+		t.Fatalf("temporary mount was not released: %+v %v", s, err)
+	}
+}
+
+// TestCollectWaitsForOldAttachmentDetach covers back-to-back collects of one
+// state: the second collect finds the previous read-only attachment still in
+// status and must let it detach before adding the mount again.
+func TestCollectWaitsForOldAttachmentDetach(t *testing.T) {
+	a, root, b := collectFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	mountPath := filepath.Join(collectMountRoot, "data")
+	b.Status.Mounts[0] = v1alpha1.MountStatus{
+		State: "data", Path: mountPath, Phase: v1alpha1.MountUnmounting,
+		AttachmentID: "old-attachment", CommitID: "old-version",
+	}
+	if err := a.c.Kube.Status().Update(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	a.env.ProgressDelay = 0
+	waiting := make(chan struct{}, 1)
+	a.env.Err = writerFunc(func(p []byte) (int, error) {
+		if strings.Contains(string(p), "finish detaching") {
+			select {
+			case waiting <- struct{}{}:
+			default:
+			}
+		}
+		return len(p), nil
+	})
+	type result struct {
+		dir     string
+		cleanup func()
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		dir, cleanup, err := a.collectMount(ctx, "data")
+		done <- result{dir, cleanup, err}
+	}()
+	select {
+	case <-waiting:
+	case r := <-done:
+		t.Fatalf("collect returned before the old attachment detached: %v", r.err)
+	case <-ctx.Done():
+		t.Fatal("collect did not report waiting for the old attachment")
+	}
+	s, err := a.getState(ctx, root.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findSpecMount(s.Spec.Mounts, "data") != nil {
+		t.Fatalf("mount was re-added while the old attachment was visible: %+v", s.Spec.Mounts)
+	}
+
+	// Detach the old mount; the collect then adds the mount and waits for
+	// its fresh attachment.
+	b, err = a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Status.Mounts = nil
+	if err := a.c.Kube.Status().Update(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	for added := false; !added; {
+		s, err = a.getState(ctx, root.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		added = findSpecMount(s.Spec.Mounts, "data") != nil
+		select {
+		case r := <-done:
+			t.Fatalf("collect returned before a fresh attachment: %v", r.err)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	data, err := a.getState(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err = a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: mountPath, Phase: v1alpha1.MountMounted,
+		AttachmentID: "new-attachment", CommitID: data.Status.Committed.ID,
+	}}
+	if err := a.c.Kube.Status().Update(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("collect failed after the fresh attachment: %v", r.err)
+		}
+		if r.dir != mountPath {
+			t.Fatalf("mount path %q, want %q", r.dir, mountPath)
+		}
+		r.cleanup()
+	case <-ctx.Done():
+		t.Fatal("collect did not accept the fresh attachment")
 	}
 	s, err = a.getState(ctx, root.Name)
 	if err != nil || len(s.Spec.Mounts) != 0 || len(mountUsers(s)) != 0 {
@@ -803,6 +944,30 @@ func TestCollectReusesDurableMountWithStaleAnnotation(t *testing.T) {
 	s, _ = a.getState(ctx, root.Name)
 	if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].BlipUID != "" {
 		t.Fatalf("durable mount removed: %+v", s.Spec.Mounts)
+	}
+}
+
+// TestCollectBackToBackLoops runs collects of one state without a pause, the
+// shape that used to copy from a mount path the previous collect had already
+// detached.
+func TestCollectBackToBackLoops(t *testing.T) {
+	root := withCollectMountRoot(t)
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/out/f.txt", "hello\n", 0o644)
+	dir := t.TempDir()
+	for i := range 10 {
+		dst := filepath.Join(dir, fmt.Sprintf("f%d", i))
+		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/f.txt:"+dst)
+		if code != 0 {
+			t.Fatalf("cycle %d: code %d: %s", i, code, errOut)
+		}
+		if got := readFile(t, dst); got != "hello\n" {
+			t.Fatalf("cycle %d: content %q", i, got)
+		}
+		assertCollectReleased(t, h, "alice.box", "alice.w1")
 	}
 }
 

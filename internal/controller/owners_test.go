@@ -63,6 +63,17 @@ func TestVMOwnersWrittenBeforeClaim(t *testing.T) {
 	if got := e.owners(); !maps.Equal(got, want) {
 		t.Fatalf("owners = %v, want %v", got, want)
 	}
+	// Claimed pods carry their owner for the guest API proxy. Warm pods stay
+	// unlabelled so they are never exposed.
+	if got := e.getPod(b.Status.Pod).Labels[LabelOwner]; got != testOwner {
+		t.Errorf("owned pod owner label = %q", got)
+	}
+	if got := e.getPod(plain.Status.Pod).Labels[LabelOwner]; got != ownerAny {
+		t.Errorf("unrestricted pod owner label = %q", got)
+	}
+	if uid := e.getPod(b.Status.Pod).Labels[LabelBlipUID]; uid != string(b.UID) {
+		t.Errorf("owned pod lost its blip UID label: %q", uid)
+	}
 }
 
 func TestVMOwnersSync(t *testing.T) {
@@ -152,6 +163,10 @@ func TestVMOwnersRestoredAfterLostClaim(t *testing.T) {
 	}
 	if got := e.owners()[stale.Name]; got != ownerAny {
 		t.Fatalf("owner of %s = %q, want %q", stale.Name, got, ownerAny)
+	}
+	// A failed claim must not relabel a pod that another Blip still owns.
+	if got := e.getPod(stale.Name).Labels[LabelOwner]; got != ownerAny {
+		t.Fatalf("failed claim changed owner label of %s to %q", stale.Name, got)
 	}
 
 	// A claim of a pod that is gone leaves no entry behind.

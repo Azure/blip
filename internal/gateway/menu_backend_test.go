@@ -246,7 +246,7 @@ func TestMenuBackendRejectsStaleUIDAndChangedOwnership(t *testing.T) {
 			if err := s.menuBackend("alice").Delete(context.Background(), entry); err == nil {
 				t.Fatal("unsafe delete accepted")
 			}
-			if _, err := s.openState(context.Background(), "alice", entry, wire.Open{Mode: wire.OpenExec}); err == nil {
+			if _, err := s.openState(context.Background(), context.Background(), "alice", entry, wire.Open{Mode: wire.OpenExec}); err == nil {
 				t.Fatal("unsafe open accepted")
 			}
 			for _, obj := range []client.Object{st, worker} {
@@ -305,7 +305,7 @@ func TestOpenStateTargetsRunningWorkersByReference(t *testing.T) {
 			}}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			sess, err := s.openState(ctx, "alice", stateEntry(st, "alice"), wire.Open{Mode: wire.OpenExec})
+			sess, err := s.openState(ctx, ctx, "alice", stateEntry(st, "alice"), wire.Open{Mode: wire.OpenExec})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -334,7 +334,7 @@ func TestOpenStateRetryReusesOpenID(t *testing.T) {
 		}
 		return guest.Connect(ctx, namespace, pod)
 	}}
-	sess, err := s.openState(context.Background(), "alice", stateEntry(st, "alice"), wire.Open{Mode: wire.OpenExec})
+	sess, err := s.openState(context.Background(), context.Background(), "alice", stateEntry(st, "alice"), wire.Open{Mode: wire.OpenExec})
 	if err != nil {
 		t.Fatal(err)
 	}
