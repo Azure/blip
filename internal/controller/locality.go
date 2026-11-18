@@ -145,7 +145,16 @@ func replicatedData(b *v1.Blip, imageStates map[string]bool) bool {
 // or it would wait forever. While the states are still being built, a Blip
 // created before its state (a fork) has no home yet; leave locality unset so
 // the pool does not boot a VM away from data that is about to appear.
-func updateLocality(b *v1.Blip, home []string, settled bool) {
+//
+// replicated means every durable filesystem is an image state, which every
+// eligible node holds. Such a Blip has no home node: it must claim any warm
+// VM at once instead of waiting out localWait for a VM on one node while the
+// pool, correctly, refuses to pin an image state there.
+func updateLocality(b *v1.Blip, home []string, settled, replicated bool) {
+	if replicated {
+		b.Status.Locality = nil
+		return
+	}
 	loc := b.Status.Locality
 	switch {
 	case loc != nil && loc.Fallback:

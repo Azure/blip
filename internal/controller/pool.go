@@ -213,7 +213,8 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// stateful Blip is usually created just before its state (a fork), so
 	// booting a generic VM now and a pinned one a moment later would double
 	// the pool. Wait for the locality the Blip reconciler writes with its
-	// state.
+	// state. Data made only of image states has no home node at all; it is
+	// demand for a generic VM, not deferred.
 	deferred := 0
 	// pinned counts, per node, the waiting Blips whose data lives there.
 	pinned := map[string]int{}
@@ -222,7 +223,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		if !countsAsDemand(b, pool.Name) || claimed[b.UID] {
 			continue
 		}
-		if hasDurableData(b) && b.Status.Locality == nil {
+		if hasDurableData(b) && b.Status.Locality == nil && !replicatedData(b, replicated) {
 			deferred++
 			continue
 		}

@@ -349,8 +349,17 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	// Image states are held by every eligible node, so a Blip using only
+	// image states has no home node. Pass that in so it does not wait for a
+	// VM on one node while the pool refuses to pin one there.
+	imageStates := map[string]bool{}
+	for name, st := range all {
+		if st.Spec.Image != "" {
+			imageStates[name] = true
+		}
+	}
 	home := homeNodes(placementScores(b, all), cl, poolSelector(pool))
-	updateLocality(b, home, waitReason == "")
+	updateLocality(b, home, waitReason == "", replicatedData(b, imageStates))
 	if waitReason != "" {
 		wait(b, waitReason, waitMsg)
 		return reconcile.Result{}, r.unclaim(ctx, b)
