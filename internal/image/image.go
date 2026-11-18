@@ -138,13 +138,15 @@ func writeTar(w io.Writer, r io.Reader) error {
 // writeTarTo copies the tar stream r to w with clean relative names. It emits
 // every path once, parents before their children, and resolves a parent path
 // through a symlink the image defines in any layer (Debian's /bin -> usr/bin),
-// so a child of that parent lands at the path the kernel would use. mke2fs
-// applies tar entries strictly in order and does not follow a symlinked parent.
+// so a child of that parent lands at the path the kernel would use. It also
+// emits a hardlink's target before the link itself. mke2fs applies tar entries
+// strictly in order and neither follows a symlinked parent nor defers a
+// hardlink to a target that has not been created yet.
 //
 // The stream from mutate.Extract is ordered top layer first, so the symlink
-// can appear after the entry that depends on it. writeTarTo therefore buffers
-// the file bodies on disk and builds the merged namespace before writing
-// anything.
+// and the hardlink target it needs can appear after the entry that depends on
+// them. writeTarTo therefore buffers the file bodies on disk and builds the
+// merged namespace before writing anything.
 func writeTarTo(w io.Writer, r io.Reader, dir string) error {
 	spool, err := os.CreateTemp(dir, "image-*.body")
 	if err != nil {
@@ -246,12 +248,42 @@ func writeTarTo(w io.Writer, r io.Reader, dir string) error {
 	for name := range final {
 		names = append(names, name)
 	}
-	// Sorting puts a parent before every child because the parent is a prefix
-	// of the child's name.
 	slices.Sort(names)
-	for _, name := range names {
-		e := final[name]
+	emitted := map[string]bool{}
+	active := map[string]bool{}
+	var emit func(string) error
+	emit = func(name string) error {
+		if emitted[name] || active[name] {
+			return nil
+		}
+		e, ok := final[name]
+		if !ok {
+			return nil
+		}
+		active[name] = true
+		defer delete(active, name)
+		if p := parentName(name); p != "" {
+			if err := emit(p); err != nil {
+				return err
+			}
+		}
 		hdr := *e.hdr
+		if hdr.Typeflag == tar.TypeLink {
+			// Emit the target first: mke2fs does not defer hardlinks.
+			if tgt := hdr.Linkname; tgt != "" {
+				if err := emit(tgt); err != nil {
+					return err
+				}
+			}
+			if hdr.Linkname == "" || hdr.Linkname == name || !emitted[hdr.Linkname] {
+				// The target is not part of the archive (a later layer may
+				// have removed it) or the links form a cycle. An empty regular
+				// file is better than an import that never succeeds.
+				hdr.Typeflag = tar.TypeReg
+				hdr.Linkname = ""
+				hdr.Size = 0
+			}
+		}
 		if err := tw.WriteHeader(&hdr); err != nil {
 			return err
 		}
@@ -262,6 +294,13 @@ func writeTarTo(w io.Writer, r io.Reader, dir string) error {
 			if _, err := io.CopyN(tw, spool, hdr.Size); err != nil {
 				return err
 			}
+		}
+		emitted[name] = true
+		return nil
+	}
+	for _, name := range names {
+		if err := emit(name); err != nil {
+			return err
 		}
 	}
 	return tw.Close()

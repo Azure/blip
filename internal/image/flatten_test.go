@@ -136,6 +136,84 @@ func TestFlattenSymlinkedParent(t *testing.T) {
 	}
 }
 
+// A hardlink in a higher layer points at a file in a lower layer. mutate.Extract
+// emits the link first; mke2fs needs the target first.
+func TestFlattenHardlinkAcrossLayers(t *testing.T) {
+	base := layer(t,
+		entry{hdr: tar.Header{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "usr/bin/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "usr/bin/x", Typeflag: tar.TypeReg, Mode: 0o755}, body: "x"},
+	)
+	top := layer(t, entry{hdr: tar.Header{Name: "usr/bin/y", Typeflag: tar.TypeLink, Linkname: "usr/bin/x"}})
+	img, err := mutate.AppendLayers(empty.Image, base, top)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := flatten(t, img)
+
+	x, xi := findEntry(entries, "usr/bin/x")
+	y, yi := findEntry(entries, "usr/bin/y")
+	if xi < 0 || yi < 0 {
+		t.Fatalf("tar lacks usr/bin/x or usr/bin/y: %v", names(entries))
+	}
+	if xi > yi {
+		t.Errorf("hardlink usr/bin/y precedes its target usr/bin/x: %v", names(entries))
+	}
+	if y.hdr.Typeflag != tar.TypeLink || y.hdr.Linkname != "usr/bin/x" {
+		t.Errorf("usr/bin/y = type %c link %q, want hardlink to usr/bin/x", y.hdr.Typeflag, y.hdr.Linkname)
+	}
+	if x.hdr.Typeflag != tar.TypeReg || x.body != "x" {
+		t.Errorf("usr/bin/x = type %c body %q, want regular file %q", x.hdr.Typeflag, x.body, "x")
+	}
+	checkParents(t, entries)
+}
+
+// The hardlink target can sort after the link, and it may sit in another
+// directory: the emitter must pull the target forward, parents included.
+func TestFlattenHardlinkTargetSortsLater(t *testing.T) {
+	base := layer(t,
+		entry{hdr: tar.Header{Name: "z/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		entry{hdr: tar.Header{Name: "z/target", Typeflag: tar.TypeReg, Mode: 0o755}, body: "data"},
+	)
+	top := layer(t, entry{hdr: tar.Header{Name: "a", Typeflag: tar.TypeLink, Linkname: "z/target"}})
+	img, err := mutate.AppendLayers(empty.Image, base, top)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := flatten(t, img)
+
+	target, ti := findEntry(entries, "z/target")
+	link, li := findEntry(entries, "a")
+	if ti < 0 || li < 0 {
+		t.Fatalf("tar lacks z/target or a: %v", names(entries))
+	}
+	if ti > li {
+		t.Errorf("hardlink a precedes its target z/target: %v", names(entries))
+	}
+	if link.hdr.Typeflag != tar.TypeLink || link.hdr.Linkname != "z/target" {
+		t.Errorf("a = type %c link %q, want hardlink to z/target", link.hdr.Typeflag, link.hdr.Linkname)
+	}
+	if target.body != "data" {
+		t.Errorf("z/target body = %q, want %q", target.body, "data")
+	}
+	checkParents(t, entries)
+}
+
+// A hardlink whose target is not in the flattened stream (a later layer
+// whiteouted it) is materialised as a regular file so the import can proceed.
+func TestFlattenHardlinkMissingTarget(t *testing.T) {
+	img := layerImage(t, entry{hdr: tar.Header{Name: "y", Typeflag: tar.TypeLink, Linkname: "gone"}})
+	entries := flatten(t, img)
+
+	y, i := findEntry(entries, "y")
+	if i < 0 {
+		t.Fatalf("tar lacks y: %v", names(entries))
+	}
+	if y.hdr.Typeflag != tar.TypeReg || y.hdr.Linkname != "" || y.hdr.Size != 0 {
+		t.Errorf("y = type %c link %q size %d, want an empty regular file", y.hdr.Typeflag, y.hdr.Linkname, y.hdr.Size)
+	}
+}
+
 func TestResolvePath(t *testing.T) {
 	links := map[string]string{
 		"bin":   "usr/bin",
@@ -163,6 +241,15 @@ func TestResolvePath(t *testing.T) {
 	if got, ok := resolvePath("a/x", links); ok {
 		t.Errorf("resolvePath(%q) = %q, true; want a symlink loop", "a/x", got)
 	}
+}
+
+func layerImage(t *testing.T, entries ...entry) v1.Image {
+	t.Helper()
+	img, err := mutate.AppendLayers(empty.Image, layer(t, entries...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return img
 }
 
 func names(entries []entry) []string {
