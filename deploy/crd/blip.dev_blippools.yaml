@@ -1,0 +1,424 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: blippools.blip.dev
+spec:
+  group: blip.dev
+  names:
+    kind: BlipPool
+    listKind: BlipPoolList
+    plural: blippools
+    singular: blippool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.warmCount
+      name: Warm
+      type: integer
+    - jsonPath: .status.ready
+      name: Ready
+      type: integer
+    - jsonPath: .status.claimed
+      name: Claimed
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BlipPoolSpec describes a VM shape and how many warm VMs to keep. Pools are
+              image independent: a warm VM has no root disk until it is claimed.
+            properties:
+              cpus:
+                default: 2
+                format: int32
+                minimum: 1
+                type: integer
+              hypervisor:
+                default: kvm
+                enum:
+                - kvm
+                type: string
+              imagePullSecrets:
+                description: |-
+                  ImagePullSecrets are merged into the image root of blips claimed
+                  through this pool. Image states use their own imagePullSecrets.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+              maxCount:
+                description: MaxCount caps vacant plus claimed VM pods. 0 means no
+                  cap.
+                format: int32
+                minimum: 0
+                type: integer
+              memory:
+                anyOf:
+                - type: integer
+                - type: string
+                default: 2Gi
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+              network:
+                description: |-
+                  Network is the maximum egress allowed for this pool. Omitted applies the
+                  default policy: public internet egress on any port, LAN and other
+                  non-public ranges denied, and cluster DNS (kube-dns) allowed. An
+                  explicitly empty policy denies all egress. Changes apply to running blips.
+                properties:
+                  egress:
+                    items:
+                      description: NetworkEgressRule allows the intersection of its
+                        destinations and ports.
+                      properties:
+                        ports:
+                          description: |-
+                            Ports allows numeric TCP/UDP destination ports. Omitted or empty means
+                            all IP protocols and ports. Service ports are not translated here.
+                          items:
+                            description: NetworkPort is a numeric destination port
+                              or inclusive port range.
+                            properties:
+                              endPort:
+                                format: int32
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              port:
+                                format: int32
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              protocol:
+                                default: TCP
+                                description: Protocol defines network protocols supported
+                                  for things like container ports.
+                                enum:
+                                - TCP
+                                - UDP
+                                type: string
+                            required:
+                            - port
+                            type: object
+                            x-kubernetes-validations:
+                            - message: endPort must be at least port
+                              rule: '!has(self.endPort) || self.endPort >= self.port'
+                          maxItems: 64
+                          type: array
+                        to:
+                          description: To selects destinations. Omitted or empty means
+                            all IPv4 destinations.
+                          items:
+                            description: |-
+                              NetworkPeer selects an IP block, pods, or services. Pod and namespace
+                              selectors are ANDed; service and namespace selectors are ANDed. Without a
+                              namespace selector, selectors are scoped to the Blip's namespace.
+                            properties:
+                              ipBlock:
+                                description: IPBlock allows an IPv4 CIDR minus its
+                                  strictly smaller exception CIDRs.
+                                properties:
+                                  cidr:
+                                    description: CIDR is an IPv4 destination range,
+                                      for example 192.0.2.0/24.
+                                    maxLength: 18
+                                    type: string
+                                  except:
+                                    description: Except removes IPv4 subranges from
+                                      CIDR.
+                                    items:
+                                      maxLength: 18
+                                      type: string
+                                    maxItems: 32
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - cidr
+                                type: object
+                                x-kubernetes-validations:
+                                - message: cidr must be a valid IPv4 CIDR
+                                  rule: isCIDR(self.cidr) && cidr(self.cidr).ip().family()
+                                    == 4
+                                - message: exceptions must be IPv4 CIDRs strictly
+                                    inside cidr
+                                  rule: '!has(self.except) || self.except.all(c, isCIDR(c)
+                                    && cidr(c).ip().family() == 4 && cidr(self.cidr).containsCIDR(cidr(c))
+                                    && cidr(c).prefixLength() > cidr(self.cidr).prefixLength())'
+                              namespaceSelector:
+                                description: NamespaceSelector selects namespaces
+                                  by label; alone it selects pods.
+                                properties:
+                                  matchExpressions:
+                                    description: matchExpressions is a list of label
+                                      selector requirements. The requirements are
+                                      ANDed.
+                                    items:
+                                      description: |-
+                                        A label selector requirement is a selector that contains values, a key, and an operator that
+                                        relates the key and values.
+                                      properties:
+                                        key:
+                                          description: key is the label key that the
+                                            selector applies to.
+                                          type: string
+                                        operator:
+                                          description: |-
+                                            operator represents a key's relationship to a set of values.
+                                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                                          type: string
+                                        values:
+                                          description: |-
+                                            values is an array of string values. If the operator is In or NotIn,
+                                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                            the values array must be empty. This array is replaced during a strategic
+                                            merge patch.
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    description: |-
+                                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              podSelector:
+                                description: |-
+                                  PodSelector selects direct PodIPs, excluding host-networked, terminal,
+                                  and deleting pods whose old addresses may have been reassigned.
+                                properties:
+                                  matchExpressions:
+                                    description: matchExpressions is a list of label
+                                      selector requirements. The requirements are
+                                      ANDed.
+                                    items:
+                                      description: |-
+                                        A label selector requirement is a selector that contains values, a key, and an operator that
+                                        relates the key and values.
+                                      properties:
+                                        key:
+                                          description: key is the label key that the
+                                            selector applies to.
+                                          type: string
+                                        operator:
+                                          description: |-
+                                            operator represents a key's relationship to a set of values.
+                                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                                          type: string
+                                        values:
+                                          description: |-
+                                            values is an array of string values. If the operator is In or NotIn,
+                                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                            the values array must be empty. This array is replaced during a strategic
+                                            merge patch.
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    description: |-
+                                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              serviceSelector:
+                                description: |-
+                                  ServiceSelector selects ClusterIPs, or EndpointSlice IPv4 addresses for
+                                  headless services. ExternalName services have no selectable address.
+                                properties:
+                                  matchExpressions:
+                                    description: matchExpressions is a list of label
+                                      selector requirements. The requirements are
+                                      ANDed.
+                                    items:
+                                      description: |-
+                                        A label selector requirement is a selector that contains values, a key, and an operator that
+                                        relates the key and values.
+                                      properties:
+                                        key:
+                                          description: key is the label key that the
+                                            selector applies to.
+                                          type: string
+                                        operator:
+                                          description: |-
+                                            operator represents a key's relationship to a set of values.
+                                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                                          type: string
+                                        values:
+                                          description: |-
+                                            values is an array of string values. If the operator is In or NotIn,
+                                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                            the values array must be empty. This array is replaced during a strategic
+                                            merge patch.
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    description: |-
+                                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                            type: object
+                            x-kubernetes-validations:
+                            - message: a peer must select an IP block, pods, namespaces,
+                                or services
+                              rule: has(self.ipBlock) || has(self.podSelector) ||
+                                has(self.namespaceSelector) || has(self.serviceSelector)
+                            - message: ipBlock cannot be combined with selectors
+                              rule: '!has(self.ipBlock) || !(has(self.podSelector)
+                                || has(self.namespaceSelector) || has(self.serviceSelector))'
+                            - message: podSelector and serviceSelector cannot be combined
+                              rule: '!(has(self.podSelector) && has(self.serviceSelector))'
+                          maxItems: 64
+                          type: array
+                      type: object
+                    maxItems: 64
+                    type: array
+                type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: |-
+                  NodeSelector selects the nodes that run this pool's VMs. It must be
+                  non-empty: matching nodes are enrolled automatically and run the node
+                  agent.
+                minProperties: 1
+                type: object
+              serviceAccountName:
+                description: ServiceAccountName is the identity of VMs in this pool.
+                type: string
+              tolerations:
+                items:
+                  description: |-
+                    The pod this Toleration is attached to tolerates any taint that matches
+                    the triple <key,value,effect> using the matching operator <operator>.
+                  properties:
+                    effect:
+                      description: |-
+                        Effect indicates the taint effect to match. Empty means match all taint effects.
+                        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                      type: string
+                    key:
+                      description: |-
+                        Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                      type: string
+                    operator:
+                      description: |-
+                        Operator represents a key's relationship to the value.
+                        Valid operators are Exists and Equal. Defaults to Equal.
+                        Exists is equivalent to wildcard for value, so that a pod can
+                        tolerate all taints of a particular category.
+                      type: string
+                    tolerationSeconds:
+                      description: |-
+                        TolerationSeconds represents the period of time the toleration (which must be
+                        of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                        it is not set, which means tolerate the taint forever (do not evict). Zero and
+                        negative values will be treated as 0 (evict immediately) by the system.
+                      format: int64
+                      type: integer
+                    value:
+                      description: |-
+                        Value is the taint value the toleration matches to.
+                        If the operator is Exists, the value should be empty, otherwise just a regular string.
+                      type: string
+                  type: object
+                type: array
+              warmCount:
+                description: WarmCount is the number of vacant, booted VMs to keep
+                  ready.
+                format: int32
+                minimum: 0
+                type: integer
+            required:
+            - nodeSelector
+            type: object
+          status:
+            properties:
+              claimed:
+                format: int32
+                type: integer
+              ready:
+                description: Ready counts vacant VMs that finished booting.
+                format: int32
+                type: integer
+              vacant:
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,54 @@
+// Command blip-runtime runs one blip VM inside a VM pod.
+//
+//	blip-runtime              supervise Cloud Hypervisor (see docs/ARCHITECTURE.md)
+//	blip-runtime bridge PORT  relay stdin/stdout to a guest vsock port
+//	blip-runtime api-proxy    serve the VM-only Kubernetes API proxy
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+
+	"github.com/Azure/blip/internal/apiproxy"
+	"github.com/Azure/blip/internal/runtime"
+)
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.SetPrefix("blip-runtime: ")
+	if len(os.Args) == 2 && os.Args[1] == "api-proxy" {
+		cfg, err := apiproxy.ConfigFromEnv()
+		if err != nil {
+			log.Fatal(err)
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		defer cancel()
+		if err := apiproxy.Run(ctx, cfg); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	o := runtime.OptionsFromEnv()
+	if len(os.Args) == 3 && os.Args[1] == "bridge" {
+		port, err := strconv.ParseUint(os.Args[2], 10, 32)
+		if err != nil {
+			log.Fatalf("bad port %q", os.Args[2])
+		}
+		if err := runtime.Bridge(o, uint32(port)); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: blip-runtime [bridge PORT | api-proxy]")
+		os.Exit(2)
+	}
+	if err := runtime.Run(o); err != nil {
+		log.Fatal(err)
+	}
+}

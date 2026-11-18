@@ -1,0 +1,20 @@
+# Built by hack/build-images.sh from binaries prebuilt with `make build`.
+# Nodes convert container images with `mke2fs -d <tarball>`, which needs
+# e2fsprogs >= 1.47.1 (trixie ships 1.47.2) and libarchive, which mke2fs
+# loads at runtime.
+FROM debian:trixie-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        dmsetup \
+        e2fsprogs \
+        iproute2 \
+        kmod \
+        libarchive13t64 \
+        nftables \
+        nvme-cli \
+        thin-provisioning-tools \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/*
+COPY bin/blip-node /usr/local/bin/blip-node
+ENTRYPOINT ["/usr/local/bin/blip-node"]

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: blip-system
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+# The SSH gateway's sandboxes (BlipStates, Blips and their VM pods) live here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: blip-ssh
+  labels:
+    pod-security.kubernetes.io/enforce: privileged

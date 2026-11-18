@@ -1,0 +1,11 @@
+# Built by hack/build-images.sh from binaries prebuilt with `make build` and
+# guest assets from `make guest`. The script stages the (static) Cloud
+# Hypervisor binary in build/images/.
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 nftables \
+    && rm -rf /var/lib/apt/lists/*
+COPY build/images/cloud-hypervisor /usr/local/bin/cloud-hypervisor
+COPY build/guest/vmlinuz build/guest/initramfs.gz /opt/blip/
+COPY bin/blip-runtime /usr/local/bin/blip-runtime
+ENTRYPOINT ["/usr/local/bin/blip-runtime"]

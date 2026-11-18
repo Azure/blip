@@ -1,0 +1,166 @@
+name: Images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CLOUD_HYPERVISOR_VERSION: v54.1
+  DEBIAN_SUITE: trixie
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Dockerfiles install arch-specific packages (and the runtime
+          # image bundles an architecture-specific kernel), so build each
+          # architecture on a native runner instead of emulating the other one.
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set image repository
+        run: echo "IMAGE_REPO=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cpio e2fsprogs kmod xz-utils zstd
+      - name: Build binaries
+        run: make build
+      - name: Build guest assets
+        run: |
+          # Use Debian's cloud kernel instead of the runner's kernel: it is a
+          # reviewed distro artifact with a stable module set, and the script
+          # verifies the package checksum.
+          eval "$(hack/guest/fetch-debian-kernel.sh "${{ matrix.arch }}" build/guest/kernel)"
+          make guest
+      - name: Fetch Cloud Hypervisor
+        run: |
+          case "${{ matrix.arch }}" in
+            amd64) asset=cloud-hypervisor-static ;;
+            arm64) asset=cloud-hypervisor-static-aarch64 ;;
+            *) echo "unsupported architecture: ${{ matrix.arch }}" >&2; exit 1 ;;
+          esac
+          mkdir -p build/images
+          curl -fsSL --retry 5 \
+            "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CLOUD_HYPERVISOR_VERSION}/${asset}" \
+            -o build/images/cloud-hypervisor
+          chmod 0755 build/images/cloud-hypervisor
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Push one image per Dockerfile by digest. The publish job assembles the
+      # digests into multi-arch tags so a pull selects the matching platform.
+      - name: Build and push per-arch images by digest
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          mkdir -p build/digests
+          for dockerfile in deploy/images/Dockerfile.*; do
+            component="${dockerfile##*.}"
+            metadata="build/digests/${component}-${arch}.json"
+            docker buildx build \
+              --platform "linux/${arch}" \
+              --file "${dockerfile}" \
+              --metadata-file "${metadata}" \
+              --provenance=false \
+              --sbom=false \
+              --output "type=image,name=${IMAGE_REPO}/blip-${component},push-by-digest=true,name-canonical=true,push=true" \
+              .
+            digest="$(jq -r '."containerimage.digest"' "${metadata}")"
+            jq -n \
+              --arg component "${component}" \
+              --arg arch "${arch}" \
+              --arg digest "${digest}" \
+              '{component: $component, arch: $arch, digest: $digest}' \
+              >> "build/digests/${arch}.jsonl"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: build/digests/${{ matrix.arch }}.jsonl
+          retention-days: 1
+
+  publish:
+    name: publish multi-arch images
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: digests
+      - name: Set image repository
+        run: echo "IMAGE_REPO=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_REPO }}/blip-controller
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Create multi-arch manifests
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          mapfile -t tags <<< "${TAGS}"
+          mapfile -t components < <(jq -r '.component' digests/*.jsonl | sort -u)
+          for component in "${components[@]}"; do
+            refs=()
+            for file in digests/*.jsonl; do
+              digest="$(jq -r --arg component "${component}" \
+                'select(.component == $component) | .digest' "${file}")"
+              [[ -n "${digest}" ]] || {
+                echo "missing ${component} digest in ${file}" >&2
+                exit 1
+              }
+              refs+=("${IMAGE_REPO}/blip-${component}@${digest}")
+            done
+            if [[ ${#refs[@]} -ne 2 ]]; then
+              echo "expected two architecture digests for ${component}, got ${#refs[@]}" >&2
+              exit 1
+            fi
+            args=()
+            for ref in "${tags[@]}"; do
+              args+=("-t" "${IMAGE_REPO}/blip-${component}:${ref##*:}")
+            done
+            docker buildx imagetools create "${args[@]}" "${refs[@]}"
+          done

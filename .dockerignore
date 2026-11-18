@@ -1,5 +1,5 @@
 .git
-bin/tools/
-bin/envtest/
-_output/guest/dl/
-.cache/
+build/*
+!build/guest/vmlinuz
+!build/guest/initramfs.gz
+!build/images/cloud-hypervisor

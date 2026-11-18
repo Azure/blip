@@ -1,0 +1,198 @@
+// Package podapi is the contract between the node agent and the in-pod
+// runtime. The node agent writes Desired; the runtime writes Observed. Both
+// live in the pod directory, which is the host path
+// <dataDir>/pods/<namespace>/<pod-name> mounted at /run/blip in the vm
+// container.
+//
+// Both documents are complete, level-triggered descriptions and are written
+// atomically (temp file + rename). A missing or unreadable Desired must never
+// cause the runtime to detach disks or stop the VM: it keeps the last valid
+// document.
+package podapi
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/Azure/blip/internal/network"
+)
+
+const (
+	// DataDir is the node agent's data directory on every node.
+	DataDir = "/var/lib/blip"
+	// PodsDir holds one directory per VM pod, below a namespace directory.
+	PodsDir = DataDir + "/pods"
+	// MountPath is where the pod directory appears inside the vm container.
+	MountPath = "/run/blip"
+
+	DesiredFile  = "desired.json"
+	ObservedFile = "observed.json"
+	// DevDir holds block device nodes the node agent creates for the VM.
+	DevDir = "dev"
+	// VsockSocket is the Cloud Hypervisor vsock unix socket. Clients
+	// connect and write "CONNECT <port>\n" to reach a guest port.
+	VsockSocket = "vsock/vsock.sock"
+	APISocket   = "ch-api.sock"
+)
+
+// Desired is written by the node agent.
+type Desired struct {
+	// Network is the compiled direct-egress policy. Missing means deny all.
+	// It is reconciled independently of disks and must be applied before claim.
+	Network *network.Policy `json:"network,omitempty"`
+	// Claim is nil while the VM is vacant (warm).
+	Claim *Claim `json:"claim,omitempty"`
+	// Mounts is the complete set of auxiliary disks that should be attached
+	// and mounted. Removing an entry unmounts and detaches it.
+	Mounts []Disk `json:"mounts,omitempty"`
+	// Stop asks for a graceful shutdown: stop processes, unmount, power off.
+	Stop bool `json:"stop,omitempty"`
+	// Freeze lists disk IDs (the claim root ID or mount IDs) whose
+	// filesystems the guest should keep frozen (FIFREEZE) so the host can
+	// snapshot them consistently. The guest thaws on its own after 30s.
+	Freeze []string `json:"freeze,omitempty"`
+}
+
+// Claim turns a vacant VM into a running blip.
+type Claim struct {
+	BlipName string `json:"blipName"`
+	BlipUID  string `json:"blipUID"`
+	Root     Disk   `json:"root"`
+	// Command is the primary command; empty means interactive.
+	Command    []string `json:"command,omitempty"`
+	TTY        bool     `json:"tty,omitempty"`
+	Env        []string `json:"env,omitempty"` // KEY=VALUE, image env first
+	WorkingDir string   `json:"workingDir,omitempty"`
+	User       string   `json:"user,omitempty"`
+	// IdleTimeoutSeconds applies when Command is empty.
+	IdleTimeoutSeconds int64 `json:"idleTimeoutSeconds,omitempty"`
+}
+
+// Disk is a block device for the VM. Device is a path inside the vm
+// container (normally /run/blip/dev/<serial>).
+type Disk struct {
+	// ID is unique per attachment (the attachment ID). It names the disk
+	// in Cloud Hypervisor.
+	ID       string `json:"id"`
+	Device   string `json:"device"`
+	Serial   string `json:"serial"` // at most 20 bytes
+	ReadOnly bool   `json:"readOnly,omitempty"`
+	// State is the BlipState name (mounts only).
+	State string `json:"state,omitempty"`
+	// Path is the guest mount point (mounts only).
+	Path string `json:"path,omitempty"`
+}
+
+const (
+	PhaseBooting  = "Booting"  // VM starting
+	PhaseWarm     = "Warm"     // guest ready, no claim
+	PhaseClaiming = "Claiming" // root attached, waiting for guest
+	PhaseRunning  = "Running"  // guest mounted root and runs the blip
+	PhaseStopping = "Stopping" // shutdown in progress
+	PhaseExited   = "Exited"   // VMM process has exited; every disk is closed
+)
+
+const (
+	DiskAttaching  = "Attaching"
+	DiskMounted    = "Mounted"
+	DiskUnmounting = "Unmounting"
+	// DiskDetached means the guest unmounted the filesystem and Cloud
+	// Hypervisor confirmed removal: the VM can no longer write it.
+	DiskDetached = "Detached"
+	DiskFailed   = "Failed"
+)
+
+// Observed is written by the runtime.
+type Observed struct {
+	Phase string `json:"phase"`
+	// NetworkRevision identifies the last successfully installed policy.
+	NetworkRevision string `json:"networkRevision,omitempty"`
+	// NetworkError reports why desired networking could not be installed.
+	NetworkError string `json:"networkError,omitempty"`
+	// ClaimID echoes Desired.Claim.Root.ID once the guest accepted it.
+	ClaimID string `json:"claimID,omitempty"`
+	// Mounts reports every auxiliary disk the runtime still tracks,
+	// including detached ones until the node removes them from Desired.
+	Mounts []DiskStatus `json:"mounts,omitempty"`
+	// Sessions is the number of attached sessions.
+	Sessions int `json:"sessions,omitempty"`
+	// Exit is set when the primary command exited (command blips) or the
+	// guest stopped (interactive blips).
+	Exit *Exit `json:"exit,omitempty"`
+	// Error describes a fatal runtime or guest failure.
+	Error string `json:"error,omitempty"`
+	// Frozen lists the disk IDs from Desired.Freeze that are frozen now.
+	Frozen []string `json:"frozen,omitempty"`
+}
+
+type DiskStatus struct {
+	ID      string `json:"id"`
+	State   string `json:"state,omitempty"`
+	Phase   string `json:"phase"`
+	Message string `json:"message,omitempty"`
+}
+
+type Exit struct {
+	Code   int    `json:"code"`
+	Signal string `json:"signal,omitempty"`
+	// Reason is e.g. "Completed", "Idle", "Stopped", "GuestCrashed".
+	Reason string `json:"reason,omitempty"`
+	// Output is the end of the command's output when it failed.
+	Output string `json:"output,omitempty"`
+}
+
+// PodDir returns the host directory for one VM pod. Namespace is part of the
+// path so identically named pods in different namespaces never share disks,
+// sockets, or status files.
+func PodDir(namespace, name string) string {
+	return filepath.Join(PodsDir, namespace, name)
+}
+
+// WriteJSON atomically replaces path with v encoded as JSON.
+func WriteJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// ErrMissing is returned by ReadJSON when the file does not exist.
+var ErrMissing = errors.New("missing")
+
+// ReadJSON reads path into v. It returns ErrMissing if the file is absent.
+func ReadJSON(path string, v any) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return ErrMissing
+	}
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	return nil
+}

@@ -1,0 +1,177 @@
+# Restricts what a VM's service account token can do. The controller keeps a
+# ConfigMap blip-vm-owners in every namespace with a BlipPool:
+#   sa.<service account>: <pools>  every VM service account, with the
+#                                  space-separated pools that use it
+#   <vm pod>: <owner>              each claimed VM pod; "-" means unrestricted
+# A caller authenticated with a pod-bound token of a VM service account may
+# only connect to pods with `blip-runtime bridge 1025` in container vm (a blip
+# session; no other exec, attach, or port-forward). A restricted owner may
+# only do so into VM pods of the same owner, and may only create, change,
+# and delete blips and states named "<owner>.<name>" and labelled
+# blip.dev/owner=<owner> (before and after the change) that reference only
+# such states, set no imagePullSecrets, and create blips only in pools of
+# its own service account. A VM pod without an entry (vacant, or unknown) is
+# denied, as is any other pod that uses a VM service account. Service account
+# keys are pruned only once no pool or VM pod uses the account, and a missing
+# table denies all blip and state changes made with pod-bound tokens. Grant
+# VM service accounts RBAC only in their own namespace: the table is per
+# namespace.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-vm-owner
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: ["*"]
+        resources: [blips, blips/status, blipstates, blipstates/status]
+        operations: [CREATE, UPDATE, DELETE]
+      - apiGroups: [""]
+        apiVersions: [v1]
+        resources: [pods/exec, pods/attach, pods/portforward]
+        operations: [CONNECT]
+  matchConditions:
+    - name: pod-bound-service-account-token
+      expression: >-
+        has(request.userInfo.extra) &&
+        'authentication.kubernetes.io/pod-name' in request.userInfo.extra &&
+        request.userInfo.username.startsWith('system:serviceaccount:' + request.namespace + ':')
+  variables:
+    - name: data
+      expression: "has(params.data) ? params.data : {}"
+    - name: callerSA
+      expression: request.userInfo.username.split(':')[3]
+    - name: vm
+      expression: "('sa.' + variables.callerSA) in variables.data"
+    - name: callerPod
+      expression: request.userInfo.extra['authentication.kubernetes.io/pod-name'][0]
+    - name: owner
+      expression: "variables.callerPod in variables.data ? string(variables.data[variables.callerPod]) : ''"
+    - name: restricted
+      expression: variables.vm && variables.owner != '-'
+    - name: prefix
+      expression: variables.owner + '.'
+    - name: writes
+      expression: request.operation == 'CREATE' || request.operation == 'UPDATE'
+    - name: pools
+      expression: "string(variables.data['sa.' + variables.callerSA]).split(' ')"
+  validations:
+    - expression: "!variables.vm || variables.owner != ''"
+      messageExpression: >-
+        'VM pod ' + variables.callerPod + ' is not claimed by a blip; its token cannot change blips or states or connect to pods'
+      reason: Forbidden
+    # status is controller-written. Letting a VM token write it would also
+    # let it forge status.copiedFrom, which node export authorization uses to
+    # decide whether copied state may be read.
+    - expression: "!variables.restricted || !has(request.subResource) || request.subResource != 'status'"
+      messageExpression: >-
+        'owner ' + variables.owner + ' may not change status; only the controller writes it'
+      reason: Forbidden
+    - expression: >-
+        !variables.vm || request.operation != 'CONNECT' ||
+        (request.subResource == 'exec' && has(object.container) && object.container == 'vm' &&
+        object.command == ['blip-runtime', 'bridge', '1025'])
+      messageExpression: >-
+        'VM pods may only open blip sessions (exec blip-runtime bridge 1025 in container vm), not ' +
+        request.subResource + ' into ' + request.name
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || request.operation != 'CONNECT' ||
+        (request.name in variables.data && variables.data[request.name] == variables.owner)
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only connect to VM pods of its own blips, not ' + request.name
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || request.operation != 'DELETE' ||
+        oldObject.metadata.name.startsWith(variables.prefix)
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only delete objects named ' + variables.prefix + '*'
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || (request.operation != 'UPDATE' && request.operation != 'DELETE') ||
+        (has(oldObject.metadata.labels) && 'blip.dev/owner' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['blip.dev/owner'] == variables.owner)
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only change objects labelled blip.dev/owner=' + variables.owner
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || !variables.writes ||
+        object.metadata.name.startsWith(variables.prefix)
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only write objects named ' + variables.prefix + '*'
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || !variables.writes ||
+        (has(object.metadata.labels) && 'blip.dev/owner' in object.metadata.labels &&
+        object.metadata.labels['blip.dev/owner'] == variables.owner)
+      messageExpression: >-
+        'owner ' + variables.owner + ' must label its objects blip.dev/owner=' + variables.owner
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || !variables.writes || request.resource.resource != 'blips' || !has(object.spec) ||
+        ((!has(object.spec.state) || object.spec.state.startsWith(variables.prefix)) &&
+        (!has(object.spec.mounts) || object.spec.mounts.all(m, m.state.startsWith(variables.prefix))))
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only use states named ' + variables.prefix + '*'
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || !variables.writes || request.resource.resource != 'blipstates' || !has(object.spec) ||
+        !has(object.spec.copyFrom) || object.spec.copyFrom.startsWith(variables.prefix)
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only copy states named ' + variables.prefix + '*'
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || !variables.writes || !has(object.spec) ||
+        !has(object.spec.imagePullSecrets) || size(object.spec.imagePullSecrets) == 0
+      messageExpression: >-
+        'owner ' + variables.owner + ' may not set imagePullSecrets'
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || request.operation != 'CREATE' || request.resource.resource != 'blips' ||
+        (has(object.spec) && has(object.spec.pool) ? object.spec.pool : 'default') in variables.pools
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only use pools of service account ' + variables.callerSA +
+        ' (' + variables.pools.join(', ') + ')'
+      reason: Forbidden
+---
+# Fail secure: without the table, pod-bound tokens of the namespace may not
+# change blips or states at all.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-vm-owner
+spec:
+  policyName: blip-vm-owner
+  validationActions: [Deny]
+  paramRef:
+    name: blip-vm-owners
+    parameterNotFoundAction: Deny
+  matchResources:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: ["*"]
+        resources: [blips, blips/status, blipstates, blipstates/status]
+        operations: [CREATE, UPDATE, DELETE]
+---
+# Namespaces without blips keep pod exec working for their own workloads.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-vm-owner-connect
+spec:
+  policyName: blip-vm-owner
+  validationActions: [Deny]
+  paramRef:
+    name: blip-vm-owners
+    parameterNotFoundAction: Allow
+  matchResources:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        resources: [pods/exec, pods/attach, pods/portforward]
+        operations: [CONNECT]

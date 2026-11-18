@@ -1,0 +1,150 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blip-gateway
+  namespace: blip-ssh
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blip-gateway
+  namespace: blip-ssh
+rules:
+  - apiGroups: [blip.dev]
+    resources: [blips, blipstates]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  # WebSocket exec is authorized as get on older clusters, create on newer.
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [get, create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch]
+  # The gateway creates its host key and user CA Secrets on first start.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blip-gateway
+  namespace: blip-ssh
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blip-gateway
+subjects:
+  - kind: ServiceAccount
+    name: blip-gateway
+    namespace: blip-ssh
+---
+# Owner name -> authorized_keys lines. Edit with
+#   kubectl -n blip-ssh edit configmap blip-ssh-users
+# `kubectl apply` leaves keys added this way alone because the manifest has no
+# data field.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blip-ssh-users
+  namespace: blip-ssh
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blip-gateway
+  namespace: blip-ssh
+  labels:
+    app.kubernetes.io/name: blip-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blip-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blip-gateway
+    spec:
+      serviceAccountName: blip-gateway
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: gateway
+          image: ghcr.io/azure/blip-controller:latest
+          imagePullPolicy: IfNotPresent
+          command: [/usr/local/bin/blip-gateway]
+          args:
+            - --namespace=blip-ssh
+            # The container image new sandboxes start from. Overlays replace it.
+            - --image=ghcr.io/azure/dev:latest
+            # The authenticated identity header set by the Envoy gateway.
+            - --identity-header=X-Forwarded-User
+            # The certificate API only accepts clients that present a
+            # certificate from the dedicated client CA.
+            - --tls-cert=/etc/blip/tls/tls.crt
+            - --tls-key=/etc/blip/tls/tls.key
+            - --tls-client-ca=/etc/blip/tls/client-ca.crt
+          ports:
+            - name: ssh
+              containerPort: 2222
+            - name: https
+              containerPort: 8443
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/blip/tls
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: ssh
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      # Create with hack/gen-gateway-certs.sh: tls.crt, tls.key and the client
+      # CA bundle (client-ca.crt) that Envoy's client certificate chains to.
+      volumes:
+        - name: tls
+          secret:
+            secretName: blip-gateway-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blip-gateway
+  namespace: blip-ssh
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: blip-gateway
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: ssh
+---
+# The certificate API. Only the Envoy gateway may reach this ClusterIP service.
+# Envoy terminates user TLS, authenticates the user, presents a client
+# certificate from the blip-gateway-tls client CA, and overwrites the identity
+# header. Callers without a valid client certificate are rejected. Never expose
+# this service directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: blip-gateway-https
+  namespace: blip-ssh
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: blip-gateway
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
