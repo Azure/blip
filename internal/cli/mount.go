@@ -70,6 +70,14 @@ var switchBusyTimeout = 30 * time.Second
 var unmountRestoreTimeout = 30 * time.Second
 
 func (a *app) mountState(ctx context.Context, state, blip, mountPath string, target *bool) error {
+	return a.mountStateAdded(ctx, state, blip, mountPath, target, nil, false)
+}
+
+// mountStateAdded is mountState for a caller that has already put the mount
+// in the spec: added reports that, and before is the status entry the caller
+// saw before adding it. A Mounted entry left over from that earlier
+// attachment must not be mistaken for the new mount.
+func (a *app) mountStateAdded(ctx context.Context, state, blip, mountPath string, target *bool, before *v1alpha1.MountStatus, added bool) error {
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return fmt.Errorf("invalid path %q: must be a clean absolute path other than /", mountPath)
 	}
@@ -87,6 +95,11 @@ func (a *app) mountState(ctx context.Context, state, blip, mountPath string, tar
 	}
 	var previous, want bool
 	var changed bool
+	// A mount that was just added gets a new attachment. The status can
+	// still describe the previous attach while the guest detaches it, so
+	// remember that attachment and wait for a different one.
+	var oldAttachment string
+	var oldMounted, newMount bool
 	baseGeneration := int64(0)
 	if s.Status.Committed != nil {
 		baseGeneration = s.Status.Committed.Generation
@@ -96,6 +109,15 @@ func (a *app) mountState(ctx context.Context, state, blip, mountPath string, tar
 			return fmt.Errorf("blip %q is stopping or has finished", blip)
 		}
 		previous, want, changed = false, false, false
+		oldAttachment, oldMounted, newMount = "", false, added
+		if m := findMount(b.Status.Mounts, state); m != nil {
+			oldAttachment, oldMounted = m.AttachmentID, m.Phase == v1alpha1.MountMounted
+		}
+		if before != nil {
+			// Status from before the caller's add is the one that may
+			// belong to the old attach.
+			oldAttachment, oldMounted = before.AttachmentID, before.Phase == v1alpha1.MountMounted
+		}
 		for i := range b.Spec.Mounts {
 			m := &b.Spec.Mounts[i]
 			if m.State != state {
@@ -122,6 +144,7 @@ func (a *app) mountState(ctx context.Context, state, blip, mountPath string, tar
 			want = *target
 		}
 		b.Spec.Mounts = append(b.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath, Writable: want})
+		newMount = true
 		return nil
 	})
 	if err != nil && !errors.Is(err, errUnchanged) {
@@ -178,6 +201,15 @@ func (a *app) mountState(ctx context.Context, state, blip, mountPath string, tar
 			return false, nil
 		}
 		if m.Phase == v1alpha1.MountMounted && m.Writable == want {
+			// Only read-only mounts are guaranteed a fresh attachment ID;
+			// a writable mount reuses its writer attachment.
+			if newMount && !want && oldMounted && oldAttachment != "" && m.AttachmentID == oldAttachment {
+				// The old attach is still in the status (often while the
+				// guest is detaching it). Its path may already be gone,
+				// so wait for the freshly added mount.
+				r.say("waiting for %s to finish detaching on %s...", state, blip)
+				return false, nil
+			}
 			if !want && changed {
 				st, err := a.getState(ctx, state)
 				if err != nil {

@@ -273,10 +273,18 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 		}
 	}
 	var mountPath string
-	var writable, shared bool
+	var writable, shared, added bool
+	// before is the status of the mount before this update adds it back.
+	// The controller may still report the previous attachment there.
+	var before *v1alpha1.MountStatus
 	_, err = a.updateBlip(ctx, self, func(b *v1alpha1.Blip) error {
 		if finished(b) || b.DeletionTimestamp != nil || b.Spec.Stop {
 			return fmt.Errorf("blip %q is stopping or has finished", self)
+		}
+		added, before = false, nil
+		if m := findMount(b.Status.Mounts, state); m != nil {
+			cp := *m
+			before = &cp
 		}
 		users := mountUsers(b)
 		if m := findSpecMount(b.Spec.Mounts, state); m != nil {
@@ -290,6 +298,7 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 			mountPath, writable = path.Join(collectMountRoot, state), false
 			b.Spec.Mounts = append(b.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath})
 			users[state] = 0
+			added = true
 		}
 		shared = true
 		users[state]++
@@ -303,7 +312,7 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 		cleanup = func() { a.releaseMount(context.WithoutCancel(ctx), self, state, mountPath) }
 	}
 	mode := writable
-	if err := a.mountState(ctx, state, self, mountPath, &mode); err != nil {
+	if err := a.mountStateAdded(ctx, state, self, mountPath, &mode, before, added); err != nil {
 		cleanup()
 		return "", nil, err
 	}
