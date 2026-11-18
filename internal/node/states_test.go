@@ -145,6 +145,19 @@ func TestEphemeralVolumesDeletedAfterFence(t *testing.T) {
 	}
 }
 
+func TestPendingDeletesRetriedByGC(t *testing.T) {
+	v := newView()
+	v.pending = []string{"a1"}
+	if p := compute(v); !hasDelete(p, "a1") {
+		t.Fatalf("pending delete not planned: %v", p.deletes)
+	}
+	// An operation already running on the ID gets its usual pass to finish.
+	v.busy["a1"] = true
+	if p := compute(v); hasDelete(p, "a1") {
+		t.Fatalf("pending delete planned while busy: %v", p.deletes)
+	}
+}
+
 func TestFetchPlanning(t *testing.T) {
 	v := newView()
 	s := state("s")

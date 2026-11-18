@@ -86,6 +86,11 @@ type Store struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// testTeardownStep, when set, is called before every destructive step of
+	// removeAll. Production leaves it nil; tests use it to inject a failed
+	// teardown.
+	testTeardownStep func() error
 }
 
 // Open opens (creating if needed) the pool and metadata, rebuilds device
@@ -467,21 +472,39 @@ func (s *Store) begin(r *record, n int) ([]uint32, error) {
 }
 
 // removeAll tears down every device and thin ID of a volume. Missing pieces
-// are fine, so it is safe to repeat.
+// are fine, so it is safe to repeat. A failure leaves the record in phase
+// deleting: the node retries PendingDeletes until the teardown succeeds.
 func (s *Store) removeAll(r *record) error {
 	names := []string{s.fetchName(r), s.plainName(r), s.topName(r), s.thinName(r), s.metaName(r)}
 	for _, n := range names {
+		if err := s.beforeTeardown(); err != nil {
+			return err
+		}
 		if err := dmRemove(n); err != nil {
 			return err
 		}
+	}
+	if err := s.beforeTeardown(); err != nil {
+		return err
 	}
 	if err := s.deleteThin(r.Thin); err != nil {
 		return err
 	}
 	if r.Clone != nil {
+		if err := s.beforeTeardown(); err != nil {
+			return err
+		}
 		if err := s.deleteThin(r.Clone.MetaThin); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// beforeTeardown runs the test hook, if any, before one destructive step.
+func (s *Store) beforeTeardown() error {
+	if s.testTeardownStep != nil {
+		return s.testTeardownStep()
 	}
 	return nil
 }
@@ -529,6 +552,23 @@ func (s *Store) List() []Volume {
 		out = append(out, s.volume(r, names))
 	}
 	return out
+}
+
+// PendingDeletes returns the IDs of volumes whose deletion started but did not
+// finish. They stay out of List/Get/lookup so a half-deleted volume is never
+// used, but the node retries their teardown, instead of leaving an invisible
+// record that blocks the ID forever.
+func (s *Store) PendingDeletes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var ids []string
+	for id, r := range s.vols {
+		if r.Phase == phaseDeleting {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 func (s *Store) Get(id string) (Volume, bool) {
@@ -681,7 +721,8 @@ func (s *Store) Activate(id string) (string, error) {
 	return mapperPath(name), nil
 }
 
-// Delete removes a volume of any kind.
+// Delete removes a volume of any kind. Deleting an ID whose earlier teardown
+// failed resumes it: the missing pieces are skipped, so it is safe to repeat.
 func (s *Store) Delete(ctx context.Context, id string) error {
 	if _, err := s.deletable(id); err != nil {
 		return err

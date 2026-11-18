@@ -107,6 +107,7 @@ var (
 //	(*Store).Incarnation() string
 //	(*Store).FreeBytes() int64
 //	(*Store).List() []Volume
+//	(*Store).PendingDeletes() []string // volume IDs whose teardown must be retried
 //	(*Store).Get(id string) (Volume, bool)
 //	(*Store).CreateImage(ctx, id string, sizeBytes int64, fill func(dev string) error) error
 //	(*Store).CreateCommit(ctx, CreateCommit) error

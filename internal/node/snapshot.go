@@ -90,6 +90,7 @@ func (a *Agent) snapshot(ctx context.Context) (*view, error) {
 			}
 		}
 	}
+	v.pending = a.store.PendingDeletes()
 	for _, s := range v.states {
 		a.loadConfig(v, s.Status.ImageDigest)
 	}

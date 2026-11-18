@@ -29,12 +29,14 @@ import (
 type fakeStore struct {
 	mu        sync.Mutex
 	volumes   map[string]storage.Volume
+	pending   map[string]bool
+	deleted   []string
 	imports   map[string]int64
 	createErr error
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{volumes: map[string]storage.Volume{}, imports: map[string]int64{}}
+	return &fakeStore{volumes: map[string]storage.Volume{}, pending: map[string]bool{}, imports: map[string]int64{}}
 }
 
 func (f *fakeStore) Incarnation() string { return "inc-n1" }
@@ -48,6 +50,25 @@ func (f *fakeStore) List() []storage.Volume {
 		out = append(out, v)
 	}
 	return out
+}
+
+func (f *fakeStore) PendingDeletes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for id := range f.pending {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (f *fakeStore) setPending(ids ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range ids {
+		f.pending[id] = true
+	}
 }
 
 func (f *fakeStore) add(v storage.Volume) {
@@ -121,6 +142,8 @@ func (f *fakeStore) Delete(ctx context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.volumes, id)
+	delete(f.pending, id)
+	f.deleted = append(f.deleted, id)
 	return nil
 }
 
@@ -272,6 +295,21 @@ func TestAgentPass(t *testing.T) {
 	settle(t, a)
 	if _, err := os.Stat(podDir); !os.IsNotExist(err) {
 		t.Fatalf("pod directory not removed: %v", err)
+	}
+}
+
+func TestAgentRetriesPendingDelete(t *testing.T) {
+	a, st, _ := testAgent(t)
+	const id = "a0000000000000f1"
+	st.setPending(id)
+	settle(t, a)
+
+	st.mu.Lock()
+	deleted := slices.Clone(st.deleted)
+	pending := len(st.pending)
+	st.mu.Unlock()
+	if pending != 0 || !slices.Contains(deleted, id) {
+		t.Fatalf("deleted %v, pending %d; the GC pass did not retry %s", deleted, pending, id)
 	}
 }
 

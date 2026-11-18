@@ -10,6 +10,16 @@ import (
 
 // planGC deletes volumes, device nodes, and pod directories nobody needs.
 func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
+	// A delete that failed after its phase was recorded is hidden from List,
+	// so it never enters v.volumes. Retry it here until teardown succeeds.
+	pending := map[string]bool{}
+	for _, id := range v.pending {
+		if v.busy[id] {
+			continue
+		}
+		pending[id] = true
+		p.deletes = append(p.deletes, id)
+	}
 	owner := map[string]string{} // attachment ID -> pod dir holding its device node
 	for name, dir := range v.dirs {
 		for id := range dir.devs {
@@ -22,6 +32,9 @@ func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
+		if pending[id] {
+			continue
+		}
 		vol := v.volumes[id]
 		if v.busy[id] {
 			continue

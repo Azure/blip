@@ -64,6 +64,7 @@ type Store interface {
 	Incarnation() string
 	FreeBytes() int64
 	List() []storage.Volume
+	PendingDeletes() []string
 	CreateImage(ctx context.Context, id string, sizeBytes int64, fill func(dev string) error) error
 	CreateCommit(ctx context.Context, req storage.CreateCommit) error
 	FetchCommit(ctx context.Context, stateUID, commitID string, src storage.Remote, progress func(done, total int64)) error
@@ -93,6 +94,7 @@ type view struct {
 	pods        map[string]*corev1.Pod // VM pods on this node by podKey
 	dirs        map[string]*podDir     // pod directories by podKey
 	volumes     map[string]storage.Volume
+	pending     []string                 // volume IDs whose teardown failed and must be retried
 	devices     map[string]uint64        // volume ID -> rdev of its active device
 	configs     map[string]*image.Config // image ID -> artifact config
 	pinned      func(commitID string) bool
