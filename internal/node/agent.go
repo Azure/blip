@@ -347,7 +347,42 @@ func (a *Agent) authorize(node string, req peer.ExportRequest) error {
 	if err := a.client.List(ctx, &blips); err != nil {
 		return err
 	}
-	return authorize(ptrs(states.Items), ptrs(blips.Items), node, req)
+	all := ptrs(states.Items)
+	// The cached list can lag a just-created state, and authorize treats a
+	// missing copy source as deleted so an in-flight copy can finish after
+	// its source is gone. Fill copy sources that the cache lacks from an
+	// uncached read, or an unlabelled destination could read a labelled
+	// source until the cache converges.
+	seen := make(map[string]bool, len(all))
+	for _, s := range all {
+		seen[string(s.UID)] = true
+	}
+	for _, s := range all {
+		cf := s.Status.CopiedFrom
+		if cf == nil || cf.StateUID != req.StateUID || seen[cf.StateUID] || s.Spec.CopyFrom == "" {
+			continue
+		}
+		// spec.copyFrom is immutable and names a state in the destination's
+		// namespace.
+		src := &v1alpha1.BlipState{}
+		err := a.live.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: s.Spec.CopyFrom}, src)
+		switch {
+		case apierrors.IsNotFound(err):
+			// Genuinely deleted: keep the deleted-source allowance.
+			continue
+		case err != nil:
+			// Forbidden or transient: do not guess that the source is gone.
+			return fmt.Errorf("read copy source %s/%s: %w", s.Namespace, s.Spec.CopyFrom, err)
+		case string(src.UID) != cf.StateUID:
+			// The name was reused; this is not the source the copy recorded.
+			// Fall through to the deleted-source allowance, which is no worse
+			// than the cache-only behavior.
+			continue
+		}
+		seen[cf.StateUID] = true
+		all = append(all, src)
+	}
+	return authorize(all, ptrs(blips.Items), node, req)
 }
 
 func ptrs[T any](items []T) []*T {
