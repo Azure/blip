@@ -10,11 +10,14 @@ import (
 
 const ownerLabel = "blip.dev/owner"
 
-// sameOwner allows copies of unlabelled (administrator-created) states, but
-// never between resources labelled for different owners.
-func sameOwner(a, b *v1alpha1.BlipState) bool {
-	ao, bo := a.Labels[ownerLabel], b.Labels[ownerLabel]
-	return ao == "" || bo == "" || ao == bo
+// copyAllowed reports whether dst may copy from src. An unlabelled source is
+// an administrator-created shared state that anyone may copy. A labelled
+// source may only be copied by a state carrying the same owner label, so a
+// non-VM writer cannot read another owner's data by creating an unlabelled
+// destination that points at a labelled source.
+func copyAllowed(dst, src *v1alpha1.BlipState) bool {
+	so, do := src.Labels[ownerLabel], dst.Labels[ownerLabel]
+	return so == "" || so == do
 }
 
 // authorize implements the export authorization rule: node may read commit C
@@ -48,7 +51,7 @@ func authorize(states []*v1alpha1.BlipState, blips []*v1alpha1.Blip, node string
 			// A deleted source leaves nothing to check; its copied commit
 			// must stay readable for the copy to finish.
 			src := byUID[cf.StateUID]
-			if src == nil || (s.Spec.CopyFrom == src.Name && sameOwner(s, src) &&
+			if src == nil || (s.Spec.CopyFrom == src.Name && copyAllowed(s, src) &&
 				src.Status.Committed != nil && src.Status.Committed.ID == cf.CommitID) {
 				return nil
 			}

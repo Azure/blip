@@ -35,6 +35,50 @@ func TestAuthorizeCopySourceAgreement(t *testing.T) {
 	if err := authorize([]*v1alpha1.BlipState{src, other}, nil, "n2", req); err == nil {
 		t.Fatal("cross-owner copy allowed")
 	}
+	// Dropping the destination's owner label must not turn a labelled
+	// source into a shared one.
+	forged := dst()
+	delete(forged.Labels, ownerLabel)
+	if err := authorize([]*v1alpha1.BlipState{src, forged}, nil, "n2", req); err == nil {
+		t.Fatal("unlabelled copy of a labelled source authorized export")
+	}
+	// An unlabelled (administrator-created) source is shared and may be
+	// copied into a labelled state.
+	shared := state("src")
+	shared.Status.Committed = &v1alpha1.Commit{ID: "c1", Generation: 1}
+	if err := authorize([]*v1alpha1.BlipState{shared, dst()}, nil, "n2", req); err != nil {
+		t.Fatalf("copy of shared source denied: %v", err)
+	}
+}
+
+// A copy is allowed from an unlabelled shared source, or between states with
+// the same owner label. A labelled source may not be copied into an unlabelled
+// or differently labelled state.
+func TestCopyAllowed(t *testing.T) {
+	cases := []struct {
+		name, src, dst string
+		want           bool
+	}{
+		{"unlabelled source to labelled destination", "", "alice", true},
+		{"labelled source to same owner", "alice", "alice", true},
+		{"labelled source to unlabelled destination", "alice", "", false},
+		{"labelled source to different owner", "alice", "bob", false},
+		{"both unlabelled", "", "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			src, dst := state("src"), state("dst")
+			if c.src != "" {
+				src.Labels = map[string]string{ownerLabel: c.src}
+			}
+			if c.dst != "" {
+				dst.Labels = map[string]string{ownerLabel: c.dst}
+			}
+			if got := copyAllowed(dst, src); got != c.want {
+				t.Errorf("copyAllowed(dst=%q, src=%q) = %v, want %v", c.dst, c.src, got, c.want)
+			}
+		})
+	}
 }
 
 func TestAuthorize(t *testing.T) {
