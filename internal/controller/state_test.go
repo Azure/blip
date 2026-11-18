@@ -231,6 +231,142 @@ func TestPendingReplicaReplaced(t *testing.T) {
 	}
 }
 
+// TestPendingSaveCommitsWithLostReplica covers a save whose replica node
+// disappears and has no replacement: the source still holds the sealed
+// commit, so the state commits with the survivors instead of waiting for the
+// dead node forever. repair tops the replicas back up later.
+func TestPendingSaveCommitsWithLostReplica(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.readyState("s", "n1", "n2")
+	st := e.getState("s")
+	const saved = "c9c9c9c9c9c9c9c9"
+	const losing = "7777777777777777"
+	base := st.DeepCopy()
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID:     saved,
+		Generation:   2,
+		SourceNode:   "n1",
+		AttachmentID: losing,
+		Replicas:     []string{"n1", "n2"},
+	}
+	e.must(patchStatus(e.ctx, e.c, st, base))
+	e.seal("s", "n1", v1.SealResult{AttachmentID: losing, CommitID: saved})
+	e.hold("s", saved, "n1")
+
+	// n2 dies before it fetches the commit and there is no other node.
+	dead := "n2"
+	e.must(e.c.Delete(e.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: dead}}))
+	e.must(e.c.Delete(e.ctx, &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: dead}}))
+
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if st.Status.Pending != nil || st.Status.Committed == nil || st.Status.Committed.ID != saved {
+		t.Fatalf("save with a lost replica did not commit with survivors: %+v", st.Status)
+	}
+	if st.Status.Committed.Generation != 2 {
+		t.Fatalf("commit generation %d", st.Status.Committed.Generation)
+	}
+	if slices.Contains(st.Status.Placements, dead) {
+		t.Fatalf("lost replica kept a placement: %v", st.Status.Placements)
+	}
+
+	// A recovered node is picked up by repair.
+	e.addNodes("n3")
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if !slices.Contains(st.Status.Placements, "n3") {
+		t.Fatalf("repair did not top up the lost replica: %v", st.Status.Placements)
+	}
+	e.hold("s", saved, "n3")
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if !slices.Equal(st.Status.Placements, []string{"n1", "n3"}) {
+		t.Fatalf("placements after repair: %v", st.Status.Placements)
+	}
+}
+
+// TestInitialVersionCommitsWithLostReplica covers the same node loss for a
+// generation-1 build: the survivors build from empty and can commit without
+// the node that disappeared.
+func TestInitialVersionCommitsWithLostReplica(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2", "n3")
+	e.newState("s", func(st *v1.BlipState) { st.Spec.Replicas = 3 })
+	e.run(e.state, ns, "s")
+	p := e.getState("s").Status.Pending
+	if p == nil || len(p.Replicas) != 3 {
+		t.Fatalf("pending %+v", p)
+	}
+	var other, dead string
+	for _, n := range p.Replicas {
+		switch {
+		case n == p.SourceNode:
+		case other == "":
+			other = n
+		default:
+			dead = n
+		}
+	}
+	e.hold("s", p.CommitID, p.SourceNode, other)
+	e.must(e.c.Delete(e.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: dead}}))
+	e.must(e.c.Delete(e.ctx, &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: dead}}))
+
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Committed == nil || st.Status.Committed.Generation != 1 {
+		t.Fatalf("initial version with survivors never commits: %+v", st.Status)
+	}
+	if slices.Contains(st.Status.Placements, dead) || len(st.Status.Placements) != 2 {
+		t.Fatalf("placements after the lost replica: %v", st.Status.Placements)
+	}
+}
+
+// TestPendingSaveLostWithoutHolder checks the safety side: when no surviving
+// node holds the sealed commit, the state must report the lost save instead of
+// committing data that no node can provide.
+func TestPendingSaveLostWithoutHolder(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	st := e.readyState("s", "n1", "n2")
+	committed := st.Status.Committed.ID
+	const saved = "dadadadadadadada"
+	const losing = "8888888888888888"
+	base := st.DeepCopy()
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID:     saved,
+		Generation:   2,
+		SourceNode:   "n1",
+		AttachmentID: losing,
+		Replicas:     []string{"n1", "n2"},
+	}
+	e.must(patchStatus(e.ctx, e.c, st, base))
+	e.seal("s", "n1", v1.SealResult{AttachmentID: losing, CommitID: saved})
+	e.hold("s", saved, "n1")
+
+	// Both nodes are gone before any survivor reports the commit.
+	for _, n := range []string{"n1", "n2"} {
+		e.must(e.c.Delete(e.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: n}}))
+		e.must(e.c.Delete(e.ctx, &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: n}}))
+	}
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if st.Status.Pending != nil {
+		t.Fatalf("lost save still pending: %+v", st.Status.Pending)
+	}
+	if st.Status.Committed == nil || st.Status.Committed.ID != committed {
+		t.Fatalf("lost save changed the committed version: %+v", st.Status.Committed)
+	}
+	if !strings.Contains(st.Status.Message, "lost") {
+		t.Fatalf("lost save not reported: %q", st.Status.Message)
+	}
+	if !slices.ContainsFunc(st.Status.Seals, func(sr v1.SealResult) bool {
+		return sr.AttachmentID == losing && sr.Error != ""
+	}) {
+		t.Fatalf("lost save has no failure seal: %+v", st.Status.Seals)
+	}
+}
+
 func TestDrainRepair(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2", "n3")

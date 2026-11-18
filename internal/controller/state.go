@@ -537,7 +537,8 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 			p.Replicas[i] = repl[0]
 		}
 	}
-	if st.Spec.Image != "" {
+	switch {
+	case st.Spec.Image != "":
 		// Every eligible node is already a replica of an image state, so a
 		// failed one has no stand-in: drop it. Generation 1 is built from
 		// the image on each node, so its source is not special.
@@ -550,6 +551,24 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 				return "no eligible node can build generation 1; replanning", nil
 			}
 			p.SourceNode = p.Replicas[0]
+		}
+	case p.Generation == 1:
+		// Generation 1 is built from empty (or the copy source) by the
+		// surviving source node, so a failed replica with no replacement
+		// only delays the build. Drop it and commit with the survivors;
+		// repair adds replicas back when a node is available again.
+		p.Replicas = slices.DeleteFunc(p.Replicas, func(n string) bool {
+			return n != p.SourceNode && cl.bad(n) && !cl.holds(st, n, p.CommitID)
+		})
+	default:
+		// A later generation exists only as the commit its source sealed,
+		// so it can commit with fewer replicas while a surviving node
+		// still holds it. Without a holder, pendingSource reports the
+		// lost save instead of committing data no node can provide.
+		if usableHolder(st, cl, p, p.Replicas) != "" {
+			p.Replicas = slices.DeleteFunc(p.Replicas, func(n string) bool {
+				return n != p.SourceNode && cl.bad(n) && !cl.holds(st, n, p.CommitID)
+			})
 		}
 	}
 	var waiting, errs []string
