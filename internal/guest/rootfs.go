@@ -128,7 +128,11 @@ func statInRoot(root, p string) (os.FileInfo, error) {
 		return nil, err
 	}
 	defer unix.Close(rootfd)
-	fd, err := openat2(rootfd, strings.TrimPrefix(p, "/"), unix.O_PATH, 0, unix.RESOLVE_IN_ROOT)
+	rel := strings.TrimPrefix(p, "/")
+	if rel == "" {
+		rel = "." // openat2 rejects an empty path
+	}
+	fd, err := openat2(rootfd, rel, unix.O_PATH, 0, unix.RESOLVE_IN_ROOT)
 	if err != nil {
 		return nil, err
 	}

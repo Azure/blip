@@ -69,6 +69,18 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+// newSession allocates a session with every channel and condition variable
+// initialized. Both a session with a running process and a session recording a
+// failed start must have a usable pumpsReady: a client attaching to a nil
+// channel would panic, which kills PID 1 and reboots the whole VM.
+func newSession(g *Guest, id string, argv []string, tty bool) *session {
+	s := &session{g: g, id: id, argv: argv, tty: tty, out: ring{max: RingSize}}
+	s.cond = sync.NewCond(&s.mu)
+	s.inCond = sync.NewCond(&s.inMu)
+	s.pumpsReady = make(chan struct{})
+	return s
+}
+
 // startSession starts a process and registers its session. base is the
 // environment applied before s.env.
 func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bool) (*session, error) {
@@ -76,10 +88,8 @@ func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bo
 	if err != nil {
 		return nil, err
 	}
-	ss := &session{g: g, id: id, argv: argv, tty: s.tty, proc: p, out: ring{max: RingSize}}
-	ss.cond = sync.NewCond(&ss.mu)
-	ss.inCond = sync.NewCond(&ss.inMu)
-	ss.pumpsReady = make(chan struct{})
+	ss := newSession(g, id, argv, s.tty)
+	ss.proc = p
 	if !holdOutput {
 		ss.releasePumps()
 	}
@@ -130,9 +140,7 @@ func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bo
 // failedSession records a session whose process could not start, so a
 // client sees the error and an exit status.
 func (g *Guest) failedSession(id string, argv []string, err error) *session {
-	ss := &session{g: g, id: id, argv: argv, out: ring{max: RingSize}}
-	ss.cond = sync.NewCond(&ss.mu)
-	ss.inCond = sync.NewCond(&ss.inMu)
+	ss := newSession(g, id, argv, false)
 	ss.out.add(wire.TStderr, []byte(err.Error()+"\n"))
 	g.mu.Lock()
 	g.sessions[id] = ss
@@ -179,7 +187,14 @@ func (s *session) pinLocked() uint64 {
 }
 
 func (s *session) releasePumps() {
-	s.pumpsOnce.Do(func() { close(s.pumpsReady) })
+	s.pumpsOnce.Do(func() {
+		// newSession always creates the channel. Keep the nil check as a
+		// last-resort guard: closing a nil channel panics, and in the guest
+		// that panic takes down init and the whole VM.
+		if s.pumpsReady != nil {
+			close(s.pumpsReady)
+		}
+	})
 }
 
 // pumpInput writes queued stdin to the process. It is the only writer of the

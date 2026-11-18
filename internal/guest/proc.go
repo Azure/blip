@@ -117,6 +117,15 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 			dir = acct.home
 		}
 	}
+	// Validate the working directory before starting: a failed chdir surfaces
+	// from os.StartProcess as ENOENT on the program path, which reads as if
+	// the executable were missing. Stat it inside the root, like the chdir
+	// will happen after chroot.
+	if fi, err := statInRoot(g.root, dir); err != nil {
+		return nil, nil, fmt.Errorf("chdir %s: %w", dir, err)
+	} else if !fi.IsDir() {
+		return nil, nil, fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR)
+	}
 
 	p := &proc{}
 	var child []*os.File
