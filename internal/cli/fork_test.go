@@ -464,6 +464,68 @@ func TestCollectGit(t *testing.T) {
 		assertCollectReleased(t, h, "alice.box", "alice.w1")
 	})
 
+	t.Run("git common directory outside state", func(t *testing.T) {
+		withCollectMountRoot(t)
+		dst := filepath.Join(t.TempDir(), "dst")
+		gitInit(t, dst)
+		outside := filepath.Join(t.TempDir(), "outside")
+		gitRepo(t, outside)
+		src := filepath.Join(collectMountRoot, "alice.w1", "repo")
+		gitRepo(t, src)
+		rel, err := filepath.Rel(filepath.Join(src, ".git"), outside)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, ".git", "commondir"), []byte(rel+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h := newHarness(t, gitObjects()...)
+		h.self = "alice.box"
+		t.Chdir(dst)
+		code, _, errOut := h.run("", "collect", "w1", "git:/repo:w1")
+		if code != 1 || !strings.Contains(errOut, "git common directory outside state") {
+			t.Fatalf("code %d stderr %q", code, errOut)
+		}
+		if out, err := exec.Command("git", "-C", dst, "rev-parse", "--verify", "w1").CombinedOutput(); err == nil {
+			t.Fatalf("fetched from a redirected common directory: %s", out)
+		}
+		assertCollectReleased(t, h, "alice.box", "alice.w1")
+	})
+
+	t.Run("git alternates outside state", func(t *testing.T) {
+		withCollectMountRoot(t)
+		dst := filepath.Join(t.TempDir(), "dst")
+		gitInit(t, dst)
+		outside := filepath.Join(t.TempDir(), "outside")
+		gitRepo(t, outside)
+		src := filepath.Join(collectMountRoot, "alice.w1", "repo")
+		gitRepo(t, src)
+		objects := filepath.Join(src, ".git", "objects")
+		if err := os.MkdirAll(filepath.Join(objects, "info"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		rel, err := filepath.Rel(objects, filepath.Join(outside, ".git", "objects"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A harmless first entry must not hide an escaping one.
+		alternates := "objects\n" + rel + "\n"
+		if err := os.WriteFile(filepath.Join(objects, "info", "alternates"), []byte(alternates), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h := newHarness(t, gitObjects()...)
+		h.self = "alice.box"
+		t.Chdir(dst)
+		code, _, errOut := h.run("", "collect", "w1", "git:/repo:w1")
+		if code != 1 || !strings.Contains(errOut, "git alternates outside state") {
+			t.Fatalf("code %d stderr %q", code, errOut)
+		}
+		if out, err := exec.Command("git", "-C", dst, "rev-parse", "--verify", "w1").CombinedOutput(); err == nil {
+			t.Fatalf("fetched from alternates outside the state: %s", out)
+		}
+		assertCollectReleased(t, h, "alice.box", "alice.w1")
+	})
+
 	t.Run("git failure releases mount", func(t *testing.T) {
 		withCollectMountRoot(t)
 		dst := filepath.Join(t.TempDir(), "dst")

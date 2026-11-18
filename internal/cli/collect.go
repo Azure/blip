@@ -383,23 +383,110 @@ func (a *app) checkGitSource(ctx context.Context, mountPath, src, display, state
 	if !underDir(root, target) {
 		return fmt.Errorf("%s escapes state %s through a symlink (resolves to %s)", display, a.short(state), target)
 	}
-	top, err := gitRepoRoot(ctx, src)
-	if err != nil {
+	// Resolve the git directory even when git itself refuses to start, so a
+	// redirect is checked instead of skipped.
+	dir := gitDir(ctx, target, root)
+	if dir == "" {
 		return nil // git fetch will report the error
 	}
-	out, err := exec.CommandContext(ctx, "git", "-C", top,
-		"-c", "safe.directory=*", "rev-parse", "--absolute-git-dir").Output()
-	if err != nil {
-		return nil
-	}
-	dir, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	dir, err := resolvePath(dir)
 	if err != nil {
 		return nil
 	}
 	if !underDir(root, dir) {
 		return fmt.Errorf("%s uses a git directory outside state %s (resolves to %s)", display, a.short(state), dir)
 	}
+	return a.checkGitMetadata(root, dir, display, state)
+}
+
+// gitDir returns the git directory of the repository at src. Git is asked
+// first; if it cannot run (for example because a redirect leaves the mounted
+// state), the .git directory or file is followed by hand up to root.
+func gitDir(ctx context.Context, src, root string) string {
+	out, err := exec.CommandContext(ctx, "git", "-C", src,
+		"-c", "safe.directory=*", "rev-parse", "--absolute-git-dir").Output()
+	if err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	for dir := src; underDir(root, dir); dir = filepath.Dir(dir) {
+		dotgit := filepath.Join(dir, ".git")
+		info, err := os.Stat(dotgit)
+		if err == nil && info.IsDir() {
+			return dotgit
+		}
+		if err == nil && info.Mode().IsRegular() {
+			b, err := os.ReadFile(dotgit)
+			if err != nil {
+				return ""
+			}
+			line := firstLine(b)
+			if !strings.HasPrefix(line, "gitdir:") {
+				return ""
+			}
+			p := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(dir, p)
+			}
+			return p
+		}
+		if dir == root {
+			break
+		}
+	}
+	return ""
+}
+
+// checkGitMetadata rejects commondir and alternates files that let the state
+// make git read objects from outside its mount. Both may be relative, and
+// alternates lists one path per line.
+func (a *app) checkGitMetadata(root, gitDir, display, state string) error {
+	common := gitDir
+	if b, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+		entry := firstLine(b)
+		if entry != "" {
+			dir, err := resolveGitPath(gitDir, entry)
+			if err != nil {
+				return fmt.Errorf("cannot resolve the git common directory %q of %s: %w", entry, display, err)
+			}
+			if !underDir(root, dir) {
+				return fmt.Errorf("%s uses a git common directory outside state %s (resolves to %s)", display, a.short(state), dir)
+			}
+			common = dir
+		}
+	}
+	objects := filepath.Join(common, "objects")
+	b, err := os.ReadFile(filepath.Join(objects, "info", "alternates"))
+	if err != nil {
+		return nil
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		entry := strings.TrimSpace(line)
+		if entry == "" {
+			continue
+		}
+		dir, err := resolveGitPath(objects, entry)
+		if err != nil {
+			return fmt.Errorf("cannot resolve the git alternates entry %q of %s: %w", entry, display, err)
+		}
+		if !underDir(root, dir) {
+			return fmt.Errorf("%s uses git alternates outside state %s (%s resolves to %s)", display, a.short(state), entry, dir)
+		}
+	}
 	return nil
+}
+
+// resolveGitPath resolves a git metadata entry against base. It resolves
+// symlinks in the existing part of the path, like resolvePath.
+func resolveGitPath(base, entry string) (string, error) {
+	if !filepath.IsAbs(entry) {
+		entry = filepath.Join(base, entry)
+	}
+	return resolvePath(entry)
+}
+
+func firstLine(b []byte) string {
+	line, _, _ := strings.Cut(string(b), "\n")
+	return strings.TrimSpace(line)
 }
 
 // checkParentInsideMount rejects a file source whose parent directories leave
