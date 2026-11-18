@@ -57,6 +57,11 @@ type record struct {
 	Clone    *cloneInfo `json:"clone,omitempty"`   // remote data still hydrating
 	Failed   string     `json:"failed,omitempty"`
 	Digest   string     `json:"digest,omitempty"` // content digest, computed on first use (see Digest)
+
+	// TeardownMetaThin keeps the clone metadata thin ID of an abandoned
+	// hydration. Clone is cleared when a failed delete gives up on the clone,
+	// but removeAll must still free this thin ID on the retry.
+	TeardownMetaThin uint32 `json:"teardownMetaThin,omitempty"`
 }
 
 type cloneInfo struct {
@@ -496,11 +501,17 @@ func (s *Store) removeAll(r *record) error {
 	if err := s.deleteThin(r.Thin); err != nil {
 		return err
 	}
+	// TeardownMetaThin is set when a failed delete abandoned hydration and
+	// dropped Clone; either way the clone metadata thin must be freed.
+	metaThin := r.TeardownMetaThin
 	if r.Clone != nil {
+		metaThin = r.Clone.MetaThin
+	}
+	if metaThin != 0 {
 		if err := s.beforeTeardown(); err != nil {
 			return err
 		}
-		if err := s.deleteThin(r.Clone.MetaThin); err != nil {
+		if err := s.deleteThin(metaThin); err != nil {
 			return err
 		}
 	}
@@ -531,18 +542,25 @@ func (s *Store) finishDelete(r *record) error {
 	return s.drop(r)
 }
 
-// releaseRemote releases the clone source of r, if any, exactly once.
+// releaseRemote releases the clone source of r, if any, exactly once. The
+// remote ID is cleared even when the release function was already lost, so a
+// retried teardown cannot release the lease a second time.
 func (s *Store) releaseRemote(r *record) {
 	s.mu.Lock()
 	h := s.hydrates[r.ID]
 	delete(s.hydrates, r.ID)
+	remoteID := ""
+	if r.Clone != nil {
+		remoteID = r.Clone.RemoteID
+		r.Clone.RemoteID = ""
+	}
 	s.mu.Unlock()
 	if h != nil && h.release != nil {
 		h.release()
 		return
 	}
-	if r.Clone != nil && r.Clone.RemoteID != "" && s.cfg.ReleaseRemote != nil {
-		s.cfg.ReleaseRemote(r.Clone.RemoteID)
+	if remoteID != "" && s.cfg.ReleaseRemote != nil {
+		s.cfg.ReleaseRemote(remoteID)
 	}
 }
 
@@ -748,7 +766,8 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	h := s.hydrates[id]
 	s.mu.Unlock()
-	if h != nil && h.stopped != nil {
+	stopped := h != nil && h.stopped != nil
+	if stopped {
 		h.cancel()
 		<-h.stopped
 	}
@@ -757,21 +776,92 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	if s.testDeleteLocked != nil {
 		s.testDeleteLocked()
 	}
+	teardown := false
 	if err == nil && r != nil {
+		teardown = true
 		// The devices users open go first: if they are still open nothing changes.
 		if err = dmRemove(s.plainName(r)); err == nil {
 			err = dmRemove(s.topName(r))
 		}
 		if err == nil {
 			if err = s.setPhase(r, phaseDeleting); err == nil {
-				return s.finishDelete(r)
+				err = s.finishDelete(r)
 			}
 		}
 	}
-	if h != nil && h.stopped != nil && r != nil && r.Clone != nil && r.Failed == "" && dmExists(s.topName(r)) {
-		s.startWatch(r, h.release)
+	if err == nil {
+		return nil
+	}
+	if r != nil && (teardown || stopped) {
+		s.deleteFailed(r, h, teardown)
 	}
 	return err
+}
+
+// deleteFailed repairs an interrupted Delete. Delete always stops the
+// hydration watcher before it touches the volume, so every error after that
+// point must either restart the watcher or abandon hydration. Otherwise the
+// record stays a live clone with a closed watcher: waitHydrated returns at
+// once, Seal/LiveCopy/Sync/Diff report "still hydrating" forever, and the
+// remote lease is never released.
+func (s *Store) deleteFailed(r *record, h *hydration, teardown bool) {
+	s.mu.Lock()
+	live := s.vols[r.ID] == r
+	phase, failed, cloning := r.Phase, r.Failed, r.Clone != nil
+	s.mu.Unlock()
+	if !live || !cloning {
+		return
+	}
+	// Hydration can continue only while this is still a live, healthy clone
+	// and its top device (which holds the clone table) survived the delete.
+	if phase == phaseReady && failed == "" && dmExists(s.topName(r)) {
+		var release func()
+		if h != nil {
+			release = h.release
+		}
+		s.startWatch(r, release)
+		return
+	}
+	if !teardown && phase == phaseReady {
+		// Delete was refused before it touched anything (for example a pin
+		// won the race). The volume is still live; do not turn a refused
+		// delete into a pending one.
+		return
+	}
+	s.abandonHydration(r)
+}
+
+// abandonHydration gives up on a clone whose delete failed after its top
+// device was removed. Hydration cannot continue without that device, so the
+// remote is released and the clone state is dropped. The record becomes a
+// pending delete: invisible to readers, retried by PendingDeletes, and still
+// owning its thin IDs (including the clone metadata thin in TeardownMetaThin)
+// so the retry can finish the teardown.
+func (s *Store) abandonHydration(r *record) {
+	s.mu.Lock()
+	live := s.vols[r.ID] == r
+	s.mu.Unlock()
+	if !live {
+		return
+	}
+	s.releaseRemote(r)
+	s.mu.Lock()
+	if s.vols[r.ID] != r {
+		s.mu.Unlock()
+		return
+	}
+	if r.Clone != nil {
+		if r.TeardownMetaThin == 0 {
+			r.TeardownMetaThin = r.Clone.MetaThin
+		}
+		r.Clone = nil
+	}
+	r.Phase = phaseDeleting
+	err := s.putLocked(r)
+	s.mu.Unlock()
+	if err != nil {
+		logf("abandon hydration of %s: %v", r.ID, err)
+	}
 }
 
 // deletable returns the record of id (nil if it does not exist) or why it

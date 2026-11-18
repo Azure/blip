@@ -133,6 +133,140 @@ func TestRecoverRetriesOldDeletingRecord(t *testing.T) {
 	}
 }
 
+// failTeardownAfterTop makes the next Delete fail one teardown step after the
+// volume's top device has been removed. removeAll's destructive steps are:
+// fetch, plain, top, thin, meta, thin ID, clone meta thin.
+func failTeardownAfterTop(s *Store) {
+	n := 0
+	s.testTeardownStep = func() error {
+		n++
+		if n == 4 {
+			s.testTeardownStep = nil
+			return errors.New("transient teardown failure after top removal")
+		}
+		return nil
+	}
+}
+
+// TestDeleteFailureAfterTopRemovalAbandonsHydration: Delete stops the
+// hydration watcher before tearing down. If it then fails after removing the
+// top device, hydration cannot continue, so the record must be abandoned
+// rather than left as a live clone whose watcher is gone (which would make
+// Seal/LiveCopy/Sync/Diff fail with "still hydrating" forever).
+func TestDeleteFailureAfterTopRemovalAbandonsHydration(t *testing.T) {
+	s := newDeleteTestStore(t)
+	const id = "f000000000000001"
+	released := 0
+	h := &hydration{
+		release: func() { released++ },
+		cancel:  func() {},
+		stopped: make(chan struct{}),
+	}
+	close(h.stopped)
+	r := &record{
+		ID: id, Kind: KindWorking, Size: 32 << 20, Phase: phaseReady, Layered: true,
+		Clone: &cloneInfo{RemoteID: "node/lease/nqn", Source: "/dev/null", SourceSize: 32 << 20},
+	}
+	addRecord(t, s, r)
+	s.mu.Lock()
+	s.hydrates[id] = h
+	s.mu.Unlock()
+
+	failTeardownAfterTop(s)
+	if err := s.Delete(context.Background(), id); err == nil {
+		t.Fatal("Delete succeeded despite a failed teardown")
+	}
+
+	// (a) No live record is left advertising hydration behind a closed
+	// watcher: the volume is visible only as a pending delete.
+	if v, ok := s.Get(id); ok {
+		t.Fatalf("half-deleted hydrating volume is visible: %+v", v)
+	}
+	if l := s.List(); len(l) != 0 {
+		t.Fatalf("half-deleted volume listed: %+v", l)
+	}
+	if pending := s.PendingDeletes(); len(pending) != 1 || pending[0] != id {
+		t.Fatalf("pending deletes = %v, want [%s]", pending, id)
+	}
+	s.mu.Lock()
+	clone, phase := r.Clone, r.Phase
+	_, watching := s.hydrates[id]
+	s.mu.Unlock()
+	if clone != nil {
+		t.Fatalf("abandoned hydration keeps clone state: %+v", clone)
+	}
+	if phase != phaseDeleting {
+		t.Fatalf("phase after abandoned delete = %q, want %q", phase, phaseDeleting)
+	}
+	if watching {
+		t.Fatal("abandoned hydration still has a watcher entry")
+	}
+	// Seal must see the pending delete, not a successful wait followed by
+	// "still hydrating" forever.
+	if _, err := s.Seal(context.Background(), id, "f0000000000000c1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Seal after abandoned delete = %v, want ErrNotFound", err)
+	}
+
+	// (b) The remote lease is released exactly once.
+	if released != 1 {
+		t.Fatalf("remote released %d times, want 1", released)
+	}
+
+	// (c) The existing delete retry finishes the teardown and frees the ID.
+	if err := s.Delete(context.Background(), id); err != nil {
+		t.Fatalf("retry delete: %v", err)
+	}
+	if pending := s.PendingDeletes(); len(pending) != 0 {
+		t.Fatalf("pending deletes after retry = %v", pending)
+	}
+	if _, err := s.begin(&record{ID: id, Kind: KindWorking, Size: 32 << 20}, 1); err != nil {
+		t.Fatalf("ID not reusable after retry: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("remote released %d times after retry, want 1", released)
+	}
+}
+
+// TestDeleteFailureReleasesRecoveredRemoteOnce covers the restart case: the
+// Release closure is gone, so the lease is released through Config and the
+// persisted remote ID is cleared so the retried teardown cannot release it
+// again.
+func TestDeleteFailureReleasesRecoveredRemoteOnce(t *testing.T) {
+	s := newDeleteTestStore(t)
+	const id = "f000000000000002"
+	released := 0
+	s.cfg.ReleaseRemote = func(string) { released++ }
+	r := &record{
+		ID: id, Kind: KindWorking, Size: 32 << 20, Phase: phaseReady, Layered: true,
+		Clone: &cloneInfo{RemoteID: "node/lease/nqn", Source: "/dev/null", SourceSize: 32 << 20},
+	}
+	addRecord(t, s, r)
+
+	failTeardownAfterTop(s)
+	if err := s.Delete(context.Background(), id); err == nil {
+		t.Fatal("Delete succeeded despite a failed teardown")
+	}
+	if released != 1 {
+		t.Fatalf("remote released %d times, want 1", released)
+	}
+	s.mu.Lock()
+	remoteID := ""
+	if r.Clone != nil {
+		remoteID = r.Clone.RemoteID
+	}
+	s.mu.Unlock()
+	if remoteID != "" {
+		t.Fatalf("released remote ID still set: %q", remoteID)
+	}
+
+	if err := s.Delete(context.Background(), id); err != nil {
+		t.Fatalf("retry delete: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("remote released %d times after retry, want 1", released)
+	}
+}
+
 // TestPinRacingDeleteCannotBeLost pins the lock ordering between Pin and
 // Delete. Delete holds the volume's key lock across its final eligibility
 // check and the teardown; a Pin that arrives in that window must wait and then
