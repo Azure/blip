@@ -353,7 +353,7 @@ func TestSimulationLifecycleCloneIncludesInFlightEffects(t *testing.T) {
 	}
 	x := w.Clone().(*world)
 	if x.Key() != w.Key() {
-		t.Fatal("clone lost hidden core transcript")
+		t.Fatal("clone lost hidden core state")
 	}
 	before := w.Key()
 	checkedStep(t, x, "fault/removal-reply")

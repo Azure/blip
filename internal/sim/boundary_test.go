@@ -16,7 +16,11 @@ func TestProductionCoreBoundaries(t *testing.T) {
 	for _, name := range []string{
 		"atomicfile/atomicfile.go",
 		"node/scheduler.go",
+		"node/scheduler_snapshot.go",
+		"node/plan.go",
+		"node/planner.go",
 		"runtime/machine.go",
+		"runtime/snapshot.go",
 		"guest/session_lifecycle.go",
 	} {
 		t.Run(name, func(t *testing.T) {

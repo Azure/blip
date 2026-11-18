@@ -3,9 +3,9 @@
 Blip's simulations execute production decision and operation code against
 controlled external effects. The virtual worlds need no Kubernetes cluster,
 VM, or privileged storage devices. Some tests use temporary files, real bbolt,
-or subprocesses to qualify persistence and process-crash behavior. The regular Go test suite runs them; the
-focused target also checks the concurrent production adapters with the race
-detector:
+or subprocesses to qualify persistence and process-crash behavior. The regular
+Go test suite runs them; the focused target also checks the concurrent
+production adapters with the race detector:
 
 ```sh
 go test ./...
@@ -129,7 +129,7 @@ cleanup path and must be represented when asserting end-to-end release.
 | `internal/runtime` | Production claim/mount/detach/freeze/stop machine and hypervisor confirmation helper | Guest, network and hypervisor service represented by effect outcomes |
 | `internal/guest`, `internal/session`, `internal/wire` | Guest control/session decisions, freeze lifecycle, protocol framing and ambiguous session opens | Guest filesystem/process behavior needs real-host qualification |
 | `internal/peer`, `internal/nvme` | Lease lifecycle, persistence, retry policy and connection workflows | Real transport/device semantics additionally tested by privileged suites |
-| `internal/simapp` | Composed allocation, runtime, node admission, lease sequencing, save/replication and reacquisition | See its README for exact simulated services and exploration windows |
+| `internal/simapp` | Composed allocation, production node planning/admission, runtime, lease sequencing, save/replication and reacquisition | See its README for exact simulated services and exploration windows |
 | `internal/sim`, `internal/simlive` | Replay, shrinking, exploration bounds, crash delivery and fair-cycle witnesses | Checker tests include deliberately broken models; production properties live in component/world tests |
 
 Tests use independent content, ownership and resource monitors where applicable.
