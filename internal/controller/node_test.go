@@ -7,6 +7,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/podapi"
 )
 
 // TestNodeWatchWakesDrainingNodeForBlip checks the Blip watch mapping: a Blip
@@ -91,5 +92,71 @@ func TestSafeToRemoveRecomputedAfterBlipFinishes(t *testing.T) {
 	}
 	if l := e.getNode("n1").Labels; l[LabelEnrolled] != "" || l[LabelHypervisorPrefix+"kvm"] != "" {
 		t.Fatalf("enrollment labels left on unenrolled node: %v", l)
+	}
+}
+
+// TestUnenrollRechecksSafetyForANewDrain covers C9: after an undrain,
+// SafeToRemove may still say true from the previous drain although a VM is
+// running. The enrollment retry must reset the verdict for the drain it
+// starts and prove safety from the live objects, so the labels and BlipNode
+// stay while the VM runs and are removed only after a fresh drain completes.
+func TestUnenrollRechecksSafetyForANewDrain(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.startBlip("b", "n1", withImage("reg/img:v1"))
+
+	// Undrain race: the drain was cleared (or never observed) but the status
+	// still carries the previous drain's safe verdict.
+	bn := e.getBlipNode("n1")
+	if bn.Spec.Drain {
+		t.Fatal("unexpected drain")
+	}
+	bn.Status.SafeToRemove = true
+	e.must(e.c.Status().Update(e.ctx, bn))
+
+	// No pool selects the node any more; the enroll retry starts a new drain.
+	e.updatePool("default", func(p *v1.BlipPool) {
+		p.Spec.NodeSelector = map[string]string{"blip.dev/node-pool": "other"}
+	})
+
+	res := e.run(e.enroll, "", "n1")
+	bn = e.getBlipNode("n1")
+	if !bn.Spec.Drain || bn.Annotations[AnnotationEnrollmentDrain] != "true" {
+		t.Fatalf("new drain not recorded: %+v", bn)
+	}
+	if bn.Status.SafeToRemove {
+		t.Fatal("stale SafeToRemove survived the new drain")
+	}
+	if res.RequeueAfter != enrollmentRetry {
+		t.Fatalf("unsafe drain requeue %v, want %v", res.RequeueAfter, enrollmentRetry)
+	}
+	if l := e.getNode("n1").Labels; l[LabelEnrolled] != "true" || l[LabelHypervisorPrefix+"kvm"] != "" {
+		t.Fatalf("node labels changed while the VM runs: %v", l)
+	}
+	expectPhase(t, e.getBlip("b"), v1.BlipRunning, "")
+
+	// A retry still sees the running Blip and keeps the agent.
+	e.run(e.enroll, "", "n1")
+	if e.getNode("n1").Labels[LabelEnrolled] != "true" {
+		t.Fatal("agent unenrolled while the VM still runs")
+	}
+	if err := e.c.Get(e.ctx, types.NamespacedName{Name: "n1"}, &v1.BlipNode{}); err != nil {
+		t.Fatalf("BlipNode deleted while the VM still runs: %v", err)
+	}
+
+	// Finish the VM through the normal stop path; a fresh check now proves
+	// the drain safe and unenrolls the node.
+	e.updateBlip("b", func(b *v1.Blip) { b.Spec.Stop = true })
+	e.observe(e.getBlip("b").Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{}})
+	e.run(e.blip, ns, "b")
+	expectPhase(t, e.getBlip("b"), v1.BlipSucceeded, "")
+	e.run(e.enroll, "", "n1")
+
+	if err := e.c.Get(e.ctx, types.NamespacedName{Name: "n1"}, &v1.BlipNode{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("node not unenrolled after the drain completed: %v", err)
+	}
+	if l := e.getNode("n1").Labels; l[LabelEnrolled] != "" || l[LabelHypervisorPrefix+"kvm"] != "" {
+		t.Fatalf("enrollment labels left after unenroll: %v", l)
 	}
 }
