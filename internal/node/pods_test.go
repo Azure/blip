@@ -115,13 +115,37 @@ func TestClaimCarriesWaitForClient(t *testing.T) {
 }
 
 func TestIdleTimeoutOverride(t *testing.T) {
-	v := newView()
-	b, d := durableBlip(v)
-	b.Spec.IdleTimeout = &metav1.Duration{Duration: 45 * time.Second}
-	readyDev(v, d, storage.Volume{ID: "r1", StateUID: "uid-root"}, 7)
-	p := compute(v)
-	if c := p.desired[pkey("p")].Claim; c == nil || c.IdleTimeoutSeconds != 45 {
-		t.Fatalf("claim with idle timeout = %+v", c)
+	for _, tt := range []struct {
+		d    time.Duration
+		want int64
+	}{
+		{45 * time.Second, 45},
+		{500 * time.Millisecond, 1},
+	} {
+		v := newView()
+		b, d := durableBlip(v)
+		b.Spec.IdleTimeout = &metav1.Duration{Duration: tt.d}
+		readyDev(v, d, storage.Volume{ID: "r1", StateUID: "uid-root"}, 7)
+		p := compute(v)
+		if c := p.desired[pkey("p")].Claim; c == nil || c.IdleTimeoutSeconds != tt.want {
+			t.Fatalf("claim with idle timeout %v = %+v, want %ds", tt.d, c, tt.want)
+		}
+	}
+}
+
+func TestIdleTimeoutSeconds(t *testing.T) {
+	for _, tt := range []struct {
+		d    time.Duration
+		want int64
+	}{
+		{0, 0},
+		{500 * time.Millisecond, 1},
+		{1500 * time.Millisecond, 2},
+		{30 * time.Second, 30},
+	} {
+		if got := idleTimeoutSeconds(tt.d); got != tt.want {
+			t.Errorf("idleTimeoutSeconds(%v) = %d, want %d", tt.d, got, tt.want)
+		}
 	}
 }
 
@@ -145,6 +169,21 @@ func TestRuntimeDefaultsPrecedence(t *testing.T) {
 				IdleTimeout: &metav1.Duration{Duration: time.Minute},
 			},
 			env: []string{"PATH=/bin", "A=image", "A=state"}, dir: "/state", user: "state-user", idle: 60,
+		},
+		{
+			name: "subsecond state default rounds up",
+			defaults: &v1alpha1.RuntimeDefaults{
+				IdleTimeout: &metav1.Duration{Duration: 500 * time.Millisecond},
+			},
+			env: []string{"PATH=/bin", "A=image"}, dir: "/image", user: "image-user", idle: 1,
+		},
+		{
+			name: "subsecond execution override wins and rounds up",
+			defaults: &v1alpha1.RuntimeDefaults{
+				IdleTimeout: &metav1.Duration{Duration: time.Minute},
+			},
+			override: v1alpha1.BlipSpec{IdleTimeout: &metav1.Duration{Duration: 500 * time.Millisecond}},
+			env:      []string{"PATH=/bin", "A=image"}, dir: "/image", user: "image-user", idle: 1,
 		},
 		{
 			name: "execution overrides including zero timeout and empty env",

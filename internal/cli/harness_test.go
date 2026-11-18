@@ -28,6 +28,9 @@ type harness struct {
 	kube  client.WithWatch
 	guest *fakeguest.Guest
 	ctrl  *fakeController
+	// connect overrides the fake guest connector when set, so tests can
+	// inject transport failures.
+	connect session.Connector
 	// self is the blip the CLI runs in, if any.
 	self string
 }
@@ -86,8 +89,12 @@ func (h *harness) run(stdin string, args ...string) (int, string, string) {
 }
 
 func (h *harness) env(in io.Reader, out, errOut io.Writer) *Env {
+	connect := session.Connector(h.guest.Connect)
+	if h.connect != nil {
+		connect = h.connect
+	}
 	env := &Env{In: in, Out: out, Err: errOut, Connect: func(KubeFlags) (*Clients, error) {
-		return &Clients{Kube: h.kube, Sessions: &session.Client{Connect: h.guest.Connect}, Namespace: ns}, nil
+		return &Clients{Kube: h.kube, Sessions: &session.Client{Connect: connect}, Namespace: ns}, nil
 	}}
 	if h.self != "" {
 		env.NamespaceFile = filepath.Join(h.t.TempDir(), "namespace")

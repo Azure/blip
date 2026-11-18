@@ -153,6 +153,138 @@ func TestNonTTYInputWaitsInsteadOfDropping(t *testing.T) {
 	}
 }
 
+// TestNonTTYInputStallDropsAndKeepsSignalsResponsive verifies that a bulk
+// client feeding a process which never reads cannot block the frame loop
+// forever. Once the 8 MiB queue stops making progress, further input is
+// dropped (with a notice) so a later SIGINT/SIGTERM is still delivered.
+func TestNonTTYInputStallDropsAndKeepsSignalsResponsive(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+
+	s := newInputTestSession(w, cmd.Process.Pid)
+	defer s.closeInput()
+
+	// Queue well past maxPendingInput. sleep never reads, so the pump blocks
+	// in write and the queue can only drain the first pipe-sized batch.
+	block := bytes.Repeat([]byte("x"), 1<<20)
+	queued := make(chan struct{})
+	go func() {
+		for i := 0; i < 32; i++ {
+			if err := s.queueInput(block); err != nil {
+				break
+			}
+		}
+		close(queued)
+	}()
+	select {
+	case <-queued:
+	case <-time.After(4 * time.Second):
+		t.Fatal("non-terminal input wedged behind a process that is not reading")
+	}
+	if !s.takeDropped() {
+		t.Fatal("input overflow was not reported")
+	}
+
+	payload, _ := json.Marshal(wire.Signal{Name: "TERM"})
+	done := make(chan struct{})
+	go func() {
+		_ = s.input(wire.TSignal, payload)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("signal frame blocked behind stalled stdin")
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("process did not receive the signal after stdin stalled")
+	}
+}
+
+// TestInputDropNoticeIsThrottled verifies that a flood of dropped frames
+// produces one notice instead of one per frame.
+func TestInputDropNoticeIsThrottled(t *testing.T) {
+	s := &session{out: ring{max: RingSize}, tty: true}
+	s.inCond = sync.NewCond(&s.inMu)
+	s.inBytes = maxPendingInput // full: every frame below is dropped
+
+	for i := 0; i < 8; i++ {
+		if err := s.queueInput([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !s.takeDropped() {
+		t.Fatal("first overflow was not reported")
+	}
+	for i := 0; i < 8; i++ {
+		if err := s.queueInput([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.takeDropped() {
+		t.Fatal("stdin-discarded notice repeated immediately after a flood")
+	}
+}
+
+// TestNonTTYInputExactlyMaxIsNotDropped keeps the normal byte-stream path
+// intact: a full 8 MiB queued to a process that is reading is delivered
+// whole.
+func TestNonTTYInputExactlyMaxIsNotDropped(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	cmd := exec.Command("cat")
+	cmd.Stdin = r
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+
+	s := newInputTestSession(w, cmd.Process.Pid)
+	defer s.closeInput()
+
+	copied := make(chan int, 1)
+	go func() {
+		n, _ := io.Copy(io.Discard, stdout)
+		copied <- int(n)
+	}()
+
+	if err := s.queueInput(bytes.Repeat([]byte("z"), maxPendingInput)); err != nil {
+		t.Fatal(err)
+	}
+	s.queueEOF()
+	select {
+	case n := <-copied:
+		if n != maxPendingInput {
+			t.Fatalf("delivered %d bytes, want %d", n, maxPendingInput)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("8 MiB of stdin was not delivered")
+	}
+	if s.takeDropped() {
+		t.Fatal("input within maxPendingInput was dropped")
+	}
+}
+
 // TestPumpCopiesReadBuffer verifies that each output frame owns its bytes.
 // Reusing one read buffer made every frame alias the latest read, which
 // corrupted downloads larger than one 32KiB read.

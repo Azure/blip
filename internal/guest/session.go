@@ -44,8 +44,10 @@ type session struct {
 	inQueue   [][]byte
 	inBytes   int
 	inEOF     bool
-	inDone    bool // no more input will be queued
-	inDropped bool // input was discarded because the process is not reading
+	inDone    bool      // no more input will be queued
+	inDropped bool      // input was discarded because the process is not reading
+	inStalled bool      // no input space was freed for inputStallTimeout
+	inNotice  time.Time // when the stdin-discarded notice was last sent
 
 	// Exec sessions hold output pumps until the client is attached (right
 	// after TOpened), so output produced during the open handshake cannot
@@ -58,6 +60,16 @@ type session struct {
 // The SSH channel window is smaller, so this leaves room for a control frame
 // (resize or signal) behind a burst of input without buffering without limit.
 const maxPendingInput = 8 << 20
+
+const (
+	// inputStallTimeout is how long a full stdin queue may make no progress
+	// before the process is treated as not reading. Waiting longer would
+	// delay SIGINT/SIGTERM behind an unread byte stream.
+	inputStallTimeout = time.Second
+	// inputNoticeInterval throttles the stdin-discarded warning so a flood
+	// produces one notice rather than one per dropped frame.
+	inputNoticeInterval = time.Second
+)
 
 type client struct {
 	closed bool
@@ -355,6 +367,12 @@ func (s *session) pumpInput() {
 	for {
 		s.inMu.Lock()
 		for len(s.inQueue) == 0 && !s.inEOF && !s.inDone {
+			// Nothing is waiting, so the process has caught up. Resume
+			// accepting input after an earlier stall.
+			if s.inStalled {
+				s.inStalled = false
+				s.inCond.Broadcast()
+			}
 			s.inCond.Wait()
 		}
 		if s.inDone {
@@ -368,6 +386,14 @@ func (s *session) pumpInput() {
 		for _, b := range queue {
 			s.writeInput(b)
 		}
+		// The process consumed this batch, so it is reading again. A stalled
+		// writer may resume queuing input.
+		s.inMu.Lock()
+		if s.inStalled {
+			s.inStalled = false
+		}
+		s.inCond.Broadcast()
+		s.inMu.Unlock()
 		if eof {
 			s.endInput()
 			// Stdin stays closed: input a later client sends cannot be
@@ -414,7 +440,10 @@ func (s *session) endInput() {
 // A non-terminal session is a byte stream, not a person typing: sftp, scp and
 // git upload data through it. Dropping a frame would corrupt the stream, so
 // wait for the input pump to make space instead. The wait propagates through
-// the client's SSH window as normal backpressure.
+// the client's SSH window as normal backpressure. If the full queue makes no
+// progress for inputStallTimeout, the process is not reading: further input
+// is dropped (with one throttled notice) so the frame loop can still deliver
+// SIGINT/SIGTERM instead of hanging behind the unread bytes.
 func (s *session) queueInput(payload []byte) error {
 	s.inMu.Lock()
 	defer s.inMu.Unlock()
@@ -423,21 +452,46 @@ func (s *session) queueInput(payload []byte) error {
 	}
 	if s.tty {
 		if len(payload) > maxPendingInput-s.inBytes {
-			s.inDropped = true
+			s.dropInputLocked()
 			return nil
 		}
-	} else {
-		for len(payload) > maxPendingInput-s.inBytes && !s.inDone {
+	} else if !s.inStalled && len(payload) > maxPendingInput-s.inBytes {
+		timer := time.AfterFunc(inputStallTimeout, func() {
+			s.inMu.Lock()
+			s.inCond.Broadcast()
+			s.inMu.Unlock()
+		})
+		deadline := time.Now().Add(inputStallTimeout)
+		for !s.inDone && !s.inStalled && len(payload) > maxPendingInput-s.inBytes && time.Now().Before(deadline) {
 			s.inCond.Wait()
 		}
-		if s.inDone {
-			return nil
+		timer.Stop()
+		if !s.inDone && len(payload) > maxPendingInput-s.inBytes {
+			s.inStalled = true
+			// Wake other clients' writers so they drop promptly too.
+			s.inCond.Broadcast()
 		}
+	}
+	if s.inStalled {
+		s.dropInputLocked()
+		return nil
 	}
 	s.inQueue = append(s.inQueue, payload)
 	s.inBytes += len(payload)
 	s.inCond.Signal()
 	return nil
+}
+
+// dropInputLocked records discarded stdin. Notices are throttled: a client
+// flooding input must not produce one warning per frame.
+func (s *session) dropInputLocked() {
+	if s.inDropped {
+		return
+	}
+	if !s.inNotice.IsZero() && time.Since(s.inNotice) < inputNoticeInterval {
+		return
+	}
+	s.inDropped = true
 }
 
 func (s *session) queueEOF() {
@@ -613,19 +667,23 @@ func (s *session) serve(c *wire.Conn, conn io.Closer) {
 		}
 		if s.takeDropped() {
 			_ = c.WriteJSON(wire.TNotice, wire.Notice{
-				Message: "stdin was discarded: the command is not reading it",
+				Message: "stdin was discarded because the command is not reading it; interrupt the command or close the connection to stop sending",
 			})
 		}
 	}
 }
 
-// takeDropped reports and clears a pending input-overflow notice.
+// takeDropped reports and clears a pending input-overflow notice. It records
+// when the notice was sent so dropInputLocked can throttle the next one.
 func (s *session) takeDropped() bool {
 	s.inMu.Lock()
 	defer s.inMu.Unlock()
-	dropped := s.inDropped
+	if !s.inDropped {
+		return false
+	}
 	s.inDropped = false
-	return dropped
+	s.inNotice = time.Now()
+	return true
 }
 
 // write streams output from the start of the ring, then live output, then
