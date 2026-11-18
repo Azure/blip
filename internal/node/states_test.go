@@ -250,6 +250,58 @@ func TestBuildPlanning(t *testing.T) {
 	}
 }
 
+// TestCopyReplicaBuildPlanning: a replica of a committed copy builds the new
+// commit locally from the source commit it already holds. A replica without
+// that source commit still fetches the new commit, and a live copy never
+// builds from a committed base.
+func TestCopyReplicaBuildPlanning(t *testing.T) {
+	cases := []struct {
+		name  string
+		hold  bool
+		live  bool
+		build string
+	}{
+		{name: "holds source", hold: true, build: "k1"},
+		{name: "base not held"},
+		{name: "live copy", hold: true, live: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := newView()
+			cp := state("cp")
+			cf := &v1alpha1.CopySource{StateUID: "uid-src", CommitID: "s1", Nodes: []string{"n3"}}
+			if tc.live {
+				cf.AttachmentID = "a1"
+			}
+			cp.Status.CopiedFrom = cf
+			cp.Status.Pending = &v1alpha1.PendingCommit{CommitID: "k1", Generation: 1, SourceNode: "n2", Replicas: []string{"n2", self}}
+			v.states = []*v1alpha1.BlipState{cp}
+			if tc.hold {
+				v.volumes["s1"] = commit("s1", "uid-src")
+			}
+			if tc.build == "" {
+				// The source node published the new commit.
+				cp.Status.Nodes = []v1alpha1.NodeObservation{holding("n2", "k1")}
+			}
+
+			p := compute(v)
+			if tc.build != "" {
+				if len(p.builds) != 1 || p.builds[0].req.CommitID != tc.build || p.builds[0].req.FromCommit != "s1" {
+					t.Fatalf("builds = %+v", p.builds)
+				}
+				if len(p.fetches) != 0 {
+					t.Fatalf("fetches = %+v", p.fetches)
+				}
+				return
+			}
+			if len(p.builds) != 0 || len(p.fetches) != 1 ||
+				p.fetches[0].owner != "uid-cp" || p.fetches[0].src.commitID != "k1" || p.fetches[0].src.node != "n2" {
+				t.Fatalf("builds = %+v fetches = %+v", p.builds, p.fetches)
+			}
+		})
+	}
+}
+
 // TestImageBuildPlanning: every node converts images itself, so the initial
 // version of an image state is built by each replica and placement instead
 // of fetched, and commits built from an image are offered as bases only by

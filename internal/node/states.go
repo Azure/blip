@@ -188,13 +188,17 @@ func (v *view) liveCopyPod(cf *v1alpha1.CopySource) string {
 // The pending source builds it. Each node converts images itself, so the
 // initial version of an image state is not fetched: every pending replica,
 // and later every placement while it is still the committed version, builds
-// its own. A save replicating to this node is fetched first.
+// its own. A replica of a copy also builds locally when it already holds the
+// committed version being copied, which is the usual case after replication.
+// A save replicating to this node is fetched first.
 func (v *view) buildTarget(s *v1alpha1.BlipState) string {
 	st := s.Status
 	pd, c := st.Pending, st.Committed
 	switch {
 	case pd != nil && pd.AttachmentID == "" &&
-		(pd.SourceNode == v.node || fromImage(s, pd.Generation, pd.AttachmentID) && slices.Contains(pd.Replicas, v.node)):
+		(pd.SourceNode == v.node ||
+			(fromImage(s, pd.Generation, pd.AttachmentID) || v.copyBase(s, pd.Generation)) &&
+				slices.Contains(pd.Replicas, v.node)):
 		return pd.CommitID
 	case pd != nil && slices.Contains(pd.Replicas, v.node) && !v.holds(pd.CommitID):
 		return ""
@@ -208,6 +212,18 @@ func (v *view) buildTarget(s *v1alpha1.BlipState) string {
 // an image.
 func fromImage(s *v1alpha1.BlipState, generation int64, attachmentID string) bool {
 	return s.Status.ImageDigest != "" && generation == 1 && attachmentID == ""
+}
+
+// copyBase reports whether this node can build the initial version of a copy
+// from the committed version it was copied from. Live copies must snapshot on
+// the source node, so they are excluded.
+func (v *view) copyBase(s *v1alpha1.BlipState, generation int64) bool {
+	cf := s.Status.CopiedFrom
+	if generation != 1 || cf == nil || cf.AttachmentID != "" || cf.CommitID == "" {
+		return false
+	}
+	vol, ok := v.volumes[cf.CommitID]
+	return ok && vol.Kind == storage.KindCommit && vol.StateUID == cf.StateUID
 }
 
 func (v *view) copySource(cf *v1alpha1.CopySource) *source {
