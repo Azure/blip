@@ -7,6 +7,7 @@ import (
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/image"
 	"github.com/Azure/blip/internal/podapi"
+	"github.com/Azure/blip/internal/registryauth"
 	"github.com/Azure/blip/internal/storage"
 )
 
@@ -62,7 +63,7 @@ type devRef struct {
 // imageImport imports a pinned image reference with its pull credentials.
 type imageImport struct {
 	ref     string
-	secrets []pullSecret
+	secrets []registryauth.PullSecret
 }
 
 // build is a commit this node builds.

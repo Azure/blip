@@ -1,0 +1,105 @@
+package cli
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path"
+	"strings"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/Azure/blip/api/v1alpha1"
+)
+
+// get fetches the named object into obj. It returns the API error unchanged, so
+// callers can fall back or ignore NotFound before reporting it with notFound.
+func get[T client.Object](ctx context.Context, c *Clients, name string, obj T) (T, error) {
+	var zero T
+	if err := c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: name}, obj); err != nil {
+		return zero, err
+	}
+	return obj, nil
+}
+
+// notFound turns a missing object into the command's standard message. Any
+// other error, including nil, passes through.
+func notFound(kind, name, namespace string, err error) error {
+	if err != nil && apierrors.IsNotFound(err) {
+		return fmt.Errorf("%s %q not found in namespace %q", kind, name, namespace)
+	}
+	return err
+}
+
+func (a *app) getBlip(ctx context.Context, name string) (*v1alpha1.Blip, error) {
+	c, err := a.clients()
+	if err != nil {
+		return nil, err
+	}
+	b, err := get(ctx, c, name, &v1alpha1.Blip{})
+	return b, notFound("blip", name, c.Namespace, err)
+}
+
+func (a *app) getState(ctx context.Context, name string) (*v1alpha1.BlipState, error) {
+	c, err := a.clients()
+	if err != nil {
+		return nil, err
+	}
+	s, err := get(ctx, c, name, &v1alpha1.BlipState{})
+	return s, notFound("state", name, c.Namespace, err)
+}
+
+func findMount(list []v1alpha1.MountStatus, state string) *v1alpha1.MountStatus {
+	for i := range list {
+		if list[i].State == state {
+			return &list[i]
+		}
+	}
+	return nil
+}
+
+func findSpecMount(list []v1alpha1.Mount, state string) *v1alpha1.Mount {
+	for i := range list {
+		if list[i].State == state {
+			return &list[i]
+		}
+	}
+	return nil
+}
+
+// parseMount parses STATE:/path[:rw|:ro].
+func parseMount(s string) (v1alpha1.Mount, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || !strings.HasPrefix(parts[1], "/") ||
+		parts[1] == "/" || path.Clean(parts[1]) != parts[1] {
+		return v1alpha1.Mount{}, fmt.Errorf("invalid mount %q: want STATE:/clean/absolute/path[:rw]", s)
+	}
+	m := v1alpha1.Mount{State: parts[0], Path: parts[1]}
+	if len(parts) == 3 {
+		switch parts[2] {
+		case "rw":
+			m.Writable = true
+		case "ro":
+		default:
+			return v1alpha1.Mount{}, fmt.Errorf("invalid mount %q: mode must be rw or ro", s)
+		}
+	}
+	return m, nil
+}
+
+// parseEnv parses KEY=VALUE; a bare KEY takes the local value.
+func parseEnv(list []string) ([]v1alpha1.EnvVar, error) {
+	var env []v1alpha1.EnvVar
+	for _, e := range list {
+		k, v, ok := strings.Cut(e, "=")
+		if k == "" {
+			return nil, fmt.Errorf("invalid environment variable %q", e)
+		}
+		if !ok {
+			v = os.Getenv(k)
+		}
+		env = append(env, v1alpha1.EnvVar{Name: k, Value: v})
+	}
+	return env, nil
+}

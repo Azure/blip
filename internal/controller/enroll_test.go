@@ -61,20 +61,20 @@ func TestEnrollLabelsMatchingNodes(t *testing.T) {
 	e.run(e.enroll, "", "n2")
 
 	n1 := e.getNode("n1")
-	if n1.Labels[LabelEnrolled] != "true" {
+	if n1.Labels[v1.LabelEnrolled] != "true" {
 		t.Errorf("selected node not enrolled: %v", n1.Labels)
 	}
-	if n1.Labels[LabelHypervisorPrefix+"kvm"] != "true" {
+	if n1.Labels[v1.LabelHypervisorPrefix+"kvm"] != "true" {
 		t.Errorf("selected node missing hypervisor label: %v", n1.Labels)
 	}
 	if n1.Labels["zone"] != "a" {
 		t.Errorf("enrollment changed an unrelated label: %v", n1.Labels)
 	}
 	n2 := e.getNode("n2")
-	if n2.Labels[LabelEnrolled] != "" {
+	if n2.Labels[v1.LabelEnrolled] != "" {
 		t.Errorf("unselected node enrolled: %v", n2.Labels)
 	}
-	if n2.Labels[LabelHypervisorPrefix+"kvm"] != "" {
+	if n2.Labels[v1.LabelHypervisorPrefix+"kvm"] != "" {
 		t.Errorf("unselected node has hypervisor label: %v", n2.Labels)
 	}
 }
@@ -89,10 +89,10 @@ func TestEnrollDoesNotEnrollUnselectedNode(t *testing.T) {
 	e.run(e.enroll, "", "n1")
 
 	n1 := e.getNode("n1")
-	if n1.Labels[LabelEnrolled] != "" {
+	if n1.Labels[v1.LabelEnrolled] != "" {
 		t.Errorf("never-enrolled node was enrolled: %v", n1.Labels)
 	}
-	if n1.Labels[LabelHypervisorPrefix+"kvm"] != "" {
+	if n1.Labels[v1.LabelHypervisorPrefix+"kvm"] != "" {
 		t.Errorf("never-enrolled node has hypervisor label: %v", n1.Labels)
 	}
 }
@@ -115,7 +115,7 @@ func TestEnrollDrainsUnselectedNode(t *testing.T) {
 	e.run(e.enroll, "", "n1")
 
 	n1 := e.getNode("n1")
-	for _, k := range []string{LabelEnrolled, LabelHypervisorPrefix + "kvm"} {
+	for _, k := range []string{v1.LabelEnrolled, v1.LabelHypervisorPrefix + "kvm"} {
 		if _, ok := n1.Labels[k]; ok {
 			t.Errorf("label %s not removed after drain: %v", k, n1.Labels)
 		}
@@ -138,7 +138,7 @@ func TestEnrollClearsAutoDrainWhenSelectedAgain(t *testing.T) {
 	})
 	bn := e.getBlipNode("n1")
 	bn.Spec.Drain = true
-	bn.Annotations = map[string]string{AnnotationEnrollmentDrain: "true"}
+	bn.Annotations = map[string]string{v1.AnnotationEnrollmentDrain: "true"}
 	e.must(e.c.Update(e.ctx, bn))
 
 	e.run(e.enroll, "", "n1")
@@ -147,10 +147,10 @@ func TestEnrollClearsAutoDrainWhenSelectedAgain(t *testing.T) {
 	if bn.Spec.Drain {
 		t.Error("automatic drain not cleared after the node matched a pool")
 	}
-	if _, ok := bn.Annotations[AnnotationEnrollmentDrain]; ok {
+	if _, ok := bn.Annotations[v1.AnnotationEnrollmentDrain]; ok {
 		t.Errorf("drain annotation not removed: %v", bn.Annotations)
 	}
-	if e.getNode("n1").Labels[LabelEnrolled] != "true" {
+	if e.getNode("n1").Labels[v1.LabelEnrolled] != "true" {
 		t.Error("matching node not enrolled")
 	}
 }
@@ -172,7 +172,7 @@ func TestEnrollPreservesOperatorDrain(t *testing.T) {
 	if !bn.Spec.Drain {
 		t.Error("operator drain was cleared")
 	}
-	if e.getNode("n1").Labels[LabelEnrolled] != "true" {
+	if e.getNode("n1").Labels[v1.LabelEnrolled] != "true" {
 		t.Error("operator-drained node not enrolled")
 	}
 }
@@ -192,10 +192,10 @@ func TestEnrollRemovesStaleHypervisorLabel(t *testing.T) {
 	e.run(e.enroll, "", "n1")
 
 	n1 := e.getNode("n1")
-	if n1.Labels[LabelEnrolled] != "true" {
+	if n1.Labels[v1.LabelEnrolled] != "true" {
 		t.Error("node with no hypervisor should stay enrolled")
 	}
-	if n1.Labels[LabelHypervisorPrefix+"kvm"] != "" {
+	if n1.Labels[v1.LabelHypervisorPrefix+"kvm"] != "" {
 		t.Errorf("stale hypervisor label remains: %v", n1.Labels)
 	}
 }
@@ -205,15 +205,15 @@ func TestEnrollRemovesStaleHypervisorLabel(t *testing.T) {
 func TestEnrollWaitsForMigration(t *testing.T) {
 	e := newEnv(t)
 	e.addEnrollableNode("n1", map[string]string{
-		LabelEnrolled:                 "true",
-		LabelHypervisorPrefix + "kvm": "true",
+		v1.LabelEnrolled:                 "true",
+		v1.LabelHypervisorPrefix + "kvm": "true",
 	}, "kvm")
 	e.create(&v1.BlipPool{ObjectMeta: metav1.ObjectMeta{Name: "default"}})
 
 	e.run(e.enroll, "", "n1")
 
 	n1 := e.getNode("n1")
-	if n1.Labels[LabelEnrolled] != "true" || n1.Labels[LabelHypervisorPrefix+"kvm"] != "true" {
+	if n1.Labels[v1.LabelEnrolled] != "true" || n1.Labels[v1.LabelHypervisorPrefix+"kvm"] != "true" {
 		t.Errorf("migrating cluster changed enrollment labels: %v", n1.Labels)
 	}
 	if bn := e.getBlipNode("n1"); bn.Spec.Drain {
@@ -226,15 +226,15 @@ func TestEnrollWaitsForMigration(t *testing.T) {
 func TestEnrollRemovesLabelsWithoutBlipNode(t *testing.T) {
 	e := newEnv(t)
 	e.create(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1", Labels: map[string]string{
-		LabelEnrolled:                 "true",
-		LabelHypervisorPrefix + "kvm": "true",
-		"keep":                        "me",
+		v1.LabelEnrolled:                 "true",
+		v1.LabelHypervisorPrefix + "kvm": "true",
+		"keep":                           "me",
 	}}})
 
 	e.run(e.enroll, "", "n1")
 
 	n1 := e.getNode("n1")
-	if n1.Labels[LabelEnrolled] != "" || n1.Labels[LabelHypervisorPrefix+"kvm"] != "" {
+	if n1.Labels[v1.LabelEnrolled] != "" || n1.Labels[v1.LabelHypervisorPrefix+"kvm"] != "" {
 		t.Errorf("managed labels not removed: %v", n1.Labels)
 	}
 	if n1.Labels["keep"] != "me" {
@@ -258,7 +258,7 @@ func TestEnrollAgainAfterUnenroll(t *testing.T) {
 	})
 	// The idle node drains and is proven safe in the same retry.
 	e.run(e.enroll, "", "n1")
-	if e.getNode("n1").Labels[LabelEnrolled] != "" {
+	if e.getNode("n1").Labels[v1.LabelEnrolled] != "" {
 		t.Fatal("node still enrolled after unenroll")
 	}
 
@@ -266,7 +266,7 @@ func TestEnrollAgainAfterUnenroll(t *testing.T) {
 		p.Spec.NodeSelector = map[string]string{"zone": "a"}
 	})
 	e.run(e.enroll, "", "n1")
-	if e.getNode("n1").Labels[LabelEnrolled] != "true" {
+	if e.getNode("n1").Labels[v1.LabelEnrolled] != "true" {
 		t.Fatal("node not enrolled again")
 	}
 
@@ -278,7 +278,7 @@ func TestEnrollAgainAfterUnenroll(t *testing.T) {
 	bn.Status = v1.BlipNodeStatus{Incarnation: "inc-n1", Heartbeat: &hb, Hypervisors: []string{"kvm"}}
 	e.must(e.c.Status().Update(e.ctx, bn))
 	e.run(e.enroll, "", "n1")
-	if e.getNode("n1").Labels[LabelHypervisorPrefix+"kvm"] != "true" {
+	if e.getNode("n1").Labels[v1.LabelHypervisorPrefix+"kvm"] != "true" {
 		t.Error("hypervisor label not restored after re-enrollment")
 	}
 }
@@ -291,7 +291,7 @@ func TestEnrollDropsOneOfSeveralHypervisors(t *testing.T) {
 		Spec:       v1.BlipPoolSpec{NodeSelector: map[string]string{"zone": "a"}},
 	})
 	e.run(e.enroll, "", "n1")
-	if e.getNode("n1").Labels[LabelHypervisorPrefix+"other"] != "true" {
+	if e.getNode("n1").Labels[v1.LabelHypervisorPrefix+"other"] != "true" {
 		t.Fatal("second hypervisor label not added")
 	}
 
@@ -301,10 +301,10 @@ func TestEnrollDropsOneOfSeveralHypervisors(t *testing.T) {
 	e.run(e.enroll, "", "n1")
 
 	n1 := e.getNode("n1")
-	if n1.Labels[LabelHypervisorPrefix+"other"] != "" {
+	if n1.Labels[v1.LabelHypervisorPrefix+"other"] != "" {
 		t.Errorf("removed hypervisor still advertised: %v", n1.Labels)
 	}
-	if n1.Labels[LabelHypervisorPrefix+"kvm"] != "true" {
+	if n1.Labels[v1.LabelHypervisorPrefix+"kvm"] != "true" {
 		t.Errorf("remaining hypervisor lost: %v", n1.Labels)
 	}
 }
@@ -325,7 +325,7 @@ func TestEnrollHandlesNilLabels(t *testing.T) {
 
 func TestUsableRequiresEnrollmentAndHypervisor(t *testing.T) {
 	e := newEnv(t)
-	e.addEnrollableNode("n1", map[string]string{LabelEnrolled: "true"}, "kvm")
+	e.addEnrollableNode("n1", map[string]string{v1.LabelEnrolled: "true"}, "kvm")
 
 	cl, err := loadCluster(e.ctx, e.c, e.now)
 	e.must(err)
@@ -345,7 +345,7 @@ func TestUsableRequiresEnrollmentAndHypervisor(t *testing.T) {
 	bn.Status.Hypervisors = []string{"kvm"}
 	e.must(e.c.Status().Update(e.ctx, bn))
 	n := e.getNode("n1")
-	delete(n.Labels, LabelEnrolled)
+	delete(n.Labels, v1.LabelEnrolled)
 	e.must(e.c.Update(e.ctx, n))
 	cl, err = loadCluster(e.ctx, e.c, e.now)
 	e.must(err)

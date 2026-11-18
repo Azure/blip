@@ -26,7 +26,7 @@ func localSetup(t *testing.T, warm, max int32) (e *env, home, away string) {
 func pinnedPods(e *env, node string) []corev1.Pod {
 	var out []corev1.Pod
 	for _, p := range e.pods() {
-		if p.Annotations[AnnotationPinnedNode] == node {
+		if p.Annotations[v1.AnnotationPinnedNode] == node {
 			out = append(out, p)
 		}
 	}
@@ -187,7 +187,7 @@ func TestPoolPreBootsForPendingCopy(t *testing.T) {
 		t.Fatalf("locality %+v", loc)
 	}
 	e.run(e.pool, ns, "default")
-	if pods := e.pods(); len(pods) != 1 || pods[0].Annotations[AnnotationPinnedNode] != node {
+	if pods := e.pods(); len(pods) != 1 || pods[0].Annotations[v1.AnnotationPinnedNode] != node {
 		t.Fatalf("pods %+v", pods)
 	}
 
@@ -223,7 +223,7 @@ func TestPoolDoesNotBootBeforeLocalityIsKnown(t *testing.T) {
 	})
 	e.run(e.pool, ns, "default")
 	pods := e.pods()
-	if len(pods) != 1 || pods[0].Annotations[AnnotationPinnedNode] != "n1" {
+	if len(pods) != 1 || pods[0].Annotations[v1.AnnotationPinnedNode] != "n1" {
 		t.Fatalf("pods %+v, want one pinned to n1", pods)
 	}
 }
@@ -258,7 +258,7 @@ func TestPoolKeepsPinnedPodsOverExcess(t *testing.T) {
 		p := e.pool.podFor(pool, name)
 		p.Spec.NodeName = node
 		if pinned != "" {
-			p.Annotations[AnnotationPinnedNode] = pinned
+			p.Annotations[v1.AnnotationPinnedNode] = pinned
 		}
 		p.CreationTimestamp = metav1.NewTime(e.now.Add(-age))
 		e.create(p)
@@ -286,9 +286,9 @@ func TestWarmPodsAvoidOthersPinnedPods(t *testing.T) {
 	for name, node := range map[string]string{"a-pinned": "n1", "b-plain": "n2"} {
 		p := e.pool.podFor(pool, name)
 		p.Spec.NodeName = node
-		p.Labels[LabelWarm] = "true"
+		p.Labels[v1.LabelWarm] = "true"
 		if name == "a-pinned" {
-			p.Annotations[AnnotationPinnedNode] = node
+			p.Annotations[v1.AnnotationPinnedNode] = node
 		}
 		e.create(p)
 		p.Status.Phase = corev1.PodRunning

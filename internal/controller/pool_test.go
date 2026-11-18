@@ -55,10 +55,10 @@ func TestPoolScaling(t *testing.T) {
 				p := e.pool.podFor(pool, fmt.Sprintf("default-p%d", i))
 				p.Status.Phase = ps.phase
 				if ps.ready {
-					p.Labels[LabelWarm] = "true"
+					p.Labels[v1.LabelWarm] = "true"
 				}
 				if ps.claimed {
-					p.Labels[LabelBlipUID] = fmt.Sprintf("uid-%d", i)
+					p.Labels[v1.LabelBlipUID] = fmt.Sprintf("uid-%d", i)
 				}
 				e.create(p)
 			}
@@ -105,7 +105,7 @@ func TestPoolAvoidsDrainingNodes(t *testing.T) {
 		p := e.pool.podFor(pool, fmt.Sprintf("default-p%d", i))
 		p.Spec.NodeName = node
 		p.Status.Phase = corev1.PodRunning
-		p.Labels[LabelWarm] = "true"
+		p.Labels[v1.LabelWarm] = "true"
 		e.create(p)
 	}
 	e.setDrain("n2")
@@ -161,7 +161,7 @@ func TestPoolRetiresCapacityOnStaleNodes(t *testing.T) {
 	}
 	replacements := 0
 	for _, p := range e.pods() {
-		if p.Spec.NodeName == "n2" || p.Annotations[AnnotationPinnedNode] == "n2" {
+		if p.Spec.NodeName == "n2" || p.Annotations[v1.AnnotationPinnedNode] == "n2" {
 			t.Fatalf("pod %s still targets stale node n2", p.Name)
 		}
 		if p.Spec.NodeName != "" {
@@ -210,11 +210,11 @@ func TestAuditPoolChurnAtWarmZero(t *testing.T) {
 			claimed := e.pool.podFor(pool, "default-claimed")
 			claimed.Spec.NodeName = "n1"
 			claimed.Status.Phase = corev1.PodRunning
-			claimed.Labels[LabelBlipUID] = "uid-claimed"
+			claimed.Labels[v1.LabelBlipUID] = "uid-claimed"
 			spare := e.pool.podFor(pool, "default-spare1")
 			spare.Spec.NodeName = "n2"
 			spare.Status.Phase = corev1.PodRunning
-			spare.Labels[LabelWarm] = "true"
+			spare.Labels[v1.LabelWarm] = "true"
 			spare2 := spare.DeepCopy()
 			spare2.Name = "default-spare2"
 			e.create(claimed, spare, spare2)
@@ -246,7 +246,8 @@ func TestPoolPodSpec(t *testing.T) {
 		Spec: v1.BlipPoolSpec{
 			Hypervisor: "kvm", CPUs: 4, Memory: resource.MustParse("8Gi"), WarmCount: 1,
 			ServiceAccountName: "agent", NodeSelector: map[string]string{"zone": "a"},
-			Tolerations: []corev1.Toleration{{Key: "blip", Operator: corev1.TolerationOpExists}},
+			Tolerations:      []corev1.Toleration{{Key: "blip", Operator: corev1.TolerationOpExists}},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "regcred"}},
 		},
 	})
 	e.run(e.pool, ns, "big")
@@ -255,14 +256,14 @@ func TestPoolPodSpec(t *testing.T) {
 		t.Fatalf("%d pods", len(pods))
 	}
 	p := pods[0]
-	if len(p.Name) != len("big-")+5 || p.Labels[LabelPool] != "big" || p.Labels[LabelBlipUID] != "" {
+	if len(p.Name) != len("big-")+5 || p.Labels[v1.LabelPool] != "big" || p.Labels[v1.LabelBlipUID] != "" {
 		t.Errorf("name/labels: %s %v", p.Name, p.Labels)
 	}
 	if ref := p.OwnerReferences; len(ref) != 1 || ref[0].Kind != "BlipPool" || ref[0].Controller == nil || !*ref[0].Controller {
 		t.Errorf("owner %+v", ref)
 	}
 	pool := e.getPool("big")
-	if got := p.Annotations[annotationTemplateHash]; got == "" || got != templateHash(pool, e.pool.RuntimeImage) {
+	if got := p.Annotations[v1.AnnotationTemplateHash]; got == "" || got != templateHash(pool, e.pool.RuntimeImage) {
 		t.Errorf("template hash %q, want %q", got, templateHash(pool, e.pool.RuntimeImage))
 	}
 	s := p.Spec
@@ -272,8 +273,11 @@ func TestPoolPodSpec(t *testing.T) {
 	if s.AutomountServiceAccountToken == nil || *s.AutomountServiceAccountToken {
 		t.Errorf("service account token automounted: %v", s.AutomountServiceAccountToken)
 	}
-	if s.NodeSelector["zone"] != "a" || s.NodeSelector[LabelEnrolled] != "true" ||
-		s.NodeSelector[LabelHypervisorPrefix+"kvm"] != "true" {
+	if len(s.ImagePullSecrets) != 1 || s.ImagePullSecrets[0].Name != "regcred" {
+		t.Errorf("image pull secrets %+v", s.ImagePullSecrets)
+	}
+	if s.NodeSelector["zone"] != "a" || s.NodeSelector[v1.LabelEnrolled] != "true" ||
+		s.NodeSelector[v1.LabelHypervisorPrefix+"kvm"] != "true" {
 		t.Errorf("node selector %v", s.NodeSelector)
 	}
 	if len(s.Containers) != 1 {
@@ -541,10 +545,10 @@ func TestPoolPodGateway(t *testing.T) {
 			if token.DefaultMode == nil || *token.DefaultMode != 0644 {
 				t.Errorf("gateway token mode %v", token.DefaultMode)
 			}
-			if !mounted(proxy, gatewayTokenVolume, gatewayTokenPath) {
+			if !mounted(proxy, gatewayTokenVolume, gatewayTokenPath, true) {
 				t.Errorf("sidecar does not mount the gateway token: %+v", proxy.VolumeMounts)
 			}
-			if hasMount(vm, gatewayTokenVolume, gatewayTokenPath) {
+			if mounted(vm, gatewayTokenVolume, gatewayTokenPath) {
 				t.Error("gateway token must not be mounted in the guest's VM container")
 			}
 
@@ -560,10 +564,10 @@ func TestPoolPodGateway(t *testing.T) {
 				ca.DefaultMode == nil || *ca.DefaultMode != 0644 {
 				t.Errorf("gateway CA volume %+v", ca)
 			}
-			if !mounted(proxy, gatewayCAVolume, gatewayCAPath) {
+			if !mounted(proxy, gatewayCAVolume, gatewayCAPath, true) {
 				t.Errorf("sidecar does not mount the gateway CA: %+v", proxy.VolumeMounts)
 			}
-			if hasMount(vm, gatewayCAVolume, gatewayCAPath) {
+			if mounted(vm, gatewayCAVolume, gatewayCAPath) {
 				t.Error("gateway CA must not be mounted in the guest's VM container")
 			}
 		})
@@ -593,15 +597,11 @@ func TestPoolPodGatewayRequiresServiceAccount(t *testing.T) {
 	}
 }
 
-func mounted(c corev1.Container, name, path string) bool {
+// mounted reports whether c mounts name at path. With readOnly set, the mount
+// mode must match too.
+func mounted(c corev1.Container, name, path string, readOnly ...bool) bool {
 	return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
-		return m.Name == name && m.MountPath == path && m.ReadOnly
-	})
-}
-
-func hasMount(c corev1.Container, name, path string) bool {
-	return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
-		return m.Name == name && m.MountPath == path
+		return m.Name == name && m.MountPath == path && (len(readOnly) == 0 || m.ReadOnly == readOnly[0])
 	})
 }
 
@@ -718,12 +718,12 @@ func TestPoolReplacesLegacyTopology(t *testing.T) {
 		t.Fatal("template hash does not version the new pod topology")
 	}
 	old := e.pool.podFor(pool, "default-old")
-	old.Annotations[annotationTemplateHash] = legacyHash
+	old.Annotations[v1.AnnotationTemplateHash] = legacyHash
 	old.Status.Phase = corev1.PodRunning
-	old.Labels[LabelWarm] = "true"
+	old.Labels[v1.LabelWarm] = "true"
 	claimed := old.DeepCopy()
 	claimed.Name = "default-claimed"
-	claimed.Labels[LabelBlipUID] = "uid-claimed"
+	claimed.Labels[v1.LabelBlipUID] = "uid-claimed"
 	e.create(old, claimed)
 	e.run(e.pool, ns, "default")
 	pods := e.pods()
@@ -735,11 +735,11 @@ func TestPoolReplacesLegacyTopology(t *testing.T) {
 		case old.Name:
 			t.Error("legacy warm pod was retained")
 		case claimed.Name:
-			if p.Annotations[annotationTemplateHash] != legacyHash {
+			if p.Annotations[v1.AnnotationTemplateHash] != legacyHash {
 				t.Error("claimed legacy pod was changed")
 			}
 		default:
-			if p.Annotations[annotationTemplateHash] != templateHash(pool, e.pool.RuntimeImage) || !hasAPIProxyToken(&p) {
+			if p.Annotations[v1.AnnotationTemplateHash] != templateHash(pool, e.pool.RuntimeImage) || !hasAPIProxyToken(&p) {
 				t.Errorf("replacement is missing the new topology: %+v", p)
 			}
 		}
@@ -754,12 +754,12 @@ func TestPoolReplacesStaleVacantPods(t *testing.T) {
 	pool := e.getPool("default")
 
 	old := e.pool.podFor(pool, "default-old")
-	old.Annotations[annotationTemplateHash] = "stale"
+	old.Annotations[v1.AnnotationTemplateHash] = "stale"
 	old.Status.Phase = corev1.PodRunning
-	old.Labels[LabelWarm] = "true"
+	old.Labels[v1.LabelWarm] = "true"
 	claimed := e.pool.podFor(pool, "default-claimed")
-	claimed.Annotations[annotationTemplateHash] = "stale"
-	claimed.Labels[LabelBlipUID] = "uid-claimed"
+	claimed.Annotations[v1.AnnotationTemplateHash] = "stale"
+	claimed.Labels[v1.LabelBlipUID] = "uid-claimed"
 	e.create(old, claimed)
 
 	pool = e.getPool("default")
@@ -776,13 +776,13 @@ func TestPoolReplacesStaleVacantPods(t *testing.T) {
 			t.Errorf("stale vacant pod kept")
 		}
 		if p.Name == "default-claimed" {
-			if p.Annotations[annotationTemplateHash] != "stale" || p.Labels[LabelBlipUID] != "uid-claimed" {
+			if p.Annotations[v1.AnnotationTemplateHash] != "stale" || p.Labels[v1.LabelBlipUID] != "uid-claimed" {
 				t.Errorf("claimed pod changed: %v %v", p.Labels, p.Annotations)
 			}
 			continue
 		}
 		vacant++
-		if got := p.Annotations[annotationTemplateHash]; got != wantHash {
+		if got := p.Annotations[v1.AnnotationTemplateHash]; got != wantHash {
 			t.Errorf("pod %s hash %q, want %q", p.Name, got, wantHash)
 		}
 		if cpu := p.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU]; cpu.Value() != 4 {
@@ -807,13 +807,13 @@ func TestPoolReplacesStaleRuntimeImage(t *testing.T) {
 	previous.RuntimeImage = "ghcr.io/azure/blip-runtime:b7e8d83edae9"
 	stale := previous.podFor(pool, "default-stale")
 	stale.Status.Phase = corev1.PodRunning
-	stale.Labels[LabelWarm] = "true"
+	stale.Labels[v1.LabelWarm] = "true"
 	claimed := previous.podFor(pool, "default-claimed")
-	claimed.Labels[LabelBlipUID] = "uid-claimed"
+	claimed.Labels[v1.LabelBlipUID] = "uid-claimed"
 	e.create(stale, claimed)
 
 	wantHash := templateHash(pool, e.pool.RuntimeImage)
-	if got := stale.Annotations[annotationTemplateHash]; got == wantHash {
+	if got := stale.Annotations[v1.AnnotationTemplateHash]; got == wantHash {
 		t.Fatalf("old and new runtime images share hash %q", got)
 	}
 
@@ -825,7 +825,7 @@ func TestPoolReplacesStaleRuntimeImage(t *testing.T) {
 		case stale.Name:
 			t.Error("vacant warm VM from the previous runtime image was kept")
 		case claimed.Name:
-			if p.Annotations[annotationTemplateHash] == wantHash {
+			if p.Annotations[v1.AnnotationTemplateHash] == wantHash {
 				t.Error("claimed pod was recreated by the runtime image change")
 			}
 		default:
@@ -833,7 +833,7 @@ func TestPoolReplacesStaleRuntimeImage(t *testing.T) {
 			if p.Spec.Containers[0].Image != e.pool.RuntimeImage {
 				t.Errorf("replacement %s runs image %q, want %q", p.Name, p.Spec.Containers[0].Image, e.pool.RuntimeImage)
 			}
-			if got := p.Annotations[annotationTemplateHash]; got != wantHash {
+			if got := p.Annotations[v1.AnnotationTemplateHash]; got != wantHash {
 				t.Errorf("replacement %s hash %q, want %q", p.Name, got, wantHash)
 			}
 		}
@@ -858,7 +858,7 @@ func TestPoolMaxCountDemand(t *testing.T) {
 		t.Fatalf("%d pods, want 1", len(pods))
 	}
 
-	pods[0].Labels[LabelBlipUID] = "uid-b0"
+	pods[0].Labels[v1.LabelBlipUID] = "uid-b0"
 	e.must(e.c.Update(e.ctx, &pods[0]))
 	e.run(e.pool, ns, "default")
 	if n := len(e.pods()); n != 1 {
@@ -882,7 +882,7 @@ func TestPoolClaimDoesNotCreateDuplicate(t *testing.T) {
 	uid := e.getBlip("b0").UID
 	for i := range pods {
 		if isVacant(&pods[i]) {
-			pods[i].Labels[LabelBlipUID] = string(uid)
+			pods[i].Labels[v1.LabelBlipUID] = string(uid)
 			e.must(e.c.Update(e.ctx, &pods[i]))
 			break
 		}
@@ -906,11 +906,11 @@ func TestPoolWarmSparesFollowRunningVMs(t *testing.T) {
 	claimed := e.pool.podFor(pool, "default-claimed")
 	claimed.Spec.NodeName = "n1"
 	claimed.Status.Phase = corev1.PodRunning
-	claimed.Labels[LabelBlipUID] = "uid-claimed"
+	claimed.Labels[v1.LabelBlipUID] = "uid-claimed"
 	warm := e.pool.podFor(pool, "default-warm")
 	warm.Spec.NodeName = "n2"
 	warm.Status.Phase = corev1.PodRunning
-	warm.Labels[LabelWarm] = "true"
+	warm.Labels[v1.LabelWarm] = "true"
 	e.create(claimed, warm)
 
 	e.run(e.pool, ns, "default")
@@ -920,7 +920,7 @@ func TestPoolWarmSparesFollowRunningVMs(t *testing.T) {
 		if !isVacant(&p) || p.DeletionTimestamp != nil || p.Name == "default-warm" || p.Name == "default-claimed" {
 			continue
 		}
-		switch p.Annotations[AnnotationPinnedNode] {
+		switch p.Annotations[v1.AnnotationPinnedNode] {
 		case "n1":
 			onN1++
 		case "n2":
@@ -960,7 +960,7 @@ func TestPoolPinsDurableCopiesOfSharedBase(t *testing.T) {
 	}
 	pinned := 0
 	for _, p := range pods {
-		if p.Annotations[AnnotationPinnedNode] != "" {
+		if p.Annotations[v1.AnnotationPinnedNode] != "" {
 			pinned++
 		}
 	}
@@ -1008,7 +1008,7 @@ func TestPoolDemand(t *testing.T) {
 
 	e.newBlip("deleting", e.withImage("reg/img:v1"))
 	b := e.getBlip("deleting")
-	b.Finalizers = []string{Finalizer}
+	b.Finalizers = []string{v1.Finalizer}
 	e.must(e.c.Update(e.ctx, b))
 	e.setBlipStatus("deleting", func(b *v1.Blip) { b.Status.Phase = v1.BlipPending })
 	e.must(e.c.Delete(e.ctx, b))

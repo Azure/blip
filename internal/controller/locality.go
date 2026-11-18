@@ -22,7 +22,7 @@ func podNode(p *corev1.Pod) string {
 	if p.Spec.NodeName != "" {
 		return p.Spec.NodeName
 	}
-	return p.Annotations[AnnotationPinnedNode]
+	return p.Annotations[v1.AnnotationPinnedNode]
 }
 
 // unschedulable reports whether the scheduler found no node for p.
@@ -45,8 +45,8 @@ func poolSelector(pool *v1.BlipPool) map[string]string {
 	for k, v := range pool.Spec.NodeSelector {
 		selector[k] = v
 	}
-	selector[LabelEnrolled] = "true"
-	selector[LabelHypervisorPrefix+hypervisor] = "true"
+	selector[v1.LabelEnrolled] = "true"
+	selector[v1.LabelHypervisorPrefix+hypervisor] = "true"
 	return selector
 }
 
@@ -65,7 +65,7 @@ func placementScores(b *v1.Blip, states map[string]*v1.BlipState) map[string]int
 	score := map[string]int{}
 	var mounts []v1.Mount
 	if root := states[b.Spec.State]; root != nil && b.Spec.State != "" {
-		mounts = desiredMounts(root, b)
+		mounts = v1.DesiredMounts(root, b)
 		for _, n := range statePlacements(root) {
 			score[n] += len(mounts) + 1
 		}
@@ -100,11 +100,6 @@ func homeNodes(score map[string]int, cl *cluster, selector map[string]string) []
 	return out
 }
 
-// Every valid Blip owns a durable root.
-func hasDurableData(b *v1.Blip) bool {
-	return b.Spec.State != ""
-}
-
 // updateLocality records the node the Blip's data lives on. A Blip that
 // fell back keeps doing so; otherwise the node follows the data.
 //
@@ -118,7 +113,7 @@ func updateLocality(b *v1.Blip, home []string, settled bool) {
 	switch {
 	case loc != nil && loc.Fallback:
 	case len(home) == 0:
-		if loc != nil || (settled && hasDurableData(b)) {
+		if loc != nil || (settled && b.Spec.State != "") {
 			if loc == nil {
 				loc = &v1.Locality{}
 				b.Status.Locality = loc

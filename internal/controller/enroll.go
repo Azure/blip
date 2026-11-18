@@ -131,28 +131,28 @@ func (r *EnrollReconciler) matchesPool(ctx context.Context, node *corev1.Node) (
 // previous unenroll. A drain without the annotation is an operator drain and
 // is preserved.
 func (r *EnrollReconciler) enroll(ctx context.Context, node *corev1.Node, bn *v1.BlipNode) error {
-	if bn != nil && bn.Spec.Drain && bn.Annotations[AnnotationEnrollmentDrain] == "true" {
+	if bn != nil && bn.Spec.Drain && bn.Annotations[v1.AnnotationEnrollmentDrain] == "true" {
 		base := bn.DeepCopy()
 		bn.Spec.Drain = false
-		delete(bn.Annotations, AnnotationEnrollmentDrain)
+		delete(bn.Annotations, v1.AnnotationEnrollmentDrain)
 		if err := patchObject(ctx, r.Client, bn, base); err != nil {
 			return client.IgnoreNotFound(err)
 		}
 	}
-	want := map[string]bool{LabelEnrolled: true}
+	want := map[string]bool{v1.LabelEnrolled: true}
 	switch {
 	case bn == nil:
 		// The agent registers its BlipNode at startup. If it disappears while
 		// the node is still selected, keep advertising capabilities until it
 		// comes back instead of making existing warm capacity unschedulable.
 		for k := range node.Labels {
-			if strings.HasPrefix(k, LabelHypervisorPrefix) {
+			if strings.HasPrefix(k, v1.LabelHypervisorPrefix) {
 				want[k] = true
 			}
 		}
 	case !bn.Spec.Drain:
 		for _, h := range bn.Status.Hypervisors {
-			want[LabelHypervisorPrefix+h] = true
+			want[v1.LabelHypervisorPrefix+h] = true
 		}
 	}
 	return r.patchLabels(ctx, node, want)
@@ -172,21 +172,9 @@ func (r *EnrollReconciler) unenroll(ctx context.Context, node *corev1.Node, bn *
 		if bn.Annotations == nil {
 			bn.Annotations = map[string]string{}
 		}
-		bn.Annotations[AnnotationEnrollmentDrain] = "true"
+		bn.Annotations[v1.AnnotationEnrollmentDrain] = "true"
 		if err := patchObject(ctx, r.Client, bn, base); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
-		}
-		if bn.Status.SafeToRemove {
-			// That verdict belongs to an earlier drain. A VM may have started
-			// on the node since (for example after an undrain that
-			// NodeReconciler has not observed yet), so it says nothing about
-			// this drain. Start the new drain unsafe; the fresh check below
-			// proves it safe.
-			sbase := bn.DeepCopy()
-			bn.Status.SafeToRemove = false
-			if err := patchStatus(ctx, r.Client, bn, sbase); err != nil {
-				return reconcile.Result{}, client.IgnoreNotFound(err)
-			}
 		}
 	}
 	// Keep the agent scheduled while draining, but stop new VM pods from
@@ -199,16 +187,9 @@ func (r *EnrollReconciler) unenroll(ctx context.Context, node *corev1.Node, bn *
 	// earlier drain, or before the pod delete that freed the last Blip was
 	// followed by the Blip finishing. Recompute from the live objects and
 	// persist the result so later retries and watchers agree.
-	safe, err := nodeSafeToRemove(ctx, r.Client, node.Name)
+	safe, err := syncSafeToRemove(ctx, r.Client, bn)
 	if err != nil {
 		return reconcile.Result{}, err
-	}
-	if bn.Status.SafeToRemove != safe {
-		base := bn.DeepCopy()
-		bn.Status.SafeToRemove = safe
-		if err := patchStatus(ctx, r.Client, bn, base); err != nil {
-			return reconcile.Result{}, client.IgnoreNotFound(err)
-		}
 	}
 	if !safe {
 		return reconcile.Result{RequeueAfter: enrollmentRetry}, nil
@@ -226,8 +207,8 @@ func (r *EnrollReconciler) unenroll(ctx context.Context, node *corev1.Node, bn *
 // keepEnrolled returns the labels that keep an already-enrolled agent
 // scheduled without advertising a hypervisor for new VM pods.
 func keepEnrolled(node *corev1.Node) map[string]bool {
-	if node.Labels[LabelEnrolled] == "true" {
-		return map[string]bool{LabelEnrolled: true}
+	if node.Labels[v1.LabelEnrolled] == "true" {
+		return map[string]bool{v1.LabelEnrolled: true}
 	}
 	return map[string]bool{}
 }
@@ -240,7 +221,7 @@ func (r *EnrollReconciler) patchLabels(ctx context.Context, node *corev1.Node, w
 		node.Labels = map[string]string{}
 	}
 	for k := range node.Labels {
-		if (k == LabelEnrolled || strings.HasPrefix(k, LabelHypervisorPrefix)) && !want[k] {
+		if (k == v1.LabelEnrolled || strings.HasPrefix(k, v1.LabelHypervisorPrefix)) && !want[k] {
 			delete(node.Labels, k)
 		}
 	}

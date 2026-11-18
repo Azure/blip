@@ -1,12 +1,13 @@
 // Package peer provides key-pinned mutual TLS control for authenticated
 // ciphertext NVMe/TCP exports.
-// See docs/ARCHITECTURE.md.
+// See the README's implementation outline.
 package peer
 
 import (
 	"context"
 	"time"
 
+	"github.com/Azure/blip/internal/nvme"
 	"github.com/Azure/blip/internal/storage"
 )
 
@@ -92,4 +93,4 @@ type ServerConfig struct {
 }
 
 // HostNQN returns this node's NVMe host NQN.
-func HostNQN(node string) string { return "nqn.2014-08.dev.blip:host:" + node }
+func HostNQN(node string) string { return nvme.NQNPrefix + "host:" + node }

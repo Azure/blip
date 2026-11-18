@@ -251,12 +251,7 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 	}
 	var root v1alpha1.BlipState
 	_ = c.kube.Get(context.Background(), client.ObjectKey{Namespace: b.Namespace, Name: b.Spec.State}, &root)
-	var mounts []v1alpha1.Mount
-	for _, m := range root.Spec.Mounts {
-		if m.BlipUID == "" || m.BlipUID == string(b.UID) {
-			mounts = append(mounts, m)
-		}
-	}
+	mounts := v1alpha1.DesiredMounts(&root, b)
 	for _, m := range mounts {
 		if findMount(st.Mounts, m.State) == nil {
 			ms := v1alpha1.MountStatus{State: m.State, Path: m.Path, Writable: m.Writable, Phase: v1alpha1.MountPending}
@@ -273,7 +268,7 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 	}
 	for i := range st.Mounts {
 		m := &st.Mounts[i]
-		sm := specMount(mounts, m.State)
+		sm := findSpecMount(mounts, m.State)
 		switch {
 		case sm != nil && m.Phase == v1alpha1.MountMounted && (sm.Path != m.Path || sm.Writable != m.Writable):
 			m.Phase, m.Switching = v1alpha1.MountUnmounting, true
@@ -338,15 +333,6 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 		return true
 	}
 	return false
-}
-
-func specMount(mounts []v1alpha1.Mount, state string) *v1alpha1.Mount {
-	for i := range mounts {
-		if mounts[i].State == state {
-			return &mounts[i]
-		}
-	}
-	return nil
 }
 
 func mustContain(t *testing.T, got string, want ...string) {

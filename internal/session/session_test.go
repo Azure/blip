@@ -8,11 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/session/fakeguest"
 	"github.com/Azure/blip/internal/wire"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestExecSessionStreamsAndExits(t *testing.T) {
@@ -92,16 +90,12 @@ func TestOpenClosedPipeIsUnreachable(t *testing.T) {
 	}
 }
 
-func TestOpenErrorAndList(t *testing.T) {
-	g := &fakeguest.Guest{OpenError: "no such session", Sessions: []wire.SessionInfo{{ID: "main"}, {ID: "s1"}}}
+func TestOpenError(t *testing.T) {
+	g := &fakeguest.Guest{OpenError: "no such session"}
 	c := &session.Client{Connect: g.Connect}
 	_, err := c.Open(context.Background(), "ns", "p", wire.Open{Mode: wire.OpenAttach, Session: "x"})
 	if err == nil || err.Error() != "no such session" {
 		t.Fatalf("err = %v", err)
-	}
-	list, err := c.List(context.Background(), "ns", "p")
-	if err != nil || len(list) != 2 || list[1].ID != "s1" {
-		t.Fatalf("list=%v err=%v", list, err)
 	}
 }
 
@@ -141,21 +135,5 @@ func TestDialStream(t *testing.T) {
 	}
 	if o := g.Opens()[0].Open; o.Mode != wire.OpenDial || o.Host != "localhost" || o.Port != 8080 {
 		t.Fatalf("open = %+v", o)
-	}
-}
-
-func TestPodFor(t *testing.T) {
-	b := &v1alpha1.Blip{ObjectMeta: metav1.ObjectMeta{Name: "a"}}
-	b.Status.Message = "waiting for a VM"
-	if _, err := session.PodFor(b); err == nil || !strings.Contains(err.Error(), "not running yet: waiting for a VM") {
-		t.Fatalf("err = %v", err)
-	}
-	b.Status.Phase, b.Status.Pod = v1alpha1.BlipRunning, "pool-abcde"
-	if p, err := session.PodFor(b); err != nil || p != "pool-abcde" {
-		t.Fatalf("pod=%q err=%v", p, err)
-	}
-	b.Status.Phase = v1alpha1.BlipSucceeded
-	if _, err := session.PodFor(b); err == nil || !strings.Contains(err.Error(), "finished") {
-		t.Fatalf("err = %v", err)
 	}
 }

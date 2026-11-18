@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/netpolicy"
 	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
 )
@@ -18,7 +18,7 @@ func TestMachineCloneOwnsMutableState(t *testing.T) {
 	desired.Claim.Command = []string{"sleep", "1"}
 	desired.Claim.Env = []string{"A=1"}
 	desired.Freeze = []string{"data"}
-	desired.Network = &network.Policy{Revision: "one", Layers: [][]network.Rule{{{CIDR: "10.0.0.0/8", Except: []string{"10.0.0.1/32"}}}}}
+	desired.Network = &netpolicy.Policy{Revision: "one", Layers: [][]netpolicy.Rule{{{CIDR: "10.0.0.0/8", Except: []string{"10.0.0.1/32"}}}}}
 	m.Apply(now, Event{Kind: EventDesired, Desired: desired})
 	desired.Claim.Command[0] = "changed"
 	desired.Claim.Env[0] = "changed"
@@ -75,7 +75,7 @@ func TestMachineCloneOwnsMutableState(t *testing.T) {
 func TestMachineKeyDistinguishesFutureBehavior(t *testing.T) {
 	now := time.Unix(100, 0)
 	m := NewMachine(false)
-	m.Apply(now, Event{Kind: EventDesired, Desired: podapi.Desired{Network: &network.Policy{Revision: "one"}}})
+	m.Apply(now, Event{Kind: EventDesired, Desired: podapi.Desired{Network: &netpolicy.Policy{Revision: "one"}}})
 	e := m.Reconcile(now)[0]
 	c := m.Clone()
 	// Same external observations, different pending completion semantics.

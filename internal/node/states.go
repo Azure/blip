@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
-	"sort"
 
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/image"
@@ -67,12 +66,7 @@ func planStates(v *view, p *plan) {
 			refs[id] = imageImport{ref: r.Ref, secrets: r.Secrets}
 		}
 	}
-	ids := make([]string, 0, len(refs))
-	for id := range refs {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
+	for _, id := range sortedKeys(refs) {
 		if !v.busy[id] && (!v.hasImage(id) || v.configs[id] == nil) {
 			p.imports = append(p.imports, refs[id])
 		}

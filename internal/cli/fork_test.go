@@ -21,7 +21,7 @@ import (
 // ownedBlip is a running sandbox of owner alice with a state root.
 func ownedBlip(name, root string, mounts ...v1alpha1.Mount) *v1alpha1.Blip {
 	b := runningBlip(name, mounts...)
-	b.Labels = map[string]string{ownerLabel: "alice"}
+	b.Labels = map[string]string{v1alpha1.LabelOwner: "alice"}
 	b.Spec.State = root
 	return b
 }
@@ -35,7 +35,7 @@ func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	}
 	mustContain(t, out, "blip/w1 created")
 	b := h.blip("alice.w1")
-	if b.Labels[ownerLabel] != "alice" || b.Spec.State != "alice.repo" {
+	if b.Labels[v1alpha1.LabelOwner] != "alice" || b.Spec.State != "alice.repo" {
 		t.Fatalf("labels %v spec %+v", b.Labels, b.Spec)
 	}
 	h.ctrl.set(func(c *fakeController) { c.exited["alice.w1"] = 0 })
@@ -58,7 +58,7 @@ func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	if code, _, errOut := h3.run("", "run", "w1", "--fork", "agent-root", "-d"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	if b := h3.blip("w1"); b.Labels[ownerLabel] != "" {
+	if b := h3.blip("w1"); b.Labels[v1alpha1.LabelOwner] != "" {
 		t.Fatalf("labels %v", b.Labels)
 	}
 }
@@ -80,7 +80,7 @@ func TestForkRoot(t *testing.T) {
 		t.Fatalf("spec = %+v", b.Spec)
 	}
 	s := h.state("alice.w1")
-	if s.Spec.CopyFrom != "alice.home" || s.Spec.Replicas != 0 || s.Labels[ownerLabel] != "alice" || s.Spec.Runtime.User != "workspace-user" {
+	if s.Spec.CopyFrom != "alice.home" || s.Spec.Replicas != 0 || s.Labels[v1alpha1.LabelOwner] != "alice" || s.Spec.Runtime.User != "workspace-user" {
 		t.Fatalf("state = %+v %v", s.Spec, s.Labels)
 	}
 	if refs := s.OwnerReferences; len(refs) != 0 {
@@ -272,7 +272,7 @@ func TestCollectMountSharesAndReusesMounts(t *testing.T) {
 		t.Fatalf("mount removed under another collect: %+v", m)
 	}
 	done2()
-	if b := h.rootState("alice.box"); len(b.Spec.Mounts) != 0 || b.Annotations[collectMountsAnnotation] != "" {
+	if b := h.rootState("alice.box"); len(b.Spec.Mounts) != 0 || b.Annotations[v1alpha1.AnnotationCollectMounts] != "" {
 		t.Fatalf("mounts %+v annotations %v", b.Spec.Mounts, b.Annotations)
 	}
 	waitForCond(t, func() bool { return len(h.blip("alice.box").Status.Mounts) == 0 })
@@ -342,7 +342,7 @@ func assertCollectReleased(t *testing.T, h *harness, blip, state string) {
 	if m := findSpecMount(b.Spec.Mounts, state); m != nil {
 		t.Fatalf("%s still mounts %s: %+v", blip, state, b.Spec.Mounts)
 	}
-	if v := b.Annotations[collectMountsAnnotation]; v != "" {
+	if v := b.Annotations[v1alpha1.AnnotationCollectMounts]; v != "" {
 		t.Fatalf("%s annotation = %q, want cleared", blip, v)
 	}
 	waitForCond(t, func() bool { return findMount(h.blip(blip).Status.Mounts, state) == nil })

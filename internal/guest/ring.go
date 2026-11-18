@@ -7,8 +7,8 @@ import (
 	"github.com/Azure/blip/internal/wire"
 )
 
-// RingSize bounds the output kept per session for replay.
-const RingSize = 1 << 20
+// ringSize bounds the output kept per session for replay.
+const ringSize = 1 << 20
 
 // exitOutputMax bounds the output reported with a failed primary command.
 const exitOutputMax = 1024

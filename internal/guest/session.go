@@ -106,7 +106,7 @@ func newID() string {
 // failed start must have a usable pumpsReady: a client attaching to a nil
 // channel would panic, which kills PID 1 and reboots the whole VM.
 func newSession(g *Guest, id string, argv []string, tty bool) *session {
-	s := &session{g: g, id: id, argv: argv, tty: tty, out: ring{max: RingSize}}
+	s := &session{g: g, id: id, argv: argv, tty: tty, out: ring{max: ringSize}}
 	s.cond = sync.NewCond(&s.mu)
 	s.inCond = sync.NewCond(&s.inMu)
 	s.pumpsReady = make(chan struct{})
@@ -780,11 +780,7 @@ func (s *session) input(t wire.Type, payload []byte) error {
 }
 
 // serveSession handles one connection on the session port.
-func (g *Guest) serveSession(f *os.File) {
-	g.serveSessionStream(f)
-}
-
-func (g *Guest) serveSessionStream(f io.ReadWriteCloser) {
+func (g *Guest) serveSession(f io.ReadWriteCloser) {
 	c := wire.NewConn(f)
 	t, payload, err := c.Read()
 	if err != nil || t != wire.TOpen {

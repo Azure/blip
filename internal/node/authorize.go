@@ -8,15 +8,13 @@ import (
 	"github.com/Azure/blip/internal/peer"
 )
 
-const ownerLabel = "blip.dev/owner"
-
 // copyAllowed reports whether dst may copy from src. An unlabelled source is
 // an administrator-created shared state that anyone may copy. A labelled
 // source may only be copied by a state carrying the same owner label, so a
 // non-VM writer cannot read another owner's data by creating an unlabelled
 // destination that points at a labelled source.
 func copyAllowed(dst, src *v1alpha1.BlipState) bool {
-	so, do := src.Labels[ownerLabel], dst.Labels[ownerLabel]
+	so, do := src.Labels[v1alpha1.LabelOwner], dst.Labels[v1alpha1.LabelOwner]
 	return so == "" || so == do
 }
 

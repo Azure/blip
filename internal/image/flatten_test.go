@@ -12,17 +12,17 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 )
 
-// flatten returns the entries writeTar emits for img, in order.
+// flatten returns the entries writeTarTo emits for img, in order.
 func flatten(t *testing.T, img v1.Image) []entry {
 	t.Helper()
 	return flattenStream(t, mutate.Extract(img))
 }
 
-// flattenStream returns the entries writeTar emits for a tar stream, in order.
+// flattenStream returns the entries writeTarTo emits for a tar stream, in order.
 func flattenStream(t *testing.T, r io.Reader) []entry {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := writeTar(&buf, r); err != nil {
+	if err := writeTarTo(&buf, r, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	var out []entry

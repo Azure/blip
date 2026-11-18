@@ -36,7 +36,7 @@ type Catalog struct {
 func NewCatalog(kube client.WithWatch, namespace string) *Catalog {
 	c := &Catalog{done: make(chan struct{}), subs: make(map[string]map[chan struct{}]struct{})}
 	ownerIndex := func(obj any) ([]string, error) {
-		return []string{obj.(client.Object).GetLabels()[ownerLabel]}, nil
+		return []string{obj.(client.Object).GetLabels()[v1alpha1.LabelOwner]}, nil
 	}
 	c.states = cache.NewSharedIndexInformer(catalogListWatch(kube, namespace, func() client.ObjectList {
 		return &v1alpha1.BlipStateList{}
@@ -117,7 +117,7 @@ func (c *Catalog) changed(obj any) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for ch := range c.subs[o.GetLabels()[ownerLabel]] {
+	for ch := range c.subs[o.GetLabels()[v1alpha1.LabelOwner]] {
 		select {
 		case ch <- struct{}{}:
 		default:
@@ -153,11 +153,11 @@ func (c *Catalog) Subscribe(owner string) (<-chan struct{}, func()) {
 }
 
 func ownedResource(obj client.Object, owner string) bool {
-	return owner != "" && obj.GetLabels()[ownerLabel] == owner && strings.HasPrefix(obj.GetName(), owner+".")
+	return owner != "" && obj.GetLabels()[v1alpha1.LabelOwner] == owner && v1alpha1.OwnedBy(obj.GetName(), owner)
 }
 
 func sharedImage(st *v1alpha1.BlipState) bool {
-	return st.Labels[ownerLabel] == "" && st.Spec.Image != ""
+	return st.Labels[v1alpha1.LabelOwner] == "" && st.Spec.Image != ""
 }
 
 func accessibleState(st *v1alpha1.BlipState, owner string) bool {
@@ -166,7 +166,7 @@ func accessibleState(st *v1alpha1.BlipState, owner string) bool {
 
 func stateEntry(st *v1alpha1.BlipState, owner string) menu.Entry {
 	return menu.Entry{
-		ID: st.Name, UID: string(st.UID), Name: strings.TrimPrefix(st.Name, owner+"."),
+		ID: st.Name, UID: string(st.UID), Name: strings.TrimPrefix(st.Name, v1alpha1.OwnerPrefix(owner)),
 	}
 }
 
@@ -245,7 +245,10 @@ func writesState(b *v1alpha1.Blip, root, st *v1alpha1.BlipState) bool {
 	if b.Spec.State == st.Name {
 		return true
 	}
-	for _, m := range desiredMounts(b, root) {
+	if root == nil {
+		return false
+	}
+	for _, m := range v1alpha1.DesiredMounts(root, b) {
 		if m.State == st.Name && m.Writable {
 			return true
 		}
@@ -274,10 +277,10 @@ func stateAttached(b *v1alpha1.Blip, root, st *v1alpha1.BlipState) bool {
 // A failed acquisition can have no UID yet, so callers deciding readiness must
 // additionally require the selected UID, while errors can still be surfaced.
 func selectedMountStatus(b *v1alpha1.Blip, root, st *v1alpha1.BlipState) *v1alpha1.MountStatus {
-	if b.Spec.State == st.Name {
+	if b.Spec.State == st.Name || root == nil {
 		return nil
 	}
-	for _, desired := range desiredMounts(b, root) {
+	for _, desired := range v1alpha1.DesiredMounts(root, b) {
 		if desired.State != st.Name || !desired.Writable {
 			continue
 		}
@@ -290,17 +293,4 @@ func selectedMountStatus(b *v1alpha1.Blip, root, st *v1alpha1.BlipState) *v1alph
 		}
 	}
 	return nil
-}
-
-func desiredMounts(b *v1alpha1.Blip, root *v1alpha1.BlipState) []v1alpha1.Mount {
-	if root == nil || root.Name != b.Spec.State {
-		return nil
-	}
-	var mounts []v1alpha1.Mount
-	for _, m := range root.Spec.Mounts {
-		if m.BlipUID == "" || m.BlipUID == string(b.UID) {
-			mounts = append(mounts, m)
-		}
-	}
-	return mounts
 }

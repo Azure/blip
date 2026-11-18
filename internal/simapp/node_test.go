@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/network"
 	"github.com/Azure/blip/internal/node"
 	"github.com/Azure/blip/internal/podapi"
@@ -82,15 +83,15 @@ func (w *world) publishPods(p node.Plan) {
 			pod.Labels = map[string]string{}
 		}
 		if m.Warm {
-			pod.Labels[node.LabelWarm] = "true"
+			pod.Labels[v1alpha1.LabelWarm] = "true"
 		} else {
-			delete(pod.Labels, node.LabelWarm)
+			delete(pod.Labels, v1alpha1.LabelWarm)
 		}
 		if m.Observed != "" {
 			if pod.Annotations == nil {
 				pod.Annotations = map[string]string{}
 			}
-			pod.Annotations[node.AnnotationObserved] = m.Observed
+			pod.Annotations[v1alpha1.AnnotationObserved] = m.Observed
 		}
 		must(c.Update(ctx, pod))
 	}
@@ -103,9 +104,9 @@ func (w *world) publishPods(p node.Plan) {
 			pod.Annotations = map[string]string{}
 		}
 		if message == "" {
-			delete(pod.Annotations, node.AnnotationPrepareError)
+			delete(pod.Annotations, v1alpha1.AnnotationPrepareError)
 		} else {
-			pod.Annotations[node.AnnotationPrepareError] = message
+			pod.Annotations[v1alpha1.AnnotationPrepareError] = message
 		}
 		must(c.Update(ctx, pod))
 	}

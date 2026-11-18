@@ -28,6 +28,7 @@ import (
 	"github.com/Azure/blip/internal/image"
 	"github.com/Azure/blip/internal/peer"
 	"github.com/Azure/blip/internal/podapi"
+	"github.com/Azure/blip/internal/registryauth"
 	"github.com/Azure/blip/internal/storage"
 )
 
@@ -65,7 +66,7 @@ type Agent struct {
 	live   client.Reader // uncached reads
 	store  Store
 	open   func(ctx context.Context, node string, req peer.ExportRequest) (storage.Remote, error)
-	pull   func(ctx context.Context, ref string, secrets []pullSecret, dir string) (image.Config, string, error)
+	pull   func(ctx context.Context, ref string, secrets []registryauth.PullSecret, dir string) (image.Config, string, error)
 	mknod  func(path, device string) error
 	pinned func(commitID string) bool
 	peers  func([]peer.Peer) error // update the firewall after publishing trust
@@ -118,8 +119,8 @@ func newAgent(cfg Config, c client.Client, live client.Reader, st Store) *Agent 
 }
 
 // pullImage pulls ref using credentials from the given image pull secrets.
-func (a *Agent) pullImage(ctx context.Context, ref string, secrets []pullSecret, dir string) (image.Config, string, error) {
-	kc, err := imageKeychain(ctx, a.live, secrets)
+func (a *Agent) pullImage(ctx context.Context, ref string, secrets []registryauth.PullSecret, dir string) (image.Config, string, error) {
+	kc, err := registryauth.Keychain(ctx, a.live, secrets)
 	if err != nil {
 		return image.Config{}, "", err
 	}

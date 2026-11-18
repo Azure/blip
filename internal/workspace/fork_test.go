@@ -55,7 +55,7 @@ func TestForkWorkspaceSnapshot(t *testing.T) {
 	repo.Spec.Mounts = []v1alpha1.Mount{{State: "missing-nested", Path: "/nested", Writable: true}}
 	c := testClient(t, src, repo, testState("cache"), testState("tools"))
 	dest := testState("alice.worker")
-	dest.Labels = map[string]string{"blip.dev/owner": "alice"}
+	dest.Labels = map[string]string{v1alpha1.LabelOwner: "alice"}
 	size := resource.MustParse("20Gi")
 	dest.Spec.Size, dest.Spec.Replicas = &size, 2
 	dest.Spec.NodeSelector = map[string]string{"disk": "ssd"}
@@ -77,7 +77,7 @@ func TestForkWorkspaceSnapshot(t *testing.T) {
 		if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: m.State}, &child); err != nil {
 			t.Fatal(err)
 		}
-		if child.Spec.CopyFrom != src.Spec.Mounts[i].State || child.Spec.Runtime != nil || len(child.Spec.Mounts) != 0 || len(child.OwnerReferences) != 0 || child.Labels["blip.dev/owner"] != "alice" || child.Spec.Replicas != 2 || child.Spec.Size != nil {
+		if child.Spec.CopyFrom != src.Spec.Mounts[i].State || child.Spec.Runtime != nil || len(child.Spec.Mounts) != 0 || len(child.OwnerReferences) != 0 || child.Labels[v1alpha1.LabelOwner] != "alice" || child.Spec.Replicas != 2 || child.Spec.Size != nil {
 			t.Fatalf("child: %+v", child)
 		}
 	}
@@ -300,7 +300,7 @@ func TestForkRollsBackValidationRejection(t *testing.T) {
 
 func TestChildNamesBoundedAndDistinct(t *testing.T) {
 	root := testState("alice." + strings.Repeat("long-name.", 20) + "end")
-	root.Labels = map[string]string{"blip.dev/owner": "alice"}
+	root.Labels = map[string]string{v1alpha1.LabelOwner: "alice"}
 	mount := v1alpha1.Mount{State: "repo", Path: "/work"}
 	name := childName(root, mount)
 	if len(name) > 70 || len(validation.IsDNS1123Subdomain(name)) != 0 || !strings.HasPrefix(name, "alice.") || name != childName(root, mount) {

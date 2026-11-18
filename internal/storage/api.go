@@ -1,7 +1,7 @@
 // Package storage manages the node's dm-thin pool: image bases, immutable
 // commits, and writable working volumes. Thin devices hold only ciphertext:
 // filesystems are read and written through a dm-crypt mapping above them.
-// See docs/ARCHITECTURE.md.
+// See the README's implementation outline.
 package storage
 
 import "errors"
@@ -103,28 +103,3 @@ var (
 	ErrUnclean  = errors.New("filesystem was not cleanly unmounted")
 	ErrInUse    = errors.New("volume is in use")
 )
-
-// Methods implemented by *Store (see store.go):
-//
-//	Open(ctx, Config) (*Store, error)
-//	(*Store).Close() error
-//	(*Store).Incarnation() string
-//	(*Store).FreeBytes() int64
-//	(*Store).List() []Volume
-//	(*Store).PendingDeletes() []string // volume IDs whose teardown must be retried
-//	(*Store).Get(id string) (Volume, bool)
-//	(*Store).CreateImage(ctx, id string, sizeBytes int64, fill func(dev string) error) error
-//	(*Store).CreateCommit(ctx, CreateCommit) error
-//	(*Store).FetchCommit(ctx, stateUID, commitID string, src Remote, progress func(done, total int64)) error
-//	(*Store).CreateWorking(ctx, CreateWorking) (device string, err error)
-//	(*Store).Seal(ctx, attachmentID, commitID string) (sizeBytes int64, err error)
-//	(*Store).LiveCopy(ctx, attachmentID, commitID, stateUID string) (sizeBytes int64, err error)
-//	(*Store).Delete(ctx, id string) error
-//	(*Store).Pin(id, holder string) error
-//	(*Store).Unpin(id, holder string) error
-//	(*Store).Activate(id string) (device string, err error) // working: plaintext device; others: read-only ciphertext
-//	(*Store).Digest(ctx, id string) (digest string, err error) // content digest of an immutable volume
-//	(*Store).Diff(ctx, id string, bases []string, digests map[string]string) (base string, regions []Region, err error)
-//	(*Store).OpenExport(id, leaseID string) (device string, err error) // writable throwaway snapshot for nvmet
-//	(*Store).CloseExport(leaseID string) error
-//	(*Store).Exports() map[string]string // leaseID -> volume ID

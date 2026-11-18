@@ -24,7 +24,7 @@ func TestAPIForwarderStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer backend.Close()
-	p, err := startAPIForwarder(0, func() (apiStream, error) {
+	p, err := startForwarder("Kubernetes API", 0, func() (apiStream, error) {
 		return dialAPISocket(unix.AF_INET, &unix.SockaddrInet4{
 			Addr: [4]byte{127, 0, 0, 1}, Port: backend.Addr().(*net.TCPAddr).Port,
 		})
@@ -103,13 +103,13 @@ func TestAPIForwarderFailureBlocksClaim(t *testing.T) {
 	if err := g.doClaim(claim); err == nil || !strings.Contains(err.Error(), "forwarding is unavailable") {
 		t.Fatalf("claim with missing API = %v", err)
 	}
-	p, err := startAPIForwarder(0, func() (apiStream, error) { return nil, errors.New("unused") })
+	p, err := startForwarder("Kubernetes API", 0, func() (apiStream, error) { return nil, errors.New("unused") })
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer p.Close()
 	port := p.listener.Addr().(*net.TCPAddr).Port
-	if other, err := startAPIForwarder(port, nil); err == nil {
+	if other, err := startForwarder("Kubernetes API", port, nil); err == nil {
 		other.Close()
 		t.Fatal("listener startup ignored an occupied port")
 	}
@@ -124,7 +124,7 @@ func TestAPIForwarderFailureBlocksClaim(t *testing.T) {
 }
 
 func TestAPIForwarderDialFailureClosesClient(t *testing.T) {
-	p, err := startAPIForwarder(0, func() (apiStream, error) { return nil, errors.New("unavailable") })
+	p, err := startForwarder("Kubernetes API", 0, func() (apiStream, error) { return nil, errors.New("unavailable") })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestGatewayForwarderStream(t *testing.T) {
 	host := &apiSocket{File: os.NewFile(uintptr(fds[0]), "host")}
 	peer := &apiSocket{File: os.NewFile(uintptr(fds[1]), "peer")}
 	defer peer.Close()
-	p, err := startGatewayForwarder(0, func() (apiStream, error) { return host, nil })
+	p, err := startForwarder("gateway", 0, func() (apiStream, error) { return host, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestGatewayForwarderFailureBlocksClaim(t *testing.T) {
 	if err := g.doClaim(claim); err != errNotInit {
 		t.Fatalf("claim without gateway = %v, want %v", err, errNotInit)
 	}
-	p, err := startGatewayForwarder(0, func() (apiStream, error) { return nil, errors.New("unused") })
+	p, err := startForwarder("gateway", 0, func() (apiStream, error) { return nil, errors.New("unused") })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestAPIForwarderCloseInterruptsStreams(t *testing.T) {
 	peer := &apiSocket{File: os.NewFile(uintptr(fds[1]), "peer")}
 	defer host.Close()
 	defer peer.Close()
-	p, err := startAPIForwarder(0, func() (apiStream, error) { return host, nil })
+	p, err := startForwarder("Kubernetes API", 0, func() (apiStream, error) { return host, nil })
 	if err != nil {
 		t.Fatal(err)
 	}

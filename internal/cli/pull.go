@@ -68,7 +68,7 @@ func (a *app) pull(ctx context.Context, name, image string, f *pullFlags) error 
 		fmt.Fprintf(a.env.Out, "blipstate/%s created\n", a.short(name))
 		return nil
 	}
-	st, err = a.waitState(ctx, name)
+	st, err = a.waitStateCommitted(ctx, name)
 	if err != nil {
 		return err
 	}

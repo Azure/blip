@@ -24,7 +24,8 @@ import (
 	"k8s.io/apiserver/pkg/cel/environment"
 	"sigs.k8s.io/yaml"
 
-	"github.com/Azure/blip/internal/session"
+	v1 "github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
 )
 
@@ -122,7 +123,7 @@ func vmUser(sa, pod string) user.Info {
 func blipObj(name, owner string, mutate ...func(spec map[string]any)) map[string]any {
 	meta := map[string]any{"name": name, "namespace": ns}
 	if owner != "" {
-		meta["labels"] = map[string]any{LabelOwner: owner}
+		meta["labels"] = map[string]any{v1.LabelOwner: owner}
 	}
 	spec := map[string]any{"pool": "default", "state": name + ".root"}
 	for _, m := range mutate {
@@ -146,7 +147,7 @@ func stateObj(name, owner, copyFrom string, mutate ...func(map[string]any)) map[
 
 // sessionExec is the exec internal/session opens for a blip session.
 func sessionExec() *corev1.PodExecOptions {
-	return &corev1.PodExecOptions{Stdin: true, Stdout: true, Container: session.Container, Command: []string{"blip-runtime", "bridge", strconv.Itoa(wire.SessionPort)}}
+	return &corev1.PodExecOptions{Stdin: true, Stdout: true, Container: podapi.VMContainer, Command: []string{"blip-runtime", "bridge", strconv.Itoa(wire.SessionPort)}}
 }
 
 func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map[string]string) (bool, string) {
@@ -235,7 +236,9 @@ func TestVMOwnerPolicy(t *testing.T) {
 	podsOnly := vmUser("other", "default-mine")
 	withState := func(s string) func(map[string]any) { return func(spec map[string]any) { spec["state"] = s } }
 	withMount := func(s string, writable bool) func(map[string]any) {
-		return func(spec map[string]any) { spec["mounts"] = []any{map[string]any{"state": s, "path": "/data", "writable": writable}} }
+		return func(spec map[string]any) {
+			spec["mounts"] = []any{map[string]any{"state": s, "path": "/data", "writable": writable}}
+		}
 	}
 	withPool := func(p string) func(map[string]any) { return func(spec map[string]any) { spec["pool"] = p } }
 	withSecret := func(spec map[string]any) { spec["imagePullSecrets"] = []any{map[string]any{"name": "creds"}} }

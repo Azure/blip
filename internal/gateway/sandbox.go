@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,22 +10,17 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/workspace"
 )
 
-// ownerLabel records the owner a sandbox resource belongs to. The gateway only
-// serves resources whose label matches the authenticated owner.
-const ownerLabel = "blip.dev/owner"
-
 // fullSandboxName joins the owner and sandbox name. The owner is a DNS label,
 // which cannot contain ".", so "." separates the two parts unambiguously:
 // alice/"dev-default" and alice-dev/"default" produce different names.
 func fullSandboxName(owner, name string) (string, error) {
-	full := owner + "." + name
+	full := v1alpha1.OwnerPrefix(owner) + name
 	if len(full) > 63 {
 		return "", fmt.Errorf("sandbox name %q is too long", full)
 	}
@@ -42,10 +38,6 @@ func SandboxName(user string) (string, error) {
 	return user, nil
 }
 
-func finished(b *v1alpha1.Blip) bool {
-	return b.Status.Phase == v1alpha1.BlipSucceeded || b.Status.Phase == v1alpha1.BlipFailed
-}
-
 // ensureSandbox makes sure the sandbox's state exists and its interactive
 // blip runs, and returns the blip's pod. It is idempotent and safe to run
 // from several gateway replicas at once. Existing resources are only served
@@ -54,6 +46,10 @@ func (s *Server) ensureSandbox(ctx context.Context, owner, name string) (string,
 	if err := s.ensureState(ctx, owner, name); err != nil {
 		return "", err
 	}
+	// The shared catalog already watches every state and Blip for this owner,
+	// so one session must not add a watch or poll loop of its own.
+	changes, unsubscribe := s.Catalog.Subscribe(owner)
+	defer unsubscribe()
 	key := client.ObjectKey{Namespace: s.Namespace, Name: name}
 	recreated := false
 	for {
@@ -69,13 +65,12 @@ func (s *Server) ensureSandbox(ctx context.Context, owner, name string) (string,
 			return "", err
 		case !ownedResource(&b, owner):
 			return "", fmt.Errorf("sandbox %s is not owned by the authenticated owner", name)
-		case b.DeletionTimestamp == nil && finished(&b):
+		case b.DeletionTimestamp == nil && v1alpha1.Finished(&b):
 			if recreated {
 				return "", fmt.Errorf("sandbox %s stopped while starting: %s %s", name, b.Status.Reason, b.Status.Message)
 			}
 			recreated = true
-			err := s.Kube.Delete(ctx, &b, client.Preconditions{UID: &b.UID})
-			if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			if err := s.recreateFinished(ctx, &b); err != nil {
 				return "", err
 			}
 			s.Log.Info("recreating finished sandbox", "sandbox", name, "phase", b.Status.Phase)
@@ -91,10 +86,30 @@ func (s *Server) ensureSandbox(ctx context.Context, owner, name string) (string,
 		case b.DeletionTimestamp == nil && !b.Spec.Stop && b.Status.Phase == v1alpha1.BlipRunning && b.Status.Pod != "":
 			return b.Status.Pod, nil
 		}
-		if err := s.waitChange(ctx, key, b.ResourceVersion); err != nil {
-			return "", fmt.Errorf("waiting for sandbox %s: %w", name, err)
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("waiting for sandbox %s: %w", name, ctx.Err())
+		case _, ok := <-changes:
+			if !ok {
+				return "", fmt.Errorf("waiting for sandbox %s: %w", name, errors.New("sandbox catalog is stopped"))
+			}
 		}
 	}
+}
+
+// recreateFinished deletes a finished Blip so a fresh worker can start in its
+// place. The preconditions keep the delete from touching a replacement, and
+// orphan propagation preserves the state and anything that names the old
+// worker as an owner. Both callers re-read and revalidate after the delete, so
+// a lost race (NotFound) or a changed object (Conflict) is not an error.
+func (s *Server) recreateFinished(ctx context.Context, b *v1alpha1.Blip) error {
+	err := s.Kube.Delete(ctx, b,
+		client.Preconditions{UID: &b.UID, ResourceVersion: &b.ResourceVersion},
+		client.PropagationPolicy(metav1.DeletePropagationOrphan))
+	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+		return err
+	}
+	return nil
 }
 
 func (s *Server) ensureState(ctx context.Context, owner, name string) error {
@@ -191,7 +206,7 @@ func (s *Server) forkState(ctx context.Context, owner, name string, source *v1al
 		}
 	}
 	dest := &v1alpha1.BlipState{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace, Labels: map[string]string{ownerLabel: owner}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace, Labels: map[string]string{v1alpha1.LabelOwner: owner}},
 		Spec:       v1alpha1.BlipStateSpec{Size: s.baseForkSize(source)},
 	}
 	if err := workspace.Fork(ctx, s.Kube, source, dest); err != nil {
@@ -204,13 +219,7 @@ func validateForkState(st *v1alpha1.BlipState, owner string) error {
 	if !accessibleState(st, owner) {
 		return fmt.Errorf("state %s is not owned by %s with its name prefix or a shared image import", st.Name, owner)
 	}
-	if st.DeletionTimestamp != nil {
-		return fmt.Errorf("state %s is being deleted", st.Name)
-	}
-	if st.Status.Phase == v1alpha1.StateFailed && st.Status.Committed == nil && st.Status.Pending == nil {
-		return fmt.Errorf("state %s failed: %s", st.Name, st.Status.Message)
-	}
-	return nil
+	return workspace.CheckSource(st)
 }
 
 func (s *Server) baseForkSize(source *v1alpha1.BlipState) *resource.Quantity {
@@ -251,38 +260,7 @@ func (s *Server) waitStateGone(ctx context.Context, key client.ObjectKey) error 
 
 func (s *Server) sandboxBlip(owner, name string) *v1alpha1.Blip {
 	return &v1alpha1.Blip{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace, Labels: map[string]string{ownerLabel: owner}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace, Labels: map[string]string{v1alpha1.LabelOwner: owner}},
 		Spec:       v1alpha1.BlipSpec{Pool: s.Pool, State: name},
-	}
-}
-
-// waitChange returns when the blip's resource version differs from rv or the
-// blip is gone.
-func (s *Server) waitChange(ctx context.Context, key client.ObjectKey, rv string) error {
-	w, err := s.Kube.Watch(ctx, &v1alpha1.BlipList{}, client.InNamespace(key.Namespace), client.MatchingFields{"metadata.name": key.Name})
-	if err != nil {
-		return err
-	}
-	defer w.Stop()
-	var b v1alpha1.Blip
-	if err := s.Kube.Get(ctx, key, &b); err != nil || b.ResourceVersion != rv {
-		return client.IgnoreNotFound(err)
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case ev, ok := <-w.ResultChan():
-			if !ok {
-				return nil
-			}
-			o, isBlip := ev.Object.(*v1alpha1.Blip)
-			if ev.Type == watch.Error {
-				return nil
-			}
-			if isBlip && o.Name == key.Name && (ev.Type == watch.Deleted || o.ResourceVersion != rv) {
-				return nil
-			}
-		}
 	}
 }

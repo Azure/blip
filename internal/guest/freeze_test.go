@@ -117,7 +117,7 @@ func TestFreezeThaw(t *testing.T) {
 func controlPair(t *testing.T, g *Guest) *wire.Conn {
 	host, guest := net.Pipe()
 	t.Cleanup(func() { host.Close() })
-	go g.serveControlStream(guest)
+	go g.serveControl(guest)
 	return wire.NewConn(host)
 }
 

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/blip/internal/bootconfig"
 	"github.com/Azure/blip/internal/podapi"
 )
 
@@ -34,7 +35,7 @@ func chArgs(o Options, configDisk, tap, mac string) []string {
 		"--cpus", fmt.Sprintf("boot=%d", o.CPUs),
 		"--memory", fmt.Sprintf("size=%dM", o.MemoryMB),
 		"--platform", "num_pci_segments=2",
-		"--disk", fmt.Sprintf("path=%s,readonly=on,image_type=raw,serial=blip-config,id=blip-config,pci_segment=0", configDisk),
+		"--disk", fmt.Sprintf("path=%s,readonly=on,image_type=raw,serial=%s,id=%s,pci_segment=0", configDisk, bootconfig.ConfigSerial, bootconfig.ConfigSerial),
 		"--vsock", fmt.Sprintf("cid=3,socket=%s", o.path(podapi.VsockSocket)),
 		"--serial", "tty", // CH stdout: the pod log, which kubelet rotates
 		"--console", "off",
@@ -101,13 +102,22 @@ type chClient struct {
 
 type detachClock interface {
 	Now() time.Time
-	Sleep(time.Duration)
+	Sleep(context.Context, time.Duration) error
 }
 
 type realDetachClock struct{}
 
-func (realDetachClock) Now() time.Time        { return time.Now() }
-func (realDetachClock) Sleep(d time.Duration) { time.Sleep(d) }
+func (realDetachClock) Now() time.Time { return time.Now() }
+func (realDetachClock) Sleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 func newCHClient(sock string) *chClient {
 	return &chClient{hc: &http.Client{
@@ -212,16 +222,8 @@ func (c *chClient) removeDisk(id string, timeout time.Duration) error {
 			}
 			return fmt.Errorf("remove %s: %w", id, err)
 		}
-		if c.clock != nil {
-			clock.Sleep(50 * time.Millisecond)
-		} else {
-			timer := time.NewTimer(50 * time.Millisecond)
-			select {
-			case <-timer.C:
-			case <-c.context().Done():
-				timer.Stop()
-				return c.context().Err()
-			}
+		if err := clock.Sleep(c.context(), 50*time.Millisecond); err != nil {
+			return err
 		}
 	}
 }

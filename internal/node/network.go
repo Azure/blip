@@ -25,8 +25,8 @@ func (v *view) networkFor(pod *corev1.Pod, b *v1alpha1.Blip) (*network.Policy, e
 	if name == "" {
 		name = "default"
 	}
-	if pod.Labels[LabelPool] != name {
-		return denyNetwork(), fmt.Errorf("pod pool %q does not match Blip pool %q", pod.Labels[LabelPool], name)
+	if pod.Labels[v1alpha1.LabelPool] != name {
+		return denyNetwork(), fmt.Errorf("pod pool %q does not match Blip pool %q", pod.Labels[v1alpha1.LabelPool], name)
 	}
 	pool := v.pools[b.Namespace+"/"+name]
 	if pool == nil {

@@ -25,11 +25,11 @@ func (e *env) warmOn(nodes ...string) {
 		if i == len(nodes) {
 			return
 		}
-		if !isVacant(&p) || p.Labels[LabelWarm] == "true" || podTerminated(&p) {
+		if !isVacant(&p) || p.Labels[v1.LabelWarm] == "true" || podTerminated(&p) {
 			continue
 		}
 		p.Spec.NodeName = nodes[i]
-		p.Labels[LabelWarm] = "true"
+		p.Labels[v1.LabelWarm] = "true"
 		e.must(e.c.Update(e.ctx, &p))
 		p.Status.Phase = corev1.PodRunning
 		e.must(e.c.Status().Update(e.ctx, &p))
@@ -162,7 +162,7 @@ func TestDurableSaveFlow(t *testing.T) {
 	if pod.Spec.NodeName != placements[1] || b.Status.Node != placements[1] {
 		t.Errorf("claimed pod on %s, want placement %s", pod.Spec.NodeName, placements[1])
 	}
-	if pod.Labels[LabelBlipUID] != string(b.UID) || pod.Annotations[AnnotationBlip] != "dev" || pod.OwnerReferences[0].Kind != "Blip" || len(pod.OwnerReferences) != 1 {
+	if pod.Labels[v1.LabelBlipUID] != string(b.UID) || pod.Annotations[v1.AnnotationBlip] != "dev" || pod.OwnerReferences[0].Kind != "Blip" || len(pod.OwnerReferences) != 1 {
 		t.Errorf("claimed pod metadata %v %v %v", pod.Labels, pod.Annotations, pod.OwnerReferences)
 	}
 	st = e.getState("home")
@@ -273,7 +273,7 @@ func TestClaimRace(t *testing.T) {
 	if err != nil || lost != nil {
 		t.Fatalf("second claim of a stale pod succeeded: %v %v", lost, err)
 	}
-	if got := e.getPod(won.Name).Labels[LabelBlipUID]; got != string(a.UID) {
+	if got := e.getPod(won.Name).Labels[v1.LabelBlipUID]; got != string(a.UID) {
 		t.Fatalf("pod claimed by %q", got)
 	}
 
@@ -298,9 +298,9 @@ func TestBlipRejectsStaleWarmPodsBeforePoolCleanup(t *testing.T) {
 			old := e.pool.podFor(pool, "a-old")
 			switch kind {
 			case "legacy topology":
-				old.Annotations[annotationTemplateHash] = "35baaef82aa3b469"
+				old.Annotations[v1.AnnotationTemplateHash] = "35baaef82aa3b469"
 			case "missing hash":
-				delete(old.Annotations, annotationTemplateHash)
+				delete(old.Annotations, v1.AnnotationTemplateHash)
 			case "old pool shape":
 				previous := pool.DeepCopy()
 				previous.Spec.ServiceAccountName = "previous"
@@ -421,7 +421,7 @@ func TestClaimRejectsConcurrentTemplateChange(t *testing.T) {
 	if len(candidates) != 1 {
 		t.Fatalf("initial candidates = %d, want 1", len(candidates))
 	}
-	e.annotatePod(candidates[0].Name, annotationTemplateHash, "stale")
+	e.annotatePod(candidates[0].Name, v1.AnnotationTemplateHash, "stale")
 	// The old candidate still matches the live pool, but the optimistic
 	// claim must fail because the pod changed after candidate selection.
 	pod, err := e.blip.claim(e.ctx, e.getBlip("b"), candidates)

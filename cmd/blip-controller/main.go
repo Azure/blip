@@ -1,5 +1,5 @@
-// Command blip-controller runs the blip control plane: node, pool, state, and
-// blip reconcilers.
+// Command blip-controller runs the blip control plane: the enrollment, node,
+// pool, state, and blip reconcilers.
 package main
 
 import (
@@ -72,7 +72,7 @@ func run(runtimeImage, insecure, namespace string, leaderElect bool) error {
 	if err := v1.AddToScheme(scheme); err != nil {
 		return err
 	}
-	vmPods, err := labels.NewRequirement(controller.LabelPool, selection.Exists, nil)
+	vmPods, err := labels.NewRequirement(v1.LabelPool, selection.Exists, nil)
 	if err != nil {
 		return err
 	}

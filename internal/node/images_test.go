@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/registryauth"
 )
 
 func digestRef(c string) string {
@@ -34,11 +35,11 @@ func TestImageRefsFiltering(t *testing.T) {
 
 	unplaced := state("unplaced")
 	unplaced.Status.ImageDigest = digestRef("d")
-	unplaced.Spec.NodeSelector = map[string]string{"blip.dev/enrolled": "true"}
+	unplaced.Spec.NodeSelector = map[string]string{v1alpha1.LabelEnrolled: "true"}
 
 	mismatch := state("mismatch")
 	mismatch.Status.ImageDigest = digestRef("e")
-	mismatch.Spec.NodeSelector = map[string]string{"blip.dev/enrolled": "false"}
+	mismatch.Spec.NodeSelector = map[string]string{v1alpha1.LabelEnrolled: "false"}
 	v.states = append(v.states, placed, pending, other, unplaced, mismatch)
 
 	pool := &v1alpha1.BlipPool{
@@ -60,7 +61,7 @@ func TestImageRefsFiltering(t *testing.T) {
 	same.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "second-secret"}}
 	v.states = append(v.states, same)
 
-	got := map[string][]pullSecret{}
+	got := map[string][]registryauth.PullSecret{}
 	for _, r := range v.imageRefs() {
 		got[r.Ref] = r.Secrets
 	}
@@ -74,11 +75,11 @@ func TestImageRefsFiltering(t *testing.T) {
 	if !slices.Equal(have, want) {
 		t.Fatalf("refs = %v, want %v", have, want)
 	}
-	if secrets := got[digestRef("a")]; !slices.Equal(secrets, []pullSecret{{ns, "state-secret"}, {"other", "second-secret"}}) {
+	if secrets := got[digestRef("a")]; !slices.Equal(secrets, []registryauth.PullSecret{{Namespace: ns, Name: "state-secret"}, {Namespace: "other", Name: "second-secret"}}) {
 		t.Fatalf("merged state secrets = %v", secrets)
 	}
 	for _, secrets := range got {
-		if slices.Contains(secrets, pullSecret{ns, "pool-secret"}) {
+		if slices.Contains(secrets, registryauth.PullSecret{Namespace: ns, Name: "pool-secret"}) {
 			t.Fatalf("state import uses infrastructure credentials: %v", secrets)
 		}
 	}

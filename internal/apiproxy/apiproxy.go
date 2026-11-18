@@ -73,7 +73,7 @@ func ConfigFromEnv() (Config, error) {
 		dir = podapi.MountPath
 	}
 	cfg := Config{
-		SocketPath:   filepath.Join(dir, podapi.VsockSocket) + "_" + strconv.FormatUint(uint64(wire.APIPort), 10),
+		SocketPath:   podapi.VsockListenerPath(dir, wire.APIPort),
 		APIAddress:   address,
 		TokenFile:    filepath.Join(serviceAccountDir, "token"),
 		CAFile:       filepath.Join(serviceAccountDir, "ca.crt"),
@@ -92,7 +92,7 @@ func ConfigFromEnv() (Config, error) {
 			return Config{}, errors.New("gateway address is set but BLIP_GATEWAY_TOKEN_FILE is empty")
 		}
 		cfg.Gateway = &GatewayConfig{
-			SocketPath: filepath.Join(dir, podapi.VsockSocket) + "_" + strconv.FormatUint(uint64(wire.GatewayPort), 10),
+			SocketPath: podapi.VsockListenerPath(dir, wire.GatewayPort),
 			Address:    gatewayAddress,
 			ServerName: os.Getenv("BLIP_GATEWAY_SERVER_NAME"),
 			CAFile:     os.Getenv("BLIP_GATEWAY_CA_FILE"),

@@ -163,7 +163,7 @@ func (s *interactiveSSH) create(t *testing.T, e *env, name string) {
 func sandboxResources(t *testing.T, e *env) ([]v1alpha1.BlipState, []v1alpha1.Blip) {
 	t.Helper()
 	var states v1alpha1.BlipStateList
-	if err := e.kube.List(context.Background(), &states, client.InNamespace(ns), client.MatchingLabels{ownerLabel: "alice"}); err != nil {
+	if err := e.kube.List(context.Background(), &states, client.InNamespace(ns), client.MatchingLabels{v1alpha1.LabelOwner: "alice"}); err != nil {
 		t.Fatal(err)
 	}
 	var blips v1alpha1.BlipList
@@ -300,7 +300,7 @@ func TestSSHInteractiveCreateReturnAndReconnect(t *testing.T) {
 		if len(states) != 1 || len(blips) != 1 {
 			t.Fatalf("round %d: states=%d blips=%d, want one of each", i+1, len(states), len(blips))
 		}
-		if states[0].Name != stateName || states[0].Labels[ownerLabel] != "alice" ||
+		if states[0].Name != stateName || states[0].Labels[v1alpha1.LabelOwner] != "alice" ||
 			states[0].Spec.Image != "" || states[0].Spec.CopyFrom != e.srv.BaseState || blips[0].Spec.State != stateName {
 			t.Fatalf("round %d: state=%+v blip=%+v", i+1, states[0], blips[0])
 		}
@@ -343,7 +343,7 @@ func TestSSHInteractiveResizeAndHangup(t *testing.T) {
 			var objects []client.Object
 			if existing {
 				objects = append(objects, &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{
-					Name: "alice.saved", Namespace: ns, UID: "saved-uid", Labels: map[string]string{ownerLabel: "alice"},
+					Name: "alice.saved", Namespace: ns, UID: "saved-uid", Labels: map[string]string{v1alpha1.LabelOwner: "alice"},
 				}})
 			}
 			e := newEnv(t, objects...)

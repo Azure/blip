@@ -16,14 +16,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/Azure/blip/internal/atomicfile"
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/netpolicy"
 )
 
 const (
 	// DataDir is the node agent's data directory on every node.
 	DataDir = "/var/lib/blip"
+	// VMContainer is the VM pod container that runs blip-runtime.
+	VMContainer = "vm"
 	// PodsDir holds one directory per VM pod, below a namespace directory.
 	PodsDir = DataDir + "/pods"
 	// MountPath is where the pod directory appears inside the vm container.
@@ -51,7 +54,7 @@ const (
 type Desired struct {
 	// Network is the compiled direct-egress policy. Missing means deny all.
 	// It is reconciled independently of disks and must be applied before claim.
-	Network *network.Policy `json:"network,omitempty"`
+	Network *netpolicy.Policy `json:"network,omitempty"`
 	// Claim is nil while the VM is vacant (warm).
 	Claim *Claim `json:"claim,omitempty"`
 	// Mounts is the complete set of auxiliary disks that should be attached
@@ -161,6 +164,13 @@ type Exit struct {
 // sockets, or status files.
 func PodDir(namespace, name string) string {
 	return filepath.Join(PodsDir, namespace, name)
+}
+
+// VsockListenerPath returns the sidecar Unix socket that forwards to the
+// guest's vsock port. It sits next to the Cloud Hypervisor vsock socket in the
+// emptyDir shared by the runtime and the API-proxy sidecar.
+func VsockListenerPath(dir string, port uint32) string {
+	return filepath.Join(dir, VsockSocket) + "_" + strconv.FormatUint(uint64(port), 10)
 }
 
 // EnsurePodDir creates a pod directory with DirMode and tightens it and its

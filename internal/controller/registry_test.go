@@ -45,22 +45,22 @@ func TestRemoteRegistry(t *testing.T) {
 	r := RemoteRegistry{}
 	ctx := context.Background()
 	for tag, want := range map[string]string{"v1": imgDigest.String(), "multi": idxDigest.String()} {
-		pinned, err := r.Digest(ctx, repo.Tag(tag).String())
+		pinned, err := r.Digest(ctx, repo.Tag(tag).String(), "", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if pinned != repo.String()+"@"+want {
 			t.Fatalf("%s pinned %q, want digest %s", tag, pinned, want)
 		}
-		if again, _ := r.Digest(ctx, pinned); again != pinned {
+		if again, _ := r.Digest(ctx, pinned, "", nil); again != pinned {
 			t.Errorf("digest reference not kept: %q", again)
 		}
 	}
-	if _, err := r.Digest(ctx, repo.Tag("missing").String()); !errors.Is(err, ErrImageNotFound) {
+	if _, err := r.Digest(ctx, repo.Tag("missing").String(), "", nil); !errors.Is(err, ErrImageNotFound) {
 		t.Errorf("missing tag: %v", err)
 	}
 	_, parseErr := name.ParseReference("bad image!!")
-	if _, err := r.Digest(ctx, "bad image!!"); !errors.Is(err, ErrInvalidImage) {
+	if _, err := r.Digest(ctx, "bad image!!", "", nil); !errors.Is(err, ErrInvalidImage) {
 		t.Errorf("invalid reference not classified: %v", err)
 	} else if !strings.Contains(err.Error(), parseErr.Error()) {
 		t.Errorf("invalid reference lost the parse error: %v", err)

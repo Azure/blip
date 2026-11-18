@@ -58,7 +58,7 @@ func newView() *view {
 			},
 		}
 		v.kubeNodes[n] = &corev1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: n, Labels: map[string]string{"blip.dev/enrolled": "true"}},
+			ObjectMeta: metav1.ObjectMeta{Name: n, Labels: map[string]string{v1alpha1.LabelEnrolled: "true"}},
 		}
 	}
 	return v
@@ -85,9 +85,9 @@ func holding(node string, commits ...string) v1alpha1.NodeObservation {
 }
 
 func vmPod(name string, blipUID string) *corev1.Pod {
-	labels := map[string]string{LabelPool: "default"}
+	labels := map[string]string{v1alpha1.LabelPool: "default"}
 	if blipUID != "" {
-		labels[LabelBlipUID] = blipUID
+		labels[v1alpha1.LabelBlipUID] = blipUID
 	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID("poduid-" + name), Labels: labels},

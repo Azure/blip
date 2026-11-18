@@ -112,7 +112,7 @@ func TestEnsureStateAcceptsOnlyOwnedConcurrentRoot(t *testing.T) {
 				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 					creates++
 					other := obj.DeepCopyObject().(client.Object)
-					other.SetLabels(map[string]string{ownerLabel: owner})
+					other.SetLabels(map[string]string{v1alpha1.LabelOwner: owner})
 					if err := c.Create(ctx, other, opts...); err != nil {
 						return err
 					}

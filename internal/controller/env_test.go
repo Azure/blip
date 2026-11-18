@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -37,7 +38,7 @@ type fakeRegistry struct {
 	configs map[string]*v1.ImageConfig
 }
 
-func (f *fakeRegistry) Digest(_ context.Context, ref string) (string, error) {
+func (f *fakeRegistry) Digest(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (string, error) {
 	if _, err := name.ParseReference(ref); err != nil {
 		return "", fmt.Errorf("%w: %v", ErrInvalidImage, err)
 	}
@@ -47,7 +48,7 @@ func (f *fakeRegistry) Digest(_ context.Context, ref string) (string, error) {
 	return "", fmt.Errorf("image %s: %w", ref, ErrImageNotFound)
 }
 
-func (f *fakeRegistry) ImageConfig(_ context.Context, ref string) (*v1.ImageConfig, error) {
+func (f *fakeRegistry) ImageConfig(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (*v1.ImageConfig, error) {
 	return f.configs[ref], nil
 }
 
@@ -135,9 +136,9 @@ func (e *env) addNodes(names ...string) {
 	e.t.Helper()
 	for _, n := range names {
 		e.create(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: n, Labels: map[string]string{
-			LabelEnrolled:                 "true",
-			"blip.dev/node-pool":          "default",
-			LabelHypervisorPrefix + "kvm": "true",
+			v1.LabelEnrolled:                 "true",
+			"blip.dev/node-pool":             "default",
+			v1.LabelHypervisorPrefix + "kvm": "true",
 		}}})
 		bn := &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: n}}
 		e.create(bn)
@@ -158,22 +159,13 @@ func (e *env) heartbeat(skip ...string) {
 	var bns v1.BlipNodeList
 	e.must(e.c.List(e.ctx, &bns))
 	for _, bn := range bns.Items {
-		if contains(skip, bn.Name) {
+		if slices.Contains(skip, bn.Name) {
 			continue
 		}
 		hb := metav1.NewTime(e.now)
 		bn.Status.Heartbeat = &hb
 		e.must(e.c.Status().Update(e.ctx, &bn))
 	}
-}
-
-func contains(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }
 
 func (e *env) must(err error) {
@@ -229,7 +221,7 @@ func (e *env) run(r reconcile.Reconciler, namespace, name string) reconcile.Resu
 func (e *env) ackClaims() bool {
 	acked := false
 	for _, p := range e.pods() {
-		if p.Labels[LabelBlipUID] != "" && p.Annotations[AnnotationObserved] == "" {
+		if p.Labels[v1.LabelBlipUID] != "" && p.Annotations[v1.AnnotationObserved] == "" {
 			e.observe(p.Name, podapi.Observed{Phase: podapi.PhaseRunning, ClaimID: "claim"})
 			acked = true
 		}
@@ -291,7 +283,7 @@ func (e *env) observe(pod string, obs podapi.Observed) {
 	if p.Annotations == nil {
 		p.Annotations = map[string]string{}
 	}
-	p.Annotations[AnnotationObserved] = string(raw)
+	p.Annotations[v1.AnnotationObserved] = string(raw)
 	e.must(e.c.Update(e.ctx, p))
 }
 

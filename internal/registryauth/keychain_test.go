@@ -1,4 +1,4 @@
-package node
+package registryauth_test
 
 import (
 	"context"
@@ -10,8 +10,13 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/Azure/blip/internal/registryauth"
 )
+
+const ns = "default"
 
 func secretFor(t *testing.T, name, key, data string) *corev1.Secret {
 	t.Helper()
@@ -22,9 +27,9 @@ func secretFor(t *testing.T, name, key, data string) *corev1.Secret {
 	}
 }
 
-func TestImageKeychain(t *testing.T) {
-	scheme, err := Scheme()
-	if err != nil {
+func TestKeychain(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	auth := base64.StdEncoding.EncodeToString([]byte("user:pass"))
@@ -39,7 +44,7 @@ func TestImageKeychain(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pull, bad, empty).Build()
 	ctx := context.Background()
 
-	kc, err := imageKeychain(ctx, c, []pullSecret{{ns, "pull"}})
+	kc, err := registryauth.Keychain(ctx, c, []registryauth.PullSecret{{Namespace: ns, Name: "pull"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,14 +87,14 @@ func TestImageKeychain(t *testing.T) {
 		"bad":     "invalid",
 		"opaque":  "has no .dockerconfigjson",
 	} {
-		_, err := imageKeychain(ctx, c, []pullSecret{{ns, name}})
+		_, err := registryauth.Keychain(ctx, c, []registryauth.PullSecret{{Namespace: ns, Name: name}})
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: err = %v, want %q", name, err, want)
 		}
 	}
 }
 
-func TestRegistryHost(t *testing.T) {
+func TestHost(t *testing.T) {
 	for in, want := range map[string]string{
 		"registry.local":                 "registry.local",
 		"https://registry.local":         "registry.local",
@@ -98,8 +103,8 @@ func TestRegistryHost(t *testing.T) {
 		"docker.io":                      "index.docker.io",
 		"registry.local:5000/repository": "registry.local:5000",
 	} {
-		if got := registryHost(in); got != want {
-			t.Errorf("registryHost(%q) = %q, want %q", in, got, want)
+		if got := registryauth.Host(in); got != want {
+			t.Errorf("Host(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

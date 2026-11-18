@@ -5,7 +5,7 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/netpolicy"
 	"github.com/Azure/blip/internal/podapi"
 )
 
@@ -56,7 +56,7 @@ func cloneDesired(d podapi.Desired) podapi.Desired {
 	return d
 }
 
-func clonePolicy(p *network.Policy) *network.Policy {
+func clonePolicy(p *netpolicy.Policy) *netpolicy.Policy {
 	if p == nil {
 		return nil
 	}

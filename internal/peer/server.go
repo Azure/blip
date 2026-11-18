@@ -118,7 +118,9 @@ func (s *Server) Run(ctx context.Context) error {
 		return nil
 	case <-s.cfg.Peers.Ready():
 	}
-	s.restore()
+	if err := s.Recover(); err != nil {
+		log.Printf("peer: recovery: %v", err)
+	}
 	mux := s.Handler()
 	var ln net.Listener
 	for {
@@ -289,7 +291,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	// and a reader with a 404. With the pin first, either the commit exists
 	// and Delete now sees the pin, or the request fails as ErrNotFound and no
 	// lease is ever published. The pin is released below if persisting the
-	// lease fails; a crash in between leaves an orphan pin that restore (which
+	// lease fails; a crash in between leaves an orphan pin that Recover (which
 	// unpins lease pins without a lease) cleans up.
 	if err := s.prepare(l); err != nil {
 		code := http.StatusInternalServerError
@@ -524,10 +526,6 @@ func (s *Server) mustRelease(l *lease, now time.Time) bool {
 	return LeaseMustRelease(now, l.LastRenewed, l.Revoked, registered, authorized)
 }
 
-// Recheck performs one expiry/authorization pass and retries orphan cleanup.
-// Run schedules the same pass.
-func (s *Server) Recheck() error { return s.recheck() }
-
 // recheck releases leases that are revoked, no longer authorized, or were not
 // renewed within LeaseTTL.
 func (s *Server) recheck() error {
@@ -564,14 +562,6 @@ func (s *Server) recheck() error {
 		}
 	}
 	return errors.Join(errs...)
-}
-
-// restore re-creates persisted exports after a restart and removes kernel
-// and store state that no lease accounts for.
-func (s *Server) restore() {
-	if err := s.Recover(); err != nil {
-		log.Printf("peer: recovery: %v", err)
-	}
 }
 
 // Recover restores live leases and removes orphan resources in dependency

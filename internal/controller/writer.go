@@ -19,8 +19,6 @@ import (
 func writerBlocked(st *v1.BlipState) string {
 	s := st.Status
 	switch {
-	case st.Spec.Image != "":
-		return "is an immutable image template; fork it before writing"
 	case st.DeletionTimestamp != nil:
 		return "is being deleted"
 	case s.Committed == nil:
@@ -44,7 +42,7 @@ func (r *BlipReconciler) acquire(ctx context.Context, b *v1.Blip, states map[str
 	ids := map[string]string{}
 	giveUp := func() error {
 		for _, n := range names {
-			if err := releaseWriter(ctx, r.Client, states[n], b.UID); err != nil {
+			if err := r.releaseWriter(ctx, states[n], b.UID); err != nil {
 				return err
 			}
 		}
@@ -92,12 +90,8 @@ func setWriterPod(w *v1.Writer, name, uid, node string) {
 // reconcile. The state reconciler cannot release these reservations: another
 // root edit can arrive while this Blip is between acquiring and publishing one.
 func (r *BlipReconciler) releaseUnpublished(ctx context.Context, b *v1.Blip) error {
-	live := r.Live
-	if live == nil {
-		live = r.Client
-	}
 	fresh := &v1.Blip{}
-	if err := live.Get(ctx, client.ObjectKeyFromObject(b), fresh); err != nil {
+	if err := r.Live.Get(ctx, client.ObjectKeyFromObject(b), fresh); err != nil {
 		return client.IgnoreNotFound(err)
 	}
 	if fresh.UID != b.UID {
@@ -108,15 +102,15 @@ func (r *BlipReconciler) releaseUnpublished(ctx context.Context, b *v1.Blip) err
 		published[m.AttachmentID] = true
 	}
 	wanted := map[string]bool{}
-	if fresh.Spec.State != "" && !finished(fresh) && !stopping(fresh) && fresh.Status.Phase != v1.BlipSaving {
+	if fresh.Spec.State != "" && !v1.Finished(fresh) && !stopping(fresh) && fresh.Status.Phase != v1.BlipSaving {
 		root := &v1.BlipState{}
-		err := live.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: fresh.Spec.State}, root)
+		err := r.Live.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: fresh.Spec.State}, root)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 		if err == nil && root.DeletionTimestamp == nil {
 			wanted[root.Name] = true
-			for _, m := range desiredMounts(root, fresh) {
+			for _, m := range v1.DesiredMounts(root, fresh) {
 				if m.Writable {
 					wanted[m.State] = true
 				}
@@ -124,34 +118,38 @@ func (r *BlipReconciler) releaseUnpublished(ctx context.Context, b *v1.Blip) err
 		}
 	}
 	var states v1.BlipStateList
-	if err := live.List(ctx, &states, client.InNamespace(b.Namespace)); err != nil {
+	if err := r.Live.List(ctx, &states, client.InNamespace(b.Namespace)); err != nil {
 		return err
 	}
 	for i := range states.Items {
 		st := &states.Items[i]
-		w := st.Status.Writer
-		if w == nil || w.BlipUID != string(b.UID) || published[w.AttachmentID] || wanted[st.Name] {
-			continue
-		}
-		base := st.DeepCopy()
-		st.Status.Writer = nil
-		if err := patchStatus(ctx, r.Client, st, base); err != nil {
-			return client.IgnoreNotFound(err)
+		name := st.Name
+		if err := r.clearWriter(ctx, st, func(w *v1.Writer) bool {
+			return w.BlipUID == string(b.UID) && !published[w.AttachmentID] && !wanted[name]
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// releaseWriter clears the writer slot if blip holds it and no pod uses it.
-// Once a pod has the slot only the node's seal (or node deletion) ends it.
-func releaseWriter(ctx context.Context, c client.Client, st *v1.BlipState, blip types.UID) error {
+// clearWriter clears the writer slot when match accepts it.
+func (r *BlipReconciler) clearWriter(ctx context.Context, st *v1.BlipState, match func(*v1.Writer) bool) error {
 	w := st.Status.Writer
-	if w == nil || w.BlipUID != string(blip) || w.PodUID != "" {
+	if w == nil || !match(w) {
 		return nil
 	}
 	base := st.DeepCopy()
 	st.Status.Writer = nil
-	return client.IgnoreNotFound(patchStatus(ctx, c, st, base))
+	return client.IgnoreNotFound(patchStatus(ctx, r.Client, st, base))
+}
+
+// releaseWriter clears the writer slot if blip holds it and no pod uses it.
+// Once a pod has the slot only the node's seal (or node deletion) ends it.
+func (r *BlipReconciler) releaseWriter(ctx context.Context, st *v1.BlipState, blip types.UID) error {
+	return r.clearWriter(ctx, st, func(w *v1.Writer) bool {
+		return w.BlipUID == string(blip) && w.PodUID == ""
+	})
 }
 
 // releaseHeld releases every slot the Blip holds without a pod, except on
@@ -168,7 +166,7 @@ func (r *BlipReconciler) releaseHeld(ctx context.Context, b *v1.Blip, keep ...st
 		if slices.Contains(keep, st.Name) {
 			continue
 		}
-		if err := releaseWriter(ctx, r.Client, st, b.UID); err != nil {
+		if err := r.releaseWriter(ctx, st, b.UID); err != nil {
 			return err
 		}
 	}
@@ -183,18 +181,11 @@ func (r *BlipReconciler) releaseHeld(ctx context.Context, b *v1.Blip, keep ...st
 func (r *BlipReconciler) releaseUnattachedWriter(ctx context.Context, b *v1.Blip, state, attachmentID string) error {
 	st := &v1.BlipState{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: state}, st); err != nil {
-		if client.IgnoreNotFound(err) != nil {
-			return err
-		}
-		return nil
+		return client.IgnoreNotFound(err)
 	}
-	w := st.Status.Writer
-	if w == nil || w.BlipUID != string(b.UID) || w.AttachmentID != attachmentID {
-		return nil
-	}
-	base := st.DeepCopy()
-	st.Status.Writer = nil
-	return client.IgnoreNotFound(patchStatus(ctx, r.Client, st, base))
+	return r.clearWriter(ctx, st, func(w *v1.Writer) bool {
+		return w.BlipUID == string(b.UID) && w.AttachmentID == attachmentID
+	})
 }
 
 // releaseSwitchWriter returns a writer slot pre-acquired for a promotion that
@@ -202,12 +193,9 @@ func (r *BlipReconciler) releaseUnattachedWriter(ctx context.Context, b *v1.Blip
 func (r *BlipReconciler) releaseSwitchWriter(ctx context.Context, b *v1.Blip, state string) error {
 	st := &v1.BlipState{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: state}, st); err != nil {
-		if client.IgnoreNotFound(err) != nil {
-			return err
-		}
-		return nil
+		return client.IgnoreNotFound(err)
 	}
-	return releaseWriter(ctx, r.Client, st, b.UID)
+	return r.releaseWriter(ctx, st, b.UID)
 }
 
 // ensureWriterPods records the claimed pod in each writer slot the Blip
@@ -226,7 +214,7 @@ func (r *BlipReconciler) ensureWriterPods(ctx context.Context, b *v1.Blip) error
 		id := atts[name]
 		st := &v1.BlipState{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, st); err != nil {
-			if client.IgnoreNotFound(err) != nil {
+			if !apierrors.IsNotFound(err) {
 				return err
 			}
 			continue

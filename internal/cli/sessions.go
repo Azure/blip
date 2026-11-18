@@ -10,28 +10,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/wire"
 )
-
-func (a *app) getBlip(ctx context.Context, name string) (*v1alpha1.Blip, error) {
-	c, err := a.clients()
-	if err != nil {
-		return nil, err
-	}
-	var b v1alpha1.Blip
-	if err := c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: name}, &b); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, fmt.Errorf("blip %q not found in namespace %q", name, c.Namespace)
-		}
-		return nil, err
-	}
-	return &b, nil
-}
 
 // finishedError explains that a blip can no longer be attached to. It names
 // the reason (for example "Stopped" or "Idle") so a teardown race looks
@@ -57,10 +40,31 @@ func (a *app) runningPod(ctx context.Context, name string) (string, error) {
 			return "", err
 		}
 	}
-	if b.Status.Phase == v1alpha1.BlipSucceeded || b.Status.Phase == v1alpha1.BlipFailed {
+	if v1alpha1.Finished(b) {
 		return "", finishedError(b)
 	}
-	return session.PodFor(b)
+	return podFor(b)
+}
+
+// podFor returns the VM pod of a running blip, or an error that explains why
+// it has none.
+func podFor(b *v1alpha1.Blip) (string, error) {
+	switch b.Status.Phase {
+	case v1alpha1.BlipRunning:
+		if b.Status.Pod != "" {
+			return b.Status.Pod, nil
+		}
+		return "", fmt.Errorf("blip %q is not running yet", b.Name)
+	case v1alpha1.BlipSaving:
+		return "", fmt.Errorf("blip %q has stopped and is saving", b.Name)
+	case v1alpha1.BlipSucceeded, v1alpha1.BlipFailed:
+		return "", fmt.Errorf("blip %q has finished (%s)", b.Name, b.Status.Phase)
+	}
+	msg := ""
+	if b.Status.Message != "" {
+		msg = ": " + b.Status.Message
+	}
+	return "", fmt.Errorf("blip %q is not running yet%s", b.Name, msg)
 }
 
 func (a *app) open(ctx context.Context, pod string, o wire.Open) (*session.Session, error) {
@@ -131,8 +135,7 @@ func (a *app) openRetrying(ctx context.Context, name, pod string, o wire.Open, r
 		}
 		// The open may have failed because the blip just stopped. Report
 		// that clearly instead of retrying a VM that no longer exists.
-		if b, gerr := a.getBlip(ctx, name); gerr == nil &&
-			(b.Status.Phase == v1alpha1.BlipSucceeded || b.Status.Phase == v1alpha1.BlipFailed) {
+		if b, gerr := a.getBlip(ctx, name); gerr == nil && v1alpha1.Finished(b) {
 			return nil, finishedError(b)
 		}
 		if time.Now().After(deadline) {

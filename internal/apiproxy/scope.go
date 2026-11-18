@@ -11,16 +11,11 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	v1 "github.com/Azure/blip/api/v1alpha1"
 )
 
 const (
-	// ownerLabel is the label the controller puts on claimed VM pods and the
-	// label owners use on their Blips and BlipStates.
-	ownerLabel = "blip.dev/owner"
-	// blipAnnotation names the Blip a claimed VM pod runs for.
-	blipAnnotation = "blip.dev/blip"
-	// blipUIDLabel binds a VM pod to one incarnation of its Blip.
-	blipUIDLabel = "blip.dev/blip-uid"
 	// adminOwner marks an unlabelled (unrestricted) Blip. Its VM is allowed
 	// the same reads as before owner scoping existed.
 	adminOwner = "-"
@@ -200,8 +195,8 @@ func (s *ownerScope) identity(ctx context.Context) (identity, error) {
 		}
 		return identity{}, fmt.Errorf("read own pod: status %d", status)
 	}
-	blipName := pod.Metadata.Annotations[blipAnnotation]
-	blipUID := pod.Metadata.Labels[blipUIDLabel]
+	blipName := pod.Metadata.Annotations[v1.AnnotationBlip]
+	blipUID := pod.Metadata.Labels[v1.LabelBlipUID]
 	if blipName == "" || blipUID == "" {
 		return empty, nil
 	}
@@ -218,7 +213,7 @@ func (s *ownerScope) identity(ctx context.Context) (identity, error) {
 	if blip.Metadata.UID != blipUID {
 		return empty, nil
 	}
-	owner := blip.Metadata.Labels[ownerLabel]
+	owner := blip.Metadata.Labels[v1.LabelOwner]
 	if owner == "" {
 		owner = adminOwner
 	}
@@ -247,7 +242,7 @@ func (s *ownerScope) allowed(ctx context.Context, id identity, req scopeRequest)
 		}
 		return false, status, nil
 	}
-	owner := obj.Metadata.Labels[ownerLabel]
+	owner := obj.Metadata.Labels[v1.LabelOwner]
 	switch req.resource {
 	case "pods":
 		// Warm and unknown pods have no owner label and are never exposed.
@@ -301,7 +296,7 @@ func withOwnerSelector(r *http.Request, owner string) *http.Request {
 	out := r.Clone(r.Context())
 	q := out.URL.Query()
 	selector := q.Get("labelSelector")
-	own := ownerLabel + "=" + owner
+	own := v1.LabelOwner + "=" + owner
 	if selector == "" {
 		selector = own
 	} else {

@@ -12,7 +12,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/workspace"
@@ -302,13 +301,13 @@ func (a *app) createState(ctx context.Context, name string, f *createStateFlags,
 	if src != nil {
 		for _, mount := range st.Spec.Mounts {
 			if mount.Writable {
-				if _, err := a.waitState(ctx, mount.State); err != nil {
+				if _, err := a.waitStateCommitted(ctx, mount.State); err != nil {
 					return err
 				}
 			}
 		}
 	}
-	st, err = a.waitState(ctx, name)
+	st, err = a.waitStateCommitted(ctx, name)
 	if err != nil {
 		return err
 	}
@@ -352,33 +351,29 @@ func stateFailure(s *v1alpha1.BlipState) string {
 	return "creation failed"
 }
 
-func (a *app) waitState(ctx context.Context, name string) (*v1alpha1.BlipState, error) {
-	c, err := a.clients()
-	if err != nil {
-		return nil, err
-	}
+// waitStateCommitted waits until the state's first commit is usable, whether
+// it is Ready or already attached by a concurrent blip.
+func (a *app) waitStateCommitted(ctx context.Context, name string) (*v1alpha1.BlipState, error) {
 	r := &reporter{a: a}
 	defer r.stop()
 	var got *v1alpha1.BlipState
-	err = waitFor(ctx, c.Kube, &v1alpha1.BlipStateList{}, client.ObjectKey{Namespace: c.Namespace, Name: name},
-		func() *v1alpha1.BlipState { return &v1alpha1.BlipState{} },
-		func(s *v1alpha1.BlipState) (bool, error) {
-			if s == nil {
-				return false, fmt.Errorf("state %q was deleted", a.short(name))
-			}
-			got = s
-			// The first commit is what makes a state usable, whether it is
-			// Ready or already attached by a concurrent blip.
-			if s.Status.Committed != nil {
-				return true, nil
-			}
-			if msg := stateFailure(s); msg != "" {
-				return false, fmt.Errorf("state %q failed: %s", a.short(name), msg)
-			}
-			if s.Status.Message != "" {
-				r.say("waiting for state %s: %s", a.short(name), s.Status.Message)
-			}
-			return false, nil
-		})
+	err := a.waitState(ctx, name, func(s *v1alpha1.BlipState) (bool, error) {
+		if s == nil {
+			return false, fmt.Errorf("state %q was deleted", a.short(name))
+		}
+		got = s
+		// The first commit is what makes a state usable, whether it is Ready
+		// or already attached by a concurrent blip.
+		if s.Status.Committed != nil {
+			return true, nil
+		}
+		if msg := stateFailure(s); msg != "" {
+			return false, fmt.Errorf("state %q failed: %s", a.short(name), msg)
+		}
+		if s.Status.Message != "" {
+			r.say("waiting for state %s: %s", a.short(name), s.Status.Message)
+		}
+		return false, nil
+	})
 	return got, err
 }

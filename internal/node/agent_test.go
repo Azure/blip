@@ -23,6 +23,7 @@ import (
 	"github.com/Azure/blip/internal/image"
 	"github.com/Azure/blip/internal/peer"
 	"github.com/Azure/blip/internal/podapi"
+	"github.com/Azure/blip/internal/registryauth"
 	"github.com/Azure/blip/internal/storage"
 )
 
@@ -236,7 +237,7 @@ func TestAgentPass(t *testing.T) {
 	s.Status.Pending = &v1alpha1.PendingCommit{CommitID: "c1", Generation: 1, SourceNode: self, Replicas: []string{self}}
 	bn := &v1alpha1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: self}}
 	a, st, ap := testAgent(t, pod, s, bn)
-	a.pull = func(ctx context.Context, ref string, secrets []pullSecret, dir string) (image.Config, string, error) {
+	a.pull = func(ctx context.Context, ref string, secrets []registryauth.PullSecret, dir string) (image.Config, string, error) {
 		if ref != imageRef {
 			t.Errorf("pull %s", ref)
 		}
@@ -284,7 +285,7 @@ func TestAgentPass(t *testing.T) {
 	if err := a.client.Get(context.Background(), client.ObjectKeyFromObject(pod), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Labels[LabelWarm] != "true" || !strings.Contains(got.Annotations[AnnotationObserved], `"Warm"`) {
+	if got.Labels[v1alpha1.LabelWarm] != "true" || !strings.Contains(got.Annotations[v1alpha1.AnnotationObserved], `"Warm"`) {
 		t.Fatalf("pod metadata %v %v", got.Labels, got.Annotations)
 	}
 
@@ -551,10 +552,10 @@ func TestPrepareErrorAnnotation(t *testing.T) {
 	if err := a.client.Get(ctx, client.ObjectKeyFromObject(pod), &got); err != nil {
 		t.Fatal(err)
 	}
-	if msg := got.Annotations[AnnotationPrepareError]; !strings.Contains(msg, "create working: boom") {
+	if msg := got.Annotations[v1alpha1.AnnotationPrepareError]; !strings.Contains(msg, "create working: boom") {
 		t.Fatalf("prepare error annotation = %q", msg)
 	}
-	if n := len(got.Annotations[AnnotationPrepareError]); n > maxPrepareErr {
+	if n := len(got.Annotations[v1alpha1.AnnotationPrepareError]); n > maxPrepareErr {
 		t.Fatalf("prepare error is %d bytes", n)
 	}
 
@@ -562,7 +563,7 @@ func TestPrepareErrorAnnotation(t *testing.T) {
 	if err := a.client.Get(ctx, client.ObjectKeyFromObject(pod), &got); err != nil {
 		t.Fatal(err)
 	}
-	if msg := got.Annotations[AnnotationPrepareError]; msg != "" {
+	if msg := got.Annotations[v1alpha1.AnnotationPrepareError]; msg != "" {
 		t.Fatalf("prepare error annotation not cleared: %q", msg)
 	}
 }

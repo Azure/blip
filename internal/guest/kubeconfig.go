@@ -9,11 +9,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// KubeconfigPath and NamespacePath contain only connection settings and self
-// metadata. They live in the root's /run tmpfs, never on a durable disk.
+// kubeconfigPath contains only connection settings and self metadata. It lives
+// in the root's /run tmpfs, never on a durable disk.
 const (
-	KubeconfigPath = "/run/blip/kubeconfig"
-	NamespacePath  = "/run/blip/namespace"
+	kubeconfigPath = "/run/blip/kubeconfig"
 	apiServer      = "http://127.0.0.1:8001"
 )
 

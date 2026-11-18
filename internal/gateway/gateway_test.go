@@ -18,12 +18,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/Azure/blip/api/v1alpha1"
@@ -52,20 +50,22 @@ type env struct {
 	started atomic.Bool // the fake controller runs blips once set
 }
 
-func newEnv(t *testing.T, objs ...client.Object) *env {
-	scheme := runtime.NewScheme()
-	v1alpha1.AddToScheme(scheme)
-	objs = append(objs, gatewayBase())
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(interceptor.Funcs{
+// withUIDs makes the fake client assign UIDs on create, as an API server does.
+// Menu actions use them to reject a stale selection after replacement.
+func withUIDs(c client.WithWatch) client.WithWatch {
+	return interceptor.NewClient(c, interceptor.Funcs{
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			// The API server assigns UIDs, but the fake client does not. Menu
-			// actions use them to reject a stale selection after replacement.
 			if obj.GetUID() == "" {
 				obj.SetUID(types.UID(rand.Text()))
 			}
 			return c.Create(ctx, obj, opts...)
 		},
-	}).Build()
+	})
+}
+
+func newEnv(t *testing.T, objs ...client.Object) *env {
+	objs = append(objs, gatewayBase())
+	kube := withUIDs(catalogClient(t, objs...))
 	hostKey, _ := newKey(t)
 	userKey, line := newKey(t)
 	users := &Users{}
@@ -245,13 +245,13 @@ func TestEnsureSandboxIsIdempotentAndRecreatesFinished(t *testing.T) {
 	if err := e.kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: "alice.dev"}, &st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Spec.Image != "" || st.Spec.CopyFrom != e.srv.BaseState || st.Spec.Size.String() != "20Gi" || st.Labels[ownerLabel] != "alice" || len(st.OwnerReferences) != 0 ||
+	if st.Spec.Image != "" || st.Spec.CopyFrom != e.srv.BaseState || st.Spec.Size.String() != "20Gi" || st.Labels[v1alpha1.LabelOwner] != "alice" || len(st.OwnerReferences) != 0 ||
 		st.Spec.Runtime == nil || st.Spec.Runtime.IdleTimeout.Duration != 45*time.Minute {
 		t.Fatalf("state spec %+v labels %v", st.Spec, st.Labels)
 	}
 	var b v1alpha1.Blip
 	e.kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: "alice.dev"}, &b)
-	if b.Spec.State != "alice.dev" || b.Spec.Pool != "small" || len(b.Spec.Command) != 0 || b.Spec.IdleTimeout != nil || b.Labels[ownerLabel] != "alice" {
+	if b.Spec.State != "alice.dev" || b.Spec.Pool != "small" || len(b.Spec.Command) != 0 || b.Spec.IdleTimeout != nil || b.Labels[v1alpha1.LabelOwner] != "alice" {
 		t.Fatalf("blip spec %+v labels %v", b.Spec, b.Labels)
 	}
 	if pod, err := e.srv.ensureSandbox(ctx, "alice", "alice.dev"); err != nil || pod != "pod-alice.dev" {
@@ -273,7 +273,7 @@ func TestEnsureSandboxIsIdempotentAndRecreatesFinished(t *testing.T) {
 }
 
 func TestEnsureSandboxFailedState(t *testing.T) {
-	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: "alice.dev", Namespace: ns, Labels: map[string]string{ownerLabel: "alice"}}}
+	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: "alice.dev", Namespace: ns, Labels: map[string]string{v1alpha1.LabelOwner: "alice"}}}
 	st.Status.Phase, st.Status.Message = v1alpha1.StateFailed, "image not found"
 	e := newEnv(t, st)
 	_, err := e.srv.ensureSandbox(context.Background(), "alice", "alice.dev")
@@ -313,8 +313,8 @@ func TestEnsureSandboxRejectsCrossOwner(t *testing.T) {
 	}
 
 	// The State belongs to the caller, but the Blip is another owner's.
-	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: "bob.dev", Namespace: ns, Labels: map[string]string{ownerLabel: "bob"}}}
-	b := &v1alpha1.Blip{ObjectMeta: metav1.ObjectMeta{Name: "bob.dev", Namespace: ns, Labels: map[string]string{ownerLabel: "alice"}}}
+	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: "bob.dev", Namespace: ns, Labels: map[string]string{v1alpha1.LabelOwner: "bob"}}}
+	b := &v1alpha1.Blip{ObjectMeta: metav1.ObjectMeta{Name: "bob.dev", Namespace: ns, Labels: map[string]string{v1alpha1.LabelOwner: "alice"}}}
 	e2 := newEnv(t, st, b)
 	if _, err := e2.srv.ensureSandbox(ctx, "bob", "bob.dev"); err == nil || !strings.Contains(err.Error(), "not owned") {
 		t.Fatalf("cross-owner blip: %v", err)
@@ -651,7 +651,7 @@ func TestSSHRejectsCrossOwnerSandbox(t *testing.T) {
 	// A resource named like bob's sandbox but owned by alice must not be
 	// served to bob.
 	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{
-		Name: "bob.default", Namespace: ns, Labels: map[string]string{ownerLabel: "alice"},
+		Name: "bob.default", Namespace: ns, Labels: map[string]string{v1alpha1.LabelOwner: "alice"},
 	}}
 	if err := e.kube.Create(context.Background(), st); err != nil {
 		t.Fatal(err)
@@ -680,7 +680,7 @@ func TestEnsureSandboxRecoversMissingState(t *testing.T) {
 	defer cancel()
 
 	b := &v1alpha1.Blip{
-		ObjectMeta: metav1.ObjectMeta{Name: "alice.default", Namespace: ns, Labels: map[string]string{ownerLabel: "alice"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "alice.default", Namespace: ns, Labels: map[string]string{v1alpha1.LabelOwner: "alice"}},
 		Spec:       v1alpha1.BlipSpec{State: "alice.default"},
 		Status:     v1alpha1.BlipStatus{Phase: v1alpha1.BlipPending, Reason: "StateNotFound"},
 	}
@@ -736,7 +736,7 @@ func TestEnsureStateWaitsForDeletion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	st := &v1alpha1.BlipState{
-		ObjectMeta: metav1.ObjectMeta{Name: "alice.default", Namespace: ns, Labels: map[string]string{ownerLabel: "alice"}, Finalizers: []string{"test"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "alice.default", Namespace: ns, Labels: map[string]string{v1alpha1.LabelOwner: "alice"}, Finalizers: []string{"test"}},
 		Spec:       v1alpha1.BlipStateSpec{Image: "reg/dev:1"},
 	}
 	if err := e.kube.Create(ctx, st); err != nil {

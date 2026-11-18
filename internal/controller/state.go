@@ -33,24 +33,12 @@ const (
 	// retryAfter paces retries of failures that no watch event resolves
 	// (registry errors).
 	retryAfter = 30 * time.Second
-	// AnnotationForceRecoverWriter clears a writer that cannot be
-	// confirmed stopped (for example after its Kubernetes Node was
-	// deleted) and records a failed seal so the Blip does not report a
-	// successful save. The controller removes it after using it.
-	AnnotationForceRecoverWriter = "blip.dev/force-recover-writer"
 	// maxSeals is the API limit for BlipState.status.seals.
 	maxSeals = 32
 	// recentSeals is how many seal results are kept even when no Blip
 	// references them.
 	recentSeals = 8
 )
-
-// imageConfigResolver is implemented by registries that can also report an
-// image's runtime configuration. The controller copies it into state status
-// so copies do not depend on the original image or source state.
-type imageConfigResolver interface {
-	ImageConfig(ctx context.Context, ref string) (*v1.ImageConfig, error)
-}
 
 // StateReconciler drives BlipState versions: initial version, commits,
 // seals, repair, and deletion. It never writes status.nodes.
@@ -62,6 +50,9 @@ type StateReconciler struct {
 }
 
 func (r *StateReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Live == nil {
+		r.Live = mgr.GetAPIReader()
+	}
 	allStates := handler.EnqueueRequestsFromMapFunc(r.allStates)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1.BlipState{}).
@@ -107,7 +98,7 @@ func (r *StateReconciler) blipStates(ctx context.Context, o client.Object) []rec
 	refs := stateRefs(b)
 	root := &v1.BlipState{}
 	if b.Spec.State != "" && r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.State}, root) == nil {
-		for _, m := range desiredMounts(root, b) {
+		for _, m := range v1.DesiredMounts(root, b) {
 			if !slices.Contains(refs, m.State) {
 				refs = append(refs, m.State)
 			}
@@ -215,9 +206,9 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 			return reconcile.Result{}, err
 		}
 	}
-	if !deleting && !controllerutil.ContainsFinalizer(st, Finalizer) {
+	if !deleting && !controllerutil.ContainsFinalizer(st, v1.Finalizer) {
 		base := st.DeepCopy()
-		controllerutil.AddFinalizer(st, Finalizer)
+		controllerutil.AddFinalizer(st, v1.Finalizer)
 		if err := patchObject(ctx, r.Client, st, base); err != nil {
 			return reconcile.Result{}, err
 		}
@@ -264,12 +255,10 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 		if stale {
 			st.Status.CopiedFrom = nil
 			st.Status.Pending = nil
-			if st.Status.Committed == nil {
-				// A failed live copy can still fall back to the source's
-				// committed version, so it is a retry, not a dead end.
-				st.Status.Phase = v1.StatePending
-				st.Status.LastError = ""
-			}
+			// A failed live copy can still fall back to the source's
+			// committed version, so it is a retry, not a dead end.
+			st.Status.Phase = v1.StatePending
+			st.Status.LastError = ""
 			if st.Spec.Size == nil {
 				st.Status.SizeBytes = 0
 			}
@@ -323,12 +312,12 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
 	}
-	if deleting && len(blockers) == 0 && controllerutil.ContainsFinalizer(st, Finalizer) {
+	if deleting && len(blockers) == 0 && controllerutil.ContainsFinalizer(st, v1.Finalizer) {
 		base := st.DeepCopy()
-		controllerutil.RemoveFinalizer(st, Finalizer)
+		controllerutil.RemoveFinalizer(st, v1.Finalizer)
 		return reconcile.Result{}, client.IgnoreNotFound(patchObject(ctx, r.Client, st, base))
 	}
-	if forceRecovered || (st.Status.Writer == nil && st.Annotations[AnnotationForceRecoverWriter] != "") {
+	if forceRecovered || (st.Status.Writer == nil && st.Annotations[v1.AnnotationForceRecover] != "") {
 		// Remove the one-shot annotation after its writer change is
 		// persisted. A later writer must not be recovered silently. The
 		// no-writer case also clears it after a conflicted status patch
@@ -343,7 +332,7 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 		nodes = append(nodes, p.SourceNode)
 		nodes = append(nodes, p.Replicas...)
 	}
-	if next := cl.nextCheck(nodes); next > 0 && (result.RequeueAfter == 0 || next < result.RequeueAfter) {
+	if next := cl.nextCrossing(nodes, repairAfter, false); next > 0 && (result.RequeueAfter == 0 || next < result.RequeueAfter) {
 		result.RequeueAfter = next
 	}
 	return result, nil
@@ -387,7 +376,7 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 	switch {
 	case st.Spec.Image != "":
 		if s.ImageDigest == "" {
-			d, err := digestImage(ctx, r.Registry, st.Spec.Image, st.Namespace, st.Spec.ImagePullSecrets)
+			d, err := r.Registry.Digest(ctx, st.Spec.Image, st.Namespace, st.Spec.ImagePullSecrets)
 			if errors.Is(err, ErrImageNotFound) || errors.Is(err, ErrInvalidImage) {
 				s.Phase = v1.StateFailed
 				return err.Error(), false, nil
@@ -398,7 +387,7 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 			s.ImageDigest = d
 		}
 		if s.ImageConfig == nil {
-			cfg, err := imageConfigFor(ctx, r.Registry, s.ImageDigest, st.Namespace, st.Spec.ImagePullSecrets)
+			cfg, err := r.Registry.ImageConfig(ctx, s.ImageDigest, st.Namespace, st.Spec.ImagePullSecrets)
 			if err != nil {
 				return fmt.Sprintf("resolve image config %s: %v", st.Spec.Image, err), true, nil
 			}
@@ -418,8 +407,7 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 			if err != nil {
 				return "", false, err
 			}
-			if owner := st.Labels[LabelOwner]; owner != "" && !ownedState(src, owner) &&
-				(src.Spec.Image == "" || src.Labels[LabelOwner] != "") {
+			if owner := st.Labels[v1.LabelOwner]; !readableBy(owner, src) {
 				s.Phase = v1.StateFailed
 				return fmt.Sprintf("copy source %q is not owned by %s or a shared image template", src.Name, owner), false, nil
 			}
@@ -495,7 +483,7 @@ func (r *StateReconciler) liveWriter(ctx context.Context, st, src *v1.BlipState,
 	if err != nil {
 		return "", err
 	}
-	if string(b.UID) != w.BlipUID || finished(b) || stopping(b) || b.Status.Phase == v1.BlipSaving {
+	if string(b.UID) != w.BlipUID || v1.Finished(b) || stopping(b) || b.Status.Phase == v1.BlipSaving {
 		return busy, nil
 	}
 	if b.Status.RootAttachmentID != w.AttachmentID {
@@ -548,7 +536,7 @@ func (r *StateReconciler) liveCopyStale(ctx context.Context, st *v1.BlipState, c
 	if err != nil {
 		return false, err
 	}
-	if finished(srcBlip) || srcBlip.DeletionTimestamp != nil || (w.BlipUID != "" && string(srcBlip.UID) != w.BlipUID) {
+	if v1.Finished(srcBlip) || srcBlip.DeletionTimestamp != nil || (w.BlipUID != "" && string(srcBlip.UID) != w.BlipUID) {
 		return true, nil
 	}
 	return false, nil
@@ -738,8 +726,7 @@ func (r *StateReconciler) pendingSource(ctx context.Context, st *v1.BlipState, c
 // A healthy draining source can still serve its sealed commit even though it
 // cannot take new placements. Replica loss must not strand that existing save.
 func servingSource(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
-	bn := cl.nodes[p.SourceNode]
-	return bn != nil && cl.k8s[p.SourceNode] != nil && healthy(bn, cl.now) && cl.holds(st, p.SourceNode, p.CommitID)
+	return cl.healthyNode(p.SourceNode) && cl.holds(st, p.SourceNode, p.CommitID)
 }
 
 // usableHolder returns a usable replica that holds the pending commit.
@@ -767,18 +754,14 @@ func firstUsable(st *v1.BlipState, cl *cluster, names []string) string {
 func (r *StateReconciler) writer(ctx context.Context, st *v1.BlipState, cl *cluster) (string, bool, error) {
 	s := &st.Status
 	w := s.Writer
-	live := r.Live
-	if live == nil {
-		live = r.Client
-	}
 	if w.PodUID == "" {
 		// Not claimed yet: release if the Blip is gone.
 		b := &v1.Blip{}
-		err := live.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: w.BlipName}, b)
+		err := r.Live.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: w.BlipName}, b)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return "", false, err
 		}
-		if apierrors.IsNotFound(err) || string(b.UID) != w.BlipUID || finished(b) {
+		if apierrors.IsNotFound(err) || string(b.UID) != w.BlipUID || v1.Finished(b) {
 			s.Writer = nil
 		}
 		return "", false, nil
@@ -819,7 +802,7 @@ func (r *StateReconciler) writer(ctx context.Context, st *v1.BlipState, cl *clus
 			return "", false, nil
 		}
 	}
-	if v, ok := st.Annotations[AnnotationForceRecoverWriter]; ok && v != "" {
+	if v, ok := st.Annotations[v1.AnnotationForceRecover]; ok && v != "" {
 		// The operator confirmed that the VM can no longer write. Report a
 		// failed seal so the Blip fails instead of reporting success.
 		s.Writer = nil
@@ -836,12 +819,12 @@ func (r *StateReconciler) writer(ctx context.Context, st *v1.BlipState, cl *clus
 	// Keep the writer reserved (so nobody else can take it) until the node
 	// reports a seal or an operator forces recovery.
 	if cl.k8s[w.Node] == nil {
-		err := live.Get(ctx, types.NamespacedName{Name: w.Node}, &corev1.Node{})
+		err := r.Live.Get(ctx, types.NamespacedName{Name: w.Node}, &corev1.Node{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return "", false, err
 		}
 		if apierrors.IsNotFound(err) {
-			return fmt.Sprintf("writer %s on deleted node %s cannot be confirmed stopped; annotate the state %s=%q after checking the node to recover", w.BlipName, w.Node, AnnotationForceRecoverWriter, "true"), false, nil
+			return fmt.Sprintf("writer %s on deleted node %s cannot be confirmed stopped; annotate the state %s=%q after checking the node to recover", w.BlipName, w.Node, v1.AnnotationForceRecover, "true"), false, nil
 		}
 	}
 	return "", false, nil
@@ -859,12 +842,8 @@ func (r *StateReconciler) unpublishedWriter(ctx context.Context, st *v1.BlipStat
 	if w == nil {
 		return false, nil
 	}
-	live := r.Live
-	if live == nil {
-		live = r.Client
-	}
 	var blips v1.BlipList
-	if err := live.List(ctx, &blips, client.InNamespace(st.Namespace)); err != nil {
+	if err := r.Live.List(ctx, &blips, client.InNamespace(st.Namespace)); err != nil {
 		return false, err
 	}
 	for _, b := range blips.Items {
@@ -876,7 +855,7 @@ func (r *StateReconciler) unpublishedWriter(ctx context.Context, st *v1.BlipStat
 				return false, nil
 			}
 		}
-		if string(b.UID) == w.BlipUID && !finished(&b) {
+		if string(b.UID) == w.BlipUID && !v1.Finished(&b) {
 			return false, nil
 		}
 	}
@@ -950,19 +929,15 @@ func pruneSeals(seals []v1.SealResult, refs map[string]bool) []v1.SealResult {
 
 // clearForceRecover removes the force-recover annotation after it was used.
 func (r *StateReconciler) clearForceRecover(ctx context.Context, st *v1.BlipState) error {
-	live := r.Live
-	if live == nil {
-		live = r.Client
-	}
 	fresh := &v1.BlipState{}
-	if err := live.Get(ctx, client.ObjectKeyFromObject(st), fresh); err != nil {
+	if err := r.Live.Get(ctx, client.ObjectKeyFromObject(st), fresh); err != nil {
 		return client.IgnoreNotFound(err)
 	}
-	if _, ok := fresh.Annotations[AnnotationForceRecoverWriter]; !ok {
+	if _, ok := fresh.Annotations[v1.AnnotationForceRecover]; !ok {
 		return nil
 	}
 	base := fresh.DeepCopy()
-	delete(fresh.Annotations, AnnotationForceRecoverWriter)
+	delete(fresh.Annotations, v1.AnnotationForceRecover)
 	return client.IgnoreNotFound(patchObject(ctx, r.Client, fresh, base))
 }
 
@@ -1021,7 +996,7 @@ func (r *StateReconciler) repair(st *v1.BlipState, cl *cluster) string {
 // state finalizer against that Pending Blip. The Blip controller fails such
 // a Blip as soon as it observes the deletion.
 func blipBlocksDeletion(b *v1.Blip, st *v1.BlipState) bool {
-	if finished(b) {
+	if v1.Finished(b) {
 		return false
 	}
 	// Only actual root use counts; offline profile references never block

@@ -93,6 +93,15 @@ func (a *app) waitBlip(ctx context.Context, name string, check func(*v1alpha1.Bl
 		func() *v1alpha1.Blip { return &v1alpha1.Blip{} }, check)
 }
 
+func (a *app) waitState(ctx context.Context, name string, check func(*v1alpha1.BlipState) (bool, error)) error {
+	c, err := a.clients()
+	if err != nil {
+		return err
+	}
+	return waitFor(ctx, c.Kube, &v1alpha1.BlipStateList{}, client.ObjectKey{Namespace: c.Namespace, Name: name},
+		func() *v1alpha1.BlipState { return &v1alpha1.BlipState{} }, check)
+}
+
 // reporter prints a progress line whenever it changes. It holds lines
 // back for Env.ProgressDelay so fast operations print nothing; call stop
 // when the wait ends.
@@ -149,12 +158,8 @@ func (r *reporter) stop() {
 	}
 }
 
-func finished(b *v1alpha1.Blip) bool {
-	return b.Status.Phase == v1alpha1.BlipSucceeded || b.Status.Phase == v1alpha1.BlipFailed
-}
-
-// waitRunning waits until the blip runs (returns its pod) or finishes
-// (returns "").
+// waitRunning waits until the blip is running or has finished and returns the
+// last version it saw.
 func (a *app) waitRunning(ctx context.Context, name string) (*v1alpha1.Blip, error) {
 	r := &reporter{a: a}
 	defer r.stop()
@@ -167,7 +172,7 @@ func (a *app) waitRunning(ctx context.Context, name string) (*v1alpha1.Blip, err
 		switch {
 		case b.Status.Phase == v1alpha1.BlipRunning && b.Status.Pod != "":
 			return true, nil
-		case b.Status.Phase == v1alpha1.BlipSaving || finished(b):
+		case b.Status.Phase == v1alpha1.BlipSaving || v1alpha1.Finished(b):
 			return true, nil
 		}
 		if b.Status.Message != "" {
@@ -188,7 +193,7 @@ func (a *app) waitFinished(ctx context.Context, name string, quiet bool) (*v1alp
 			return false, fmt.Errorf("blip %q not found", name)
 		}
 		got = b
-		if finished(b) {
+		if v1alpha1.Finished(b) {
 			return true, nil
 		}
 		if !quiet && b.Status.Phase == v1alpha1.BlipSaving {

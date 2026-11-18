@@ -16,7 +16,7 @@ import (
 const testOwner = "u-0123456789abcdef0123456789abcdef"
 
 func withOwner(owner string) func(*v1.Blip) {
-	return func(b *v1.Blip) { b.Labels = map[string]string{LabelOwner: owner} }
+	return func(b *v1.Blip) { b.Labels = map[string]string{v1.LabelOwner: owner} }
 }
 
 func (e *env) owners() map[string]string {
@@ -34,7 +34,7 @@ type claimCheck struct {
 }
 
 func (c *claimCheck) Patch(ctx context.Context, o client.Object, p client.Patch, opts ...client.PatchOption) error {
-	if pod, ok := o.(*corev1.Pod); ok && pod.Labels[LabelBlipUID] != "" {
+	if pod, ok := o.(*corev1.Pod); ok && pod.Labels[v1.LabelBlipUID] != "" {
 		c.claims++
 		if got := c.e.owners()[pod.Name]; got == "" {
 			c.e.t.Errorf("pod %s claimed before its owner entry was written", pod.Name)
@@ -50,7 +50,7 @@ func TestVMOwnersWrittenBeforeClaim(t *testing.T) {
 	check := &claimCheck{Client: e.c, e: e}
 	e.blip.Client = check
 	root := e.readyState(testOwner+".root", "n1")
-	root.Labels = map[string]string{LabelOwner: testOwner}
+	root.Labels = map[string]string{v1.LabelOwner: testOwner}
 	e.must(e.c.Update(e.ctx, root))
 	e.readyState("plain-root", "n2")
 
@@ -65,13 +65,13 @@ func TestVMOwnersWrittenBeforeClaim(t *testing.T) {
 	}
 	// Claimed pods carry their owner for the guest API proxy. Warm pods stay
 	// unlabelled so they are never exposed.
-	if got := e.getPod(b.Status.Pod).Labels[LabelOwner]; got != testOwner {
+	if got := e.getPod(b.Status.Pod).Labels[v1.LabelOwner]; got != testOwner {
 		t.Errorf("owned pod owner label = %q", got)
 	}
-	if got := e.getPod(plain.Status.Pod).Labels[LabelOwner]; got != ownerAny {
+	if got := e.getPod(plain.Status.Pod).Labels[v1.LabelOwner]; got != ownerAny {
 		t.Errorf("unrestricted pod owner label = %q", got)
 	}
-	if uid := e.getPod(b.Status.Pod).Labels[LabelBlipUID]; uid != string(b.UID) {
+	if uid := e.getPod(b.Status.Pod).Labels[v1.LabelBlipUID]; uid != string(b.UID) {
 		t.Errorf("owned pod lost its blip UID label: %q", uid)
 	}
 }
@@ -85,7 +85,7 @@ func TestVMOwnersSync(t *testing.T) {
 		t.Fatalf("owners of an idle pool = %v", got)
 	}
 	root := e.readyState(testOwner+".root", "n1")
-	root.Labels = map[string]string{LabelOwner: testOwner}
+	root.Labels = map[string]string{v1.LabelOwner: testOwner}
 	e.must(e.c.Update(e.ctx, root))
 	b := e.startBlip(testOwner+".a", "n1", withRoot(testOwner+".root"), withOwner(testOwner))
 
@@ -116,7 +116,7 @@ func TestVMOwnersSharedBases(t *testing.T) {
 	e.newState("base-dev", func(s *v1.BlipState) { s.Spec.Image = "reg/dev:v1" })
 	e.newState("private-base", func(s *v1.BlipState) {
 		s.Spec.Image = "reg/private:v1"
-		s.Labels = map[string]string{LabelOwner: testOwner}
+		s.Labels = map[string]string{v1.LabelOwner: testOwner}
 	})
 	e.newState("workspace", func(s *v1.BlipState) { s.Spec.CopyFrom = "base-dev" })
 	e.must(syncVMOwners(e.ctx, e.c, ns))
@@ -129,7 +129,7 @@ func TestVMOwnersSharedBases(t *testing.T) {
 		t.Fatalf("shared bases after deletion = %q", got)
 	}
 	base := e.getState("base-dev")
-	base.Labels = map[string]string{LabelOwner: testOwner}
+	base.Labels = map[string]string{v1.LabelOwner: testOwner}
 	e.must(e.c.Update(e.ctx, base))
 	e.must(syncVMOwners(e.ctx, e.c, ns))
 	if _, ok := e.owners()[ownersBasesKey]; ok {
@@ -143,7 +143,7 @@ func TestVMOwnersRestoredAfterLostClaim(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.readyState("first-root", "n1")
 	root := e.readyState(testOwner+".root", "n1")
-	root.Labels = map[string]string{LabelOwner: testOwner}
+	root.Labels = map[string]string{v1.LabelOwner: testOwner}
 	e.must(e.c.Update(e.ctx, root))
 	stale := func() corev1.Pod {
 		e.newBlip("first", withRoot("first-root"))
@@ -165,7 +165,7 @@ func TestVMOwnersRestoredAfterLostClaim(t *testing.T) {
 		t.Fatalf("owner of %s = %q, want %q", stale.Name, got, ownerAny)
 	}
 	// A failed claim must not relabel a pod that another Blip still owns.
-	if got := e.getPod(stale.Name).Labels[LabelOwner]; got != ownerAny {
+	if got := e.getPod(stale.Name).Labels[v1.LabelOwner]; got != ownerAny {
 		t.Fatalf("failed claim changed owner label of %s to %q", stale.Name, got)
 	}
 
@@ -313,8 +313,8 @@ func TestVMOwnersRetainsLivePodAccounts(t *testing.T) {
 			}
 			e.newBlip("owned", withOwner(testOwner))
 			b := e.getBlip("owned")
-			p.Labels[LabelBlipUID] = string(b.UID)
-			p.Annotations[AnnotationBlip] = b.Name
+			p.Labels[v1.LabelBlipUID] = string(b.UID)
+			p.Annotations[v1.AnnotationBlip] = b.Name
 			e.create(p)
 			e.must(setVMOwner(e.ctx, e.c, p, b))
 			if got, want := e.owners(), map[string]string{"sa.old": "", p.Name: testOwner}; !maps.Equal(got, want) {

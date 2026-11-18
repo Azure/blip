@@ -9,26 +9,22 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Azure/blip/internal/devnode"
 )
 
-func ensureNode(path string, major, minor uint32, block bool) error {
-	dev := unix.Mkdev(major, minor)
-	mode := uint32(unix.S_IFCHR)
-	if block {
-		mode = unix.S_IFBLK
+// ensureBlockNode makes sure path is a block device node for the sysfs
+// "major:minor" in devFile.
+func ensureBlockNode(path, devFile string) error {
+	b, err := os.ReadFile(devFile)
+	if err != nil {
+		return err
 	}
-	var st unix.Stat_t
-	if err := unix.Stat(path, &st); err == nil {
-		if st.Rdev == dev && st.Mode&unix.S_IFMT == mode {
-			return nil
-		}
-		os.Remove(path)
+	rdev, err := devnode.Parse(string(b))
+	if err != nil {
+		return fmt.Errorf("%s: %w", devFile, err)
 	}
-	os.MkdirAll(filepath.Dir(path), 0o755)
-	if err := unix.Mknod(path, mode|0o600, int(dev)); err != nil && !errors.Is(err, unix.EEXIST) {
-		return fmt.Errorf("mknod %s: %w", path, err)
-	}
-	return nil
+	return devnode.Ensure(path, rdev)
 }
 
 // attachLoop returns a loop device backed by path, reusing an existing
@@ -70,10 +66,8 @@ func configureFreeLoop(backing *os.File) (string, *os.File, error) {
 	}
 	name := "loop" + strconv.Itoa(n)
 	dev := "/dev/" + name
-	if err := ensureNode(dev, 7, uint32(n), true); err != nil {
-		if err := ensureBlockNode(dev, "/sys/block/"+name+"/dev"); err != nil {
-			return "", nil, err
-		}
+	if err := ensureBlockNode(dev, "/sys/block/"+name+"/dev"); err != nil {
+		return "", nil, err
 	}
 	f, err := os.OpenFile(dev, os.O_RDWR, 0)
 	if err != nil {
@@ -94,10 +88,8 @@ func configureFreeLoop(backing *os.File) (string, *os.File, error) {
 
 func openLoopControl() (*os.File, error) {
 	const path = "/dev/loop-control"
-	if _, err := os.Stat(path); err != nil {
-		if err := ensureNode(path, 10, 237, false); err != nil {
-			return nil, err
-		}
+	if err := devnode.EnsureChar(path, unix.Mkdev(10, 237)); err != nil {
+		return nil, err
 	}
 	return os.OpenFile(path, os.O_RDWR, 0)
 }

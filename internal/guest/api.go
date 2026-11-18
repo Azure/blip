@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/blip/internal/wire"
 	"golang.org/x/sys/unix"
 )
 
@@ -30,16 +29,7 @@ type apiForwarder struct {
 	conns    map[apiStream]struct{}
 }
 
-// startAPIForwarder binds only IPv4 loopback, including when tests use port 0.
-func startAPIForwarder(port int, dial func() (apiStream, error)) (*apiForwarder, error) {
-	return startForwarder("Kubernetes API", port, dial)
-}
-
-// startGatewayForwarder exposes the host's gateway proxy on guest loopback.
-func startGatewayForwarder(port int, dial func() (apiStream, error)) (*apiForwarder, error) {
-	return startForwarder("gateway", port, dial)
-}
-
+// startForwarder binds only IPv4 loopback, including when tests use port 0.
 func startForwarder(name string, port int, dial func() (apiStream, error)) (*apiForwarder, error) {
 	l, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
@@ -143,12 +133,10 @@ func (p *apiForwarder) Close() {
 	}
 }
 
-func dialHostAPI() (apiStream, error) {
-	return dialAPISocket(unix.AF_VSOCK, &unix.SockaddrVM{CID: unix.VMADDR_CID_HOST, Port: wire.APIPort})
-}
-
-func dialHostGateway() (apiStream, error) {
-	return dialAPISocket(unix.AF_VSOCK, &unix.SockaddrVM{CID: unix.VMADDR_CID_HOST, Port: wire.GatewayPort})
+func dialHost(port uint32) func() (apiStream, error) {
+	return func() (apiStream, error) {
+		return dialAPISocket(unix.AF_VSOCK, &unix.SockaddrVM{CID: unix.VMADDR_CID_HOST, Port: port})
+	}
 }
 
 // dialAPISocket leaves the descriptor nonblocking before os.NewFile adopts

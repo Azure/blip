@@ -265,7 +265,7 @@ func TestRuntimeElapsedClockPreservesDeadlines(t *testing.T) {
 		t.Fatal("elapsed retry deadline was missed")
 	}
 
-	r.o.SkipNetwork = true
+	r.skipNetwork = true
 	r.execute(r.Apply(r.now(), Event{Kind: EventStop}))
 	r.reconcile()
 	if !r.stopSince.Equal(epoch.Add(retryInterval)) {

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/blip/internal/bootconfig"
 	"golang.org/x/sys/unix"
 )
 
@@ -30,7 +31,7 @@ func bootMounts() {
 			log.Printf("mount %s: %v", x.dst, err)
 		}
 	}
-	for _, d := range []string{"/tmp", "/etc", RootDir} {
+	for _, d := range []string{"/tmp", "/etc", rootDir} {
 		_ = os.MkdirAll(d, 0o755)
 	}
 	if f, err := os.OpenFile("/dev/console", os.O_RDWR, 0); err == nil {
@@ -39,8 +40,8 @@ func bootMounts() {
 		}
 		f.Close()
 	}
-	if err := os.MkdirAll(WorkCgroup, 0o755); err != nil {
-		log.Printf("create %s: %v", WorkCgroup, err)
+	if err := os.MkdirAll(workCgroup, 0o755); err != nil {
+		log.Printf("create %s: %v", workCgroup, err)
 	}
 }
 
@@ -100,22 +101,22 @@ func findBlock(serial string, timeout time.Duration) (string, error) {
 }
 
 // readConfig reads the config disk.
-func readConfig() (Config, error) {
-	dev, err := findBlock(ConfigSerial, 5*time.Second)
+func readConfig() (bootconfig.Config, error) {
+	dev, err := findBlock(bootconfig.ConfigSerial, 5*time.Second)
 	if err != nil {
-		return Config{}, err
+		return bootconfig.Config{}, err
 	}
 	f, err := os.Open(dev)
 	if err != nil {
-		return Config{}, err
+		return bootconfig.Config{}, err
 	}
 	defer f.Close()
-	buf := make([]byte, ConfigDiskSize)
+	buf := make([]byte, bootconfig.ConfigDiskSize)
 	n, err := f.ReadAt(buf, 0)
 	if n == 0 && err != nil {
-		return Config{}, err
+		return bootconfig.Config{}, err
 	}
-	return DecodeConfig(buf[:n])
+	return bootconfig.DecodeConfig(buf[:n])
 }
 
 // listenVsock listens on a vsock port on any CID.

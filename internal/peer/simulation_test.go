@@ -251,7 +251,7 @@ func TestLeaseSimulationCrashAtEveryEffect(t *testing.T) {
 					t.Fatal("live durable lease not restored")
 				}
 				w.clock.now = w.clock.now.Add(LeaseTTL)
-				if err := w.server.Recheck(); err != nil {
+				if err := w.server.recheck(); err != nil {
 					t.Fatal(err)
 				}
 				w.empty()
@@ -284,7 +284,7 @@ func TestLeaseSimulationReleaseFailures(t *testing.T) {
 					t.Fatal("tore down before durable revocation")
 				}
 				w.fault = nil
-				if err := w.server.Recheck(); err != nil {
+				if err := w.server.recheck(); err != nil {
 					t.Fatal(err)
 				}
 				w.empty()
@@ -319,7 +319,7 @@ func TestLeaseSimulationAmbiguousPrepare(t *testing.T) {
 				w.empty()
 			}
 			w.fault = nil
-			if err := w.server.Recheck(); err != nil {
+			if err := w.server.recheck(); err != nil {
 				t.Fatal(err)
 			}
 			w.empty()
@@ -410,7 +410,7 @@ func TestLeaseSimulationRenewalDurabilityAndExpiry(t *testing.T) {
 	if rec := w.request("/v1/leases/lease1/renew", struct{}{}); rec.Code != http.StatusForbidden {
 		t.Fatalf("expired lease renewed: %d", rec.Code)
 	}
-	if err := w.server.Recheck(); err != nil {
+	if err := w.server.recheck(); err != nil {
 		t.Fatal(err)
 	}
 	w.empty()
@@ -479,7 +479,7 @@ func TestLeaseSimulationLostExportResponseExpires(t *testing.T) {
 		t.Fatalf("ambiguous export retried or rolled back: requests=%d exports=%v", requests, w.exports)
 	}
 	w.clock.now = w.clock.now.Add(LeaseTTL)
-	if err := w.server.Recheck(); err != nil {
+	if err := w.server.recheck(); err != nil {
 		t.Fatal(err)
 	}
 	w.empty()

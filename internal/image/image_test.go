@@ -163,14 +163,11 @@ func TestPull(t *testing.T) {
 
 	for _, repo := range []string{"single", "multi"} {
 		t.Run(repo, func(t *testing.T) {
-			pinned, err := Resolve(ctx, host+"/test/"+repo+":v1", Options{Insecure: insecure})
-			if err != nil {
-				t.Fatal(err)
-			}
 			want, _ := img.Digest()
 			if repo == "multi" {
 				want, _ = idx.Digest()
 			}
+			pinned := host + "/test/" + repo + "@" + want.String()
 			if d, err := DigestOf(pinned); err != nil || d != want.String() {
 				t.Fatalf("DigestOf(%q) = %q, %v; want %s", pinned, d, err, want)
 			}

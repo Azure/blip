@@ -2,7 +2,6 @@ package node
 
 import (
 	"slices"
-	"sort"
 
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/storage"
@@ -33,12 +32,7 @@ func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
 			owners[id] = append(owners[id], name)
 		}
 	}
-	ids := make([]string, 0, len(v.volumes))
-	for id := range v.volumes {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
+	for _, id := range sortedKeys(v.volumes) {
 		if pending[id] {
 			continue
 		}
@@ -62,12 +56,7 @@ func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
 		}
 	}
 
-	names := make([]string, 0, len(v.dirs))
-	for name := range v.dirs {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range sortedKeys(v.dirs) {
 		dir := v.dirs[name]
 		for _, id := range sortedKeys(dir.devs) {
 			if _, ok := v.volumes[id]; !ok && !reserved[id] && v.fenced(name, "", id) {

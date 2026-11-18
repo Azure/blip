@@ -86,7 +86,7 @@ func TestFreezeExpiresWhileResultBackpressured(t *testing.T) {
 		}
 		host, guest := net.Pipe()
 		defer host.Close()
-		go g.serveControlStream(guest)
+		go g.serveControl(guest)
 		c := wire.NewConn(host)
 		readFrame(t, c, wire.THello, &wire.Hello{})
 		readFrame(t, c, wire.TStatus, &wire.Status{})

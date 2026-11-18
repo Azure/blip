@@ -66,7 +66,7 @@ func (c *cluster) usable(name string, selector map[string]string) bool {
 	bn, k := c.nodes[name], c.k8s[name]
 	if bn == nil || k == nil || bn.Spec.Drain || !healthy(bn, c.now) ||
 		bn.Status.Incarnation == "" || len(bn.Status.Hypervisors) == 0 ||
-		k.Labels[LabelEnrolled] != "true" {
+		k.Labels[v1.LabelEnrolled] != "true" {
 		return false
 	}
 	return labels.SelectorFromSet(selector).Matches(labels.Set(k.Labels))
@@ -120,17 +120,40 @@ func (c *cluster) choose(n int, selector map[string]string, prefer, exclude []st
 	return cands
 }
 
-// nextCheck is when one of names next crosses the repair threshold.
-func (c *cluster) nextCheck(names []string) time.Duration {
+// nextCrossing is when one of names next crosses threshold. skipDraining
+// ignores nodes that are already draining.
+func (c *cluster) nextCrossing(names []string, threshold time.Duration, skipDraining bool) time.Duration {
 	var next time.Duration
 	for _, name := range names {
 		bn := c.nodes[name]
-		if bn == nil || bn.Status.Heartbeat == nil {
+		if bn == nil || (skipDraining && bn.Spec.Drain) || bn.Status.Heartbeat == nil {
 			continue
 		}
-		if d := repairAfter - heartbeatAge(bn, c.now) + time.Second; d > 0 && (next == 0 || d < next) {
+		if d := threshold - heartbeatAge(bn, c.now) + time.Second; d > 0 && (next == 0 || d < next) {
 			next = d
 		}
 	}
 	return next
+}
+
+// healthyNode reports whether the node has both objects and is heartbeating.
+func (c *cluster) healthyNode(name string) bool {
+	bn := c.nodes[name]
+	return bn != nil && c.k8s[name] != nil && healthy(bn, c.now)
+}
+
+// avoidNodes is the set of known nodes no new VM may use.
+func (c *cluster) avoidNodes() map[string]bool {
+	avoid := map[string]bool{}
+	for name := range c.nodes {
+		if !c.usable(name, nil) {
+			avoid[name] = true
+		}
+	}
+	for name, k := range c.k8s {
+		if k.Labels[v1.LabelEnrolled] == "true" && !c.usable(name, nil) {
+			avoid[name] = true
+		}
+	}
+	return avoid
 }

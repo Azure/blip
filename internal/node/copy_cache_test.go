@@ -30,7 +30,7 @@ func fakeReader(t *testing.T, objs ...client.Object) client.Client {
 // so copyAllowed still runs.
 func TestAuthorizeCopySourceMissingFromCache(t *testing.T) {
 	src := state("src")
-	src.Labels = map[string]string{ownerLabel: "alice"}
+	src.Labels = map[string]string{v1alpha1.LabelOwner: "alice"}
 	src.Status.Committed = &v1alpha1.Commit{ID: "c1", Generation: 1}
 	dst := func() *v1alpha1.BlipState {
 		s := state("dst")
@@ -51,7 +51,7 @@ func TestAuthorizeCopySourceMissingFromCache(t *testing.T) {
 
 	t.Run("stale cache allows same-owner copy", func(t *testing.T) {
 		same := dst()
-		same.Labels = map[string]string{ownerLabel: "alice"}
+		same.Labels = map[string]string{v1alpha1.LabelOwner: "alice"}
 		a := newAgent(Config{}, fakeReader(t, same), fakeReader(t, src, same), nil)
 		if err := a.authorize("n2", req); err != nil {
 			t.Fatalf("same-owner copy denied: %v", err)

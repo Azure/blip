@@ -4,24 +4,16 @@ package network
 import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+
+	"github.com/Azure/blip/internal/netpolicy"
 )
 
-// Policy is an intersection of layers, each containing an OR of rules.
-// No layers, or any empty layer, denies all traffic.
-type Policy struct {
-	Revision string   `json:"revision"`
-	Layers   [][]Rule `json:"layers"`
-}
-
-// Rule matches an IPv4 destination excluding Except. Empty Protocol matches
-// all IP protocols; Port zero matches all ports; EndPort zero means only Port.
-type Rule struct {
-	CIDR     string   `json:"cidr"`
-	Except   []string `json:"except,omitempty"`
-	Protocol string   `json:"protocol,omitempty"`
-	Port     int32    `json:"port,omitempty"`
-	EndPort  int32    `json:"endPort,omitempty"`
-}
+// Policy and Rule are defined in netpolicy so packages that only describe
+// rules (notably the VM runtime) need not import Kubernetes API types.
+type (
+	Policy = netpolicy.Policy
+	Rule   = netpolicy.Rule
+)
 
 // Destinations is a snapshot of the objects used to resolve selectors.
 type Destinations struct {

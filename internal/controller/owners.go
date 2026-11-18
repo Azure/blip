@@ -31,7 +31,7 @@ const (
 
 // blipOwner is the owner a Blip's VM acts for.
 func blipOwner(b *v1.Blip) string {
-	if o := b.Labels[LabelOwner]; o != "" {
+	if o := b.Labels[v1.LabelOwner]; o != "" {
 		return o
 	}
 	return ownerAny
@@ -145,11 +145,11 @@ func restoreVMOwner(ctx context.Context, c client.Client, live client.Reader, ns
 	}
 	if err == nil && !isVacant(p) {
 		b := &v1.Blip{}
-		err := live.Get(ctx, types.NamespacedName{Namespace: ns, Name: p.Annotations[AnnotationBlip]}, b)
+		err := live.Get(ctx, types.NamespacedName{Namespace: ns, Name: p.Annotations[v1.AnnotationBlip]}, b)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
-		if err == nil && string(b.UID) == p.Labels[LabelBlipUID] {
+		if err == nil && string(b.UID) == p.Labels[v1.LabelBlipUID] {
 			o := blipOwner(b)
 			owner = &o
 		}
@@ -169,7 +169,7 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 		return err
 	}
 	var pods corev1.PodList
-	if err := c.List(ctx, &pods, client.InNamespace(ns), client.HasLabels{LabelPool}); err != nil {
+	if err := c.List(ctx, &pods, client.InNamespace(ns), client.HasLabels{v1.LabelPool}); err != nil {
 		return err
 	}
 	var blips v1.BlipList
@@ -189,7 +189,7 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 	var bases []string
 	for i := range states.Items {
 		s := &states.Items[i]
-		if s.Spec.Image != "" && s.Labels[LabelOwner] == "" && s.DeletionTimestamp == nil {
+		if s.Spec.Image != "" && s.Labels[v1.LabelOwner] == "" && s.DeletionTimestamp == nil {
 			bases = append(bases, s.Name)
 		}
 	}
@@ -206,7 +206,7 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 				want[ownersSAPrefix+sa] = ""
 			}
 		}
-		if b := byUID[p.Labels[LabelBlipUID]]; !isVacant(p) && b != nil && b.Name == p.Annotations[AnnotationBlip] {
+		if b := byUID[p.Labels[v1.LabelBlipUID]]; !isVacant(p) && b != nil && b.Name == p.Annotations[v1.AnnotationBlip] {
 			want[p.Name] = blipOwner(b)
 		}
 	}

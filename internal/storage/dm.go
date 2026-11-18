@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -84,12 +83,6 @@ func dmRemove(name string) error {
 	return nil
 }
 
-// dmReload replaces the table of an active device, keeping its name and
-// device number.
-func dmReload(name, table string, readOnly bool) error {
-	return (&Store{}).deviceReload(name, table, readOnly)
-}
-
 // dmResume is idempotent for recovery: resuming an already-active device can
 // fail with EINVAL on some kernels. The attr field includes 's' when suspended.
 func dmResume(name string) error {
@@ -144,10 +137,6 @@ func cryptTable(dev string, size int64, key []byte) string {
 
 // pool messages
 
-func (s *Store) createThin(id uint32) error {
-	return s.runOperation([]deviceEffect{{Kind: eCreateThin, Name: s.poolName(), Thin: id}}, nil)
-}
-
 func (s *Store) createSnap(id, origin uint32) error {
 	return s.runOperation([]deviceEffect{{Kind: eSnapshot, Name: s.poolName(), Thin: id, Origin: origin}}, nil)
 }
@@ -166,31 +155,4 @@ func deleteThin(pool string, id uint32) error {
 		return nil
 	}
 	return err
-}
-
-// ensureBlockNode makes sure path is a block device node for the sysfs
-// "major:minor" in devFile.
-func ensureBlockNode(path, devFile string) error {
-	b, err := os.ReadFile(devFile)
-	if err != nil {
-		return err
-	}
-	major, minor, err := parseDevNum(string(b))
-	if err != nil {
-		return err
-	}
-	return ensureNode(path, major, minor, true)
-}
-
-func parseDevNum(s string) (uint32, uint32, error) {
-	ma, mi, ok := strings.Cut(strings.TrimSpace(s), ":")
-	if !ok {
-		return 0, 0, errors.New("bad device number " + s)
-	}
-	a, err1 := strconv.ParseUint(ma, 10, 32)
-	b, err2 := strconv.ParseUint(mi, 10, 32)
-	if err1 != nil || err2 != nil {
-		return 0, 0, errors.New("bad device number " + s)
-	}
-	return uint32(a), uint32(b), nil
 }

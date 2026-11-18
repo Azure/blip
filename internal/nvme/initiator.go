@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Azure/blip/internal/devnode"
 )
 
 const fabricsDev = "/dev/nvme-fabrics"
@@ -31,29 +33,19 @@ type InitiatorSystem interface {
 	WriteFile(string, []byte, os.FileMode) error
 }
 
-type InitiatorClock interface {
-	Wait(context.Context, time.Duration) error
-	WithTimeout(context.Context, time.Duration) (context.Context, context.CancelFunc)
-}
-
 type InitiatorOptions struct {
 	System InitiatorSystem
-	Clock  InitiatorClock
 }
 
 type Initiator struct {
 	system InitiatorSystem
-	clock  InitiatorClock
 }
 
 func NewInitiator(opts InitiatorOptions) *Initiator {
 	if opts.System == nil {
 		opts.System = kernelInitiator{}
 	}
-	if opts.Clock == nil {
-		opts.Clock = initiatorClock{}
-	}
-	return &Initiator{system: opts.System, clock: opts.Clock}
+	return &Initiator{system: opts.System}
 }
 
 type kernelInitiator struct{}
@@ -69,22 +61,13 @@ func (kernelInitiator) WriteFile(p string, b []byte, mode os.FileMode) error {
 	return os.WriteFile(p, b, mode)
 }
 
-type initiatorClock struct{}
-
-func (initiatorClock) WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, d)
-}
-func (initiatorClock) Wait(ctx context.Context, d time.Duration) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+// sleep waits for d or until ctx is done.
+func sleep(ctx context.Context, d time.Duration) {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
 	case <-t.C:
-		return ctx.Err()
 	}
 }
 
@@ -118,7 +101,7 @@ func (i *Initiator) Connect(ctx context.Context, addr string, port int, nqn, hos
 			return "", errors.Join(err, i.Disconnect(nqn))
 		}
 	}
-	ctx, cancel := i.clock.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
 		if err := ctx.Err(); err != nil {
@@ -130,7 +113,7 @@ func (i *Initiator) Connect(ctx context.Context, addr string, port int, nqn, hos
 			}
 			return dev, nil
 		}
-		i.clock.Wait(ctx, 100*time.Millisecond)
+		sleep(ctx, 100*time.Millisecond)
 	}
 }
 
@@ -271,28 +254,23 @@ func (i *Initiator) Disconnect(nqn string) error {
 		if len(ctrls) == 0 {
 			return nil
 		}
-		i.clock.Wait(context.Background(), 100*time.Millisecond)
+		sleep(context.Background(), 100*time.Millisecond)
 	}
 	return fmt.Errorf("nvme: %s still connected", nqn)
 }
 
 func ensureNode(path, devnum string, mode uint32) error {
-	ma, mi, ok := strings.Cut(devnum, ":")
-	major, err1 := strconv.ParseUint(ma, 10, 32)
-	minor, err2 := strconv.ParseUint(mi, 10, 32)
-	if !ok || err1 != nil || err2 != nil {
-		return fmt.Errorf("nvme: bad device number %q", devnum)
+	rdev, err := devnode.Parse(devnum)
+	if err != nil {
+		return fmt.Errorf("nvme: %w", err)
 	}
-	dev := unix.Mkdev(uint32(major), uint32(minor))
-	var st unix.Stat_t
-	if unix.Stat(path, &st) == nil {
-		if st.Rdev == dev && st.Mode&unix.S_IFMT == mode {
-			return nil
-		}
-		os.Remove(path)
+	if mode == unix.S_IFBLK {
+		err = devnode.Ensure(path, rdev)
+	} else {
+		err = devnode.EnsureChar(path, rdev)
 	}
-	if err := unix.Mknod(path, mode|0o600, int(dev)); err != nil && !errors.Is(err, unix.EEXIST) {
-		return fmt.Errorf("nvme: mknod %s: %w", path, err)
+	if err != nil {
+		return fmt.Errorf("nvme: %w", err)
 	}
 	return nil
 }

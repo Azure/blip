@@ -1,6 +1,6 @@
 // Package image pulls ordinary container images and turns them into ext4
 // filesystems: Pull flattens the linux/GOARCH variant into one tar file and
-// MakeFS writes it to a block device. See docs/ARCHITECTURE.md.
+// MakeFS writes it to a block device. See the README's implementation outline.
 package image
 
 import (
@@ -67,20 +67,6 @@ func DigestOf(ref string) (string, error) {
 	return h.String(), nil
 }
 
-// Resolve returns the pinned reference "repo@sha256:..." of ref. For a
-// multi-platform image this is the digest of the index.
-func Resolve(ctx context.Context, ref string, opts Options) (string, error) {
-	r, err := ParseReference(ref, opts.Insecure)
-	if err != nil {
-		return "", err
-	}
-	desc, err := remote.Head(r, remoteOptions(ctx, opts)...)
-	if err != nil {
-		return "", fmt.Errorf("resolve %s: %w", ref, err)
-	}
-	return r.Context().Digest(desc.Digest.String()).String(), nil
-}
-
 // Pull fetches the linux/GOARCH variant of ref and writes its flattened
 // filesystem (layers applied, whiteouts removed, parent directories before
 // their children) as a tar file in dir. The caller removes the file.
@@ -127,12 +113,6 @@ func pull(ctx context.Context, ref string, opts Options, dir string) (Config, st
 		return Config{}, "", err
 	}
 	return cfg, f.Name(), nil
-}
-
-// writeTar copies the flattened image stream r to w. writeTarTo is the same
-// with temporary files in dir.
-func writeTar(w io.Writer, r io.Reader) error {
-	return writeTarTo(w, r, "")
 }
 
 // writeTarTo copies the tar stream r to w with clean relative names. It emits
@@ -480,9 +460,9 @@ func MakeFS(ctx context.Context, tarPath, dev, seed string) error {
 	return nil
 }
 
-// fakeTime is the clock of reproducible e2fsprogs runs, shared with the
-// storage package's filesystem growth (2025-01-01T00:00:00Z). Unlike
-// SOURCE_DATE_EPOCH, E2FSPROGS_FAKE_TIME does not clamp file times.
+// fakeTime is the clock of reproducible e2fsprogs runs
+// (2025-01-01T00:00:00Z). Unlike SOURCE_DATE_EPOCH, E2FSPROGS_FAKE_TIME does
+// not clamp file times.
 const fakeTime = "1735689600"
 
 // seedUUID derives a version 4 style UUID from seed.

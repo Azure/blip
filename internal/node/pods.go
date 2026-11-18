@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"path"
 	"slices"
-	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,12 +18,7 @@ import (
 const defaultIdleTimeoutSeconds = 30
 
 func planPods(v *view, p *plan) {
-	keys := make([]string, 0, len(v.pods))
-	for key := range v.pods {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
+	for _, key := range sortedKeys(v.pods) {
 		pod := v.pods[key]
 		dir := v.dirs[key]
 		if m, ok := podMetaFor(pod, dir); ok {
@@ -34,11 +28,15 @@ func planPods(v *view, p *plan) {
 			continue
 		}
 		d, preps, perr := desiredFor(v, p, pod, dir)
-		if !sameDesired(dir.desired, d) {
+		cur := podapi.Desired{}
+		if dir.desired != nil {
+			cur = *dir.desired
+		}
+		if !sameJSON(cur, d) {
 			p.desired[key] = d
 		}
 		p.prepares = append(p.prepares, preps...)
-		switch cur := pod.Annotations[AnnotationPrepareError]; {
+		switch cur := pod.Annotations[v1alpha1.AnnotationPrepareError]; {
 		case perr != "" && perr != cur:
 			p.podErrs = append(p.podErrs, podErr{pod: key, err: perr})
 		case perr == "" && cur != "":
@@ -53,25 +51,16 @@ func podMetaFor(pod *corev1.Pod, dir *podDir) (podMeta, bool) {
 	if dir != nil {
 		obs = dir.observed
 	}
-	m.warm = obs != nil && obs.Phase == podapi.PhaseWarm && pod.Labels[LabelBlipUID] == ""
-	changed := m.warm != (pod.Labels[LabelWarm] == "true")
+	m.warm = obs != nil && obs.Phase == podapi.PhaseWarm && pod.Labels[v1alpha1.LabelBlipUID] == ""
+	changed := m.warm != (pod.Labels[v1alpha1.LabelWarm] == "true")
 	if obs != nil {
 		data, _ := json.Marshal(obs)
-		if string(data) != pod.Annotations[AnnotationObserved] {
+		if string(data) != pod.Annotations[v1alpha1.AnnotationObserved] {
 			m.observed = string(data)
 			changed = true
 		}
 	}
 	return m, changed
-}
-
-func sameDesired(cur *podapi.Desired, d podapi.Desired) bool {
-	if cur == nil {
-		cur = &podapi.Desired{}
-	}
-	a, _ := json.Marshal(cur)
-	b, _ := json.Marshal(d)
-	return string(a) == string(b)
 }
 
 // desiredFor computes desired.json for a VM pod and the disks still to prepare.
@@ -84,7 +73,7 @@ func desiredFor(v *view, p *plan, pod *corev1.Pod, dir *podDir) (podapi.Desired,
 		prev = *dir.desired
 	}
 	key := podKey(pod.Namespace, pod.Name)
-	uid := pod.Labels[LabelBlipUID]
+	uid := pod.Labels[v1alpha1.LabelBlipUID]
 	if uid == "" || podDone(pod, dir) {
 		prev.Network = denyNetwork()
 		return prev, nil, ""

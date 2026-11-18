@@ -48,7 +48,7 @@ func formatSecret(s []byte) string {
 // checkAuth fails unless the kernel's nvmet supports in-band authentication
 // (CONFIG_NVME_TARGET_AUTH): only then do host entries have dhchap_key.
 func checkAuth(node string) error {
-	dir := filepath.Join(nvmetDir, "hosts", nqnPrefix+"probe:"+NodeHash(node))
+	dir := filepath.Join(nvmetDir, "hosts", NQNPrefix+"probe:"+NodeHash(node))
 	if err := mkdir(dir); err != nil {
 		return err
 	}

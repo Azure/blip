@@ -171,33 +171,54 @@ func releaseOnce(r *Remote) {
 	}
 }
 
-// Seal snapshots a fenced working volume into a new commit owned by the
-// volume's state. It returns the commit size.
-func (s *Store) Seal(ctx context.Context, attachmentID, commitID string) (int64, error) {
+// prepareSnapshot validates a snapshot request. It returns the working source,
+// or, when commitID already exists, its size and existing=true. The returned
+// unlock releases both volume key locks and must be called by the caller.
+func (s *Store) prepareSnapshot(ctx context.Context, attachmentID, commitID string) (w *record, size int64, existing bool, unlock func(), err error) {
 	if attachmentID == "" || commitID == "" || attachmentID == commitID {
-		return 0, errors.New("storage: invalid snapshot IDs")
+		return nil, 0, false, nil, errors.New("storage: invalid snapshot IDs")
 	}
 	if err := s.waitHydrated(ctx, attachmentID); err != nil {
-		return 0, err
+		return nil, 0, false, nil, err
 	}
-	defer s.locks.lockPair(attachmentID, commitID)()
+	unlock = s.locks.lockPair(attachmentID, commitID)
 	if c, err := s.lookup(commitID); err == nil {
 		if c.Kind != KindCommit {
-			return 0, fmt.Errorf("%w: %s is a %s", ErrInUse, c.ID, c.Kind)
+			unlock()
+			return nil, 0, false, nil, fmt.Errorf("%w: %s is a %s", ErrInUse, c.ID, c.Kind)
 		}
-		return c.Size, nil
+		return nil, c.Size, true, unlock, nil
 	}
-	w, err := s.lookup(attachmentID)
+	w, err = s.lookup(attachmentID)
 	if err != nil {
-		return 0, err
+		unlock()
+		return nil, 0, false, nil, err
 	}
 	switch {
 	case w.Kind != KindWorking:
-		return 0, fmt.Errorf("storage: %s is not a working volume", w.ID)
+		err = fmt.Errorf("storage: %s is not a working volume", w.ID)
 	case w.Failed != "":
-		return 0, fmt.Errorf("storage: %s failed: %s", w.ID, w.Failed)
+		err = fmt.Errorf("storage: %s failed: %s", w.ID, w.Failed)
 	case w.Clone != nil:
-		return 0, fmt.Errorf("storage: %s is still hydrating", w.ID)
+		err = fmt.Errorf("storage: %s is still hydrating", w.ID)
+	}
+	if err != nil {
+		unlock()
+		return nil, 0, false, nil, err
+	}
+	return w, 0, false, unlock, nil
+}
+
+// Seal snapshots a fenced working volume into a new commit owned by the
+// volume's state. It returns the commit size.
+func (s *Store) Seal(ctx context.Context, attachmentID, commitID string) (int64, error) {
+	w, size, existing, unlock, err := s.prepareSnapshot(ctx, attachmentID, commitID)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+	if existing {
+		return size, nil
 	}
 	// The host-side fence: nothing (in particular the VMM) may still have
 	// the disk open, or writes could land after the snapshot.
@@ -226,30 +247,13 @@ func (s *Store) Seal(ctx context.Context, attachmentID, commitID string) (int64,
 // snapshot is kept only if its ext4 superblock is clean. It returns the
 // commit size.
 func (s *Store) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID string) (int64, error) {
-	if attachmentID == "" || commitID == "" || attachmentID == commitID {
-		return 0, errors.New("storage: invalid snapshot IDs")
-	}
-	if err := s.waitHydrated(ctx, attachmentID); err != nil {
-		return 0, err
-	}
-	defer s.locks.lockPair(attachmentID, commitID)()
-	if c, err := s.lookup(commitID); err == nil {
-		if c.Kind != KindCommit {
-			return 0, fmt.Errorf("%w: %s is a %s", ErrInUse, c.ID, c.Kind)
-		}
-		return c.Size, nil
-	}
-	w, err := s.lookup(attachmentID)
+	w, size, existing, unlock, err := s.prepareSnapshot(ctx, attachmentID, commitID)
 	if err != nil {
 		return 0, err
 	}
-	switch {
-	case w.Kind != KindWorking:
-		return 0, fmt.Errorf("storage: %s is not a working volume", w.ID)
-	case w.Failed != "":
-		return 0, fmt.Errorf("storage: %s failed: %s", w.ID, w.Failed)
-	case w.Clone != nil:
-		return 0, fmt.Errorf("storage: %s is still hydrating", w.ID)
+	defer unlock()
+	if existing {
+		return size, nil
 	}
 	if err := s.runOperation([]deviceEffect{{Kind: eFlush, Name: s.plainName(w)}}, nil); err != nil {
 		return 0, err

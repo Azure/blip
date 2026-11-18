@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/netpolicy"
 	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
 )
@@ -22,8 +23,15 @@ type logicalDetachClock struct {
 	sleeps int
 }
 
-func (c *logicalDetachClock) Now() time.Time        { return c.now }
-func (c *logicalDetachClock) Sleep(d time.Duration) { c.now = c.now.Add(d); c.sleeps++ }
+func (c *logicalDetachClock) Now() time.Time { return c.now }
+func (c *logicalDetachClock) Sleep(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.now = c.now.Add(d)
+	c.sleeps++
+	return nil
+}
 
 // simulatedCH models only the external API. addDisk/removeDisk/hasDisk are the
 // production operations, including all confirmation polls and ambiguous replies.
@@ -226,7 +234,7 @@ func TestMachineLostClaimAndMountRepliesResync(t *testing.T) {
 	}
 	// The guest claimed and mounted, but neither reply arrived. A deadline
 	// reconnects rather than reissuing potentially destructive operations.
-	s.clock.Sleep(controlResponseTimeout)
+	s.clock.Sleep(context.Background(), controlResponseTimeout)
 	s.settle()
 	s.take(EffectClose, 0)
 	connect := s.take(EffectConnect, 0)
@@ -257,7 +265,7 @@ func TestMachineLostUnmountReplyReaddAndStaleRemoval(t *testing.T) {
 	if !s.m.disks["data"].mounted {
 		t.Fatal("stale mount result completed unmount")
 	}
-	s.clock.Sleep(controlResponseTimeout)
+	s.clock.Sleep(context.Background(), controlResponseTimeout)
 	s.settle()
 	s.take(EffectClose, 0)
 	connect := s.take(EffectConnect, 0)
@@ -335,7 +343,7 @@ func TestMachineFreezeDetachReaddStop(t *testing.T) {
 	d.Stop = true
 	s.desired(d)
 	s.take(EffectSend, wire.TShutdown)
-	s.clock.Sleep(stopTimeout + time.Nanosecond)
+	s.clock.Sleep(context.Background(), stopTimeout+time.Nanosecond)
 	s.settle()
 	s.take(EffectKill, 0)
 	s.settle()
@@ -369,7 +377,7 @@ func TestMachineReaddAfterAmbiguousDetachMustConfirm(t *testing.T) {
 	if !s.m.disks["data"].detachPending {
 		t.Fatal("forgot uncertain removal")
 	}
-	s.clock.Sleep(retryInterval)
+	s.clock.Sleep(context.Background(), retryInterval)
 	s.settle()
 	retry := s.take(EffectRemoveDisk, 0)
 	s.none() // no Mount can race an eject that may still be taking effect
@@ -415,7 +423,7 @@ func TestMachineFreezeReplyLostReconnectAndGuestReboot(t *testing.T) {
 	d.Freeze = []string{"data"}
 	s.desired(d)
 	s.take(EffectSend, wire.TFreeze)
-	s.clock.Sleep(controlResponseTimeout)
+	s.clock.Sleep(context.Background(), controlResponseTimeout)
 	s.settle()
 	s.take(EffectClose, 0)
 	e := s.take(EffectConnect, 0)
@@ -438,10 +446,10 @@ func TestMachineFreezeReplyLostReconnectAndGuestReboot(t *testing.T) {
 func TestMachineNetworkCompletionRevisionAndUnsafe(t *testing.T) {
 	m := NewMachine(false)
 	now := time.Unix(100, 0)
-	d := podapi.Desired{Network: &network.Policy{Revision: "old"}, Claim: &podapi.Claim{Root: podapi.Disk{ID: "root"}}}
+	d := podapi.Desired{Network: &netpolicy.Policy{Revision: "old"}, Claim: &podapi.Claim{Root: podapi.Disk{ID: "root"}}}
 	m.Apply(now, Event{Kind: EventDesired, Desired: d})
 	e := m.Reconcile(now)[0]
-	d.Network = &network.Policy{Revision: "new"}
+	d.Network = &netpolicy.Policy{Revision: "new"}
 	m.Apply(now, Event{Kind: EventDesired, Desired: d})
 	m.Apply(now, Event{Kind: EventResult, Token: e.Token})
 	if m.networkReady || m.Observed().NetworkRevision != "" {
@@ -460,7 +468,7 @@ func TestMachineNetworkCompletionRevisionAndUnsafe(t *testing.T) {
 	d.Network = nil
 	m.Apply(now, Event{Kind: EventDesired, Desired: d})
 	revoke := m.Reconcile(now)[0]
-	d.Network = &network.Policy{Revision: "latest"}
+	d.Network = &netpolicy.Policy{Revision: "latest"}
 	m.Apply(now, Event{Kind: EventDesired, Desired: d})
 	// Even an obsolete policy completion must kill when the runner could not
 	// enforce its deny-all fallback.
@@ -557,10 +565,10 @@ func TestMachineClaimFailureAndBusyUnmountDeadlines(t *testing.T) {
 	s.take(EffectSend, wire.TClaim)
 	s.control(wire.TClaimResult, wire.Result{ID: "root", Error: "root not ready"})
 	s.none()
-	s.clock.Sleep(retryInterval - time.Nanosecond)
+	s.clock.Sleep(context.Background(), retryInterval-time.Nanosecond)
 	s.settle()
 	s.none()
-	s.clock.Sleep(time.Nanosecond)
+	s.clock.Sleep(context.Background(), time.Nanosecond)
 	s.settle()
 	s.take(EffectSend, wire.TClaim)
 	s.control(wire.TMountResult, wire.Result{ID: "data"})
@@ -570,13 +578,13 @@ func TestMachineClaimFailureAndBusyUnmountDeadlines(t *testing.T) {
 	s.take(EffectSend, wire.TUnmount)
 	s.control(wire.TUnmountResult, wire.Result{ID: "data", Error: "busy"})
 	s.none()
-	s.clock.Sleep(unmountRetryInterval - time.Nanosecond)
+	s.clock.Sleep(context.Background(), unmountRetryInterval-time.Nanosecond)
 	s.settle()
 	s.none()
 	if !s.vmm.disks["data"] {
 		t.Fatal("busy disk detached")
 	}
-	s.clock.Sleep(time.Nanosecond)
+	s.clock.Sleep(context.Background(), time.Nanosecond)
 	s.settle()
 	s.take(EffectSend, wire.TUnmount)
 }

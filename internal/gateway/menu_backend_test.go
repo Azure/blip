@@ -14,7 +14,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -27,16 +26,7 @@ import (
 
 func backendServer(t *testing.T, kube client.WithWatch) *Server {
 	t.Helper()
-	var uid atomic.Int32
-	kube = interceptor.NewClient(kube, interceptor.Funcs{
-		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			// The fake API does not allocate UIDs, unlike an API server.
-			if obj.GetUID() == "" {
-				obj.SetUID(types.UID(fmt.Sprintf("created-%d", uid.Add(1))))
-			}
-			return c.Create(ctx, obj, opts...)
-		},
-	})
+	kube = withUIDs(kube)
 	return &Server{
 		Config: Config{Namespace: ns, BaseState: "gateway-base", Pool: "small", StateSize: resource.MustParse("20Gi")},
 		Kube:   kube, Catalog: startCatalog(t, kube),
@@ -63,7 +53,7 @@ func TestMenuBackendCreate(t *testing.T) {
 	if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: e.ID}, &st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Spec.Image != "" || st.Spec.CopyFrom != s.BaseState || st.Spec.Size == nil || !st.Spec.Size.Equal(s.StateSize) || st.Labels[ownerLabel] != "alice" || len(st.OwnerReferences) != 0 {
+	if st.Spec.Image != "" || st.Spec.CopyFrom != s.BaseState || st.Spec.Size == nil || !st.Spec.Size.Equal(s.StateSize) || st.Labels[v1alpha1.LabelOwner] != "alice" || len(st.OwnerReferences) != 0 {
 		t.Fatalf("created state = %#v", st)
 	}
 	if err := s.Kube.Get(ctx, client.ObjectKeyFromObject(&st), &v1alpha1.Blip{}); !apierrors.IsNotFound(err) {
@@ -120,7 +110,7 @@ func TestForkStateCopiesWorkspace(t *testing.T) {
 			if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: root.Spec.Mounts[0].State}, &child); err != nil {
 				t.Fatal(err)
 			}
-			if child.Spec.CopyFrom != data.Name || child.Labels[ownerLabel] != "alice" || len(child.OwnerReferences) != 0 {
+			if child.Spec.CopyFrom != data.Name || child.Labels[v1alpha1.LabelOwner] != "alice" || len(child.OwnerReferences) != 0 {
 				t.Fatalf("writable mount was not copied independently: %#v", child)
 			}
 			var liveSource v1alpha1.BlipState
@@ -139,7 +129,7 @@ func TestMenuBackendImportedAndSharedStatesCannotRun(t *testing.T) {
 		t.Run("owner="+owner, func(t *testing.T) {
 			st := gatewayBase()
 			if owner != "" {
-				st.Labels = map[string]string{ownerLabel: owner}
+				st.Labels = map[string]string{v1alpha1.LabelOwner: owner}
 				st.Name = owner + ".base"
 			}
 			s := backendServer(t, catalogClient(t, st))
@@ -232,7 +222,7 @@ func TestMenuBackendRejectsStaleUIDAndChangedOwnership(t *testing.T) {
 			case "uid":
 				st.UID = "replacement"
 			case "owner":
-				st.Labels[ownerLabel] = "bob"
+				st.Labels[v1alpha1.LabelOwner] = "bob"
 			case "missing-uid":
 				entry.UID = ""
 			}
@@ -263,7 +253,7 @@ func TestMenuBackendDeleteRechecksWorkerOwner(t *testing.T) {
 				if err := c.Get(ctx, key, &live); err != nil {
 					return err
 				}
-				live.Labels[ownerLabel] = "bob"
+				live.Labels[v1alpha1.LabelOwner] = "bob"
 				if err := c.Update(ctx, &live); err != nil {
 					return err
 				}

@@ -469,7 +469,7 @@ func TestPrivilegedRestart(t *testing.T) {
 	if _, err := s.begin(crash, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.createThin(crash.Thin); err != nil {
+	if err := s.runOperation([]deviceEffect{{Kind: eCreateThin, Name: s.poolName(), Thin: crash.Thin}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := dmCreate(s.thinName(crash), thinTable(s.poolName(), crash.Thin, crash.Size), false); err != nil {

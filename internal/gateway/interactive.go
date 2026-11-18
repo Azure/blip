@@ -148,15 +148,11 @@ func terminalType(env []string) string {
 }
 
 func (c *sessionChannel) relayInteractive(ctx context.Context, input *channelInput, sess *session.Session, o wire.Open) string {
-	c.mu.Lock()
-	c.sess = sess
-	if c.closing || ctx.Err() != nil {
-		c.mu.Unlock()
+	if !c.adopt(sess) {
 		c.hangup()
 		sess.Close()
 		return ""
 	}
-	c.mu.Unlock()
 	stopResize := c.resizeGuest(ctx, sess, o)
 	reader := input.reader()
 	done := make(chan struct{})

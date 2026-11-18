@@ -57,14 +57,20 @@ func validateGatewayAddress(address string) error {
 func validGatewayHost(host string) bool {
 	// SplitHostPort removes the brackets of an IPv6 literal but leaves any
 	// zone, which ParseIP rejects below.
-	if host == "" || strings.ContainsAny(host, "/\\@?#[] \t\r\n") {
-		return false
-	}
 	if strings.Contains(host, ":") {
 		return net.ParseIP(host) != nil
 	}
-	name := strings.TrimSuffix(strings.ToLower(host), ".")
-	return name != "" && len(validation.IsDNS1123Subdomain(name)) == 0
+	return validDNSName(host)
+}
+
+// validDNSName reports whether name is a DNS name with an optional trailing
+// dot and no scheme, port, path, or whitespace.
+func validDNSName(name string) bool {
+	if strings.ContainsAny(name, "/\\@?#[] \t\r\n") {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(name), ".")
+	return host != "" && len(validation.IsDNS1123Subdomain(host)) == 0
 }
 
 func validGatewayPort(port string) bool {
@@ -91,11 +97,7 @@ func validateGatewayServerName(name string) error {
 	if net.ParseIP(name) != nil {
 		return nil
 	}
-	host := strings.TrimSuffix(name, ".")
-	if host == "" || strings.ContainsAny(name, "/\\@?#[] \t\r\n") {
-		return errors.New("must be a DNS name or IP address without a scheme, port, or path")
-	}
-	if len(validation.IsDNS1123Subdomain(strings.ToLower(host))) != 0 {
+	if !validDNSName(name) {
 		return errors.New("must be a DNS name or IP address without a scheme, port, or path")
 	}
 	return nil

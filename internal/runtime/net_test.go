@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/netpolicy"
 )
 
 func testPodNet(run commandRunner) *podNet {
@@ -39,12 +39,9 @@ func TestPrivateLinkAvoidsRoutes(t *testing.T) {
 }
 
 func TestPolicyValidation(t *testing.T) {
-	valid := network.Rule{CIDR: "10.0.0.0/8", Except: []string{"10.2.0.0/16"}, Protocol: "TCP", Port: 80, EndPort: 90}
+	valid := netpolicy.Rule{CIDR: "10.0.0.0/8", Except: []string{"10.2.0.0/16"}, Protocol: "TCP", Port: 80, EndPort: 90}
 	for _, reverse := range []bool{false, true} {
-		match, err := ruleMatch(valid, reverse)
-		if err != nil {
-			t.Fatal(err)
-		}
+		match := ruleMatch(valid, reverse)
 		want := "tcp dport 80-90"
 		if reverse {
 			want = "tcp sport 80-90"
@@ -53,7 +50,7 @@ func TestPolicyValidation(t *testing.T) {
 			t.Fatalf("match %q", match)
 		}
 	}
-	for _, rule := range []network.Rule{
+	for _, rule := range []netpolicy.Rule{
 		{CIDR: "::/0"}, {CIDR: "10.0.0.1"}, {CIDR: "0.0.0.0/0; accept"},
 		{CIDR: "10.0.0.0/8", Except: []string{"11.0.0.0/8"}},
 		{CIDR: "10.0.0.0/8", Except: []string{"0.0.0.0/0"}},
@@ -67,11 +64,11 @@ func TestPolicyValidation(t *testing.T) {
 		{CIDR: "0.0.0.0/0", Protocol: "UDP", EndPort: 53},
 		{CIDR: "0.0.0.0/0", Protocol: "TCP", Port: 90, EndPort: 80},
 	} {
-		if _, err := ruleMatch(rule, false); err == nil {
+		if err := rule.Validate(); err == nil {
 			t.Errorf("accepted invalid rule %+v", rule)
 		}
 	}
-	if _, err := testPodNet(nil).policyScript(&network.Policy{}, true); err == nil {
+	if _, err := testPodNet(nil).policyScript(&netpolicy.Policy{}, true); err == nil {
 		t.Fatal("accepted empty revision")
 	}
 }
@@ -86,8 +83,8 @@ func TestApplyInvalidPolicyRevokesAndNftFailureDisablesTap(t *testing.T) {
 		}
 		return nil, nil
 	})
-	invalid := &network.Policy{Revision: "bad", Layers: [][]network.Rule{{{CIDR: "garbage"}}}}
-	if err := p.apply(invalid, true); err == nil {
+	invalid := &netpolicy.Policy{Revision: "bad", Layers: [][]netpolicy.Rule{{{CIDR: "garbage"}}}}
+	if _, err := p.apply(invalid, true); err == nil {
 		t.Fatal("invalid policy applied")
 	}
 	if len(calls) != 1 || !strings.Contains(calls[0], "chain egress {\n  counter drop") || strings.Contains(calls[0], "jump egress\n") {
@@ -95,18 +92,18 @@ func TestApplyInvalidPolicyRevokesAndNftFailureDisablesTap(t *testing.T) {
 	}
 	nftFails = true
 	calls = nil
-	if err := p.apply(&network.Policy{Revision: "deny"}, true); err == nil {
+	if _, err := p.apply(&netpolicy.Policy{Revision: "deny"}, true); err == nil {
 		t.Fatal("nft failure ignored")
 	}
 	if !p.disabled || p.unsafe || len(calls) != 3 || !strings.Contains(calls[2], "ip link set blip-tap0 down") {
 		t.Fatalf("TAP not safely disabled: %+v %v", p, calls)
 	}
 	nftFails = false
-	if err := p.apply(&network.Policy{Revision: "recovered"}, true); err != nil || p.disabled {
+	if unsafe, err := p.apply(&netpolicy.Policy{Revision: "recovered"}, true); err != nil || unsafe || p.disabled {
 		t.Fatalf("failed to recover: %v", err)
 	}
 	nftFails, ipFails = true, true
-	if err := p.apply(invalid, true); err == nil || !p.unsafe {
+	if unsafe, err := p.apply(invalid, true); err == nil || !unsafe || !p.unsafe {
 		t.Fatal("uncontainable failure not reported")
 	}
 }

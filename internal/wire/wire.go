@@ -150,8 +150,18 @@ type Status struct {
 	Sessions int `json:"sessions"`
 }
 
-// ReasonStopped marks a session ended because the VM is shutting down.
-const ReasonStopped = "Stopped"
+// Exit reasons shared by the guest, the runtime, and their clients. The
+// controller compares the same strings when it interprets Blip status.
+const (
+	// ReasonCompleted marks a primary command that finished on its own.
+	ReasonCompleted = "Completed"
+	// ReasonIdle marks an interactive VM shut down for inactivity.
+	ReasonIdle = "Idle"
+	// ReasonStopped marks a session ended because the VM is shutting down.
+	ReasonStopped = "Stopped"
+	// ReasonGuestCrashed marks a VM that exited without a shutdown request.
+	ReasonGuestCrashed = "GuestCrashed"
+)
 
 type Exit struct {
 	Code   int    `json:"code"`

@@ -17,10 +17,10 @@ import (
 )
 
 const (
-	// RootDir is where the claimed root filesystem is mounted.
-	RootDir = "/mnt/root"
-	// WorkCgroup holds every workload process.
-	WorkCgroup = "/sys/fs/cgroup/work"
+	// rootDir is where the claimed root filesystem is mounted.
+	rootDir = "/mnt/root"
+	// workCgroup holds every workload process.
+	workCgroup = "/sys/fs/cgroup/work"
 	// stopGrace is how long processes get between SIGTERM and cgroup.kill.
 	stopGrace = 10 * time.Second
 	// exitAttachTimeout bounds how long a finished primary keeps its replay
@@ -120,17 +120,17 @@ func Main() {
 			powerOff()
 		}
 	}
-	g := newGuest(RootDir, WorkCgroup)
+	g := newGuest(rootDir, workCgroup)
 	g.kubeNamespace = cfg.KubeNamespace
 	if cfg.KubeNamespace != "" {
-		g.api, err = startAPIForwarder(8001, dialHostAPI)
+		g.api, err = startForwarder("Kubernetes API", 8001, dialHost(wire.APIPort))
 		if err != nil {
 			log.Printf("listen Kubernetes API: %v", err)
 			powerOff()
 		}
 	}
 	if cfg.GatewayLoopbackPort > 0 {
-		g.gateway, err = startGatewayForwarder(cfg.GatewayLoopbackPort, dialHostGateway)
+		g.gateway, err = startForwarder("gateway", cfg.GatewayLoopbackPort, dialHost(wire.GatewayPort))
 		if err != nil {
 			log.Printf("listen gateway: %v", err)
 			powerOff()
@@ -153,7 +153,7 @@ func Main() {
 	powerOff()
 }
 
-func (g *Guest) accept(lfd int, serve func(*os.File)) {
+func (g *Guest) accept(lfd int, serve func(io.ReadWriteCloser)) {
 	for {
 		f, err := acceptVsock(lfd)
 		if err != nil {
@@ -179,11 +179,7 @@ func (g *Guest) helloLocked() wire.Hello {
 
 // serveControl serves the runtime. A new connection replaces the previous
 // one; Hello tells the runtime the current state.
-func (g *Guest) serveControl(f *os.File) {
-	g.serveControlStream(f)
-}
-
-func (g *Guest) serveControlStream(f io.ReadWriteCloser) {
+func (g *Guest) serveControl(f io.ReadWriteCloser) {
 	c := &controlConn{Conn: wire.NewConn(f), stream: f}
 	gone := make(chan struct{})
 	// Reserve the first output slot before publishing c so asynchronous
@@ -508,7 +504,7 @@ func (g *Guest) sessionExited(s *session) {
 	}
 	waitForClient := g.claim != nil && g.claim.WaitForClient
 	st := s.status
-	st.Reason = "Completed"
+	st.Reason = wire.ReasonCompleted
 	if st.Code != 0 || st.Signal != "" {
 		st.Output = s.tail(exitOutputMax)
 	}
@@ -560,7 +556,7 @@ func (g *Guest) idleLoop() {
 			g.mu.Unlock()
 			continue
 		}
-		g.exit = &wire.Exit{Reason: "Idle"}
+		g.exit = &wire.Exit{Reason: wire.ReasonIdle}
 		ex := *g.exit
 		g.mu.Unlock()
 		log.Printf("idle for %ds; shutting down", c.IdleTimeoutSeconds)

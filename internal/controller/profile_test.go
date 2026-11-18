@@ -347,10 +347,10 @@ func TestInheritedMountOwnership(t *testing.T) {
 			e.ownedState("alice.home", "alice")
 			st := e.readyState(tt.state, "n1")
 			st.Spec.Image = tt.image
-			st.Labels = map[string]string{LabelOwner: tt.owner}
+			st.Labels = map[string]string{v1.LabelOwner: tt.owner}
 			e.must(e.c.Update(e.ctx, st))
 			e.newBlip("alice.dev", withRoot("alice.home"), e.withMount(tt.state, "/data", tt.writable), func(b *v1.Blip) {
-				b.Labels = map[string]string{LabelOwner: "alice"}
+				b.Labels = map[string]string{v1.LabelOwner: "alice"}
 			})
 			e.run(e.blip, ns, "alice.dev")
 			b := e.getBlip("alice.dev")
@@ -385,11 +385,11 @@ func TestCopyValidatesActualSharedSource(t *testing.T) {
 			e.addNodes("n1")
 			st := e.readyState(tt.source, "n1")
 			st.Spec.Image = tt.image
-			st.Labels = map[string]string{LabelOwner: tt.owner}
+			st.Labels = map[string]string{v1.LabelOwner: tt.owner}
 			e.must(e.c.Update(e.ctx, st))
 			e.newState("alice.copy", func(st *v1.BlipState) {
 				st.Spec.CopyFrom = tt.source
-				st.Labels = map[string]string{LabelOwner: "alice"}
+				st.Labels = map[string]string{v1.LabelOwner: "alice"}
 			})
 			e.run(e.state, ns, "alice.copy")
 			copy := e.getState("alice.copy")
@@ -447,8 +447,8 @@ func TestTemporaryMountCleanupPrunesCountersAtomically(t *testing.T) {
 		{State: "adopted", Path: "/adopted"},
 	}
 	root.Annotations = map[string]string{
-		"unrelated":             "keep",
-		collectMountsAnnotation: `{"active":{"blipUID":"uid-active","path":"/active","token":"live","users":2},"stale":{"blipUID":"gone","path":"/stale","token":"old","users":1},"adopted":{"blipUID":"gone","path":"/adopted","token":"old","users":1},"removed":{"blipUID":"gone","path":"/removed","token":"old","users":1}}`,
+		"unrelated":                "keep",
+		v1.AnnotationCollectMounts: `{"active":{"blipUID":"uid-active","path":"/active","token":"live","users":2},"stale":{"blipUID":"gone","path":"/stale","token":"old","users":1},"adopted":{"blipUID":"gone","path":"/adopted","token":"old","users":1},"removed":{"blipUID":"gone","path":"/removed","token":"old","users":1}}`,
 	}
 	e.must(e.c.Update(e.ctx, root))
 	e.run(e.state, ns, "home")
@@ -457,9 +457,9 @@ func TestTemporaryMountCleanupPrunesCountersAtomically(t *testing.T) {
 		t.Fatalf("cleanup changed durable intent: %+v", root)
 	}
 	var users map[string]json.RawMessage
-	e.must(json.Unmarshal([]byte(root.Annotations[collectMountsAnnotation]), &users))
+	e.must(json.Unmarshal([]byte(root.Annotations[v1.AnnotationCollectMounts]), &users))
 	if len(users) != 1 || !strings.Contains(string(users["active"]), `"users":2`) || !strings.Contains(string(users["active"]), `"token":"live"`) {
-		t.Fatalf("stale counters retained or active counters lost: %s", root.Annotations[collectMountsAnnotation])
+		t.Fatalf("stale counters retained or active counters lost: %s", root.Annotations[v1.AnnotationCollectMounts])
 	}
 	// Adopting the last temporary mount cleans its counters on the next
 	// reconcile even though the root no longer has any temporary references.
@@ -467,7 +467,7 @@ func TestTemporaryMountCleanupPrunesCountersAtomically(t *testing.T) {
 	e.must(e.c.Update(e.ctx, root))
 	e.run(e.state, ns, "home")
 	root = e.getState("home")
-	if _, ok := root.Annotations[collectMountsAnnotation]; ok {
+	if _, ok := root.Annotations[v1.AnnotationCollectMounts]; ok {
 		t.Fatalf("adopted mount kept stale counters: %v", root.Annotations)
 	}
 }
@@ -478,7 +478,7 @@ func TestTemporaryCleanupDoesNotOverwriteConcurrentAdoption(t *testing.T) {
 	e.readyState("home", "n1")
 	root := e.getState("home")
 	root.Spec.Mounts = []v1.Mount{{State: "data", Path: "/data", BlipUID: "gone"}}
-	root.Annotations = map[string]string{collectMountsAnnotation: `{"data":{"blipUID":"gone","path":"/data","token":"old","users":1}}`}
+	root.Annotations = map[string]string{v1.AnnotationCollectMounts: `{"data":{"blipUID":"gone","path":"/data","token":"old","users":1}}`}
 	e.must(e.c.Update(e.ctx, root))
 	adopted := false
 	c := interceptor.NewClient(e.c.(client.WithWatch), interceptor.Funcs{
@@ -498,7 +498,7 @@ func TestTemporaryCleanupDoesNotOverwriteConcurrentAdoption(t *testing.T) {
 	root = e.getState("home")
 	e.must(pruneTemporaryMounts(e.ctx, c, e.c, root))
 	root = e.getState("home")
-	if len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0].BlipUID != "" || root.Annotations[collectMountsAnnotation] != "" {
+	if len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0].BlipUID != "" || root.Annotations[v1.AnnotationCollectMounts] != "" {
 		t.Fatalf("adopted mount or counter cleanup lost on retry: %+v", root)
 	}
 }
@@ -512,7 +512,7 @@ func TestSharedReadOnlyMountRevalidatesAttachedUID(t *testing.T) {
 	base.Spec.Image = "reg/img:v1"
 	e.must(e.c.Update(e.ctx, base))
 	e.newBlip("alice.dev", withRoot("alice.home"), e.withMount("base", "/base", false), func(b *v1.Blip) {
-		b.Labels = map[string]string{LabelOwner: "alice"}
+		b.Labels = map[string]string{v1.LabelOwner: "alice"}
 	})
 	e.run(e.pool, ns, "default")
 	e.warmOn("n1")
@@ -527,7 +527,7 @@ func TestSharedReadOnlyMountRevalidatesAttachedUID(t *testing.T) {
 				if reads > 1 {
 					st.UID = "private-replacement"
 					st.Spec.Image = ""
-					st.Labels = map[string]string{LabelOwner: "bob"}
+					st.Labels = map[string]string{v1.LabelOwner: "bob"}
 				}
 			}
 			return nil
@@ -544,7 +544,7 @@ func TestSharedReadOnlyMountRevalidatesAttachedUID(t *testing.T) {
 func (e *env) ownedState(name, owner string) *v1.BlipState {
 	e.t.Helper()
 	st := e.readyState(name, "n1")
-	st.Labels = map[string]string{LabelOwner: owner}
+	st.Labels = map[string]string{v1.LabelOwner: owner}
 	e.must(e.c.Update(e.ctx, st))
 	return st
 }
@@ -558,7 +558,7 @@ func TestSharedLiveMountRevalidatesAttachedUID(t *testing.T) {
 	base.Spec.Image = "reg/img:v1"
 	e.must(e.c.Update(e.ctx, base))
 	b := e.startBlip("alice.dev", "n1", withRoot("alice.home"), func(b *v1.Blip) {
-		b.Labels = map[string]string{LabelOwner: "alice"}
+		b.Labels = map[string]string{v1.LabelOwner: "alice"}
 	})
 	e.run(e.blip, ns, b.Name)
 	gen := e.getBlip(b.Name).Status.StateGeneration
@@ -574,7 +574,7 @@ func TestSharedLiveMountRevalidatesAttachedUID(t *testing.T) {
 				if reads > 1 {
 					st.UID = "private-replacement"
 					st.Spec.Image = ""
-					st.Labels = map[string]string{LabelOwner: "bob"}
+					st.Labels = map[string]string{v1.LabelOwner: "bob"}
 				}
 			}
 			return nil
@@ -593,19 +593,19 @@ func TestLiveRootOwnershipCheckedBeforeProfileCleanup(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.ownedState("alice.home", "alice")
 	b := e.startBlip("alice.dev", "n1", withRoot("alice.home"), func(b *v1.Blip) {
-		b.Labels = map[string]string{LabelOwner: "alice"}
+		b.Labels = map[string]string{v1.LabelOwner: "alice"}
 	})
 	e.run(e.blip, ns, b.Name)
 	gen := e.getBlip(b.Name).Status.StateGeneration
 	root := e.getState(b.Spec.State)
-	root.Labels[LabelOwner] = "bob"
+	root.Labels[v1.LabelOwner] = "bob"
 	root.Spec.Mounts = []v1.Mount{{State: "missing", Path: "/collect", BlipUID: "gone"}}
-	root.Annotations = map[string]string{collectMountsAnnotation: `{"missing":{"blipUID":"gone","path":"/collect","users":1}}`}
+	root.Annotations = map[string]string{v1.AnnotationCollectMounts: `{"missing":{"blipUID":"gone","path":"/collect","users":1}}`}
 	e.must(e.c.Update(e.ctx, root))
 	e.run(e.blip, ns, b.Name)
 	b = e.getBlip(b.Name)
 	expectPhase(t, b, v1.BlipRunning, ReasonInvalidSpec)
-	if b.Status.StateGeneration != gen || len(e.getState(root.Name).Spec.Mounts) != 1 || e.getState(root.Name).Annotations[collectMountsAnnotation] == "" {
+	if b.Status.StateGeneration != gen || len(e.getState(root.Name).Spec.Mounts) != 1 || e.getState(root.Name).Annotations[v1.AnnotationCollectMounts] == "" {
 		t.Fatalf("foreign root profile was applied or pruned: %+v", b.Status)
 	}
 }

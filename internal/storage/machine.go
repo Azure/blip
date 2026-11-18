@@ -200,10 +200,6 @@ func reloadPlan(name, table string, ro bool) []deviceEffect {
 	}
 }
 
-func (s *Store) deviceReload(name, table string, ro bool) error {
-	return s.runOperation(reloadPlan(name, table, ro), nil)
-}
-
 // layout is the immutable input to the pure volume planners.
 type layout struct {
 	pool, thin, top, plain, meta, fetch, crypt string

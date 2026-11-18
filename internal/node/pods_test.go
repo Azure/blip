@@ -23,13 +23,13 @@ func TestWarmLabelAndObservedAnnotation(t *testing.T) {
 	v.pods[pkey("p1")] = vmPod("p1", "")
 	v.dirs[pkey("p1")] = dir(podapi.PhaseWarm)
 	claimed := vmPod("p2", "blipuid-x")
-	claimed.Labels[LabelWarm] = "true"
+	claimed.Labels[v1alpha1.LabelWarm] = "true"
 	v.pods[pkey("p2")] = claimed
 	v.dirs[pkey("p2")] = dir(podapi.PhaseWarm)
 	same := vmPod("p3", "")
-	same.Labels[LabelWarm] = "true"
+	same.Labels[v1alpha1.LabelWarm] = "true"
 	data, _ := json.Marshal(podapi.Observed{Phase: podapi.PhaseWarm})
-	same.Annotations = map[string]string{AnnotationObserved: string(data)}
+	same.Annotations = map[string]string{v1alpha1.AnnotationObserved: string(data)}
 	v.pods[pkey("p3")] = same
 	v.dirs[pkey("p3")] = dir(podapi.PhaseWarm)
 

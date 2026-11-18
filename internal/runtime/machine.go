@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/netpolicy"
 	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
 )
@@ -81,7 +81,7 @@ type Effect struct {
 	Root, ClaimMount bool
 	Type             wire.Type
 	Payload          json.RawMessage
-	Policy           *network.Policy
+	Policy           *netpolicy.Policy
 	Active           bool
 	Key              string
 }
@@ -170,9 +170,9 @@ func (m *Machine) Apply(now time.Time, ev Event) []Effect {
 		m.resetFreeze()
 		if m.exit == nil {
 			if m.stopRequested() {
-				m.exit = &podapi.Exit{Reason: "Stopped"}
+				m.exit = &podapi.Exit{Reason: wire.ReasonStopped}
 			} else {
-				m.exit = &podapi.Exit{Code: 255, Reason: "GuestCrashed"}
+				m.exit = &podapi.Exit{Code: 255, Reason: wire.ReasonGuestCrashed}
 				if m.errMsg == "" {
 					m.errMsg = fmt.Sprintf("VM exited unexpectedly (cloud-hypervisor: %s)", ev.Error)
 				}
@@ -543,7 +543,7 @@ func (m *Machine) Reconcile(now time.Time) []Effect {
 
 func (m *Machine) policyKey() string {
 	data, _ := json.Marshal(struct {
-		Policy *network.Policy
+		Policy *netpolicy.Policy
 		Active bool
 	}{m.desired.Network, m.desired.Claim != nil})
 	return string(data)

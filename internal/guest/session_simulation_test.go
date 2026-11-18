@@ -48,7 +48,7 @@ func lifecycleConnector(t *testing.T, g *Guest) sessionclient.Connector {
 	return func(context.Context, string, string) (io.ReadWriteCloser, error) {
 		host, guest := net.Pipe()
 		t.Cleanup(func() { host.Close() })
-		go g.serveSessionStream(guest)
+		go g.serveSession(guest)
 		return host, nil
 	}
 }
@@ -80,9 +80,9 @@ func TestSessionLostOpenAckFaults(t *testing.T) {
 					t.Cleanup(func() { host.Close() })
 					attempt++
 					if attempt == 1 {
-						go g.serveSessionStream(cutOpenReply{guest, keep})
+						go g.serveSession(cutOpenReply{guest, keep})
 					} else {
-						go g.serveSessionStream(guest)
+						go g.serveSession(guest)
 					}
 					return host, nil
 				}}
@@ -101,8 +101,13 @@ func TestSessionLostOpenAckFaults(t *testing.T) {
 				if retry.Opened.Session != s.id || len(*waits) != 1 || s.clients != 1 {
 					t.Fatalf("retry duplicated or leaked session: id=%s starts=%d clients=%d", retry.Opened.Session, len(*waits), s.clients)
 				}
-				list, err := c.List(context.Background(), "ns", "pod")
-				if err != nil || len(list) != 1 || list[0].ID != s.id || list[0].Clients != 1 {
+				listSession, err := c.Open(context.Background(), "ns", "pod", wire.Open{Mode: wire.OpenList})
+				if err != nil {
+					t.Fatal(err)
+				}
+				list := listSession.Opened.Sessions
+				listSession.Close()
+				if len(list) != 1 || list[0].ID != s.id || list[0].Clients != 1 {
 					t.Fatalf("list after reconnect: %+v %v", list, err)
 				}
 				(*waits)[0] <- unix.WaitStatus(7 << 8)
@@ -132,7 +137,7 @@ func TestSessionExitDuringBackpressuredOpenAck(t *testing.T) {
 		g, waits := lifecycleGuest(t)
 		host, guest := net.Pipe()
 		defer host.Close()
-		go g.serveSessionStream(guest)
+		go g.serveSession(guest)
 		c := wire.NewConn(host)
 		if err := c.WriteJSON(wire.TOpen, wire.Open{Mode: wire.OpenExec, OpenID: "fast"}); err != nil {
 			t.Fatal(err)
@@ -359,7 +364,7 @@ func TestSessionMalformedOpensDoNotStartProcesses(t *testing.T) {
 				g, waits := lifecycleGuest(t)
 				host, guest := net.Pipe()
 				defer host.Close()
-				go g.serveSessionStream(guest)
+				go g.serveSession(guest)
 				c := wire.NewConn(host)
 				if err := c.Write(tc.typ, tc.payload); err != nil {
 					t.Fatal(err)

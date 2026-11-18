@@ -1,8 +1,8 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
-	"encoding/binary"
 	"io"
 	"log/slog"
 	"sync"
@@ -24,15 +24,13 @@ type captureEOFConn struct {
 func (captureEOFConn) Read([]byte) (int, error) { return 0, io.EOF }
 
 func (c captureEOFConn) Write(p []byte) (int, error) {
-	if len(p) >= 5 && wire.Type(p[0]) == wire.TOpen {
-		n := int(binary.BigEndian.Uint32(p[1:5]))
-		if 5+n <= len(p) {
-			var o wire.Open
-			if wire.Decode(p[5:5+n], &o) == nil {
-				select {
-				case c.opens <- o:
-				default:
-				}
+	t, payload, err := wire.NewConn(bytes.NewBuffer(p)).Read()
+	if err == nil && t == wire.TOpen {
+		var o wire.Open
+		if wire.Decode(payload, &o) == nil {
+			select {
+			case c.opens <- o:
+			default:
 			}
 		}
 	}

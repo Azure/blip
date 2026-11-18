@@ -45,8 +45,11 @@ const (
 	ReasonPodLost       = "PodLost"
 	ReasonRuntimeFailed = "RuntimeFailed"
 	ReasonSaveFailed    = "SaveFailed"
-	exitAnnotationGrace = 30 * time.Second
 )
+
+// exitAnnotationGrace lets a pod that reported Succeeded still publish its
+// final observation before the controller treats the exit as pod loss.
+const exitAnnotationGrace = 30 * time.Second
 
 // reasonStateDeleting is an internal state condition: usableState returns it
 // when a referenced state is terminating. Unlike a plain missing state (which
@@ -56,10 +59,6 @@ const (
 const reasonStateDeleting = "StateDeleting"
 
 const (
-	// AnnotationPrepareError is set by the node agent when it cannot
-	// prepare a claimed pod's disks. Some errors are transient, so it is
-	// surfaced immediately but only fails the Blip after startTimeout.
-	AnnotationPrepareError = "blip.dev/prepare-error"
 	// startTimeout bounds how long a claimed Blip may stay Starting.
 	startTimeout = 10 * time.Minute
 	// pendingTimeout bounds how long a Blip may wait for a VM before it is
@@ -99,17 +98,17 @@ func (r *BlipReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *BlipReconciler) podBlips(ctx context.Context, o client.Object) []reconcile.Request {
 	p := o.(*corev1.Pod)
 	if !isVacant(p) {
-		if name := p.Annotations[AnnotationBlip]; name != "" {
+		if name := p.Annotations[v1.AnnotationBlip]; name != "" {
 			return []reconcile.Request{req(p.Namespace, name)}
 		}
 		return nil
 	}
 	// A pinned pod the scheduler cannot place ends the local wait of the
 	// Blips it was booted for.
-	if !ready(p) && !(p.Annotations[AnnotationPinnedNode] != "" && unschedulable(p)) {
+	if !ready(p) && !(p.Annotations[v1.AnnotationPinnedNode] != "" && unschedulable(p)) {
 		return nil
 	}
-	return r.blipsBy(ctx, p.Namespace, indexPool, p.Labels[LabelPool], true)
+	return r.blipsBy(ctx, p.Namespace, indexPool, p.Labels[v1.LabelPool], true)
 }
 
 func (r *BlipReconciler) blipsBy(ctx context.Context, ns, field, value string, waiting bool) []reconcile.Request {
@@ -119,7 +118,7 @@ func (r *BlipReconciler) blipsBy(ctx context.Context, ns, field, value string, w
 	}
 	var out []reconcile.Request
 	for _, b := range blips.Items {
-		if !waiting || b.Status.Pod == "" && !finished(&b) {
+		if !waiting || b.Status.Pod == "" && !v1.Finished(&b) {
 			out = append(out, req(b.Namespace, b.Name))
 		}
 	}
@@ -155,12 +154,12 @@ func (r *BlipReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	if err := r.releaseUnpublished(ctx, b); err != nil {
 		return reconcile.Result{}, err
 	}
-	if finished(b) {
+	if v1.Finished(b) {
 		return reconcile.Result{}, r.cleanup(ctx, b)
 	}
-	if b.DeletionTimestamp == nil && !controllerutil.ContainsFinalizer(b, Finalizer) {
+	if b.DeletionTimestamp == nil && !controllerutil.ContainsFinalizer(b, v1.Finalizer) {
 		base := b.DeepCopy()
-		controllerutil.AddFinalizer(b, Finalizer)
+		controllerutil.AddFinalizer(b, v1.Finalizer)
 		if err := patchObject(ctx, r.Client, b, base); err != nil {
 			return reconcile.Result{}, err
 		}
@@ -189,7 +188,7 @@ func (r *BlipReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	if err := r.flush(ctx, b, base); err != nil {
 		return reconcile.Result{}, err
 	}
-	if finished(b) {
+	if v1.Finished(b) {
 		return reconcile.Result{}, r.cleanup(ctx, b)
 	}
 	return result, nil
@@ -221,9 +220,9 @@ func (r *BlipReconciler) cleanup(ctx context.Context, b *v1.Blip) error {
 	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 		return err
 	}
-	if b.DeletionTimestamp != nil && controllerutil.ContainsFinalizer(b, Finalizer) {
+	if b.DeletionTimestamp != nil && controllerutil.ContainsFinalizer(b, v1.Finalizer) {
 		base := b.DeepCopy()
-		controllerutil.RemoveFinalizer(b, Finalizer)
+		controllerutil.RemoveFinalizer(b, v1.Finalizer)
 		return client.IgnoreNotFound(patchObject(ctx, r.Client, b, base))
 	}
 	return nil
@@ -265,30 +264,35 @@ func (r *BlipReconciler) startDeadline(b *v1.Blip) (time.Time, bool) {
 
 // pending acquires the Blip's states and claims a warm pod.
 func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconcile.Result, error) {
-	claimed, err := r.claimedPod(ctx, r.Client, b)
+	claimed, err := claimedPod(ctx, r.Client, b)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 	if claimed != nil {
 		return reconcile.Result{}, r.startRunning(ctx, b, claimed)
 	}
-	if stopping(b) {
+	finish := func(phase, reason, msg string) (reconcile.Result, error) {
 		if err := r.unclaim(ctx, b); err != nil {
 			return reconcile.Result{}, err
 		}
+		r.finish(b, phase, reason, msg)
+		return reconcile.Result{}, nil
+	}
+	fail := func(reason, msg string) (reconcile.Result, error) {
+		if reason == reasonStateDeleting {
+			reason = ReasonStateNotFound
+		}
+		return finish(v1.BlipFailed, reason, msg)
+	}
+	if stopping(b) {
 		phase := v1.BlipFailed
 		if interactive(b) {
 			phase = v1.BlipSucceeded
 		}
-		r.finish(b, phase, ReasonStopped, "stopped before start")
-		return reconcile.Result{}, nil
+		return finish(phase, ReasonStopped, "stopped before start")
 	}
 	if b.Spec.State == "" {
-		if err := r.unclaim(ctx, b); err != nil {
-			return reconcile.Result{}, err
-		}
-		r.finish(b, v1.BlipFailed, ReasonInvalidSpec, "state is required")
-		return reconcile.Result{}, nil
+		return fail(ReasonInvalidSpec, "state is required")
 	}
 	if since := b.CreationTimestamp.Time; !since.IsZero() && r.now().Sub(since) > pendingTimeout {
 		r.finish(b, v1.BlipFailed, ReasonStartTimeout, "timed out waiting for a VM")
@@ -307,17 +311,15 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		return reconcile.Result{}, err
 	}
 	if reason != "" {
+		if reason == ReasonInvalidSpec || reason == reasonStateDeleting {
+			res, err := fail(reason, msg)
+			res.RequeueAfter = retryAfter
+			return res, err
+		}
 		if err := r.unclaim(ctx, b); err != nil {
 			return reconcile.Result{}, err
 		}
-		if reason == ReasonInvalidSpec || reason == reasonStateDeleting {
-			if reason == reasonStateDeleting {
-				reason = ReasonStateNotFound
-			}
-			r.finish(b, v1.BlipFailed, reason, msg)
-		} else {
-			wait(b, reason, msg)
-		}
+		wait(b, reason, msg)
 		return reconcile.Result{RequeueAfter: retryAfter}, nil
 	}
 
@@ -337,8 +339,7 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 			return reconcile.Result{}, err
 		}
 		if reason == ReasonStateFailed {
-			r.finish(b, v1.BlipFailed, reason, msg)
-			return reconcile.Result{}, r.unclaim(ctx, b)
+			return fail(reason, msg)
 		}
 		if reason == reasonStateDeleting {
 			// A terminating state can never become usable. Finish so the
@@ -346,21 +347,13 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 			// release it. unclaim releases any writer this Blip took
 			// before it was queued (there is no pod yet: claimedPod was
 			// checked above).
-			if err := r.unclaim(ctx, b); err != nil {
-				return reconcile.Result{}, err
-			}
-			r.finish(b, v1.BlipFailed, ReasonStateNotFound, msg)
-			return reconcile.Result{}, nil
+			return fail(reason, msg)
 		}
 		if st != nil {
 			all[n] = st
 			writable := i == 0 || mounts[i-1].Writable
 			if msg := mountStateError(b, st, writable); msg != "" {
-				if err := r.unclaim(ctx, b); err != nil {
-					return reconcile.Result{}, err
-				}
-				r.finish(b, v1.BlipFailed, ReasonInvalidSpec, msg)
-				return reconcile.Result{}, nil
+				return fail(ReasonInvalidSpec, msg)
 			}
 		}
 		if reason != "" {
@@ -443,7 +436,7 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	}
 
 	// A stale cache may not show a claim this Blip already made.
-	pod, err := r.claimedPod(ctx, r.Live, b)
+	pod, err := claimedPod(ctx, r.Live, b)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -569,21 +562,30 @@ func sealError(sr v1.SealResult) string {
 }
 
 // claimedPod finds a pod this Blip already claimed.
-func (r *BlipReconciler) claimedPod(ctx context.Context, c client.Reader, b *v1.Blip) (*corev1.Pod, error) {
+func claimedPod(ctx context.Context, c client.Reader, b *v1.Blip) (*corev1.Pod, error) {
 	var pods corev1.PodList
-	if err := c.List(ctx, &pods, client.InNamespace(b.Namespace), client.MatchingLabels{LabelBlipUID: string(b.UID)}); err != nil {
+	if err := c.List(ctx, &pods, client.InNamespace(b.Namespace), client.MatchingLabels{v1.LabelBlipUID: string(b.UID)}); err != nil {
 		return nil, err
 	}
-	for i := range pods.Items {
-		return &pods.Items[i], nil
+	if len(pods.Items) == 0 {
+		return nil, nil
 	}
-	return nil, nil
+	return &pods.Items[0], nil
+}
+
+// observed decodes the node's observation annotation, if present.
+func observed(pod *corev1.Pod) podapi.Observed {
+	var obs podapi.Observed
+	if raw := pod.Annotations[v1.AnnotationObserved]; raw != "" {
+		_ = json.Unmarshal([]byte(raw), &obs)
+	}
+	return obs
 }
 
 // poolPods lists the pods of the Blip's pool.
 func (r *BlipReconciler) poolPods(ctx context.Context, b *v1.Blip) ([]corev1.Pod, error) {
 	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(b.Namespace), client.MatchingLabels{LabelPool: poolName(b)}); err != nil {
+	if err := r.List(ctx, &pods, client.InNamespace(b.Namespace), client.MatchingLabels{v1.LabelPool: poolName(b)}); err != nil {
 		return nil, err
 	}
 	return pods.Items, nil
@@ -603,7 +605,7 @@ func (r *BlipReconciler) warmPods(b *v1.Blip, pool *v1.BlipPool, states map[stri
 	}
 	score := placementScores(b, states)
 	pinnedAway := func(p *corev1.Pod) bool {
-		return p.Annotations[AnnotationPinnedNode] != "" && score[p.Spec.NodeName] == 0
+		return p.Annotations[v1.AnnotationPinnedNode] != "" && score[p.Spec.NodeName] == 0
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		si, sj := score[out[i].Spec.NodeName], score[out[j].Spec.NodeName]
@@ -623,7 +625,7 @@ func (r *BlipReconciler) warmPods(b *v1.Blip, pool *v1.BlipPool, states map[stri
 // image indefinitely.
 func claimableForPool(p *corev1.Pod, pool *v1.BlipPool, runtimeImage string) bool {
 	return pool.DeletionTimestamp == nil && p.Namespace == pool.Namespace &&
-		p.Labels[LabelPool] == pool.Name && p.Annotations[annotationTemplateHash] == templateHash(pool, runtimeImage) &&
+		p.Labels[v1.LabelPool] == pool.Name && p.Annotations[v1.AnnotationTemplateHash] == templateHash(pool, runtimeImage) &&
 		isVacant(p) && ready(p)
 }
 
@@ -647,12 +649,12 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 		if p.Labels == nil {
 			p.Labels = map[string]string{}
 		}
-		p.Labels[LabelBlipUID] = string(b.UID)
-		p.Labels[LabelOwner] = blipOwner(b)
+		p.Labels[v1.LabelBlipUID] = string(b.UID)
+		p.Labels[v1.LabelOwner] = blipOwner(b)
 		if p.Annotations == nil {
 			p.Annotations = map[string]string{}
 		}
-		p.Annotations[AnnotationBlip] = b.Name
+		p.Annotations[v1.AnnotationBlip] = b.Name
 		p.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(b, v1.GroupVersion.WithKind("Blip"))}
 		if err := setVMOwner(ctx, r.Client, p, b); err != nil {
 			return nil, err
@@ -694,15 +696,12 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 	}
 	// Running means the guest accepted the claim; until then the node is
 	// still preparing disks.
-	var obs podapi.Observed
-	if raw := pod.Annotations[AnnotationObserved]; raw != "" {
-		_ = json.Unmarshal([]byte(raw), &obs)
-	}
+	obs := observed(pod)
 	started := obs.ClaimID != "" || obs.Exit != nil || obs.Phase == podapi.PhaseExited ||
 		pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded ||
 		pod.DeletionTimestamp != nil || stopping(b)
 	if !started {
-		prepareErr := pod.Annotations[AnnotationPrepareError]
+		prepareErr := pod.Annotations[v1.AnnotationPrepareError]
 		msg := "preparing the root disk on " + pod.Spec.NodeName
 		reason := ReasonStarting
 		switch {
@@ -744,11 +743,9 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Res
 	}
 	var obs podapi.Observed
 	if pod != nil {
-		if raw := pod.Annotations[AnnotationObserved]; raw != "" {
-			_ = json.Unmarshal([]byte(raw), &obs)
-		}
+		obs = observed(pod)
 	}
-	if pod != nil && pod.Annotations[AnnotationObserved] == "" && b.Status.StartTime != nil &&
+	if pod != nil && pod.Annotations[v1.AnnotationObserved] == "" && b.Status.StartTime != nil &&
 		r.now().Sub(b.Status.StartTime.Time) > startTimeout {
 		// A VM that never reported an observation has no state to save, so
 		// stopping or deleting it must not wait for one either.
@@ -947,19 +944,17 @@ func (r *BlipReconciler) attachment(ctx context.Context, ns, state, id string) (
 	if s.Writer != nil && s.Writer.AttachmentID == id || s.Pending != nil && s.Pending.AttachmentID == id {
 		return false, "", nil
 	}
-	for _, sr := range s.Seals {
-		if sr.AttachmentID != id {
-			continue
-		}
-		if sr.CommitID == "" {
-			if sr.Error == "" {
-				return true, "save failed without an error", nil
-			}
-			return true, sr.Error, nil
-		}
-		return true, "", nil
+	sr, found, err := r.sealResult(ctx, ns, state, id)
+	if err != nil {
+		return false, "", err
 	}
-	// The attachment is no longer in progress and no seal result exists.
-	// Never report success: the save outcome is unknown.
-	return true, fmt.Sprintf("no seal result for attachment %s", id), nil
+	if !found {
+		// The attachment is no longer in progress and no seal result exists.
+		// Never report success: the save outcome is unknown.
+		return true, fmt.Sprintf("no seal result for attachment %s", id), nil
+	}
+	if sr.CommitID == "" {
+		return true, sealError(sr), nil
+	}
+	return true, "", nil
 }

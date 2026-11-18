@@ -1,6 +1,6 @@
 // Command blip-runtime runs one blip VM inside a VM pod.
 //
-//	blip-runtime              supervise Cloud Hypervisor (see docs/ARCHITECTURE.md)
+//	blip-runtime              supervise Cloud Hypervisor (see the README's implementation outline)
 //	blip-runtime bridge PORT  relay stdin/stdout to a guest vsock port
 //	blip-runtime api-proxy    serve the VM-only Kubernetes API proxy
 package main

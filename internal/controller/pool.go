@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"iter"
 	"maps"
 	"slices"
 	"sort"
@@ -35,11 +34,6 @@ import (
 const expectTimeout = time.Minute
 
 const (
-	// annotationTemplateHash records the VM shape, including the runtime
-	// image, a warm pod was created from. A pool spec or controller image
-	// change leaves vacant pods with a stale hash, which reconcile deletes
-	// so they are replaced with the new shape.
-	annotationTemplateHash = "blip.dev/template-hash"
 	// Bump when pod topology changes without a pool spec change, so warm
 	// pods cannot retain the old credential or socket layout.
 	podTopologyVersion = "api-proxy-v2"
@@ -96,7 +90,7 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1.BlipPool{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
-			if p := o.GetLabels()[LabelPool]; p != "" {
+			if p := o.GetLabels()[v1.LabelPool]; p != "" {
 				return []reconcile.Request{req(o.GetNamespace(), p)}
 			}
 			return nil
@@ -107,17 +101,9 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.statePools)).
 		// A stale heartbeat is a status-only change, and an agent that dies
 		// sends no event at all; reconcile also requeues itself while a node
-		// it uses is still healthy (see nextHeartbeatCheck).
+		// it uses is still healthy (see nextCrossing).
 		Watches(&v1.BlipNode{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
-			var pools v1.BlipPoolList
-			if err := r.List(ctx, &pools); err != nil {
-				return nil
-			}
-			var out []reconcile.Request
-			for _, p := range pools.Items {
-				out = append(out, req(p.Namespace, p.Name))
-			}
-			return out
+			return r.poolRequests(ctx, "")
 		})).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
 			if o.GetName() != VMOwnersConfigMap {
@@ -137,8 +123,18 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // State imports and deletions refresh shared-base authorization even when no
 // Blip currently waits for a VM.
 func (r *PoolReconciler) statePools(ctx context.Context, o client.Object) []reconcile.Request {
+	return r.poolRequests(ctx, o.GetNamespace())
+}
+
+// poolRequests enqueues every pool, or only the ones in namespace when it is
+// not empty.
+func (r *PoolReconciler) poolRequests(ctx context.Context, namespace string) []reconcile.Request {
+	var opts []client.ListOption
+	if namespace != "" {
+		opts = append(opts, client.InNamespace(namespace))
+	}
 	var pools v1.BlipPoolList
-	if err := r.List(ctx, &pools, client.InNamespace(o.GetNamespace())); err != nil {
+	if err := r.List(ctx, &pools, opts...); err != nil {
 		return nil
 	}
 	var out []reconcile.Request
@@ -172,7 +168,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		return reconcile.Result{}, fmt.Errorf("invalid gateway for pool %s/%s: %w", pool.Namespace, pool.Name, err)
 	}
 	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels{LabelPool: pool.Name}); err != nil {
+	if err := r.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels{v1.LabelPool: pool.Name}); err != nil {
 		return reconcile.Result{}, err
 	}
 	// API list order is not a placement or deletion preference. This also
@@ -196,17 +192,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	usable := func(node string) bool { return node == "" || cl.usable(node, nil) }
 	// avoid holds every enrolled node a new VM must not use. A generic
 	// replacement is otherwise free to land on the dead node it replaces.
-	avoid := map[string]bool{}
-	for name := range cl.nodes {
-		if !cl.usable(name, nil) {
-			avoid[name] = true
-		}
-	}
-	for name, k := range cl.k8s {
-		if k.Labels[LabelEnrolled] == "true" && !cl.usable(name, nil) {
-			avoid[name] = true
-		}
-	}
+	avoid := cl.avoidNodes()
 
 	// claimed holds the Blips whose VM pod already exists, even if the Blip
 	// reconciler has not written status.pod yet. Counting such a Blip as
@@ -214,7 +200,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// under a burst of forks the pool booted one extra VM per claim.
 	claimed := map[types.UID]bool{}
 	for i := range pods.Items {
-		if uid := pods.Items[i].Labels[LabelBlipUID]; uid != "" {
+		if uid := pods.Items[i].Labels[v1.LabelBlipUID]; uid != "" {
 			claimed[types.UID(uid)] = true
 		}
 	}
@@ -232,7 +218,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		if !countsAsDemand(b, pool.Name) || claimed[b.UID] {
 			continue
 		}
-		if hasDurableData(b) && b.Status.Locality == nil {
+		if b.Spec.State != "" && b.Status.Locality == nil {
 			deferred++
 			continue
 		}
@@ -286,7 +272,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			if unusable {
 				total--
 			}
-		case podTerminated(p) || unusable || p.Annotations[annotationTemplateHash] != hash:
+		case podTerminated(p) || unusable || p.Annotations[v1.AnnotationTemplateHash] != hash:
 			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
@@ -327,7 +313,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// Blip only holds a slot.
 	kept := vacant[:0]
 	for _, p := range vacant {
-		if !reserved[p.Name] && p.Annotations[AnnotationPinnedNode] != "" && unschedulable(p) {
+		if !reserved[p.Name] && p.Annotations[v1.AnnotationPinnedNode] != "" && unschedulable(p) {
 			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
@@ -369,7 +355,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	blocked := map[string]bool{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if unschedulable(p) && p.Annotations[AnnotationPinnedNode] != "" {
+		if unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "" {
 			blocked[podNode(p)] = true
 		}
 	}
@@ -398,12 +384,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	} else {
 		spare := slices.DeleteFunc(slices.Clone(vacant), func(p *corev1.Pod) bool { return reserved[p.Name] })
 		// Delete booting pods before ready ones, newest first.
-		sort.SliceStable(spare, func(i, j int) bool {
-			if ready(spare[i]) != ready(spare[j]) {
-				return !ready(spare[i])
-			}
-			return spare[j].CreationTimestamp.Before(&spare[i].CreationTimestamp)
-		})
+		sortForRemoval(spare)
 		for _, p := range spare[:max(0, min(have-target, len(spare)))] {
 			if err := del(p); err != nil {
 				return reconcile.Result{}, err
@@ -424,12 +405,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		}
 		// Move booting pods before ready ones: a ready spare is more useful
 		// even if it is remote, and booting ones are already cold.
-		sort.SliceStable(spare, func(i, j int) bool {
-			if ready(spare[i]) != ready(spare[j]) {
-				return !ready(spare[i])
-			}
-			return spare[j].CreationTimestamp.Before(&spare[i].CreationTimestamp)
-		})
+		sortForRemoval(spare)
 		for _, p := range spare {
 			node := pickWarmNode(hot, warm, blocked)
 			if node == "" || !room() {
@@ -462,28 +438,22 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// A node whose agent dies stops heartbeating and therefore stops
 	// producing events. Wake up when one of the nodes this pool uses is due
 	// to cross heartbeatTimeout so its capacity is retired.
-	return reconcile.Result{RequeueAfter: nextHeartbeatCheck(cl, maps.Keys(used))}, nil
+	return reconcile.Result{RequeueAfter: cl.nextCrossing(slices.Sorted(maps.Keys(used)), heartbeatTimeout, true)}, nil
 }
 
-// nextHeartbeatCheck is how long until a healthy node used by the pool might
-// go stale; zero when no such node exists.
-func nextHeartbeatCheck(cl *cluster, names iter.Seq[string]) time.Duration {
-	var next time.Duration
-	for name := range names {
-		bn := cl.nodes[name]
-		if bn == nil || bn.Spec.Drain || bn.Status.Heartbeat == nil {
-			continue
+// sortForRemoval orders pods to delete or move: booting before ready, newest
+// first.
+func sortForRemoval(pods []*corev1.Pod) {
+	sort.SliceStable(pods, func(i, j int) bool {
+		if ready(pods[i]) != ready(pods[j]) {
+			return !ready(pods[i])
 		}
-		d := heartbeatTimeout - heartbeatAge(bn, cl.now) + time.Second
-		if d > 0 && (next == 0 || d < next) {
-			next = d
-		}
-	}
-	return next
+		return pods[j].CreationTimestamp.Before(&pods[i].CreationTimestamp)
+	})
 }
 
 func ready(p *corev1.Pod) bool {
-	return p.Labels[LabelWarm] == "true" && p.Status.Phase == corev1.PodRunning && p.DeletionTimestamp == nil
+	return p.Labels[v1.LabelWarm] == "true" && p.Status.Phase == corev1.PodRunning && p.DeletionTimestamp == nil
 }
 
 // pickWarmNode picks the node where a warm spare is most useful: a node
@@ -511,7 +481,7 @@ func pickWarmNode(hot, warm map[string]int, blocked map[string]bool) string {
 func countsAsDemand(b *v1.Blip, pool string) bool {
 	phase := b.Status.Phase
 	return poolName(b) == pool && (phase == "" || phase == v1.BlipPending) &&
-		b.Status.Pod == "" && b.DeletionTimestamp == nil && !finished(b)
+		b.Status.Pod == "" && b.DeletionTimestamp == nil && !v1.Finished(b)
 }
 
 // expectations drops entries the cache now reflects and returns how many
@@ -563,7 +533,7 @@ func (r *PoolReconciler) createPod(ctx context.Context, pool *v1.BlipPool, avoid
 	var match *corev1.NodeSelectorRequirement
 	switch {
 	case node != "":
-		pod.Annotations[AnnotationPinnedNode] = node
+		pod.Annotations[v1.AnnotationPinnedNode] = node
 		match = &corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{node}}
 	case len(avoid) > 0:
 		match = &corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpNotIn, Values: slices.Sorted(maps.Keys(avoid))}
@@ -596,7 +566,7 @@ func (r *PoolReconciler) deletePod(ctx context.Context, pool types.NamespacedNam
 	return nil
 }
 
-// podFor builds a VM pod (docs/ARCHITECTURE.md "VM pod").
+// podFor builds a VM pod (see the README's implementation outline).
 func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 	cpus, memory, hypervisor := poolShape(pool)
 	request := memory.DeepCopy()
@@ -610,15 +580,12 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 	automount := false
 	grace := terminationGracePeriod
 	hostPathType := corev1.HostPathDirectoryOrCreate
-	fieldEnv := func(name, path string) corev1.EnvVar {
-		return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: path}}}
-	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
 			Namespace:       pool.Namespace,
-			Labels:          map[string]string{LabelPool: pool.Name},
-			Annotations:     map[string]string{annotationTemplateHash: templateHash(pool, r.RuntimeImage)},
+			Labels:          map[string]string{v1.LabelPool: pool.Name},
+			Annotations:     map[string]string{v1.AnnotationTemplateHash: templateHash(pool, r.RuntimeImage)},
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(pool, v1.GroupVersion.WithKind("BlipPool"))},
 		},
 		Spec: corev1.PodSpec{
@@ -628,8 +595,9 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 			TerminationGracePeriodSeconds: &grace,
 			NodeSelector:                  selector,
 			Tolerations:                   pool.Spec.Tolerations,
+			ImagePullSecrets:              pool.Spec.ImagePullSecrets,
 			Containers: []corev1.Container{{
-				Name:    "vm",
+				Name:    podapi.VMContainer,
 				Image:   r.RuntimeImage,
 				Command: []string{"blip-runtime"},
 				Env: []corev1.EnvVar{
@@ -683,6 +651,10 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 	return pod
 }
 
+func fieldEnv(name, path string) corev1.EnvVar {
+	return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: path}}}
+}
+
 func addAPIProxy(pod *corev1.Pod, image string, gateway *v1.GatewaySpec) {
 	uid := apiProxyUID
 	enabled, disabled := true, false
@@ -702,8 +674,8 @@ func addAPIProxy(pod *corev1.Pod, image string, gateway *v1.GatewaySpec) {
 		Env: []corev1.EnvVar{
 			// Trusted identity for owner-scoped reads. The guest cannot set
 			// these; they come from the pod's own metadata.
-			{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
-			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+			fieldEnv("POD_NAME", "metadata.name"),
+			fieldEnv("POD_NAMESPACE", "metadata.namespace"),
 		},
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                &uid,
@@ -832,7 +804,7 @@ func templateHash(pool *v1.BlipPool, runtimeImage string) string {
 		Gateway            *v1.GatewaySpec
 		NodeSelector       map[string]string
 		Tolerations        []corev1.Toleration
-		ImagePullSecrets   []corev1.LocalObjectReference
+		ImagePullSecrets   []corev1.LocalObjectReference `json:",omitempty"`
 	}{
 		TopologyVersion:    podTopologyVersion,
 		RuntimeImage:       runtimeImage,

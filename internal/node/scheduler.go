@@ -16,7 +16,7 @@ type Operation struct {
 	Reads  []string
 }
 
-// Attempt identifies one admitted generation, including across Restart.
+// Attempt identifies one admitted generation, durable across forgotten work.
 type Attempt struct {
 	Operation  Operation
 	Generation uint64
@@ -206,11 +206,4 @@ func (s *Scheduler) Failures(key string) int {
 		return j.failures
 	}
 	return 0
-}
-
-// Restart forgets volatile work after the adapter has stopped its old I/O.
-// The generation counter survives so delayed completions cannot release a
-// new attempt's reservations. Durable storage is reconciled by the next plan.
-func (s *Scheduler) Restart() {
-	s.jobs = nil
 }

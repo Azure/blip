@@ -23,6 +23,13 @@ func (e *env) setDrain(node string) {
 	e.must(e.c.Update(e.ctx, bn))
 }
 
+// removeNode deletes both objects that represent a node.
+func (e *env) removeNode(node string) {
+	e.t.Helper()
+	e.must(e.c.Delete(e.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: node}}))
+	e.must(e.c.Delete(e.ctx, &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: node}}))
+}
+
 func (e *env) safeToRemove(node string) bool {
 	e.t.Helper()
 	e.run(e.node, "", node)
@@ -256,8 +263,7 @@ func TestPendingSaveCommitsWithLostReplica(t *testing.T) {
 
 	// n2 dies before it fetches the commit and there is no other node.
 	dead := "n2"
-	e.must(e.c.Delete(e.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: dead}}))
-	e.must(e.c.Delete(e.ctx, &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: dead}}))
+	e.removeNode(dead)
 
 	e.run(e.state, ns, "s")
 	st = e.getState("s")
@@ -298,8 +304,7 @@ func TestDrainingSaveSourceCommitsWithLostReplica(t *testing.T) {
 	e.must(e.c.Status().Update(e.ctx, st))
 	e.hold("s", saved, "n1")
 	e.setDrain("n1")
-	e.must(e.c.Delete(e.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}}))
-	e.must(e.c.Delete(e.ctx, &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: "n2"}}))
+	e.removeNode("n2")
 	e.run(e.state, ns, "s")
 	st = e.getState("s")
 	if st.Status.Pending != nil || st.Status.Committed.ID != saved || !slices.Equal(st.Status.Placements, []string{"n1"}) {
@@ -333,8 +338,7 @@ func TestInitialVersionCommitsWithLostReplica(t *testing.T) {
 		}
 	}
 	e.hold("s", p.CommitID, p.SourceNode, other)
-	e.must(e.c.Delete(e.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: dead}}))
-	e.must(e.c.Delete(e.ctx, &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: dead}}))
+	e.removeNode(dead)
 
 	e.run(e.state, ns, "s")
 	st := e.getState("s")
@@ -370,8 +374,7 @@ func TestPendingSaveLostWithoutHolder(t *testing.T) {
 
 	// Both nodes are gone before any survivor reports the commit.
 	for _, n := range []string{"n1", "n2"} {
-		e.must(e.c.Delete(e.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: n}}))
-		e.must(e.c.Delete(e.ctx, &v1.BlipNode{ObjectMeta: metav1.ObjectMeta{Name: n}}))
+		e.removeNode(n)
 	}
 	e.run(e.state, ns, "s")
 	st = e.getState("s")
@@ -554,7 +557,7 @@ func TestQueuedBlipDoesNotBlockStateDeletion(t *testing.T) {
 	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "s"}, &v1.BlipState{}); err == nil {
 		t.Fatal("state still waiting for the queued blip")
 	}
-	if b := e.getBlip("queued"); b.DeletionTimestamp != nil || finished(b) {
+	if b := e.getBlip("queued"); b.DeletionTimestamp != nil || v1.Finished(b) {
 		t.Fatalf("test changed the queued blip: %+v", b.Status)
 	}
 }
@@ -645,7 +648,7 @@ func TestWriterNodeDeletedRequiresForceRecover(t *testing.T) {
 	if st.Status.Writer == nil {
 		t.Fatal("deleted node was treated as proof that the VM stopped")
 	}
-	if !strings.Contains(st.Status.Message, AnnotationForceRecoverWriter) {
+	if !strings.Contains(st.Status.Message, v1.AnnotationForceRecover) {
 		t.Fatalf("no manual recovery message: %q", st.Status.Message)
 	}
 	e.run(e.blip, ns, "b")
@@ -660,7 +663,7 @@ func TestWriterNodeDeletedRequiresForceRecover(t *testing.T) {
 	if st.Annotations == nil {
 		st.Annotations = map[string]string{}
 	}
-	st.Annotations[AnnotationForceRecoverWriter] = "true"
+	st.Annotations[v1.AnnotationForceRecover] = "true"
 	e.must(e.c.Update(e.ctx, st))
 	e.run(e.state, ns, "s")
 	st = e.getState("s")
@@ -670,7 +673,7 @@ func TestWriterNodeDeletedRequiresForceRecover(t *testing.T) {
 	if len(st.Status.Seals) == 0 {
 		t.Fatalf("no seal result after force recovery: %+v", st.Status.Seals)
 	}
-	if _, ok := st.Annotations[AnnotationForceRecoverWriter]; ok {
+	if _, ok := st.Annotations[v1.AnnotationForceRecover]; ok {
 		t.Error("force-recover annotation was not removed")
 	}
 	e.run(e.blip, ns, "b")

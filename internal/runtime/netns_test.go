@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/blip/internal/guest"
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/bootconfig"
+	"github.com/Azure/blip/internal/netpolicy"
 )
 
 // TestNetworkNamespace is opt-in and ALL network mutations run in child
@@ -142,7 +142,7 @@ func testNetworkNamespace(t *testing.T) {
 	if _, err := networkCommand("add table inet unrelated\n", "nft", "-f", "-"); err != nil {
 		t.Fatal(err)
 	}
-	var cfg guest.Config
+	var cfg bootconfig.Config
 	p, err := setupNetwork(&cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -213,16 +213,16 @@ func testNetworkNamespace(t *testing.T) {
 		}
 	}
 	checkSidecar(request.Address, p.podIP)
-	policy := &network.Policy{Revision: "allow", Layers: [][]network.Rule{
+	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
 		{{CIDR: "198.51.100.0/24", Except: []string{"198.51.100.11/32", "198.51.100.128/25", "198.51.100.128/26"}}},
 		{{CIDR: "0.0.0.0/0", Protocol: "TCP", Port: 8080, EndPort: 8081}, {CIDR: "0.0.0.0/0", Protocol: "UDP", Port: 5353}},
 		{{CIDR: "0.0.0.0/0", Protocol: "TCP", Port: 8080}, {CIDR: "0.0.0.0/0", Protocol: "UDP", Port: 5353}},
 	}}
-	if err := p.apply(policy, false); err != nil {
+	if _, err := p.apply(policy, false); err != nil {
 		t.Fatal(err)
 	}
 	denied(request) // preinstall does not open a warm VM
-	if err := p.apply(policy, true); err != nil {
+	if _, err := p.apply(policy, true); err != nil {
 		t.Fatal(err)
 	}
 	allowed(request)
@@ -234,8 +234,8 @@ func testNetworkNamespace(t *testing.T) {
 	spoof.LocalIP = "10.77.0.1"
 	denied(spoof)
 	// Even allow-all cannot expose the pod's gateway/pod-IP listeners.
-	all := &network.Policy{Revision: "all", Layers: [][]network.Rule{{{CIDR: "0.0.0.0/0"}}}}
-	if err := p.apply(all, true); err != nil {
+	all := &netpolicy.Policy{Revision: "all", Layers: [][]netpolicy.Rule{{{CIDR: "0.0.0.0/0"}}}}
+	if _, err := p.apply(all, true); err != nil {
 		t.Fatal(err)
 	}
 	for _, address := range []string{cfg.Gateway + ":9090", p.podIP + ":9090"} {
@@ -268,14 +268,14 @@ func testNetworkNamespace(t *testing.T) {
 	wan.must(t, nsCommand{Op: "listen", Network: "tcp", Address: "[2001:db8:1::1]:8080"})
 	checkSidecar("[2001:db8:1::1]:8080", "2001:db8:1::2")
 	denied(nsCommand{Op: "exchange", Network: "tcp", Address: "[2001:db8:1::1]:8080"})
-	if err := p.apply(policy, true); err != nil {
+	if _, err := p.apply(policy, true); err != nil {
 		t.Fatal(err)
 	}
 	// Refresh both flows, then revoke. Unsolicited server pushes on existing
 	// flows check the reverse path independently of blocked outbound packets.
 	allowed(request)
 	allowed(udp)
-	if err := p.apply(&network.Policy{Revision: "revoke", Layers: [][]network.Rule{{}}}, true); err != nil {
+	if _, err := p.apply(&netpolicy.Policy{Revision: "revoke", Layers: [][]netpolicy.Rule{{}}}, true); err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range []nsCommand{request, udp} {
@@ -294,7 +294,7 @@ func testNetworkNamespace(t *testing.T) {
 	if got := wan.must(t, nsCommand{Op: "exchange", Network: "tcp", Address: p.podIP + ":8088"}); !strings.HasSuffix(got, "|hello\n") {
 		t.Fatalf("inbound DNAT/return failed: %q", got)
 	}
-	if err := p.apply(&network.Policy{Revision: "invalid", Layers: [][]network.Rule{{{CIDR: "not-an-address"}}}}, true); err == nil {
+	if _, err := p.apply(&netpolicy.Policy{Revision: "invalid", Layers: [][]netpolicy.Rule{{{CIDR: "not-an-address"}}}}, true); err == nil {
 		t.Fatal("invalid policy accepted")
 	}
 	denied(request)

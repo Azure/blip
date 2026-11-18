@@ -139,7 +139,7 @@ func newWorld() *world {
 	for i, name := range []string{"n1", "n2"} {
 		m := meta(name)
 		m.Namespace = ""
-		m.Labels = map[string]string{controller.LabelEnrolled: "true", controller.LabelHypervisorPrefix + "kvm": "true"}
+		m.Labels = map[string]string{v1.LabelEnrolled: "true", v1.LabelHypervisorPrefix + "kvm": "true"}
 		w.Actual.KubeNodes.Items = append(w.Actual.KubeNodes.Items, corev1.Node{ObjectMeta: m})
 		hb := metav1.NewTime(epoch)
 		key := sha256.Sum256([]byte(name))
@@ -374,7 +374,7 @@ func (w *world) progress(lose bool) error {
 			w.publishPods(w.nodePlan(name))
 		}
 		for _, p := range w.Actual.Pods.Items {
-			next = next && p.Labels[node.LabelWarm] == "true"
+			next = next && p.Labels[v1.LabelWarm] == "true"
 		}
 	case 2, 32:
 		if err := w.reconcile("blip", b.Name, lose); err != nil {
@@ -525,7 +525,7 @@ func (w *world) progress(lose bool) error {
 		}
 		next = w.blip().Status.Phase == v1.BlipSucceeded
 		for _, p := range w.Actual.Pods.Items {
-			if p.Labels[controller.LabelBlipUID] == string(w.blip().UID) {
+			if p.Labels[v1.LabelBlipUID] == string(w.blip().UID) {
 				next = false
 			}
 		}

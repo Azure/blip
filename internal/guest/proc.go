@@ -209,7 +209,7 @@ func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
 		env = append(env, "TERM=xterm-256color")
 	}
 	if g.kubeNamespace != "" {
-		env = append(env, "KUBECONFIG="+KubeconfigPath)
+		env = append(env, "KUBECONFIG="+kubeconfigPath)
 	}
 	return mergeEnv(env, base, s.env)
 }

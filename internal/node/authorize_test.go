@@ -11,11 +11,11 @@ import (
 // with CopiedFrom; status alone must not authorize a cross-owner export.
 func TestAuthorizeCopySourceAgreement(t *testing.T) {
 	src := state("src")
-	src.Labels = map[string]string{ownerLabel: "alice"}
+	src.Labels = map[string]string{v1alpha1.LabelOwner: "alice"}
 	src.Status.Committed = &v1alpha1.Commit{ID: "c1", Generation: 1}
 	dst := func() *v1alpha1.BlipState {
 		s := state("dst")
-		s.Labels = map[string]string{ownerLabel: "alice"}
+		s.Labels = map[string]string{v1alpha1.LabelOwner: "alice"}
 		s.Spec.CopyFrom = "src"
 		s.Status.CopiedFrom = &v1alpha1.CopySource{StateUID: "uid-src", CommitID: "c1"}
 		s.Status.Pending = &v1alpha1.PendingCommit{CommitID: "c2", Generation: 1, Replicas: []string{"n2"}}
@@ -31,14 +31,14 @@ func TestAuthorizeCopySourceAgreement(t *testing.T) {
 		t.Fatal("copy with mismatched spec.copyFrom allowed")
 	}
 	other = dst()
-	other.Labels[ownerLabel] = "bob"
+	other.Labels[v1alpha1.LabelOwner] = "bob"
 	if err := authorize([]*v1alpha1.BlipState{src, other}, nil, "n2", req); err == nil {
 		t.Fatal("cross-owner copy allowed")
 	}
 	// Dropping the destination's owner label must not turn a labelled
 	// source into a shared one.
 	forged := dst()
-	delete(forged.Labels, ownerLabel)
+	delete(forged.Labels, v1alpha1.LabelOwner)
 	if err := authorize([]*v1alpha1.BlipState{src, forged}, nil, "n2", req); err == nil {
 		t.Fatal("unlabelled copy of a labelled source authorized export")
 	}
@@ -69,10 +69,10 @@ func TestCopyAllowed(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			src, dst := state("src"), state("dst")
 			if c.src != "" {
-				src.Labels = map[string]string{ownerLabel: c.src}
+				src.Labels = map[string]string{v1alpha1.LabelOwner: c.src}
 			}
 			if c.dst != "" {
-				dst.Labels = map[string]string{ownerLabel: c.dst}
+				dst.Labels = map[string]string{v1alpha1.LabelOwner: c.dst}
 			}
 			if got := copyAllowed(dst, src); got != c.want {
 				t.Errorf("copyAllowed(dst=%q, src=%q) = %v, want %v", c.dst, c.src, got, c.want)

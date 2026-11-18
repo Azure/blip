@@ -16,11 +16,9 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 
+	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
 )
-
-// Container is the VM pod container that runs blip-runtime.
-const Container = "vm"
 
 // NewClient returns a Client that reaches guests through pod exec.
 func NewClient(cfg *rest.Config) (*Client, error) {
@@ -39,7 +37,7 @@ func podExec(cfg *rest.Config, cs kubernetes.Interface) Connector {
 		req := cs.CoreV1().RESTClient().Post().
 			Resource("pods").Namespace(namespace).Name(pod).SubResource("exec").
 			VersionedParams(&corev1.PodExecOptions{
-				Container: Container,
+				Container: podapi.VMContainer,
 				Command:   []string{"blip-runtime", "bridge", strconv.Itoa(wire.SessionPort)},
 				Stdin:     true,
 				Stdout:    true,

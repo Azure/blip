@@ -183,7 +183,7 @@ func TestCleanupReservationsAcrossCompletionAndRestart(t *testing.T) {
 	// Recover a pending teardown, stale device nodes and an empty directory.
 	// The planner first retries the volume delete; then removes device nodes;
 	// only a later confirmed-absent snapshot can remove the directory.
-	scheduler.Restart()
+	scheduler.jobs = nil
 	v.busy = scheduler.Busy()
 	delete(v.volumes, "source")
 	v.pending = []string{"source", "source"}

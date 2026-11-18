@@ -35,7 +35,7 @@ func TestPrepareFailureRetainsFailedRollback(t *testing.T) {
 					t.Fatal("failed rollback lost its cleanup owner")
 				}
 				w.fault = nil
-				if err := w.server.Recheck(); err != nil {
+				if err := w.server.recheck(); err != nil {
 					t.Fatal(err)
 				}
 				w.empty()
@@ -119,7 +119,7 @@ func TestRecheckRevokesWholeSelectionBeforeRenewal(t *testing.T) {
 			return nil
 		}
 		done := make(chan error, 1)
-		go func() { done <- w.server.Recheck() }()
+		go func() { done <- w.server.recheck() }()
 		<-entered
 		renewed := make(chan int, 1)
 		started := make(chan struct{})
@@ -189,7 +189,7 @@ func TestRecoveryOrphanFailuresRetryDuringRecheck(t *testing.T) {
 				w.fault = nil
 				// This is the periodic entry point Run actually invokes after
 				// a failed restore. No process restart or manual Recover call.
-				if err := w.server.Recheck(); err != nil {
+				if err := w.server.recheck(); err != nil {
 					t.Fatal(err)
 				}
 				w.empty()

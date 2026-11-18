@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -67,42 +64,6 @@ func blipFromFlags(name, namespace string, f *runFlags, command []string) (*v1al
 		b.Annotations[v1alpha1.AnnotationWaitForClient] = "true"
 	}
 	return b, nil
-}
-
-// parseMount parses STATE:/path[:rw|:ro].
-func parseMount(s string) (v1alpha1.Mount, error) {
-	parts := strings.Split(s, ":")
-	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || !strings.HasPrefix(parts[1], "/") ||
-		parts[1] == "/" || path.Clean(parts[1]) != parts[1] {
-		return v1alpha1.Mount{}, fmt.Errorf("invalid mount %q: want STATE:/clean/absolute/path[:rw]", s)
-	}
-	m := v1alpha1.Mount{State: parts[0], Path: parts[1]}
-	if len(parts) == 3 {
-		switch parts[2] {
-		case "rw":
-			m.Writable = true
-		case "ro":
-		default:
-			return v1alpha1.Mount{}, fmt.Errorf("invalid mount %q: mode must be rw or ro", s)
-		}
-	}
-	return m, nil
-}
-
-// parseEnv parses KEY=VALUE; a bare KEY takes the local value.
-func parseEnv(list []string) ([]v1alpha1.EnvVar, error) {
-	var env []v1alpha1.EnvVar
-	for _, e := range list {
-		k, v, ok := strings.Cut(e, "=")
-		if k == "" {
-			return nil, fmt.Errorf("invalid environment variable %q", e)
-		}
-		if !ok {
-			v = os.Getenv(k)
-		}
-		env = append(env, v1alpha1.EnvVar{Name: k, Value: v})
-	}
-	return env, nil
 }
 
 func envStrings(env []v1alpha1.EnvVar) []string {

@@ -9,13 +9,14 @@ import (
 
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/image"
+	"github.com/Azure/blip/internal/registryauth"
 )
 
 // imageSource is one pinned image this node may need, with the namespaced
 // imagePullSecrets that authenticate its pull.
 type imageSource struct {
 	Ref     string
-	Secrets []pullSecret
+	Secrets []registryauth.PullSecret
 }
 
 // imageRefs returns the image references this node may need to import. It only
@@ -33,7 +34,7 @@ func (v *view) imageRefs() []imageSource {
 				r.Ref = ref
 			}
 			for _, s := range secrets {
-				ps := pullSecret{Namespace: namespace, Name: s.Name}
+				ps := registryauth.PullSecret{Namespace: namespace, Name: s.Name}
 				if !slices.Contains(r.Secrets, ps) {
 					r.Secrets = append(r.Secrets, ps)
 				}
@@ -48,7 +49,7 @@ func (v *view) imageRefs() []imageSource {
 	}
 	refs := make([]imageSource, 0, len(byID))
 	for _, r := range byID {
-		slices.SortFunc(r.Secrets, func(a, b pullSecret) int {
+		slices.SortFunc(r.Secrets, func(a, b registryauth.PullSecret) int {
 			if a.Namespace != b.Namespace {
 				return strings.Compare(a.Namespace, b.Namespace)
 			}

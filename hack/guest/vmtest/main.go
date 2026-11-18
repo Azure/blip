@@ -19,11 +19,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/blip/internal/apiproxy"
 	"github.com/Azure/blip/internal/network"
 	"github.com/Azure/blip/internal/podapi"
+	sessionpkg "github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/wire"
 )
 
@@ -209,10 +211,46 @@ func fsCat(img, path string) string {
 
 // ---- sessions ----
 
+// readDeadline is shared with deadlineConn so collect can bound a Recv that
+// has no exposed deadline on session.Session.
+type readDeadline struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (d *readDeadline) set(at time.Time) {
+	d.mu.Lock()
+	d.at = at
+	d.mu.Unlock()
+}
+
+func (d *readDeadline) get() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.at
+}
+
+type deadlineConn struct {
+	net.Conn
+	d *readDeadline
+}
+
+func (c *deadlineConn) Read(p []byte) (int, error) {
+	_ = c.Conn.SetReadDeadline(c.d.get())
+	return c.Conn.Read(p)
+}
+
 type session struct {
-	conn   net.Conn
-	c      *wire.Conn
-	opened wire.Opened
+	s        *sessionpkg.Session
+	opened   wire.Opened
+	deadline *readDeadline
+}
+
+func (s *session) Close() error { return s.s.Close() }
+
+func writeStdin(s *session, data string) error {
+	_, err := s.s.Write([]byte(data))
+	return err
 }
 
 func dialPort(p *pod, port uint32) (net.Conn, error) {
@@ -220,31 +258,19 @@ func dialPort(p *pod, port uint32) (net.Conn, error) {
 }
 
 func open(p *pod, o wire.Open) (*session, error) {
-	conn, err := dialPort(p, wire.SessionPort)
+	deadline := &readDeadline{}
+	client := &sessionpkg.Client{Connect: func(ctx context.Context, _, _ string) (io.ReadWriteCloser, error) {
+		conn, err := dialPort(p, wire.SessionPort)
+		if err != nil {
+			return nil, err
+		}
+		return &deadlineConn{Conn: conn, d: deadline}, nil
+	}}
+	s, err := client.Open(context.Background(), "", "", o)
 	if err != nil {
 		return nil, err
 	}
-	c := wire.NewConn(conn)
-	if err := c.WriteJSON(wire.TOpen, o); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	t, payload, err := c.Read()
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	if t != wire.TOpened {
-		conn.Close()
-		return nil, fmt.Errorf("unexpected frame %d", t)
-	}
-	s := &session{conn: conn, c: c}
-	_ = wire.Decode(payload, &s.opened)
-	if s.opened.Error != "" {
-		conn.Close()
-		return s, fmt.Errorf("open: %s", s.opened.Error)
-	}
-	return s, nil
+	return &session{s: s, opened: s.Opened, deadline: deadline}, nil
 }
 
 type result struct {
@@ -258,26 +284,22 @@ type result struct {
 func (s *session) collect(timeout time.Duration, stop func(string) bool) result {
 	var r result
 	var out, errb bytes.Buffer
-	_ = s.conn.SetReadDeadline(time.Now().Add(timeout))
-	defer s.conn.SetReadDeadline(time.Time{})
+	s.deadline.set(time.Now().Add(timeout))
+	defer s.deadline.set(time.Time{})
 	for {
-		t, payload, err := s.c.Read()
+		f, err := s.s.Recv()
 		if err != nil {
 			break
 		}
-		switch t {
+		switch f.Type {
 		case wire.TStdout:
-			out.Write(payload)
+			out.Write(f.Data)
 		case wire.TStderr:
-			errb.Write(payload)
+			errb.Write(f.Data)
 		case wire.TNotice:
-			var n wire.Notice
-			_ = wire.Decode(payload, &n)
-			r.notices = append(r.notices, n.Message)
+			r.notices = append(r.notices, f.Notice)
 		case wire.TExited:
-			var e wire.Exit
-			_ = wire.Decode(payload, &e)
-			r.exit = &e
+			r.exit = f.Exit
 		}
 		if r.exit != nil || (stop != nil && stop(out.String())) {
 			break
@@ -291,11 +313,12 @@ func run(p *pod, o wire.Open, stdin string) result {
 	o.Mode = wire.OpenExec
 	s, err := open(p, o)
 	must(err, fmt.Sprintf("exec %v", o.Argv))
-	defer s.conn.Close()
+	defer s.Close()
 	if stdin != "" {
-		must(s.c.Write(wire.TStdin, []byte(stdin)), "stdin")
+		_, err = s.s.Write([]byte(stdin))
+		must(err, "stdin")
 	}
-	must(s.c.WriteJSON(wire.TStdinEOF, struct{}{}), "stdin eof")
+	must(s.s.CloseStdin(), "stdin eof")
 	r := s.collect(30*time.Second, nil)
 	if r.exit == nil {
 		log.Fatalf("FAIL: %v: no exit status (stdout %q stderr %q)", o.Argv, r.stdout, r.stderr)
@@ -447,7 +470,7 @@ func scenarioMain() {
 	r = run(p, wire.Open{Argv: []string{"cat"}}, "abc")
 	check(r.stdout == "abc" && r.exit.Code == 0, "stdin + EOF: %q", r.stdout)
 	if s, err := open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"no-such-command"}}); err == nil {
-		s.conn.Close()
+		s.Close()
 		log.Fatalf("FAIL: missing command opened")
 	} else {
 		check(strings.Contains(err.Error(), "not found"), "missing command: %v", err)
@@ -505,9 +528,9 @@ func scenarioMain() {
 	check(r.stdout == "echo:from-guest\n", "explicitly allowed guest TCP egress over routed TAP: %q", r.stdout)
 	s, err := open(p, wire.Open{Mode: wire.OpenDial, Host: "10.99.0.1", Port: 18080})
 	must(err, "dial")
-	must(s.c.Write(wire.TStdin, []byte("via-dial\n")), "dial write")
+	must(writeStdin(s, "via-dial\n"), "dial write")
 	r = s.collect(5*time.Second, nil)
-	s.conn.Close()
+	s.Close()
 	check(r.stdout == "echo:via-dial\n" && r.exit != nil, "dial relay: %q exit=%v", r.stdout, r.exit != nil)
 	s, err = open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"bash", "-c", `exec 3<>/dev/tcp/10.99.0.1/18080
 echo live-before >&3
@@ -522,9 +545,9 @@ echo revoked`}})
 	policy = &network.Policy{Revision: "revoke-echo"}
 	p.setDesired(podapi.Desired{Claim: claim, Network: policy})
 	p.wait("revoke-echo policy applied", 5*time.Second, func(o podapi.Observed) bool { return o.NetworkRevision == policy.Revision && o.NetworkError == "" })
-	must(s.c.Write(wire.TStdin, []byte("continue\n")), "resume live connection")
+	must(writeStdin(s, "continue\n"), "resume live connection")
 	r = s.collect(5*time.Second, nil)
-	s.conn.Close()
+	s.Close()
 	check(r.stdout == "revoked\n" && r.exit != nil && r.exit.Code == 0, "revocation blocks an established connection: %q", r.stdout)
 	denied("revoked policy")
 	ln.Close()
@@ -533,24 +556,24 @@ echo revoked`}})
 	s, err = open(p, wire.Open{Mode: wire.OpenExec, TTY: true, Rows: 30, Cols: 100})
 	must(err, "pty open")
 	check(s.opened.TTY, "pty session opened (%s)", s.opened.Session)
-	must(s.c.Write(wire.TStdin, []byte("stty size; tty; echo $0\n")), "pty write")
+	must(writeStdin(s, "stty size; tty; echo $0\n"), "pty write")
 	r = s.collect(10*time.Second, func(out string) bool { return strings.Contains(out, "-bash") && strings.Contains(out, "/dev/pts/") })
 	check(strings.Contains(r.stdout, "30 100"), "pty initial size 30x100")
-	must(s.c.WriteJSON(wire.TResize, wire.Resize{Rows: 50, Cols: 132}), "resize")
-	must(s.c.Write(wire.TStdin, []byte("stty size\n")), "pty write")
+	must(s.s.Resize(50, 132), "resize")
+	must(writeStdin(s, "stty size\n"), "pty write")
 	r = s.collect(10*time.Second, func(out string) bool { return strings.Contains(out, "50 132") })
 	check(strings.Contains(r.stdout, "50 132"), "pty resize to 50x132")
-	must(s.c.Write(wire.TStdin, []byte("exit 4\n")), "pty exit")
+	must(writeStdin(s, "exit 4\n"), "pty exit")
 	r = s.collect(10*time.Second, nil)
 	check(r.exit != nil && r.exit.Code == 4, "pty shell exit code 4")
-	s.conn.Close()
+	s.Close()
 
 	// Detach and rejoin with replay.
 	s, err = open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"sh", "-c", "for i in 1 2 3; do echo line$i; sleep 0.3; done; sleep 1; echo done"}})
 	must(err, "replay exec")
 	id := s.opened.Session
 	r = s.collect(5*time.Second, func(out string) bool { return strings.Contains(out, "line1") })
-	s.conn.Close()
+	s.Close()
 	time.Sleep(500 * time.Millisecond)
 	ls, err := open(p, wire.Open{Mode: wire.OpenList})
 	must(err, "list")
@@ -560,12 +583,12 @@ echo revoked`}})
 			found = true
 		}
 	}
-	ls.conn.Close()
+	ls.Close()
 	check(found, "list shows detached running session %s", id)
 	s, err = open(p, wire.Open{Mode: wire.OpenAttach, Session: id})
 	must(err, "attach")
 	r = s.collect(10*time.Second, nil)
-	s.conn.Close()
+	s.Close()
 	check(r.stdout == "line1\nline2\nline3\ndone\n" && r.exit != nil && r.exit.Code == 0, "rejoin replays all output then exit: %q", r.stdout)
 	// Retirement follows the final client's disconnect asynchronously.
 	retireBy := time.Now().Add(5 * time.Second)
@@ -575,7 +598,7 @@ echo revoked`}})
 			check(strings.Contains(err.Error(), "no session"), "consumed finished non-primary session is retired: %v", err)
 			break
 		}
-		s.conn.Close()
+		s.Close()
 		if time.Now().After(retireBy) {
 			log.Fatal("FAIL: consumed finished non-primary session was not retired")
 		}
@@ -586,29 +609,29 @@ echo revoked`}})
 	s, err = open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"sh", "-c", "head -c 3000000 /dev/zero | tr '\\0' a; echo; echo tail-marker; sleep 1"}})
 	must(err, "big exec")
 	id = s.opened.Session
-	s.conn.Close()
+	s.Close()
 	time.Sleep(700 * time.Millisecond)
 	s, err = open(p, wire.Open{Mode: wire.OpenAttach, Session: id})
 	must(err, "attach big")
 	r = s.collect(10*time.Second, nil)
-	s.conn.Close()
+	s.Close()
 	check(len(r.notices) == 1 && len(r.stdout) <= 1<<20+64<<10 && len(r.stdout) > 900<<10 && strings.HasSuffix(r.stdout, "tail-marker\n"), "gap notice %q, replay %d bytes", r.notices, len(r.stdout))
 
 	// Signals by name.
 	s, err = open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"sleep", "100"}})
 	must(err, "sleep")
-	must(s.c.WriteJSON(wire.TSignal, wire.Signal{Name: "TERM"}), "signal")
+	must(s.s.Signal("TERM"), "signal")
 	r = s.collect(5*time.Second, nil)
-	s.conn.Close()
+	s.Close()
 	check(r.exit != nil && r.exit.Signal == "TERM" && r.exit.Code == 143, "signal TERM: %+v", r.exit)
 
 	// Sessions count.
 	s, err = open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"sleep", "100"}})
 	must(err, "sleep")
 	p.wait("sessions=1", 5*time.Second, func(o podapi.Observed) bool { return o.Sessions == 1 })
-	must(s.c.WriteJSON(wire.TSignal, wire.Signal{Name: "KILL"}), "kill")
+	must(s.s.Signal("KILL"), "kill")
 	s.collect(5*time.Second, nil)
-	s.conn.Close()
+	s.Close()
 	p.wait("sessions=0", 5*time.Second, func(o podapi.Observed) bool { return o.Sessions == 0 })
 	check(true, "observed sessions follows attached clients")
 
@@ -653,9 +676,9 @@ echo revoked`}})
 	check(strings.Contains(diskStatus(o, dataID).Message, "busy"), "busy unmount reported: %q", diskStatus(o, dataID).Message)
 	r = sh(p, "cat /data/file")
 	check(r.stdout == "persisted\n", "still mounted after failed unmount")
-	must(busy.c.WriteJSON(wire.TSignal, wire.Signal{Name: "KILL"}), "kill busy")
+	must(busy.s.Signal("KILL"), "kill busy")
 	busy.collect(5*time.Second, nil)
-	busy.conn.Close()
+	busy.Close()
 	t = time.Now()
 	o = p.wait("data Detached", 30*time.Second, func(o podapi.Observed) bool { return diskStatus(o, dataID).Phase == podapi.DiskDetached })
 	log.Printf("retry detached after %v", time.Since(t).Round(time.Millisecond))
@@ -714,8 +737,8 @@ echo revoked`}})
 	p.wait("Stopping", 5*time.Second, func(o podapi.Observed) bool { return o.Phase == podapi.PhaseStopping })
 	o = p.wait("Exited", 60*time.Second, func(o podapi.Observed) bool { return o.Phase == podapi.PhaseExited })
 	log.Printf("stop -> Exited: %v (includes 10s grace for a TERM-ignoring process)", time.Since(t).Round(time.Millisecond))
-	keep.conn.Close()
-	check(o.Exit != nil && o.Exit.Reason == "Stopped" && o.Error == "", "observed exit %+v error %q", o.Exit, o.Error)
+	keep.Close()
+	check(o.Exit != nil && o.Exit.Reason == wire.ReasonStopped && o.Error == "", "observed exit %+v error %q", o.Exit, o.Error)
 	p.waitExit(10 * time.Second)
 	fsClean(rootImg)
 	check(fsCat(rootImg, "/root/marker") == "root-data\n", "root data persisted")
@@ -736,12 +759,12 @@ func scenarioIdle() {
 	must(err, "exec")
 	t := time.Now()
 	s.collect(10*time.Second, nil)
-	s.conn.Close()
+	s.Close()
 	// Detached background work keeps the blip alive.
 	sh(p, "setsid sleep 3 >/dev/null 2>&1 < /dev/null &")
 	o := p.wait("Exited", 30*time.Second, func(o podapi.Observed) bool { return o.Phase == podapi.PhaseExited })
 	idle := time.Since(t)
-	check(o.Exit != nil && o.Exit.Reason == "Idle", "idle exit %+v", o.Exit)
+	check(o.Exit != nil && o.Exit.Reason == wire.ReasonIdle, "idle exit %+v", o.Exit)
 	check(idle > 9*time.Second, "idle waited for session (4s), background work (3s) and timeout (3s): %v", idle.Round(time.Millisecond))
 	p.waitExit(10 * time.Second)
 	fsClean(rootImg)
@@ -762,10 +785,10 @@ func scenarioCommand() {
 	s, err := open(p, wire.Open{Mode: wire.OpenAttach})
 	must(err, "attach main")
 	r := s.collect(10*time.Second, nil)
-	s.conn.Close()
+	s.Close()
 	check(r.stdout == "cmd-out\n/etc\n" && r.exit != nil && r.exit.Code == 7, "attach to main: %q %+v", r.stdout, r.exit)
 	o := p.wait("Exited", 30*time.Second, func(o podapi.Observed) bool { return o.Phase == podapi.PhaseExited })
-	check(o.Exit != nil && o.Exit.Code == 7 && o.Exit.Reason == "Completed", "command exit %+v", o.Exit)
+	check(o.Exit != nil && o.Exit.Code == 7 && o.Exit.Reason == wire.ReasonCompleted, "command exit %+v", o.Exit)
 	p.waitExit(10 * time.Second)
 	fsClean(rootImg)
 	check(fsCat(rootImg, "/cmd") == "yes\n", "command output file persisted")

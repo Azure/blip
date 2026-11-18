@@ -32,7 +32,7 @@ func (w *world) Check() error {
 	}
 	claims := map[string]int{}
 	for _, p := range w.Actual.Pods.Items {
-		uid := p.Labels[controller.LabelBlipUID]
+		uid := p.Labels[v1.LabelBlipUID]
 		if uid == "" {
 			continue
 		}

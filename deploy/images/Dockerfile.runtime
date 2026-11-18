@@ -1,7 +1,7 @@
 # Built by hack/build-images.sh from binaries prebuilt with `make build` and
 # guest assets from `make guest`. The script stages the (static) Cloud
-# Hypervisor binary in build/images/.
-FROM debian:bookworm-slim
+# Hypervisor binary in build/images/. The base suite matches the node image.
+FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends iproute2 nftables ca-certificates \
     && rm -rf /var/lib/apt/lists/*

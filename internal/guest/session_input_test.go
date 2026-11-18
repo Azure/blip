@@ -15,7 +15,7 @@ import (
 )
 
 func newInputTestSession(stdin *os.File, pid int) *session {
-	s := &session{proc: &proc{pid: pid, stdin: stdin}, out: ring{max: RingSize}}
+	s := &session{proc: &proc{pid: pid, stdin: stdin}, out: ring{max: ringSize}}
 	s.cond = sync.NewCond(&s.mu)
 	s.inCond = sync.NewCond(&s.inMu)
 	go s.pumpInput()
@@ -121,7 +121,7 @@ func TestTTYInputOverflowDoesNotBlockSignals(t *testing.T) {
 // sftp or scp is never silently truncated. Once the queue is full, the next
 // frame waits for the pump to make space instead of being discarded.
 func TestNonTTYInputWaitsInsteadOfDropping(t *testing.T) {
-	s := &session{out: ring{max: RingSize}}
+	s := &session{out: ring{max: ringSize}}
 	s.inCond = sync.NewCond(&s.inMu)
 	defer s.closeInput()
 
@@ -217,7 +217,7 @@ func TestNonTTYInputStallDropsAndKeepsSignalsResponsive(t *testing.T) {
 // TestInputDropNoticeIsThrottled verifies that a flood of dropped frames
 // produces one notice instead of one per frame.
 func TestInputDropNoticeIsThrottled(t *testing.T) {
-	s := &session{out: ring{max: RingSize}, tty: true}
+	s := &session{out: ring{max: ringSize}, tty: true}
 	s.inCond = sync.NewCond(&s.inMu)
 	s.inBytes = maxPendingInput // full: every frame below is dropped
 
@@ -294,7 +294,7 @@ func TestPumpCopiesReadBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	s := &session{out: ring{max: RingSize}}
+	s := &session{out: ring{max: ringSize}}
 	s.cond = sync.NewCond(&s.mu)
 	go s.pump(r, wire.TStdout)
 

@@ -20,6 +20,29 @@ import (
 // startTimeout bounds waiting for a sandbox to run.
 const startTimeout = 10 * time.Minute
 
+// retryUnreachable starts a sandbox and connects to its guest. ErrUnreachable
+// means no process observed the open, so the sandbox is recreated and the open
+// retried once. start receives a context bounded by startTimeout; open receives
+// the running pod. On a retry, a non-nil onRetry sees the pod that was lost.
+func retryUnreachable[T any](ctx context.Context, onRetry func(pod string), start func(context.Context) (string, error), open func(pod string) (T, error)) (T, error) {
+	var zero T
+	for attempt := 0; ; attempt++ {
+		startCtx, cancel := context.WithTimeout(ctx, startTimeout)
+		pod, err := start(startCtx)
+		cancel()
+		if err != nil {
+			return zero, err
+		}
+		v, err := open(pod)
+		if err == nil || attempt > 0 || !errors.Is(err, session.ErrUnreachable) {
+			return v, err
+		}
+		if onRetry != nil {
+			onRetry(pod)
+		}
+	}
+}
+
 // sftpCommand runs the image's sftp-server.
 var sftpCommand = []string{"/bin/sh", "-c", `for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/sftp-server; do [ -x "$p" ] && exec "$p"; done; exec sftp-server`}
 
@@ -29,6 +52,9 @@ type sessionChannel struct {
 	sandbox string
 	name    string // short sandbox name, for messages
 	ch      ssh.Channel
+	// connCtx ends with the SSH connection. adopt checks it so a guest opened
+	// while the connection was going away is not used.
+	connCtx context.Context
 
 	// guestCtx owns the guest transport for this channel. It deliberately
 	// ignores the SSH connection's cancellation: after an abrupt disconnect
@@ -59,7 +85,7 @@ func (s *Server) handleSession(ctx context.Context, owner, sandbox, name string,
 	// hangup path has finished. context.WithoutCancel also keeps its values.
 	guestCtx, guestCancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer guestCancel()
-	c := &sessionChannel{srv: s, owner: owner, sandbox: sandbox, name: name, ch: ch, guestCtx: guestCtx, open: wire.Open{Mode: wire.OpenExec}, resized: make(chan struct{}, 1)}
+	c := &sessionChannel{srv: s, owner: owner, sandbox: sandbox, name: name, ch: ch, connCtx: ctx, guestCtx: guestCtx, open: wire.Open{Mode: wire.OpenExec}, resized: make(chan struct{}, 1)}
 	for req := range reqs {
 		c.handle(ctx, req)
 	}
@@ -210,23 +236,23 @@ func (c *sessionChannel) openSession(ctx context.Context, o wire.Open, nl string
 	if o.OpenID == "" {
 		o.OpenID = newOpenID()
 	}
-	guestCtx := c.guestCtx
-	if guestCtx == nil {
-		guestCtx = ctx
-	}
-	for attempt := 0; ; attempt++ {
-		startCtx, cancel := context.WithTimeout(ctx, startTimeout)
-		pod, err := c.start(startCtx, nl, o.TTY)
-		cancel()
-		if err != nil {
-			return nil, err
-		}
-		sess, err := c.srv.Sessions.Open(guestCtx, c.srv.Namespace, pod, o)
-		if err == nil || attempt > 0 || !errors.Is(err, session.ErrUnreachable) {
-			return sess, err
-		}
-		c.srv.Log.Info("sandbox stopped while opening; recreating", "pod", pod)
-	}
+	return retryUnreachable(ctx,
+		func(pod string) { c.srv.Log.Info("sandbox stopped while opening; recreating", "pod", pod) },
+		func(startCtx context.Context) (string, error) {
+			return c.start(startCtx, nl, o.TTY)
+		},
+		func(pod string) (*session.Session, error) {
+			return c.srv.Sessions.Open(c.guestCtx, c.srv.Namespace, pod, o)
+		})
+}
+
+// adopt makes sess the channel's current guest session. It reports false when
+// the SSH side is already gone; the caller must then hang up and close sess.
+func (c *sessionChannel) adopt(sess *session.Session) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sess = sess
+	return !c.closing && c.connCtx.Err() == nil
 }
 
 // run starts the guest session, answers req, and relays until the session
@@ -243,15 +269,11 @@ func (c *sessionChannel) run(ctx context.Context, req *ssh.Request, o wire.Open)
 		req.Reply(false, nil)
 		return
 	}
-	c.mu.Lock()
-	c.sess = sess
-	if c.closing || ctx.Err() != nil {
-		c.mu.Unlock()
+	if !c.adopt(sess) {
 		c.hangup()
 		sess.Close()
 		return
 	}
-	c.mu.Unlock()
 	stopResize := c.resizeGuest(ctx, sess, o)
 	// Close only after the hangup path below has had a chance to signal the
 	// guest. hangupSession closes the transport itself; Close is idempotent.
@@ -391,22 +413,14 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, owner, sandbox string, n
 		nch.Reject(ssh.ConnectionFailed, "invalid direct-tcpip request")
 		return
 	}
-	var st *session.Stream
-	var err error
-	for attempt := 0; ; attempt++ {
-		startCtx, cancel := context.WithTimeout(ctx, startTimeout)
-		pod, aerr := s.ensureSandbox(startCtx, owner, sandbox)
-		cancel()
-		if aerr != nil {
-			err = aerr
-			break
-		}
-		st, err = s.Sessions.Dial(ctx, s.Namespace, pod, p.Host, int(p.Port))
-		if err == nil || attempt > 0 || !errors.Is(err, session.ErrUnreachable) {
-			break
-		}
-		log.Info("sandbox stopped while dialing; recreating", "pod", pod)
-	}
+	st, err := retryUnreachable(ctx,
+		func(pod string) { log.Info("sandbox stopped while dialing; recreating", "pod", pod) },
+		func(startCtx context.Context) (string, error) {
+			return s.ensureSandbox(startCtx, owner, sandbox)
+		},
+		func(pod string) (*session.Stream, error) {
+			return s.Sessions.Dial(ctx, s.Namespace, pod, p.Host, int(p.Port))
+		})
 	if err != nil {
 		log.Info("direct-tcpip failed", "host", p.Host, "port", p.Port, "error", err)
 		nch.Reject(ssh.ConnectionFailed, err.Error())

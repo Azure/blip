@@ -10,7 +10,6 @@ import (
 	"io"
 	"sync"
 
-	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/wire"
 )
 
@@ -72,16 +71,6 @@ func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (
 		return nil, errors.New(s.Opened.Error)
 	}
 	return s, nil
-}
-
-// List returns the guest's sessions.
-func (c *Client) List(ctx context.Context, namespace, pod string) ([]wire.SessionInfo, error) {
-	s, err := c.Open(ctx, namespace, pod, wire.Open{Mode: wire.OpenList})
-	if err != nil {
-		return nil, err
-	}
-	s.Close()
-	return s.Opened.Sessions, nil
 }
 
 // Dial connects to host:port from inside the guest.
@@ -241,24 +230,3 @@ func (st *Stream) Write(p []byte) (int, error) { return st.s.Write(p) }
 func (st *Stream) CloseWrite() error { return st.s.CloseStdin() }
 
 func (st *Stream) Close() error { return st.s.Close() }
-
-// PodFor returns the VM pod of a running blip, or an error that explains why
-// it has none.
-func PodFor(b *v1alpha1.Blip) (string, error) {
-	switch b.Status.Phase {
-	case v1alpha1.BlipRunning:
-		if b.Status.Pod != "" {
-			return b.Status.Pod, nil
-		}
-		return "", fmt.Errorf("blip %q is not running yet", b.Name)
-	case v1alpha1.BlipSaving:
-		return "", fmt.Errorf("blip %q has stopped and is saving", b.Name)
-	case v1alpha1.BlipSucceeded, v1alpha1.BlipFailed:
-		return "", fmt.Errorf("blip %q has finished (%s)", b.Name, b.Status.Phase)
-	}
-	msg := ""
-	if b.Status.Message != "" {
-		msg = ": " + b.Status.Message
-	}
-	return "", fmt.Errorf("blip %q is not running yet%s", b.Name, msg)
-}

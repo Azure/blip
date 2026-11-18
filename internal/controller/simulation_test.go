@@ -256,7 +256,7 @@ func (s *controllerSimulation) warm(name, node string) {
 	s.t.Helper()
 	p := s.pool.podFor(s.getPool("default"), name)
 	p.Spec.NodeName = node
-	p.Labels[LabelWarm] = "true"
+	p.Labels[v1.LabelWarm] = "true"
 	p.Status.Phase = corev1.PodRunning
 	s.create(p)
 }
@@ -284,9 +284,9 @@ func allocationSave(t *testing.T, loseAt int) *controllerSimulation {
 		b := s.getBlip("job")
 		claimed := 0
 		for _, p := range s.pods() {
-			if p.Labels[LabelBlipUID] == string(b.UID) {
+			if p.Labels[v1.LabelBlipUID] == string(b.UID) {
 				claimed++
-				if p.Annotations[AnnotationBlip] != b.Name || len(p.OwnerReferences) != 1 || p.OwnerReferences[0].UID != b.UID {
+				if p.Annotations[v1.AnnotationBlip] != b.Name || len(p.OwnerReferences) != 1 || p.OwnerReferences[0].UID != b.UID {
 					t.Fatalf("claim ownership mismatch: %+v", p.ObjectMeta)
 				}
 			}
@@ -377,7 +377,7 @@ func allocationSave(t *testing.T, loseAt int) *controllerSimulation {
 	s.until("durable success", func() bool { return s.getBlip("job").Status.Phase == v1.BlipSucceeded }, "state", "root", "state", "data", "blip", "job")
 	s.until("pod cleanup", func() bool {
 		for _, p := range s.pods() {
-			if p.Labels[LabelBlipUID] == string(b.UID) {
+			if p.Labels[v1.LabelBlipUID] == string(b.UID) {
 				return false
 			}
 		}
@@ -505,7 +505,7 @@ func TestSimulationPoolDeleteLosesToClaim(t *testing.T) {
 	}
 	s.deliver()
 	s.step("pool", "default")
-	if pods := s.pods(); len(pods) != 1 || pods[0].Labels[LabelBlipUID] != string(s.getBlip("job").UID) {
+	if pods := s.pods(); len(pods) != 1 || pods[0].Labels[v1.LabelBlipUID] != string(s.getBlip("job").UID) {
 		t.Fatalf("pool deleted the concurrently claimed pod: %+v", pods)
 	}
 }
@@ -547,9 +547,9 @@ func TestSimulationContendedAllocation(t *testing.T) {
 				s.newBlip(name, withRoot(name+".root"))
 				if !shared {
 					root := s.getState(name + ".root")
-					root.Labels = map[string]string{LabelOwner: name}
+					root.Labels = map[string]string{v1.LabelOwner: name}
 					s.must(s.c.Update(s.ctx, root))
-					s.updateBlip(name, func(b *v1.Blip) { b.Labels = map[string]string{LabelOwner: name} })
+					s.updateBlip(name, func(b *v1.Blip) { b.Labels = map[string]string{v1.LabelOwner: name} })
 				}
 			}
 			if shared {
@@ -586,7 +586,7 @@ func TestSimulationContendedAllocation(t *testing.T) {
 			if loser := s.getBlip("left"); loser.Status.Pod != "" {
 				t.Fatalf("loser claimed a pod: %+v", loser.Status)
 			}
-			if got := s.getPod(winner.Status.Pod); got.Labels[LabelBlipUID] != string(winner.UID) {
+			if got := s.getPod(winner.Status.Pod); got.Labels[v1.LabelBlipUID] != string(winner.UID) {
 				t.Fatalf("winner lost pod ownership: %+v", got.ObjectMeta)
 			}
 			if !shared {

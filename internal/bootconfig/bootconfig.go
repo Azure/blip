@@ -1,5 +1,7 @@
-// Package guest is blip-guest, the init process (PID 1) of every blip VM.
-package guest
+// Package bootconfig is the contract for the read-only config disk the runtime
+// attaches at boot. It is shared by the runtime, which writes the disk, and the
+// guest, which reads it.
+package bootconfig
 
 import (
 	"bytes"

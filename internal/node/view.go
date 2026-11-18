@@ -1,6 +1,6 @@
 // Package node is the blip-node agent: it owns the node's storage, peer trust and
 // export service, prepares disks for VM pods, and reports this node's view of
-// every BlipState. See docs/ARCHITECTURE.md.
+// every BlipState. See the README's implementation outline.
 //
 // Each pass reads a snapshot (view) of cached cluster objects, the store, and
 // the pod directories, computes a plan with pure functions, and executes it.
@@ -25,17 +25,6 @@ import (
 	"github.com/Azure/blip/internal/peer"
 	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/storage"
-)
-
-const (
-	LabelPool          = "blip.dev/pool"
-	LabelBlipUID       = "blip.dev/blip-uid"
-	LabelWarm          = "blip.dev/warm"
-	AnnotationBlip     = "blip.dev/blip"
-	AnnotationObserved = "blip.dev/observed"
-	// AnnotationPrepareError reports why a claimed pod's network, root or a mount
-	// could not be prepared. The node agent sets and clears it.
-	AnnotationPrepareError = "blip.dev/prepare-error"
 )
 
 // nodeHeartbeatTTL is how long a node's last heartbeat keeps it eligible as

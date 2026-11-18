@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/blip/internal/guest"
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/bootconfig"
+	"github.com/Azure/blip/internal/netpolicy"
 	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
 )
@@ -90,6 +90,7 @@ func newTestRuntime(t *testing.T) (*runtime, *fakeCH, *fakeGuest) {
 	a, b := net.Pipe()
 	t.Cleanup(func() { a.Close(); b.Close() })
 	r.raw, r.conn = a, wire.NewConn(a)
+	r.Apply(r.now(), Event{Kind: EventConnected, Generation: r.gen})
 	g := &fakeGuest{t: t, r: r, frames: make(chan frame, 64), conn: wire.NewConn(b)}
 	go func() {
 		for {
@@ -478,7 +479,7 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := guest.DecodeConfig(img)
+	cfg, err := bootconfig.DecodeConfig(img)
 	if err != nil || cfg.KubeNamespace != "tenant" || cfg.GatewayLoopbackPort != 8123 {
 		t.Fatalf("config %+v: %v", cfg, err)
 	}
@@ -577,24 +578,25 @@ func TestWaitSocketRejectsNonSocket(t *testing.T) {
 
 type fakePolicyNetwork struct {
 	calls  int
-	policy *network.Policy
+	policy *netpolicy.Policy
 	active bool
+	unsafe bool
 	err    error
 }
 
-func (n *fakePolicyNetwork) apply(p *network.Policy, active bool) error {
+func (n *fakePolicyNetwork) apply(p *netpolicy.Policy, active bool) (bool, error) {
 	n.calls++
 	n.policy, n.active = p, active
-	return n.err
+	return n.unsafe, n.err
 }
 
 func TestPolicyGatesClaimAndReconcilesWithoutGuest(t *testing.T) {
 	r, ch, g := newTestRuntime(t)
-	r.o.SkipNetwork = false
+	r.skipNetwork = false
 	n := &fakePolicyNetwork{}
 	r.network = n
 	// A warm VM can preinstall policy, but forwarding stays closed.
-	r.desired.Network = &network.Policy{Revision: "one"}
+	r.desired.Network = &netpolicy.Policy{Revision: "one"}
 	r.reconcile()
 	r.writeObserved()
 	if n.calls != 1 || n.active || observed(t, r).NetworkRevision != "one" {
@@ -609,15 +611,15 @@ func TestPolicyGatesClaimAndReconcilesWithoutGuest(t *testing.T) {
 	}
 	// A corrected policy is applied immediately, without waiting for retry.
 	n.err = nil
-	r.desired.Network = &network.Policy{Revision: "two"}
+	r.desired.Network = &netpolicy.Policy{Revision: "two"}
 	r.reconcile()
 	g.expect(wire.TClaim, nil)
 	if !n.active {
 		t.Fatal("claim did not open policy gate")
 	}
 	g.reply(wire.TClaimResult, wire.Result{ID: "root"})
-	r.conn = nil
-	r.desired.Network = &network.Policy{Revision: "revoked"}
+	r.execute(r.Apply(r.now(), Event{Kind: EventDisconnected, Generation: r.gen}))
+	r.desired.Network = &netpolicy.Policy{Revision: "revoked"}
 	r.reconcile()
 	r.writeObserved()
 	if n.policy.Revision != "revoked" || observed(t, r).NetworkRevision != "revoked" {
@@ -627,7 +629,7 @@ func TestPolicyGatesClaimAndReconcilesWithoutGuest(t *testing.T) {
 
 func TestMissingPolicyBlocksClaimButNotStopOrMounts(t *testing.T) {
 	r, _, g := newTestRuntime(t)
-	r.o.SkipNetwork = false
+	r.skipNetwork = false
 	n := &fakePolicyNetwork{}
 	r.network = n
 	r.desired.Claim = &podapi.Claim{Root: podapi.Disk{ID: "root"}}
@@ -638,7 +640,7 @@ func TestMissingPolicyBlocksClaimButNotStopOrMounts(t *testing.T) {
 	}
 	// Once running, a policy error must not strand attached disks or stop.
 	r.claimID = "root"
-	r.desired.Network = &network.Policy{Revision: "bad"}
+	r.desired.Network = &netpolicy.Policy{Revision: "bad"}
 	n.err = errors.New("invalid policy")
 	r.desired.Mounts = []podapi.Disk{{ID: "data", Path: "/data"}}
 	r.reconcile()
@@ -646,6 +648,17 @@ func TestMissingPolicyBlocksClaimButNotStopOrMounts(t *testing.T) {
 	r.desired.Stop = true
 	r.reconcile()
 	g.expect(wire.TShutdown, nil)
+}
+
+func TestUnsafePolicyFailureKillsVM(t *testing.T) {
+	r, _, _ := newTestRuntime(t)
+	r.skipNetwork = false
+	r.network = &fakePolicyNetwork{unsafe: true, err: errors.New("TAP removal failed")}
+	r.desired.Network = &netpolicy.Policy{Revision: "bad"}
+	r.reconcile()
+	if !r.killSent {
+		t.Fatal("unsafe policy failure did not kill the VM")
+	}
 }
 
 // mountedRuntime returns a running runtime with d mounted in the guest.

@@ -96,22 +96,14 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	if err := r.Get(ctx, rq.NamespacedName, bn); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
-	safe := false
 	if bn.Spec.Drain {
 		if err := r.stopBlips(ctx, bn.Name); err != nil {
 			return reconcile.Result{}, err
 		}
-		var err error
-		if safe, err = r.safeToRemove(ctx, bn.Name); err != nil {
-			return reconcile.Result{}, err
-		}
 	}
-	if bn.Status.SafeToRemove != safe {
-		base := bn.DeepCopy()
-		bn.Status.SafeToRemove = safe
-		if err := r.Status().Patch(ctx, bn, client.MergeFrom(base)); err != nil {
-			return reconcile.Result{}, client.IgnoreNotFound(err)
-		}
+	safe, err := syncSafeToRemove(ctx, r.Client, bn)
+	if err != nil {
+		return reconcile.Result{}, err
 	}
 	if bn.Spec.Drain && !safe {
 		// Keep recomputing while the drain is not safe. The event that frees
@@ -132,7 +124,7 @@ func (r *NodeReconciler) stopBlips(ctx context.Context, node string) error {
 	}
 	for i := range blips.Items {
 		b := &blips.Items[i]
-		if finished(b) || b.Spec.Stop || b.Status.Node != node {
+		if v1.Finished(b) || b.Spec.Stop || b.Status.Node != node {
 			continue
 		}
 		base := b.DeepCopy()
@@ -147,8 +139,25 @@ func (r *NodeReconciler) stopBlips(ctx context.Context, node string) error {
 	return nil
 }
 
-func (r *NodeReconciler) safeToRemove(ctx context.Context, node string) (bool, error) {
-	return nodeSafeToRemove(ctx, r.Client, node)
+// syncSafeToRemove recomputes the node's safe-to-remove verdict and persists
+// it. A node that is not draining is never safe by this definition; its drain
+// verdict belongs to an earlier drain.
+func syncSafeToRemove(ctx context.Context, c client.Client, bn *v1.BlipNode) (bool, error) {
+	safe := false
+	if bn.Spec.Drain {
+		var err error
+		if safe, err = nodeSafeToRemove(ctx, c, bn.Name); err != nil {
+			return false, err
+		}
+	}
+	if bn.Status.SafeToRemove != safe {
+		base := bn.DeepCopy()
+		bn.Status.SafeToRemove = safe
+		if err := patchStatus(ctx, c, bn, base); err != nil {
+			return safe, client.IgnoreNotFound(err)
+		}
+	}
+	return safe, nil
 }
 
 // nodeSafeToRemove reports whether a draining node holds nothing that still
@@ -174,11 +183,11 @@ func nodeSafeToRemove(ctx context.Context, c client.Client, node string) (bool, 
 		return false, err
 	}
 	for _, b := range blips.Items {
-		if !finished(&b) && b.Status.Node == node {
+		if !v1.Finished(&b) && b.Status.Node == node {
 			return false, nil
 		}
 	}
-	claimed, _ := labels.NewRequirement(LabelBlipUID, selection.Exists, nil)
+	claimed, _ := labels.NewRequirement(v1.LabelBlipUID, selection.Exists, nil)
 	var pods corev1.PodList
 	if err := c.List(ctx, &pods, client.MatchingLabelsSelector{Selector: labels.NewSelector().Add(*claimed)}); err != nil && !apierrors.IsNotFound(err) {
 		return false, err

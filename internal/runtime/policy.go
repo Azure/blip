@@ -6,42 +6,26 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/netpolicy"
 )
 
-// ruleMatch validates even rules in unreachable/empty layers. Only parsed
-// addresses, numeric ports, and a fixed protocol vocabulary enter nft syntax.
-func ruleMatch(r network.Rule, reverse bool) (string, error) {
-	cidr, err := netip.ParsePrefix(r.CIDR)
-	if err != nil || !cidr.Addr().Is4() {
-		return "", fmt.Errorf("invalid IPv4 CIDR %q", r.CIDR)
-	}
-	cidr = cidr.Masked()
+// ruleMatch renders one rule. The rule must already have passed
+// netpolicy.Rule.Validate; only parsed addresses, numeric ports, and a fixed
+// protocol vocabulary enter nft syntax.
+func ruleMatch(r netpolicy.Rule, reverse bool) string {
+	cidr := r.CIDRPrefix()
 	addr, port := "daddr", "dport"
 	if reverse {
 		addr, port = "saddr", "sport"
 	}
 	match := "ip " + addr + " " + cidr.String()
 	for _, value := range r.Except {
-		p, err := netip.ParsePrefix(value)
-		if err != nil || !p.Addr().Is4() || p.Bits() < cidr.Bits() || !cidr.Contains(p.Masked().Addr()) {
-			return "", fmt.Errorf("exception %q is not within %s", value, cidr)
-		}
 		// Separate negative matches also handle nested/duplicate exceptions;
 		// anonymous interval sets reject overlapping CIDRs on some kernels.
+		p, _ := netip.ParsePrefix(value)
 		match += " ip " + addr + " != " + p.Masked().String()
 	}
 	proto := strings.ToLower(r.Protocol)
-	switch proto {
-	case "", "tcp", "udp":
-	default:
-		return "", fmt.Errorf("unsupported protocol %q", r.Protocol)
-	}
-	if r.Port < 0 || r.Port > 65535 || r.EndPort < 0 || r.EndPort > 65535 ||
-		(r.EndPort != 0 && (r.Port == 0 || r.EndPort < r.Port)) ||
-		(r.Port != 0 && proto == "") {
-		return "", fmt.Errorf("invalid %q port range %d-%d", r.Protocol, r.Port, r.EndPort)
-	}
 	if proto != "" {
 		match += " meta l4proto " + proto
 	}
@@ -51,12 +35,12 @@ func ruleMatch(r network.Rule, reverse bool) (string, error) {
 			match += "-" + strconv.Itoa(int(r.EndPort))
 		}
 	}
-	return match, nil
+	return match
 }
 
-func (p *podNet) policyScript(policy *network.Policy, active bool) (string, error) {
-	if policy != nil && strings.TrimSpace(policy.Revision) == "" {
-		return "", fmt.Errorf("network policy revision is empty")
+func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, error) {
+	if err := policy.Validate(); err != nil {
+		return "", err
 	}
 	var b strings.Builder
 	// 'add' is idempotent. Deleting/recreating ONLY our table in the same
@@ -66,11 +50,8 @@ func (p *podNet) policyScript(policy *network.Policy, active bool) (string, erro
 		if policy != nil {
 			for i, layer := range policy.Layers {
 				fmt.Fprintf(&b, " chain %s_%d {\n", direction, i)
-				for j, rule := range layer {
-					match, err := ruleMatch(rule, direction == "reply")
-					if err != nil {
-						return "", fmt.Errorf("layer %d rule %d: %w", i, j, err)
-					}
+				for _, rule := range layer {
+					match := ruleMatch(rule, direction == "reply")
 					// Return passes this OR layer; the caller checks the next
 					// layer. An accept here would incorrectly bypass the AND.
 					fmt.Fprintf(&b, "  %s counter return\n", match)

@@ -1,5 +1,5 @@
-// Package controller implements blip-controller: the node, pool, state, and
-// blip reconcilers. See docs/ARCHITECTURE.md.
+// Package controller implements blip-controller: the enrollment, node, pool,
+// state, and blip reconcilers. See the README's implementation outline.
 package controller
 
 import (
@@ -14,27 +14,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
-)
-
-// Labels, annotations, and the finalizer (the complete list is in
-// docs/ARCHITECTURE.md).
-const (
-	LabelPool             = "blip.dev/pool"
-	LabelBlipUID          = "blip.dev/blip-uid"
-	LabelWarm             = "blip.dev/warm"
-	LabelEnrolled         = "blip.dev/enrolled"
-	LabelHypervisorPrefix = "blip.dev/hypervisor-"
-	LabelOwner            = "blip.dev/owner"
-	AnnotationBlip        = "blip.dev/blip"
-	AnnotationObserved    = "blip.dev/observed"
-	// AnnotationEnrollmentDrain marks a drain the controller started because
-	// the node stopped matching every pool. It is cleared if the node matches
-	// a pool again; a drain without it is an operator drain and is left alone.
-	AnnotationEnrollmentDrain = "blip.dev/enrollment-drain"
-	// AnnotationPinnedNode marks a VM pod the pool booted for Blips whose
-	// data lives on that node; the pod's node affinity allows only it.
-	AnnotationPinnedNode = "blip.dev/pinned-node"
-	Finalizer            = "blip.dev/finalizer"
 )
 
 // Field indexes.
@@ -160,11 +139,7 @@ func stateRefs(b *v1.Blip) []string {
 	return out
 }
 
-func finished(b *v1.Blip) bool {
-	return b.Status.Phase == v1.BlipSucceeded || b.Status.Phase == v1.BlipFailed
-}
-
-func isVacant(p *corev1.Pod) bool { return p.Labels[LabelBlipUID] == "" }
+func isVacant(p *corev1.Pod) bool { return p.Labels[v1.LabelBlipUID] == "" }
 
 func podTerminated(p *corev1.Pod) bool {
 	return p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed

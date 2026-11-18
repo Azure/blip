@@ -1,6 +1,6 @@
 // Package v1alpha1 contains the blip.dev/v1alpha1 API.
 //
-// Ownership rules (see docs/ARCHITECTURE.md):
+// Ownership rules (see the README's implementation outline):
 //   - Users write spec.
 //   - The controller is the only writer of Blip.status, BlipPool.status,
 //     BlipNode.spec, and every BlipState.status field except status.nodes.
@@ -582,11 +582,6 @@ type Locality struct {
 	// Fallback means the Blip stopped waiting and claims any warm VM.
 	Fallback bool `json:"fallback,omitempty"`
 }
-
-// AnnotationWaitForClient on a Blip asks the guest to hold the primary
-// command's output until a client attaches. `kubectl blip run` sets it when it
-// will attach; a detached run leaves it unset so the command starts itself.
-const AnnotationWaitForClient = "blip.dev/wait-for-client"
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

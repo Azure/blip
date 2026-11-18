@@ -26,7 +26,7 @@ func TestForkValidatesSourceBeforeCreatingStates(t *testing.T) {
 		{name: "ownerless-copy", change: func(st *v1alpha1.BlipState) {
 			st.Name, st.Labels, st.Spec.CopyFrom = "shared-copy", nil, "shared-image"
 		}},
-		{name: "wrong-owner-label", change: func(st *v1alpha1.BlipState) { st.Labels[ownerLabel] = "bob" }},
+		{name: "wrong-owner-label", change: func(st *v1alpha1.BlipState) { st.Labels[v1alpha1.LabelOwner] = "bob" }},
 		{name: "failed", change: func(st *v1alpha1.BlipState) { st.Status.Phase = v1alpha1.StateFailed }},
 		{name: "deleting", change: deletingForkFixture},
 	} {
@@ -72,9 +72,9 @@ func TestForkValidatesEveryInheritedMountBeforeCreatingStates(t *testing.T) {
 			{name: "same-owner-legacy", change: func(st *v1alpha1.BlipState) { st.Name = "legacy" }},
 			{name: "ownerless-filesystem", change: func(st *v1alpha1.BlipState) { st.Name, st.Labels = "shared-data", nil }},
 			{name: "foreign-owner", change: func(st *v1alpha1.BlipState) {
-				st.Name, st.Labels[ownerLabel] = "bob.data", "bob"
+				st.Name, st.Labels[v1alpha1.LabelOwner] = "bob.data", "bob"
 			}},
-			{name: "owner-prefix-wrong-label", change: func(st *v1alpha1.BlipState) { st.Labels[ownerLabel] = "bob" }},
+			{name: "owner-prefix-wrong-label", change: func(st *v1alpha1.BlipState) { st.Labels[v1alpha1.LabelOwner] = "bob" }},
 			{name: "failed", change: func(st *v1alpha1.BlipState) { st.Status.Phase = v1alpha1.StateFailed }},
 			{name: "deleting", change: deletingForkFixture},
 			{name: "missing", missing: true},

@@ -409,7 +409,7 @@ func TestCollectOwnRootState(t *testing.T) {
 	if m := findSpecMount(s.Spec.Mounts, "alice.home"); m != nil {
 		t.Fatalf("collect mounted the caller's root state: %+v", m)
 	}
-	if v := s.Annotations[collectMountsAnnotation]; v != "" {
+	if v := s.Annotations[v1alpha1.AnnotationCollectMounts]; v != "" {
 		t.Fatalf("annotation = %q, want cleared", v)
 	}
 }
@@ -901,7 +901,7 @@ func TestCollectCleanupProvenance(t *testing.T) {
 			case "new lifetime":
 				s.Spec.Mounts[0].BlipUID = "new-execution"
 			case "lost annotation":
-				delete(s.Annotations, collectMountsAnnotation)
+				delete(s.Annotations, v1alpha1.AnnotationCollectMounts)
 			case "new root":
 				if err := a.c.Kube.Delete(ctx, s); err != nil {
 					t.Fatal(err)
@@ -930,7 +930,11 @@ func TestCollectReusesDurableMountWithStaleAnnotation(t *testing.T) {
 	ctx := context.Background()
 	s, _ := a.getState(ctx, root.Name)
 	s.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: filepath.Join(collectMountRoot, "data")}}
-	if err := setMountUsers(s, map[string]collectMountUse{"data": {BlipUID: string(a.self.UID), Path: s.Spec.Mounts[0].Path, Token: "abrupt-exit", Users: 1}}); err != nil {
+	if err := setMountUsers(s, map[string]collectMountUse{"data": {
+		CollectMountUse: v1alpha1.CollectMountUse{BlipUID: string(a.self.UID), Path: s.Spec.Mounts[0].Path},
+		Token:           "abrupt-exit",
+		Users:           1,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.c.Kube.Update(ctx, s); err != nil {

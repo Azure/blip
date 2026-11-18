@@ -25,7 +25,7 @@ import (
 
 func catalogState(owner, name, parent string) *v1alpha1.BlipState {
 	return &v1alpha1.BlipState{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: owner + "." + name, UID: types.UID(owner + "." + name + "-uid"), Labels: map[string]string{ownerLabel: owner}},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: owner + "." + name, UID: types.UID(owner + "." + name + "-uid"), Labels: map[string]string{v1alpha1.LabelOwner: owner}},
 		Spec:       v1alpha1.BlipStateSpec{CopyFrom: parent},
 	}
 }
@@ -39,7 +39,7 @@ func gatewayBase() *v1alpha1.BlipState {
 }
 
 func mountRoot(b *v1alpha1.Blip, mounts ...v1alpha1.Mount) *v1alpha1.BlipState {
-	root := catalogState(b.Labels[ownerLabel], "root-"+b.Name, "")
+	root := catalogState(b.Labels[v1alpha1.LabelOwner], "root-"+b.Name, "")
 	b.Spec.State = root.Name
 	root.Spec.Mounts = mounts
 	return root
@@ -47,7 +47,7 @@ func mountRoot(b *v1alpha1.Blip, mounts ...v1alpha1.Mount) *v1alpha1.BlipState {
 
 func catalogBlip(owner, name, state, phase string) *v1alpha1.Blip {
 	return &v1alpha1.Blip{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: owner + "." + name, UID: types.UID(owner + "." + name + "-uid"), Labels: map[string]string{ownerLabel: owner}},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: owner + "." + name, UID: types.UID(owner + "." + name + "-uid"), Labels: map[string]string{v1alpha1.LabelOwner: owner}},
 		Spec:       v1alpha1.BlipSpec{State: state},
 		Status:     v1alpha1.BlipStatus{Phase: phase, Pod: "pod-" + name},
 	}
@@ -89,9 +89,9 @@ func TestCatalogListsOwnedRoots(t *testing.T) {
 	ownerless.Name, ownerless.Labels = "shared-data", nil
 	other := catalogState("bob", "home", "")
 	mismatched := catalogState("alice", "mismatched", "")
-	mismatched.Labels[ownerLabel] = "bob"
+	mismatched.Labels[v1alpha1.LabelOwner] = "bob"
 	wrongPrefix := catalogState("bob", "wrong-prefix", "")
-	wrongPrefix.Labels[ownerLabel] = "alice"
+	wrongPrefix.Labels[v1alpha1.LabelOwner] = "alice"
 	deleting := catalogState("alice", "deleting", "")
 	deleting.Finalizers = []string{"blip.dev/test"}
 	running := catalogBlip("alice", "root-worker", root.Name, v1alpha1.BlipRunning)
@@ -217,7 +217,7 @@ func TestCatalogEventsOwnersAndTombstones(t *testing.T) {
 		t.Fatal(err)
 	}
 	awaitCatalogEvent(t, alice)
-	st.Labels[ownerLabel] = "bob"
+	st.Labels[v1alpha1.LabelOwner] = "bob"
 	if err := kube.Update(context.Background(), st); err != nil {
 		t.Fatal(err)
 	}

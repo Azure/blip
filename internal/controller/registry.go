@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
 	"slices"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	ociv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	corev1 "k8s.io/api/core/v1"
@@ -30,7 +32,11 @@ type Registry interface {
 	// Digest returns the pinned reference repo@sha256:... for ref. For a
 	// multi-platform image it is the digest of the index; nodes pick their
 	// platform.
-	Digest(ctx context.Context, ref string) (string, error)
+	Digest(ctx context.Context, ref, namespace string, secrets []corev1.LocalObjectReference) (string, error)
+	// ImageConfig returns the runtime configuration of ref's platform image.
+	// The controller stores it in state status so copies and image states keep
+	// their defaults after the image reference or source state is gone.
+	ImageConfig(ctx context.Context, ref, namespace string, secrets []corev1.LocalObjectReference) (*v1.ImageConfig, error)
 }
 
 // RemoteRegistry talks to OCI registries. Registries in Insecure (host or
@@ -40,12 +46,6 @@ type RemoteRegistry struct {
 	// Reader loads image pull secrets. The controller sets it from the API
 	// reader; tests that do not use secrets may leave it nil.
 	Reader client.Reader
-}
-
-// SecretRegistry resolves images with namespace-scoped pull secrets.
-type SecretRegistry interface {
-	DigestWithPullSecrets(ctx context.Context, ref, namespace string, secrets []corev1.LocalObjectReference) (string, error)
-	ImageConfigWithPullSecrets(ctx context.Context, ref, namespace string, secrets []corev1.LocalObjectReference) (*v1.ImageConfig, error)
 }
 
 func (r RemoteRegistry) parse(ref string) (name.Reference, error) {
@@ -77,11 +77,7 @@ func (r RemoteRegistry) keychain(ctx context.Context, namespace string, secrets 
 	return registryauth.Keychain(ctx, r.Reader, registryauth.RefList(namespace, secrets))
 }
 
-func (r RemoteRegistry) Digest(ctx context.Context, ref string) (string, error) {
-	return r.digest(ctx, ref, authn.DefaultKeychain)
-}
-
-func (r RemoteRegistry) DigestWithPullSecrets(ctx context.Context, ref, namespace string, secrets []corev1.LocalObjectReference) (string, error) {
+func (r RemoteRegistry) Digest(ctx context.Context, ref, namespace string, secrets []corev1.LocalObjectReference) (string, error) {
 	kc, err := r.keychain(ctx, namespace, secrets)
 	if err != nil {
 		return "", err
@@ -113,11 +109,34 @@ func (r RemoteRegistry) digest(ctx context.Context, ref string, kc authn.Keychai
 	return parsed.Context().Digest(desc.Digest.String()).String(), nil
 }
 
-// digestImage resolves ref using the registry's pull-secret support when
-// available. Tests and other registries keep the plain interface.
-func digestImage(ctx context.Context, reg Registry, ref, namespace string, secrets []corev1.LocalObjectReference) (string, error) {
-	if sr, ok := reg.(SecretRegistry); ok {
-		return sr.DigestWithPullSecrets(ctx, ref, namespace, secrets)
+func (r RemoteRegistry) ImageConfig(ctx context.Context, ref, namespace string, secrets []corev1.LocalObjectReference) (*v1.ImageConfig, error) {
+	kc, err := r.keychain(ctx, namespace, secrets)
+	if err != nil {
+		return nil, err
 	}
-	return reg.Digest(ctx, ref)
+	return r.imageConfig(ctx, ref, kc)
+}
+
+func (r RemoteRegistry) imageConfig(ctx context.Context, ref string, kc authn.Keychain) (*v1.ImageConfig, error) {
+	parsed, err := r.parse(ref)
+	if err != nil {
+		return nil, err
+	}
+	opts := append(r.options(ctx, kc), remote.WithPlatform(ociv1.Platform{OS: "linux", Architecture: runtime.GOARCH}))
+	img, err := remote.Image(parsed, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("image config %s: %w", ref, err)
+	}
+	cf, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("image config %s: %w", ref, err)
+	}
+	c := cf.Config
+	return &v1.ImageConfig{
+		Env:        c.Env,
+		Entrypoint: c.Entrypoint,
+		Cmd:        c.Cmd,
+		WorkingDir: c.WorkingDir,
+		User:       c.User,
+	}, nil
 }

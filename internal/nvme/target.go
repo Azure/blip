@@ -19,10 +19,12 @@ import (
 )
 
 const (
-	configFS  = "/sys/kernel/config"
-	nvmetDir  = configFS + "/nvmet"
-	nqnPrefix = "nqn.2014-08.dev.blip:"
+	configFS = "/sys/kernel/config"
+	nvmetDir = configFS + "/nvmet"
 )
+
+// NQNPrefix is the prefix of every NQN the cluster uses.
+const NQNPrefix = "nqn.2014-08.dev.blip:"
 
 // NodeHash is the per-node hash used in kernel-global names.
 func NodeHash(node string) string {
@@ -31,7 +33,7 @@ func NodeHash(node string) string {
 }
 
 // SubsystemNQN is the NQN of node's export for lease.
-func SubsystemNQN(node, lease string) string { return nqnPrefix + NodeHash(node) + ":" + lease }
+func SubsystemNQN(node, lease string) string { return NQNPrefix + NodeHash(node) + ":" + lease }
 
 // Target manages one node's nvmet port and subsystems.
 type Target struct {

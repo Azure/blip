@@ -73,7 +73,7 @@ func TestSafeToRemoveRecomputedAfterBlipFinishes(t *testing.T) {
 	e.run(e.blip, ns, "b")
 	e.saveWriter(b.Spec.State, newID())
 	e.run(e.blip, ns, "b")
-	if !finished(e.getBlip("b")) {
+	if !v1.Finished(e.getBlip("b")) {
 		t.Fatalf("blip did not finish: %+v", e.getBlip("b").Status)
 	}
 	// The saved root is the last durable placement on this one-node cluster.
@@ -96,7 +96,7 @@ func TestSafeToRemoveRecomputedAfterBlipFinishes(t *testing.T) {
 		t.Fatalf("node not unenrolled after the last blip finished: %v (SafeToRemove=%v)",
 			err, bn.Status.SafeToRemove)
 	}
-	if l := e.getNode("n1").Labels; l[LabelEnrolled] != "" || l[LabelHypervisorPrefix+"kvm"] != "" {
+	if l := e.getNode("n1").Labels; l[v1.LabelEnrolled] != "" || l[v1.LabelHypervisorPrefix+"kvm"] != "" {
 		t.Fatalf("enrollment labels left on unenrolled node: %v", l)
 	}
 }
@@ -128,7 +128,7 @@ func TestUnenrollRechecksSafetyForANewDrain(t *testing.T) {
 
 	res := e.run(e.enroll, "", "n1")
 	bn = e.getBlipNode("n1")
-	if !bn.Spec.Drain || bn.Annotations[AnnotationEnrollmentDrain] != "true" {
+	if !bn.Spec.Drain || bn.Annotations[v1.AnnotationEnrollmentDrain] != "true" {
 		t.Fatalf("new drain not recorded: %+v", bn)
 	}
 	if bn.Status.SafeToRemove {
@@ -137,14 +137,14 @@ func TestUnenrollRechecksSafetyForANewDrain(t *testing.T) {
 	if res.RequeueAfter != enrollmentRetry {
 		t.Fatalf("unsafe drain requeue %v, want %v", res.RequeueAfter, enrollmentRetry)
 	}
-	if l := e.getNode("n1").Labels; l[LabelEnrolled] != "true" || l[LabelHypervisorPrefix+"kvm"] != "" {
+	if l := e.getNode("n1").Labels; l[v1.LabelEnrolled] != "true" || l[v1.LabelHypervisorPrefix+"kvm"] != "" {
 		t.Fatalf("node labels changed while the VM runs: %v", l)
 	}
 	expectPhase(t, e.getBlip("b"), v1.BlipRunning, "")
 
 	// A retry still sees the running Blip and keeps the agent.
 	e.run(e.enroll, "", "n1")
-	if e.getNode("n1").Labels[LabelEnrolled] != "true" {
+	if e.getNode("n1").Labels[v1.LabelEnrolled] != "true" {
 		t.Fatal("agent unenrolled while the VM still runs")
 	}
 	if err := e.c.Get(e.ctx, types.NamespacedName{Name: "n1"}, &v1.BlipNode{}); err != nil {
@@ -166,7 +166,7 @@ func TestUnenrollRechecksSafetyForANewDrain(t *testing.T) {
 	if err := e.c.Get(e.ctx, types.NamespacedName{Name: "n1"}, &v1.BlipNode{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("node not unenrolled after the drain completed: %v", err)
 	}
-	if l := e.getNode("n1").Labels; l[LabelEnrolled] != "" || l[LabelHypervisorPrefix+"kvm"] != "" {
+	if l := e.getNode("n1").Labels; l[v1.LabelEnrolled] != "" || l[v1.LabelHypervisorPrefix+"kvm"] != "" {
 		t.Fatalf("enrollment labels left after unenroll: %v", l)
 	}
 }

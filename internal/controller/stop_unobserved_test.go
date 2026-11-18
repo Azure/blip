@@ -18,7 +18,7 @@ func unobservedStopEnv(t *testing.T, stop, deleteBlip bool) (*env, string) {
 	e.newPool("default", 0, 0)
 	b := e.startBlip("b", "n1", e.withImage("reg/img:v1"))
 	pod := e.getPod(b.Status.Pod)
-	delete(pod.Annotations, AnnotationObserved)
+	delete(pod.Annotations, v1.AnnotationObserved)
 	e.must(e.c.Update(e.ctx, pod))
 	if stop {
 		e.updateBlip("b", func(b *v1.Blip) { b.Spec.Stop = true })

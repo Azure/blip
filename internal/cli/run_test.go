@@ -105,7 +105,7 @@ func TestOwnedForkSourceResolution(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("code %d: %s", code, errOut)
 			}
-			if st := h.state("alice.worker"); st.Spec.CopyFrom != want || st.Labels[ownerLabel] != "alice" {
+			if st := h.state("alice.worker"); st.Spec.CopyFrom != want || st.Labels[v1alpha1.LabelOwner] != "alice" {
 				t.Fatalf("fork %+v", st)
 			}
 		})

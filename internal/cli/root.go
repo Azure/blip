@@ -150,14 +150,11 @@ func (a *app) findSelf(ctx context.Context) error {
 		return err
 	}
 	a.self = &b
-	if o := b.Labels[ownerLabel]; o != "" {
-		a.owner, a.prefix = o, o+"."
+	if o := b.Labels[v1alpha1.LabelOwner]; o != "" {
+		a.owner, a.prefix = o, v1alpha1.OwnerPrefix(o)
 	}
 	return nil
 }
-
-// ownerLabel names the owner of an SSH sandbox and the blips it creates.
-const ownerLabel = "blip.dev/owner"
 
 // scope connects and maps the names a user typed to the names of objects
 // in the caller's owner scope.
@@ -172,7 +169,7 @@ func (a *app) scope(names ...*string) error {
 }
 
 func (a *app) full(name string) string {
-	if a.prefix == "" || name == "" || strings.HasPrefix(name, a.prefix) {
+	if a.owner == "" || name == "" || v1alpha1.OwnedBy(name, a.owner) {
 		return name
 	}
 	return a.prefix + name
@@ -187,15 +184,14 @@ func (a *app) resolveState(ctx context.Context, name string) (*v1alpha1.BlipStat
 		return nil, err
 	}
 	full := a.full(name)
-	st := &v1alpha1.BlipState{}
-	err = c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: full}, st)
+	st, err := get(ctx, c, full, &v1alpha1.BlipState{})
 	if apierrors.IsNotFound(err) && full != name {
-		err = c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: name}, st)
+		st, err = get(ctx, c, name, &v1alpha1.BlipState{})
 	}
-	if apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("state %q not found in namespace %s", name, c.Namespace)
+	if err != nil {
+		return nil, notFound("state", name, c.Namespace, err)
 	}
-	return st, err
+	return st, nil
 }
 
 // short is how a scoped name is shown.
@@ -205,7 +201,7 @@ func (a *app) short(name string) string {
 
 func (a *app) label(o client.Object) {
 	if a.owner != "" {
-		o.SetLabels(map[string]string{ownerLabel: a.owner})
+		o.SetLabels(map[string]string{v1alpha1.LabelOwner: a.owner})
 	}
 }
 

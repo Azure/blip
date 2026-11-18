@@ -52,7 +52,7 @@ func TestCreateStateFromOwnedState(t *testing.T) {
 	}
 	mustContain(t, out, "blipstate/repo created")
 	s := h.state("alice.repo")
-	if s.Spec.CopyFrom != "alice.base" || s.Spec.Replicas != 2 || s.Labels[ownerLabel] != "alice" {
+	if s.Spec.CopyFrom != "alice.base" || s.Spec.Replicas != 2 || s.Labels[v1alpha1.LabelOwner] != "alice" {
 		t.Fatalf("state %+v labels %v", s.Spec, s.Labels)
 	}
 }
@@ -132,7 +132,7 @@ func TestCreateStateAttachesToSelf(t *testing.T) {
 			}
 			mustContain(t, out, "blipstate/data Ready")
 			mustContain(t, out, "state data mounted on blip box at /data ("+modeName(tc.writable)+")")
-			if s := h.state("alice.data"); s.Labels[ownerLabel] != "alice" {
+			if s := h.state("alice.data"); s.Labels[v1alpha1.LabelOwner] != "alice" {
 				t.Fatalf("labels %v", s.Labels)
 			}
 			want := v1alpha1.Mount{State: "alice.data", Path: "/data", Writable: tc.writable}

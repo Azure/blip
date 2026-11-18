@@ -407,7 +407,7 @@ func TestStartingTimeouts(t *testing.T) {
 		e.warmOn("n1")
 		pod := e.pods()[0]
 		e.observe(pod.Name, podapi.Observed{Phase: podapi.PhaseWarm})
-		e.annotatePod(pod.Name, AnnotationPrepareError, "disk resize failed")
+		e.annotatePod(pod.Name, v1.AnnotationPrepareError, "disk resize failed")
 
 		e.newBlip("b", e.withImage("reg/img:v1"))
 		res := e.run(e.blip, ns, "b")

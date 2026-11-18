@@ -103,7 +103,7 @@ func TestNetworkPolicyFailureRevokesGrantsAndPreservesDisks(t *testing.T) {
 			pool.Namespace = "other"
 			v.pools["other/default"] = pool
 		}},
-		{"pool mismatch", func(v *view, _ *v1alpha1.Blip) { v.pods[pkey("p")].Labels[LabelPool] = "other" }},
+		{"pool mismatch", func(v *view, _ *v1alpha1.Blip) { v.pods[pkey("p")].Labels[v1alpha1.LabelPool] = "other" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := newView()
@@ -242,9 +242,9 @@ func TestNetworkSnapshotAndLiveUpdates(t *testing.T) {
 	}
 	remoteVM, plainLocal := vmPod("remote-vm", ""), vmPod("plain-local", "")
 	remoteVM.Spec.NodeName = "remote"
-	delete(plainLocal.Labels, LabelPool)
+	delete(plainLocal.Labels, v1alpha1.LabelPool)
 	// If either pod entered the management view, podMetaFor would clear this.
-	remoteVM.Labels[LabelWarm], plainLocal.Labels[LabelWarm] = "true", "true"
+	remoteVM.Labels[v1alpha1.LabelWarm], plainLocal.Labels[v1alpha1.LabelWarm] = "true", "true"
 	a, _, _ := testAgent(t, b, root, pod, pool, namespace, target, service, headless, endpoints, remoteVM, plainLocal)
 	dir := a.podDirFor(pkey("p"))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -291,7 +291,7 @@ func TestNetworkSnapshotAndLiveUpdates(t *testing.T) {
 		if err := a.client.Get(ctx, client.ObjectKeyFromObject(original), &current); err != nil {
 			t.Fatal(err)
 		}
-		if current.Labels[LabelWarm] != "true" || len(current.Annotations) != 0 {
+		if current.Labels[v1alpha1.LabelWarm] != "true" || len(current.Annotations) != 0 {
 			t.Fatalf("unmanaged pod was reconciled: %+v", current.ObjectMeta)
 		}
 	}
@@ -357,7 +357,7 @@ func TestNetworkSnapshotAndLiveUpdates(t *testing.T) {
 	if err := a.client.Get(ctx, client.ObjectKeyFromObject(pod), pod); err != nil {
 		t.Fatal(err)
 	}
-	if msg := pod.Annotations[AnnotationPrepareError]; !strings.Contains(msg, "network policy:") {
+	if msg := pod.Annotations[v1alpha1.AnnotationPrepareError]; !strings.Contains(msg, "network policy:") {
 		t.Fatalf("compile failure not reported: %q", msg)
 	}
 	b.Spec.Network = nil
@@ -366,7 +366,7 @@ func TestNetworkSnapshotAndLiveUpdates(t *testing.T) {
 	if err := a.client.Get(ctx, client.ObjectKeyFromObject(pod), pod); err != nil {
 		t.Fatal(err)
 	}
-	if msg := pod.Annotations[AnnotationPrepareError]; msg != "" {
+	if msg := pod.Annotations[v1alpha1.AnnotationPrepareError]; msg != "" {
 		t.Fatalf("repaired policy still has error: %q", msg)
 	}
 }

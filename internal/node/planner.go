@@ -124,7 +124,7 @@ func Compute(s Snapshot) Plan {
 	}
 	for i := range s.Pods {
 		p := &s.Pods[i]
-		if p.Spec.NodeName == s.Node && p.Labels[LabelPool] != "" {
+		if p.Spec.NodeName == s.Node && p.Labels[v1alpha1.LabelPool] != "" {
 			v.pods[podKey(p.Namespace, p.Name)] = p
 		}
 	}

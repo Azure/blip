@@ -35,7 +35,7 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 	if dest.Spec.Image != "" || len(dest.Spec.ImagePullSecrets) != 0 || len(dest.OwnerReferences) != 0 {
 		return errors.New("fork destination cannot have an image, image pull secrets, or owner references")
 	}
-	if err := usableSource(source); err != nil {
+	if err := CheckSource(source); err != nil {
 		return err
 	}
 	root := dest.DeepCopy()
@@ -52,7 +52,7 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 			if err := c.Get(ctx, client.ObjectKey{Namespace: source.Namespace, Name: mount.State}, &src); err != nil {
 				return fmt.Errorf("read mount source %q: %w", mount.State, err)
 			}
-			if err := usableSource(&src); err != nil {
+			if err := CheckSource(&src); err != nil {
 				return err
 			}
 			child := &v1alpha1.BlipState{
@@ -111,7 +111,9 @@ func createRejected(err error) bool {
 		apierrors.IsNotFound(err)
 }
 
-func usableSource(source *v1alpha1.BlipState) error {
+// CheckSource reports whether a state can be the source of a fork: it must not
+// be going away, and a failed import must not be waiting for its commit.
+func CheckSource(source *v1alpha1.BlipState) error {
 	if source.DeletionTimestamp != nil {
 		return fmt.Errorf("copy source %q is being deleted", source.Name)
 	}
@@ -125,8 +127,8 @@ func usableSource(source *v1alpha1.BlipState) error {
 // label. Hashing the full root and mount identity avoids truncation collisions.
 func childName(root *v1alpha1.BlipState, mount v1alpha1.Mount) string {
 	prefix := ""
-	if owner := root.Labels["blip.dev/owner"]; owner != "" && strings.HasPrefix(root.Name, owner+".") {
-		prefix = owner + "."
+	if owner := root.Labels[v1alpha1.LabelOwner]; owner != "" && v1alpha1.OwnedBy(root.Name, owner) {
+		prefix = v1alpha1.OwnerPrefix(owner)
 	}
 	name := strings.TrimPrefix(root.Name, prefix)
 	name = strings.ReplaceAll(name, ".", "-")

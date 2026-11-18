@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -19,9 +20,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/devnode"
 	"github.com/Azure/blip/internal/image"
 	"github.com/Azure/blip/internal/peer"
 	"github.com/Azure/blip/internal/podapi"
+	"github.com/Azure/blip/internal/registryauth"
 	"github.com/Azure/blip/internal/storage"
 )
 
@@ -37,6 +40,19 @@ const freezeTimeout = 60 * time.Second
 // The copy cannot capture the source, but the controller can still fall back
 // to the source's last committed version, so this is not a state failure.
 var errPodGone = errors.New("VM pod is gone")
+
+// mknodDevice creates (or replaces) path as a block device node with the
+// same device number as device.
+func mknodDevice(path, device string) error {
+	var st unix.Stat_t
+	if err := unix.Stat(device, &st); err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFBLK {
+		return &os.PathError{Op: "mknod", Path: device, Err: unix.ENOTBLK}
+	}
+	return devnode.Ensure(path, st.Rdev)
+}
 
 func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
 	for _, key := range sortedKeys(p.desired) {
@@ -188,17 +204,17 @@ func (a *Agent) patchPrepareError(ctx context.Context, key, value string) error 
 	if err := a.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &pod); err != nil {
 		return client.IgnoreNotFound(err)
 	}
-	if cur := pod.Annotations[AnnotationPrepareError]; cur == value {
+	if cur := pod.Annotations[v1alpha1.AnnotationPrepareError]; cur == value {
 		return nil
 	}
 	orig := pod.DeepCopy()
 	if value == "" {
-		delete(pod.Annotations, AnnotationPrepareError)
+		delete(pod.Annotations, v1alpha1.AnnotationPrepareError)
 	} else {
 		if pod.Annotations == nil {
 			pod.Annotations = map[string]string{}
 		}
-		pod.Annotations[AnnotationPrepareError] = value
+		pod.Annotations[v1alpha1.AnnotationPrepareError] = value
 	}
 	return client.IgnoreNotFound(a.client.Patch(ctx, &pod, client.MergeFrom(orig)))
 }
@@ -258,15 +274,15 @@ func (a *Agent) patchPod(ctx context.Context, m podMeta) error {
 		if pod.Labels == nil {
 			pod.Labels = map[string]string{}
 		}
-		pod.Labels[LabelWarm] = "true"
+		pod.Labels[v1alpha1.LabelWarm] = "true"
 	} else {
-		delete(pod.Labels, LabelWarm)
+		delete(pod.Labels, v1alpha1.LabelWarm)
 	}
 	if m.observed != "" {
 		if pod.Annotations == nil {
 			pod.Annotations = map[string]string{}
 		}
-		pod.Annotations[AnnotationObserved] = m.observed
+		pod.Annotations[v1alpha1.AnnotationObserved] = m.observed
 	}
 	return client.IgnoreNotFound(a.client.Patch(ctx, &pod, client.MergeFrom(orig)))
 }
@@ -478,7 +494,7 @@ func (a *Agent) waitFrozen(ctx context.Context, pod, id string, frozen bool) err
 	}
 }
 
-func (a *Agent) importImage(ctx context.Context, ref, id string, secrets []pullSecret) error {
+func (a *Agent) importImage(ctx context.Context, ref, id string, secrets []registryauth.PullSecret) error {
 	// Scratch space for the image's tar lives on the data disk. Imports of
 	// one image never run concurrently, so leftovers of a crashed attempt
 	// are removed here.

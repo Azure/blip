@@ -1,8 +1,6 @@
 package guest
 
 import (
-	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -121,20 +119,6 @@ func TestKubeMetadataRejectsSymlinks(t *testing.T) {
 	}
 }
 
-func TestBootConfigContainsOnlyNamespaceMetadata(t *testing.T) {
-	image, err := EncodeConfig(Config{KubeNamespace: "sandbox"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data := bytes.TrimRight(image, "\x00"); string(data) != `{"kubeNamespace":"sandbox"}` {
-		t.Fatalf("boot metadata = %s", data)
-	}
-	data, err := json.Marshal(Config{})
-	if err != nil || string(data) != "{}" {
-		t.Fatalf("disabled boot metadata = %s, %v", data, err)
-	}
-}
-
 func TestPrimaryAndSessionKubeconfigEnvironment(t *testing.T) {
 	for _, user := range []*account{
 		{name: "root", home: "/root", shell: "/bin/sh"},
@@ -145,8 +129,8 @@ func TestPrimaryAndSessionKubeconfigEnvironment(t *testing.T) {
 			base, session []string
 			want          string
 		}{
-			{name: "primary", want: KubeconfigPath},
-			{name: "exec", session: []string{"TERM=xterm"}, want: KubeconfigPath},
+			{name: "primary", want: kubeconfigPath},
+			{name: "exec", session: []string{"TERM=xterm"}, want: kubeconfigPath},
 			{name: "claim override", base: []string{"KUBECONFIG=/custom"}, want: "/custom"},
 			{name: "session override", base: []string{"KUBECONFIG=/custom"}, session: []string{"KUBECONFIG=/session"}, want: "/session"},
 			{name: "explicit empty", session: []string{"KUBECONFIG="}, want: ""},

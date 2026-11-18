@@ -78,7 +78,7 @@ func (a *Agent) snapshot(ctx context.Context) (*view, error) {
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if pod.Spec.NodeName == a.cfg.NodeName && pod.Labels[LabelPool] != "" {
+		if pod.Spec.NodeName == a.cfg.NodeName && pod.Labels[v1alpha1.LabelPool] != "" {
 			v.pods[podKey(pod.Namespace, pod.Name)] = pod
 		}
 	}
@@ -266,7 +266,7 @@ func (a *Agent) confirmBlipsGone(ctx context.Context, v *view) {
 		known[string(b.UID)] = true
 	}
 	for _, pod := range v.pods {
-		uid := pod.Labels[LabelBlipUID]
+		uid := pod.Labels[v1alpha1.LabelBlipUID]
 		if uid == "" || known[uid] {
 			continue
 		}
@@ -280,7 +280,7 @@ func (a *Agent) confirmBlipsGone(ctx context.Context, v *view) {
 			continue
 		}
 		var b v1alpha1.Blip
-		err := a.live.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Annotations[AnnotationBlip]}, &b)
+		err := a.live.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Annotations[v1alpha1.AnnotationBlip]}, &b)
 		if apierrors.IsNotFound(err) || (err == nil && string(b.UID) != uid) {
 			a.mu.Lock()
 			a.blipsGone[uid] = true
@@ -326,32 +326,4 @@ func readPodDirs(root string) map[string]*podDir {
 		}
 	}
 	return dirs
-}
-
-// mknodDevice creates (or replaces) path as a block device node with the
-// same device number as device.
-func mknodDevice(path, device string) error {
-	var st unix.Stat_t
-	if err := unix.Stat(device, &st); err != nil {
-		return err
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFBLK {
-		return &os.PathError{Op: "mknod", Path: device, Err: unix.ENOTBLK}
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	var cur unix.Stat_t
-	if unix.Lstat(path, &cur) == nil {
-		if cur.Mode&unix.S_IFMT == unix.S_IFBLK && cur.Rdev == st.Rdev {
-			return nil
-		}
-		if err := os.Remove(path); err != nil {
-			return err
-		}
-	}
-	if err := unix.Mknod(path, unix.S_IFBLK|0o660, int(st.Rdev)); err != nil {
-		return &os.PathError{Op: "mknod", Path: path, Err: err}
-	}
-	return os.Chmod(path, 0o660)
 }

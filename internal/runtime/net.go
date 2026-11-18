@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/blip/internal/guest"
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/bootconfig"
+	"github.com/Azure/blip/internal/netpolicy"
 )
 
 const (
@@ -50,7 +50,7 @@ func networkCommand(input, name string, args ...string) ([]byte, error) {
 
 // setupNetwork installs default deny before bringing up the routed TAP or
 // starting the VMM. It never removes or redirects the pod interface's IP.
-func setupNetwork(cfg *guest.Config) (*podNet, error) {
+func setupNetwork(cfg *bootconfig.Config) (*podNet, error) {
 	iface, _ := defaultRoute()
 	if iface == "" {
 		return nil, fmt.Errorf("no IPv4 default route")
@@ -145,7 +145,7 @@ func setupNetwork(cfg *guest.Config) (*podNet, error) {
 			p.teardown()
 		}
 	}()
-	if err := p.install(nil, false); err != nil {
+	if _, err := p.install(nil, false); err != nil {
 		return nil, err
 	}
 	p.tableCreated = true
@@ -267,49 +267,61 @@ func guestMAC(ip netip.Addr, podMAC string) string {
 	return m.String()
 }
 
-func (p *podNet) install(policy *network.Policy, active bool) error {
+func (p *podNet) install(policy *netpolicy.Policy, active bool) (unsafe bool, err error) {
 	script, err := p.policyScript(policy, active)
 	if err != nil {
-		return err
+		// An invalid desired policy still revokes the previous allow rules.
+		return p.denyAll(err)
 	}
-	_, err = p.run(script, "nft", "-f", "-")
-	return err
+	if _, err := p.run(script, "nft", "-f", "-"); err != nil {
+		return p.denyAll(err)
+	}
+	return false, nil
+}
+
+// denyAll falls back to default deny after a failed nft transaction and, when
+// even that cannot be installed, lowers or removes the TAP. unsafe reports
+// that traffic may still reach the old allow rules.
+func (p *podNet) denyAll(cause error) (unsafe bool, err error) {
+	script, denyErr := p.policyScript(nil, false)
+	if denyErr == nil {
+		_, denyErr = p.run(script, "nft", "-f", "-")
+	}
+	if denyErr == nil {
+		p.unsafe = false
+		return false, cause
+	}
+	// A failed nft binary/kernel transaction must not leave the old allow
+	// rules usable. Lowering the TAP is independent of nftables.
+	p.disabled = true
+	p.unsafe = false
+	if _, downErr := p.run("", "ip", "link", "set", tapName, "down"); downErr != nil {
+		if _, delErr := p.run("", "ip", "link", "del", tapName); delErr != nil {
+			p.unsafe = true
+			return true, fmt.Errorf("%w; default deny failed: %v; disable TAP: %v; remove TAP: %v", cause, denyErr, downErr, delErr)
+		}
+		p.tapCreated = false
+	}
+	return false, fmt.Errorf("%w; default deny failed: %v (TAP disabled)", cause, denyErr)
 }
 
 // apply uses one nft transaction. Old conntrack entries never bypass the new
 // policy: both original packets and replies traverse the current layer chains.
 // Even invalid desired policy revokes the previously installed allow rules.
-func (p *podNet) apply(policy *network.Policy, active bool) error {
-	err := p.install(policy, active)
+func (p *podNet) apply(policy *netpolicy.Policy, active bool) (unsafe bool, err error) {
+	unsafe, err = p.install(policy, active)
 	if err == nil && p.disabled {
 		_, err = p.run("", "ip", "link", "set", tapName, "up")
 		if err == nil {
 			p.disabled = false
 		}
 	}
-	if err == nil {
-		p.unsafe = false
-		return nil
-	}
-	if denyErr := p.install(nil, false); denyErr != nil {
-		// A failed nft binary/kernel transaction must not leave the old allow
-		// rules usable. Lowering the TAP is independent of nftables.
-		p.disabled = true
-		p.unsafe = false
-		if _, downErr := p.run("", "ip", "link", "set", tapName, "down"); downErr != nil {
-			if _, delErr := p.run("", "ip", "link", "del", tapName); delErr != nil {
-				p.unsafe = true
-				return fmt.Errorf("%w; default deny failed: %v; disable TAP: %v; remove TAP: %v", err, denyErr, downErr, delErr)
-			}
-			p.tapCreated = false
-		}
-		return fmt.Errorf("%w; default deny failed: %v (TAP disabled)", err, denyErr)
-	}
-	p.unsafe = false
-	return err
+	p.unsafe = unsafe
+	return unsafe, err
 }
 
-// defaultRoute returns the interface and gateway of the IPv4 default route.
+// defaultRoute returns the interface and gateway of the main table's IPv4
+// default route.
 func defaultRoute() (string, string) {
 	f, err := os.Open("/proc/net/route")
 	if err != nil {

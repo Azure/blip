@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	v1 "github.com/Azure/blip/api/v1alpha1"
 )
 
 const scopeNamespace = "blip-ssh"
@@ -175,20 +177,20 @@ func scopedFixture() *fakeKube {
 	kube := newFakeKube()
 	kube.pods["alice-vm"] = fakeObject{
 		Name: "alice-vm", UID: "pod-alice",
-		Labels:      map[string]string{ownerLabel: "alice", blipUIDLabel: "uid-alice"},
-		Annotations: map[string]string{blipAnnotation: "alice.a"},
+		Labels:      map[string]string{v1.LabelOwner: "alice", v1.LabelBlipUID: "uid-alice"},
+		Annotations: map[string]string{v1.AnnotationBlip: "alice.a"},
 	}
 	kube.pods["bob-vm"] = fakeObject{
 		Name: "bob-vm", UID: "pod-bob",
-		Labels:      map[string]string{ownerLabel: "bob", blipUIDLabel: "uid-bob"},
-		Annotations: map[string]string{blipAnnotation: "bob.b"},
+		Labels:      map[string]string{v1.LabelOwner: "bob", v1.LabelBlipUID: "uid-bob"},
+		Annotations: map[string]string{v1.AnnotationBlip: "bob.b"},
 	}
 	kube.pods["warm-vm"] = fakeObject{Name: "warm-vm", UID: "pod-warm"}
-	kube.blips["alice.a"] = fakeObject{Name: "alice.a", UID: "uid-alice", Labels: map[string]string{ownerLabel: "alice"}, Secret: "alice-coffee"}
-	kube.blips["bob.b"] = fakeObject{Name: "bob.b", UID: "uid-bob", Labels: map[string]string{ownerLabel: "bob"}, Secret: "super-secret-bob-12345"}
+	kube.blips["alice.a"] = fakeObject{Name: "alice.a", UID: "uid-alice", Labels: map[string]string{v1.LabelOwner: "alice"}, Secret: "alice-coffee"}
+	kube.blips["bob.b"] = fakeObject{Name: "bob.b", UID: "uid-bob", Labels: map[string]string{v1.LabelOwner: "bob"}, Secret: "super-secret-bob-12345"}
 	kube.blips["admin.a"] = fakeObject{Name: "admin.a", UID: "uid-admin", Secret: "admin-secret"}
-	kube.states["alice.home"] = fakeObject{Name: "alice.home", UID: "state-alice", Labels: map[string]string{ownerLabel: "alice"}}
-	kube.states["bob.home"] = fakeObject{Name: "bob.home", UID: "state-bob", Labels: map[string]string{ownerLabel: "bob"}}
+	kube.states["alice.home"] = fakeObject{Name: "alice.home", UID: "state-alice", Labels: map[string]string{v1.LabelOwner: "alice"}}
+	kube.states["bob.home"] = fakeObject{Name: "bob.home", UID: "state-bob", Labels: map[string]string{v1.LabelOwner: "bob"}}
 	kube.states["gateway-base"] = fakeObject{Name: "gateway-base", UID: "state-base"}
 	return kube
 }
@@ -426,11 +428,11 @@ func TestOwnerScopeAdminIsUnrestricted(t *testing.T) {
 	kube := newFakeKube()
 	kube.pods["admin-vm"] = fakeObject{
 		Name: "admin-vm", UID: "pod-admin",
-		Labels:      map[string]string{blipUIDLabel: "uid-admin"},
-		Annotations: map[string]string{blipAnnotation: "admin.a"},
+		Labels:      map[string]string{v1.LabelBlipUID: "uid-admin"},
+		Annotations: map[string]string{v1.AnnotationBlip: "admin.a"},
 	}
 	kube.blips["admin.a"] = fakeObject{Name: "admin.a", UID: "uid-admin", Secret: "admin-secret"}
-	kube.blips["bob.b"] = fakeObject{Name: "bob.b", UID: "uid-bob", Labels: map[string]string{ownerLabel: "bob"}, Secret: "bob-secret"}
+	kube.blips["bob.b"] = fakeObject{Name: "bob.b", UID: "uid-bob", Labels: map[string]string{v1.LabelOwner: "bob"}, Secret: "bob-secret"}
 	kube.pods["warm-vm"] = fakeObject{Name: "warm-vm", UID: "pod-warm"}
 	p := startScoped(t, kube, "admin-vm")
 
@@ -461,7 +463,7 @@ func TestOwnerScopeAdminIsUnrestricted(t *testing.T) {
 func TestOwnerScopeVacantPodDenies(t *testing.T) {
 	kube := newFakeKube()
 	kube.pods["warm-vm"] = fakeObject{Name: "warm-vm", UID: "pod-warm"}
-	kube.blips["alice.a"] = fakeObject{Name: "alice.a", UID: "uid-alice", Labels: map[string]string{ownerLabel: "alice"}}
+	kube.blips["alice.a"] = fakeObject{Name: "alice.a", UID: "uid-alice", Labels: map[string]string{v1.LabelOwner: "alice"}}
 	p := startScoped(t, kube, "warm-vm")
 
 	for _, path := range []string{
@@ -483,10 +485,10 @@ func TestOwnerScopeRejectsStaleBlipBinding(t *testing.T) {
 	kube := newFakeKube()
 	kube.pods["alice-vm"] = fakeObject{
 		Name: "alice-vm", UID: "pod-alice",
-		Labels:      map[string]string{ownerLabel: "alice", blipUIDLabel: "uid-stale"},
-		Annotations: map[string]string{blipAnnotation: "alice.a"},
+		Labels:      map[string]string{v1.LabelOwner: "alice", v1.LabelBlipUID: "uid-stale"},
+		Annotations: map[string]string{v1.AnnotationBlip: "alice.a"},
 	}
-	kube.blips["alice.a"] = fakeObject{Name: "alice.a", UID: "uid-new", Labels: map[string]string{ownerLabel: "alice"}}
+	kube.blips["alice.a"] = fakeObject{Name: "alice.a", UID: "uid-new", Labels: map[string]string{v1.LabelOwner: "alice"}}
 	p := startScoped(t, kube, "alice-vm")
 	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips"); status != http.StatusForbidden {
 		t.Fatalf("stale pod/Blip binding status = %d, want 403", status)

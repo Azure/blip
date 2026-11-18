@@ -155,7 +155,7 @@ func TestSchedulerCancellationRestartAndGeneration(t *testing.T) {
 	if a.Generation == b.Generation || s.Complete(testNow, a, Failed) || !s.Busy()["source"] {
 		t.Fatal("stale completion released replacement")
 	}
-	s.Restart()
+	s.jobs = nil
 	c := s.Schedule(testNow, []Operation{op})[0]
 	if c.Generation == b.Generation || s.Complete(testNow, b, Succeeded) || !s.Busy()["source"] {
 		t.Fatal("pre-restart completion released restarted operation")
@@ -268,7 +268,7 @@ func TestSchedulerAdversarialReplay(t *testing.T) {
 						for _, key := range sortedKeys(active) {
 							stale = append(stale, active[key])
 						}
-						s.Restart()
+						s.jobs = nil
 						active = map[string]Attempt{}
 					}
 					keys := sortedKeys(active)

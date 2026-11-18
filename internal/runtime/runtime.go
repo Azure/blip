@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Azure/blip/internal/guest"
-	"github.com/Azure/blip/internal/network"
+	"github.com/Azure/blip/internal/bootconfig"
+	"github.com/Azure/blip/internal/netpolicy"
 	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
 	"golang.org/x/sys/unix"
@@ -100,7 +100,7 @@ type removeResult struct {
 }
 
 type policyNetwork interface {
-	apply(*network.Policy, bool) error
+	apply(*netpolicy.Policy, bool) (unsafe bool, err error)
 }
 
 // runtime is the effect runner. All lifecycle state and decisions live in the
@@ -261,10 +261,7 @@ func (r *runtime) execute(effects []Effect) bool {
 			if r.network == nil {
 				err = fmt.Errorf("network is not initialized")
 			} else {
-				err = r.network.apply(e.Policy, e.Active)
-			}
-			if pn, ok := r.network.(*podNet); ok {
-				unsafe = pn.unsafe
+				unsafe, err = r.network.apply(e.Policy, e.Active)
 			}
 		case EffectRemoveDisk:
 			r.start(func() {
@@ -325,7 +322,6 @@ func (r *runtime) handleControl(ev ctlEvent) {
 		r.execute(r.Apply(r.now(), Event{Kind: EventConnected, Generation: ev.gen}))
 		return
 	}
-	r.connected = r.conn != nil
 	evMachine := Event{Kind: EventControl, Generation: ev.gen, Type: ev.t, Payload: ev.payload}
 	if ev.err != nil {
 		evMachine.Kind, evMachine.Error = EventDisconnected, ev.err.Error()
@@ -342,7 +338,6 @@ func (r *runtime) handleRemoved(res removeResult) {
 }
 
 func (r *runtime) reconcile() {
-	r.skipNetwork, r.connected = r.o.SkipNetwork, r.conn != nil
 	for r.execute(r.Reconcile(r.now())) {
 	}
 }
@@ -368,7 +363,7 @@ func (r *runtime) writeObserved() {
 // boot writes the config disk, sets up networking and starts the VMM.
 func (r *runtime) boot() (*podNet, error) {
 	hostname, _ := os.Hostname()
-	cfg := guest.Config{Hostname: hostname, KubeNamespace: r.o.KubeNamespace, GatewayLoopbackPort: r.o.GatewayLoopbackPort}
+	cfg := bootconfig.Config{Hostname: hostname, KubeNamespace: r.o.KubeNamespace, GatewayLoopbackPort: r.o.GatewayLoopbackPort}
 	var pn *podNet
 	started := false
 	defer func() {
@@ -384,7 +379,7 @@ func (r *runtime) boot() (*podNet, error) {
 		}
 		r.network = pn
 	}
-	img, err := guest.EncodeConfig(cfg)
+	img, err := bootconfig.EncodeConfig(cfg)
 	if err != nil {
 		return nil, err
 	}

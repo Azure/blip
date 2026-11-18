@@ -15,7 +15,7 @@ func TestControlReconnectReplacesBlockedHello(t *testing.T) {
 		host, guest := net.Pipe()
 		defer host.Close()
 		done := make(chan struct{})
-		go func() { g.serveControlStream(guest); close(done) }()
+		go func() { g.serveControl(guest); close(done) }()
 		synctest.Wait() // Hello cannot be delivered to this host.
 		start := time.Now()
 		c := controlPair(t, g)

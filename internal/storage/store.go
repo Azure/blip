@@ -555,12 +555,6 @@ func (s *Store) putLocked(r *record) error {
 	})
 }
 
-func (s *Store) put(r *record) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.putLocked(r)
-}
-
 func (s *Store) setPhase(r *record, phase string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

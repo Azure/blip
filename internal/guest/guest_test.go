@@ -143,7 +143,7 @@ func TestRingPinned(t *testing.T) {
 }
 
 func testSession(id string) *session {
-	s := &session{g: &Guest{sessions: map[string]*session{}}, id: id, out: ring{max: RingSize}}
+	s := &session{g: &Guest{sessions: map[string]*session{}}, id: id, out: ring{max: ringSize}}
 	s.cond = sync.NewCond(&s.mu)
 	return s
 }
@@ -192,7 +192,7 @@ func TestHostsFile(t *testing.T) {
 // session per SSH command and would otherwise grow without bound.
 func TestFinishedSessionIsForgotten(t *testing.T) {
 	g := &Guest{sessions: map[string]*session{}}
-	s := &session{g: g, id: "exec-1", out: ring{max: RingSize}}
+	s := &session{g: g, id: "exec-1", out: ring{max: ringSize}}
 	s.cond = sync.NewCond(&s.mu)
 	s.inCond = sync.NewCond(&s.inMu)
 	g.sessions[s.id] = s
@@ -416,18 +416,6 @@ func TestMergeEnv(t *testing.T) {
 	got := strings.Join(mergeEnv([]string{"A=1", "B=2"}, []string{"B=3", "C=4"}, []string{"A=5"}), " ")
 	if got != "A=5 B=3 C=4" {
 		t.Fatalf("mergeEnv = %s", got)
-	}
-}
-
-func TestConfigRoundTrip(t *testing.T) {
-	c := Config{Hostname: "h", IP: "10.0.0.2", Prefix: 24, Gateway: "10.0.0.1", MTU: 1450, DNS: []string{"10.0.0.10"}, Options: []string{"ndots:5"}, KubeNamespace: "sandbox", GatewayLoopbackPort: 8123}
-	img, err := EncodeConfig(c)
-	if err != nil || len(img) != ConfigDiskSize {
-		t.Fatalf("encode: %d %v", len(img), err)
-	}
-	got, err := DecodeConfig(img)
-	if err != nil || got.IP != c.IP || got.Prefix != 24 || got.Options[0] != "ndots:5" || got.KubeNamespace != c.KubeNamespace || got.GatewayLoopbackPort != 8123 {
-		t.Fatalf("decode: %+v %v", got, err)
 	}
 }
 

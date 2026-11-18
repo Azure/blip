@@ -40,15 +40,18 @@ func mountStateError(b *v1.Blip, st *v1.BlipState, writable bool) string {
 	if writable && st.Spec.Image != "" {
 		return immutableStateMessage(st.Name)
 	}
-	if owner := b.Labels[LabelOwner]; owner != "" && !ownedState(st, owner) &&
-		(writable || st.Spec.Image == "" || st.Labels[LabelOwner] != "") {
+	if owner := b.Labels[v1.LabelOwner]; !readableBy(owner, st) {
 		return fmt.Sprintf("mount %q is not owned by %s or a shared read-only image template", st.Name, owner)
 	}
 	return ""
 }
 
-func ownedState(st *v1.BlipState, owner string) bool {
-	return strings.HasPrefix(st.Name, owner+".") && st.Labels[LabelOwner] == owner
+// readableBy reports whether owner may use st: it owns st, or st is a shared
+// read-only image template.
+func readableBy(owner string, st *v1.BlipState) bool {
+	return owner == "" ||
+		(v1.OwnedBy(st.Name, owner) && st.Labels[v1.LabelOwner] == owner) ||
+		(st.Spec.Image != "" && st.Labels[v1.LabelOwner] == "")
 }
 
 // rootIntent reads only the root profile. Auxiliary profiles never expand.
@@ -73,20 +76,21 @@ func (r *BlipReconciler) rootIntent(ctx context.Context, b *v1.Blip) (*v1.BlipSt
 	if err := pruneTemporaryMounts(ctx, r.Client, r.Live, root); err != nil {
 		return nil, nil, "", "", err
 	}
-	mounts := desiredMounts(root, b)
+	mounts := v1.DesiredMounts(root, b)
 	if msg := validateMounts(root.Name, mounts); msg != "" {
 		return root, nil, ReasonInvalidSpec, msg, nil
 	}
 	for _, m := range mounts {
-		owner := b.Labels[LabelOwner]
-		owned := owner == "" || strings.HasPrefix(m.State, owner+".")
+		owner := b.Labels[v1.LabelOwner]
 		if !m.Writable && owner == "" {
 			continue
 		}
 		st := &v1.BlipState{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: m.State}, st); err != nil {
 			if apierrors.IsNotFound(err) {
-				if !owned {
+				// A missing state may be created again; check only the name
+				// prefix, since there is no object to read a label from.
+				if owner != "" && !v1.OwnedBy(m.State, owner) {
 					return root, nil, ReasonInvalidSpec, fmt.Sprintf("mount %q is not owned by %s or a shared read-only image template", m.State, owner), nil
 				}
 				continue
@@ -98,16 +102,6 @@ func (r *BlipReconciler) rootIntent(ctx context.Context, b *v1.Blip) (*v1.BlipSt
 		}
 	}
 	return root, mounts, "", "", nil
-}
-
-func desiredMounts(root *v1.BlipState, b *v1.Blip) []v1.Mount {
-	var mounts []v1.Mount
-	for _, m := range root.Spec.Mounts {
-		if m.BlipUID == "" || m.BlipUID == string(b.UID) {
-			mounts = append(mounts, m)
-		}
-	}
-	return mounts
 }
 
 // Only acknowledge a generation after its desired topology is mounted, and
