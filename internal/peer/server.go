@@ -53,6 +53,7 @@ type Server struct {
 	activateExport func(*lease) (string, error)
 	unexport       func(leaseID string) error
 	closeExport    func(leaseID string) error
+	pin            func(commitID, holder string) error
 	unpin          func(commitID, holder string) error
 	now            func() time.Time
 
@@ -75,6 +76,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		leases:      map[string]*lease{},
 		unexport:    t.Unexport,
 		closeExport: cfg.Store.CloseExport,
+		pin:         cfg.Store.Pin,
 		unpin:       cfg.Store.Unpin,
 		now:         time.Now,
 	}
@@ -213,6 +215,22 @@ func (s *Server) Pinned(commitID string) bool {
 	return false
 }
 
+// pinCommit records the lease's pin in the store.
+func (s *Server) pinCommit(l *lease) error {
+	if s.pin != nil {
+		return s.pin(l.Req.CommitID, leasePinPrefix+l.ID)
+	}
+	return s.cfg.Store.Pin(l.Req.CommitID, leasePinPrefix+l.ID)
+}
+
+// unpinCommit releases the lease's pin in the store.
+func (s *Server) unpinCommit(l *lease) error {
+	if s.unpin != nil {
+		return s.unpin(l.Req.CommitID, leasePinPrefix+l.ID)
+	}
+	return s.cfg.Store.Unpin(l.Req.CommitID, leasePinPrefix+l.ID)
+}
+
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	node, ok := s.caller(w, r)
 	if !ok {
@@ -232,16 +250,35 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	l := &lease{ID: newLeaseID(), Node: node, Req: req, LastRenewed: s.now()}
+	// Pin before the lease becomes visible. Otherwise a GC pass that already
+	// planned to delete the commit could race the lease insert and drop the
+	// volume before pinAndExport runs, leaving a live lease that pins nothing
+	// and a reader with a 404. With the pin first, either the commit exists
+	// and Delete now sees the pin, or the request fails as ErrNotFound and no
+	// lease is ever published. The pin is released below if persisting the
+	// lease fails; a crash in between leaves an orphan pin that restore (which
+	// unpins lease pins without a lease) cleans up.
+	if err := s.pinCommit(l); err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, storage.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		httpError(w, code, err.Error())
+		return
+	}
 	s.mu.Lock()
 	s.leases[l.ID] = l
 	err := s.saveLocked()
 	if err != nil {
-		// The lease was never persisted, so it must not linger in memory:
-		// nothing else would export, release, or later save it.
+		// The lease was never persisted, so it must not linger in memory or
+		// hold a pin: nothing else would export, release, or later save it.
 		delete(s.leases, l.ID)
 	}
 	s.mu.Unlock()
 	if err != nil {
+		if uerr := s.unpinCommit(l); uerr != nil {
+			log.Printf("peer: unpin failed export %s: %v", l.ID, uerr)
+		}
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

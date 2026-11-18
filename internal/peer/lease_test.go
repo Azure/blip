@@ -49,6 +49,10 @@ func newLeaseTestServer(t *testing.T, authorize Authorizer) *leaseTestServer {
 		now:         func() time.Time { return ts.now },
 		unexport:    func(id string) error { ts.released = append(ts.released, "unexport:"+id); return nil },
 		closeExport: func(id string) error { ts.released = append(ts.released, "close:"+id); return nil },
+		pin: func(commit, holder string) error {
+			ts.released = append(ts.released, "pin:"+commit+":"+holder)
+			return nil
+		},
 		unpin: func(commit, holder string) error {
 			ts.released = append(ts.released, "unpin:"+commit+":"+holder)
 			return nil
@@ -275,8 +279,8 @@ func TestLeaseReleaseWaitsForActivation(t *testing.T) {
 
 func TestHandleExportDropsLeaseWhenSaveFails(t *testing.T) {
 	ts := newLeaseTestServer(t, allow)
-	// A zero store reports ErrNotFound, exercising the ordinary export error
-	// path on the retry below.
+	// The store is pinned first; a zero store reports ErrNotFound on the
+	// export path below, exercising the ordinary export error on the retry.
 	ts.srv.cfg.Store = &storage.Store{}
 	ts.srv.activateExport = func(*lease) (string, error) { return "nqn", nil }
 	good := ts.srv.path
@@ -291,8 +295,11 @@ func TestHandleExportDropsLeaseWhenSaveFails(t *testing.T) {
 	if ts.srv.Pinned("c1") {
 		t.Fatal("failed export still pins its commit")
 	}
-	if len(ts.released) != 0 {
-		t.Fatalf("failed export touched kernel/store state: %v", ts.released)
+	// The pin taken before publishing the lease is released again; no kernel
+	// work happened.
+	if len(ts.released) != 2 || !strings.HasPrefix(ts.released[0], "pin:c1:"+leasePinPrefix) ||
+		!strings.HasPrefix(ts.released[1], "unpin:c1:"+leasePinPrefix) {
+		t.Fatalf("failed export did not unpin its lease: %v", ts.released)
 	}
 
 	// Persistence works again: a later export proceeds normally and the
@@ -312,7 +319,41 @@ func TestHandleExportDropsLeaseWhenSaveFails(t *testing.T) {
 	if len(leases) != 0 {
 		t.Fatalf("persisted leases = %+v, want none", leases)
 	}
-	if len(ts.released) != 3 || !strings.HasPrefix(ts.released[2], "unpin:c2:"+leasePinPrefix) {
+	if len(ts.released) != 6 ||
+		!strings.HasPrefix(ts.released[2], "pin:c2:"+leasePinPrefix) ||
+		!strings.HasPrefix(ts.released[3], "unexport:") ||
+		!strings.HasPrefix(ts.released[4], "close:") ||
+		!strings.HasPrefix(ts.released[5], "unpin:c2:"+leasePinPrefix) {
 		t.Fatalf("subsequent export did not release normally: %v", ts.released)
+	}
+}
+
+// TestHandleExportPinsBeforePublishingLease: the store pin must exist before
+// the lease is visible to Pinned/recheck/GC, so a delete can never drop a
+// commit that a lease already claims.
+func TestHandleExportPinsBeforePublishingLease(t *testing.T) {
+	ts := newLeaseTestServer(t, allow)
+	ts.srv.cfg.Store = &storage.Store{}
+	ts.srv.activateExport = func(*lease) (string, error) { return "", storage.ErrNotFound }
+	checked := false
+	ts.srv.pin = func(commit, holder string) error {
+		checked = true
+		if commit != "c1" || !strings.HasPrefix(holder, leasePinPrefix) {
+			t.Errorf("pin(%q, %q)", commit, holder)
+		}
+		// The lease must not be published before its pin is taken.
+		if ts.srv.Pinned(commit) {
+			t.Error("lease published before its pin")
+		}
+		if len(ts.srv.leases) != 0 {
+			t.Errorf("leases published before pin: %+v", ts.srv.leases)
+		}
+		return nil
+	}
+	if rec := ts.requestExport(t, "n1", "c1"); rec.Code != http.StatusNotFound {
+		t.Fatalf("export: %d %s", rec.Code, rec.Body)
+	}
+	if !checked {
+		t.Fatal("handleExport did not pin the commit")
 	}
 }

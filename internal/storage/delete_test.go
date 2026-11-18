@@ -3,8 +3,11 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -127,5 +130,155 @@ func TestRecoverRetriesOldDeletingRecord(t *testing.T) {
 	}
 	if pending := s.PendingDeletes(); len(pending) != 0 {
 		t.Fatalf("pending after retry = %v", pending)
+	}
+}
+
+// TestPinRacingDeleteCannotBeLost pins the lock ordering between Pin and
+// Delete. Delete holds the volume's key lock across its final eligibility
+// check and the teardown; a Pin that arrives in that window must wait and then
+// fail with ErrNotFound, never be accepted into a record that is then dropped.
+func TestPinRacingDeleteCannotBeLost(t *testing.T) {
+	s := newDeleteTestStore(t)
+	const id = "d000000000000001"
+	addRecord(t, s, &record{ID: id, Kind: KindCommit, Size: 32 << 20, Phase: phaseReady})
+
+	// Stop Delete inside its key-locked critical section, right after the
+	// eligibility re-check and before the record is touched.
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	s.testDeleteLocked = func() {
+		close(entered)
+		<-proceed
+	}
+	deleted := make(chan error, 1)
+	go func() { deleted <- s.Delete(context.Background(), id) }()
+	<-entered
+
+	pinned := make(chan error, 1)
+	go func() { pinned <- s.Pin(id, "lease:late") }()
+	select {
+	case err := <-pinned:
+		t.Fatalf("Pin returned while Delete held the key lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// Pin is blocked on the key lock: what a racing Pin must do.
+	}
+
+	close(proceed)
+	if err := <-deleted; err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := <-pinned; !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Pin that lost the race = %v, want ErrNotFound", err)
+	}
+	if _, ok := s.Get(id); ok {
+		t.Fatal("deleted volume still visible")
+	}
+}
+
+// TestPinBeforeDeletePreventsDeletion: a pin that does land before Delete's
+// final check makes Delete fail with ErrPinned and stays on the record.
+func TestPinBeforeDeletePreventsDeletion(t *testing.T) {
+	s := newDeleteTestStore(t)
+	const id = "d000000000000002"
+	addRecord(t, s, &record{ID: id, Kind: KindCommit, Size: 32 << 20, Phase: phaseReady})
+
+	if err := s.Pin(id, "lease:a"); err != nil {
+		t.Fatalf("pin: %v", err)
+	}
+	if err := s.Delete(context.Background(), id); !errors.Is(err, ErrPinned) {
+		t.Fatalf("delete pinned volume = %v, want ErrPinned", err)
+	}
+	v, ok := s.Get(id)
+	if !ok || len(v.Pins) != 1 || v.Pins[0] != "lease:a" {
+		t.Fatalf("pin lost after refused delete: %+v", v)
+	}
+
+	if err := s.Unpin(id, "lease:a"); err != nil {
+		t.Fatalf("unpin: %v", err)
+	}
+	if err := s.Delete(context.Background(), id); err != nil {
+		t.Fatalf("delete unpinned volume: %v", err)
+	}
+	if err := s.Pin(id, "lease:b"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("pin after delete = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPinUnpinIdempotent keeps the documented return semantics: double Pin is
+// a no-op, Unpin of a missing pin or record succeeds.
+func TestPinUnpinIdempotent(t *testing.T) {
+	s := newDeleteTestStore(t)
+	const id = "d000000000000003"
+	addRecord(t, s, &record{ID: id, Kind: KindCommit, Size: 32 << 20, Phase: phaseReady})
+
+	for range 2 {
+		if err := s.Pin(id, "lease:a"); err != nil {
+			t.Fatalf("pin: %v", err)
+		}
+	}
+	v, _ := s.Get(id)
+	if len(v.Pins) != 1 {
+		t.Fatalf("pins after double pin = %v", v.Pins)
+	}
+	if err := s.Unpin(id, "missing"); err != nil {
+		t.Fatalf("unpin missing holder: %v", err)
+	}
+	if err := s.Unpin(id, "lease:a"); err != nil {
+		t.Fatalf("unpin: %v", err)
+	}
+	if err := s.Unpin(id, "lease:a"); err != nil {
+		t.Fatalf("second unpin: %v", err)
+	}
+	if err := s.Unpin("unknown", "lease:a"); err != nil {
+		t.Fatalf("unpin unknown volume: %v", err)
+	}
+}
+
+// TestPinDeleteStress runs Pin/Unpin/Delete concurrently under -race. A pin
+// that Pin accepts must stay visible until it is unpinned: Delete may not drop
+// a pinned record.
+func TestPinDeleteStress(t *testing.T) {
+	s := newDeleteTestStore(t)
+	const id = "d000000000000004"
+	addRecord(t, s, &record{ID: id, Kind: KindCommit, Size: 32 << 20, Phase: phaseReady})
+
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			holder := fmt.Sprintf("lease:%d", i)
+			for range 50 {
+				if err := s.Pin(id, holder); err == nil {
+					// The pin is held here, so Delete must not have dropped
+					// the record.
+					if _, ok := s.Get(id); !ok {
+						t.Errorf("pinned volume %s is gone", id)
+					}
+					if err := s.Unpin(id, holder); err != nil {
+						t.Errorf("unpin %s: %v", id, err)
+					}
+				} else if !errors.Is(err, ErrNotFound) {
+					t.Errorf("pin %s: %v", id, err)
+				}
+			}
+		}()
+	}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				if err := s.Delete(context.Background(), id); err != nil && !errors.Is(err, ErrPinned) {
+					t.Errorf("delete %s: %v", id, err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if err := s.Delete(context.Background(), id); err != nil {
+		t.Fatalf("final delete: %v", err)
+	}
+	if _, ok := s.Get(id); ok {
+		t.Fatal("volume still visible after final delete")
 	}
 }

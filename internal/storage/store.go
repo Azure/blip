@@ -91,6 +91,12 @@ type Store struct {
 	// removeAll. Production leaves it nil; tests use it to inject a failed
 	// teardown.
 	testTeardownStep func() error
+
+	// testDeleteLocked, when set, is called by Delete after it took the
+	// volume's key lock and re-checked deletion eligibility, before it touches
+	// any device. Production leaves it nil; tests use it to race a Pin against
+	// that window.
+	testDeleteLocked func()
 }
 
 // Open opens (creating if needed) the pool and metadata, rebuilds device
@@ -669,7 +675,15 @@ func thinFree(st string) (int64, bool) {
 }
 
 // Pin marks id as held by holder; pinned volumes cannot be deleted.
+//
+// It takes the volume's key lock, like every other operation that changes the
+// volume: Delete re-checks deletability while holding that lock, so a pin
+// either lands before that check (and Delete fails with ErrPinned) or waits
+// until the delete has dropped the record (and then fails with ErrNotFound).
+// Without this, a pin accepted between Delete's check and the teardown was
+// silently dropped with the record.
 func (s *Store) Pin(id, holder string) error {
+	defer s.locks.lock(id)()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.vols[id]
@@ -683,7 +697,10 @@ func (s *Store) Pin(id, holder string) error {
 	return s.putLocked(r)
 }
 
+// Unpin releases a pin. It takes the volume's key lock for the same reason as
+// Pin: its result must be ordered with Delete's eligibility check.
 func (s *Store) Unpin(id, holder string) error {
+	defer s.locks.lock(id)()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.vols[id]
@@ -737,6 +754,9 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	}
 	defer s.locks.lock(id)()
 	r, err := s.deletable(id)
+	if s.testDeleteLocked != nil {
+		s.testDeleteLocked()
+	}
 	if err == nil && r != nil {
 		// The devices users open go first: if they are still open nothing changes.
 		if err = dmRemove(s.plainName(r)); err == nil {
