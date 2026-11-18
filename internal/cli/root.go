@@ -141,10 +141,12 @@ func (a *app) findSelf(ctx context.Context) error {
 	}
 	var b v1alpha1.Blip
 	err = a.c.Kube.Get(ctx, client.ObjectKey{Namespace: a.c.Namespace, Name: host}, &b)
-	if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
+	switch {
+	case apierrors.IsNotFound(err):
 		return nil
-	}
-	if err != nil {
+	case apierrors.IsForbidden(err):
+		return fmt.Errorf("cannot read blip %q to find out where this command runs: %w", host, err)
+	case err != nil:
 		return err
 	}
 	a.self = &b

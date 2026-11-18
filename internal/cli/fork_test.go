@@ -199,6 +199,24 @@ func TestMountDefaultsToSelf(t *testing.T) {
 	}
 }
 
+func TestFindSelfReportsForbidden(t *testing.T) {
+	h := newHarness(t, readyState("repo"))
+	h.self = "agent"
+	gr := v1alpha1.GroupVersion.WithResource("blips").GroupResource()
+	h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*v1alpha1.Blip); ok {
+				return apierrors.NewForbidden(gr, key.Name, errors.New("access denied"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	code, _, errOut := h.run("", "mount", "repo", "--path", "/work")
+	if code != 1 || !strings.Contains(errOut, `cannot read blip "agent"`) || !strings.Contains(errOut, "forbidden") {
+		t.Fatalf("code %d stderr %q", code, errOut)
+	}
+}
+
 func TestParseCollectOpsAndState(t *testing.T) {
 	const cwd = "/home/dev/src"
 	for _, tc := range []struct {
