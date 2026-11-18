@@ -302,5 +302,5 @@ func TestRunReportsMissingPoolAndState(t *testing.T) {
 	if code == 0 {
 		t.Fatal("run succeeded without a state")
 	}
-	mustContain(t, errOut, `state "home" not found`, "examples/state-from-image.yaml")
+	mustContain(t, errOut, `state "home" not found`, "kubectl blip create blipstate")
 }

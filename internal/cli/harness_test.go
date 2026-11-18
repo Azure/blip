@@ -120,11 +120,13 @@ type fakeController struct {
 
 	mu sync.Mutex
 	// autoFinish ends command blips without a guest exit.
-	autoFinish  bool
-	paused      bool
-	mountFail   string
-	unmountFail string
-	exited      map[string]int32
+	autoFinish       bool
+	paused           bool
+	stateFail        string
+	stateFailPending bool
+	mountFail        string
+	unmountFail      string
+	exited           map[string]int32
 }
 
 func (c *fakeController) set(f func(c *fakeController)) {
@@ -150,8 +152,21 @@ func (c *fakeController) tick(ctx context.Context) {
 	c.kube.List(ctx, &states)
 	for i := range states.Items {
 		s := &states.Items[i]
-		if s.Status.Phase == "" {
+		switch {
+		case s.Status.Phase == "":
+			if c.stateFail != "" {
+				s.Status.Phase, s.Status.Message = v1alpha1.StateFailed, c.stateFail
+				if c.stateFailPending {
+					s.Status.Pending = &v1alpha1.PendingCommit{CommitID: "fedcba9876543210", Generation: 1}
+				}
+			} else {
+				s.Status.Phase = v1alpha1.StateReady
+				s.Status.Committed = &v1alpha1.Commit{ID: "0123456789abcdef", Generation: 1}
+			}
+			c.kube.Update(ctx, s)
+		case s.Status.Phase == v1alpha1.StateFailed && s.Status.Pending != nil:
 			s.Status.Phase = v1alpha1.StateReady
+			s.Status.Pending = nil
 			s.Status.Committed = &v1alpha1.Commit{ID: "0123456789abcdef", Generation: 1}
 			c.kube.Update(ctx, s)
 		}

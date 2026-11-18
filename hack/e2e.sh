@@ -59,15 +59,7 @@ blip run "$P-hello" --image "$IMG" -- sh -c 'echo hello from $(hostname)'
 k delete blip "$P-hello" >/dev/null
 
 step "a durable root survives a restart"
-k create -f - >/dev/null <<EOF
-apiVersion: blip.dev/v1alpha1
-kind: BlipState
-metadata:
-  name: $P-agent
-spec:
-  image: $IMG
-EOF
-k wait --for=jsonpath='{.status.phase}'=Ready --timeout "${T}s" "blipstate/$P-agent" >/dev/null
+blip create blipstate "$P-agent" --image "$IMG"
 blip run "$P-agent" --state "$P-agent" -d
 blip exec "$P-agent" -- sh -c 'mkdir -p ~/kept'
 k patch blip "$P-agent" --type merge -p '{"spec":{"stop":true}}' >/dev/null
@@ -179,19 +171,9 @@ echo "$B checks passed"
 b_checks >"$tmp/b.log" 2>&1 &
 bpid=$!
 
-step "$A: fork a mounted state"
-k -n "$SSH_NS" create -f - >/dev/null <<EOF
-apiVersion: blip.dev/v1alpha1
-kind: BlipState
-metadata:
-  name: $A.repo
-  labels:
-    blip.dev/owner: $A
-spec:
-  size: 2Gi
-EOF
-k -n "$SSH_NS" wait --for=jsonpath='{.status.phase}'=Ready --timeout "${T}s" "blipstate/$A.repo" >/dev/null
+step "$A: create and fork a mounted state"
 as "$A" <<'EOF'
+blip create blipstate repo --size 2Gi
 blip mount repo --path /work --write
 sudo chown dev /work
 mkdir /work/repo && cd /work/repo

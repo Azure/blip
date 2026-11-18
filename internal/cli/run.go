@@ -163,7 +163,7 @@ func (a *app) preflight(ctx context.Context, kube client.Client, b *v1alpha1.Bli
 		}
 		err := kube.Get(ctx, client.ObjectKey{Namespace: b.Namespace, Name: s}, &v1alpha1.BlipState{})
 		if apierrors.IsNotFound(err) {
-			return fmt.Errorf("state %q not found in namespace %s (create a BlipState with kubectl apply; see examples/state-from-image.yaml)", s, b.Namespace)
+			return fmt.Errorf("state %q not found in namespace %s (create it with kubectl blip create blipstate NAME)", s, b.Namespace)
 		}
 		if err != nil {
 			return err
