@@ -153,9 +153,13 @@ func copySourcePredicate() predicate.Predicate {
 				return false
 			}
 			// deletionBlockers considers a copy blocking while it has no
-			// committed version and names a source it copied from.
+			// committed version, names a source it copied from, and can
+			// still use that source. A failed or deleting copy stops
+			// blocking, so wake the source on those transitions too.
 			return old.Spec.CopyFrom != cur.Spec.CopyFrom ||
 				(old.Status.Committed == nil) != (cur.Status.Committed == nil) ||
+				old.Status.Phase != cur.Status.Phase ||
+				(old.DeletionTimestamp == nil) != (cur.DeletionTimestamp == nil) ||
 				!equality.Semantic.DeepEqual(old.Status.CopiedFrom, cur.Status.CopiedFrom)
 		},
 		DeleteFunc:  func(event.DeleteEvent) bool { return true },
@@ -1012,9 +1016,22 @@ func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState
 		return nil, err
 	}
 	for _, c := range copies.Items {
-		if c.Status.Committed == nil && c.Status.CopiedFrom != nil && c.Status.CopiedFrom.StateUID == string(st.UID) {
+		if copyBlocksDeletion(&c, st) {
 			out = append(out, "copy "+c.Name)
 		}
 	}
 	return out, nil
+}
+
+// copyBlocksDeletion reports whether a copy still needs the source state's
+// data. A copy can only use the source while it is making progress: one that
+// failed terminally (for example a size smaller than the source) will never
+// commit, and one that is being deleted is no longer built by the controller.
+// Neither may pin the source's finalizer forever.
+func copyBlocksDeletion(c, src *v1.BlipState) bool {
+	if c.DeletionTimestamp != nil || c.Status.Phase == v1.StateFailed {
+		return false
+	}
+	return c.Status.Committed == nil && c.Status.CopiedFrom != nil &&
+		c.Status.CopiedFrom.StateUID == string(src.UID)
 }
