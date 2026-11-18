@@ -80,6 +80,72 @@ func TestStateInitialization(t *testing.T) {
 	}
 }
 
+func TestInitialReplicaWaitsForSource(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.newState("s", func(st *v1.BlipState) { st.Spec.Replicas = 2 })
+	e.run(e.state, ns, "s")
+	p := e.getState("s").Status.Pending
+	if p == nil {
+		t.Fatal("no pending initial version")
+	}
+	replica := "n1"
+	if p.SourceNode == replica {
+		replica = "n2"
+	}
+
+	// The replica cannot see the commit until the source publishes it.
+	e.report("s", replica, func(o *v1.NodeObservation) {
+		o.Error = "no healthy holder of commit " + p.CommitID + " (source node " + p.SourceNode + ")"
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StatePending || st.Status.Committed != nil {
+		t.Fatalf("transient replica error failed the state: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "waiting") {
+		t.Fatalf("message %q does not say waiting", st.Status.Message)
+	}
+
+	// The source publishes the commit and the replica fetches it.
+	e.hold("s", p.CommitID, p.SourceNode)
+	e.report("s", replica, func(o *v1.NodeObservation) {
+		o.Error = ""
+		o.Commits = append(o.Commits, p.CommitID)
+	})
+	e.run(e.state, ns, "s")
+	if st = e.getState("s"); st.Status.Phase != v1.StateReady || st.Status.Committed == nil {
+		t.Fatalf("state did not become ready: %+v", st.Status)
+	}
+}
+
+func TestInitialReplicaErrorAfterSourceFailsState(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.newState("s", func(st *v1.BlipState) { st.Spec.Replicas = 2 })
+	e.run(e.state, ns, "s")
+	p := e.getState("s").Status.Pending
+	if p == nil {
+		t.Fatal("no pending initial version")
+	}
+	replica := "n1"
+	if p.SourceNode == replica {
+		replica = "n2"
+	}
+
+	// Once the source holds the commit, a replica error is no longer just
+	// status lag; it must surface as a failed initialization.
+	e.hold("s", p.CommitID, p.SourceNode)
+	e.report("s", replica, func(o *v1.NodeObservation) {
+		o.Error = "storage: no space left on device"
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StateFailed || !strings.Contains(st.Status.Message, "no space") {
+		t.Fatalf("replica error not surfaced: %+v", st.Status)
+	}
+}
+
 func TestPendingReplicaReplaced(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2", "n3")

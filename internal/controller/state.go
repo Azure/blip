@@ -513,10 +513,12 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 	}
 	if len(waiting) > 0 {
 		msg := fmt.Sprintf("saving generation %d: waiting for %s", p.Generation, strings.Join(waiting, ", "))
-		if p.Generation == 1 && len(errs) > 0 {
+		if p.Generation == 1 && len(errs) > 0 && initialSourceSettled(st, cl, p) {
 			// Keep pending so a retry or a recovered node can still
 			// complete it, but surface a failing initial build (for
-			// example an image larger than the requested size).
+			// example an image larger than the requested size). Until
+			// the source reports the commit or an error, replicas that
+			// cannot see it are only waiting for it to publish.
 			s.Phase = v1.StateFailed
 			return "initial version failed: " + s.LastError, nil
 		}
@@ -533,6 +535,25 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 	s.Pending = nil
 	s.LastError = ""
 	return "", nil
+}
+
+// initialSourceSettled reports whether the source of an initial version has
+// had its chance to build it: it reports holding the commit or reports an
+// error. Before that, replica errors only mean the commit is not visible yet,
+// so they do not prove that initialization failed.
+func initialSourceSettled(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
+	if p.Generation != 1 {
+		return true
+	}
+	if cl.holds(st, p.SourceNode, p.CommitID) {
+		return true
+	}
+	for _, o := range st.Status.Nodes {
+		if o.Node == p.SourceNode && o.Error != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // pendingSource keeps Pending.SourceNode on a node that can serve the

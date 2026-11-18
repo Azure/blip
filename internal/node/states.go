@@ -272,6 +272,14 @@ func planFetch(v *view, p *plan, s *v1alpha1.BlipState) *fetch {
 		return nil
 	}
 	if src == nil {
+		if pd := st.Pending; pd != nil && pd.CommitID == want && pd.Generation == 1 &&
+			v.healthyNode(pd.SourceNode, "") != nil {
+			// The source may not have published the initial commit yet.
+			// Waiting for it is not a preparation failure; the state
+			// stays pending until the source reports the commit or an
+			// error.
+			return nil
+		}
 		msg := fmt.Sprintf("no healthy holder of commit %s", want)
 		if pd := st.Pending; pd != nil && pd.CommitID == want && pd.SourceNode != "" {
 			msg = fmt.Sprintf("no healthy holder of commit %s (source node %s)", want, pd.SourceNode)

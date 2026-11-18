@@ -589,6 +589,37 @@ func TestHolderFailover(t *testing.T) {
 	}
 }
 
+// TestInitialReplicaWaitsForSource: a generation-1 replica does not report an
+// error while its healthy source has not published the initial commit.
+func TestInitialReplicaWaitsForSource(t *testing.T) {
+	v := newView()
+	s := state("s")
+	s.Status.Pending = &v1alpha1.PendingCommit{CommitID: "c1", Generation: 1, SourceNode: "n2", Replicas: []string{self, "n2"}}
+	v.states = append(v.states, s)
+
+	p := compute(v)
+	if len(p.fetches) != 0 {
+		t.Fatalf("fetches = %+v", p.fetches)
+	}
+	if e := entryFor(p, "s"); e != nil && e.Error != "" {
+		t.Fatalf("replica error while the source builds: %+v", e)
+	}
+
+	// Once the source publishes the commit, the replica fetches it.
+	s.Status.Nodes = []v1alpha1.NodeObservation{holding("n2", "c1")}
+	p = compute(v)
+	if len(p.fetches) != 1 || p.fetches[0].src.node != "n2" {
+		t.Fatalf("fetches = %+v", p.fetches)
+	}
+
+	// An unhealthy source is still reported: it cannot publish the commit.
+	v.blipNodes["n2"].Spec.Drain = true
+	p = compute(v)
+	if e := entryFor(p, "s"); e == nil || !strings.Contains(e.Error, "no healthy holder") {
+		t.Fatalf("entry = %+v", e)
+	}
+}
+
 func TestSourcesSkipAmbiguousIdentities(t *testing.T) {
 	for _, duplicateOf := range []string{"n3", self} {
 		t.Run("duplicate of "+duplicateOf, func(t *testing.T) {
