@@ -58,6 +58,8 @@ type Guest struct {
 	rootDev    string
 	mounts     map[string]*mount // auxiliary mounts by ID
 	sessions   map[string]*session
+	openIDs    map[string]*openRecord // exec opens by client OpenID
+	openOrder  []string               // completed OpenIDs, oldest first
 	clients    int
 	lastActive time.Time // last client attach or session start; resets idle
 	exit       *wire.Exit
@@ -85,6 +87,7 @@ func newGuest(root, cgroup string) *Guest {
 		mounts:   map[string]*mount{},
 		frozen:   map[string]*frozenFS{},
 		sessions: map[string]*session{},
+		openIDs:  map[string]*openRecord{},
 	}
 	if fd, err := unix.Open(cgroup, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0); err == nil {
 		g.cgroupFD = fd

@@ -18,11 +18,12 @@ import (
 // session is one process with replayable output and any number of attached
 // clients.
 type session struct {
-	g    *Guest
-	id   string
-	argv []string
-	tty  bool
-	proc *proc
+	g      *Guest
+	id     string
+	openID string // client-generated exec open ID, for retry deduplication
+	argv   []string
+	tty    bool
+	proc   *proc
 
 	mu        sync.Mutex
 	cond      *sync.Cond
@@ -63,6 +64,25 @@ type client struct {
 	cursor uint64 // next output frame the client has not received
 }
 
+// maxOpenTombstones bounds the completed open IDs remembered so a retry that
+// arrives after a fast command exited cannot start it again. Exec opens are
+// short-lived, so a small window covers the gateway's single retry.
+const maxOpenTombstones = 256
+
+// errOpenCompleted reports a retry for a command that already ran and left the
+// session list. Rerunning it could repeat a non-idempotent operation, so the
+// caller gets an error instead.
+var errOpenCompleted = errors.New("session already completed")
+
+// openRecord tracks one client-generated OpenID. session is nil while the
+// process is starting and after the session is gone; done closes once the
+// start attempt has resolved either way.
+type openRecord struct {
+	session   *session
+	completed bool
+	done      chan struct{}
+}
+
 func newID() string {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
@@ -84,6 +104,12 @@ func newSession(g *Guest, id string, argv []string, tty bool) *session {
 // startSession starts a process and registers its session. base is the
 // environment applied before s.env.
 func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bool) (*session, error) {
+	return g.startSessionOpen(id, "", s, base, holdOutput)
+}
+
+// startSessionOpen is startSession with a client OpenID recorded on the
+// session before it becomes visible, so removeSession can tombstone it.
+func (g *Guest) startSessionOpen(id, openID string, s procSpec, base []string, holdOutput bool) (*session, error) {
 	start := g.startProc
 	if g.startProcess != nil {
 		start = g.startProcess
@@ -93,6 +119,7 @@ func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bo
 		return nil, err
 	}
 	ss := newSession(g, id, argv, s.tty)
+	ss.openID = openID
 	ss.proc = p
 	if !holdOutput {
 		ss.releasePumps()
@@ -144,6 +171,121 @@ func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bo
 		ss.finish(e)
 	}()
 	return ss, nil
+}
+
+// openExec validates and starts an exec session, deduplicating client retries
+// by OpenID. An empty OpenID keeps the old behavior: every open is a new
+// process.
+func (g *Guest) openExec(o wire.Open) (*session, error) {
+	if o.OpenID != "" {
+		if s, err, found := g.lookupOpen(o.OpenID); found {
+			return s, err
+		}
+	}
+	g.mu.Lock()
+	claim, stopping, exited := g.claim, g.stopping, g.exit != nil
+	g.mu.Unlock()
+	if claim == nil || stopping {
+		return nil, errors.New("blip is not running")
+	}
+	if exited {
+		// The primary command has finished and the guest is only keeping its
+		// session replayable. A new command could still write a durable root
+		// after it was supposed to be sealed.
+		return nil, errors.New("blip primary command has exited")
+	}
+	spec := execProcSpec(claim, o)
+	return g.startExec(o.OpenID, newID(), spec, claim.Env)
+}
+
+// lookupOpen returns the session recorded for openID. If another connection
+// with the same ID is still starting its process, lookupOpen waits for it
+// rather than letting a retry start a duplicate. found is false only for an
+// unknown ID.
+func (g *Guest) lookupOpen(openID string) (*session, error, bool) {
+	for {
+		g.mu.Lock()
+		rec, ok := g.openIDs[openID]
+		if !ok {
+			g.mu.Unlock()
+			return nil, nil, false
+		}
+		if rec.completed {
+			g.mu.Unlock()
+			return nil, errOpenCompleted, true
+		}
+		if rec.session != nil {
+			s := rec.session
+			g.mu.Unlock()
+			return s, nil, true
+		}
+		done := rec.done
+		g.mu.Unlock()
+		<-done
+	}
+}
+
+// startExec is the single-flight path for an exec OpenID: exactly one process
+// starts per ID, concurrent duplicates attach to its session, and an ID kept
+// as a tombstone is never rerun.
+func (g *Guest) startExec(openID, id string, spec procSpec, base []string) (*session, error) {
+	if openID == "" {
+		return g.startSessionOpen(id, "", spec, base, true)
+	}
+	for {
+		g.mu.Lock()
+		if rec, ok := g.openIDs[openID]; ok {
+			switch {
+			case rec.completed:
+				g.mu.Unlock()
+				return nil, errOpenCompleted
+			case rec.session != nil:
+				s := rec.session
+				g.mu.Unlock()
+				return s, nil
+			}
+			done := rec.done
+			g.mu.Unlock()
+			<-done
+			continue
+		}
+		rec := &openRecord{done: make(chan struct{})}
+		g.openIDs[openID] = rec
+		g.mu.Unlock()
+
+		s, err := g.startSessionOpen(id, openID, spec, base, true)
+
+		g.mu.Lock()
+		if err != nil {
+			// No process started, so a retry may safely try again.
+			delete(g.openIDs, openID)
+		} else {
+			rec.session = s
+			if g.sessions[s.id] != s {
+				// The command exited and was removed before the open could
+				// link it. Tombstone it now instead of leaving a session
+				// pointer that no one can attach to.
+				rec.session = nil
+				rec.completed = true
+				g.rememberOpenLocked(openID)
+			}
+		}
+		close(rec.done)
+		g.mu.Unlock()
+		return s, err
+	}
+}
+
+// rememberOpenLocked keeps a completed OpenID as a bounded tombstone.
+func (g *Guest) rememberOpenLocked(openID string) {
+	g.openOrder = append(g.openOrder, openID)
+	for len(g.openOrder) > maxOpenTombstones {
+		old := g.openOrder[0]
+		g.openOrder = g.openOrder[1:]
+		if rec := g.openIDs[old]; rec != nil && rec.completed {
+			delete(g.openIDs, old)
+		}
+	}
 }
 
 // failedSession records a session whose process could not start, so a
@@ -349,7 +491,9 @@ func (s *session) finish(st wire.Exit) {
 
 // removeSession forgets a finished command session once no client can attach
 // to it. Every non-primary session is one command, so keeping them would grow
-// the session list (and memory) without bound in a long-lived blip.
+// the session list (and memory) without bound in a long-lived blip. An exec
+// open ID becomes a bounded tombstone so a delayed retry cannot run the
+// command a second time.
 func (g *Guest) removeSession(s *session) {
 	if s.id == wire.PrimarySession {
 		return
@@ -357,6 +501,13 @@ func (g *Guest) removeSession(s *session) {
 	g.mu.Lock()
 	if g.sessions[s.id] == s {
 		delete(g.sessions, s.id)
+	}
+	if s.openID != "" {
+		if rec := g.openIDs[s.openID]; rec != nil && rec.session == s && !rec.completed {
+			rec.session = nil
+			rec.completed = true
+			g.rememberOpenLocked(s.openID)
+		}
 	}
 	g.mu.Unlock()
 }
@@ -603,22 +754,7 @@ func (g *Guest) serveSession(f *os.File) {
 		}
 		s.serve(c, f)
 	case wire.OpenExec:
-		g.mu.Lock()
-		claim, stopping, exited := g.claim, g.stopping, g.exit != nil
-		g.mu.Unlock()
-		if claim == nil || stopping {
-			reject(c, f, errors.New("blip is not running"))
-			return
-		}
-		if exited {
-			// The primary command has finished and the guest is only
-			// keeping its session replayable. A new command could still
-			// write a durable root after it was supposed to be sealed.
-			reject(c, f, errors.New("blip primary command has exited"))
-			return
-		}
-		spec := execProcSpec(claim, o)
-		s, err := g.startSession(newID(), spec, claim.Env, true)
+		s, err := g.openExec(o)
 		if err != nil {
 			reject(c, f, err)
 			return

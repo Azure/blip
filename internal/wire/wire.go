@@ -194,6 +194,11 @@ type Open struct {
 	Cols       uint16   `json:"cols,omitempty"`
 	Host       string   `json:"host,omitempty"`
 	Port       int      `json:"port,omitempty"`
+	// OpenID identifies one logical exec/attach attempt. A client that
+	// retries after a transport failure reuses it so the guest can attach to
+	// a session it may already have started instead of running the command
+	// twice. Old clients leave it empty, which preserves the old behavior.
+	OpenID string `json:"openID,omitempty"`
 }
 
 type Opened struct {

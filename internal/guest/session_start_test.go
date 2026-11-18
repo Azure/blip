@@ -44,6 +44,7 @@ func testGuest(t *testing.T) *Guest {
 		mounts:   map[string]*mount{},
 		frozen:   map[string]*frozenFS{},
 		sessions: map[string]*session{},
+		openIDs:  map[string]*openRecord{},
 	}
 }
 

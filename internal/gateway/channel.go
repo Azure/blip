@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -160,12 +162,24 @@ func (c *sessionChannel) start(ctx context.Context, nl string, tty bool) (string
 	}
 }
 
+// newOpenID names one logical exec open. The gateway generates it once and
+// reuses it across the recreate-and-retry loops, so a guest that already
+// received the open can attach instead of starting the command twice.
+func newOpenID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // open ensures the sandbox is running and opens a guest session. The
 // sandbox can start stopping after ensureSandbox observed it Running but
 // before pod exec reaches it, often when a user reconnects during the idle
 // save window. ErrUnreachable means no process reported an outcome, so
 // recreate the sandbox and try once more.
 func (c *sessionChannel) openSession(ctx context.Context, o wire.Open, nl string) (*session.Session, error) {
+	if o.OpenID == "" {
+		o.OpenID = newOpenID()
+	}
 	for attempt := 0; ; attempt++ {
 		startCtx, cancel := context.WithTimeout(ctx, startTimeout)
 		pod, err := c.start(startCtx, nl, o.TTY)

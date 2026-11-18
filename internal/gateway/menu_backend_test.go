@@ -225,6 +225,45 @@ func TestOpenStateTargetsRunningWorkersByReference(t *testing.T) {
 	}
 }
 
+func TestOpenStateRetryReusesOpenID(t *testing.T) {
+	st := catalogState("alice", "fork", "alice.home")
+	st.Name = "legacy-fork"
+	worker := catalogBlip("alice", "worker", st.Name, v1alpha1.BlipRunning)
+	worker.Name = "legacy-worker"
+	st.OwnerReferences = []metav1.OwnerReference{{APIVersion: v1alpha1.GroupVersion.String(), Kind: "Blip", Name: worker.Name, UID: worker.UID}}
+	st.Status.Writer = &v1alpha1.Writer{BlipName: worker.Name, BlipUID: string(worker.UID)}
+	s := backendServer(t, catalogClient(t, st, worker))
+	guest := &fakeguest.Guest{}
+	captured := make(chan wire.Open, 1)
+	var first atomic.Bool
+	s.Sessions = &session.Client{Connect: func(ctx context.Context, namespace, pod string) (io.ReadWriteCloser, error) {
+		if first.CompareAndSwap(false, true) {
+			return captureEOFConn{opens: captured}, nil
+		}
+		return guest.Connect(ctx, namespace, pod)
+	}}
+	sess, err := s.openState(context.Background(), "alice", stateEntry(st, "alice"), wire.Open{Mode: wire.OpenExec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	opens := guest.Opens()
+	if len(opens) != 1 {
+		t.Fatalf("guest opened %d sessions, want 1", len(opens))
+	}
+	var failed wire.Open
+	select {
+	case failed = <-captured:
+	default:
+		t.Fatal("the failed attempt did not send an open")
+	}
+	got := opens[0].Open
+	if failed.OpenID == "" || got.OpenID != failed.OpenID {
+		t.Fatalf("retry OpenID = %q, first attempt = %q; want the same non-empty ID", got.OpenID, failed.OpenID)
+	}
+}
+
 func TestOpenStateWaitsForMountReadiness(t *testing.T) {
 	for _, tt := range []struct {
 		name, initial, next string

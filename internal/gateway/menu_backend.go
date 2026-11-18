@@ -189,6 +189,9 @@ func (b *catalogBackend) Delete(ctx context.Context, entry menu.Entry) error {
 // cannot silently recreate it after deletion. Startup waits use the shared
 // catalog's events rather than adding a watch or polling loop per SSH session.
 func (s *Server) openState(ctx context.Context, owner string, entry menu.Entry, o wire.Open) (*session.Session, error) {
+	if o.OpenID == "" {
+		o.OpenID = newOpenID()
+	}
 	for attempt := 0; ; attempt++ {
 		startCtx, cancel := context.WithTimeout(ctx, startTimeout)
 		pod, err := s.startSelectedState(startCtx, owner, entry)

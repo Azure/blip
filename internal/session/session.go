@@ -28,7 +28,10 @@ type Client struct {
 	Connect Connector
 }
 
-// Open starts or joins a session (o.Mode exec or attach).
+// Open starts or joins a session (o.Mode exec or attach). A caller that may
+// retry after ErrUnreachable should reuse o.OpenID across attempts: the guest
+// attaches to a session it already started instead of running the command
+// again. An empty OpenID preserves the old behavior for existing clients.
 func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (*Session, error) {
 	rwc, err := c.Connect(ctx, namespace, pod)
 	if err != nil {
@@ -45,6 +48,8 @@ func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (
 	t, payload, err := conn.Read()
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		rwc.Close()
+		// The guest may have received the open even though its answer was
+		// lost, so a retry must carry the same OpenID.
 		return nil, ErrUnreachable
 	}
 	if err != nil {
