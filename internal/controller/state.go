@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -85,6 +86,9 @@ func (r *StateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return out
 		})).
 		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.copies)).
+		// A copy that commits or stops blocking can release its source's
+		// finalizer; wake the source instead of waiting for a resync.
+		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.copySource), builder.WithPredicates(copySourcePredicate())).
 		Named("blipstate").
 		// Live copies and seals of independent states do not share locks
 		// in the controller; a single worker made parallel forks queue
@@ -120,6 +124,43 @@ func (r *StateReconciler) copiesOf(ctx context.Context, namespace, name string) 
 		out = append(out, req(st.Namespace, st.Name))
 	}
 	return out
+}
+
+// copySource maps a state copying another to the source state. It wakes the
+// source when the copy stops or starts blocking the source's deletion, so the
+// finalizer is retried without waiting for the periodic resync.
+func (r *StateReconciler) copySource(_ context.Context, o client.Object) []reconcile.Request {
+	st, ok := o.(*v1.BlipState)
+	if !ok || st.Spec.CopyFrom == "" || st.Spec.CopyFrom == st.Name {
+		return nil
+	}
+	return []reconcile.Request{req(st.Namespace, st.Spec.CopyFrom)}
+}
+
+// copySourcePredicate keeps copySource from mapping unrelated status churn
+// (messages, node observations) that cannot change whether the copy blocks
+// its source.
+func copySourcePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			old, ok := e.ObjectOld.(*v1.BlipState)
+			if !ok {
+				return false
+			}
+			cur, ok := e.ObjectNew.(*v1.BlipState)
+			if !ok {
+				return false
+			}
+			// deletionBlockers considers a copy blocking while it has no
+			// committed version and names a source it copied from.
+			return old.Spec.CopyFrom != cur.Spec.CopyFrom ||
+				(old.Status.Committed == nil) != (cur.Status.Committed == nil) ||
+				!equality.Semantic.DeepEqual(old.Status.CopiedFrom, cur.Status.CopiedFrom)
+		},
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
 }
 
 func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (reconcile.Result, error) {
