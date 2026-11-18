@@ -49,6 +49,13 @@ const (
 	exitAnnotationGrace = 30 * time.Second
 )
 
+// reasonStateDeleting is an internal state condition: usableState returns it
+// when a referenced state is terminating. Unlike a plain missing state (which
+// may be created again), a deleting state can never become usable. A Blip must
+// finish instead of waiting for it, or the state finalizer would wait for that
+// Blip forever.
+const reasonStateDeleting = "StateDeleting"
+
 const (
 	// AnnotationPrepareError is set by the node agent when it cannot
 	// prepare a claimed pod's disks. Some errors are transient, so it is
@@ -308,6 +315,18 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 			r.finish(b, v1.BlipFailed, reason, msg)
 			return reconcile.Result{}, r.unclaim(ctx, b)
 		}
+		if reason == reasonStateDeleting {
+			// A terminating state can never become usable. Finish so the
+			// state finalizer does not wait for a Blip that can never
+			// release it. unclaim releases any writer this Blip took
+			// before it was queued (there is no pod yet: claimedPod was
+			// checked above).
+			if err := r.unclaim(ctx, b); err != nil {
+				return reconcile.Result{}, err
+			}
+			r.finish(b, v1.BlipFailed, ReasonStateNotFound, msg)
+			return reconcile.Result{}, nil
+		}
 		if st != nil {
 			all[n] = st
 		}
@@ -459,7 +478,7 @@ func (r *BlipReconciler) usableState(ctx context.Context, ns, name string) (*v1.
 	case err != nil:
 		return nil, "", "", err
 	case st.DeletionTimestamp != nil:
-		return nil, ReasonStateNotFound, fmt.Sprintf("state %q is being deleted", name), nil
+		return nil, reasonStateDeleting, fmt.Sprintf("state %q is being deleted", name), nil
 	case st.Status.Committed == nil && st.Status.Phase == v1.StateFailed:
 		return nil, ReasonStateFailed, fmt.Sprintf("state %q failed: %s", name, st.Status.Message), nil
 	case st.Status.Committed == nil:

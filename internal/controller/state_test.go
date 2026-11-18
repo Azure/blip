@@ -313,6 +313,148 @@ func TestStateDeletionBlockedByBlip(t *testing.T) {
 	}
 }
 
+// TestStateDeletionBlockedByActiveWriter checks the safety side of the queued
+// Blip deadlock fix: a state with a real writer (or a Blip still committing)
+// must keep its finalizer.
+func TestStateDeletionBlockedByActiveWriter(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("s", "n1")
+	b := e.startBlip("b", "n1", withRoot("s"))
+
+	e.must(e.c.Delete(e.ctx, e.getState("s")))
+	e.run(e.state, ns, "s")
+	if st := e.getState("s"); !strings.Contains(st.Status.Message, "writer b") || len(st.Finalizers) == 0 {
+		t.Fatalf("deletion not blocked by active writer: %+v", st.Status)
+	}
+
+	// The writer commits its last version before the state is released.
+	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
+	e.run(e.blip, ns, "b")
+	expectPhase(t, e.getBlip("b"), v1.BlipSaving, ReasonStopped)
+	e.saveWriter("s", "c2c2c2c2c2c2c2c2")
+	e.run(e.blip, ns, "b")
+	expectPhase(t, e.getBlip("b"), v1.BlipSucceeded, ReasonStopped)
+	e.run(e.state, ns, "s")
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "s"}, &v1.BlipState{}); err == nil {
+		t.Fatal("state not deleted after its writer finished")
+	}
+}
+
+// TestQueuedBlipDoesNotBlockStateDeletion reproduces the P1-1 deadlock: a
+// Blip that is queued behind the state's writer only names the state in its
+// spec, so it must not keep the deleting state alive. The state finalizer has
+// to complete once the real writer is gone, without deleting the queued Blip.
+func TestQueuedBlipDoesNotBlockStateDeletion(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("s", "n1")
+	holder := e.startBlip("holder", "n1", withRoot("s"))
+
+	e.newBlip("queued", withRoot("s"))
+	e.run(e.blip, ns, "queued")
+	e.run(e.pool, ns, "default")
+	e.warmOn("n1")
+	e.run(e.blip, ns, "queued")
+	queued := e.getBlip("queued")
+	expectPhase(t, queued, v1.BlipPending, ReasonStateBusy)
+	if queued.Status.Pod != "" || len(queued.Status.Mounts) != 0 || queued.Status.RootAttachmentID != "" {
+		t.Fatalf("queued blip acquired the state: %+v", queued.Status)
+	}
+
+	// The deleting state still waits for its writer.
+	e.must(e.c.Delete(e.ctx, e.getState("s")))
+	e.run(e.state, ns, "s")
+	if st := e.getState("s"); !strings.Contains(st.Status.Message, "writer holder") || len(st.Finalizers) == 0 {
+		t.Fatalf("deletion not blocked by the holder: %+v", st.Status)
+	}
+
+	// Stop the holder and commit its last version.
+	e.observe(holder.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
+	e.run(e.blip, ns, "holder")
+	e.saveWriter("s", "d2d2d2d2d2d2d2d2")
+	e.run(e.blip, ns, "holder")
+	expectPhase(t, e.getBlip("holder"), v1.BlipSucceeded, ReasonStopped)
+
+	// Reconcile only the state: the queued Blip has not reconciled the
+	// deletion yet, and must not block the finalizer.
+	e.run(e.state, ns, "s")
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "s"}, &v1.BlipState{}); err == nil {
+		t.Fatal("state still waiting for the queued blip")
+	}
+	if b := e.getBlip("queued"); b.DeletionTimestamp != nil || finished(b) {
+		t.Fatalf("test changed the queued blip: %+v", b.Status)
+	}
+}
+
+// TestQueuedBlipFailsWhenStateIsBeingDeleted checks the Blip side of the
+// deadlock: once the state terminates, a Blip that never acquired it must
+// finish instead of waiting for it forever.
+func TestQueuedBlipFailsWhenStateIsBeingDeleted(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("s", "n1")
+	e.startBlip("holder", "n1", withRoot("s"))
+
+	e.newBlip("queued", withRoot("s"))
+	e.run(e.blip, ns, "queued")
+	e.run(e.pool, ns, "default")
+	e.warmOn("n1")
+	e.run(e.blip, ns, "queued")
+	expectPhase(t, e.getBlip("queued"), v1.BlipPending, ReasonStateBusy)
+
+	e.must(e.c.Delete(e.ctx, e.getState("s")))
+	e.run(e.blip, ns, "queued")
+	b := e.getBlip("queued")
+	if b.Status.Phase != v1.BlipFailed || b.Status.Reason != ReasonStateNotFound || !strings.Contains(b.Status.Message, "being deleted") {
+		t.Fatalf("queued blip did not finish: %+v", b.Status)
+	}
+}
+
+// TestPendingBlipWithMountBlocksStateDeletion covers the race where a Blip is
+// about to reach Running when deletion starts: an attachment it already
+// acquired must still protect the state until the Blip lets go.
+func TestPendingBlipWithMountBlocksStateDeletion(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	st := e.readyState("s", "n1")
+	e.newBlip("b", withImage("reg/img:v1"), withMount("s", "/s", false))
+	e.setBlipStatus("b", func(b *v1.Blip) {
+		b.Status.Phase = v1.BlipPending
+		b.Status.Reason = ReasonWaitingForVM
+		b.Status.Mounts = []v1.MountStatus{{
+			State: "s", Path: "/s", StateUID: string(st.UID),
+			CommitID: st.Status.Committed.ID, AttachmentID: "0000000000000001",
+			Phase: v1.MountPending,
+		}}
+	})
+
+	e.must(e.c.Delete(e.ctx, e.getState("s")))
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if !strings.Contains(st.Status.Message, "blip b") || len(st.Finalizers) == 0 {
+		t.Fatalf("deletion not blocked by pending mount: %+v", st.Status)
+	}
+
+	// Seeing the deletion, the Blip releases the attachment and fails.
+	e.run(e.blip, ns, "b")
+	b := e.getBlip("b")
+	if b.Status.Phase != v1.BlipFailed || b.Status.Reason != ReasonStateNotFound {
+		t.Fatalf("pending blip did not finish: %+v", b.Status)
+	}
+	if len(b.Status.Mounts) != 0 {
+		t.Fatalf("pending blip kept its mounts: %+v", b.Status.Mounts)
+	}
+	e.run(e.state, ns, "s")
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "s"}, &v1.BlipState{}); err == nil {
+		t.Fatal("state not deleted after the pending blip failed")
+	}
+}
+
 func TestWriterNodeDeletedRequiresForceRecover(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2")

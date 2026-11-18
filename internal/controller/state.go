@@ -894,6 +894,40 @@ func (r *StateReconciler) repair(st *v1.BlipState, cl *cluster) string {
 	return ""
 }
 
+// blipBlocksDeletion reports whether b still uses st in a way that must
+// outlive the state. Merely naming st in spec is not a use: a queued Blip
+// that has not acquired a writer, a mount, or a pod cannot make progress
+// against a terminating state. Treating it as a blocker would deadlock the
+// state finalizer against that Pending Blip. The Blip controller fails such
+// a Blip as soon as it observes the deletion.
+func blipBlocksDeletion(b *v1.Blip, st *v1.BlipState) bool {
+	if finished(b) {
+		return false
+	}
+	// A Blip that is running or saving owns a mounted disk or is
+	// committing one.
+	if b.Status.Phase == v1.BlipRunning || b.Status.Phase == v1.BlipSaving {
+		return true
+	}
+	// A claimed VM may already be preparing or attaching the disks, even
+	// before the Blip publishes them as mounted or reaches Running.
+	if b.Status.Pod != "" {
+		return true
+	}
+	if w := st.Status.Writer; w != nil && w.BlipUID == string(b.UID) {
+		return true
+	}
+	// An attachment was already assigned to the Blip. For a read-only
+	// mount there is no writer slot on the state, so this is the only
+	// record that the disk is about to be used.
+	for _, m := range b.Status.Mounts {
+		if m.State == st.Name && m.StateUID == string(st.UID) && m.AttachmentID != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // deletionBlockers lists what keeps a deleted state alive.
 func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState) ([]string, error) {
 	var out []string
@@ -915,9 +949,15 @@ func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState
 		return nil, err
 	}
 	for _, b := range blips.Items {
-		if !finished(&b) {
-			out = append(out, "blip "+b.Name)
+		if !blipBlocksDeletion(&b, st) {
+			continue
 		}
+		if w := st.Status.Writer; w != nil && w.BlipUID == string(b.UID) {
+			// Already reported above; naming the holder twice only
+			// makes the message noisier.
+			continue
+		}
+		out = append(out, "blip "+b.Name)
 	}
 	var copies v1.BlipStateList
 	if err := r.List(ctx, &copies, client.InNamespace(st.Namespace), client.MatchingFields{indexCopyFrom: st.Name}); err != nil {
