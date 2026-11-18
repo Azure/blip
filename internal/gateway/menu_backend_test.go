@@ -56,7 +56,7 @@ func TestMenuBackendCreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.ID != "alice.new" || e.Name != "new" || e.UID == "" || e.Parent != s.BaseState || e.Running || e.ForkOnly {
+	if e.ID != "alice.new" || e.Name != "new" || e.UID == "" || e.Running {
 		t.Fatalf("created entry = %#v", e)
 	}
 	var st v1alpha1.BlipState
@@ -80,7 +80,7 @@ func TestMenuBackendCreate(t *testing.T) {
 	})
 }
 
-func TestMenuBackendForkCopiesWorkspace(t *testing.T) {
+func TestForkStateCopiesWorkspace(t *testing.T) {
 	for _, explicitIdle := range []bool{false, true} {
 		t.Run(fmt.Sprintf("explicit-idle=%t", explicitIdle), func(t *testing.T) {
 			source := catalogState("alice", "source", "gateway-base")
@@ -102,12 +102,8 @@ func TestMenuBackendForkCopiesWorkspace(t *testing.T) {
 			s := backendServer(t, catalogClient(t, source, data, tools))
 			s.IdleTimeout = time.Minute
 			ctx := context.Background()
-			entry, err := s.menuBackend("alice").Fork(ctx, stateEntry(source, "alice"), "fork")
+			root, err := s.forkState(ctx, "alice", "alice.fork", source)
 			if err != nil {
-				t.Fatal(err)
-			}
-			var root v1alpha1.BlipState
-			if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: entry.ID}, &root); err != nil {
 				t.Fatal(err)
 			}
 			wantRuntime := source.Spec.Runtime.DeepCopy()
@@ -138,7 +134,7 @@ func TestMenuBackendForkCopiesWorkspace(t *testing.T) {
 	}
 }
 
-func TestMenuBackendSharedAndImportedStatesRequireFork(t *testing.T) {
+func TestMenuBackendImportedAndSharedStatesCannotRun(t *testing.T) {
 	for _, owner := range []string{"", "alice", "bob"} {
 		t.Run("owner="+owner, func(t *testing.T) {
 			st := gatewayBase()
@@ -148,34 +144,33 @@ func TestMenuBackendSharedAndImportedStatesRequireFork(t *testing.T) {
 			}
 			s := backendServer(t, catalogClient(t, st))
 			entry := stateEntry(st, "alice")
-			// The cached menu flag is only presentation; the API enforces this.
-			entry.ForkOnly = false
-			if _, err := s.startSelectedState(context.Background(), "alice", entry); err == nil {
+			// The menu only lists owned roots, but startup revalidates the
+			// live state so an imported base cannot be run writable.
+			_, err := s.startSelectedState(context.Background(), "alice", entry)
+			if err == nil {
 				t.Fatal("imported/shared state was run writable")
 			}
-			if owner != "alice" {
-				if err := s.menuBackend("alice").Delete(context.Background(), entry); err == nil {
-					t.Fatal("unowned state was deleted")
-				}
+			if owner == "alice" && !strings.Contains(err.Error(), "cannot be run directly") {
+				t.Fatalf("unexpected start error: %v", err)
 			}
-			_, err := s.menuBackend("alice").Fork(context.Background(), entry, "fork")
-			if (err != nil) != (owner == "bob") {
-				t.Fatalf("fork owner %q: %v", owner, err)
+			deleteErr := s.menuBackend("alice").Delete(context.Background(), entry)
+			if (deleteErr != nil) != (owner != "alice") {
+				t.Fatalf("delete owner %q: %v", owner, deleteErr)
 			}
 		})
 	}
 }
 
-func TestMenuBackendForkRejectsReplacedSource(t *testing.T) {
-	st := gatewayBase()
+func TestMenuBackendRejectsReplacedSelection(t *testing.T) {
+	st := catalogState("alice", "home", "")
 	s := backendServer(t, catalogClient(t, st))
-	entry := menu.Entry{ID: st.Name, UID: "previous-base", ForkOnly: true}
-	if _, err := s.menuBackend("alice").Fork(context.Background(), entry, "fork"); err == nil {
-		t.Fatal("fork accepted a stale source selection")
+	entry := menu.Entry{ID: st.Name, UID: "previous-home"}
+	if _, err := s.startSelectedState(context.Background(), "alice", entry); err == nil {
+		t.Fatal("startup accepted a replaced selection")
 	}
 	var list v1alpha1.BlipStateList
 	if err := s.Kube.List(context.Background(), &list); err != nil || len(list.Items) != 1 {
-		t.Fatalf("stale fork created states: %v, %v", list.Items, err)
+		t.Fatalf("replaced selection created states: %v, %v", list.Items, err)
 	}
 }
 
@@ -391,8 +386,8 @@ func TestOpenStateWaitsForMountReadiness(t *testing.T) {
 			})
 			s := backendServer(t, kube)
 			entries, err := s.Catalog.List("alice")
-			if err != nil || len(entries) != 2 || entries[0].Running {
-				t.Fatalf("unattached state has Running badge: %v, %v", entries, err)
+			if err != nil || len(entries) != 1 || entries[0].ID != root.Name {
+				t.Fatalf("mount target should be hidden: %v, %v", entries, err)
 			}
 			changes, unsubscribe := s.Catalog.Subscribe("alice")
 			defer unsubscribe()
@@ -443,8 +438,8 @@ func TestOpenStateWaitsForMountReadiness(t *testing.T) {
 				t.Fatal("mount update did not wake startup")
 			}
 			entries, err = s.Catalog.List("alice")
-			if err != nil || len(entries) != 2 || entries[0].Running != (tt.next == v1alpha1.MountMounted) {
-				t.Fatalf("updated mount badge incorrect: %v, %v", entries, err)
+			if err != nil || len(entries) != 1 || entries[0].ID != root.Name {
+				t.Fatalf("mount target appeared after update: %v, %v", entries, err)
 			}
 		})
 	}

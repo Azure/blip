@@ -17,22 +17,16 @@ import (
 func TestForkInheritsWorkspaceSizeAndNeverShrinksBase(t *testing.T) {
 	for _, tt := range []struct {
 		name, sourceSize, actualSize, gatewaySize, want string
-		fromBase                                        bool
 	}{
-		{name: "workspace-40Gi", sourceSize: "40Gi", actualSize: "40Gi", gatewaySize: "20Gi"},
-		{name: "workspace-inherits-not-gateway-size", sourceSize: "40Gi", actualSize: "40Gi", gatewaySize: "80Gi"},
-		{name: "base-40Gi", fromBase: true, sourceSize: "40Gi", actualSize: "40Gi", gatewaySize: "20Gi", want: "40Gi"},
-		{name: "base-observed-size", fromBase: true, sourceSize: "10Gi", actualSize: "40Gi", gatewaySize: "20Gi", want: "40Gi"},
-		{name: "base-extra-space", fromBase: true, sourceSize: "40Gi", actualSize: "40Gi", gatewaySize: "80Gi", want: "80Gi"},
-		{name: "pending-base-known-size", fromBase: true, sourceSize: "40Gi", gatewaySize: "20Gi", want: "40Gi"},
-		{name: "pending-base-unresolved-size", fromBase: true, gatewaySize: "20Gi"},
-		{name: "base-sizing-disabled", fromBase: true, sourceSize: "40Gi", actualSize: "40Gi", gatewaySize: "0"},
+		{name: "base-40Gi", sourceSize: "40Gi", actualSize: "40Gi", gatewaySize: "20Gi", want: "40Gi"},
+		{name: "base-observed-size", sourceSize: "10Gi", actualSize: "40Gi", gatewaySize: "20Gi", want: "40Gi"},
+		{name: "base-extra-space", sourceSize: "40Gi", actualSize: "40Gi", gatewaySize: "80Gi", want: "80Gi"},
+		{name: "pending-base-known-size", sourceSize: "40Gi", gatewaySize: "20Gi", want: "40Gi"},
+		{name: "pending-base-unresolved-size", gatewaySize: "20Gi"},
+		{name: "base-sizing-disabled", sourceSize: "40Gi", actualSize: "40Gi", gatewaySize: "0"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source := gatewayBase()
-			if !tt.fromBase {
-				source = catalogState("alice", "workspace", "gateway-base")
-			}
 			source.Spec.Size = nil
 			if tt.sourceSize != "" {
 				size := resource.MustParse(tt.sourceSize)
@@ -45,14 +39,7 @@ func TestForkInheritsWorkspaceSizeAndNeverShrinksBase(t *testing.T) {
 			s := backendServer(t, catalogClient(t, source))
 			s.StateSize = resource.MustParse(tt.gatewaySize)
 			ctx := context.Background()
-			backend := s.menuBackend("alice")
-			var err error
-			if tt.fromBase {
-				_, err = backend.Create(ctx, "copy")
-			} else {
-				_, err = backend.Fork(ctx, stateEntry(source, "alice"), "copy")
-			}
-			if err != nil {
+			if _, err := s.menuBackend("alice").Create(ctx, "copy"); err != nil {
 				t.Fatal(err)
 			}
 			var copy v1alpha1.BlipState

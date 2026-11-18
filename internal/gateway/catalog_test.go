@@ -80,47 +80,37 @@ func startCatalog(t *testing.T, kube client.WithWatch) *Catalog {
 	return c
 }
 
-func TestCatalogOwnerTreeAndRunningReferences(t *testing.T) {
+func TestCatalogListsOwnedRoots(t *testing.T) {
 	root := catalogState("alice", "home", "")
-	fork := catalogState("alice", "fork", root.Name)
-	orphan := catalogState("alice", "orphan", "alice.deleted")
-	foreignParent := catalogState("alice", "foreign-parent", "bob.home")
-	legacy := catalogState("alice", "legacy", "")
-	badLabel := catalogState("alice", "secret", "")
-	badLabel.Labels[ownerLabel] = "bob"
-	otherNamespace := catalogState("alice", "elsewhere", "")
-	otherNamespace.Namespace = "elsewhere"
-	worker := catalogBlip("alice", "worker", "", v1alpha1.BlipRunning)
-	worker.Spec.State = legacy.Name
-	legacy.Spec.Mounts = []v1alpha1.Mount{{State: fork.Name, Path: "/work", Writable: true}}
-	worker.Status.Mounts = []v1alpha1.MountStatus{{State: fork.Name, StateUID: string(fork.UID), Path: "/work", Writable: true, Phase: v1alpha1.MountMounted}}
-	readOnly := catalogBlip("alice", "reader", "", v1alpha1.BlipRunning)
-	readOnly.Spec.State = foreignParent.Name
-	foreignParent.Spec.Mounts = []v1alpha1.Mount{{State: root.Name, Path: "/work"}}
-	readOnly.Status.Mounts = []v1alpha1.MountStatus{{State: root.Name, StateUID: string(root.UID), Path: "/work", Phase: v1alpha1.MountMounted}}
-	c := startCatalog(t, catalogClient(t, root, fork, orphan, foreignParent, legacy, badLabel, otherNamespace,
-		catalogState("bob", "home", ""), worker, readOnly,
-		catalogBlip("alice", "home", root.Name, v1alpha1.BlipPending),
-		catalogBlip("bob", "thief", orphan.Name, v1alpha1.BlipRunning)))
+	stopped := catalogState("alice", "stopped", "")
+	base := catalogState("alice", "base", "")
+	base.Spec.Image = "reg/dev:1"
+	ownerless := catalogState("alice", "ownerless", "")
+	ownerless.Name, ownerless.Labels = "shared-data", nil
+	other := catalogState("bob", "home", "")
+	mismatched := catalogState("alice", "mismatched", "")
+	mismatched.Labels[ownerLabel] = "bob"
+	wrongPrefix := catalogState("bob", "wrong-prefix", "")
+	wrongPrefix.Labels[ownerLabel] = "alice"
+	deleting := catalogState("alice", "deleting", "")
+	deleting.Finalizers = []string{"blip.dev/test"}
+	running := catalogBlip("alice", "root-worker", root.Name, v1alpha1.BlipRunning)
+	running.Status.RootAttachmentID = "root-attachment"
+	root.Status.Writer = &v1alpha1.Writer{BlipName: running.Name, BlipUID: string(running.UID), AttachmentID: "root-attachment"}
+	stoppedWorker := catalogBlip("alice", "stopped-worker", stopped.Name, v1alpha1.BlipRunning)
+	stoppedWorker.Spec.Stop = true
+	kube := catalogClient(t, root, stopped, base, ownerless, other, mismatched, wrongPrefix, deleting, running, stoppedWorker)
+	if err := kube.Delete(context.Background(), deleting); err != nil {
+		t.Fatal(err)
+	}
+	c := startCatalog(t, kube)
 	entries, err := c.List("alice")
 	want := []menu.Entry{
-		{ID: foreignParent.Name, UID: string(foreignParent.UID), Name: "foreign-parent", Running: true},
-		{ID: fork.Name, UID: string(fork.UID), Name: "fork", Parent: root.Name, Running: true},
-		{ID: root.Name, UID: string(root.UID), Name: "home"},
-		{ID: legacy.Name, UID: string(legacy.UID), Name: "legacy", Running: true},
-		{ID: orphan.Name, UID: string(orphan.UID), Name: "orphan"},
+		{ID: root.Name, UID: string(root.UID), Name: "home", Running: true},
+		{ID: stopped.Name, UID: string(stopped.UID), Name: "stopped"},
 	}
 	if err != nil || !reflect.DeepEqual(entries, want) {
 		t.Fatalf("entries = %#v, err %v; want %#v", entries, err, want)
-	}
-	// CopyFrom is lineage, not lifecycle ownership: deleting a parent leaves
-	// the copy visible, now as a top-level entry.
-	if err := c.states.GetIndexer().Delete(root); err != nil {
-		t.Fatal(err)
-	}
-	entries, err = c.List("alice")
-	if err != nil || len(entries) != 4 || entries[1].ID != fork.Name || entries[1].Parent != "" {
-		t.Fatalf("orphaned fork disappeared: %#v, %v", entries, err)
 	}
 }
 
@@ -263,82 +253,69 @@ func TestCatalogEventsOwnersAndTombstones(t *testing.T) {
 	awaitCatalogEvent(t, alice)
 }
 
-func TestCatalogSharedBasesAndNotifications(t *testing.T) {
+func TestCatalogOwnerlessChangesDoNotNotify(t *testing.T) {
 	base := gatewayBase()
 	fork := catalogState("alice", "fork", base.Name)
 	c := startCatalog(t, catalogClient(t, base, fork))
 	entries, err := c.List("alice")
-	if err != nil || len(entries) != 2 || entries[0].Parent != base.Name || !entries[1].ForkOnly {
-		t.Fatalf("shared base and fork: %v, %v", entries, err)
+	want := []menu.Entry{{ID: fork.Name, UID: string(fork.UID), Name: "fork"}}
+	if err != nil || !reflect.DeepEqual(entries, want) {
+		t.Fatalf("alice entries = %#v, err %v; want %#v", entries, err, want)
 	}
-	entries, err = c.List("bob")
-	if err != nil || len(entries) != 1 || entries[0].ID != base.Name || !entries[0].ForkOnly {
-		t.Fatalf("other owner sees shared base only: %v, %v", entries, err)
+	if entries, err := c.List("bob"); err != nil || len(entries) != 0 {
+		t.Fatalf("bob sees shared base: %v, %v", entries, err)
 	}
 	alice, cancelAlice := c.Subscribe("alice")
 	defer cancelAlice()
 	bob, cancelBob := c.Subscribe("bob")
 	defer cancelBob()
 	c.changed(base)
+	select {
+	case <-alice:
+		t.Fatal("ownerless state notified alice")
+	default:
+	}
+	select {
+	case <-bob:
+		t.Fatal("ownerless state notified bob")
+	default:
+	}
+	// Matching owners still receive notifications after the ownerless event
+	// was dropped.
+	c.changed(fork)
 	awaitCatalogEvent(t, alice)
-	awaitCatalogEvent(t, bob)
-}
-
-func TestCatalogExcludesUnsupportedForkSources(t *testing.T) {
-	base := gatewayBase()
-	owned := catalogState("alice", "workspace", "")
-	legacy := catalogState("alice", "legacy", "")
-	legacy.Name = "legacy"
-	ownerless := catalogState("alice", "ownerless", "")
-	ownerless.Name, ownerless.Labels = "shared-data", nil
-	ownerlessCopy := ownerless.DeepCopy()
-	ownerlessCopy.Name, ownerlessCopy.Spec.CopyFrom = "shared-copy", base.Name
-	other := catalogState("bob", "workspace", "")
-	mismatched := catalogState("alice", "mismatched", "")
-	mismatched.Labels[ownerLabel] = "bob"
-	wrongPrefix := catalogState("bob", "wrong-prefix", "")
-	wrongPrefix.Labels[ownerLabel] = "alice"
-	c := startCatalog(t, catalogClient(t, base, owned, legacy, ownerless, ownerlessCopy, other, mismatched, wrongPrefix))
-	entries, err := c.List("alice")
-	if err != nil || len(entries) != 2 || entries[0].ID != owned.Name || entries[1].ID != base.Name || !entries[1].ForkOnly {
-		t.Fatalf("catalog advertised unsupported states: %v, %v", entries, err)
+	select {
+	case <-bob:
+		t.Fatal("alice's state notified bob")
+	default:
 	}
 }
 
-func TestCatalogMountsFollowRootConfiguration(t *testing.T) {
-	st := catalogState("alice", "data", "")
-	b := catalogBlip("alice", "worker", "", v1alpha1.BlipRunning)
-	root := mountRoot(b, v1alpha1.Mount{State: st.Name, Path: "/work", Writable: true})
-	b.Status.Mounts = []v1alpha1.MountStatus{{State: st.Name, StateUID: string(st.UID), Path: "/work", Writable: true, Phase: v1alpha1.MountMounted}}
-	kube := catalogClient(t, st, b, root)
+func TestCatalogHidesWritableMountTargets(t *testing.T) {
+	root := catalogState("alice", "root", "")
+	data := catalogState("alice", "data", "")
+	cache := catalogState("alice", "cache", "")
+	root.Spec.Mounts = []v1alpha1.Mount{
+		{State: data.Name, Path: "/work", Writable: true},
+		{State: cache.Name, Path: "/cache"},
+	}
+	// Deleting states still hide their writable mount targets.
+	aux := catalogState("alice", "aux", "")
+	oldRoot := catalogState("alice", "old-root", "")
+	oldRoot.Finalizers = []string{"blip.dev/test"}
+	oldRoot.Spec.Mounts = []v1alpha1.Mount{{State: aux.Name, Path: "/aux", Writable: true}}
+	kube := catalogClient(t, root, data, cache, aux, oldRoot)
+	if err := kube.Delete(context.Background(), oldRoot); err != nil {
+		t.Fatal(err)
+	}
 	c := startCatalog(t, kube)
-	changes, unsubscribe := c.Subscribe("alice")
-	defer unsubscribe()
-	for _, tt := range []struct {
-		mounts []v1alpha1.Mount
-		want   bool
-	}{
-		{[]v1alpha1.Mount{{State: st.Name, Path: "/work", Writable: true}}, true},
-		{[]v1alpha1.Mount{{State: st.Name, Path: "/new-path", Writable: true}}, false},
-		{[]v1alpha1.Mount{{State: st.Name, Path: "/work", Writable: true, BlipUID: "old-worker"}}, false},
-		{[]v1alpha1.Mount{{State: st.Name, Path: "/work", Writable: true, BlipUID: string(b.UID)}}, true},
-		{nil, false},
-	} {
-		root.Spec.Mounts = tt.mounts
-		if err := kube.Update(context.Background(), root); err != nil {
-			t.Fatal(err)
-		}
-		awaitCatalogEvent(t, changes)
-		// Updates notify for both old and new owners. A coalesced event can
-		// still belong to the preceding update, so pin this cache revision.
-		eventually(t, func() bool {
-			obj, exists, err := c.states.GetIndexer().GetByKey(ns + "/" + root.Name)
-			return err == nil && exists && obj.(*v1alpha1.BlipState).ResourceVersion == root.ResourceVersion
-		})
-		entries, err := c.List("alice")
-		if err != nil || len(entries) != 2 || entries[0].ID != st.Name || entries[0].Running != tt.want {
-			t.Fatalf("mounts=%v: entries=%v, err=%v", tt.mounts, entries, err)
-		}
+	entries, err := c.List("alice")
+	want := []menu.Entry{
+		{ID: cache.Name, UID: string(cache.UID), Name: "cache"},
+		{ID: root.Name, UID: string(root.UID), Name: "root"},
+	}
+	if err != nil || !reflect.DeepEqual(entries, want) {
+		t.Fatalf("entries = %#v, err %v; want %#v", entries, err, want)
 	}
 }
 
@@ -380,47 +357,23 @@ func TestCatalogRunningRequiresAttachedState(t *testing.T) {
 		change func(*v1alpha1.BlipState, *v1alpha1.Blip)
 		want   bool
 	}{
-		{name: "mounted", want: true},
-		{name: "absent", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Mounts = nil }},
-		{name: "pending", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Mounts[0].Phase = v1alpha1.MountPending }},
-		{name: "failed", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Mounts[0].Phase = v1alpha1.MountFailed }},
-		{name: "unmounting", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Mounts[0].Phase = v1alpha1.MountUnmounting }},
-		{name: "saving", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Mounts[0].Phase = v1alpha1.MountSaving }},
-		{name: "old-uid", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Mounts[0].StateUID = "old-state" }},
-		{name: "missing-uid", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Mounts[0].StateUID = "" }},
-		{name: "old-path", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Mounts[0].Path = "/old" }},
-		{name: "read-only", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Mounts[0].Writable = false }},
-		{name: "root-mounted", want: true, change: func(st *v1alpha1.BlipState, b *v1alpha1.Blip) {
-			b.Spec.State, b.Status.RootAttachmentID = st.Name, "root-attachment"
-			st.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID), AttachmentID: "root-attachment"}
-		}},
-		{name: "root-old-attachment", change: func(st *v1alpha1.BlipState, b *v1alpha1.Blip) {
-			b.Spec.State, b.Status.RootAttachmentID = st.Name, "old-attachment"
-			st.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID), AttachmentID: "new-attachment"}
-		}},
-		{name: "root-no-writer", change: func(st *v1alpha1.BlipState, b *v1alpha1.Blip) {
-			b.Spec.State, b.Status.RootAttachmentID = st.Name, "root-attachment"
-		}},
-		{name: "root-old-worker", change: func(st *v1alpha1.BlipState, b *v1alpha1.Blip) {
-			b.Spec.State, b.Status.RootAttachmentID = st.Name, "root-attachment"
-			st.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: "old-worker", AttachmentID: "root-attachment"}
-		}},
+		{name: "attached", want: true},
+		{name: "no-writer", change: func(st *v1alpha1.BlipState, _ *v1alpha1.Blip) { st.Status.Writer = nil }},
+		{name: "old-worker", change: func(st *v1alpha1.BlipState, _ *v1alpha1.Blip) { st.Status.Writer.BlipUID = "old-worker" }},
+		{name: "old-attachment", change: func(st *v1alpha1.BlipState, _ *v1alpha1.Blip) { st.Status.Writer.AttachmentID = "old-attachment" }},
+		{name: "missing-attachment", want: true, change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.RootAttachmentID = "" }},
+		{name: "not-running", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Status.Phase = v1alpha1.BlipSaving }},
+		{name: "stopping", change: func(_ *v1alpha1.BlipState, b *v1alpha1.Blip) { b.Spec.Stop = true }},
 	}
 	var objects []client.Object
 	want := make(map[string]bool)
 	for _, tt := range cases {
 		st := catalogState("alice", tt.name, "")
-		b := catalogBlip("alice", "worker-"+tt.name, "", v1alpha1.BlipRunning)
-		root := mountRoot(b, v1alpha1.Mount{State: st.Name, Path: "/work", Writable: true})
-		b.Status.Mounts = []v1alpha1.MountStatus{{State: st.Name, StateUID: string(st.UID), Path: "/work", Writable: true, Phase: v1alpha1.MountMounted}}
+		b := catalogBlip("alice", "worker-"+tt.name, st.Name, v1alpha1.BlipRunning)
+		b.Status.RootAttachmentID = "root-attachment"
+		st.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID), AttachmentID: "root-attachment"}
 		if tt.change != nil {
 			tt.change(st, b)
-		}
-		if b.Spec.State == st.Name {
-			b.Status.Mounts = nil
-		} else {
-			objects = append(objects, root)
-			want[root.Name] = true
 		}
 		objects = append(objects, st, b)
 		want[st.Name] = tt.want

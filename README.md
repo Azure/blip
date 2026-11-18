@@ -171,10 +171,11 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 
 - `blip-gateway` serves SSH on 2222 with public keys or CA-signed user
   certificates. The key determines the owner and the SSH user name selects a
-  sandbox within it; resources are named `owner.name`. The gateway forks the
-  configured base state and creates its Blip on demand. Interactive shells
-  without a command enter a Bubble Tea menu for listing, creating, forking,
-  connecting to, and deleting sandboxes. `direct-tcpip` forwarding is supported;
+  sandbox within it; resources are named `owner.name`. The gateway starts each
+  sandbox from the configured base state and creates its Blip on demand.
+  Interactive shells without a command enter a Bubble Tea menu for listing,
+  creating, connecting to, and deleting root sandboxes that start from the
+  gateway's configured base. `direct-tcpip` forwarding is supported;
   remote forwarding is not. An mTLS certificate API on 8443 (behind Envoy)
   issues short-lived user certificates from a trusted identity header.
 - `kubectl-blip` provides `run`, `exec`, `attach`, `sessions`, `wait`, `pull`,

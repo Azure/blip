@@ -183,9 +183,6 @@ func assertNoSandboxes(t *testing.T, e *env) {
 
 func TestSSHInteractiveEmptyMenuDoesNotAllocate(t *testing.T) {
 	e := newEnv(t)
-	if err := e.kube.Delete(context.Background(), gatewayBase()); err != nil {
-		t.Fatal(err)
-	}
 	s := startInteractiveSSH(t, e, "dev")
 	s.output.waitFor(t, 0, menuLogoLine)
 	s.output.waitFor(t, 0, "No blips yet.")
@@ -211,14 +208,14 @@ func TestSSHInteractiveZeroSizePTYMenuUsable(t *testing.T) {
 	e := newEnv(t)
 	s := startInteractiveSSHSize(t, e, "dev", 0, 0)
 	s.output.waitFor(t, 0, menuLogoLine)
-	s.output.waitFor(t, 0, "gateway-base")
+	s.output.waitFor(t, 0, "No blips yet.")
 	mark := s.output.mark()
 	s.typeKeys(t, "n")
 	s.output.waitFor(t, mark, "Name:")
 	assertNoSandboxes(t, e)
 	mark = s.output.mark()
 	s.typeKeys(t, "\x1b")
-	s.output.waitFor(t, mark, "gateway-base")
+	s.output.waitFor(t, mark, "No blips yet.")
 	s.quit(t)
 	assertNoSandboxes(t, e)
 }
@@ -285,7 +282,7 @@ func TestSSHInteractiveCreateReturnAndReconnect(t *testing.T) {
 	}
 	s := startInteractiveSSH(t, e, "dev")
 	s.output.waitFor(t, 0, menuLogoLine)
-	s.output.waitFor(t, 0, "gateway-base")
+	s.output.waitFor(t, 0, "No blips yet.")
 	assertNoSandboxes(t, e)
 
 	const stateName = "alice.created"

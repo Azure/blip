@@ -38,7 +38,7 @@ func TestForkValidatesSourceBeforeCreatingStates(t *testing.T) {
 			s := backendServer(t, catalogClient(t, source))
 			var creates int
 			s.Kube = countForkCreates(s.Kube, &creates)
-			_, err := s.menuBackend("alice").Fork(context.Background(), stateEntry(source, "alice"), "copy")
+			_, err := s.forkState(context.Background(), "alice", "alice.copy", source)
 			if (err == nil) != tt.valid {
 				t.Fatalf("valid=%t: %v", tt.valid, err)
 			}
@@ -101,7 +101,7 @@ func TestForkValidatesEveryInheritedMountBeforeCreatingStates(t *testing.T) {
 				s := backendServer(t, catalogClient(t, objects...))
 				var creates int
 				s.Kube = countForkCreates(s.Kube, &creates)
-				_, err := s.menuBackend("alice").Fork(context.Background(), stateEntry(source, "alice"), "copy")
+				_, err := s.forkState(context.Background(), "alice", "alice.copy", source)
 				if (err == nil) != tt.valid {
 					t.Fatalf("valid=%t: %v", tt.valid, err)
 				}

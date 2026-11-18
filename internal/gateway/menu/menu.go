@@ -11,23 +11,20 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-// Entry is a state available to the authenticated user. ID and Parent are full
-// resource names, UID identifies this particular resource, and Name is its
-// short display name. Parent is the state's copyFrom resource, when present.
+// Entry is a root state available to the authenticated user. ID is the full
+// resource name, UID identifies this particular resource, and Name is its short
+// display name.
 type Entry struct {
-	ID, UID, Name, Parent string
-	Running               bool
-	ForkOnly              bool // shared or imported base; cannot run directly
-	Shared                bool // cannot be deleted by this owner
+	ID, UID, Name string
+	Running       bool
 }
 
-// Backend supplies states and change notifications. Create forks the configured
-// shared base. Notifications may be coalesced: each notification
-// prompts a fresh List, with at most one List call in flight.
+// Backend supplies states and change notifications. Create starts a new root
+// from the gateway's configured base. Notifications may be coalesced: each
+// notification prompts a fresh List, with at most one List call in flight.
 type Backend interface {
 	List(context.Context) ([]Entry, error)
 	Create(context.Context, string) (Entry, error)
-	Fork(context.Context, Entry, string) (Entry, error)
 	Delete(context.Context, Entry) error
 	// ValidateName reports whether name may be created, without side effects.
 	ValidateName(string) error
@@ -64,7 +61,7 @@ type Model struct {
 	unsubscribe func()
 	closeOnce   sync.Once
 
-	rows         []row
+	rows         []Entry
 	cursor       int
 	offset       int
 	preselect    string
@@ -74,7 +71,6 @@ type Model struct {
 	mode         mode
 	input        textinput.Model
 	deleteTarget Entry
-	forkTarget   *Entry
 	busy         action
 	loading      bool
 	loaded       bool
@@ -265,15 +261,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.err, m.notice, m.busy = "", "", createAction
 				m.input.Blur()
-				ctx, backend, source := m.ctx, m.backend, m.forkTarget
+				ctx, backend := m.ctx, m.backend
 				return m, func() tea.Msg {
-					var entry Entry
-					var err error
-					if source != nil {
-						entry, err = backend.Fork(ctx, *source, name)
-					} else {
-						entry, err = backend.Create(ctx, name)
-					}
+					entry, err := backend.Create(ctx, name)
 					return createdMsg{entry: entry, err: err}
 				}
 			}
@@ -307,23 +297,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = min(max(0, len(m.rows)-1), m.cursor+max(1, m.listHeight()))
 			case "enter":
 				if entry, ok := m.current(); ok {
-					if entry.ForkOnly {
-						return m, m.beginCreate(&entry)
-					}
 					return m, m.connect(entry)
 				}
 			case "n":
-				return m, m.beginCreate(nil)
-			case "f":
-				if entry, ok := m.current(); ok {
-					return m, m.beginCreate(&entry)
-				}
+				return m, m.beginCreate()
 			case "d":
 				if entry, ok := m.current(); ok {
-					if entry.Shared {
-						m.err = "Fork this base to create your own blip."
-						return m, nil
-					}
 					m.mode, m.deleteTarget, m.err = confirming, entry, ""
 				}
 			case "?":
@@ -343,9 +322,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) beginCreate(source *Entry) tea.Cmd {
+func (m *Model) beginCreate() tea.Cmd {
 	m.mode, m.err, m.notice = creating, "", ""
-	m.forkTarget = source
 	m.input.Reset()
 	return m.input.Focus()
 }
@@ -365,7 +343,7 @@ func (m *Model) current() (Entry, bool) {
 	if m.cursor < 0 || m.cursor >= len(m.rows) {
 		return Entry{}, false
 	}
-	return m.rows[m.cursor].Entry, true
+	return m.rows[m.cursor], true
 }
 
 func (m *Model) replaceEntries(entries []Entry) {
@@ -373,19 +351,19 @@ func (m *Model) replaceEntries(entries []Entry) {
 	if current, ok := m.current(); ok {
 		selected = current.ID
 	}
-	m.rows = buildTree(entries)
+	m.rows = sortEntries(entries)
 	m.cursor = min(m.cursor, max(0, len(m.rows)-1))
-	for i, row := range m.rows {
-		if row.ID == selected {
+	for i, entry := range m.rows {
+		if entry.ID == selected {
 			m.cursor = i
 			break
 		}
 	}
 	m.preselect = ""
 	if m.mode == confirming && m.busy == noAction {
-		for _, row := range m.rows {
-			if row.ID == m.deleteTarget.ID && row.UID == m.deleteTarget.UID {
-				m.deleteTarget = row.Entry
+		for _, entry := range m.rows {
+			if entry.ID == m.deleteTarget.ID && entry.UID == m.deleteTarget.UID {
+				m.deleteTarget = entry
 				return
 			}
 		}

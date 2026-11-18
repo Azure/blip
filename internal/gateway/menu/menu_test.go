@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -21,7 +20,6 @@ type fakeBackend struct {
 	changes      chan struct{}
 	listCalls    int
 	createNames  []string
-	forkSources  []Entry
 	deleted      []Entry
 	created      Entry
 	listErr      error
@@ -42,11 +40,6 @@ func (b *fakeBackend) Create(ctx context.Context, name string) (Entry, error) {
 	b.contexts = append(b.contexts, ctx)
 	b.createNames = append(b.createNames, name)
 	return b.created, b.createErr
-}
-
-func (b *fakeBackend) Fork(ctx context.Context, entry Entry, name string) (Entry, error) {
-	b.forkSources = append(b.forkSources, entry)
-	return b.Create(ctx, name)
 }
 
 func (b *fakeBackend) Delete(ctx context.Context, entry Entry) error {
@@ -108,79 +101,69 @@ func selectedID(m *Model) string {
 	return entry.ID
 }
 
-func TestTreePreservesForksAndOrdering(t *testing.T) {
+func entryIDs(entries []Entry) []string {
+	ids := make([]string, len(entries))
+	for i, entry := range entries {
+		ids[i] = entry.ID
+	}
+	return ids
+}
+
+func TestSortEntriesOrdersByDisplayNameThenID(t *testing.T) {
 	entries := []Entry{
-		{ID: "worker.child", Name: "worker", Parent: "owner.dev"},
-		{ID: "owner.z", Name: "zebra"},
-		{ID: "owner.fork", Name: "Alpha", Parent: "owner.dev"},
-		{ID: "owner.dev", Name: "dev"},
-		{ID: "owner.grandchild", Name: "deep", Parent: "owner.fork"},
-		{ID: "owner.orphan", Name: "orphan", Parent: "deleted.parent"},
+		{ID: "owner.zeta", Name: "Zeta"},
+		{ID: "owner.beta", Name: "beta"},
+		{ID: "owner.alpha.2", Name: "alpha"},
+		{ID: "owner.alpha.1", Name: "Alpha"},
+		{ID: "", Name: "no-id"},
 	}
-	rows := buildTree(entries)
-	ids := make([]string, len(rows))
-	for i, row := range rows {
-		ids[i] = row.ID
+	want := []string{"owner.alpha.1", "owner.alpha.2", "owner.beta", "owner.zeta"}
+	if got := entryIDs(sortEntries(entries)); !slices.Equal(got, want) {
+		t.Fatalf("sorted order = %v, want %v", got, want)
 	}
-	want := []string{"owner.dev", "owner.fork", "owner.grandchild", "worker.child", "owner.orphan", "owner.z"}
-	if !slices.Equal(ids, want) {
-		t.Fatalf("tree order = %v, want %v", ids, want)
-	}
-	if rows[1].prefix == "" || len(rows[2].prefix) <= len(rows[1].prefix) || rows[4].prefix != "" {
-		t.Fatalf("hierarchy did not preserve children and orphan roots: %#v", rows)
+	if len(entries) != 5 || entries[0].ID != "owner.zeta" {
+		t.Fatal("sortEntries mutated its input")
 	}
 	slices.Reverse(entries)
-	if !reflect.DeepEqual(rows, buildTree(entries)) {
-		t.Fatal("tree depends on backend list ordering")
+	if got := entryIDs(sortEntries(entries)); !slices.Equal(got, want) {
+		t.Fatalf("order depends on backend list order: %v", got)
+	}
+	dupes := []Entry{
+		{ID: "b", Name: "same"},
+		{ID: "a", Name: "Same"},
+		{ID: "c", Name: "same"},
+	}
+	slices.Reverse(dupes)
+	if got := entryIDs(sortEntries(dupes)); !slices.Equal(got, []string{"a", "b", "c"}) {
+		t.Fatalf("case-insensitive name ties are not broken by resource ID: %v", got)
 	}
 }
 
-func TestTreeCyclesAreDeterministicAndKeepEveryEntry(t *testing.T) {
-	entries := []Entry{
-		{ID: "b", Name: "B", Parent: "c"},
-		{ID: "a", Name: "A", Parent: "b"},
-		{ID: "c", Name: "C", Parent: "a"},
-		{ID: "child", Name: "0-child", Parent: "c"},
-		{ID: "self", Name: "Self", Parent: "self"},
-	}
-	rows := buildTree(entries)
-	seen := map[string]bool{}
-	for _, row := range rows {
-		if seen[row.ID] {
-			t.Fatalf("resource %s appeared twice", row.ID)
-		}
-		seen[row.ID] = true
-	}
-	if len(seen) != len(entries) {
-		t.Fatalf("cycle hid resources: %v", seen)
-	}
-	if rows[0].ID != "a" || rows[0].prefix != "" {
-		t.Fatal("cycle should break at its alphabetically first member")
-	}
-	slices.Reverse(entries)
-	if !reflect.DeepEqual(rows, buildTree(entries)) {
-		t.Fatal("cycle resolution changed with list ordering")
-	}
-}
-
-func TestSelectionSurvivesReorderAndParentDeletion(t *testing.T) {
+func TestSelectionSurvivesReorder(t *testing.T) {
 	entries := []Entry{
 		{ID: "owner.root", Name: "root"},
-		{ID: "worker.fork", Name: "fork", Parent: "owner.root"},
-		{ID: "owner.other", Name: "other"},
+		{ID: "worker.other", Name: "other"},
+		{ID: "owner.zzz", Name: "zed"},
 	}
-	m, _ := testModel(t, entries, "worker.fork")
-	if selectedID(m) != "worker.fork" {
+	m, _ := testModel(t, entries, "worker.other")
+	if selectedID(m) != "worker.other" {
 		t.Fatal("initial full resource ID was not preselected")
 	}
-	entries = append(entries[1:], Entry{ID: "owner.aaa", Name: "aaa"})
-	entries[0].Running = true
+	entries = []Entry{
+		{ID: "owner.root", Name: "root"},
+		{ID: "worker.other", Name: "other", Running: true},
+		{ID: "owner.aaa", Name: "aaa"},
+	}
 	m.Update(listMsg{entries: entries})
-	if selectedID(m) != "worker.fork" || !m.rows[m.cursor].Running || m.rows[m.cursor].prefix != "" {
-		t.Fatal("selection or entry data lost after reparenting to a root")
+	current, ok := m.current()
+	if !ok || current.ID != "worker.other" || current.Name != "other" || !current.Running {
+		t.Fatalf("selection or entry data lost after reorder: %#v", current)
 	}
 	press(m, "down")
 	id := selectedID(m)
+	if id != "owner.root" {
+		t.Fatalf("selection did not follow sorted order: %s", id)
+	}
 	slices.Reverse(entries)
 	m.Update(listMsg{entries: entries})
 	if selectedID(m) != id {
@@ -272,48 +255,35 @@ func TestCreateIsAsyncAndConnectsReturnedEntry(t *testing.T) {
 	}
 }
 
-func TestForkSelectedState(t *testing.T) {
-	for _, key := range []string{"enter", "f"} {
-		t.Run(key, func(t *testing.T) {
-			base := Entry{ID: "shared-base", UID: "base-uid", Name: "shared-base", ForkOnly: key == "enter"}
-			m, b := testModel(t, []Entry{base}, base.ID)
-			b.created = Entry{ID: "alice.fork", UID: "fork-uid", Name: "fork", Parent: base.ID}
-			press(m, key)
-			if m.mode != creating || m.Selected != nil || m.forkTarget == nil || *m.forkTarget != base {
-				t.Fatal("fork did not prompt for an independent workspace")
-			}
-			m.input.SetValue("fork")
-			cmd := press(m, "enter")
-			if cmd == nil || len(b.forkSources) != 0 {
-				t.Fatal("fork did not defer backend work")
-			}
-			m.Update(cmd())
-			if len(b.forkSources) != 1 || b.forkSources[0] != base || m.Selected == nil || *m.Selected != b.created {
-				t.Fatalf("fork selection: sources=%v selected=%v", b.forkSources, m.Selected)
-			}
-		})
+func TestFDoesNothing(t *testing.T) {
+	entries := []Entry{
+		{ID: "a", Name: "alpha"},
+		{ID: "b", Name: "beta"},
 	}
-}
-
-func TestSharedBaseCannotBeDeleted(t *testing.T) {
-	m, b := testModel(t, []Entry{{ID: "shared-base", UID: "uid", ForkOnly: true, Shared: true}}, "")
-	press(m, "d")
-	if m.mode != browsing || m.err == "" || len(b.deleted) != 0 {
-		t.Fatal("delete offered for a shared base")
+	m, b := testModel(t, entries, "a")
+	if cmd := press(m, "f"); cmd != nil {
+		t.Fatal("f returned a command")
 	}
-	press(m, "enter")
-	press(m, "esc")
-	press(m, "n")
-	if m.forkTarget != nil {
-		t.Fatal("new workspace retained a canceled fork source")
+	if m.mode != browsing || m.Selected != nil || m.busy != noAction || m.quitting {
+		t.Fatalf("f changed the menu state: mode=%v selected=%v busy=%v", m.mode, m.Selected, m.busy)
 	}
-}
-
-func TestOwnedImportedBaseCanBeDeleted(t *testing.T) {
-	m, _ := testModel(t, []Entry{{ID: "alice.base", UID: "uid", ForkOnly: true}}, "")
-	press(m, "d")
-	if m.mode != confirming {
-		t.Fatal("owner cannot delete their imported base")
+	if selectedID(m) != "a" {
+		t.Fatal("f changed the selected row")
+	}
+	if m.input.Focused() || m.input.Value() != "" {
+		t.Fatal("f focused the create prompt")
+	}
+	if len(b.createNames) != 0 {
+		t.Fatal("f created a blip")
+	}
+	view := ansi.Strip(m.View().Content)
+	if strings.Contains(strings.ToLower(view), "fork") {
+		t.Fatalf("browse view advertises a removed fork action:\n%s", view)
+	}
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	press(m, "?")
+	if help := ansi.Strip(m.View().Content); strings.Contains(strings.ToLower(help), "fork") {
+		t.Fatalf("help still lists a fork action:\n%s", help)
 	}
 }
 
@@ -448,9 +418,6 @@ func TestResizeAndScrollingKeepSelectionVisible(t *testing.T) {
 	entries := make([]Entry, 60)
 	for i := range entries {
 		entries[i] = Entry{ID: fmt.Sprintf("id-%02d", i), Name: fmt.Sprintf("blip-%02d", i), Running: true}
-		if i > 0 {
-			entries[i].Parent = entries[i-1].ID
-		}
 	}
 	m, _ := testModel(t, entries, entries[40].ID)
 	for _, size := range [][2]int{{80, 24}, {22, 8}, {12, 4}, {1, 1}, {120, 40}, {0, 0}} {
@@ -478,7 +445,7 @@ func TestResizeAndScrollingKeepSelectionVisible(t *testing.T) {
 			t.Fatalf("selection marker missing at size %v", size)
 		}
 		if size[0] >= 20 && !strings.Contains(ansi.Strip(content), "running") {
-			t.Fatalf("deeply nested running indicator hidden at size %v", size)
+			t.Fatalf("running indicator hidden at size %v", size)
 		}
 	}
 	m.Update(tea.WindowSizeMsg{Width: 40, Height: 10})
@@ -563,6 +530,9 @@ func TestCreateDialogValidatesBeforeCreating(t *testing.T) {
 	view = ansi.Strip(m.View().Content)
 	if !strings.Contains(view, "Lowercase letters") {
 		t.Fatalf("create dialog lost its name guidance:\n%s", view)
+	}
+	if strings.Contains(strings.ToLower(view), "fork") {
+		t.Fatalf("create dialog still offers a fork line:\n%s", view)
 	}
 }
 

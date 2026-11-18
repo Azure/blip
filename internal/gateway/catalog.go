@@ -117,17 +117,10 @@ func (c *Catalog) changed(obj any) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	owner := o.GetLabels()[ownerLabel]
-	_, isState := o.(*v1alpha1.BlipState)
-	for subscriber, channels := range c.subs {
-		if subscriber != owner && !(isState && owner == "") {
-			continue
-		}
-		for ch := range channels {
-			select {
-			case ch <- struct{}{}:
-			default:
-			}
+	for ch := range c.subs[o.GetLabels()[ownerLabel]] {
+		select {
+		case ch <- struct{}{}:
+		default:
 		}
 	}
 }
@@ -174,13 +167,12 @@ func accessibleState(st *v1alpha1.BlipState, owner string) bool {
 func stateEntry(st *v1alpha1.BlipState, owner string) menu.Entry {
 	return menu.Entry{
 		ID: st.Name, UID: string(st.UID), Name: strings.TrimPrefix(st.Name, owner+"."),
-		ForkOnly: !ownedResource(st, owner) || st.Spec.Image != "",
-		Shared:   !ownedResource(st, owner),
 	}
 }
 
-// List returns this owner's states and shared fork sources. Missing or
-// inaccessible parents leave their children at the top level.
+// List returns the owner's writable root states. Image bases, ownerless
+// filesystems, and states that a root mounts writable are auxiliary and are
+// not selectable roots.
 func (c *Catalog) List(owner string) ([]menu.Entry, error) {
 	if !c.states.HasSynced() || !c.blips.HasSynced() {
 		return nil, fmt.Errorf("sandbox catalog is not ready")
@@ -194,39 +186,52 @@ func (c *Catalog) List(owner string) ([]menu.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	shared, err := c.states.GetIndexer().ByIndex(catalogOwnerIndex, "")
-	if err != nil {
-		return nil, err
-	}
-	objects = append(objects, shared...)
 	states := make(map[string]*v1alpha1.BlipState, len(objects))
+	mounted := make(map[string]struct{})
 	for _, obj := range objects {
 		st := obj.(*v1alpha1.BlipState)
-		if accessibleState(st, owner) && st.DeletionTimestamp == nil {
-			states[st.Name] = st
+		states[st.Name] = st
+		// Deleting states still describe their mounts, and an auxiliary
+		// filesystem stays hidden until every reference is gone.
+		for _, m := range st.Spec.Mounts {
+			if m.Writable {
+				mounted[m.State] = struct{}{}
+			}
 		}
+	}
+	visible := make(map[string]*v1alpha1.BlipState, len(states))
+	for name, st := range states {
+		if !ownedResource(st, owner) || st.DeletionTimestamp != nil || st.Spec.Image != "" {
+			continue
+		}
+		if _, auxiliary := mounted[name]; auxiliary {
+			continue
+		}
+		visible[name] = st
 	}
 	blips, err := c.blips.GetIndexer().ByIndex(catalogOwnerIndex, owner)
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]menu.Entry, 0, len(states))
-	for _, st := range states {
+	entries := make([]menu.Entry, 0, len(visible))
+	for _, st := range visible {
 		e := stateEntry(st, owner)
-		if parent := states[st.Spec.CopyFrom]; parent != nil && parent.Name != st.Name {
-			e.Parent = parent.Name
-		}
 		for _, obj := range blips {
 			b := obj.(*v1alpha1.Blip)
-			root := states[b.Spec.State]
-			if !e.ForkOnly && ownedResource(b, owner) && runningBlip(b) && stateAttached(b, root, st) {
+			if ownedResource(b, owner) && runningBlip(b) && b.Spec.State == st.Name && stateAttached(b, states[b.Spec.State], st) {
 				e.Running = true
 				break
 			}
 		}
 		entries = append(entries, e)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+	sort.Slice(entries, func(i, j int) bool {
+		ni, nj := strings.ToLower(entries[i].Name), strings.ToLower(entries[j].Name)
+		if ni != nj {
+			return ni < nj
+		}
+		return entries[i].ID < entries[j].ID
+	})
 	return entries, nil
 }
 

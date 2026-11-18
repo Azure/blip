@@ -109,7 +109,7 @@ func (s *Server) ensureState(ctx context.Context, owner, name string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := s.forkState(ctx, owner, name, source, true); err != nil {
+			if _, err := s.forkState(ctx, owner, name, source); err != nil {
 				if !apierrors.IsAlreadyExists(err) {
 					return err
 				}
@@ -141,7 +141,7 @@ func (s *Server) ensureState(ctx context.Context, owner, name string) error {
 			return fmt.Errorf("sandbox state %s failed: %s", name, st.Status.Message)
 		}
 		if st.Spec.Image != "" {
-			return fmt.Errorf("sandbox state %s is an imported base; fork it before running", name)
+			return fmt.Errorf("sandbox state %s is an imported image and cannot be run directly", name)
 		}
 		return nil
 	}
@@ -161,7 +161,7 @@ func (s *Server) baseState(ctx context.Context) (*v1alpha1.BlipState, error) {
 	return &st, nil
 }
 
-func (s *Server) forkState(ctx context.Context, owner, name string, source *v1alpha1.BlipState, fromBase bool) (*v1alpha1.BlipState, error) {
+func (s *Server) forkState(ctx context.Context, owner, name string, source *v1alpha1.BlipState) (*v1alpha1.BlipState, error) {
 	if err := validateForkState(source, owner); err != nil {
 		return nil, err
 	}
@@ -192,9 +192,7 @@ func (s *Server) forkState(ctx context.Context, owner, name string, source *v1al
 	}
 	dest := &v1alpha1.BlipState{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace, Labels: map[string]string{ownerLabel: owner}},
-	}
-	if fromBase {
-		dest.Spec.Size = s.baseForkSize(source)
+		Spec:       v1alpha1.BlipStateSpec{Size: s.baseForkSize(source)},
 	}
 	if err := workspace.Fork(ctx, s.Kube, source, dest); err != nil {
 		return nil, err
@@ -216,9 +214,9 @@ func validateForkState(st *v1alpha1.BlipState, owner string) error {
 }
 
 func (s *Server) baseForkSize(source *v1alpha1.BlipState) *resource.Quantity {
-	// A workspace fork always inherits its source size. New sandboxes may
-	// request extra space, but never shrink an import. If an import has not
-	// resolved its size yet, let the controller inherit it once available.
+	// A new sandbox inherits its base size. The gateway may request extra
+	// space, but never shrink the base. If the base has not resolved its size
+	// yet, let the controller inherit it once available.
 	if s.StateSize.Sign() <= 0 || source.Spec.Size == nil && source.Status.SizeBytes <= 0 {
 		return nil
 	}

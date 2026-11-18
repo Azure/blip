@@ -58,18 +58,6 @@ func (b *catalogBackend) ValidateName(name string) error {
 }
 
 func (b *catalogBackend) Create(ctx context.Context, name string) (menu.Entry, error) {
-	return b.create(ctx, name, nil)
-}
-
-func (b *catalogBackend) Fork(ctx context.Context, entry menu.Entry, name string) (menu.Entry, error) {
-	source, err := b.srv.selectedSource(ctx, b.owner, entry, false)
-	if err != nil {
-		return menu.Entry{}, err
-	}
-	return b.create(ctx, name, source)
-}
-
-func (b *catalogBackend) create(ctx context.Context, name string, source *v1alpha1.BlipState) (menu.Entry, error) {
 	if err := b.ValidateName(name); err != nil {
 		return menu.Entry{}, err
 	}
@@ -89,39 +77,20 @@ func (b *catalogBackend) create(ctx context.Context, name string, source *v1alph
 			return menu.Entry{}, err
 		}
 	}
-	fromBase := source == nil
-	if fromBase {
-		source, err = s.baseState(ctx)
-		if err != nil {
-			return menu.Entry{}, err
-		}
-	}
-	st, err := s.forkState(ctx, b.owner, full, source, fromBase)
+	source, err := s.baseState(ctx)
 	if err != nil {
 		return menu.Entry{}, err
 	}
-	entry := stateEntry(st, b.owner)
-	entry.Parent = source.Name
-	return entry, nil
+	st, err := s.forkState(ctx, b.owner, full, source)
+	if err != nil {
+		return menu.Entry{}, err
+	}
+	return stateEntry(st, b.owner), nil
 }
 
 // selectedState validates the resource name, live owner, and incarnation. The
 // display name and cached Running flag are never used as authority.
 func (s *Server) selectedState(ctx context.Context, owner string, entry menu.Entry, deleting bool) (*v1alpha1.BlipState, error) {
-	st, err := s.selectedSource(ctx, owner, entry, deleting)
-	if err != nil {
-		return nil, err
-	}
-	if !ownedResource(st, owner) {
-		return nil, fmt.Errorf("sandbox state %s is not owned by the authenticated owner; fork it first", entry.ID)
-	}
-	if !deleting && st.Spec.Image != "" {
-		return nil, fmt.Errorf("sandbox state %s is an imported base; fork it before running", entry.ID)
-	}
-	return st, nil
-}
-
-func (s *Server) selectedSource(ctx context.Context, owner string, entry menu.Entry, deleting bool) (*v1alpha1.BlipState, error) {
 	if owner == "" || entry.ID == "" || entry.UID == "" {
 		return nil, errors.New("invalid sandbox selection; refresh the menu")
 	}
@@ -129,14 +98,17 @@ func (s *Server) selectedSource(ctx context.Context, owner string, entry menu.En
 	if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: entry.ID}, &st); err != nil {
 		return nil, err
 	}
-	if !accessibleState(&st, owner) {
-		return nil, fmt.Errorf("sandbox state %s is not owned by the authenticated owner with its name prefix or a shared image import", entry.ID)
+	if !ownedResource(&st, owner) {
+		return nil, fmt.Errorf("sandbox state %s is not owned by the authenticated owner", entry.ID)
 	}
 	if string(st.UID) != entry.UID {
 		return nil, fmt.Errorf("sandbox state %s was replaced; refresh the menu", entry.ID)
 	}
 	if !deleting && st.DeletionTimestamp != nil {
 		return nil, fmt.Errorf("sandbox state %s is being deleted", entry.ID)
+	}
+	if !deleting && st.Spec.Image != "" {
+		return nil, fmt.Errorf("sandbox state %s is an imported image and cannot be run directly", entry.ID)
 	}
 	return &st, nil
 }
