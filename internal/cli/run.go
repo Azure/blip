@@ -31,6 +31,9 @@ func blipFromFlags(name, namespace string, f *runFlags, command []string) (*v1al
 	if (f.image == "") == (f.state == "") {
 		return nil, errors.New("set exactly one of --image (throwaway root) and --state (durable root)")
 	}
+	if f.idle < 0 {
+		return nil, errors.New("--idle-timeout must not be negative")
+	}
 	env, err := parseEnv(f.env)
 	if err != nil {
 		return nil, err

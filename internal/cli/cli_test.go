@@ -49,6 +49,7 @@ func TestRunRejectsBadFlags(t *testing.T) {
 		{[]string{"run", "x", "--image", "i", "--mount", "s:/a/../b", "-d"}, "invalid mount"},
 		{[]string{"run", "x", "--image", "i", "--mount", "s:/w:rx", "-d"}, "mode must be rw or ro"},
 		{[]string{"run", "x", "--image", "i", "--mount", "s:/a", "--mount", "s:/b", "-d"}, "mounted twice"},
+		{[]string{"run", "x", "--image", "i", "--idle-timeout=-5s", "-d"}, "must not be negative"},
 	} {
 		code, _, errOut := h.run("", tc.args...)
 		if code != 1 || !strings.Contains(errOut, tc.want) {
