@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
@@ -25,6 +26,69 @@ func TestGeneratedNetworkCRDsAreValid(t *testing.T) {
 			crd := readCRD(t, name)
 			if errs := crdvalidation.ValidateCustomResourceDefinition(context.Background(), crd); len(errs) != 0 {
 				t.Fatal(errs.ToAggregate())
+			}
+		})
+	}
+}
+
+// TestNetworkIPBlockRuleCompatibleWithKubernetes131 guards admission for the
+// exception rule on Kubernetes 1.31. Running the v0.33 CEL libraries (as the
+// test above does) does not catch the 1.31 containsCIDR bug: v0.31 compares an
+// unmasked PrefixFrom(exceptionAddr, parentBits) and so rejects exceptions such
+// as 10.1.0.0/16 inside 10.0.0.0/8. Assert the generated rule keeps using
+// containsIP, which masks before comparing.
+func TestNetworkIPBlockRuleCompatibleWithKubernetes131(t *testing.T) {
+	for _, name := range []string{"blips", "blippools"} {
+		t.Run(name, func(t *testing.T) {
+			var rules []string
+			var walk func(*apiextensions.JSONSchemaProps)
+			walk = func(s *apiextensions.JSONSchemaProps) {
+				if s == nil {
+					return
+				}
+				for _, validation := range s.XValidations {
+					if validation.Message == "exceptions must be IPv4 CIDRs strictly inside cidr" {
+						rules = append(rules, validation.Rule)
+					}
+				}
+				for name := range s.Properties {
+					property := s.Properties[name]
+					walk(&property)
+				}
+				if s.Items != nil {
+					walk(s.Items.Schema)
+					for i := range s.Items.JSONSchemas {
+						walk(&s.Items.JSONSchemas[i])
+					}
+				}
+				if s.AdditionalProperties != nil {
+					walk(s.AdditionalProperties.Schema)
+				}
+				for i := range s.AllOf {
+					walk(&s.AllOf[i])
+				}
+				for i := range s.AnyOf {
+					walk(&s.AnyOf[i])
+				}
+				for i := range s.OneOf {
+					walk(&s.OneOf[i])
+				}
+				walk(s.Not)
+			}
+			walk(readCRD(t, name).Spec.Validation.OpenAPIV3Schema)
+
+			if len(rules) != 1 {
+				t.Fatalf("found %d exception rules, want 1", len(rules))
+			}
+			rule := rules[0]
+			if strings.Contains(rule, "containsCIDR") {
+				t.Errorf("rule uses containsCIDR, which is broken before Kubernetes 1.32: %s", rule)
+			}
+			if !strings.Contains(rule, "containsIP(cidr(c).ip())") {
+				t.Errorf("rule does not check containment with containsIP: %s", rule)
+			}
+			if !strings.Contains(rule, "cidr(c).prefixLength() > cidr(self.cidr).prefixLength()") {
+				t.Errorf("rule does not require a strictly longer exception prefix: %s", rule)
 			}
 		})
 	}
@@ -81,6 +145,8 @@ func TestNetworkAdmissionAndLiveUpdates(t *testing.T) {
 				{"deny all", `{}`, true},
 				{"allow all", `{"egress":[{}]}`, true},
 				{"IPv4 exceptions", `{"egress":[{"to":[{"ipBlock":{"cidr":"10.0.0.0/8","except":["10.1.0.0/16"]}}]}]}`, true},
+				{"IPv4 exception at parent network address", `{"egress":[{"to":[{"ipBlock":{"cidr":"10.0.0.0/8","except":["10.0.0.0/16"]}}]}]}`, true},
+				{"all but private", `{"egress":[{"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16"]}}]}]}`, true},
 				{"namespace and pods", `{"egress":[{"to":[{"namespaceSelector":{},"podSelector":{}}]}]}`, true},
 				{"namespace and services", `{"egress":[{"to":[{"namespaceSelector":{},"serviceSelector":{}}]}]}`, true},
 				{"range", `{"egress":[{"ports":[{"protocol":"UDP","port":53,"endPort":55}]}]}`, true},
@@ -90,7 +156,10 @@ func TestNetworkAdmissionAndLiveUpdates(t *testing.T) {
 				{"IPv6", `{"egress":[{"to":[{"ipBlock":{"cidr":"fd00::/64"}}]}]}`, false},
 				{"bad CIDR", `{"egress":[{"to":[{"ipBlock":{"cidr":"10.0.0.0/99"}}]}]}`, false},
 				{"bad exception", `{"egress":[{"to":[{"ipBlock":{"cidr":"10.0.0.0/8","except":["192.0.2.0/24"]}}]}]}`, false},
+				{"equal exception", `{"egress":[{"to":[{"ipBlock":{"cidr":"10.0.0.0/8","except":["10.0.0.0/8"]}}]}]}`, false},
+				{"less specific exception", `{"egress":[{"to":[{"ipBlock":{"cidr":"10.1.0.0/16","except":["10.0.0.0/8"]}}]}]}`, false},
 				{"IPv6 exception", `{"egress":[{"to":[{"ipBlock":{"cidr":"10.0.0.0/8","except":["fd00::/64"]}}]}]}`, false},
+				{"malformed exception", `{"egress":[{"to":[{"ipBlock":{"cidr":"10.0.0.0/8","except":["10.1.0.0/99"]}}]}]}`, false},
 				{"no port", `{"egress":[{"ports":[{"protocol":"TCP"}]}]}`, false},
 				{"named port", `{"egress":[{"ports":[{"port":"http"}]}]}`, false},
 				{"zero port", `{"egress":[{"ports":[{"port":0}]}]}`, false},

@@ -367,7 +367,10 @@ type NetworkPeer struct {
 // NetworkIPBlock is an IPv4 CIDR with optional, strictly smaller exceptions.
 //
 // +kubebuilder:validation:XValidation:rule="isCIDR(self.cidr) && cidr(self.cidr).ip().family() == 4",message="cidr must be a valid IPv4 CIDR"
-// +kubebuilder:validation:XValidation:rule="!has(self.except) || self.except.all(c, isCIDR(c) && cidr(c).ip().family() == 4 && cidr(self.cidr).containsCIDR(cidr(c)) && cidr(c).prefixLength() > cidr(self.cidr).prefixLength())",message="exceptions must be IPv4 CIDRs strictly inside cidr"
+// Check containment with containsIP rather than containsCIDR: Kubernetes 1.31's
+// containsCIDR compares an unmasked PrefixFrom(exceptionAddr, parentBits), so it
+// rejects valid exceptions whose address is not the parent's network address.
+// +kubebuilder:validation:XValidation:rule="!has(self.except) || self.except.all(c, isCIDR(c) && cidr(c).ip().family() == 4 && cidr(self.cidr).containsIP(cidr(c).ip()) && cidr(c).prefixLength() > cidr(self.cidr).prefixLength())",message="exceptions must be IPv4 CIDRs strictly inside cidr"
 type NetworkIPBlock struct {
 	// CIDR is an IPv4 destination range, for example 192.0.2.0/24.
 	// +kubebuilder:validation:MaxLength=18
