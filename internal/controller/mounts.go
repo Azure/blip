@@ -247,6 +247,13 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, pod *corev1
 		if m.Phase == v1.MountFailed && !same && !m.Switching && !saveFailure {
 			// The mount never attached and is gone from the spec: drop it
 			// so it no longer blocks unmounting or remounting the state.
+			// A failed writable attach may already have its pod recorded
+			// in the pre-acquired writer (promotion), so release that too.
+			if m.Writable && m.AttachmentID != "" {
+				if err := r.releaseUnattachedWriter(ctx, b, m.State, m.AttachmentID); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		out = append(out, m)
