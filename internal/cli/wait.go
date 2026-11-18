@@ -218,6 +218,9 @@ func (a *app) waitCommand() *cobra.Command {
 				if fin.Status.ExitCode != nil {
 					line += fmt.Sprintf(" (exit %d)", *fin.Status.ExitCode)
 				}
+				if fin.Status.Phase == v1alpha1.BlipSucceeded && fin.Status.Reason != "" && fin.Status.Reason != "Completed" {
+					line += fmt.Sprintf(" (%s)", fin.Status.Reason)
+				}
 				if fin.Status.Phase == v1alpha1.BlipFailed {
 					failed = true
 					if msg := fin.Status.Message; strings.Contains(msg, "\n") {

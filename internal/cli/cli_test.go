@@ -182,6 +182,18 @@ func TestWaitFailsIfAnyFailed(t *testing.T) {
 	mustContain(t, out, "blip/ok Succeeded (exit 0)", "blip/bad Failed (exit 1): command failed")
 }
 
+func TestWaitShowsStopReason(t *testing.T) {
+	stopped := runningBlip("stopped")
+	stopped.Status.Phase = v1alpha1.BlipSucceeded
+	stopped.Status.Reason = "Stopped"
+	h := newHarness(t, stopped)
+	code, out, _ := h.run("", "wait", "stopped")
+	if code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	mustContain(t, out, "blip/stopped Succeeded (Stopped)")
+}
+
 func TestMountAddsSpecAndWaitsMounted(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"), readyState("repo"))
 	code, out, errOut := h.run("", "mount", "repo", "--blip", "agent", "--path", "/work", "--write")
