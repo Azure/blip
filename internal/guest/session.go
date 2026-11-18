@@ -583,11 +583,7 @@ func (g *Guest) serveSession(f *os.File) {
 			reject(c, f, errors.New("blip is not running"))
 			return
 		}
-		user := o.User
-		if user == "" {
-			user = claim.User
-		}
-		spec := procSpec{argv: o.Argv, env: o.Env, dir: o.WorkingDir, user: user, tty: o.TTY, rows: o.Rows, cols: o.Cols}
+		spec := execProcSpec(claim, o)
 		s, err := g.startSession(newID(), spec, claim.Env, true)
 		if err != nil {
 			reject(c, f, err)
@@ -604,6 +600,21 @@ func (g *Guest) serveSession(f *os.File) {
 	default:
 		reject(c, f, errors.New("unknown mode "+strconv.Quote(o.Mode)))
 	}
+}
+
+// execProcSpec applies the blip's defaults to a new exec session. An exec
+// without -w or -u uses the working directory and user the blip was created
+// with, just like the primary command.
+func execProcSpec(claim *wire.Claim, o wire.Open) procSpec {
+	user := o.User
+	if user == "" {
+		user = claim.User
+	}
+	dir := o.WorkingDir
+	if dir == "" {
+		dir = claim.WorkingDir
+	}
+	return procSpec{argv: o.Argv, env: o.Env, dir: dir, user: user, tty: o.TTY, rows: o.Rows, cols: o.Cols}
 }
 
 func reject(c *wire.Conn, f io.Closer, err error) {

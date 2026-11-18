@@ -164,6 +164,18 @@ func TestFailedSessionKeepsOutputWithoutClient(t *testing.T) {
 	}
 }
 
+func TestExecProcSpecInheritsBlipDefaults(t *testing.T) {
+	claim := &wire.Claim{WorkingDir: "/work", User: "dev"}
+	spec := execProcSpec(claim, wire.Open{Argv: []string{"pwd"}})
+	if spec.dir != "/work" || spec.user != "dev" || len(spec.argv) != 1 || spec.argv[0] != "pwd" {
+		t.Fatalf("defaults not inherited: %+v", spec)
+	}
+	spec = execProcSpec(claim, wire.Open{Argv: []string{"id"}, WorkingDir: "/tmp", User: "root"})
+	if spec.dir != "/tmp" || spec.user != "root" {
+		t.Fatalf("explicit values not used: %+v", spec)
+	}
+}
+
 func TestHostsFile(t *testing.T) {
 	got := hostsFile("alice.default")
 	for _, want := range []string{"127.0.0.1 localhost\n", "127.0.1.1 alice.default\n", "::1 localhost"} {
