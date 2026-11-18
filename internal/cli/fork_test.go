@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -14,9 +12,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/Azure/blip/api/v1alpha1"
@@ -203,30 +199,40 @@ func TestMountDefaultsToSelf(t *testing.T) {
 	}
 }
 
-func TestParseGitURLAndState(t *testing.T) {
-	for in, want := range map[string][2]string{
-		"w1/home/dev/src":        {"w1", "/home/dev/src"},
-		"blip::w1/home/dev/src/": {"w1", "/home/dev/src"},
-		"w1/":                    {"w1", "/"},
+func TestParseGitSourceAndState(t *testing.T) {
+	const cwd = "/home/dev/src"
+	for _, tc := range []struct {
+		in, name, dir string
+	}{
+		{"w1", "w1", cwd},
+		{"w1:/home/dev/src", "w1", "/home/dev/src"},
+		{"w1:home/dev/src", "w1", "/home/dev/src"},
+		{"w1:/a/../b", "w1", "/b"},
 	} {
-		name, dir, err := parseGitURL(in)
-		if err != nil || name != want[0] || dir != want[1] {
-			t.Errorf("%q: %q %q %v", in, name, dir, err)
+		name, dir, err := parseGitSource(tc.in, cwd)
+		if err != nil || name != tc.name || dir != tc.dir {
+			t.Errorf("%q: got %q %q %v, want %q %q", tc.in, name, dir, err, tc.name, tc.dir)
 		}
 	}
-	if _, _, err := parseGitURL("w1"); err == nil {
-		t.Error("URL without a path accepted")
+	for _, in := range []string{"w1:", ":path"} {
+		if _, _, err := parseGitSource(in, cwd); err == nil {
+			t.Errorf("%q: accepted", in)
+		}
 	}
-	b := runningBlip("w", v1alpha1.Mount{State: "a", Path: "/work"}, v1alpha1.Mount{State: "b", Path: "/work/src"})
+
+	b := runningBlip("w",
+		v1alpha1.Mount{State: "repo", Path: "/work"},
+		v1alpha1.Mount{State: "nested", Path: "/work/repo/deep"},
+	)
 	b.Spec.State = "root"
 	for dir, want := range map[string][2]string{
-		"/work/src/x": {"b", "/x"},
-		"/work/src":   {"b", ""},
-		"/work/srcx":  {"a", "/srcx"},
-		"/home/dev":   {"root", "/home/dev"},
+		"/work/repo/sub":    {"repo", "/repo/sub"},
+		"/work/repo/deep/x": {"nested", "/x"},
+		"/work":             {"repo", ""},
+		"/home/dev":         {"root", "/home/dev"},
 	} {
 		if s, rel := gitStateFor(b, dir); s != want[0] || rel != want[1] {
-			t.Errorf("%s: %q %q", dir, s, rel)
+			t.Errorf("%s: got %q %q, want %q %q", dir, s, rel, want[0], want[1])
 		}
 	}
 }
@@ -253,43 +259,6 @@ func gitObjects() []client.Object {
 	worker := ownedBlip("alice.w1", "alice.w1")
 	worker.Status.Phase = v1alpha1.BlipSucceeded
 	return []client.Object{ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1")}
-}
-
-func TestGitRemoteHelperServesWorkerStateReadOnly(t *testing.T) {
-	root := t.TempDir()
-	defer func(r string) { gitMountRoot = r }(gitMountRoot)
-	gitMountRoot = root
-	commit := gitRepo(t, filepath.Join(root, "alice.w1", "home/dev/src"))
-	h := newHarness(t, gitObjects()...)
-	h.self = "alice.box"
-	var out, errOut bytes.Buffer
-	in := strings.NewReader("capabilities\nconnect git-upload-pack\n0000")
-	code := GitRemoteMain(context.Background(), h.env(in, &out, &errOut), []string{"origin", "blip::w1/home/dev/src"})
-	if code != 0 {
-		t.Fatalf("code %d: %s", code, errOut.String())
-	}
-	if !strings.HasPrefix(out.String(), "connect\n\n\n") || !strings.Contains(out.String(), commit+" refs/heads/w1") {
-		t.Fatalf("out %q", out.String())
-	}
-	waitForCond(t, func() bool { return len(h.blip("alice.box").Spec.Mounts) == 0 })
-
-	in = strings.NewReader("capabilities\nconnect git-receive-pack\n")
-	if code := GitRemoteMain(context.Background(), h.env(in, &out, &errOut), []string{"origin", "w1/home/dev/src"}); code != 1 ||
-		!strings.Contains(errOut.String(), "blip: push is not supported (read-only)") {
-		t.Fatalf("code %d err %q", code, errOut.String())
-	}
-
-	s := h.state("alice.w1")
-	s.Status.Writer = &v1alpha1.Writer{BlipName: "alice.w1"}
-	if err := h.kube.Update(context.Background(), s); err != nil {
-		t.Fatal(err)
-	}
-	errOut.Reset()
-	in = strings.NewReader("capabilities\nconnect git-upload-pack\n")
-	if code := GitRemoteMain(context.Background(), h.env(in, &out, &errOut), []string{"origin", "w1/home/dev/src"}); code != 1 ||
-		!strings.Contains(errOut.String(), "blip: w1 is still running; wait for it to finish (blip wait w1)") {
-		t.Fatalf("code %d err %q", code, errOut.String())
-	}
 }
 
 func TestGitCheckoutSharesAndReusesMounts(t *testing.T) {
@@ -342,84 +311,172 @@ func waitForCond(t *testing.T, f func() bool) {
 	}
 }
 
-// TestGitFetch runs a real `git fetch blip::...` with this test binary
-// installed as git-remote-blip (see TestMain).
-func TestGitFetch(t *testing.T) {
+// withGitMountRoot points git-fetch's mounts at a temporary directory for
+// the duration of a test.
+func withGitMountRoot(t *testing.T) string {
+	t.Helper()
+	old := gitMountRoot
+	root := t.TempDir()
+	gitMountRoot = root
+	t.Cleanup(func() { gitMountRoot = old })
+	return root
+}
+
+func requireGit(t *testing.T) {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
-	tmp := t.TempDir()
-	root := filepath.Join(tmp, "mounts")
-	commit := gitRepo(t, filepath.Join(root, "alice.w1", "home/dev/src"))
-	objs, err := json.Marshal(gitObjects())
-	if err != nil {
-		t.Fatal(err)
-	}
-	objFile := filepath.Join(tmp, "objects.json")
-	bin := filepath.Join(tmp, "bin")
-	exe, _ := os.Executable()
-	if err := os.WriteFile(objFile, objs, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(exe, filepath.Join(bin, "git-remote-blip")); err != nil {
-		t.Fatal(err)
-	}
-	dst := filepath.Join(tmp, "dst")
-	if out, err := exec.Command("git", "init", "-q", dst).CombinedOutput(); err != nil {
-		t.Fatalf("%v %s", err, out)
-	}
-	cmd := exec.Command("git", "-C", dst, "fetch", "-q", "blip::w1/home/dev/src", "w1")
-	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "BLIP_TEST_OBJECTS="+objFile, "BLIP_TEST_MOUNTS="+root)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git fetch: %v %s", err, out)
-	}
-	out, err := exec.Command("git", "-C", dst, "rev-parse", "FETCH_HEAD").Output()
-	if err != nil || strings.TrimSpace(string(out)) != commit {
-		t.Fatalf("FETCH_HEAD %q %v, want %s", out, err, commit)
+}
+
+// gitInit makes an empty repository at dir.
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	if out, err := exec.Command("git", "init", "-q", "-b", "main", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init %s: %v %s", dir, err, out)
 	}
 }
 
-func TestMain(m *testing.M) {
-	if IsGitRemoteHelper(os.Args[0]) {
-		os.Exit(fakeGitRemote())
+// gitRun runs git in dir and returns its trimmed output.
+func gitRun(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	args = append([]string{"-C", dir}, args...)
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v %s", args, err, out)
 	}
-	os.Exit(m.Run())
+	return strings.TrimSpace(string(out))
 }
 
-// fakeGitRemote runs the helper against fake objects from TestGitFetch.
-func fakeGitRemote() int {
-	data, err := os.ReadFile(os.Getenv("BLIP_TEST_OBJECTS"))
-	if err != nil {
-		panic(err)
+// assertFetchReleased checks that the fetch removed its mount and its use
+// count from the caller blip.
+func assertFetchReleased(t *testing.T, h *harness, blip, state string) {
+	t.Helper()
+	b := h.blip(blip)
+	if m := findSpecMount(b.Spec.Mounts, state); m != nil {
+		t.Fatalf("%s still mounts %s: %+v", blip, state, b.Spec.Mounts)
 	}
-	var raw []json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		panic(err)
+	if v := b.Annotations[gitMountsAnnotation]; v != "" {
+		t.Fatalf("%s annotation = %q, want cleared", blip, v)
 	}
-	b := fake.NewClientBuilder().WithScheme(Scheme)
-	for i, r := range raw {
-		var obj client.Object = &v1alpha1.Blip{}
-		if i == len(raw)-1 {
-			obj = &v1alpha1.BlipState{}
+	waitForCond(t, func() bool { return findMount(h.blip(blip).Status.Mounts, state) == nil })
+}
+
+// TestGitFetch runs blip git-fetch against real repositories.
+func TestGitFetch(t *testing.T) {
+	requireGit(t)
+
+	t.Run("default cwd", func(t *testing.T) {
+		withGitMountRoot(t)
+		dst := filepath.Join(t.TempDir(), "dst")
+		gitInit(t, dst)
+		// Without an explicit path, the source is the caller's cwd, which
+		// gitStateFor places under the worker's state root.
+		commit := gitRepo(t, filepath.Join(gitMountRoot, "alice.w1", dst))
+		h := newHarness(t, gitObjects()...)
+		h.self = "alice.box"
+		t.Chdir(dst)
+		code, _, errOut := h.run("", "git-fetch", "w1", "w1:w1")
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
 		}
-		if err := json.Unmarshal(r, obj); err != nil {
-			panic(err)
+		if got := gitRun(t, dst, "rev-parse", "w1"); got != commit {
+			t.Fatalf("w1 = %s, want %s", got, commit)
 		}
-		b.WithObjects(obj)
+		assertFetchReleased(t, h, "alice.box", "alice.w1")
+	})
+
+	t.Run("subdirectory", func(t *testing.T) {
+		withGitMountRoot(t)
+		dst := filepath.Join(t.TempDir(), "dst")
+		gitInit(t, dst)
+		sub := filepath.Join(dst, "repo", "sub")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// The corresponding source path is a subdirectory of the source
+		// repository, so fetching has to resolve the repository top level.
+		src := filepath.Join(gitMountRoot, "alice.w1", dst)
+		commit := gitRepo(t, src)
+		if err := os.MkdirAll(filepath.Join(src, "repo", "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		h := newHarness(t, gitObjects()...)
+		h.self = "alice.box"
+		t.Chdir(sub)
+		code, _, errOut := h.run("", "git-fetch", "w1", "w1:w1")
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if got := gitRun(t, dst, "rev-parse", "w1"); got != commit {
+			t.Fatalf("w1 = %s, want %s", got, commit)
+		}
+		assertFetchReleased(t, h, "alice.box", "alice.w1")
+	})
+
+	t.Run("explicit path", func(t *testing.T) {
+		withGitMountRoot(t)
+		dst := filepath.Join(t.TempDir(), "dst")
+		gitInit(t, dst)
+		commit := gitRepo(t, filepath.Join(gitMountRoot, "alice.w1", "home/dev/src"))
+		h := newHarness(t, gitObjects()...)
+		h.self = "alice.box"
+		t.Chdir(dst)
+		code, _, errOut := h.run("", "git-fetch", "w1:/home/dev/src", "w1:w1")
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if got := gitRun(t, dst, "rev-parse", "w1"); got != commit {
+			t.Fatalf("w1 = %s, want %s", got, commit)
+		}
+		assertFetchReleased(t, h, "alice.box", "alice.w1")
+	})
+
+	t.Run("git failure releases mount", func(t *testing.T) {
+		withGitMountRoot(t)
+		dst := filepath.Join(t.TempDir(), "dst")
+		gitInit(t, dst)
+		gitRepo(t, filepath.Join(gitMountRoot, "alice.w1", dst))
+		h := newHarness(t, gitObjects()...)
+		h.self = "alice.box"
+		t.Chdir(dst)
+		code, _, errOut := h.run("", "git-fetch", "w1", "no-such-ref:w1")
+		if code == 0 {
+			t.Fatalf("fetch of a nonexistent ref succeeded: %s", errOut)
+		}
+		assertFetchReleased(t, h, "alice.box", "alice.w1")
+	})
+}
+
+func TestGitFetchRejections(t *testing.T) {
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	writer := readyState("alice.w1")
+	writer.Status.Writer = &v1alpha1.Writer{BlipName: "alice.w1"}
+	for _, tc := range []struct {
+		name string
+		objs []client.Object
+		self string
+		args []string
+		want string
+	}{
+		{"outside a blip", gitObjects(), "", []string{"git-fetch", "w1", "w1:w1"},
+			"git-fetch only works inside a blip"},
+		{"self", gitObjects(), "alice.box", []string{"git-fetch", "box"},
+			"cannot fetch from box, the blip running this fetch"},
+		{"missing worker", gitObjects(), "alice.box", []string{"git-fetch", "nope"},
+			`blip "alice.nope" not found`},
+		{"running source", []client.Object{ownedBlip("alice.box", "alice.home"), worker, writer},
+			"alice.box", []string{"git-fetch", "w1"},
+			"is still running; wait for it to finish (blip wait w1)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.objs...)
+			h.self = tc.self
+			code, _, errOut := h.run("", tc.args...)
+			if code != 1 || !strings.Contains(errOut, tc.want) {
+				t.Fatalf("code %d stderr %q, want %q", code, errOut, tc.want)
+			}
+		})
 	}
-	b.WithObjects(&v1alpha1.BlipPool{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: ns}})
-	kube := b.Build()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go (&fakeController{kube: kube, exited: map[string]int32{}}).loop(ctx)
-	gitMountRoot = os.Getenv("BLIP_TEST_MOUNTS")
-	nsFile := filepath.Join(filepath.Dir(os.Getenv("BLIP_TEST_OBJECTS")), "namespace")
-	_ = os.WriteFile(nsFile, []byte(ns), 0o644)
-	env := &Env{In: os.Stdin, Out: os.Stdout, Err: os.Stderr, NamespaceFile: nsFile,
-		Hostname: func() (string, error) { return "alice.box", nil },
-		Connect:  func(KubeFlags) (*Clients, error) { return &Clients{Kube: kube, Namespace: ns}, nil }}
-	return GitRemoteMain(ctx, env, os.Args[1:])
 }

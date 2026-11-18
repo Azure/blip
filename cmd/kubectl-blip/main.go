@@ -24,8 +24,5 @@ func main() {
 	_ = fs.Set("stderrthreshold", "FATAL")
 	klog.SetOutput(io.Discard)
 	utilruntime.ErrorHandlers = nil
-	if cli.IsGitRemoteHelper(os.Args[0]) {
-		os.Exit(cli.GitRemoteMain(context.Background(), cli.DefaultEnv(), os.Args[1:]))
-	}
 	os.Exit(cli.Main(context.Background(), cli.DefaultEnv(), os.Args[1:]))
 }

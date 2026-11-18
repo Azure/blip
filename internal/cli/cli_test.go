@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -251,9 +252,11 @@ func TestUnmountBusy(t *testing.T) {
 	}
 }
 
-// TestGitWorkflow runs the README's Git workflow against fakes, creating
-// states the way kubectl apply would.
+// TestGitWorkflow runs the fan-out/fan-in Git workflow against fakes,
+// creating states the way kubectl apply would.
 func TestGitWorkflow(t *testing.T) {
+	requireGit(t)
+	withGitMountRoot(t)
 	h := newHarness(t, runningBlip("agent"))
 	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
 	repo := state("repo")
@@ -270,8 +273,6 @@ func TestGitWorkflow(t *testing.T) {
 		{apply: worker},
 		{args: []string{"run", "worker-1", "--image", "img", "-d", "--mount", "worker-1:/work:rw", "-w", "/work/repo", "--", "sh", "-lc", "make fix"}},
 		{args: []string{"wait", "worker-1"}},
-		{args: []string{"mount", "worker-1", "--blip", "agent", "--path", "/results/worker-1"}},
-		{args: []string{"exec", "agent", "--", "git", "-C", "/work/repo", "fetch", "/results/worker-1/repo", "HEAD"}},
 	}
 	for _, s := range steps {
 		if s.apply != nil {
@@ -282,10 +283,22 @@ func TestGitWorkflow(t *testing.T) {
 			t.Fatalf("%v: code %d: %s", s.args, code, errOut)
 		}
 	}
-	b := h.blip("agent")
-	if len(b.Spec.Mounts) != 1 || b.Spec.Mounts[0] != (v1alpha1.Mount{State: "worker-1", Path: "/results/worker-1"}) {
-		t.Fatalf("agent mounts = %+v", b.Spec.Mounts)
+
+	// Fetch the worker's changes with blip git-fetch: the worker has its
+	// state mounted at /work, so /work/repo is the repository in it.
+	dst := filepath.Join(t.TempDir(), "dst")
+	gitInit(t, dst)
+	commit := gitRepo(t, filepath.Join(gitMountRoot, "worker-1", "repo"))
+	h.self = "agent"
+	t.Chdir(dst)
+	if code, _, errOut := h.run("", "git-fetch", "worker-1:/work/repo", "w1:fetched"); code != 0 {
+		t.Fatalf("git-fetch: code %d: %s", code, errOut)
 	}
+	if got := gitRun(t, dst, "rev-parse", "fetched"); got != commit {
+		t.Fatalf("fetched = %s, want %s", got, commit)
+	}
+	assertFetchReleased(t, h, "agent", "worker-1")
+
 	if w := h.blip("worker-1"); w.Status.Phase != v1alpha1.BlipSucceeded {
 		t.Fatalf("worker phase = %s", w.Status.Phase)
 	}

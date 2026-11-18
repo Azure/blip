@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end tests against the kind cluster from hack/kind-up.sh. The Git
 # fan-out runs the way users run it: from an SSH sandbox through the gateway,
-# forking workers from the live sandbox and fetching their commits with the
-# blip:: Git remote. A second user checks that the ownership policy keeps
-# the two apart.
+# forking workers from the live sandbox and fetching their commits with
+# `blip git-fetch`. A second user checks that the ownership policy keeps the
+# two apart.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -121,7 +121,7 @@ for i in 1 2; do
 done
 for p in $pids; do wait "$p"; done
 for i in 1 2; do
-	git fetch -q blip::w$i/home/dev/src w$i:w$i
+	blip git-fetch w$i w$i:w$i
 	test "$(git show w$i:tasks.txt)" = "task $i"
 	ms=$((($(git log -1 --format=%s w$i) - $(cat ~/start.w$i)) / 1000000))
 	rm ~/start.w$i
@@ -133,8 +133,7 @@ test "$(git status --porcelain)" = "?? notes.txt"
 git log --oneline --all
 kill -0 "$(cat ~/sleeper)"
 touch ~/thawed && rm ~/thawed
-if git fetch -q blip::w9/home/dev/src w9 2>/dev/null; then echo "fetch from a missing worker succeeded"; exit 1; fi
-if git push -q blip::w1/home/dev/src main 2>/dev/null; then echo "push succeeded"; exit 1; fi
+if blip git-fetch w9 w9 2>/dev/null; then echo "fetch from a missing worker succeeded"; exit 1; fi
 EOF
 
 b_checks() {
@@ -163,7 +162,7 @@ denied POST "$states" -d "{\"apiVersion\":\"blip.dev/v1alpha1\",\"kind\":\"BlipS
 denied POST "$states" -d "{\"apiVersion\":\"blip.dev/v1alpha1\",\"kind\":\"BlipState\",\"metadata\":{\"name\":\"$A.planted\",\"labels\":{\"blip.dev/owner\":\"$A\"}},\"spec\":{\"size\":\"1Gi\"}}"
 denied DELETE "/apis/blip.dev/v1alpha1/namespaces/$SSH_NS/blips/$A.default"
 denied POST "/api/v1/namespaces/$SSH_NS/pods/$APOD/exec?command=true&stdout=true"
-if git fetch -q blip::w1/home/dev/src w1 2>/dev/null; then echo "$B fetched $A's worker"; exit 1; fi
+if blip git-fetch w1 w1 2>/dev/null; then echo "$B fetched $A's worker"; exit 1; fi
 blip run bw --fork / -- true
 EOF
 echo "$B checks passed"
@@ -180,7 +179,7 @@ mkdir /work/repo && cd /work/repo
 git init -q && git config user.email a@example.com && git config user.name a
 cp ~/src/task.sh . && git add task.sh && git commit -qm init
 blip run w3 --fork /work -- sh -c 'git switch -qc w3 && ./task.sh 3 && git add tasks.txt && git commit -qm w3'
-git fetch -q blip::w3/work/repo w3:w3
+blip git-fetch w3 w3:w3
 test "$(git show w3:tasks.txt)" = "task 3"
 cd / && blip unmount repo
 EOF

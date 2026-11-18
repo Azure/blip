@@ -34,11 +34,10 @@ RUN arch="$(dpkg --print-architecture)" \
     && install -m 0755 /tmp/kubectl /usr/local/bin/kubectl \
     && rm -f /tmp/kubectl /tmp/kubectl.sha256
 
-# The CLI, also as `blip` and as the git remote helper for blip:: URLs. It is
-# in /usr/local/bin, so `kubectl blip` finds it via PATH.
+# The CLI, also as `blip`. It is in /usr/local/bin, so `kubectl blip` finds
+# it via PATH.
 COPY bin/kubectl-blip /usr/local/bin/kubectl-blip
-RUN ln -s kubectl-blip /usr/local/bin/blip \
-    && ln -s kubectl-blip /usr/local/bin/git-remote-blip
+RUN ln -s kubectl-blip /usr/local/bin/blip
 
 # Replace the image's default "ubuntu" user so dev gets UID 1000.
 RUN userdel -r ubuntu \

@@ -201,8 +201,9 @@ func NewCommand(env *Env) *cobra.Command {
 		Long: `Run fast VM sandboxes with durable state on Kubernetes.
 
 These commands cover what kubectl cannot do: sessions inside a blip,
-mounts on a running blip, waits that report its result, and creating
-states without YAML. Use kubectl for everything else:
+mounts on a running blip, waits that report its result, fetching commits
+from a finished blip, and creating states without YAML. Use kubectl for
+everything else:
   kubectl get blips,blipstates
   kubectl apply -f state.yaml  # advanced state fields
   kubectl patch blip NAME --type=merge -p '{"spec":{"stop":true}}'
@@ -219,8 +220,8 @@ states without YAML. Use kubectl for everything else:
 	pf.StringVar(&a.flags.Context, "context", "", "kubeconfig context to use")
 	pf.StringVarP(&a.flags.Namespace, "namespace", "n", "", "namespace (default from kubeconfig)")
 	root.AddCommand(
-		a.createCommand(), a.runCommand(), a.execCommand(), a.attachCommand(), a.sessionsCommand(),
-		a.mountCommand(), a.unmountCommand(), a.waitCommand(),
+		a.createCommand(), a.runCommand(), a.gitFetchCommand(), a.execCommand(), a.attachCommand(),
+		a.sessionsCommand(), a.mountCommand(), a.unmountCommand(), a.waitCommand(),
 	)
 	return root
 }
