@@ -36,9 +36,10 @@ import (
 const expectTimeout = time.Minute
 
 const (
-	// annotationTemplateHash records the VM shape a warm pod was created
-	// from. A pool spec change leaves vacant pods with a stale hash, which
-	// reconcile deletes so they are replaced with the new shape.
+	// annotationTemplateHash records the VM shape, including the runtime
+	// image, a warm pod was created from. A pool spec or controller image
+	// change leaves vacant pods with a stale hash, which reconcile deletes
+	// so they are replaced with the new shape.
 	annotationTemplateHash = "blip.dev/template-hash"
 	// Bump when pod topology changes without a pool spec change, so warm
 	// pods cannot retain the old credential or socket layout.
@@ -208,7 +209,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		}
 	}
 
-	hash := templateHash(pool)
+	hash := templateHash(pool, r.RuntimeImage)
 	created, createdOn, deleted := r.expectations(rq.NamespacedName, pods.Items)
 	total := len(pods.Items) + created
 	var vacant []*corev1.Pod
@@ -538,7 +539,7 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 			Name:            name,
 			Namespace:       pool.Namespace,
 			Labels:          map[string]string{LabelPool: pool.Name},
-			Annotations:     map[string]string{annotationTemplateHash: templateHash(pool)},
+			Annotations:     map[string]string{annotationTemplateHash: templateHash(pool, r.RuntimeImage)},
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(pool, v1.GroupVersion.WithKind("BlipPool"))},
 		},
 		Spec: corev1.PodSpec{
@@ -728,13 +729,17 @@ func poolShape(pool *v1.BlipPool) (cpus int32, memory resource.Quantity, hypervi
 	return cpus, memory, hypervisor
 }
 
-// templateHash identifies the VM shape a pool creates. Warm pods keep the
-// shape they were built with, so a change to any of these fields must retire
-// them: reconcile deletes vacant pods whose hash no longer matches.
-func templateHash(pool *v1.BlipPool) string {
+// templateHash identifies the VM shape a controller builds for a pool. Warm
+// pods keep the shape they were built with, so a change to any of these
+// fields must retire them: reconcile deletes vacant pods whose hash no longer
+// matches. The runtime image is controller configuration rather than pool
+// spec, but it determines the guest version, so a controller rollout with a
+// new image must not leave warm VMs booted by the old one.
+func templateHash(pool *v1.BlipPool, runtimeImage string) string {
 	cpus, memory, hypervisor := poolShape(pool)
 	shape := struct {
 		TopologyVersion    string
+		RuntimeImage       string
 		CPUs               int32
 		Memory             resource.Quantity
 		Hypervisor         string
@@ -745,6 +750,7 @@ func templateHash(pool *v1.BlipPool) string {
 		ImagePullSecrets   []corev1.LocalObjectReference
 	}{
 		TopologyVersion:    podTopologyVersion,
+		RuntimeImage:       runtimeImage,
 		CPUs:               cpus,
 		Memory:             memory,
 		Hypervisor:         hypervisor,

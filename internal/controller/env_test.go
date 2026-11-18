@@ -26,6 +26,10 @@ import (
 
 const ns = "ns"
 
+// runtimeImage is the controller image the test env runs; the pool template
+// hash covers it so a controller rollout retires old warm VMs.
+const runtimeImage = "reg/blip-runtime:dev"
+
 func metadata(name string) metav1.ObjectMeta { return metav1.ObjectMeta{Name: name} }
 
 type fakeRegistry struct {
@@ -98,7 +102,7 @@ func newEnv(t *testing.T) *env {
 		},
 	}
 	cfg := Config{
-		RuntimeImage: "reg/blip-runtime:dev",
+		RuntimeImage: runtimeImage,
 		Registry:     e.reg,
 		Now:          func() time.Time { return e.now },
 	}

@@ -569,7 +569,7 @@ func (r *BlipReconciler) warmPods(b *v1.Blip, pool *v1.BlipPool, states map[stri
 	for _, p := range pods {
 		// Never claim a VM on a node that is not a usable BlipNode: missing
 		// Kubernetes Node, draining, stale heartbeat, or no incarnation.
-		if claimableForPool(&p, pool) && cl.usable(p.Spec.NodeName, nil) {
+		if claimableForPool(&p, pool, r.RuntimeImage) && cl.usable(p.Spec.NodeName, nil) {
 			out = append(out, p)
 		}
 	}
@@ -591,10 +591,11 @@ func (r *BlipReconciler) warmPods(b *v1.Blip, pool *v1.BlipPool, states map[stri
 }
 
 // claimableForPool excludes stale warm VMs before the pool reconciler has
-// deleted them. Claiming one would let it keep its old topology indefinitely.
-func claimableForPool(p *corev1.Pod, pool *v1.BlipPool) bool {
+// deleted them. Claiming one would let it keep its old topology or guest
+// image indefinitely.
+func claimableForPool(p *corev1.Pod, pool *v1.BlipPool, runtimeImage string) bool {
 	return pool.DeletionTimestamp == nil && p.Namespace == pool.Namespace &&
-		p.Labels[LabelPool] == pool.Name && p.Annotations[annotationTemplateHash] == templateHash(pool) &&
+		p.Labels[LabelPool] == pool.Name && p.Annotations[annotationTemplateHash] == templateHash(pool, runtimeImage) &&
 		isVacant(p) && ready(p)
 }
 
@@ -611,7 +612,7 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 		if err := r.Live.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: poolName(b)}, pool); err != nil {
 			return nil, client.IgnoreNotFound(err)
 		}
-		if !claimableForPool(base, pool) {
+		if !claimableForPool(base, pool, r.RuntimeImage) {
 			continue
 		}
 		p := base.DeepCopy()

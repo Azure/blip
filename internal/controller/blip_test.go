@@ -279,7 +279,7 @@ func TestClaimRace(t *testing.T) {
 }
 
 func TestBlipRejectsStaleWarmPodsBeforePoolCleanup(t *testing.T) {
-	for _, kind := range []string{"legacy topology", "missing hash", "old pool shape"} {
+	for _, kind := range []string{"legacy topology", "missing hash", "old pool shape", "old runtime image"} {
 		t.Run(kind, func(t *testing.T) {
 			e := newEnv(t)
 			e.addNodes("n1")
@@ -295,6 +295,10 @@ func TestBlipRejectsStaleWarmPodsBeforePoolCleanup(t *testing.T) {
 				previous := pool.DeepCopy()
 				previous.Spec.ServiceAccountName = "previous"
 				old = e.pool.podFor(previous, old.Name)
+			case "old runtime image":
+				previous := &PoolReconciler{Client: e.c, Config: e.pool.Config}
+				previous.RuntimeImage = "ghcr.io/azure/blip-runtime:b7e8d83edae9"
+				old = previous.podFor(pool, old.Name)
 			}
 			e.create(old)
 			e.warmOn("n1")
