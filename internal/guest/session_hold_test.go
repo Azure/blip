@@ -3,6 +3,7 @@ package guest
 import (
 	"bytes"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,6 +60,23 @@ func started(s *session) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func waitStopping(t *testing.T, g *Guest, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		g.mu.Lock()
+		stopping := g.stopping
+		g.mu.Unlock()
+		if stopping {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("guest did not shut down")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -170,5 +188,143 @@ func TestShutdownReleasesHeldPumps(t *testing.T) {
 	g.shutdown()
 	if !started(s) {
 		t.Fatal("shutdown did not release held pumps")
+	}
+}
+
+// sessionPair returns two connected stream files for serveSession tests.
+func sessionPair(t *testing.T) (*os.File, *os.File) {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := os.NewFile(uintptr(fds[0]), "session-server")
+	cli := os.NewFile(uintptr(fds[1]), "session-client")
+	t.Cleanup(func() {
+		srv.Close()
+		cli.Close()
+	})
+	return srv, cli
+}
+
+// A detached run (no client, no WaitForClient) must not linger after its
+// command exits; that delay was paid by blip run -d and blip wait.
+func TestPrimaryExitShutsDownWithoutClient(t *testing.T) {
+	g := testGuest(t)
+	out, wait := fakePrimary(t, g)
+	g.claim = &wire.Claim{ID: "root", Command: []string{"true"}}
+	g.startPrimary()
+	out.Close()
+	wait <- unix.WaitStatus(0)
+	waitStopping(t, g, 2*time.Second)
+}
+
+// A run that expects a client keeps the replay until the client attaches,
+// then delivers the final output and exit status before shutting down.
+func TestPrimaryExitWaitsForExpectedClient(t *testing.T) {
+	g := testGuest(t)
+	out, wait := fakePrimary(t, g)
+	g.claim = &wire.Claim{ID: "root", Command: []string{"echo"}, WaitForClient: true}
+	g.startPrimary()
+	s := primarySession(t, g)
+
+	if _, err := out.Write([]byte("bye\n")); err != nil {
+		t.Fatal(err)
+	}
+	out.Close()
+	wait <- unix.WaitStatus(0)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !s.info().Exited {
+		if time.Now().After(deadline) {
+			t.Fatal("primary session did not exit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	g.mu.Lock()
+	stopping := g.stopping
+	g.mu.Unlock()
+	if stopping {
+		t.Fatal("guest shut down before the expected client attached")
+	}
+
+	got, ex := attachAndRead(t, s)
+	if got != "bye\n" || ex.Code != 0 {
+		t.Fatalf("client got %q exit %+v, want %q exit 0", got, ex, "bye\n")
+	}
+	waitStopping(t, g, 5*time.Second)
+}
+
+// An exec after the primary exited could still write a durable root after the
+// guest reported its final status, so it must be rejected.
+func TestExecRejectedAfterPrimaryExit(t *testing.T) {
+	g := testGuest(t)
+	g.claim = &wire.Claim{ID: "root"}
+	g.exit = &wire.Exit{Code: 0, Reason: "Completed"}
+
+	srv, cliFile := sessionPair(t)
+	_ = cliFile.SetDeadline(time.Now().Add(5 * time.Second))
+	c := wire.NewConn(cliFile)
+	go g.serveSession(srv)
+	if err := c.WriteJSON(wire.TOpen, wire.Open{Mode: wire.OpenExec, Argv: []string{"sh"}}); err != nil {
+		t.Fatal(err)
+	}
+	typ, payload, err := c.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var o wire.Opened
+	if err := wire.Decode(payload, &o); typ != wire.TOpened || err != nil || !strings.Contains(o.Error, "primary command has exited") {
+		t.Fatalf("exec after exit: frame %d %q %v", typ, o.Error, err)
+	}
+	g.mu.Lock()
+	sessions := len(g.sessions)
+	g.mu.Unlock()
+	if sessions != 0 {
+		t.Fatalf("exec after the primary exited started %d session(s)", sessions)
+	}
+}
+
+// Attaching is still allowed after the primary exited: the caller replays the
+// final output and exit status.
+func TestAttachAfterPrimaryExitReplaysOutput(t *testing.T) {
+	g := testGuest(t)
+	g.claim = &wire.Claim{ID: "root", WaitForClient: true}
+	s := newSession(g, wire.PrimarySession, []string{"echo"}, false)
+	s.out.add(wire.TStdout, []byte("bye\n"))
+	g.sessions[wire.PrimarySession] = s
+	s.finish(wire.Exit{Code: 7})
+	if g.exit == nil {
+		t.Fatal("primary exit was not recorded")
+	}
+
+	srv, cliFile := sessionPair(t)
+	_ = cliFile.SetDeadline(time.Now().Add(5 * time.Second))
+	c := wire.NewConn(cliFile)
+	go g.serveSession(srv)
+	if err := c.WriteJSON(wire.TOpen, wire.Open{Mode: wire.OpenAttach}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	for {
+		typ, payload, err := c.Read()
+		if err != nil {
+			t.Fatalf("read after attach: %v (output %q)", err, out.String())
+		}
+		switch typ {
+		case wire.TStdout, wire.TStderr:
+			out.Write(payload)
+		case wire.TExited:
+			var ex wire.Exit
+			if err := wire.Decode(payload, &ex); err != nil {
+				t.Fatal(err)
+			}
+			if out.String() != "bye\n" || ex.Code != 7 {
+				t.Fatalf("replay %q exit %+v, want %q exit 7", out.String(), ex, "bye\n")
+			}
+			waitStopping(t, g, 5*time.Second)
+			return
+		}
 	}
 }

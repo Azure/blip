@@ -22,6 +22,12 @@ const (
 	WorkCgroup = "/sys/fs/cgroup/work"
 	// stopGrace is how long processes get between SIGTERM and cgroup.kill.
 	stopGrace = 10 * time.Second
+	// exitAttachTimeout bounds how long a finished primary keeps its replay
+	// for a caller that is expected to attach.
+	exitAttachTimeout = 30 * time.Second
+	// exitDeliveryTimeout bounds delivery of the exit status to an attached
+	// caller; a client that stops reading cannot hold the guest up.
+	exitDeliveryTimeout = 30 * time.Second
 )
 
 // waitForClientTimeout bounds how long a primary command's output pumps stay
@@ -488,6 +494,7 @@ func (g *Guest) sessionExited(s *session) {
 		g.mu.Unlock()
 		return
 	}
+	waitForClient := g.claim != nil && g.claim.WaitForClient
 	st := s.status
 	st.Reason = "Completed"
 	if st.Code != 0 || st.Signal != "" {
@@ -498,10 +505,22 @@ func (g *Guest) sessionExited(s *session) {
 	log.Printf("primary exited: code %d %s", st.Code, st.Signal)
 	g.send(wire.TExit, st)
 	go func() {
-		// A caller can be delayed by the API watch while a very fast
-		// command already ran. Keep the replay available so it can still
-		// attach and read the output.
-		s.waitDelivered(30*time.Second, 30*time.Second)
+		s.mu.Lock()
+		clients := s.clients
+		s.mu.Unlock()
+		switch {
+		case clients > 0:
+			// An attached caller is still reading the final output and exit
+			// status. Keep the replay until it has both.
+			s.waitDelivered(0, exitDeliveryTimeout)
+		case waitForClient:
+			// The caller is expected to attach. Keep the replay for it, but
+			// only for a bounded time: a client that never comes must not
+			// hold the VM open.
+			s.waitDelivered(exitAttachTimeout, exitDeliveryTimeout)
+		}
+		// No client is attached and none is expected: shut down now instead
+		// of paying the old fixed 30s linger (detached runs and blip wait).
 		g.shutdown()
 	}()
 }

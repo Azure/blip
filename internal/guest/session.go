@@ -119,6 +119,11 @@ func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bo
 	}
 	go func() {
 		ws := <-p.wait
+		// The process can no longer write. Let pumps that were held for a
+		// client drain the rest of the pipe (or PTY) into the replay ring,
+		// so a caller that attaches after the command exited still sees its
+		// final output.
+		ss.releasePumps()
 		// Output written right before exit is still in the pipe or PTY;
 		// give the pumps a moment to drain it. Background processes may keep
 		// the PTY open, so do not wait for EOF forever.
@@ -599,10 +604,17 @@ func (g *Guest) serveSession(f *os.File) {
 		s.serve(c, f)
 	case wire.OpenExec:
 		g.mu.Lock()
-		claim, stopping := g.claim, g.stopping
+		claim, stopping, exited := g.claim, g.stopping, g.exit != nil
 		g.mu.Unlock()
 		if claim == nil || stopping {
 			reject(c, f, errors.New("blip is not running"))
+			return
+		}
+		if exited {
+			// The primary command has finished and the guest is only
+			// keeping its session replayable. A new command could still
+			// write a durable root after it was supposed to be sealed.
+			reject(c, f, errors.New("blip primary command has exited"))
 			return
 		}
 		spec := execProcSpec(claim, o)
