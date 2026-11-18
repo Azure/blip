@@ -46,7 +46,7 @@ func (a *app) pull(ctx context.Context, name, image string, f *pullFlags) error 
 		return err
 	}
 	c, _ := a.clients()
-	st, err := stateFromFlags(name, c.Namespace, &createStateFlags{size: f.size}, false)
+	st, err := stateFromFlags(name, c.Namespace, &createStateFlags{size: f.size}, nil, false)
 	if err != nil {
 		return err
 	}

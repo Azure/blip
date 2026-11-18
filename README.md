@@ -60,9 +60,11 @@ spec:
 
 `blip mount data workspace --path /work --write` adds a persistent mount;
 `blip unmount data workspace` removes it. Mounts follow the root state into later
-executions, including differently named Blips. Runtime
-defaults override imported image metadata; per-execution overrides take
-precedence. `network` narrows the pool's egress policy.
+executions, including differently named Blips. Inside a Blip,
+`blip create blipstate data --mount /work` creates the state and attaches it to
+the current Blip in one step; the attachment is writable unless `:ro` is
+given. Runtime defaults override imported image metadata; per-execution
+overrides take precedence. `network` narrows the pool's egress policy.
 
 Forking a workspace copies its root, runtime defaults, and writable auxiliary
 states, and shares read-only auxiliary states. These states also survive deletion
