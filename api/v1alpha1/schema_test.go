@@ -20,6 +20,7 @@ type crdValidation struct {
 type crdSchema struct {
 	Type         string               `json:"type"`
 	Pattern      string               `json:"pattern"`
+	MaxLength    int64                `json:"maxLength"`
 	Properties   map[string]crdSchema `json:"properties"`
 	Items        *crdSchema           `json:"items"`
 	XValidations []crdValidation      `json:"x-kubernetes-validations"`
@@ -163,6 +164,11 @@ func TestMountPathCRDRules(t *testing.T) {
 	const pathPattern = `^/[^/]+(/[^/]+)*$`
 	if path.Pattern != pathPattern {
 		t.Errorf("mount path pattern %q, want %q", path.Pattern, pathPattern)
+	}
+	// CEL cost estimation needs a bound on the string length; without it the
+	// split/exists rule blows the per-object admission budget.
+	if path.MaxLength != 4096 {
+		t.Errorf("mount path maxLength %d, want 4096", path.MaxLength)
 	}
 	const segments = "!self.split('/').exists(s, s == '.' || s == '..')"
 	if rule := ruleFor(t, path.XValidations, "path must not contain . or .. segments"); rule != segments {

@@ -409,6 +409,7 @@ type Mount struct {
 	// Path is an absolute path inside the guest root. It must be clean: no
 	// trailing slash, repeated slash, or . and .. segments.
 	// +kubebuilder:validation:Pattern=`^/[^/]+(/[^/]+)*$`
+	// +kubebuilder:validation:MaxLength=4096
 	// +kubebuilder:validation:XValidation:rule="!self.split('/').exists(s, s == '.' || s == '..')",message="path must not contain . or .. segments"
 	Path string `json:"path"`
 	// Writable mounts take the state's single writer slot and save a new

@@ -127,6 +127,7 @@ spec:
                       description: |-
                         Path is an absolute path inside the guest root. It must be clean: no
                         trailing slash, repeated slash, or . and .. segments.
+                      maxLength: 4096
                       pattern: ^/[^/]+(/[^/]+)*$
                       type: string
                       x-kubernetes-validations:
