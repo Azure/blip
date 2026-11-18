@@ -20,6 +20,10 @@ type Config struct {
 	Key []byte
 	// ReleaseRemote releases a Remote by its ID when its Release func was lost
 	// in a restart (interrupted fetch, or hydration finished after restart).
+	// It must be idempotent: a crash after release but before its durable
+	// acknowledgement causes the same ID to be released again.
+	// Return acknowledges callback dispatch. This API cannot report remote
+	// completion; asynchronous implementations own subsequent retries.
 	ReleaseRemote func(remoteID string)
 	// ResumeRemote resumes lease renewal for a remote working volume recovered
 	// after a restart. It must return without waiting for peer discovery.

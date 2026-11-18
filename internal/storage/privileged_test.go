@@ -327,7 +327,16 @@ func TestPrivilegedVolumes(t *testing.T) {
 	if err := s.Delete(ctx, "a000000000000001"); !errors.Is(err, ErrInUse) {
 		t.Fatalf("delete open volume: %v", err)
 	}
+	if v, ok := s.Get("a000000000000001"); !ok || v.Device != w {
+		t.Fatalf("refused delete hid the writer: %+v, %v", v, ok)
+	}
+	if dev, err := s.Activate("a000000000000001"); err != nil || dev != w {
+		t.Fatalf("activate after refused delete: %q, %v", dev, err)
+	}
 	h.Close()
+	if _, err := s.Seal(ctx, "a000000000000001", "c000000000000002"); err != nil {
+		t.Fatalf("seal after refused delete: %v", err)
+	}
 
 	for _, id := range []string{"a000000000000001", "a000000000000002", "a000000000000003", "c000000000000002", "c000000000000001", "f000000000000001", "e000000000000001", imgID} {
 		if err := s.Delete(ctx, id); err != nil {
@@ -503,6 +512,39 @@ func TestPrivilegedRestart(t *testing.T) {
 	if _, err := s.CreateWorking(ctx, CreateWorking{AttachmentID: "b000000000000003", FromImage: imgID}); err != nil {
 		t.Fatalf("thin IDs reused? %v", err)
 	}
+}
+
+func TestPrivilegedRefusedDeleteHostRestart(t *testing.T) {
+	s, cfg := openTest(t)
+	ctx := context.Background()
+	must(t, s.CreateCommit(ctx, CreateCommit{CommitID: "base", SizeBytes: 32 << 20}))
+	dev, err := s.CreateWorking(ctx, CreateWorking{AttachmentID: "writer", FromCommit: "base"})
+	must(t, err)
+	writeFile(t, dev, "payload", []byte("preserved after refused deletion"))
+	h, err := os.Open(dev)
+	must(t, err)
+	defer h.Close()
+	failDeleteRestoration(s)
+	if err := s.Delete(ctx, "writer"); !errors.Is(err, ErrInUse) {
+		t.Fatalf("Delete = %v", err)
+	}
+	if s.vols["writer"].Phase != phaseReady || len(s.PendingDeletes()) != 0 {
+		t.Fatal("refused delete is not usable before restart")
+	}
+	must(t, h.Close())
+	must(t, s.Close())
+	RemoveNodeDevices(cfg.NodeName) // host reboot: no surviving DM table can disambiguate the gate
+	s, err = Open(ctx, cfg)
+	must(t, err)
+	t.Cleanup(func() { s.Close() })
+	if v, ok := s.Get("writer"); !ok || v.Device != dev {
+		t.Fatalf("host restart lost refused writer: %+v, %v", v, ok)
+	}
+	if got := string(catFile(t, dev, "payload")); got != "preserved after refused deletion" {
+		t.Fatalf("data after host restart = %q", got)
+	}
+	_, err = s.Seal(ctx, "writer", "sealed")
+	must(t, err)
 }
 
 func TestPrivilegedDiff(t *testing.T) {

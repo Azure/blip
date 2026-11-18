@@ -30,21 +30,7 @@ func (s *Store) CreateImage(ctx context.Context, id string, sizeBytes int64, fil
 }
 
 func (s *Store) buildImage(ctx context.Context, rec *record, fill func(dev string) error) error {
-	if err := s.createThin(rec.Thin); err != nil {
-		return err
-	}
-	name := s.thinName(rec)
-	if err := dmCreate(name, thinTable(s.poolName(), rec.Thin, rec.Size), false); err != nil {
-		return err
-	}
-	err := ctx.Err()
-	if err == nil {
-		err = s.withPlain(rec, false, fill)
-	}
-	if rerr := dmRemove(name); err == nil {
-		err = rerr
-	}
-	return err
+	return s.runOperation(createPlan(s.layout(rec), rec, nil, true), imageFill(ctx, fill))
 }
 
 // CreateCommit builds a commit from an image, another commit, or nothing.
@@ -93,32 +79,7 @@ func (s *Store) CreateCommit(ctx context.Context, req CreateCommit) error {
 }
 
 func (s *Store) buildCommit(rec, src *record) error {
-	if src != nil {
-		if err := s.createSnap(rec.Thin, src.Thin); err != nil {
-			return err
-		}
-		if rec.Size <= src.Size {
-			return nil
-		}
-	} else if err := s.createThin(rec.Thin); err != nil {
-		return err
-	}
-	name := s.thinName(rec)
-	if err := dmCreate(name, thinTable(s.poolName(), rec.Thin, rec.Size), false); err != nil {
-		return err
-	}
-	err := s.withPlain(rec, false, func(dev string) error {
-		if src == nil {
-			return mkfsExt4(dev)
-		}
-		// Every node builds commits from images itself; growing them
-		// reproducibly lets nodes use each other's copies as delta bases.
-		return growExt4(dev, src.Kind == KindImage)
-	})
-	if rerr := dmRemove(name); err == nil {
-		err = rerr
-	}
-	return err
+	return s.runOperation(createPlan(s.layout(rec), rec, src, false), nil)
 }
 
 // source holds a ready volume of the given kind for the duration of an
@@ -201,29 +162,7 @@ func (s *Store) CreateWorking(ctx context.Context, req CreateWorking) (string, e
 }
 
 func (s *Store) buildWorking(rec, src *record) error {
-	if err := s.createSnap(rec.Thin, src.Thin); err != nil {
-		return err
-	}
-	name := s.thinName(rec)
-	table := thinTable(s.poolName(), rec.Thin, rec.Size)
-	if rec.Size <= src.Size {
-		if err := dmCreate(name, table, rec.ReadOnly); err != nil {
-			return err
-		}
-		return s.openPlain(rec)
-	}
-	if err := dmCreate(name, table, false); err != nil {
-		return err
-	}
-	if err := s.withPlain(rec, false, func(dev string) error { return growExt4(dev, false) }); err != nil {
-		return err
-	}
-	if rec.ReadOnly {
-		if err := dmReload(name, table, true); err != nil {
-			return err
-		}
-	}
-	return s.openPlain(rec)
+	return s.runOperation(createPlan(s.layout(rec), rec, src, false), nil)
 }
 
 func releaseOnce(r *Remote) {
@@ -235,11 +174,13 @@ func releaseOnce(r *Remote) {
 // Seal snapshots a fenced working volume into a new commit owned by the
 // volume's state. It returns the commit size.
 func (s *Store) Seal(ctx context.Context, attachmentID, commitID string) (int64, error) {
+	if attachmentID == "" || commitID == "" || attachmentID == commitID {
+		return 0, errors.New("storage: invalid snapshot IDs")
+	}
 	if err := s.waitHydrated(ctx, attachmentID); err != nil {
 		return 0, err
 	}
-	defer s.locks.lock(attachmentID)()
-	defer s.locks.lock(commitID)()
+	defer s.locks.lockPair(attachmentID, commitID)()
 	if c, err := s.lookup(commitID); err == nil {
 		if c.Kind != KindCommit {
 			return 0, fmt.Errorf("%w: %s is a %s", ErrInUse, c.ID, c.Kind)
@@ -260,27 +201,15 @@ func (s *Store) Seal(ctx context.Context, attachmentID, commitID string) (int64,
 	}
 	// The host-side fence: nothing (in particular the VMM) may still have
 	// the disk open, or writes could land after the snapshot.
-	if n, err := dmOpenCount(s.plainName(w)); err != nil {
-		return 0, err
-	} else if n > 0 {
-		return 0, fmt.Errorf("%w: %s is still open", ErrInUse, w.ID)
-	}
-	plain := mapperPath(s.plainName(w))
-	dirty, err := ext4NeedsRecovery(plain)
-	if err != nil {
-		return 0, err
-	}
-	if dirty {
-		return 0, ErrUnclean
-	}
-	if err := flushDevice(plain); err != nil {
+	name := s.plainName(w)
+	if err := s.runOperation([]deviceEffect{{Kind: eCheckClosed, Name: name}, {Kind: eCheckClean, Name: name}, {Kind: eFlush, Name: name}}, nil); err != nil {
 		return 0, err
 	}
 	rec := &record{ID: commitID, Kind: KindCommit, StateUID: w.StateUID, Base: w.Base, Size: w.Size}
 	if _, err := s.begin(rec, 1); err != nil {
 		return 0, err
 	}
-	if err := s.snapshotActive(w, rec.Thin); err != nil {
+	if err := s.snapshotActive(w, rec); err != nil {
 		if rerr := s.rollback(rec); rerr != nil {
 			logf("rollback seal %s: %v", rec.ID, rerr)
 		}
@@ -297,11 +226,13 @@ func (s *Store) Seal(ctx context.Context, attachmentID, commitID string) (int64,
 // snapshot is kept only if its ext4 superblock is clean. It returns the
 // commit size.
 func (s *Store) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID string) (int64, error) {
+	if attachmentID == "" || commitID == "" || attachmentID == commitID {
+		return 0, errors.New("storage: invalid snapshot IDs")
+	}
 	if err := s.waitHydrated(ctx, attachmentID); err != nil {
 		return 0, err
 	}
-	defer s.locks.lock(attachmentID)()
-	defer s.locks.lock(commitID)()
+	defer s.locks.lockPair(attachmentID, commitID)()
 	if c, err := s.lookup(commitID); err == nil {
 		if c.Kind != KindCommit {
 			return 0, fmt.Errorf("%w: %s is a %s", ErrInUse, c.ID, c.Kind)
@@ -320,14 +251,14 @@ func (s *Store) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID s
 	case w.Clone != nil:
 		return 0, fmt.Errorf("storage: %s is still hydrating", w.ID)
 	}
-	if err := flushDevice(mapperPath(s.plainName(w))); err != nil {
+	if err := s.runOperation([]deviceEffect{{Kind: eFlush, Name: s.plainName(w)}}, nil); err != nil {
 		return 0, err
 	}
 	rec := &record{ID: commitID, Kind: KindCommit, StateUID: stateUID, Base: w.Base, Size: w.Size}
 	if _, err := s.begin(rec, 1); err != nil {
 		return 0, err
 	}
-	err = s.snapshotActive(w, rec.Thin)
+	err = s.snapshotActive(w, rec)
 	if err == nil {
 		err = s.checkClean(rec)
 	}
@@ -347,36 +278,33 @@ func (s *Store) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID s
 // commit has needs_recovery clear.
 func (s *Store) checkClean(rec *record) error {
 	name := s.thinName(rec)
-	if err := dmCreate(name, thinTable(s.poolName(), rec.Thin, rec.Size), true); err != nil {
+	if err := s.deviceCreate(name, thinTable(s.poolName(), rec.Thin, rec.Size), true); err != nil {
 		return err
 	}
-	var dirty bool
-	err := s.withPlain(rec, true, func(dev string) (err error) {
-		dirty, err = ext4NeedsRecovery(dev)
-		return err
+	err := s.withPlain(rec, true, func(string) error {
+		return s.runOperation([]deviceEffect{{Kind: eCheckClean, Name: s.plainName(rec)}}, nil)
 	})
-	if rerr := dmRemove(name); err == nil {
+	if rerr := s.deviceRemove(name); err == nil {
 		err = rerr
-	}
-	if err == nil && dirty {
-		err = ErrUnclean
 	}
 	return err
 }
 
 // snapshotActive snapshots an active thin device, suspending it as dm-thin
 // requires.
-func (s *Store) snapshotActive(origin *record, thin uint32) error {
+func (s *Store) snapshotActive(origin, dest *record) error {
 	name := s.thinName(origin)
-	if !dmExists(name) {
-		return s.createSnap(thin, origin.Thin)
+	active := s.deviceExists(name)
+	if active {
+		err := s.change(dest, func(next *record) { next.ResumeDevice = name })
+		if err != nil {
+			return err
+		}
 	}
-	if _, err := dmsetup("--noudevsync", "suspend", name); err != nil {
+	if err := s.runOperation(snapshotPlan(s.poolName(), name, dest.Thin, origin.Thin, active), nil); err != nil {
 		return err
 	}
-	err := s.createSnap(thin, origin.Thin)
-	if _, rerr := dmsetup("--noudevsync", "resume", name); err == nil {
-		err = rerr
-	}
-	return err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.changeLocked(dest, func(next *record) { next.ResumeDevice = "" })
 }

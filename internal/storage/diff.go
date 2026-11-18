@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"regexp"
@@ -73,18 +74,23 @@ func (s *Store) Diff(ctx context.Context, id string, bases []string, digests map
 
 // withMetaSnap runs fn while the pool holds a metadata snapshot, which
 // thin_dump and thin_delta read from s.meta.
-func (s *Store) withMetaSnap(fn func() error) error {
+func (s *Store) withMetaSnap(fn func() error) (err error) {
 	s.snapMu.Lock()
 	defer s.snapMu.Unlock()
 	pool := s.poolName()
-	if err := dmMessage(pool, "reserve_metadata_snap"); err != nil {
+	message := func(msg string) error {
+		return s.runOperation([]deviceEffect{{Kind: eMessage, Name: pool, Table: msg}}, nil)
+	}
+	if err := message("reserve_metadata_snap"); err != nil {
 		// A snapshot left by a crash blocks a new one.
-		dmMessage(pool, "release_metadata_snap")
-		if err := dmMessage(pool, "reserve_metadata_snap"); err != nil {
+		if rerr := message("release_metadata_snap"); rerr != nil {
+			return errors.Join(err, rerr)
+		}
+		if err := message("reserve_metadata_snap"); err != nil {
 			return err
 		}
 	}
-	defer dmMessage(pool, "release_metadata_snap")
+	defer func() { err = errors.Join(err, message("release_metadata_snap")) }()
 	return fn()
 }
 
@@ -207,7 +213,7 @@ func (s *Store) OpenExport(id, leaseID string) (string, error) {
 	}
 	err = s.createSnap(rec.Thin, src.Thin)
 	if err == nil {
-		err = dmCreate(s.thinName(rec), thinTable(s.poolName(), rec.Thin, rec.Size), false)
+		err = s.deviceCreate(s.thinName(rec), thinTable(s.poolName(), rec.Thin, rec.Size), false)
 	}
 	if err == nil {
 		err = s.setPhase(rec, phaseReady)
@@ -231,13 +237,14 @@ func (s *Store) CloseExport(leaseID string) error {
 	if !ok {
 		return nil
 	}
-	if err := dmRemove(s.thinName(r)); err != nil {
+	phase := phaseDeleting
+	if r.Phase == phaseReady || r.Phase == phaseDetaching {
+		phase = phaseDetaching
+	}
+	if err := s.setPhase(r, phase); err != nil {
 		return err
 	}
-	if err := s.setPhase(r, phaseDeleting); err != nil {
-		return err
-	}
-	return s.finishDelete(r)
+	return s.detachAndDelete(r)
 }
 
 // Exports returns leaseID -> volume ID of every export device.

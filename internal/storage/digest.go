@@ -62,8 +62,7 @@ func (s *Store) Digest(ctx context.Context, id string) (string, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r.Digest = d
-	if err := s.putLocked(r); err != nil {
+	if err := s.changeLocked(r, func(next *record) { next.Digest = d }); err != nil {
 		return "", err
 	}
 	return d, nil

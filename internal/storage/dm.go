@@ -87,21 +87,23 @@ func dmRemove(name string) error {
 // dmReload replaces the table of an active device, keeping its name and
 // device number.
 func dmReload(name, table string, readOnly bool) error {
-	if _, err := dmsetup("--noudevsync", "suspend", name); err != nil {
-		return err
+	return (&Store{}).deviceReload(name, table, readOnly)
+}
+
+// dmResume is idempotent for recovery: resuming an already-active device can
+// fail with EINVAL on some kernels. The attr field includes 's' when suspended.
+func dmResume(name string) error {
+	if !dmExists(name) {
+		return nil
 	}
-	args := []string{"load", name}
-	if readOnly {
-		args = append(args, "--readonly")
-	}
-	_, err := runIn(table+"\n", nil, "dmsetup", args...)
-	if _, rerr := dmsetup("--noudevsync", "resume", name); err == nil {
-		err = rerr
-	}
+	attr, err := dmsetup("info", "-c", "--noheadings", "-o", "attr", name)
 	if err != nil {
 		return err
 	}
-	_, err = dmsetup("mknodes", name)
+	if !strings.Contains(attr, "s") {
+		return nil
+	}
+	_, err = dmsetup("--noudevsync", "resume", name)
 	return err
 }
 
@@ -143,19 +145,23 @@ func cryptTable(dev string, size int64, key []byte) string {
 // pool messages
 
 func (s *Store) createThin(id uint32) error {
-	return dmMessage(s.poolName(), "create_thin", strconv.FormatUint(uint64(id), 10))
+	return s.runOperation([]deviceEffect{{Kind: eCreateThin, Name: s.poolName(), Thin: id}}, nil)
 }
 
 func (s *Store) createSnap(id, origin uint32) error {
-	return dmMessage(s.poolName(), "create_snap", strconv.FormatUint(uint64(id), 10), strconv.FormatUint(uint64(origin), 10))
+	return s.runOperation([]deviceEffect{{Kind: eSnapshot, Name: s.poolName(), Thin: id, Origin: origin}}, nil)
 }
 
 // deleteThin deletes a thin device; a missing one is not an error.
 func (s *Store) deleteThin(id uint32) error {
+	return s.runOperation([]deviceEffect{{Kind: eDeleteThin, Name: s.poolName(), Thin: id}}, nil)
+}
+
+func deleteThin(pool string, id uint32) error {
 	if id == 0 {
 		return nil
 	}
-	err := dmMessage(s.poolName(), "delete", strconv.FormatUint(uint64(id), 10))
+	err := dmMessage(pool, "delete", strconv.FormatUint(uint64(id), 10))
 	if err != nil && strings.Contains(err.Error(), "No data available") {
 		return nil
 	}

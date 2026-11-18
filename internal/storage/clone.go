@@ -15,9 +15,10 @@ import (
 
 // hydration tracks a background clone watcher.
 type hydration struct {
-	release func()
-	cancel  context.CancelFunc
-	stopped chan struct{}
+	release  func()
+	released bool
+	cancel   context.CancelFunc
+	stopped  chan struct{}
 }
 
 func cloneMetaSize(size int64) int64 { return roundUp(8<<20+size/512, blockSize) }
@@ -50,10 +51,12 @@ func (s *Store) createRemoteWorking(ctx context.Context, req CreateWorking) (str
 	top := s.topName(rec)
 	err = s.setupClone(rec, base, top, src.Regions)
 	if err == nil && rec.Size > src.SizeBytes {
-		err = s.withPlain(rec, false, func(dev string) error { return growExt4(dev, false) })
+		err = s.withPlain(rec, false, func(string) error {
+			return s.runOperation([]deviceEffect{{Kind: eGrow, Name: s.plainName(rec)}}, nil)
+		})
 	}
 	if err == nil {
-		err = dmMessage(top, "enable_hydration")
+		err = s.runOperation([]deviceEffect{{Kind: eMessage, Name: top, Table: "enable_hydration"}}, nil)
 	}
 	if err == nil {
 		err = s.openPlain(rec)
@@ -108,12 +111,7 @@ func (s *Store) FetchCommit(ctx context.Context, stateUID, commitID string, src 
 		}
 		return err
 	}
-	s.releaseRemote(rec)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec.Clone = nil
-	rec.Phase = phaseReady
-	return s.putLocked(rec)
+	return s.completeClone(rec, phaseReady)
 }
 
 func (s *Store) fetch(ctx context.Context, rec, base *record, regions []Region, progress func(done, total int64)) error {
@@ -121,14 +119,17 @@ func (s *Store) fetch(ctx context.Context, rec, base *record, regions []Region, 
 	if err := s.setupClone(rec, base, name, regions); err != nil {
 		return err
 	}
-	if err := dmMessage(name, "enable_hydration"); err != nil {
+	if err := s.runOperation([]deviceEffect{{Kind: eMessage, Name: name, Table: "enable_hydration"}}, nil); err != nil {
 		return err
 	}
-	if err := waitClone(ctx, name, rec.Clone.Source, progress); err != nil {
+	if err := s.waitClone(ctx, name, rec.Clone.Source, progress); err != nil {
+		return err
+	}
+	if err := s.runOperation([]deviceEffect{{Kind: eFlush, Name: name}}, nil); err != nil {
 		return err
 	}
 	for _, n := range []string{name, s.metaName(rec), s.thinName(rec)} {
-		if err := dmRemove(n); err != nil {
+		if err := s.deviceRemove(n); err != nil {
 			return err
 		}
 	}
@@ -149,35 +150,7 @@ func (s *Store) cloneBase(src *Remote) (*record, error) {
 // clone metadata volume, and a dm-clone device named name with hydration
 // disabled, then marks every region outside regions as hydrated.
 func (s *Store) setupClone(rec, base *record, name string, regions []Region) error {
-	c := rec.Clone
-	var err error
-	if base != nil {
-		err = s.createSnap(rec.Thin, base.Thin)
-	} else {
-		err = s.createThin(rec.Thin)
-	}
-	if err != nil {
-		return err
-	}
-	if err := s.createThin(c.MetaThin); err != nil {
-		return err
-	}
-	dest, meta := s.thinName(rec), s.metaName(rec)
-	if err := dmCreate(dest, thinTable(s.poolName(), rec.Thin, rec.Size), false); err != nil {
-		return err
-	}
-	if err := dmCreate(meta, thinTable(s.poolName(), c.MetaThin, c.MetaSize), false); err != nil {
-		return err
-	}
-	table := fmt.Sprintf("0 %d clone %s %s %s %d 2 no_hydration no_discard_passdown 4 hydration_threshold 256 hydration_batch_size 32",
-		c.SourceSize/512, mapperPath(meta), mapperPath(dest), c.Source, blockSectors)
-	if rec.Size > c.SourceSize {
-		table += fmt.Sprintf("\n%d %d linear %s %d", c.SourceSize/512, (rec.Size-c.SourceSize)/512, mapperPath(dest), c.SourceSize/512)
-	}
-	if err := dmCreate(name, table, false); err != nil {
-		return err
-	}
-	return discardOutside(mapperPath(name), regions, c.SourceSize)
+	return s.runOperation(cloneSetupPlan(s.layout(rec), rec, base, name, regions), nil)
 }
 
 // discardOutside discards (on dm-clone: marks hydrated without copying)
@@ -262,18 +235,15 @@ func waitClone(ctx context.Context, name, source string, progress func(done, tot
 		if err != nil {
 			return err
 		}
-		h, t, mode, err := cloneProgress(st)
+		done, h, t, err := hydrationDecision(name, st)
 		if err != nil {
 			return err
 		}
 		if progress != nil {
 			progress(h*blockSize, t*blockSize)
 		}
-		if h == t {
+		if done {
 			return nil
-		}
-		if mode == "fail" || mode == "ro" {
-			return fmt.Errorf("clone %s metadata is %s", name, mode)
 		}
 		if _, err := os.Stat(source); err != nil {
 			return fmt.Errorf("clone source %s is gone", source)
@@ -286,10 +256,18 @@ func waitClone(ctx context.Context, name, source string, progress func(done, tot
 	}
 }
 
+func (s *Store) waitClone(ctx context.Context, name, source string, progress func(int64, int64)) error {
+	if s.cloneWait != nil {
+		return s.cloneWait(ctx, name, source, progress)
+	}
+	return waitClone(ctx, name, source, progress)
+}
+
 // startWatch runs a background goroutine that waits for a remote working
 // volume to hydrate and then swaps it to a linear mapping.
 func (s *Store) startWatch(r *record, release func()) {
 	ctx, cancel := context.WithCancel(s.ctx)
+	source := r.Clone.Source
 	h := &hydration{release: release, cancel: cancel, stopped: make(chan struct{})}
 	s.mu.Lock()
 	s.hydrates[r.ID] = h
@@ -298,7 +276,7 @@ func (s *Store) startWatch(r *record, release func()) {
 	go func() {
 		defer s.wg.Done()
 		defer close(h.stopped)
-		err := waitClone(ctx, s.topName(r), r.Clone.Source, nil)
+		err := s.waitClone(ctx, s.topName(r), source, nil)
 		if ctx.Err() != nil {
 			return
 		}
@@ -325,27 +303,57 @@ func (s *Store) startWatch(r *record, release func()) {
 // destination (same dm name, so open handles stay valid), drops the clone
 // metadata, and releases the remote.
 func (s *Store) finishClone(r *record) error {
+	if r.Clone == nil {
+		return s.releaseRemote(r)
+	}
 	top := s.topName(r)
-	table, err := dmTable(top)
+	table, err := s.deviceTable(top)
 	if err != nil {
 		return err
 	}
-	if strings.Contains(table, " clone ") {
-		if err := dmReload(top, linearTable(mapperPath(s.thinName(r)), r.Size), r.ReadOnly); err != nil {
+	cloning := strings.Contains(table, " clone ")
+	if !cloning {
+		for _, line := range strings.Split(strings.TrimSpace(table), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 3 || fields[2] != "linear" {
+				return fmt.Errorf("storage: unexpected completed clone table %q", table)
+			}
+		}
+	}
+	if !r.CloneFinishing {
+		// A full hydration counter is only an in-memory observation. Flush
+		// destination data and clone metadata before claiming that a host
+		// reboot can reconstruct this volume without its remote source.
+		if err := s.runOperation([]deviceEffect{{Kind: eResume, Name: top}, {Kind: eFlush, Name: top}}, nil); err != nil {
+			return err
+		}
+		if err := s.change(r, func(next *record) { next.CloneFinishing = true }); err != nil {
 			return err
 		}
 	}
-	if err := dmRemove(s.metaName(r)); err != nil {
+	if err := s.runOperation(finishClonePlan(s.layout(r), r, cloning), nil); err != nil {
 		return err
 	}
-	if err := s.deleteThin(r.Clone.MetaThin); err != nil {
+	return s.completeClone(r, r.Phase)
+}
+
+// completeClone makes local ownership and pending release durable together.
+// A failed write leaves Clone intact so retry/recovery still owns its metadata
+// thin ID and remote lease. The device cleanup that precedes this is replayable.
+func (s *Store) completeClone(r *record, phase string) error {
+	err := s.change(r, func(next *record) {
+		if next.Clone != nil && next.Clone.RemoteID != "" {
+			next.PendingRemote = next.Clone.RemoteID
+		}
+		next.Clone = nil
+		next.CloneFinishing = false
+		next.Phase = phase
+		next.Failed = ""
+	})
+	if err != nil {
 		return err
 	}
-	s.releaseRemote(r)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r.Clone = nil
-	return s.putLocked(r)
+	return s.releaseRemote(r)
 }
 
 // waitHydrated blocks until the background hydration of id (if any) stops.
