@@ -115,7 +115,7 @@ func pull(ctx context.Context, ref string, opts Options, dir string) (Config, st
 		return Config{}, "", err
 	}
 	rc := mutate.Extract(img)
-	err = writeTar(f, rc)
+	err = writeTarTo(f, rc, dir)
 	if cerr := rc.Close(); err == nil {
 		err = cerr
 	}
@@ -129,13 +129,36 @@ func pull(ctx context.Context, ref string, opts Options, dir string) (Config, st
 	return cfg, f.Name(), nil
 }
 
-// writeTar copies the tar stream r to w with clean relative names, adding any
-// missing parent directory before its first child: mke2fs requires it, and
-// image layers need not contain their parent directories. A real directory
-// entry that comes later still sets the directory's mode and owner.
+// writeTar copies the flattened image stream r to w. writeTarTo is the same
+// with temporary files in dir.
 func writeTar(w io.Writer, r io.Reader) error {
-	tr, tw := tar.NewReader(r), tar.NewWriter(w)
-	dirs := map[string]bool{}
+	return writeTarTo(w, r, "")
+}
+
+// writeTarTo copies the tar stream r to w with clean relative names. It emits
+// every path once, parents before their children, and resolves a parent path
+// through a symlink the image defines in any layer (Debian's /bin -> usr/bin),
+// so a child of that parent lands at the path the kernel would use. mke2fs
+// applies tar entries strictly in order and does not follow a symlinked parent.
+//
+// The stream from mutate.Extract is ordered top layer first, so the symlink
+// can appear after the entry that depends on it. writeTarTo therefore buffers
+// the file bodies on disk and builds the merged namespace before writing
+// anything.
+func writeTarTo(w io.Writer, r io.Reader, dir string) error {
+	spool, err := os.CreateTemp(dir, "image-*.body")
+	if err != nil {
+		return err
+	}
+	defer spool.Close()
+	defer os.Remove(spool.Name())
+
+	var (
+		items []tarItem
+		syms  []tarSymlink
+		seen  = map[string]bool{}
+	)
+	tr := tar.NewReader(r)
 	for {
 		h, err := tr.Next()
 		if err == io.EOF {
@@ -143,36 +166,224 @@ func writeTar(w io.Writer, r io.Reader) error {
 			if _, err := io.Copy(io.Discard, r); err != nil {
 				return err
 			}
-			return tw.Close()
+			break
 		}
 		if err != nil {
 			return err
 		}
-		h.Name = path.Clean("/" + h.Name)[1:]
-		if h.Name == "" {
+		// tr.Next reuses its header, and writeHeader may be handed a modified
+		// copy, so keep a value copy of every one.
+		hdr := *h
+		hdr.Name = cleanTarName(hdr.Name)
+		if hdr.Name == "" {
 			continue
 		}
-		for i := range len(h.Name) {
-			if p := h.Name[:i]; h.Name[i] == '/' && !dirs[p] {
-				dirs[p] = true
-				if err := tw.WriteHeader(&tar.Header{Name: p, Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
-					return err
+		off, err := spool.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(spool, tr); err != nil {
+			return err
+		}
+		if hdr.Typeflag == tar.TypeSymlink && !seen[hdr.Name] {
+			// The first entry for a name wins: the input is top layer first.
+			seen[hdr.Name] = true
+			syms = append(syms, tarSymlink{name: hdr.Name, target: hdr.Linkname})
+		}
+		items = append(items, tarItem{hdr: &hdr, off: off})
+	}
+
+	links := resolveLinks(syms)
+	final := map[string]*tarEntry{}
+	// addParents synthesises the directories mke2fs needs but an image layer
+	// need not contain. A real directory entry replaces its synthetic parent
+	// later, preserving its mode and owner.
+	addParents := func(name string) {
+		for i := 1; i < len(name); i++ {
+			if name[i] != '/' {
+				continue
+			}
+			p := name[:i]
+			if _, ok := final[p]; !ok {
+				final[p] = &tarEntry{
+					hdr:       &tar.Header{Name: p, Typeflag: tar.TypeDir, Mode: 0o755},
+					synthetic: true,
 				}
 			}
 		}
-		if h.Typeflag == tar.TypeDir {
-			dirs[h.Name] = true
+	}
+	for _, it := range items {
+		h := it.hdr
+		parent, ok := resolvePath(parentName(h.Name), links)
+		if !ok {
+			// The path goes through a symlink loop, so the kernel could not
+			// reach it either.
+			continue
 		}
+		name := joinName(parent, path.Base(h.Name))
+		h.Name = name
 		if h.Typeflag == tar.TypeLink {
-			h.Linkname = path.Clean("/" + h.Linkname)[1:]
+			target := cleanTarName(h.Linkname)
+			if target != "" {
+				tparent, ok := resolvePath(parentName(target), links)
+				if !ok {
+					continue
+				}
+				h.Linkname = joinName(tparent, path.Base(target))
+			}
 		}
-		if err := tw.WriteHeader(h); err != nil {
+		e := &tarEntry{hdr: h, off: it.off}
+		if old, ok := final[name]; !ok || old.synthetic {
+			// Keep the highest layer's entry; only a synthetic directory may
+			// be replaced by a real entry for the same path.
+			final[name] = e
+		}
+		addParents(name)
+	}
+
+	tw := tar.NewWriter(w)
+	names := make([]string, 0, len(final))
+	for name := range final {
+		names = append(names, name)
+	}
+	// Sorting puts a parent before every child because the parent is a prefix
+	// of the child's name.
+	slices.Sort(names)
+	for _, name := range names {
+		e := final[name]
+		hdr := *e.hdr
+		if err := tw.WriteHeader(&hdr); err != nil {
 			return err
 		}
-		if _, err := io.Copy(tw, tr); err != nil {
-			return err
+		if hdr.Size > 0 && hdr.Typeflag != tar.TypeLink {
+			if _, err := spool.Seek(e.off, io.SeekStart); err != nil {
+				return err
+			}
+			if _, err := io.CopyN(tw, spool, hdr.Size); err != nil {
+				return err
+			}
 		}
 	}
+	return tw.Close()
+}
+
+type tarItem struct {
+	hdr *tar.Header
+	off int64
+}
+
+type tarSymlink struct {
+	name, target string
+}
+
+type tarEntry struct {
+	hdr       *tar.Header
+	off       int64
+	synthetic bool
+}
+
+// cleanTarName turns an archive path into a clean path relative to the image
+// root, so absolute names and ".." cannot escape it.
+func cleanTarName(name string) string {
+	return path.Clean("/" + name)[1:]
+}
+
+func parentName(name string) string {
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		return name[:i]
+	}
+	return ""
+}
+
+func joinName(dir, base string) string {
+	if dir == "" {
+		return base
+	}
+	return dir + "/" + base
+}
+
+// resolveLinks places every symlink in the merged tree. A symlink whose parent
+// path is itself a symlink belongs at the resolved parent, not at its name in
+// the layer. The locations are a fixed point: resolving one symlink can need
+// the resolved location of another, so repeat until the map stops changing.
+func resolveLinks(syms []tarSymlink) map[string]string {
+	prev := map[string]string{}
+	for range len(syms) + 1 {
+		cur := make(map[string]string, len(syms))
+		for _, s := range syms {
+			parent, ok := resolvePath(parentName(s.name), prev)
+			if !ok {
+				continue
+			}
+			loc := joinName(parent, path.Base(s.name))
+			if _, ok := cur[loc]; !ok {
+				cur[loc] = s.target
+			}
+		}
+		var same bool
+		if same = len(cur) == len(prev); same {
+			for k, v := range cur {
+				if prev[k] != v {
+					same = false
+					break
+				}
+			}
+		}
+		if same {
+			break
+		}
+		prev = cur
+	}
+	return prev
+}
+
+// resolvePath resolves every symlink in the root-relative path p. Relative
+// targets are interpreted from the link's directory and absolute targets from
+// the image root; ".." is clamped at the root, matching how the kernel
+// resolves paths inside a container. The last bool is false when a symlink
+// loop makes the path unreachable.
+func resolvePath(p string, links map[string]string) (string, bool) {
+	const maxHops = 255
+	var out []string
+	rest := p
+	for hops := 0; rest != ""; {
+		var c string
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			c, rest = rest[:i], rest[i+1:]
+		} else {
+			c, rest = rest, ""
+		}
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			if len(out) > 0 {
+				out = out[:len(out)-1]
+			}
+			continue
+		}
+		canonical := joinName(strings.Join(out, "/"), c)
+		target, ok := links[canonical]
+		if !ok {
+			out = append(out, c)
+			continue
+		}
+		hops++
+		if hops > maxHops {
+			return "", false
+		}
+		var tp string
+		if strings.HasPrefix(target, "/") {
+			tp = strings.TrimLeft(target, "/")
+		} else {
+			tp = joinName(strings.Join(out, "/"), target)
+		}
+		if rest != "" {
+			tp = joinName(tp, rest)
+		}
+		out, rest = nil, tp
+	}
+	return strings.Join(out, "/"), true
 }
 
 // FSSize returns the ext4 size for a filesystem holding tarBytes of tar
