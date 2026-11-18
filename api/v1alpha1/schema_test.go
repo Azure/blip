@@ -218,7 +218,7 @@ func TestGatewayAddressAndServerNameCRDRules(t *testing.T) {
 		t.Errorf("gateway serverName maxLength %d, want 253", serverName.MaxLength)
 	}
 	rule := ruleFor(t, serverName.XValidations, "serverName must be a DNS name or IP address")
-	const namePrefix = "self.serverName.matches('"
+	const namePrefix = "self.matches('"
 	i := strings.Index(rule, namePrefix)
 	if i < 0 {
 		t.Fatalf("serverName rule %q has no DNS matches() expression", rule)
@@ -269,12 +269,12 @@ func TestGatewayAudienceCRDRule(t *testing.T) {
 	if audience.MaxLength != 1024 {
 		t.Errorf("gateway audience maxLength %d, want 1024", audience.MaxLength)
 	}
-	const rule = "!self.audience.trim().lowerAscii().matches('^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$')"
+	const rule = "!self.trim().lowerAscii().matches('^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$')"
 	if got := ruleFor(t, audience.XValidations, "audience must not be a Kubernetes API server audience"); got != rule {
 		t.Fatalf("gateway audience rule %q, want %q", got, rule)
 	}
 
-	const prefix = "self.audience.trim().lowerAscii().matches('"
+	const prefix = "self.trim().lowerAscii().matches('"
 	i := strings.Index(rule, prefix)
 	if i < 0 {
 		t.Fatalf("audience rule %q has no matches() expression", rule)
