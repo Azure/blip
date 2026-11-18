@@ -91,6 +91,21 @@ type proc struct {
 	stderr *os.File
 }
 
+// workdirInRoot returns dir as an absolute path inside the workload root.
+// os.StartProcess resolves ProcAttr.Dir relative to the guest init's cwd,
+// which is outside the root after chroot, so a relative workdir has to be
+// anchored at the root first. path.Clean clamps ".." at "/", so a workdir can
+// never escape the root.
+func workdirInRoot(dir string) string {
+	if dir == "" {
+		return "/"
+	}
+	if !path.IsAbs(dir) {
+		dir = "/" + dir
+	}
+	return path.Clean(dir)
+}
+
 // startProc starts a process chrooted in the root filesystem, as the
 // requested user, in the work cgroup, in a new session.
 func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
@@ -117,6 +132,11 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 			dir = acct.home
 		}
 	}
+	// The child chdirs after chrooting, but os.StartProcess applies Dir
+	// relative to the guest init's cwd (outside the root). Anchor relative
+	// workdirs at the root so "tmp" means "<root>/tmp" rather than the
+	// initramfs /tmp, and so getcwd(3) works inside the workload.
+	dir = workdirInRoot(dir)
 	// Validate the working directory before starting: a failed chdir surfaces
 	// from os.StartProcess as ENOENT on the program path, which reads as if
 	// the executable were missing. Stat it inside the root, like the chdir

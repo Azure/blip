@@ -75,7 +75,8 @@ func TestStartSessionStartFailures(t *testing.T) {
 		{
 			name: "relative working directory",
 			spec: procSpec{argv: []string{"/bin/sh"}, dir: "relative/dir"},
-			want: "chdir relative/dir: no such file or directory",
+			// Relative workdirs are anchored at the root before validation.
+			want: "chdir /relative/dir: no such file or directory",
 		},
 		{
 			name: "working directory is a file",
