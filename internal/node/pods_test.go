@@ -119,13 +119,37 @@ func TestClaimCarriesWaitForClient(t *testing.T) {
 }
 
 func TestIdleTimeoutOverride(t *testing.T) {
-	v := newView()
-	b, d := imageBlip(v)
-	b.Spec.IdleTimeout = &metav1.Duration{Duration: 45 * time.Second}
-	readyDev(v, d, storage.Volume{ID: "r1"}, 7)
-	p := compute(v)
-	if c := p.desired[pkey("p")].Claim; c == nil || c.IdleTimeoutSeconds != 45 {
-		t.Fatalf("claim with idle timeout = %+v", c)
+	for _, tt := range []struct {
+		d    time.Duration
+		want int64
+	}{
+		{45 * time.Second, 45},
+		{500 * time.Millisecond, 1},
+	} {
+		v := newView()
+		b, d := imageBlip(v)
+		b.Spec.IdleTimeout = &metav1.Duration{Duration: tt.d}
+		readyDev(v, d, storage.Volume{ID: "r1"}, 7)
+		p := compute(v)
+		if c := p.desired[pkey("p")].Claim; c == nil || c.IdleTimeoutSeconds != tt.want {
+			t.Fatalf("claim with idle timeout %v = %+v, want %ds", tt.d, c, tt.want)
+		}
+	}
+}
+
+func TestIdleTimeoutSeconds(t *testing.T) {
+	for _, tt := range []struct {
+		d    time.Duration
+		want int64
+	}{
+		{0, 0},
+		{500 * time.Millisecond, 1},
+		{1500 * time.Millisecond, 2},
+		{30 * time.Second, 30},
+	} {
+		if got := idleTimeoutSeconds(tt.d); got != tt.want {
+			t.Errorf("idleTimeoutSeconds(%v) = %d, want %d", tt.d, got, tt.want)
+		}
 	}
 }
 

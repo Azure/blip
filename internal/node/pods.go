@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -274,10 +275,21 @@ func claimFor(b *v1alpha1.Blip, root podapi.Disk, cfg *image.Config) *podapi.Cla
 	if len(c.Command) == 0 {
 		c.IdleTimeoutSeconds = defaultIdleTimeoutSeconds
 		if b.Spec.IdleTimeout != nil {
-			c.IdleTimeoutSeconds = int64(b.Spec.IdleTimeout.Seconds())
+			c.IdleTimeoutSeconds = idleTimeoutSeconds(b.Spec.IdleTimeout.Duration)
 		}
 	}
 	return c
+}
+
+// idleTimeoutSeconds converts an idle timeout into whole seconds for the
+// guest. An explicit zero keeps its meaning of disabling idle shutdown, but a
+// positive sub-second value rounds up instead of truncating to zero, which
+// the guest would treat as disabled.
+func idleTimeoutSeconds(d time.Duration) int64 {
+	if d <= 0 {
+		return 0
+	}
+	return int64((d + time.Second - 1) / time.Second)
 }
 
 // attach describes a working volume a pod needs.
