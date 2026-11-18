@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -57,6 +58,12 @@ func TestRemoteRegistry(t *testing.T) {
 	}
 	if _, err := r.Digest(ctx, repo.Tag("missing").String()); !errors.Is(err, ErrImageNotFound) {
 		t.Errorf("missing tag: %v", err)
+	}
+	_, parseErr := name.ParseReference("bad image!!")
+	if _, err := r.Digest(ctx, "bad image!!"); !errors.Is(err, ErrInvalidImage) {
+		t.Errorf("invalid reference not classified: %v", err)
+	} else if !strings.Contains(err.Error(), parseErr.Error()) {
+		t.Errorf("invalid reference lost the parse error: %v", err)
 	}
 
 	insecure := RemoteRegistry{Insecure: []string{"registry.kind:5000"}}

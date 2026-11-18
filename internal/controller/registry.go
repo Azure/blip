@@ -21,6 +21,10 @@ import (
 // ErrImageNotFound means the registry has no such image.
 var ErrImageNotFound = errors.New("not found")
 
+// ErrInvalidImage means the image reference itself cannot be parsed. Retrying
+// cannot fix it.
+var ErrInvalidImage = errors.New("invalid image reference")
+
 // Registry resolves container image references.
 type Registry interface {
 	// Digest returns the pinned reference repo@sha256:... for ref. For a
@@ -47,10 +51,14 @@ type SecretRegistry interface {
 func (r RemoteRegistry) parse(ref string) (name.Reference, error) {
 	parsed, err := name.ParseReference(ref)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrInvalidImage, err)
 	}
 	if slices.Contains(r.Insecure, parsed.Context().RegistryStr()) {
-		return name.ParseReference(ref, name.Insecure)
+		parsed, err := name.ParseReference(ref, name.Insecure)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidImage, err)
+		}
+		return parsed, nil
 	}
 	return parsed, nil
 }

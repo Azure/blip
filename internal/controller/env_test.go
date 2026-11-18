@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +34,9 @@ type fakeRegistry struct {
 }
 
 func (f *fakeRegistry) Digest(_ context.Context, ref string) (string, error) {
+	if _, err := name.ParseReference(ref); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalidImage, err)
+	}
 	if d, ok := f.digests[ref]; ok {
 		return d, nil
 	}

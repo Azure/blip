@@ -289,6 +289,10 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 			r.finish(b, v1.BlipFailed, ReasonImageNotFound, err.Error())
 			return reconcile.Result{}, nil
 		}
+		if errors.Is(err, ErrInvalidImage) {
+			r.finish(b, v1.BlipFailed, ReasonInvalidSpec, err.Error())
+			return reconcile.Result{}, nil
+		}
 		if err != nil {
 			wait(b, ReasonImageResolve, fmt.Sprintf("resolve image %s: %v", b.Spec.Image, err))
 			return reconcile.Result{RequeueAfter: retryAfter}, nil

@@ -45,6 +45,7 @@ func TestStateInitialization(t *testing.T) {
 		{name: "image", spec: v1.BlipStateSpec{Image: "reg/img:v1"}, size: 10 << 30, nodes: 2},
 		{name: "image size", spec: v1.BlipStateSpec{Image: "reg/img:v1", Size: &size20G}, size: 20 << 30, nodes: 2},
 		{name: "missing image", spec: v1.BlipStateSpec{Image: "reg/nope:v1"}, message: "image reg/nope:v1: not found", phase: v1.StateFailed},
+		{name: "invalid image", spec: v1.BlipStateSpec{Image: "bad image!!"}, message: "invalid image reference", phase: v1.StateFailed},
 		{name: "missing copy source", spec: v1.BlipStateSpec{CopyFrom: "nope", Replicas: 1}, message: `copy source "nope" not found`, phase: v1.StateFailed},
 		{name: "no matching nodes", spec: v1.BlipStateSpec{Replicas: 1, NodeSelector: map[string]string{"zone": "x"}}, message: "no healthy node"},
 	}

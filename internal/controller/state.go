@@ -294,7 +294,7 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 	case st.Spec.Image != "":
 		if s.ImageDigest == "" {
 			d, err := digestImage(ctx, r.Registry, st.Spec.Image, st.Namespace, st.Spec.ImagePullSecrets)
-			if errors.Is(err, ErrImageNotFound) {
+			if errors.Is(err, ErrImageNotFound) || errors.Is(err, ErrInvalidImage) {
 				s.Phase = v1.StateFailed
 				return err.Error(), false, nil
 			}

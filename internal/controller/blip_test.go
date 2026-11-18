@@ -521,6 +521,7 @@ func TestBlipValidationAndWaiting(t *testing.T) {
 		{"root also mounted", []func(*v1.Blip){withRoot("data"), withMount("data", "/data", false)}, v1.BlipFailed, ReasonInvalidSpec},
 		{"image and state", []func(*v1.Blip){withRoot("data"), withImage("reg/img:v1")}, v1.BlipFailed, ReasonInvalidSpec},
 		{"missing image", []func(*v1.Blip){withImage("reg/missing:v1")}, v1.BlipFailed, ReasonImageNotFound},
+		{"invalid image", []func(*v1.Blip){withImage("bad image!!")}, v1.BlipFailed, ReasonInvalidSpec},
 		{"missing state", []func(*v1.Blip){withRoot("nope")}, v1.BlipPending, ReasonStateNotFound},
 		{"uncommitted state", []func(*v1.Blip){withRoot("fresh")}, v1.BlipPending, ReasonStateNotReady},
 		{"missing pool", []func(*v1.Blip){withImage("reg/img:v1"), func(b *v1.Blip) { b.Spec.Pool = "gpu" }}, v1.BlipPending, ReasonPoolNotFound},
