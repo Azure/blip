@@ -12,6 +12,18 @@ go test ./...
 make test-sim
 ```
 
+The daily campaign explores a fresh, reproducible range of lifecycle seeds and
+retains failing output, including JSON traces, as a workflow artifact. To replay
+a particular seed or expand the local campaign, bypass the Go test cache:
+
+```sh
+BLIP_SIM_SEED=123 BLIP_SIM_RUNS=1 go test -count=1 -v \
+  -run '^TestSimulationLifecycleSeededReplayAndHealing$' ./internal/simapp
+```
+
+The default pull-request campaign uses seeds 1 through 12. `BLIP_SIM_RUNS`
+accepts 1 through 10000; the daily job uses 128 runs.
+
 ## Execution model
 
 Keep decisions, retry policy, reservations, and operation continuations in

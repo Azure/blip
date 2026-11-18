@@ -2,7 +2,9 @@ package simapp
 
 import (
 	"fmt"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -200,7 +202,21 @@ func fairAction(w *world) string {
 }
 
 func TestSimulationLifecycleSeededReplayAndHealing(t *testing.T) {
-	for seed := uint64(1); seed <= 12; seed++ {
+	first, runs := uint64(1), uint64(12)
+	for name, dst := range map[string]*uint64{"BLIP_SIM_SEED": &first, "BLIP_SIM_RUNS": &runs} {
+		if value, set := os.LookupEnv(name); set {
+			n, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			*dst = n
+		}
+	}
+	if runs == 0 || runs > 10000 || first > ^uint64(0)-(runs-1) {
+		t.Fatal("simulation campaign requires 1..10000 runs and a non-overflowing seed range")
+	}
+	for i := uint64(0); i < runs; i++ {
+		seed := first + i
 		t.Run(fmt.Sprintf("seed-%02d", seed), func(t *testing.T) {
 			initial := newWorld()
 			trace, err := sim.Run(initial, seed, 300)

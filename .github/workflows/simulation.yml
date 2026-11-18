@@ -1,0 +1,39 @@
+name: Simulation campaign
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simulation-campaign
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Explore fresh reproducible lifecycle schedules
+        env:
+          BLIP_SIM_RUNS: '128'
+        run: |
+          export BLIP_SIM_SEED=$((GITHUB_RUN_NUMBER * BLIP_SIM_RUNS))
+          echo "Seeds start at ${BLIP_SIM_SEED}; runs=${BLIP_SIM_RUNS}"
+          set -o pipefail
+          go test -count=1 -timeout 15m -v -run '^TestSimulationLifecycleSeededReplayAndHealing$' ./internal/simapp 2>&1 | tee simulation.log
+      - name: Retain failure traces
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: simulation-traces
+          path: simulation.log
+          if-no-files-found: ignore
