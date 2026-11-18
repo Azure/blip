@@ -418,8 +418,8 @@ type EnvVar struct {
 // BlipSpec is one VM lifetime: either one command, or an interactive
 // sandbox that lives while sessions or processes are active.
 //
-// +kubebuilder:validation:XValidation:rule="has(self.image) != has(self.state)",message="set exactly one of image and state"
-// +kubebuilder:validation:XValidation:rule="has(self.image) == has(oldSelf.image) && has(self.command) == has(oldSelf.command)",message="image, state, and command are immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.image) && size(self.image) > 0) != (has(self.state) && size(self.state) > 0)",message="set exactly one of image and state"
+// +kubebuilder:validation:XValidation:rule="(has(self.image) && size(self.image) > 0) == (has(oldSelf.image) && size(oldSelf.image) > 0) && has(self.command) == has(oldSelf.command)",message="image, state, and command are immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env == oldSelf.env)",message="env is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.workingDir) == has(oldSelf.workingDir)) && (!has(self.workingDir) || self.workingDir == oldSelf.workingDir)",message="workingDir is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user == oldSelf.user)",message="user is immutable"

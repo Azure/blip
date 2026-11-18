@@ -425,10 +425,11 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: set exactly one of image and state
-              rule: has(self.image) != has(self.state)
+              rule: (has(self.image) && size(self.image) > 0) != (has(self.state)
+                && size(self.state) > 0)
             - message: image, state, and command are immutable
-              rule: has(self.image) == has(oldSelf.image) && has(self.command) ==
-                has(oldSelf.command)
+              rule: (has(self.image) && size(self.image) > 0) == (has(oldSelf.image)
+                && size(oldSelf.image) > 0) && has(self.command) == has(oldSelf.command)
             - message: env is immutable
               rule: (has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env
                 == oldSelf.env)
