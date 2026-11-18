@@ -101,20 +101,31 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 		return err
 	}
 	var want, demoting bool
+	var oldAttachment string
 	s, err := a.updateState(ctx, root, func(s *v1alpha1.BlipState) error {
 		want, demoting = false, false
+		oldAttachment = ""
 		m := findSpecMount(s.Spec.Mounts, state)
 		if m != nil {
 			if m.Path != mountPath {
 				return fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", state, root, m.Path)
 			}
 			want = m.Writable
+			// Adoption of a collect mount must finish its pending reattach.
+			if u := mountUsers(s)[state]; m.BlipUID != "" && u.BlipUID == m.BlipUID && u.Path == m.Path {
+				oldAttachment = u.PreviousAttachment
+			}
 		} else {
 			for _, other := range s.Spec.Mounts {
 				if other.Path == mountPath {
 					return fmt.Errorf("root state %q already has state %q mounted at %s", root, other.State, mountPath)
 				}
 			}
+			writer, err := a.rootWriter(ctx, s)
+			if err != nil {
+				return err
+			}
+			oldAttachment = mountedAttachment(writer, state)
 			s.Spec.Mounts = append(s.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath})
 			m = &s.Spec.Mounts[len(s.Spec.Mounts)-1]
 		}
@@ -146,15 +157,28 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 	if demoting && source.Status.Committed != nil {
 		generation = source.Status.Committed.Generation
 	}
-	if err := a.waitMount(ctx, b, state, mountPath, want, generation); err != nil {
+	if err := a.waitMount(ctx, b, state, mountPath, want, generation, oldAttachment); err != nil {
 		return err
 	}
 	fmt.Fprintf(a.env.Out, "state %s mounted on blip %s at %s (%s)\n", a.short(state), a.short(b.Name), mountPath, modeName(want))
 	return nil
 }
 
+// mountedAttachment captures the attachment before re-adding desired intent.
+// The old Mounted status may outlive the filesystem it describes.
+func mountedAttachment(b *v1alpha1.Blip, state string) string {
+	if b != nil {
+		if m := findMount(b.Status.Mounts, state); m != nil && m.Phase == v1alpha1.MountMounted {
+			return m.AttachmentID
+		}
+	}
+	return ""
+}
+
 // waitMount observes the runtime attachment without editing desired intent.
-func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mountPath string, want bool, baseGeneration int64) error {
+// oldAttachment identifies a previous mount that was still Mounted when the
+// desired mount was re-added, and must not be accepted as the new attachment.
+func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mountPath string, want bool, baseGeneration int64, oldAttachment string) error {
 	r := &reporter{a: a}
 	defer r.stop()
 	start := time.Now()
@@ -187,6 +211,12 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			return false, fmt.Errorf("mount of state %q on blip %q failed: %s; desired mount remains applied", state, b.Name, m.Message)
 		}
 		if m.Phase == v1alpha1.MountMounted && !m.Switching && m.Writable == want {
+			// Read-only mounts get a fresh ID; writable mounts can reuse their
+			// writer attachment. Wait until the stale read-only attach is gone.
+			if !want && oldAttachment != "" && m.AttachmentID == oldAttachment {
+				r.say("waiting for %s to finish detaching on %s...", state, b.Name)
+				return false, nil
+			}
 			if baseGeneration > 0 {
 				s, err := a.getState(ctx, state)
 				if err != nil {

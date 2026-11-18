@@ -743,7 +743,9 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Res
 		}
 	}
 	if pod != nil && pod.Annotations[AnnotationObserved] == "" && b.Status.StartTime != nil &&
-		!stopping(b) && r.now().Sub(b.Status.StartTime.Time) > startTimeout {
+		r.now().Sub(b.Status.StartTime.Time) > startTimeout {
+		// A VM that never reported an observation has no state to save, so
+		// stopping or deleting it must not wait for one either.
 		r.finish(b, v1.BlipFailed, ReasonStartTimeout, "timed out starting sandbox: the VM never reported its state")
 		return reconcile.Result{}, nil
 	}

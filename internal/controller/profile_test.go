@@ -675,6 +675,10 @@ func TestRootEditDuringWriterPublication(t *testing.T) {
 					t.Fatalf("published attachment lost its reservation: mount=%+v writer=%+v", m, w)
 				}
 				expectPhase(t, b, v1.BlipRunning, "")
+				// If the node attached before seeing the newer root intent,
+				// removal must use the normal detach/save path. A mount the
+				// node never attached is covered by the never-attached tests.
+				e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{{ID: assigned, Phase: podapi.DiskMounted}}})
 				e.run(e.blip, ns, "dev")
 				if m := mountOf(e.getBlip("dev"), "z-data"); m == nil || m.Phase != v1.MountUnmounting {
 					t.Fatalf("root edit did not safely detach published mount: %+v", m)

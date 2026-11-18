@@ -50,21 +50,6 @@ func loadCluster(ctx context.Context, c client.Reader, now time.Time) (*cluster,
 	return cl, nil
 }
 
-// drainingNodes returns the names of nodes that new VMs must avoid.
-func drainingNodes(ctx context.Context, c client.Reader) (map[string]bool, error) {
-	var bns v1.BlipNodeList
-	if err := c.List(ctx, &bns); err != nil {
-		return nil, err
-	}
-	out := map[string]bool{}
-	for _, bn := range bns.Items {
-		if bn.Spec.Drain {
-			out[bn.Name] = true
-		}
-	}
-	return out, nil
-}
-
 func heartbeatAge(bn *v1.BlipNode, now time.Time) time.Duration {
 	if bn.Status.Heartbeat == nil {
 		return time.Duration(1<<63 - 1)

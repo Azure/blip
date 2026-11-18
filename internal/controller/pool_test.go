@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -129,6 +130,112 @@ func TestPoolAvoidsDrainingNodes(t *testing.T) {
 	req := aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchFields[0]
 	if req.Operator != corev1.NodeSelectorOpNotIn || len(req.Values) != 1 || req.Values[0] != "n2" {
 		t.Errorf("affinity %+v", req)
+	}
+}
+
+// TestPoolRetiresCapacityOnStaleNodes reproduces the stale-node capacity bug:
+// a warm pod on a node whose agent stopped heartbeating is not claimable by
+// any Blip, but the pool counted it, booted no replacement, and reported it as
+// Ready/Vacant. The replacement must avoid the dead node and serve demand.
+func TestPoolRetiresCapacityOnStaleNodes(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.newPool("default", 2, 0)
+	e.run(e.pool, ns, "default")
+	e.warmOn("n1", "n2")
+
+	// n2's agent dies: its heartbeat goes stale while its warm pod remains.
+	e.now = e.now.Add(5 * time.Minute)
+	e.heartbeat("n2")
+
+	e.pendingBlip("b1", e.withImage("reg/img:v1"))
+	e.pendingBlip("b2", e.withImage("reg/img:v1"))
+	e.run(e.pool, ns, "default")
+
+	status := e.getPool("default").Status
+	if status.Ready != 1 || status.Claimed != 0 {
+		t.Fatalf("pool status counts the stale node's capacity: %+v", status)
+	}
+	if live := int32(len(e.pods())); status.Vacant != live {
+		t.Errorf("pool status vacant %d, want %d live pods", status.Vacant, live)
+	}
+	replacements := 0
+	for _, p := range e.pods() {
+		if p.Spec.NodeName == "n2" || p.Annotations[AnnotationPinnedNode] == "n2" {
+			t.Fatalf("pod %s still targets stale node n2", p.Name)
+		}
+		if p.Spec.NodeName != "" {
+			continue
+		}
+		replacements++
+		aff := p.Spec.Affinity
+		if aff == nil || aff.NodeAffinity == nil || aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+			t.Fatalf("replacement %s has no node affinity: %+v", p.Name, aff)
+		}
+		req := aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchFields[0]
+		if req.Operator != corev1.NodeSelectorOpNotIn || !slices.Contains(req.Values, "n2") {
+			t.Errorf("replacement %s may be scheduled on stale n2: %+v", p.Name, req)
+		}
+	}
+	if replacements == 0 {
+		t.Fatal("no replacement for the warm pod on the stale node")
+	}
+
+	// b1 claims the healthy warm VM; b2 needs one of the replacements.
+	e.run(e.blip, ns, "b1")
+	if b := e.getBlip("b1"); b.Status.Phase != v1.BlipRunning || b.Status.Node != "n1" {
+		t.Fatalf("b1: phase=%s node=%q msg=%s", b.Status.Phase, b.Status.Node, b.Status.Message)
+	}
+	// Play the scheduler: the only healthy node schedules the replacements.
+	e.warmOn("n1", "n1", "n1")
+	e.run(e.blip, ns, "b2")
+	b2 := e.getBlip("b2")
+	if b2.Status.Phase != v1.BlipRunning || b2.Status.Node != "n1" {
+		t.Fatalf("b2: phase=%s node=%q msg=%s", b2.Status.Phase, b2.Status.Node, b2.Status.Message)
+	}
+}
+
+// TestAuditPoolChurnAtWarmZero reproduces the shrink+relocate interaction: a
+// warmCount=0 pool deletes its spares, then relocation acted on the same
+// stale vacancy entries and booted fresh spares on the hot node. Pods deleted
+// in this pass must not be relocated, and relocation must respect maxCount.
+func TestAuditPoolChurnAtWarmZero(t *testing.T) {
+	for _, maxCount := range []int32{0, 2} {
+		t.Run(fmt.Sprintf("maxCount=%d", maxCount), func(t *testing.T) {
+			e := newEnv(t)
+			e.addNodes("n1", "n2")
+			e.newPool("default", 0, maxCount)
+			pool := e.getPool("default")
+
+			claimed := e.pool.podFor(pool, "default-claimed")
+			claimed.Spec.NodeName = "n1"
+			claimed.Status.Phase = corev1.PodRunning
+			claimed.Labels[LabelBlipUID] = "uid-claimed"
+			spare := e.pool.podFor(pool, "default-spare1")
+			spare.Spec.NodeName = "n2"
+			spare.Status.Phase = corev1.PodRunning
+			spare.Labels[LabelWarm] = "true"
+			spare2 := spare.DeepCopy()
+			spare2.Name = "default-spare2"
+			e.create(claimed, spare, spare2)
+
+			for pass := range 3 {
+				e.run(e.pool, ns, "default")
+				live := 0
+				for _, p := range e.pods() {
+					if p.DeletionTimestamp != nil {
+						continue
+					}
+					live++
+					if isVacant(&p) {
+						t.Fatalf("pass %d: shrink+relocate re-created spare %s", pass, p.Name)
+					}
+				}
+				if maxCount > 0 && live > int(maxCount) {
+					t.Fatalf("pass %d: %d live pods exceed maxCount %d", pass, live, maxCount)
+				}
+			}
+		})
 	}
 }
 

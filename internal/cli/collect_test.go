@@ -288,6 +288,57 @@ func TestCopyPathRejectsOverlap(t *testing.T) {
 	})
 }
 
+func TestCopyTreePreservesExistingDestination(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcTime := time.Date(2019, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := os.Chtimes(src, srcTime, srcTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// A destination the user already has keeps its mode and mtime.
+	dst := filepath.Join(base, "existing")
+	if err := os.Mkdir(dst, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dstTime := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(dst, dstTime, dstTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyPath(context.Background(), src, dst); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("existing destination mode = %o, want 700", info.Mode().Perm())
+	}
+	if !info.ModTime().Equal(dstTime) {
+		t.Fatalf("existing destination mtime = %v, want %v", info.ModTime(), dstTime)
+	}
+
+	// A destination this call creates takes the source's mode and mtime.
+	created := filepath.Join(base, "created")
+	if err := copyPath(context.Background(), src, created); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("created destination mode = %o, want 755", info.Mode().Perm())
+	}
+	if !info.ModTime().Equal(srcTime) {
+		t.Fatalf("created destination mtime = %v, want %v", info.ModTime(), srcTime)
+	}
+}
+
 func TestCopyPathCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -585,6 +636,83 @@ func TestCollectConcurrentMountOwnership(t *testing.T) {
 	s, _ = a.getState(ctx, root.Name)
 	if len(s.Spec.Mounts) != 0 || len(mountUsers(s)) != 0 {
 		t.Fatalf("last collect did not release: %+v %+v", s.Spec.Mounts, mountUsers(s))
+	}
+}
+
+func TestCollectConcurrentWaitsForFreshAttachment(t *testing.T) {
+	a, root, b := collectFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b.Status.Mounts[0].AttachmentID = "old-attachment"
+	b.Status.Mounts[0].CommitID = "old-version"
+	if err := a.c.Kube.Status().Update(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan struct{}, 2)
+	a.env.Err = writerFunc(func(p []byte) (int, error) {
+		if strings.Contains(string(p), "finish detaching") {
+			waiting <- struct{}{}
+		}
+		return len(p), nil
+	})
+	type result struct {
+		cleanup func()
+		err     error
+	}
+	done := make(chan result, 2)
+	for range 2 {
+		go func() {
+			_, cleanup, err := a.collectMount(ctx, "data")
+			done <- result{cleanup, err}
+		}()
+		// Start the second collector after the first publishes the temporary
+		// mount. Reuse must inherit its pending-attachment requirement.
+		select {
+		case <-waiting:
+		case r := <-done:
+			t.Fatalf("collect returned before the old attachment was replaced: %v", r.err)
+		case <-ctx.Done():
+			t.Fatal("collect did not wait for a fresh attachment")
+		}
+	}
+	s, err := a.getState(ctx, root.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := mountUsers(s)["data"]; u.Users != 2 || u.PreviousAttachment != "old-attachment" {
+		t.Fatalf("shared attachment metadata: %+v", u)
+	}
+	b, err = a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := a.getState(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Status.Mounts[0].AttachmentID = "new-attachment"
+	b.Status.Mounts[0].CommitID = data.Status.Committed.ID
+	if err := a.c.Kube.Status().Update(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	var cleanups []func()
+	for range 2 {
+		select {
+		case r := <-done:
+			if r.err != nil {
+				t.Fatal(r.err)
+			}
+			cleanups = append(cleanups, r.cleanup)
+		case <-ctx.Done():
+			t.Fatal("collect did not accept the fresh attachment")
+		}
+	}
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+	s, err = a.getState(ctx, root.Name)
+	if err != nil || len(s.Spec.Mounts) != 0 || len(mountUsers(s)) != 0 {
+		t.Fatalf("temporary mount was not released: %+v %v", s, err)
 	}
 }
 

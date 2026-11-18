@@ -176,6 +176,18 @@ func (r *EnrollReconciler) unenroll(ctx context.Context, node *corev1.Node, bn *
 		if err := patchObject(ctx, r.Client, bn, base); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
+		if bn.Status.SafeToRemove {
+			// That verdict belongs to an earlier drain. A VM may have started
+			// on the node since (for example after an undrain that
+			// NodeReconciler has not observed yet), so it says nothing about
+			// this drain. Start the new drain unsafe; the fresh check below
+			// proves it safe.
+			sbase := bn.DeepCopy()
+			bn.Status.SafeToRemove = false
+			if err := patchStatus(ctx, r.Client, bn, sbase); err != nil {
+				return reconcile.Result{}, client.IgnoreNotFound(err)
+			}
+		}
 	}
 	// Keep the agent scheduled while draining, but stop new VM pods from
 	// selecting this node by dropping the hypervisor labels now. A node that
@@ -183,7 +195,22 @@ func (r *EnrollReconciler) unenroll(ctx context.Context, node *corev1.Node, bn *
 	if err := r.patchLabels(ctx, node, keepEnrolled(node)); err != nil {
 		return reconcile.Result{}, err
 	}
-	if !bn.Status.SafeToRemove {
+	// Never trust the cached verdict alone: it may have been computed for an
+	// earlier drain, or before the pod delete that freed the last Blip was
+	// followed by the Blip finishing. Recompute from the live objects and
+	// persist the result so later retries and watchers agree.
+	safe, err := nodeSafeToRemove(ctx, r.Client, node.Name)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if bn.Status.SafeToRemove != safe {
+		base := bn.DeepCopy()
+		bn.Status.SafeToRemove = safe
+		if err := patchStatus(ctx, r.Client, bn, base); err != nil {
+			return reconcile.Result{}, client.IgnoreNotFound(err)
+		}
+	}
+	if !safe {
 		return reconcile.Result{RequeueAfter: enrollmentRetry}, nil
 	}
 	if err := r.patchLabels(ctx, node, nil); err != nil {

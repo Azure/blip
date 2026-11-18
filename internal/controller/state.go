@@ -190,9 +190,13 @@ func copySourcePredicate() predicate.Predicate {
 				return false
 			}
 			// deletionBlockers considers a copy blocking while it has no
-			// committed version and names a source it copied from.
+			// committed version, names a source it copied from, and can
+			// still use that source. A failed or deleting copy stops
+			// blocking, so wake the source on those transitions too.
 			return old.Spec.CopyFrom != cur.Spec.CopyFrom ||
 				(old.Status.Committed == nil) != (cur.Status.Committed == nil) ||
+				old.Status.Phase != cur.Status.Phase ||
+				(old.DeletionTimestamp == nil) != (cur.DeletionTimestamp == nil) ||
 				!equality.Semantic.DeepEqual(old.Status.CopiedFrom, cur.Status.CopiedFrom)
 		},
 		DeleteFunc:  func(event.DeleteEvent) bool { return true },
@@ -580,7 +584,8 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 			p.Replicas[i] = repl[0]
 		}
 	}
-	if st.Spec.Image != "" {
+	switch {
+	case st.Spec.Image != "":
 		// Every eligible node is already a replica of an image state, so a
 		// failed one has no stand-in: drop it. Generation 1 is built from
 		// the image on each node, so its source is not special.
@@ -593,6 +598,24 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 				return "no eligible node can build generation 1; replanning", nil
 			}
 			p.SourceNode = p.Replicas[0]
+		}
+	case p.Generation == 1:
+		// Generation 1 is built from empty (or the copy source) by the
+		// surviving source node, so a failed replica with no replacement
+		// only delays the build. Drop it and commit with the survivors;
+		// repair adds replicas back when a node is available again.
+		p.Replicas = slices.DeleteFunc(p.Replicas, func(n string) bool {
+			return n != p.SourceNode && cl.bad(n) && !cl.holds(st, n, p.CommitID)
+		})
+	default:
+		// A later generation exists only as the commit its source sealed,
+		// so it can commit with fewer replicas while a surviving node
+		// still holds it. Without a holder, pendingSource reports the
+		// lost save instead of committing data no node can provide.
+		if servingSource(st, cl, p) || usableHolder(st, cl, p, p.Replicas) != "" {
+			p.Replicas = slices.DeleteFunc(p.Replicas, func(n string) bool {
+				return n != p.SourceNode && cl.bad(n) && !cl.holds(st, n, p.CommitID)
+			})
 		}
 	}
 	var waiting, errs []string
@@ -685,7 +708,7 @@ func (r *StateReconciler) pendingSource(ctx context.Context, st *v1.BlipState, c
 	}
 	// A draining writer still serves its sealed disk to replacement replicas.
 	// Draining forbids new placements, not completing an existing save.
-	if bn := cl.nodes[p.SourceNode]; bn != nil && cl.k8s[p.SourceNode] != nil && healthy(bn, cl.now) && cl.holds(st, p.SourceNode, p.CommitID) {
+	if servingSource(st, cl, p) {
 		return false, "", nil
 	}
 	if n := usableHolder(st, cl, p, p.Replicas); n != "" {
@@ -710,6 +733,13 @@ func (r *StateReconciler) pendingSource(ctx context.Context, st *v1.BlipState, c
 	}
 	s.Pending = nil
 	return true, fmt.Sprintf("pending generation %d lost: no node holds %s", p.Generation, p.CommitID), nil
+}
+
+// A healthy draining source can still serve its sealed commit even though it
+// cannot take new placements. Replica loss must not strand that existing save.
+func servingSource(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
+	bn := cl.nodes[p.SourceNode]
+	return bn != nil && cl.k8s[p.SourceNode] != nil && healthy(bn, cl.now) && cl.holds(st, p.SourceNode, p.CommitID)
 }
 
 // usableHolder returns a usable replica that holds the pending commit.
@@ -1049,9 +1079,22 @@ func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState
 		return nil, err
 	}
 	for _, c := range copies.Items {
-		if c.Status.Committed == nil && c.Status.CopiedFrom != nil && c.Status.CopiedFrom.StateUID == string(st.UID) {
+		if copyBlocksDeletion(&c, st) {
 			out = append(out, "copy "+c.Name)
 		}
 	}
 	return out, nil
+}
+
+// copyBlocksDeletion reports whether a copy still needs the source state's
+// data. A copy can only use the source while it is making progress: one that
+// failed terminally (for example a size smaller than the source) will never
+// commit, and one that is being deleted is no longer built by the controller.
+// Neither may pin the source's finalizer forever.
+func copyBlocksDeletion(c, src *v1.BlipState) bool {
+	if c.DeletionTimestamp != nil || c.Status.Phase == v1.StateFailed {
+		return false
+	}
+	return c.Status.Committed == nil && c.Status.CopiedFrom != nil &&
+		c.Status.CopiedFrom.StateUID == string(src.UID)
 }

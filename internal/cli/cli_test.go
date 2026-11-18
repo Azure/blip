@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -212,6 +214,44 @@ func TestMountAddsSpecAndWaitsMounted(t *testing.T) {
 	code, _, errOut = h.run("", "mount", "repo", "agent-root", "--path", "/other")
 	if code != 1 || !strings.Contains(errOut, "already mounted") {
 		t.Fatal(errOut)
+	}
+}
+
+func TestMountWaitsForFreshAttachment(t *testing.T) {
+	h := newHarness(t, runningBlip("agent"), readyState("repo"))
+	// Keep the status where the test puts it: no controller progress.
+	h.ctrl.set(func(c *fakeController) { c.paused = true })
+	b := h.blip("agent")
+	b.Status.Mounts = []v1alpha1.MountStatus{{State: "repo", Path: "/work", Phase: v1alpha1.MountMounted, AttachmentID: "old"}}
+	if err := h.kube.Status().Update(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &app{env: h.env(strings.NewReader(""), io.Discard, io.Discard)}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.mountState(ctx, "repo", "agent-root", "/work", nil) }()
+
+	// The stale Mounted entry from the previous attach is not accepted.
+	select {
+	case err := <-done:
+		t.Fatalf("mountState returned while the old attachment was still current: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	b = h.blip("agent")
+	b.Status.Mounts = []v1alpha1.MountStatus{{State: "repo", Path: "/work", Phase: v1alpha1.MountMounted, AttachmentID: "new"}}
+	if err := h.kube.Status().Update(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("mountState failed after the fresh attachment: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("mountState did not return after the fresh attachment")
 	}
 }
 

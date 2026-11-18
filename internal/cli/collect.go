@@ -285,6 +285,7 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 	var mountPath string
 	var writable, shared bool
 	var token string
+	var oldAttachment string
 	_, err = a.updateState(ctx, root.Name, func(s *v1alpha1.BlipState) error {
 		if s.UID != root.UID {
 			return errors.New("the calling blip's root state was replaced")
@@ -298,18 +299,23 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 		}
 		users := mountUsers(s)
 		shared = false
+		oldAttachment = ""
 		if m := findSpecMount(s.Spec.Mounts, state); m != nil {
 			mountPath, writable = m.Path, m.Writable
 			if m.BlipUID != "" && m.BlipUID != string(b.UID) {
 				return fmt.Errorf("temporary mount of state %q belongs to an earlier execution; wait for cleanup", state)
 			}
-			if !writable {
+			u := users[state]
+			tracked := m.BlipUID != "" && u.BlipUID == m.BlipUID && u.Path == m.Path && u.Token != "" && u.Users > 0
+			if tracked {
+				oldAttachment = u.PreviousAttachment
+			}
+			if !writable && (oldAttachment == "" || mountedAttachment(writer, state) != oldAttachment) {
 				if err := a.checkMountCurrent(ctx, writer, state, mountPath); err != nil {
 					return err
 				}
 			}
-			u := users[state]
-			if m.BlipUID == "" || u.BlipUID != m.BlipUID || u.Path != m.Path || u.Token == "" || u.Users < 1 {
+			if !tracked {
 				// Durable user mounts, and temporary mounts whose bookkeeping
 				// was lost, are left in place until their owner's lifetime ends.
 				return errUnchanged
@@ -322,12 +328,13 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 				}
 			}
 			s.Spec.Mounts = append(s.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath, BlipUID: string(b.UID)})
-			users[state] = collectMountUse{BlipUID: string(b.UID), Path: mountPath, Token: rand.Text()}
+			users[state] = collectMountUse{BlipUID: string(b.UID), Path: mountPath, Token: rand.Text(), PreviousAttachment: mountedAttachment(writer, state)}
 		}
 		shared = true
 		u := users[state]
 		u.Users++
 		users[state], token = u, u.Token
+		oldAttachment = u.PreviousAttachment
 		return setMountUsers(s, users)
 	})
 	if err != nil && !errors.Is(err, errUnchanged) {
@@ -337,7 +344,7 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 	if shared {
 		cleanup = sync.OnceFunc(func() { a.releaseMount(context.WithoutCancel(ctx), root, state, token) })
 	}
-	if err := a.waitMount(ctx, b, state, mountPath, writable, 0); err != nil {
+	if err := a.waitMount(ctx, b, state, mountPath, writable, 0, oldAttachment); err != nil {
 		cleanup()
 		return "", nil, err
 	}
@@ -420,23 +427,110 @@ func (a *app) checkGitSource(ctx context.Context, mountPath, src, display, state
 	if !underDir(root, target) {
 		return fmt.Errorf("%s escapes state %s through a symlink (resolves to %s)", display, a.short(state), target)
 	}
-	top, err := gitRepoRoot(ctx, src)
-	if err != nil {
+	// Resolve the git directory even when git itself refuses to start, so a
+	// redirect is checked instead of skipped.
+	dir := gitDir(ctx, target, root)
+	if dir == "" {
 		return nil // git fetch will report the error
 	}
-	out, err := exec.CommandContext(ctx, "git", "-C", top,
-		"-c", "safe.directory=*", "rev-parse", "--absolute-git-dir").Output()
-	if err != nil {
-		return nil
-	}
-	dir, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	dir, err := resolvePath(dir)
 	if err != nil {
 		return nil
 	}
 	if !underDir(root, dir) {
 		return fmt.Errorf("%s uses a git directory outside state %s (resolves to %s)", display, a.short(state), dir)
 	}
+	return a.checkGitMetadata(root, dir, display, state)
+}
+
+// gitDir returns the git directory of the repository at src. Git is asked
+// first; if it cannot run (for example because a redirect leaves the mounted
+// state), the .git directory or file is followed by hand up to root.
+func gitDir(ctx context.Context, src, root string) string {
+	out, err := exec.CommandContext(ctx, "git", "-C", src,
+		"-c", "safe.directory=*", "rev-parse", "--absolute-git-dir").Output()
+	if err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	for dir := src; underDir(root, dir); dir = filepath.Dir(dir) {
+		dotgit := filepath.Join(dir, ".git")
+		info, err := os.Stat(dotgit)
+		if err == nil && info.IsDir() {
+			return dotgit
+		}
+		if err == nil && info.Mode().IsRegular() {
+			b, err := os.ReadFile(dotgit)
+			if err != nil {
+				return ""
+			}
+			line := firstLine(b)
+			if !strings.HasPrefix(line, "gitdir:") {
+				return ""
+			}
+			p := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(dir, p)
+			}
+			return p
+		}
+		if dir == root {
+			break
+		}
+	}
+	return ""
+}
+
+// checkGitMetadata rejects commondir and alternates files that let the state
+// make git read objects from outside its mount. Both may be relative, and
+// alternates lists one path per line.
+func (a *app) checkGitMetadata(root, gitDir, display, state string) error {
+	common := gitDir
+	if b, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+		entry := firstLine(b)
+		if entry != "" {
+			dir, err := resolveGitPath(gitDir, entry)
+			if err != nil {
+				return fmt.Errorf("cannot resolve the git common directory %q of %s: %w", entry, display, err)
+			}
+			if !underDir(root, dir) {
+				return fmt.Errorf("%s uses a git common directory outside state %s (resolves to %s)", display, a.short(state), dir)
+			}
+			common = dir
+		}
+	}
+	objects := filepath.Join(common, "objects")
+	b, err := os.ReadFile(filepath.Join(objects, "info", "alternates"))
+	if err != nil {
+		return nil
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		entry := strings.TrimSpace(line)
+		if entry == "" {
+			continue
+		}
+		dir, err := resolveGitPath(objects, entry)
+		if err != nil {
+			return fmt.Errorf("cannot resolve the git alternates entry %q of %s: %w", entry, display, err)
+		}
+		if !underDir(root, dir) {
+			return fmt.Errorf("%s uses git alternates outside state %s (%s resolves to %s)", display, a.short(state), entry, dir)
+		}
+	}
 	return nil
+}
+
+// resolveGitPath resolves a git metadata entry against base. It resolves
+// symlinks in the existing part of the path, like resolvePath.
+func resolveGitPath(base, entry string) (string, error) {
+	if !filepath.IsAbs(entry) {
+		entry = filepath.Join(base, entry)
+	}
+	return resolvePath(entry)
+}
+
+func firstLine(b []byte) string {
+	line, _, _ := strings.Cut(string(b), "\n")
+	return strings.TrimSpace(line)
 }
 
 // checkParentInsideMount rejects a file source whose parent directories leave
@@ -521,6 +615,9 @@ type collectMountUse struct {
 	Path    string `json:"path"`
 	Token   string `json:"token"`
 	Users   int    `json:"users"`
+	// Concurrent collectors must wait for the same fresh attachment when
+	// an old Mounted status remained after the previous mount was removed.
+	PreviousAttachment string `json:"previousAttachment,omitempty"`
 }
 
 func mountUsers(s *v1alpha1.BlipState) map[string]collectMountUse {
@@ -720,6 +817,7 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	created := false
 	if di, err := os.Lstat(dst); err == nil {
 		if !di.IsDir() {
 			return fmt.Errorf("cannot copy directory %s onto %s: not a directory", src, dst)
@@ -733,8 +831,12 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return err
 		}
-		if err := os.Mkdir(dst, 0o700); err != nil && !os.IsExist(err) {
-			return err
+		if err := os.Mkdir(dst, 0o700); err != nil {
+			if !os.IsExist(err) {
+				return err
+			}
+		} else {
+			created = true
 		}
 	}
 	entries, err := os.ReadDir(src)
@@ -760,6 +862,11 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 		if err := copyEntry(ctx, s, d, ei); err != nil {
 			return err
 		}
+	}
+	// An existing destination directory belongs to the caller: keep its
+	// mode and mtime. Only a directory created here takes the source's.
+	if !created {
+		return nil
 	}
 	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
 		return err

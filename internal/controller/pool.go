@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"iter"
 	"maps"
 	"slices"
 	"sort"
@@ -19,12 +20,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -106,6 +105,9 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return []reconcile.Request{req(o.GetNamespace(), poolName(o.(*v1.Blip)))}
 		})).
 		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.statePools)).
+		// A stale heartbeat is a status-only change, and an agent that dies
+		// sends no event at all; reconcile also requeues itself while a node
+		// it uses is still healthy (see nextHeartbeatCheck).
 		Watches(&v1.BlipNode{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
 			var pools v1.BlipPoolList
 			if err := r.List(ctx, &pools); err != nil {
@@ -116,7 +118,7 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				out = append(out, req(p.Namespace, p.Name))
 			}
 			return out
-		}), builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		})).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
 			if o.GetName() != VMOwnersConfigMap {
 				return nil
@@ -171,9 +173,30 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	if err := r.List(ctx, &blips, client.InNamespace(pool.Namespace), client.MatchingFields{indexPool: pool.Name}); err != nil {
 		return reconcile.Result{}, err
 	}
-	draining, err := drainingNodes(ctx, r)
+	// The pool places and counts VMs with the same node view as the Blip
+	// side. A vacant pod on a node that is draining, stale, gone, or no
+	// longer enrolled is not capacity: no Blip may claim it, so keeping it
+	// in have/total would block the replacement that demand needs.
+	cl, err := loadCluster(ctx, r.Client, r.now())
 	if err != nil {
 		return reconcile.Result{}, err
+	}
+	// Match the Blip side, which filters candidates with a nil selector:
+	// a node is usable for health/placement purposes when it is an
+	// enrolled, incarnated, healthy BlipNode that is not draining.
+	usable := func(node string) bool { return node == "" || cl.usable(node, nil) }
+	// avoid holds every enrolled node a new VM must not use. A generic
+	// replacement is otherwise free to land on the dead node it replaces.
+	avoid := map[string]bool{}
+	for name := range cl.nodes {
+		if !cl.usable(name, nil) {
+			avoid[name] = true
+		}
+	}
+	for name, k := range cl.k8s {
+		if k.Labels[LabelEnrolled] == "true" && !cl.usable(name, nil) {
+			avoid[name] = true
+		}
 	}
 
 	// claimed holds the Blips whose VM pod already exists, even if the Blip
@@ -205,14 +228,27 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			continue
 		}
 		demand++
-		if loc := b.Status.Locality; loc != nil && !loc.Fallback && loc.Node != "" && !draining[loc.Node] {
+		if loc := b.Status.Locality; loc != nil && !loc.Fallback && loc.Node != "" && usable(loc.Node) {
 			pinned[loc.Node]++
 		}
 	}
 
 	hash := templateHash(pool, r.RuntimeImage)
 	created, createdOn, deleted := r.expectations(rq.NamespacedName, pods.Items)
+	// del records pods deleted in this pass. The cached list still shows
+	// them (and the deletion expectation hides them only on the next
+	// reconcile), so later phases must not act on them again.
+	del := func(p *corev1.Pod) error {
+		if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			return err
+		}
+		deleted[p.Name] = true
+		return nil
+	}
 	total := len(pods.Items) + created
+	// used holds the nodes that host a pod of this pool; it bounds the
+	// self-requeue that notices an agent dying without an event.
+	used := map[string]bool{}
 	var vacant []*corev1.Pod
 	var status v1.BlipPoolStatus
 	// hot counts the nodes that run a claimed VM of this pool. Warm spares
@@ -222,18 +258,31 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	hot := map[string]int{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
+		node := podNode(p)
+		if node != "" {
+			used[node] = true
+		}
+		unusable := node != "" && !usable(node)
 		switch {
 		case !isVacant(p):
 			if !podTerminated(p) {
 				status.Claimed++
-				if p.DeletionTimestamp == nil && p.Spec.NodeName != "" && !draining[p.Spec.NodeName] {
+				if p.DeletionTimestamp == nil && p.Spec.NodeName != "" && usable(p.Spec.NodeName) {
 					hot[p.Spec.NodeName]++
 				}
 			}
 		case p.DeletionTimestamp != nil || deleted[p.Name]:
-		case podTerminated(p) || draining[podNode(p)] || p.Annotations[annotationTemplateHash] != hash:
-			if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			// Its replacement is already accounted for; do not let a pod
+			// leaving an unusable node hold maxCount capacity either.
+			if unusable {
+				total--
+			}
+		case podTerminated(p) || unusable || p.Annotations[annotationTemplateHash] != hash:
+			if err := del(p); err != nil {
 				return reconcile.Result{}, err
+			}
+			if unusable {
+				total--
 			}
 		default:
 			vacant = append(vacant, p)
@@ -270,7 +319,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	kept := vacant[:0]
 	for _, p := range vacant {
 		if !reserved[p.Name] && p.Annotations[AnnotationPinnedNode] != "" && unschedulable(p) {
-			if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
 			continue
@@ -292,7 +341,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			if !room() {
 				break
 			}
-			if err := r.createPod(ctx, pool, draining, node); err != nil {
+			if err := r.createPod(ctx, pool, avoid, node); err != nil {
 				return reconcile.Result{}, err
 			}
 			total++
@@ -328,7 +377,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 				break
 			}
 			node := pickWarmNode(hot, warm, blocked)
-			if err := r.createPod(ctx, pool, draining, node); err != nil {
+			if err := r.createPod(ctx, pool, avoid, node); err != nil {
 				return reconcile.Result{}, err
 			}
 			total++
@@ -347,7 +396,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			return spare[j].CreationTimestamp.Before(&spare[i].CreationTimestamp)
 		})
 		for _, p := range spare[:max(0, min(have-target, len(spare)))] {
-			if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
 			have--
@@ -374,14 +423,14 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		})
 		for _, p := range spare {
 			node := pickWarmNode(hot, warm, blocked)
-			if node == "" {
+			if node == "" || !room() {
 				break
 			}
-			if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
 			warm[podNode(p)]--
-			if err := r.createPod(ctx, pool, draining, node); err != nil {
+			if err := r.createPod(ctx, pool, avoid, node); err != nil {
 				return reconcile.Result{}, err
 			}
 			warm[node]++
@@ -401,7 +450,27 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		// is a safety net while a state is created or copied.
 		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
-	return reconcile.Result{}, nil
+	// A node whose agent dies stops heartbeating and therefore stops
+	// producing events. Wake up when one of the nodes this pool uses is due
+	// to cross heartbeatTimeout so its capacity is retired.
+	return reconcile.Result{RequeueAfter: nextHeartbeatCheck(cl, maps.Keys(used))}, nil
+}
+
+// nextHeartbeatCheck is how long until a healthy node used by the pool might
+// go stale; zero when no such node exists.
+func nextHeartbeatCheck(cl *cluster, names iter.Seq[string]) time.Duration {
+	var next time.Duration
+	for name := range names {
+		bn := cl.nodes[name]
+		if bn == nil || bn.Spec.Drain || bn.Status.Heartbeat == nil {
+			continue
+		}
+		d := heartbeatTimeout - heartbeatAge(bn, cl.now) + time.Second
+		if d > 0 && (next == 0 || d < next) {
+			next = d
+		}
+	}
+	return next
 }
 
 func ready(p *corev1.Pod) bool {
@@ -479,16 +548,16 @@ func (r *PoolReconciler) expect(m *map[types.NamespacedName]map[string]expectati
 }
 
 // createPod creates a VM pod. A pod for a node is pinned to it; others avoid
-// draining nodes.
-func (r *PoolReconciler) createPod(ctx context.Context, pool *v1.BlipPool, draining map[string]bool, node string) error {
+// nodes that cannot run one, including draining and unhealthy ones.
+func (r *PoolReconciler) createPod(ctx context.Context, pool *v1.BlipPool, avoid map[string]bool, node string) error {
 	pod := r.podFor(pool, pool.Name+"-"+utilrand.String(5))
 	var match *corev1.NodeSelectorRequirement
 	switch {
 	case node != "":
 		pod.Annotations[AnnotationPinnedNode] = node
 		match = &corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{node}}
-	case len(draining) > 0:
-		match = &corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpNotIn, Values: slices.Sorted(maps.Keys(draining))}
+	case len(avoid) > 0:
+		match = &corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpNotIn, Values: slices.Sorted(maps.Keys(avoid))}
 	}
 	if match != nil {
 		pod.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
