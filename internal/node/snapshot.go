@@ -94,9 +94,6 @@ func (a *Agent) snapshot(ctx context.Context) (*view, error) {
 	for _, s := range v.states {
 		a.loadConfig(v, s.Status.ImageDigest)
 	}
-	for _, b := range v.blips {
-		a.loadConfig(v, b.Status.ImageDigest)
-	}
 	a.confirmGone(ctx, v)
 	a.confirmBlipsGone(ctx, v)
 

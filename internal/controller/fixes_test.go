@@ -42,20 +42,20 @@ func TestRemovedFailedMountIsForgotten(t *testing.T) {
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
 	e.readyState("data", "n1")
-	e.startBlip("b", "n1", withImage("reg/img:v1"))
+	e.startBlip("b", "n1", e.withImage("reg/img:v1"))
 
-	e.updateBlip("b", func(b *v1.Blip) {
+	e.updateRoot("b", func(b *v1.BlipState) {
 		b.Spec.Mounts = []v1.Mount{{State: "data", Path: "data"}}
 	})
 	e.run(e.blip, ns, "b")
 	b := e.getBlip("b")
 	m := mountOf(b, "data")
-	if m == nil || m.Phase != v1.MountFailed || m.AttachmentID != "" || !strings.Contains(m.Message, "not absolute") {
+	if m != nil || !strings.Contains(b.Status.Message, "not absolute") {
 		t.Fatalf("failed attach %+v", m)
 	}
 
 	// Dropping the failed mount from the spec drops its status entry.
-	e.updateBlip("b", func(b *v1.Blip) { b.Spec.Mounts = nil })
+	e.updateRoot("b", func(b *v1.BlipState) { b.Spec.Mounts = nil })
 	e.run(e.blip, ns, "b")
 	b = e.getBlip("b")
 	expectPhase(t, b, v1.BlipRunning, "")
@@ -64,7 +64,7 @@ func TestRemovedFailedMountIsForgotten(t *testing.T) {
 	}
 
 	// The same state can be mounted at a different, valid path.
-	e.updateBlip("b", func(b *v1.Blip) {
+	e.updateRoot("b", func(b *v1.BlipState) {
 		b.Spec.Mounts = []v1.Mount{{State: "data", Path: "/data"}}
 	})
 	e.run(e.blip, ns, "b")
@@ -80,9 +80,9 @@ func TestRemovedMountSaveFailureStaysVisible(t *testing.T) {
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
 	e.readyState("data", "n1")
-	b := e.startBlip("b", "n1", withImage("reg/img:v1"))
+	b := e.startBlip("b", "n1", e.withImage("reg/img:v1"))
 
-	e.updateBlip("b", func(b *v1.Blip) {
+	e.updateRoot("b", func(b *v1.BlipState) {
 		b.Spec.Mounts = []v1.Mount{{State: "data", Path: "/data", Writable: true}}
 	})
 	e.run(e.blip, ns, "b")
@@ -100,7 +100,7 @@ func TestRemovedMountSaveFailureStaysVisible(t *testing.T) {
 	}
 
 	// Remove it: the mount is unmounted and then saved.
-	e.updateBlip("b", func(b *v1.Blip) { b.Spec.Mounts = nil })
+	e.updateRoot("b", func(b *v1.BlipState) { b.Spec.Mounts = nil })
 	e.run(e.blip, ns, "b")
 	if m = mountOf(e.getBlip("b"), "data"); m == nil || m.Phase != v1.MountUnmounting {
 		t.Fatalf("after removal %+v", m)
@@ -123,15 +123,15 @@ func TestRemovedMountSaveFailureStaysVisible(t *testing.T) {
 	}
 }
 
-// TestStopSaveErrorNotLostWhileOtherMountSaving covers B's early-return case:
-// a failed root seal fails the Blip even while another mount is still Saving.
+// A failed root seal stays visible while every other attachment finishes its
+// save. Deletion must not discard a still-saving execution's mount records.
 func TestStopSaveErrorNotLostWhileOtherMountSaving(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
 	e.readyState("home", "n1")
 	e.readyState("data", "n1")
-	b := e.startBlip("b", "n1", withRoot("home"), withMount("data", "/data", true))
+	b := e.startBlip("b", "n1", withRoot("home"), e.withMount("data", "/data", true))
 
 	e.updateBlip("b", func(b *v1.Blip) { b.Spec.Stop = true })
 	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{}})
@@ -144,6 +144,12 @@ func TestStopSaveErrorNotLostWhileOtherMountSaving(t *testing.T) {
 	if w := e.getState("data").Status.Writer; w == nil {
 		t.Fatal("mount writer cleared before the test seal")
 	}
+	e.run(e.blip, ns, "b")
+	expectPhase(t, e.getBlip("b"), v1.BlipSaving, ReasonSaveFailed)
+	if m := mountOf(e.getBlip("b"), "data"); m == nil || m.Phase != v1.MountSaving {
+		t.Fatalf("saving attachment lost: %+v", m)
+	}
+	e.saveWriter("data", newID())
 	e.run(e.blip, ns, "b")
 	expectPhase(t, e.getBlip("b"), v1.BlipFailed, ReasonSaveFailed)
 }
@@ -196,19 +202,19 @@ func (e *env) updateBlipStatus(name string, mutate func(*v1.Blip)) {
 	e.must(e.c.Status().Update(e.ctx, b))
 }
 
-// TestUnpublishedWriterReleased covers D: a writer persisted with its pod but
-// never named by Blip status guards no disk and is released.
+// A live owner's serialized reconcile releases unused reservations. The state
+// controller cannot distinguish these from acquire-to-publish work in flight.
 func TestUnpublishedWriterReleased(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
 	e.readyState("data", "n1")
-	b := e.startBlip("b", "n1", withImage("reg/img:v1"))
+	b := e.startBlip("b", "n1", e.withImage("reg/img:v1"))
 
-	e.updateBlip("b", func(b *v1.Blip) {
+	e.updateRoot("b", func(b *v1.BlipState) {
 		b.Spec.Mounts = []v1.Mount{{State: "data", Path: "/data", Writable: true}}
 	})
-	e.updateBlip("b", func(b *v1.Blip) { b.Spec.Mounts = nil })
+	e.updateRoot("b", func(b *v1.BlipState) { b.Spec.Mounts = nil })
 
 	st := e.getState("data")
 	base := st.DeepCopy()
@@ -225,13 +231,13 @@ func TestUnpublishedWriterReleased(t *testing.T) {
 
 	e.run(e.state, ns, "data")
 	st = e.getState("data")
+	if st.Status.Writer == nil {
+		t.Fatal("state controller released a possibly publishing writer")
+	}
+	e.run(e.blip, ns, "b")
+	st = e.getState("data")
 	if st.Status.Writer != nil {
 		t.Fatalf("unpublished writer kept: %+v", st.Status.Writer)
-	}
-	if !slices.ContainsFunc(st.Status.Seals, func(sr v1.SealResult) bool {
-		return sr.AttachmentID == "4444444444444444" && sr.Error != ""
-	}) {
-		t.Fatalf("released writer has no failure seal: %+v", st.Status.Seals)
 	}
 }
 
@@ -379,7 +385,7 @@ func TestWarmPodsSkipUnhealthyNodes(t *testing.T) {
 
 	e.now = e.now.Add(61 * time.Second)
 	e.heartbeat("n2")
-	e.newBlip("b", withImage("reg/img:v1"))
+	e.newBlip("b", e.withImage("reg/img:v1"))
 
 	pods := e.warmPods("b", nil)
 	if len(pods) != 1 || pods[0].Spec.NodeName != "n1" {
@@ -403,7 +409,7 @@ func TestStartingTimeouts(t *testing.T) {
 		e.observe(pod.Name, podapi.Observed{Phase: podapi.PhaseWarm})
 		e.annotatePod(pod.Name, AnnotationPrepareError, "disk resize failed")
 
-		e.newBlip("b", withImage("reg/img:v1"))
+		e.newBlip("b", e.withImage("reg/img:v1"))
 		res := e.run(e.blip, ns, "b")
 		if res.RequeueAfter <= 0 || res.RequeueAfter > startTimeout {
 			t.Errorf("start deadline requeue %v", res.RequeueAfter)
@@ -429,7 +435,7 @@ func TestStartingTimeouts(t *testing.T) {
 		e.run(e.pool, ns, "default")
 		e.warmOn("n1")
 		e.observe(e.pods()[0].Name, podapi.Observed{Phase: podapi.PhaseWarm})
-		e.newBlip("b", withImage("reg/img:v1"))
+		e.newBlip("b", e.withImage("reg/img:v1"))
 		res := e.run(e.blip, ns, "b")
 		if res.RequeueAfter <= 0 || res.RequeueAfter > startTimeout {
 			t.Errorf("start deadline requeue %v", res.RequeueAfter)
@@ -444,7 +450,7 @@ func TestStartingTimeouts(t *testing.T) {
 		e := newEnv(t)
 		e.addNodes("n1")
 		e.newPool("default", 0, 0)
-		e.newBlip("b", withImage("reg/img:v1"))
+		e.newBlip("b", e.withImage("reg/img:v1"))
 		res := e.run(e.blip, ns, "b")
 		if res.RequeueAfter <= 0 || res.RequeueAfter > pendingTimeout {
 			t.Errorf("pending deadline requeue %v", res.RequeueAfter)
@@ -461,7 +467,7 @@ func TestDrainStopsBlips(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
-	b := e.startBlip("b", "n1", withImage("reg/img:v1"))
+	b := e.startBlip("b", "n1", e.withImage("reg/img:v1"))
 
 	e.setDrain("n1")
 	e.run(e.node, "", "n1")
@@ -473,7 +479,15 @@ func TestDrainStopsBlips(t *testing.T) {
 	}
 	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{}})
 	e.run(e.blip, ns, "b")
+	expectPhase(t, e.getBlip("b"), v1.BlipSaving, "")
+	e.saveWriter(b.Spec.State, newID())
+	e.run(e.blip, ns, "b")
 	expectPhase(t, e.getBlip("b"), v1.BlipSucceeded, "")
+	if e.safeToRemove("n1") {
+		t.Fatal("node with the only durable root replica is safe to remove")
+	}
+	e.must(e.c.Delete(e.ctx, e.getState(b.Spec.State)))
+	e.run(e.state, ns, b.Spec.State)
 	if !e.safeToRemove("n1") {
 		t.Fatal("drained node with no blip or state left is not safe to remove")
 	}

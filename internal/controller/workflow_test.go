@@ -17,11 +17,11 @@ func TestGitWorkflow(t *testing.T) {
 	e.readyState("repo", "n1", "n2")
 	gen1 := e.getState("repo").Status.Committed.ID
 
-	git := e.startBlip("git", "n1", withImage("reg/img:v1"))
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"))
 	pod := git.Status.Pod
 
 	// Mount writable while running.
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts = []v1.Mount{{State: "repo", Path: "/src", Writable: true}} })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts = []v1.Mount{{State: "repo", Path: "/src", Writable: true}} })
 	e.run(e.blip, ns, "git")
 	git = e.getBlip("git")
 	m := mountOf(git, "repo")
@@ -36,7 +36,7 @@ func TestGitWorkflow(t *testing.T) {
 	}
 
 	// Unmount: Unmounting -> Saving (after Detached) -> removed once committed.
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts = nil })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts = nil })
 	e.run(e.blip, ns, "git")
 	if m = mountOf(e.getBlip("git"), "repo"); m == nil || m.Phase != v1.MountUnmounting {
 		t.Fatalf("after unmount request %+v", m)
@@ -90,18 +90,19 @@ func TestGitWorkflow(t *testing.T) {
 		t.Fatalf("copy not ready %+v", w1.Status)
 	}
 
-	worker := e.startBlip("worker", "n2", withImage("reg/img:v1"), withCommand("make", "test"), withMount("w1", "/work", true))
+	worker := e.startBlip("worker", "n2", e.withImage("reg/img:v1"), withCommand("make", "test"), e.withMount("w1", "/work", true))
 	e.observe(worker.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Code: 0}})
 	e.run(e.blip, ns, "worker")
 	if m := mountOf(e.getBlip("worker"), "w1"); m == nil || m.Phase != v1.MountSaving {
 		t.Fatalf("worker mount %+v", m)
 	}
 	e.saveWriter("w1", "b2b2b2b2b2b2b2b2")
+	e.saveWriter(worker.Spec.State, newID())
 	e.run(e.blip, ns, "worker")
 	expectPhase(t, e.getBlip("worker"), v1.BlipSucceeded, "")
 
 	// Mount the results read-only in the running sandbox.
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts = []v1.Mount{{State: "w1", Path: "/results"}} })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts = []v1.Mount{{State: "w1", Path: "/results"}} })
 	e.run(e.blip, ns, "git")
 	if m := mountOf(e.getBlip("git"), "w1"); m == nil || m.Writable || m.CommitID != "b2b2b2b2b2b2b2b2" || m.Phase != v1.MountPending {
 		t.Fatalf("results mount %+v", m)
@@ -110,14 +111,14 @@ func TestGitWorkflow(t *testing.T) {
 		t.Fatalf("read-only mount took writer %+v", w)
 	}
 
-	// Invalid mounts added while running fail individually.
-	e.updateBlip("git", func(b *v1.Blip) {
+	// Invalid edits preserve the existing topology and report an error.
+	e.updateRoot("git", func(b *v1.BlipState) {
 		b.Spec.Mounts = append(b.Spec.Mounts, v1.Mount{State: "repo", Path: "/results/x", Writable: true})
 	})
 	e.run(e.blip, ns, "git")
 	git = e.getBlip("git")
 	expectPhase(t, git, v1.BlipRunning, "")
-	if m := mountOf(git, "repo"); m == nil || m.Phase != v1.MountFailed || !strings.Contains(m.Message, "overlaps") {
+	if m := mountOf(git, "repo"); m != nil || !strings.Contains(git.Status.Message, "overlaps") {
 		t.Fatalf("overlapping mount %+v", m)
 	}
 	if w := e.getState("repo").Status.Writer; w != nil {

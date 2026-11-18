@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -85,9 +84,7 @@ func (r *BlipReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1.Blip{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.podBlips)).
-		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
-			return r.blipsBy(ctx, o.GetNamespace(), indexStates, o.GetName(), false)
-		})).
+		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.stateBlips)).
 		Watches(&v1.BlipPool{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
 			return r.blipsBy(ctx, o.GetNamespace(), indexPool, o.GetName(), true)
 		})).
@@ -129,10 +126,34 @@ func (r *BlipReconciler) blipsBy(ctx context.Context, ns, field, value string, w
 	return out
 }
 
+// A child can become usable before its root's Blip publishes any attachment.
+// Follow exactly one profile edge: auxiliary states do not expand recursively.
+func (r *BlipReconciler) stateBlips(ctx context.Context, o client.Object) []reconcile.Request {
+	out := r.blipsBy(ctx, o.GetNamespace(), indexStates, o.GetName(), false)
+	var roots v1.BlipStateList
+	if err := r.List(ctx, &roots, client.InNamespace(o.GetNamespace()), client.MatchingFields{indexMounts: o.GetName()}); err != nil {
+		return out
+	}
+	for _, root := range roots.Items {
+		for _, rq := range r.blipsBy(ctx, root.Namespace, indexStates, root.Name, false) {
+			// indexStates also includes status mounts. Only root users inherit
+			// this profile's desired mounts.
+			b := &v1.Blip{}
+			if r.Get(ctx, rq.NamespacedName, b) == nil && b.Spec.State == root.Name && !slices.Contains(out, rq) {
+				out = append(out, rq)
+			}
+		}
+	}
+	return out
+}
+
 func (r *BlipReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (reconcile.Result, error) {
 	b := &v1.Blip{}
 	if err := r.Get(ctx, rq.NamespacedName, b); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
+	}
+	if err := r.releaseUnpublished(ctx, b); err != nil {
+		return reconcile.Result{}, err
 	}
 	if finished(b) {
 		return reconcile.Result{}, r.cleanup(ctx, b)
@@ -262,11 +283,11 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		r.finish(b, phase, ReasonStopped, "stopped before start")
 		return reconcile.Result{}, nil
 	}
-	if msg := validateSpec(b); msg != "" {
+	if b.Spec.State == "" {
 		if err := r.unclaim(ctx, b); err != nil {
 			return reconcile.Result{}, err
 		}
-		r.finish(b, v1.BlipFailed, ReasonInvalidSpec, msg)
+		r.finish(b, v1.BlipFailed, ReasonInvalidSpec, "state is required")
 		return reconcile.Result{}, nil
 	}
 	if since := b.CreationTimestamp.Time; !since.IsZero() && r.now().Sub(since) > pendingTimeout {
@@ -281,33 +302,33 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		}
 		return reconcile.Result{}, err
 	}
-	if b.Spec.Image != "" && b.Status.ImageDigest == "" {
-		secrets := slices.Clone(b.Spec.ImagePullSecrets)
-		secrets = append(secrets, pool.Spec.ImagePullSecrets...)
-		d, err := digestImage(ctx, r.Registry, b.Spec.Image, b.Namespace, secrets)
-		if errors.Is(err, ErrImageNotFound) {
-			r.finish(b, v1.BlipFailed, ReasonImageNotFound, err.Error())
-			return reconcile.Result{}, nil
+	_, mounts, reason, msg, err := r.rootIntent(ctx, b)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if reason != "" {
+		if err := r.unclaim(ctx, b); err != nil {
+			return reconcile.Result{}, err
 		}
-		if errors.Is(err, ErrInvalidImage) {
-			r.finish(b, v1.BlipFailed, ReasonInvalidSpec, err.Error())
-			return reconcile.Result{}, nil
+		if reason == ReasonInvalidSpec || reason == reasonStateDeleting {
+			if reason == reasonStateDeleting {
+				reason = ReasonStateNotFound
+			}
+			r.finish(b, v1.BlipFailed, reason, msg)
+		} else {
+			wait(b, reason, msg)
 		}
-		if err != nil {
-			wait(b, ReasonImageResolve, fmt.Sprintf("resolve image %s: %v", b.Spec.Image, err))
-			return reconcile.Result{RequeueAfter: retryAfter}, nil
-		}
-		b.Status.ImageDigest = d
+		return reconcile.Result{RequeueAfter: retryAfter}, nil
 	}
 
 	states := map[string]*v1.BlipState{}
 	all := map[string]*v1.BlipState{}
 	names := []string{b.Spec.State}
-	for _, m := range b.Spec.Mounts {
+	for _, m := range mounts {
 		names = append(names, m.State)
 	}
 	var waitReason, waitMsg string
-	for _, n := range names {
+	for i, n := range names {
 		if n == "" {
 			continue
 		}
@@ -333,6 +354,14 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		}
 		if st != nil {
 			all[n] = st
+			writable := i == 0 || mounts[i-1].Writable
+			if msg := mountStateError(b, st, writable); msg != "" {
+				if err := r.unclaim(ctx, b); err != nil {
+					return reconcile.Result{}, err
+				}
+				r.finish(b, v1.BlipFailed, ReasonInvalidSpec, msg)
+				return reconcile.Result{}, nil
+			}
 		}
 		if reason != "" {
 			if waitReason == "" {
@@ -384,7 +413,7 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	if b.Spec.State != "" {
 		writable = append(writable, b.Spec.State)
 	}
-	for _, m := range b.Spec.Mounts {
+	for _, m := range mounts {
 		if m.Writable {
 			writable = append(writable, m.State)
 		}
@@ -401,16 +430,12 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		return reconcile.Result{}, r.unclaim(ctx, b)
 	}
 
-	if b.Spec.State != "" {
-		b.Status.RootAttachmentID = ids[b.Spec.State]
-	} else if b.Status.RootAttachmentID == "" {
-		b.Status.RootAttachmentID = newID()
+	b.Status.RootAttachmentID = ids[b.Spec.State]
+	var attached []v1.MountStatus
+	for _, m := range mounts {
+		attached = append(attached, r.newMount(b, m, states[m.State], ids[m.State]))
 	}
-	var mounts []v1.MountStatus
-	for _, m := range b.Spec.Mounts {
-		mounts = append(mounts, r.newMount(b, m, states[m.State], ids[m.State]))
-	}
-	b.Status.Mounts = mounts
+	b.Status.Mounts = attached
 	wait(b, ReasonWaitingForVM, "claiming a VM")
 	// The node reads the attachments from status once it sees the claim.
 	if err := r.flush(ctx, b, base); err != nil {
@@ -501,6 +526,9 @@ func (r *BlipReconciler) preparePromote(ctx context.Context, b *v1.Blip, sm v1.M
 		return "", err
 	}
 	if reason != "" {
+		return msg, nil
+	}
+	if msg := mountStateError(b, st, true); msg != "" {
 		return msg, nil
 	}
 	if m.CommitID != st.Status.Committed.ID {
@@ -743,8 +771,24 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Res
 
 	fenced, after := r.fenced(b, pod, &obs)
 	if !fenced {
-		if err := r.syncMounts(ctx, b, pod, &obs); err != nil {
-			return reconcile.Result{}, err
+		if !stopping(b) {
+			root, mounts, reason, msg, err := r.rootIntent(ctx, b)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			if reason != "" {
+				b.Status.Reason, b.Status.Message = reason, msg
+				return reconcile.Result{RequeueAfter: retryAfter}, nil
+			}
+			b.Status.Reason = ""
+			if err := r.syncMounts(ctx, b, mounts, pod, &obs); err != nil {
+				return reconcile.Result{}, err
+			}
+			if mountsReconciled(b, mounts) {
+				b.Status.StateGeneration = root.Generation
+			} else if after == 0 || after > retryAfter {
+				after = retryAfter
+			}
 		}
 		return reconcile.Result{RequeueAfter: after}, nil
 	}
@@ -850,21 +894,22 @@ func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
 				if saveErr == "" {
 					saveErr = fmt.Sprintf("save of state %s failed: %s", m.State, msg)
 				}
-			case m.Phase == v1.MountSaving:
-				continue
 			}
 		}
 		mounts = append(mounts, m)
 	}
 	b.Status.Mounts = mounts
+	if outstanding {
+		if saveErr != "" {
+			b.Status.Reason, b.Status.Message = ReasonSaveFailed, saveErr
+		}
+		return nil
+	}
 	if saveErr != "" {
-		if b.Status.Message != "" {
+		if b.Status.Message != "" && b.Status.Reason != ReasonSaveFailed {
 			saveErr += "\n" + b.Status.Message
 		}
 		r.finish(b, v1.BlipFailed, ReasonSaveFailed, saveErr)
-		return nil
-	}
-	if outstanding {
 		return nil
 	}
 	code := b.Status.ExitCode

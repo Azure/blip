@@ -113,8 +113,8 @@ spec:
                 type: string
               imagePullSecrets:
                 description: |-
-                  ImagePullSecrets are merged into the image root of blips claimed
-                  through this pool. Image states use their own imagePullSecrets.
+                  ImagePullSecrets authenticate pulls of the pool's infrastructure pod
+                  images. Image states use their own imagePullSecrets.
                 items:
                   description: |-
                     LocalObjectReference contains enough information to let you locate the

@@ -124,19 +124,22 @@ func blipObj(name, owner string, mutate ...func(spec map[string]any)) map[string
 	if owner != "" {
 		meta["labels"] = map[string]any{LabelOwner: owner}
 	}
-	spec := map[string]any{"pool": "default"}
+	spec := map[string]any{"pool": "default", "state": name + ".root"}
 	for _, m := range mutate {
 		m(spec)
 	}
 	return map[string]any{"apiVersion": "blip.dev/v1alpha1", "kind": "Blip", "metadata": meta, "spec": spec}
 }
 
-func stateObj(name, owner, copyFrom string) map[string]any {
+func stateObj(name, owner, copyFrom string, mutate ...func(map[string]any)) map[string]any {
 	o := blipObj(name, owner)
 	o["kind"] = "BlipState"
 	o["spec"] = map[string]any{}
 	if copyFrom != "" {
 		o["spec"] = map[string]any{"copyFrom": copyFrom}
+	}
+	for _, m := range mutate {
+		m(o["spec"].(map[string]any))
 	}
 	return o
 }
@@ -191,10 +194,37 @@ func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map
 	return true, ""
 }
 
+func TestVMOwnerPolicyRetiredBase(t *testing.T) {
+	v := loadVMOwnerPolicy(t)
+	const owner = "u-0123456789abcdef0123456789abcdef"
+	params := map[string]string{"sa.vm": "default", "default-mine": owner, "bases": "base-dev"}
+	original := stateObj(owner+".root", owner, "base-dev")
+	req := policyRequest{user: vmUser("vm", "default-mine"), op: admission.Create, resource: "blipstates", name: owner + ".root", object: original}
+	if allow, msg := req.evaluate(t, v, params); !allow {
+		t.Fatalf("copy shared base: %s", msg)
+	}
+	delete(params, "bases")
+	if allow, _ := req.evaluate(t, v, params); allow {
+		t.Fatal("new copy allowed after base was retired")
+	}
+	// copyFrom is immutable provisioning history. Retiring the source must not
+	// prevent its independent copies from changing their durable configuration.
+	req.op = admission.Update
+	req.oldObject = original
+	req.object = stateObj(owner+".root", owner, "base-dev", func(spec map[string]any) {
+		spec["runtime"] = map[string]any{"workingDir": "/work"}
+		spec["mounts"] = []any{map[string]any{"state": owner + ".data", "path": "/work", "writable": true}}
+	})
+	if allow, msg := req.evaluate(t, v, params); !allow {
+		t.Fatalf("edit workspace after base retired: %s", msg)
+	}
+}
+
 func TestVMOwnerPolicy(t *testing.T) {
 	v := loadVMOwnerPolicy(t)
 	const o, x = "u-0123456789abcdef0123456789abcdef", "u-fedcba9876543210fedcba9876543210"
 	params := map[string]string{
+		"bases":         "base-dev base-tools",
 		"sa.vm":         "default gpu",
 		"sa.other":      "",
 		"default-mine":  o,
@@ -204,8 +234,8 @@ func TestVMOwnerPolicy(t *testing.T) {
 	mine, other, vacant, admin := vmUser("vm", "default-mine"), vmUser("vm", "default-other"), vmUser("vm", "default-vacant"), vmUser("vm", "default-admin")
 	podsOnly := vmUser("other", "default-mine")
 	withState := func(s string) func(map[string]any) { return func(spec map[string]any) { spec["state"] = s } }
-	withMount := func(s string) func(map[string]any) {
-		return func(spec map[string]any) { spec["mounts"] = []any{map[string]any{"state": s, "path": "/data"}} }
+	withMount := func(s string, writable bool) func(map[string]any) {
+		return func(spec map[string]any) { spec["mounts"] = []any{map[string]any{"state": s, "path": "/data", "writable": writable}} }
 	}
 	withPool := func(p string) func(map[string]any) { return func(spec map[string]any) { spec["pool"] = p } }
 	withSecret := func(spec map[string]any) { spec["imagePullSecrets"] = []any{map[string]any{"name": "creds"}} }
@@ -226,7 +256,7 @@ func TestVMOwnerPolicy(t *testing.T) {
 		{"vacant VM denied", policyRequest{user: vacant, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o)}, false, "not claimed"},
 		{"unrestricted owner", policyRequest{user: admin, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "", withState("b"))}, true, ""},
 		{"unrestricted owner exec", policyRequest{user: admin, op: admission.Connect, resource: "pods/exec", name: "default-other"}, true, ""},
-		{"own blip", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withState(o+".root"), withMount(o+".data"))}, true, ""},
+		{"own blip", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withState(o+".root"))}, true, ""},
 		{"own blip update", policyRequest{user: mine, op: admission.Update, resource: "blips", name: o + ".a", object: blipObj(o+".a", o), oldObject: blipObj(o+".a", o)}, true, ""},
 		{"own blip status", policyRequest{user: mine, op: admission.Update, resource: "blips/status", name: o + ".a", object: blipObj(o+".a", o), oldObject: blipObj(o+".a", o)}, false, "may not change status"},
 		{"own state status", policyRequest{user: mine, op: admission.Update, resource: "blipstates/status", name: o + ".s", object: stateObj(o+".s", o, ""), oldObject: stateObj(o+".s", o, "")}, false, "may not change status"},
@@ -237,7 +267,14 @@ func TestVMOwnerPolicy(t *testing.T) {
 		{"no prefix", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o, object: stateObj(o, o, "")}, false, "named"},
 		{"relabel other's", policyRequest{user: mine, op: admission.Update, resource: "blips", name: x + ".a", object: blipObj(x+".a", o), oldObject: blipObj(x+".a", x)}, false, "labelled"},
 		{"root is other's state", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withState(x+".root"))}, false, "use states"},
-		{"mount of other's state", policyRequest{user: mine, op: admission.Update, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withMount(x+".data")), oldObject: blipObj(o+".a", o)}, false, "use states"},
+		{"mount own state", policyRequest{user: mine, op: admission.Update, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, "", withMount(o+".data", true)), oldObject: stateObj(o+".s", o, "")}, true, ""},
+		{"mount of other's state", policyRequest{user: mine, op: admission.Update, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, "", withMount(x+".data", false)), oldObject: stateObj(o+".s", o, "")}, false, "may only mount"},
+		{"mount shared base read-only", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, "", withMount("base-tools", false))}, true, ""},
+		{"mount shared base writable", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, "", withMount("base-tools", true))}, false, "may only mount"},
+		{"copy shared base", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, "base-dev")}, true, ""},
+		{"copy base name prefix", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, "base")}, false, "copy states"},
+		{"copy unlisted base", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, "base-private")}, false, "copy states"},
+		{"use shared base as root", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withState("base-dev"))}, false, "use states"},
 		{"copy other's state", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, x+".root")}, false, "copy states"},
 		{"delete own", policyRequest{user: mine, op: admission.Delete, resource: "blipstates", name: o + ".s", oldObject: stateObj(o+".s", o, "")}, true, ""},
 		{"delete other's", policyRequest{user: mine, op: admission.Delete, resource: "blips", name: x + ".a", oldObject: blipObj(x+".a", x)}, false, "delete"},

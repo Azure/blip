@@ -176,6 +176,26 @@ func (a *app) full(name string) string {
 	return a.prefix + name
 }
 
+// resolveState prefers the caller's workspace, then a literal shared source.
+// Only NotFound triggers fallback: authorization and transport failures must
+// not silently select another source.
+func (a *app) resolveState(ctx context.Context, name string) (*v1alpha1.BlipState, error) {
+	c, err := a.clients()
+	if err != nil {
+		return nil, err
+	}
+	full := a.full(name)
+	st := &v1alpha1.BlipState{}
+	err = c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: full}, st)
+	if apierrors.IsNotFound(err) && full != name {
+		err = c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: name}, st)
+	}
+	if apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("state %q not found in namespace %s", name, c.Namespace)
+	}
+	return st, err
+}
+
 // short is how a scoped name is shown.
 func (a *app) short(name string) string {
 	return strings.TrimPrefix(name, a.prefix)
@@ -220,7 +240,7 @@ kubectl for everything else:
 	pf.StringVar(&a.flags.Context, "context", "", "kubeconfig context to use")
 	pf.StringVarP(&a.flags.Namespace, "namespace", "n", "", "namespace (default from kubeconfig)")
 	root.AddCommand(
-		a.createCommand(), a.runCommand(), a.collectCommand(), a.execCommand(), a.attachCommand(),
+		a.createCommand(), a.pullCommand(), a.runCommand(), a.collectCommand(), a.execCommand(), a.attachCommand(),
 		a.sessionsCommand(), a.mountCommand(), a.unmountCommand(), a.waitCommand(),
 	)
 	return root

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -98,11 +100,12 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 	if err != nil {
 		return err
 	}
+	root, err := a.getState(ctx, b.Spec.State)
+	if err != nil {
+		return err
+	}
 	for i := range ops {
-		state, rel := stateForPath(b, ops[i].source)
-		if state == "" {
-			return fmt.Errorf("%s is not on a state of blip %s (its root is an image)", ops[i].source, a.short(name))
-		}
+		state, rel := stateForPath(b, root, ops[i].source)
 		ops[i].state, ops[i].rel = state, rel
 	}
 
@@ -218,13 +221,25 @@ func collectSource(src, cwd string) (string, error) {
 	return src, nil
 }
 
-// stateForPath returns the state of b that holds dir and dir's path inside
-// it: the mount with the longest matching path, else the root state.
-func stateForPath(b *v1alpha1.Blip, dir string) (state, rel string) {
+// stateForPath uses the source root's mounts, preferring an actual attachment
+// when an edit has not reached the guest yet. The longest path wins.
+func stateForPath(b *v1alpha1.Blip, root *v1alpha1.BlipState, dir string) (state, rel string) {
 	best := -1
-	for _, m := range b.Spec.Mounts {
+	actualStates, actualPaths := map[string]bool{}, map[string]bool{}
+	consider := func(m v1alpha1.Mount) {
 		if (dir == m.Path || strings.HasPrefix(dir, m.Path+"/")) && len(m.Path) > best {
 			best, state, rel = len(m.Path), m.State, strings.TrimPrefix(dir, m.Path)
+		}
+	}
+	for _, m := range b.Status.Mounts {
+		if m.Phase == v1alpha1.MountMounted || m.Phase == v1alpha1.MountUnmounting || m.Phase == v1alpha1.MountSaving {
+			actualStates[m.State], actualPaths[m.Path] = true, true
+			consider(v1alpha1.Mount{State: m.State, Path: m.Path})
+		}
+	}
+	for _, m := range root.Spec.Mounts {
+		if !actualStates[m.State] && !actualPaths[m.Path] && (m.BlipUID == "" || m.BlipUID == string(b.UID)) {
+			consider(m)
 		}
 	}
 	if best < 0 {
@@ -243,8 +258,14 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 	if a.self == nil {
 		return "", nil, errors.New("collect only works inside a blip")
 	}
-	self := a.self.Name
-	b, err := a.getBlip(ctx, self)
+	b, err := a.getBlip(ctx, a.self.Name)
+	if err != nil {
+		return "", nil, err
+	}
+	if b.UID != a.self.UID || b.UID == "" {
+		return "", nil, errors.New("the calling blip was replaced")
+	}
+	root, err := a.getState(ctx, b.Spec.State)
 	if err != nil {
 		return "", nil, err
 	}
@@ -256,56 +277,79 @@ func (a *app) collectMount(ctx context.Context, state string) (string, func(), e
 	}
 	// A writable mount means this blip holds the writer; waiting for the
 	// state to become ready would never return. Its contents are current.
-	if existing := findSpecMount(b.Spec.Mounts, state); existing == nil || !existing.Writable {
+	if existing := findSpecMount(root.Spec.Mounts, state); existing == nil || !existing.Writable {
 		if err := a.waitStateReady(ctx, state); err != nil {
 			return "", nil, err
-		}
-		// Another collect may have mounted the state while we waited. A
-		// read-only mount pins its version, so do not reuse a stale one.
-		b, err = a.getBlip(ctx, self)
-		if err != nil {
-			return "", nil, err
-		}
-		if m := findSpecMount(b.Spec.Mounts, state); m != nil && !m.Writable {
-			if err := a.checkMountCurrent(ctx, b, state, m.Path); err != nil {
-				return "", nil, err
-			}
 		}
 	}
 	var mountPath string
 	var writable, shared bool
-	_, err = a.updateBlip(ctx, self, func(b *v1alpha1.Blip) error {
-		if finished(b) || b.DeletionTimestamp != nil || b.Spec.Stop {
-			return fmt.Errorf("blip %q is stopping or has finished", self)
+	var token string
+	_, err = a.updateState(ctx, root.Name, func(s *v1alpha1.BlipState) error {
+		if s.UID != root.UID {
+			return errors.New("the calling blip's root state was replaced")
 		}
-		users := mountUsers(b)
-		if m := findSpecMount(b.Spec.Mounts, state); m != nil {
+		writer, err := a.rootWriter(ctx, s)
+		if err != nil {
+			return err
+		}
+		if writer == nil || writer.UID != b.UID {
+			return fmt.Errorf("blip %q no longer owns root state %q", b.Name, root.Name)
+		}
+		users := mountUsers(s)
+		shared = false
+		if m := findSpecMount(s.Spec.Mounts, state); m != nil {
 			mountPath, writable = m.Path, m.Writable
-			if users[state] == 0 {
-				// Mounted by the caller: use it and leave it.
-				shared = false
+			if m.BlipUID != "" && m.BlipUID != string(b.UID) {
+				return fmt.Errorf("temporary mount of state %q belongs to an earlier execution; wait for cleanup", state)
+			}
+			if !writable {
+				if err := a.checkMountCurrent(ctx, writer, state, mountPath); err != nil {
+					return err
+				}
+			}
+			u := users[state]
+			if m.BlipUID == "" || u.BlipUID != m.BlipUID || u.Path != m.Path || u.Token == "" || u.Users < 1 {
+				// Durable user mounts, and temporary mounts whose bookkeeping
+				// was lost, are left in place until their owner's lifetime ends.
 				return errUnchanged
 			}
 		} else {
 			mountPath, writable = path.Join(collectMountRoot, state), false
-			b.Spec.Mounts = append(b.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath})
-			users[state] = 0
+			for _, m := range s.Spec.Mounts {
+				if m.Path == mountPath {
+					return fmt.Errorf("collect path %s is already used by state %q", mountPath, m.State)
+				}
+			}
+			s.Spec.Mounts = append(s.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath, BlipUID: string(b.UID)})
+			users[state] = collectMountUse{BlipUID: string(b.UID), Path: mountPath, Token: rand.Text()}
 		}
 		shared = true
-		users[state]++
-		return setMountUsers(b, users)
+		u := users[state]
+		u.Users++
+		users[state], token = u, u.Token
+		return setMountUsers(s, users)
 	})
 	if err != nil && !errors.Is(err, errUnchanged) {
 		return "", nil, err
 	}
 	cleanup := func() {}
 	if shared {
-		cleanup = func() { a.releaseMount(context.WithoutCancel(ctx), self, state, mountPath) }
+		cleanup = sync.OnceFunc(func() { a.releaseMount(context.WithoutCancel(ctx), root, state, token) })
 	}
-	mode := writable
-	if err := a.mountState(ctx, state, self, mountPath, &mode); err != nil {
+	if err := a.waitMount(ctx, b, state, mountPath, writable, 0); err != nil {
 		cleanup()
 		return "", nil, err
+	}
+	if !writable {
+		current, err := a.getBlip(ctx, b.Name)
+		if err == nil {
+			err = a.checkMountCurrent(ctx, current, state, mountPath)
+		}
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
 	}
 	return mountPath, cleanup, nil
 }
@@ -327,7 +371,9 @@ func (a *app) waitStateReady(ctx context.Context, name string) error {
 			}
 			switch s.Status.Phase {
 			case v1alpha1.StateReady:
-				return true, nil
+				if s.Status.Writer == nil && s.Status.Pending == nil {
+					return true, nil
+				}
 			case v1alpha1.StateFailed:
 				return false, fmt.Errorf("state %q failed: %s", name, s.Status.Message)
 			}
@@ -349,7 +395,7 @@ func (a *app) waitStateReady(ctx context.Context, name string) error {
 // version than the state's latest commit.
 func (a *app) checkMountCurrent(ctx context.Context, b *v1alpha1.Blip, state, mountPath string) error {
 	m := findMount(b.Status.Mounts, state)
-	if m == nil || m.Phase != v1alpha1.MountMounted {
+	if m == nil || m.Path != mountPath || m.Writable || m.Phase != v1alpha1.MountMounted {
 		return nil
 	}
 	s, err := a.getState(ctx, state)
@@ -465,62 +511,70 @@ func commonDir(a, b string) string {
 	return a
 }
 
-// collectMountsAnnotation counts, per state, the collect commands using a
-// mount they added to the blip they run in. The last one to finish removes
-// it. A blip mounts a state at most once, so concurrent collects share it.
+// collectMountsAnnotation lives on the caller's root state so refcounts and
+// mount edits are atomic. Lifetime and token provenance prevent stale cleanup
+// from removing a durable mount or a new use of the same path.
 const collectMountsAnnotation = "blip.dev/collect-mounts"
 
-func mountUsers(b *v1alpha1.Blip) map[string]int {
-	users := map[string]int{}
-	if v := b.Annotations[collectMountsAnnotation]; v != "" {
-		_ = json.Unmarshal([]byte(v), &users)
+type collectMountUse struct {
+	BlipUID string `json:"blipUID"`
+	Path    string `json:"path"`
+	Token   string `json:"token"`
+	Users   int    `json:"users"`
+}
+
+func mountUsers(s *v1alpha1.BlipState) map[string]collectMountUse {
+	users := map[string]collectMountUse{}
+	if v := s.Annotations[collectMountsAnnotation]; v != "" {
+		if err := json.Unmarshal([]byte(v), &users); err != nil || users == nil {
+			return map[string]collectMountUse{}
+		}
 	}
 	return users
 }
 
-func setMountUsers(b *v1alpha1.Blip, users map[string]int) error {
+func setMountUsers(s *v1alpha1.BlipState, users map[string]collectMountUse) error {
 	if len(users) == 0 {
-		delete(b.Annotations, collectMountsAnnotation)
+		delete(s.Annotations, collectMountsAnnotation)
 		return nil
 	}
 	v, err := json.Marshal(users)
 	if err != nil {
 		return err
 	}
-	if b.Annotations == nil {
-		b.Annotations = map[string]string{}
+	if s.Annotations == nil {
+		s.Annotations = map[string]string{}
 	}
-	b.Annotations[collectMountsAnnotation] = string(v)
+	s.Annotations[collectMountsAnnotation] = string(v)
 	return nil
 }
 
-// releaseMount drops this collect's use of the mount of state at mountPath
-// and removes the mount if no other collect uses it.
-func (a *app) releaseMount(ctx context.Context, self, state, mountPath string) {
+// releaseMount only releases the exact temporary mount this collect acquired.
+func (a *app) releaseMount(ctx context.Context, root *v1alpha1.BlipState, state, token string) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_, _ = a.updateBlip(ctx, self, func(b *v1alpha1.Blip) error {
-		users := mountUsers(b)
-		switch n := users[state]; {
-		case n > 1:
-			users[state] = n - 1
-			return setMountUsers(b, users)
-		case n == 1:
+	_, _ = a.updateState(ctx, root.Name, func(s *v1alpha1.BlipState) error {
+		users := mountUsers(s)
+		u := users[state]
+		m := findSpecMount(s.Spec.Mounts, state)
+		if s.UID != root.UID || u.Token != token || u.Users < 1 || m == nil ||
+			m.BlipUID == "" || m.BlipUID != u.BlipUID || m.Path != u.Path {
+			return errUnchanged
+		}
+		if u.Users > 1 {
+			u.Users--
+			users[state] = u
+		} else {
 			delete(users, state)
 			var keep []v1alpha1.Mount
-			for _, m := range b.Spec.Mounts {
-				if m.State != state || m.Path != mountPath {
+			for _, m := range s.Spec.Mounts {
+				if m.State != state {
 					keep = append(keep, m)
 				}
 			}
-			b.Spec.Mounts = keep
-			return setMountUsers(b, users)
-		default:
-			// The annotation was lost (or another collect already cleaned
-			// up). Removing the mount now could pull it from under a
-			// concurrent collect, so leave it until the blip exits.
-			return errUnchanged
+			s.Spec.Mounts = keep
 		}
+		return setMountUsers(s, users)
 	})
 }
 

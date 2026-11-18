@@ -1,12 +1,23 @@
 package v1alpha1
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	crdvalidation "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/validation"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	celvalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	openapivalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
+	kubejson "k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	celconfig "k8s.io/apiserver/pkg/apis/cel"
 	"sigs.k8s.io/yaml"
 )
 
@@ -113,23 +124,27 @@ func TestIdleTimeoutCRDPattern(t *testing.T) {
 	}
 }
 
-// TestBlipRootImageOrStateCRDRules guards the admission rules for
-// Blip.spec.image and Blip.spec.state. An explicitly empty image or state used
-// to count as "set", so image: "" or state: "" was admitted and only later
-// failed with InvalidSpec.
-func TestBlipRootImageOrStateCRDRules(t *testing.T) {
+// Every execution requires a durable root; workload images and mounts belong
+// to the state rather than the execution schema.
+func TestBlipRootRequired(t *testing.T) {
 	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blips.yaml")
-
-	const exactlyOne = "(has(self.image) && size(self.image) > 0) != (has(self.state) && size(self.state) > 0)"
-	if rule := ruleFor(t, spec.XValidations, "set exactly one of image and state"); rule != exactlyOne {
-		t.Errorf("exactly-one rule %q, want %q", rule, exactlyOne)
+	for _, name := range []string{"image", "mounts", "imagePullSecrets"} {
+		if _, exists := spec.Properties[name]; exists {
+			t.Errorf("Blip schema retains spec.%s", name)
+		}
 	}
-
-	// The presence rule must use the same definition of "set" as the
-	// exactly-one rule: an empty image is not a set root.
-	const immutable = "(has(self.image) && size(self.image) > 0) == (has(oldSelf.image) && size(oldSelf.image) > 0) && has(self.command) == has(oldSelf.command)"
-	if rule := ruleFor(t, spec.XValidations, "image, state, and command are immutable"); rule != immutable {
-		t.Errorf("immutability rule %q, want %q", rule, immutable)
+	validate := admissionValidator(t, "blips")
+	for _, object := range []string{`{}`, `{"spec":{}}`, `{"spec":{"state":""}}`} {
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted execution without a root: %s", object)
+		}
+	}
+	root := `{"spec":{"state":"root"}}`
+	if errs := validate(root, ""); len(errs) != 0 {
+		t.Fatal(errs.ToAggregate())
+	}
+	if errs := validate(`{"spec":{"state":"other"}}`, root); len(errs) == 0 {
+		t.Fatal("admitted root replacement")
 	}
 }
 
@@ -148,10 +163,10 @@ func TestBlipStateSizeCRDRule(t *testing.T) {
 	}
 }
 
-// TestMountPathCRDRules guards admission of Blip.spec.mounts paths. Paths used
+// TestMountPathCRDRules guards admission of BlipState.spec.mounts paths. Paths used
 // to be validated only by the controller after it had claimed a VM.
 func TestMountPathCRDRules(t *testing.T) {
-	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blips.yaml")
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipstates.yaml")
 	mounts, ok := spec.Properties["mounts"]
 	if !ok || mounts.Items == nil {
 		t.Fatal("generated CRD has no spec.mounts items")
@@ -207,5 +222,95 @@ func TestMountPathCRDRules(t *testing.T) {
 		if validMountPath(value) {
 			t.Errorf("mount path validation accepts invalid path %q", value)
 		}
+	}
+}
+
+func TestStateProvisioningImmutableAndRuntimeMutable(t *testing.T) {
+	validate := admissionValidator(t, "blipstates")
+	for _, tc := range []struct{ name, initial, changed string }{
+		{"image", `"busybox:1"`, `"busybox:2"`},
+		{"copyFrom", `"source"`, `"other"`},
+		{"size", `"1Gi"`, `"2Gi"`},
+		{"replicas", `1`, `2`},
+		{"nodeSelector", `{"role":"one"}`, `{"role":"two"}`},
+		{"imagePullSecrets", `[{"name":"one"}]`, `[{"name":"two"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := fmt.Sprintf(`{"spec":{%q:%s}}`, tc.name, tc.initial)
+			after := fmt.Sprintf(`{"spec":{%q:%s}}`, tc.name, tc.changed)
+			if errs := validate(before, ""); len(errs) != 0 {
+				t.Fatal(errs.ToAggregate())
+			}
+			for _, pair := range [][2]string{{after, before}, {before, `{"spec":{}}`}, {`{"spec":{}}`, before}, {`{}`, before}} {
+				if errs := validate(pair[0], pair[1]); len(errs) == 0 {
+					t.Errorf("admitted provisioning change: %s -> %s", pair[1], pair[0])
+				}
+			}
+		})
+	}
+	objects := []string{
+		`{"spec":{"copyFrom":"source"}}`,
+		`{"spec":{"copyFrom":"source","mounts":[{"state":"data","path":"/data","blipUID":"execution-uid"}],"runtime":{"env":[{"name":"A","value":"1"}],"workingDir":"/work","user":"1000","idleTimeout":"1m","network":{}}}}`,
+		`{"spec":{"copyFrom":"source","mounts":[{"state":"data","path":"/updated","writable":true}],"runtime":{"env":[{"name":"A","value":"2"}],"workingDir":"/next","user":"1001","idleTimeout":"0s","network":{"egress":[{}]}}}}`,
+	}
+	for _, before := range objects {
+		for _, after := range objects {
+			if errs := validate(after, before); len(errs) != 0 {
+				t.Errorf("runtime/mount update rejected: %v", errs.ToAggregate())
+			}
+		}
+	}
+	if errs := validate(`{"spec":{"runtime":{"idleTimeout":"bogus"}}}`, ""); len(errs) == 0 {
+		t.Fatal("admitted malformed runtime idle timeout")
+	}
+}
+
+// admissionValidator applies the same structural, OpenAPI, and CEL checks as
+// the API server, including transition rules and their static cost limits.
+func admissionValidator(t *testing.T, name string) func(object, old string) field.ErrorList {
+	t.Helper()
+	data, err := os.ReadFile("../../deploy/crd/blip.dev_" + name + ".yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var versioned apiextensionsv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(data, &versioned); err != nil {
+		t.Fatal(err)
+	}
+	apiextensionsv1.SetDefaults_CustomResourceDefinition(&versioned)
+	var crd apiextensions.CustomResourceDefinition
+	if err := apiextensionsv1.Convert_v1_CustomResourceDefinition_To_apiextensions_CustomResourceDefinition(&versioned, &crd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if errs := crdvalidation.ValidateCustomResourceDefinition(context.Background(), &crd); len(errs) != 0 {
+		t.Fatal(errs.ToAggregate())
+	}
+	root := crd.Spec.Validation.OpenAPIV3Schema
+	openAPI, _, err := openapivalidation.NewSchemaValidator(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	structural, err := schema.NewStructural(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cel := celvalidation.NewValidator(structural, true, celconfig.PerCallLimit)
+	return func(object, old string) field.ErrorList {
+		t.Helper()
+		var current, previous interface{}
+		if err := kubejson.Unmarshal([]byte(object), &current); err != nil {
+			t.Fatal(err)
+		}
+		if old != "" {
+			if err := kubejson.Unmarshal([]byte(old), &previous); err != nil {
+				t.Fatal(err)
+			}
+		}
+		errs := openapivalidation.ValidateCustomResource(field.NewPath("root"), current, openAPI)
+		if len(errs) == 0 {
+			celErrors, _ := cel.Validate(context.Background(), field.NewPath("root"), structural, current, previous, celconfig.RuntimeCELCostBudget)
+			errs = append(errs, celErrors...)
+		}
+		return errs
 	}
 }

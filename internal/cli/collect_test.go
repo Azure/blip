@@ -7,10 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 type writerFunc func([]byte) (int, error)
@@ -349,20 +353,22 @@ func TestCollectOwnRootState(t *testing.T) {
 	if got := readFile(t, dst); got != "self\n" {
 		t.Fatalf("content = %q", got)
 	}
-	b := h.blip("alice.box")
-	if m := findSpecMount(b.Spec.Mounts, "alice.home"); m != nil {
+	s := h.rootState("alice.box")
+	if m := findSpecMount(s.Spec.Mounts, "alice.home"); m != nil {
 		t.Fatalf("collect mounted the caller's root state: %+v", m)
 	}
-	if v := b.Annotations[collectMountsAnnotation]; v != "" {
+	if v := s.Annotations[collectMountsAnnotation]; v != "" {
 		t.Fatalf("annotation = %q, want cleared", v)
 	}
 }
 
 func TestCollectMultipleStatesAndOps(t *testing.T) {
 	root := withCollectMountRoot(t)
-	worker := ownedBlip("alice.w1", "alice.w1", v1alpha1.Mount{State: "alice.repo", Path: "/work"})
+	worker := ownedBlip("alice.w1", "alice.w1")
 	worker.Status.Phase = v1alpha1.BlipSucceeded
-	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"), readyState("alice.repo"))
+	source := readyState("alice.w1")
+	source.Spec.Mounts = []v1alpha1.Mount{{State: "alice.repo", Path: "/work"}}
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, source, readyState("alice.repo"))
 	h.self = "alice.box"
 	writeCollectFile(t, root, "alice.w1", "/home/dev/log", "root state\n", 0o644)
 	writeCollectFile(t, root, "alice.repo", "/out.txt", "mounted state\n", 0o644)
@@ -478,4 +484,215 @@ func TestCollectWaitsForState(t *testing.T) {
 		t.Fatalf("content = %q", got)
 	}
 	assertCollectReleased(t, h, "alice.box", "alice.w1")
+}
+
+func TestCollectResolvesRootDesiredAndActualMounts(t *testing.T) {
+	b := runningBlip("worker")
+	root := readyState(b.Spec.State)
+	root.Spec.Mounts = []v1alpha1.Mount{
+		{State: "repo", Path: "/new"},
+		{State: "replacement", Path: "/work"},
+		{State: "nested", Path: "/work/deep"},
+		{State: "abandoned", Path: "/old", BlipUID: "another-execution"},
+	}
+	b.Status.Mounts = []v1alpha1.MountStatus{{State: "repo", Path: "/work", Phase: v1alpha1.MountMounted}}
+	for dir, want := range map[string][2]string{
+		"/work/file":      {"repo", "/file"},
+		"/work/deep/file": {"nested", "/file"},
+		"/new/file":       {root.Name, "/new/file"},
+		"/old/file":       {root.Name, "/old/file"},
+		"/etc/file":       {root.Name, "/etc/file"},
+	} {
+		if state, rel := stateForPath(b, root, dir); state != want[0] || rel != want[1] {
+			t.Errorf("%s resolved to %s:%s, want %s:%s", dir, state, rel, want[0], want[1])
+		}
+	}
+}
+
+// collectFixture supplies a runtime attachment while leaving desired intent
+// empty, so concurrent acquisitions must create and count it atomically.
+func collectFixture(t *testing.T) (*app, *v1alpha1.BlipState, *v1alpha1.Blip) {
+	t.Helper()
+	b := runningBlip("caller")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	data := readyState("data")
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: data.Name, Path: filepath.Join(collectMountRoot, data.Name),
+		Phase: v1alpha1.MountMounted, CommitID: data.Status.Committed.ID,
+	}}
+	a := mountTestApp(t, b, root, data)
+	a.self = b
+	return a, root, b
+}
+
+func TestCollectConcurrentMountOwnership(t *testing.T) {
+	a, root, _ := collectFixture(t)
+	// Force both acquisitions to read the same resource version. Exactly
+	// one update succeeds; the other must retry its mount+refcount edit.
+	var updates atomic.Int32
+	ready := make(chan struct{})
+	a.c.Kube = interceptor.NewClient(a.c.Kube, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if obj.GetName() == root.Name {
+			switch updates.Add(1) {
+			case 1:
+				select {
+				case <-ready:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			case 2:
+				close(ready)
+			}
+		}
+		return c.Update(ctx, obj, opts...)
+	}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type result struct {
+		cleanup func()
+		err     error
+	}
+	done := make(chan result, 2)
+	for range 2 {
+		go func() {
+			_, cleanup, err := a.collectMount(ctx, "data")
+			done <- result{cleanup, err}
+		}()
+	}
+	var cleanups []func()
+	for range 2 {
+		r := <-done
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		cleanups = append(cleanups, r.cleanup)
+	}
+	s, err := a.getState(ctx, root.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].BlipUID != string(a.self.UID) || mountUsers(s)["data"].Users != 2 {
+		t.Fatalf("mounts %+v users %+v", s.Spec.Mounts, mountUsers(s))
+	}
+	cleanups[0]()
+	cleanups[0]() // a cleanup is idempotent even while another collect uses it
+	s, _ = a.getState(ctx, root.Name)
+	if len(s.Spec.Mounts) != 1 || mountUsers(s)["data"].Users != 1 {
+		t.Fatalf("removed another collect's mount: %+v %+v", s.Spec.Mounts, mountUsers(s))
+	}
+	cleanups[1]()
+	s, _ = a.getState(ctx, root.Name)
+	if len(s.Spec.Mounts) != 0 || len(mountUsers(s)) != 0 {
+		t.Fatalf("last collect did not release: %+v %+v", s.Spec.Mounts, mountUsers(s))
+	}
+}
+
+func TestCollectManualAdoptionAndUnmount(t *testing.T) {
+	a, root, _ := collectFixture(t)
+	ctx := context.Background()
+	dir, cleanup, err := a.collectMount(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.unmountState(ctx, "data", root.Name); err == nil || !strings.Contains(err.Error(), "in use by collect") {
+		t.Fatalf("manual unmount removed a borrowed mount: %v", err)
+	}
+	if err := a.mountState(ctx, "data", root.Name, dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	s, _ := a.getState(ctx, root.Name)
+	if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].BlipUID != "" || len(mountUsers(s)) != 0 {
+		t.Fatalf("adopted mount lost: %+v %+v", s.Spec.Mounts, mountUsers(s))
+	}
+}
+
+func TestCollectCleanupProvenance(t *testing.T) {
+	for _, change := range []string{"durable", "new token", "new lifetime", "lost annotation", "new root"} {
+		t.Run(change, func(t *testing.T) {
+			a, root, _ := collectFixture(t)
+			ctx := context.Background()
+			_, cleanup, err := a.collectMount(ctx, "data")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s, _ := a.getState(ctx, root.Name)
+			u := mountUsers(s)
+			switch change {
+			case "durable":
+				s.Spec.Mounts[0].BlipUID = "" // intentionally leave stale annotation
+			case "new token":
+				entry := u["data"]
+				entry.Token = "new-mount-instance"
+				u["data"] = entry
+				if err := setMountUsers(s, u); err != nil {
+					t.Fatal(err)
+				}
+			case "new lifetime":
+				s.Spec.Mounts[0].BlipUID = "new-execution"
+			case "lost annotation":
+				delete(s.Annotations, collectMountsAnnotation)
+			case "new root":
+				if err := a.c.Kube.Delete(ctx, s); err != nil {
+					t.Fatal(err)
+				}
+				s.UID, s.ResourceVersion = "new-root", ""
+				if err := a.c.Kube.Create(ctx, s); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if change != "new root" {
+				if err := a.c.Kube.Update(ctx, s); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cleanup()
+			s, _ = a.getState(ctx, root.Name)
+			if len(s.Spec.Mounts) != 1 {
+				t.Fatalf("stale cleanup removed replacement mount: %+v", s.Spec.Mounts)
+			}
+		})
+	}
+}
+
+func TestCollectReusesDurableMountWithStaleAnnotation(t *testing.T) {
+	a, root, _ := collectFixture(t)
+	ctx := context.Background()
+	s, _ := a.getState(ctx, root.Name)
+	s.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: filepath.Join(collectMountRoot, "data")}}
+	if err := setMountUsers(s, map[string]collectMountUse{"data": {BlipUID: string(a.self.UID), Path: s.Spec.Mounts[0].Path, Token: "abrupt-exit", Users: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.c.Kube.Update(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	_, cleanup, err := a.collectMount(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	s, _ = a.getState(ctx, root.Name)
+	if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].BlipUID != "" {
+		t.Fatalf("durable mount removed: %+v", s.Spec.Mounts)
+	}
+}
+
+func TestCollectConcurrentCleanupAndAdoption(t *testing.T) {
+	a, root, _ := collectFixture(t)
+	ctx := context.Background()
+	dir, cleanup, err := a.collectMount(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(cleanup)
+	if err := a.mountState(ctx, "data", root.Name, dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	s, _ := a.getState(ctx, root.Name)
+	if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].BlipUID != "" {
+		t.Fatalf("adoption lost to cleanup: %+v", s.Spec.Mounts)
+	}
 }

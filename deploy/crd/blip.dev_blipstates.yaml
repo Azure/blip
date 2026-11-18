@@ -56,7 +56,8 @@ spec:
           spec:
             description: |-
               BlipStateSpec is one durable ext4 filesystem. A state can be a blip's root
-              filesystem or an auxiliary mount. All fields are immutable.
+              filesystem or an auxiliary mount. Provisioning fields are immutable;
+              mounts and runtime defaults can be updated for subsequent or running blips.
             properties:
               copyFrom:
                 description: |-
@@ -71,7 +72,8 @@ spec:
                   Image initializes the filesystem from a container image, which each
                   node converts to ext4 itself. Every eligible node (matching
                   nodeSelector) holds an image state. Without image or copyFrom the
-                  state starts as an empty ext4 filesystem.
+                  state starts as an empty ext4 filesystem. Image states may only be
+                  attached read-only; copy one to create a writable root.
                 type: string
               imagePullSecrets:
                 description: ImagePullSecrets authenticate the image pull when Image
@@ -93,6 +95,50 @@ spec:
                   type: object
                   x-kubernetes-map-type: atomic
                 type: array
+              mounts:
+                description: |-
+                  Mounts attaches states when this state is used as a blip's root.
+                  Changes apply to the running blip.
+                items:
+                  description: Mount attaches a state's filesystem inside a running
+                    blip.
+                  properties:
+                    blipUID:
+                      description: |-
+                        BlipUID scopes a temporary mount to one execution. Empty keeps the
+                        mount across executions of the root state.
+                      type: string
+                    path:
+                      description: |-
+                        Path is an absolute path inside the guest root. It must be clean: no
+                        trailing slash, repeated slash, or . and .. segments.
+                      maxLength: 4096
+                      pattern: ^/[^/]+(/[^/]+)*$
+                      type: string
+                      x-kubernetes-validations:
+                      - message: path must not contain . or .. segments
+                        rule: '!self.split(''/'').exists(s, s == ''.'' || s == ''..'')'
+                    state:
+                      description: State names a BlipState in the blip's namespace.
+                      pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                      type: string
+                    writable:
+                      description: |-
+                        Writable mounts take the state's single writer slot and save a new
+                        version when unmounted. Read-only mounts pin the committed version.
+                      type: boolean
+                  required:
+                  - path
+                  - state
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - state
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: mount paths must be unique
+                  rule: self.all(m, self.exists_one(o, o.path == m.path))
               nodeSelector:
                 additionalProperties:
                   type: string
@@ -106,6 +152,280 @@ spec:
                 maximum: 3
                 minimum: 1
                 type: integer
+              runtime:
+                description: |-
+                  Runtime supplies execution defaults over the imported image metadata.
+                  Blip execution overrides take precedence.
+                properties:
+                  env:
+                    items:
+                      properties:
+                        name:
+                          type: string
+                        value:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  idleTimeout:
+                    description: IdleTimeout applies to interactive blips. Default
+                      30s.
+                    pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                    type: string
+                  network:
+                    description: |-
+                      Network narrows the pool's egress policy. Omitted inherits the pool;
+                      explicitly empty denies all.
+                    properties:
+                      egress:
+                        items:
+                          description: NetworkEgressRule allows the intersection of
+                            its destinations and ports.
+                          properties:
+                            ports:
+                              description: |-
+                                Ports allows numeric TCP/UDP destination ports. Omitted or empty means
+                                all IP protocols and ports. Service ports are not translated here.
+                              items:
+                                description: NetworkPort is a numeric destination
+                                  port or inclusive port range.
+                                properties:
+                                  endPort:
+                                    format: int32
+                                    maximum: 65535
+                                    minimum: 1
+                                    type: integer
+                                  port:
+                                    format: int32
+                                    maximum: 65535
+                                    minimum: 1
+                                    type: integer
+                                  protocol:
+                                    default: TCP
+                                    description: Protocol defines network protocols
+                                      supported for things like container ports.
+                                    enum:
+                                    - TCP
+                                    - UDP
+                                    type: string
+                                required:
+                                - port
+                                type: object
+                                x-kubernetes-validations:
+                                - message: endPort must be at least port
+                                  rule: '!has(self.endPort) || self.endPort >= self.port'
+                              maxItems: 64
+                              type: array
+                            to:
+                              description: To selects destinations. Omitted or empty
+                                means all IPv4 destinations.
+                              items:
+                                description: |-
+                                  NetworkPeer selects an IP block, pods, or services. Pod and namespace
+                                  selectors are ANDed; service and namespace selectors are ANDed. Without a
+                                  namespace selector, selectors are scoped to the Blip's namespace.
+                                properties:
+                                  ipBlock:
+                                    description: IPBlock allows an IPv4 CIDR minus
+                                      its strictly smaller exception CIDRs.
+                                    properties:
+                                      cidr:
+                                        description: CIDR is an IPv4 destination range,
+                                          for example 192.0.2.0/24.
+                                        maxLength: 18
+                                        type: string
+                                      except:
+                                        description: Except removes IPv4 subranges
+                                          from CIDR.
+                                        items:
+                                          maxLength: 18
+                                          type: string
+                                        maxItems: 32
+                                        type: array
+                                        x-kubernetes-list-type: atomic
+                                    required:
+                                    - cidr
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: cidr must be a valid IPv4 CIDR
+                                      rule: isCIDR(self.cidr) && cidr(self.cidr).ip().family()
+                                        == 4
+                                    - message: exceptions must be IPv4 CIDRs strictly
+                                        inside cidr
+                                      rule: '!has(self.except) || self.except.all(c,
+                                        isCIDR(c) && cidr(c).ip().family() == 4 &&
+                                        cidr(self.cidr).containsIP(cidr(c).ip()) &&
+                                        cidr(c).prefixLength() > cidr(self.cidr).prefixLength())'
+                                  namespaceSelector:
+                                    description: NamespaceSelector selects namespaces
+                                      by label; alone it selects pods.
+                                    properties:
+                                      matchExpressions:
+                                        description: matchExpressions is a list of
+                                          label selector requirements. The requirements
+                                          are ANDed.
+                                        items:
+                                          description: |-
+                                            A label selector requirement is a selector that contains values, a key, and an operator that
+                                            relates the key and values.
+                                          properties:
+                                            key:
+                                              description: key is the label key that
+                                                the selector applies to.
+                                              type: string
+                                            operator:
+                                              description: |-
+                                                operator represents a key's relationship to a set of values.
+                                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                                              type: string
+                                            values:
+                                              description: |-
+                                                values is an array of string values. If the operator is In or NotIn,
+                                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                                the values array must be empty. This array is replaced during a strategic
+                                                merge patch.
+                                              items:
+                                                type: string
+                                              type: array
+                                              x-kubernetes-list-type: atomic
+                                          required:
+                                          - key
+                                          - operator
+                                          type: object
+                                        type: array
+                                        x-kubernetes-list-type: atomic
+                                      matchLabels:
+                                        additionalProperties:
+                                          type: string
+                                        description: |-
+                                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                        type: object
+                                    type: object
+                                    x-kubernetes-map-type: atomic
+                                  podSelector:
+                                    description: |-
+                                      PodSelector selects direct PodIPs, excluding host-networked, terminal,
+                                      and deleting pods whose old addresses may have been reassigned.
+                                    properties:
+                                      matchExpressions:
+                                        description: matchExpressions is a list of
+                                          label selector requirements. The requirements
+                                          are ANDed.
+                                        items:
+                                          description: |-
+                                            A label selector requirement is a selector that contains values, a key, and an operator that
+                                            relates the key and values.
+                                          properties:
+                                            key:
+                                              description: key is the label key that
+                                                the selector applies to.
+                                              type: string
+                                            operator:
+                                              description: |-
+                                                operator represents a key's relationship to a set of values.
+                                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                                              type: string
+                                            values:
+                                              description: |-
+                                                values is an array of string values. If the operator is In or NotIn,
+                                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                                the values array must be empty. This array is replaced during a strategic
+                                                merge patch.
+                                              items:
+                                                type: string
+                                              type: array
+                                              x-kubernetes-list-type: atomic
+                                          required:
+                                          - key
+                                          - operator
+                                          type: object
+                                        type: array
+                                        x-kubernetes-list-type: atomic
+                                      matchLabels:
+                                        additionalProperties:
+                                          type: string
+                                        description: |-
+                                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                        type: object
+                                    type: object
+                                    x-kubernetes-map-type: atomic
+                                  serviceSelector:
+                                    description: |-
+                                      ServiceSelector selects ClusterIPs, or EndpointSlice IPv4 addresses for
+                                      headless services. ExternalName services have no selectable address.
+                                    properties:
+                                      matchExpressions:
+                                        description: matchExpressions is a list of
+                                          label selector requirements. The requirements
+                                          are ANDed.
+                                        items:
+                                          description: |-
+                                            A label selector requirement is a selector that contains values, a key, and an operator that
+                                            relates the key and values.
+                                          properties:
+                                            key:
+                                              description: key is the label key that
+                                                the selector applies to.
+                                              type: string
+                                            operator:
+                                              description: |-
+                                                operator represents a key's relationship to a set of values.
+                                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                                              type: string
+                                            values:
+                                              description: |-
+                                                values is an array of string values. If the operator is In or NotIn,
+                                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                                the values array must be empty. This array is replaced during a strategic
+                                                merge patch.
+                                              items:
+                                                type: string
+                                              type: array
+                                              x-kubernetes-list-type: atomic
+                                          required:
+                                          - key
+                                          - operator
+                                          type: object
+                                        type: array
+                                        x-kubernetes-list-type: atomic
+                                      matchLabels:
+                                        additionalProperties:
+                                          type: string
+                                        description: |-
+                                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                        type: object
+                                    type: object
+                                    x-kubernetes-map-type: atomic
+                                type: object
+                                x-kubernetes-validations:
+                                - message: a peer must select an IP block, pods, namespaces,
+                                    or services
+                                  rule: has(self.ipBlock) || has(self.podSelector)
+                                    || has(self.namespaceSelector) || has(self.serviceSelector)
+                                - message: ipBlock cannot be combined with selectors
+                                  rule: '!has(self.ipBlock) || !(has(self.podSelector)
+                                    || has(self.namespaceSelector) || has(self.serviceSelector))'
+                                - message: podSelector and serviceSelector cannot
+                                    be combined
+                                  rule: '!(has(self.podSelector) && has(self.serviceSelector))'
+                              maxItems: 64
+                              type: array
+                          type: object
+                        maxItems: 64
+                        type: array
+                    type: object
+                  user:
+                    type: string
+                  workingDir:
+                    type: string
+                type: object
               size:
                 anyOf:
                 - type: integer
@@ -130,8 +450,24 @@ spec:
             - message: replicas cannot be set for image states; they are held by every
                 eligible node
               rule: '!(has(self.image) && has(self.replicas))'
-            - message: spec is immutable
-              rule: self == oldSelf
+            - message: image is immutable
+              rule: has(self.image) == has(oldSelf.image) && (!has(self.image) ||
+                self.image == oldSelf.image)
+            - message: copyFrom is immutable
+              rule: has(self.copyFrom) == has(oldSelf.copyFrom) && (!has(self.copyFrom)
+                || self.copyFrom == oldSelf.copyFrom)
+            - message: size is immutable
+              rule: has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size
+                == oldSelf.size)
+            - message: replicas is immutable
+              rule: has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas)
+                || self.replicas == oldSelf.replicas)
+            - message: nodeSelector is immutable
+              rule: has(self.nodeSelector) == has(oldSelf.nodeSelector) && (!has(self.nodeSelector)
+                || self.nodeSelector == oldSelf.nodeSelector)
+            - message: imagePullSecrets is immutable
+              rule: has(self.imagePullSecrets) == has(oldSelf.imagePullSecrets) &&
+                (!has(self.imagePullSecrets) || self.imagePullSecrets == oldSelf.imagePullSecrets)
           status:
             properties:
               committed:
@@ -381,6 +717,8 @@ spec:
                 - podUID
                 type: object
             type: object
+        required:
+        - spec
         type: object
     served: true
     storage: true

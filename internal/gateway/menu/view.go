@@ -177,6 +177,8 @@ func (m *Model) renderRow(index, width int) string {
 	badge := ""
 	if row.Running {
 		badge = "● running"
+	} else if row.ForkOnly {
+		badge = "base"
 	}
 	avail := width - lipgloss.Width(marker)
 	if width < 20 {
@@ -263,6 +265,9 @@ func (m *Model) createLines(width int) []string {
 		"",
 		"  " + padLine(hint, width-2),
 	}
+	if m.forkTarget != nil {
+		lines = append([]string{"", "  Fork " + accent(displayName(*m.forkTarget))}, lines...)
+	}
 	return lines
 }
 
@@ -288,6 +293,7 @@ func helpLines(width int) []string {
 		{"↑/↓  j/k", "move"},
 		{"enter", "connect"},
 		{"n", "new blip"},
+		{"f", "fork selected"},
 		{"d", "delete"},
 		{"?", "help"},
 		{"q", "quit"},
@@ -383,7 +389,13 @@ func (m *Model) hints() []hint {
 	case m.mode == helping:
 		return []hint{{"any key", "close"}}
 	}
-	return []hint{{"enter", "connect"}, {"n", "new"}, {"d", "delete"}, {"?", "help"}, {"q", "quit"}}
+	if entry, ok := m.current(); ok && entry.ForkOnly {
+		if !entry.Shared {
+			return []hint{{"enter", "fork"}, {"n", "new"}, {"d", "delete"}, {"?", "help"}, {"q", "quit"}}
+		}
+		return []hint{{"enter", "fork"}, {"n", "new"}, {"?", "help"}, {"q", "quit"}}
+	}
+	return []hint{{"enter", "connect"}, {"n", "new"}, {"f", "fork"}, {"d", "delete"}, {"?", "help"}, {"q", "quit"}}
 }
 
 func renderHints(hints []hint, width int) string {
@@ -440,6 +452,9 @@ func (m *Model) title() (string, string) {
 	case m.busy == deleteAction:
 		return "deleting", ""
 	case m.mode == creating:
+		if m.forkTarget != nil {
+			return "fork blip", ""
+		}
 		return "new blip", ""
 	case m.mode == confirming:
 		return "delete blip", ""

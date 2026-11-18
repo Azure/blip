@@ -19,11 +19,13 @@ import (
 // ValidatingAdmissionPolicy (deploy/base/vm-owner-policy.yaml). Keys are
 // "sa.<service account>" for every VM service account, with the sorted,
 // space-separated names of the pools using it, and "<pod>" with the owner of
-// each claimed VM pod ("-" for an unrestricted Blip).
+// each claimed VM pod ("-" for an unrestricted Blip). "bases" lists the
+// ownerless imported states available for shared read-only use and copying.
 const VMOwnersConfigMap = "blip-vm-owners"
 
 const (
 	ownersSAPrefix = "sa."
+	ownersBasesKey = "bases"
 	ownerAny       = "-"
 )
 
@@ -180,6 +182,21 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 	}
 
 	want := poolsByServiceAccount(pools.Items)
+	var states v1.BlipStateList
+	if err := c.List(ctx, &states, client.InNamespace(ns)); err != nil {
+		return err
+	}
+	var bases []string
+	for i := range states.Items {
+		s := &states.Items[i]
+		if s.Spec.Image != "" && s.Labels[LabelOwner] == "" && s.DeletionTimestamp == nil {
+			bases = append(bases, s.Name)
+		}
+	}
+	if len(bases) > 0 {
+		slices.Sort(bases)
+		want[ownersBasesKey] = strings.Join(bases, " ")
+	}
 	exists := map[string]bool{}
 	for i := range pods.Items {
 		p := &pods.Items[i]

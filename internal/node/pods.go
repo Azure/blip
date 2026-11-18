@@ -14,12 +14,7 @@ import (
 	"github.com/Azure/blip/internal/storage"
 )
 
-const (
-	defaultIdleTimeoutSeconds = 30
-	// defaultRootSize is the size of a throwaway image root; the store
-	// grows it to the image's size if that is larger.
-	defaultRootSize = 10 << 30
-)
+const defaultIdleTimeoutSeconds = 30
 
 func planPods(v *view, p *plan) {
 	keys := make([]string, 0, len(v.pods))
@@ -122,25 +117,13 @@ func desiredFor(v *view, p *plan, pod *corev1.Pod, dir *podDir) (podapi.Desired,
 	if prev.Claim != nil && prev.Claim.BlipUID == uid {
 		claim = prev.Claim
 	} else if rootID != "" {
-		var cfg *image.Config
-		var a *attach
-		if b.Spec.Image != "" {
-			if id, err := image.DigestOf(b.Status.ImageDigest); err == nil && v.configs[id] != nil {
-				cfg = v.configs[id]
-				a = &attach{id: rootID, image: id}
-			} else if err == nil {
-				perr = v.stateErrs[imageKey(id)]
-			}
-		} else if s := v.stateByName[b.Namespace+"/"+b.Spec.State]; s != nil && writes(s, rootID, pod) {
-			cfg = v.stateConfig(s)
-			a = &attach{id: rootID, state: s, commitID: s.Status.Writer.BaseCommit, purpose: "attach"}
-		}
-		if a != nil {
-			ready, pr := v.ensure(key, dir, *a)
+		if s := v.stateByName[b.Namespace+"/"+b.Spec.State]; s != nil && writes(s, rootID, pod) {
+			a := attach{id: rootID, state: s, commitID: s.Status.Writer.BaseCommit, purpose: "attach"}
+			ready, pr := v.ensure(key, dir, a)
 			add(pr)
 			if ready {
-				claim = claimFor(b, disk(rootID, false), cfg)
-			} else if e := v.waitErr(*a); e != "" {
+				claim = claimFor(b, disk(rootID, false), v.stateConfig(s), s.Spec.Runtime)
+			} else if e := v.waitErr(a); e != "" {
 				perr = e
 			}
 		}
@@ -202,9 +185,6 @@ func desiredFor(v *view, p *plan, pod *corev1.Pod, dir *podDir) (podapi.Desired,
 
 // waitErr returns the last error that explains why a is not ready yet.
 func (v *view) waitErr(a attach) string {
-	if a.image != "" && !v.hasImage(a.image) {
-		return v.stateErrs[imageKey(a.image)]
-	}
 	if a.state != nil {
 		return v.stateErrs[string(a.state.UID)]
 	}
@@ -233,7 +213,7 @@ func writerLost(v *view, pod *corev1.Pod, b *v1alpha1.Blip, prev podapi.Desired)
 		s := v.stateByName[b.Namespace+"/"+stateName]
 		return s == nil || !writes(s, id, pod)
 	}
-	if b.Spec.State != "" && lost(b.Spec.State, prev.Claim.Root.ID) {
+	if lost(b.Spec.State, prev.Claim.Root.ID) {
 		return true
 	}
 	for _, m := range prev.Mounts {
@@ -248,33 +228,48 @@ func disk(id string, readOnly bool) podapi.Disk {
 	return podapi.Disk{ID: id, Device: path.Join(podapi.MountPath, podapi.DevDir, id), Serial: id, ReadOnly: readOnly}
 }
 
-func claimFor(b *v1alpha1.Blip, root podapi.Disk, cfg *image.Config) *podapi.Claim {
+func claimFor(b *v1alpha1.Blip, root podapi.Disk, cfg *image.Config, defaults *v1alpha1.RuntimeDefaults) *podapi.Claim {
 	c := &podapi.Claim{
 		BlipName:      b.Name,
 		BlipUID:       string(b.UID),
 		Root:          root,
 		Command:       b.Spec.Command,
 		TTY:           b.Spec.TTY,
-		WorkingDir:    b.Spec.WorkingDir,
-		User:          b.Spec.User,
 		WaitForClient: b.Annotations[v1alpha1.AnnotationWaitForClient] == "true",
 	}
 	if cfg != nil {
 		c.Env = append(c.Env, cfg.Env...)
-		if c.WorkingDir == "" {
-			c.WorkingDir = cfg.WorkingDir
+		c.WorkingDir = cfg.WorkingDir
+		c.User = cfg.User
+	}
+	idleTimeout := b.Spec.IdleTimeout
+	if defaults != nil {
+		for _, e := range defaults.Env {
+			c.Env = append(c.Env, e.Name+"="+e.Value)
 		}
-		if c.User == "" {
-			c.User = cfg.User
+		if defaults.WorkingDir != "" {
+			c.WorkingDir = defaults.WorkingDir
 		}
+		if defaults.User != "" {
+			c.User = defaults.User
+		}
+		if idleTimeout == nil {
+			idleTimeout = defaults.IdleTimeout
+		}
+	}
+	if b.Spec.WorkingDir != "" {
+		c.WorkingDir = b.Spec.WorkingDir
+	}
+	if b.Spec.User != "" {
+		c.User = b.Spec.User
 	}
 	for _, e := range b.Spec.Env {
 		c.Env = append(c.Env, e.Name+"="+e.Value)
 	}
 	if len(c.Command) == 0 {
 		c.IdleTimeoutSeconds = defaultIdleTimeoutSeconds
-		if b.Spec.IdleTimeout != nil {
-			c.IdleTimeoutSeconds = int64(b.Spec.IdleTimeout.Seconds())
+		if idleTimeout != nil {
+			c.IdleTimeoutSeconds = int64(idleTimeout.Seconds())
 		}
 	}
 	return c
@@ -283,7 +278,6 @@ func claimFor(b *v1alpha1.Blip, root podapi.Disk, cfg *image.Config) *podapi.Cla
 // attach describes a working volume a pod needs.
 type attach struct {
 	id       string
-	image    string              // image root
 	state    *v1alpha1.BlipState // durable or read-only source state (may be nil for read-only)
 	stateUID string              // read-only mounts: the pinned state's UID
 	commitID string
@@ -319,12 +313,6 @@ func (v *view) ensure(podKey string, dir *podDir, a attach) (bool, *prepare) {
 		}
 	}
 	switch {
-	case a.image != "":
-		if !v.hasImage(a.image) {
-			return false, nil
-		}
-		pr.req.FromImage = a.image
-		pr.req.SizeBytes = defaultRootSize
 	case a.commitID == "":
 		return false, nil
 	case v.holds(a.commitID):

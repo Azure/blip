@@ -40,11 +40,19 @@ spec:
         - name: gateway
           args:
             - --namespace=blip-ssh
-            - --image=blip-registry:5000/blip/dev:latest
+            - --base-state=gateway-base
             - --identity-header=X-Forwarded-User
             - --tls-cert=/etc/blip/tls/tls.crt
             - --tls-key=/etc/blip/tls/tls.key
             - --tls-client-ca=/etc/blip/tls/client-ca.crt
+---
+apiVersion: blip.dev/v1alpha1
+kind: BlipState
+metadata:
+  name: gateway-base
+  namespace: blip-ssh
+spec:
+  image: blip-registry:5000/blip/dev:latest
 ---
 apiVersion: v1
 kind: Service

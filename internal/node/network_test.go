@@ -55,7 +55,7 @@ func policyHasCIDR(policy *network.Policy, cidr string) bool {
 
 func TestNetworkPolicyBeforeRootReady(t *testing.T) {
 	v := newView()
-	b, d := imageBlip(v)
+	b, d := durableBlip(v)
 	v.pools[ns+"/default"].Spec.Network = allowCIDR("10.0.0.0/8")
 	b.Spec.Network = allowCIDR("10.1.0.0/16")
 	p := compute(v)
@@ -91,6 +91,10 @@ func TestNetworkPolicyFailureRevokesGrantsAndPreservesDisks(t *testing.T) {
 			v.pools[ns+"/default"].Spec.Network = allowCIDR("invalid")
 		}},
 		{"invalid Blip", func(_ *view, b *v1alpha1.Blip) { b.Spec.Network = allowCIDR("invalid") }},
+		{"invalid state", func(v *view, _ *v1alpha1.Blip) {
+			v.states[0].Spec.Runtime = &v1alpha1.RuntimeDefaults{Network: allowCIDR("invalid")}
+		}},
+		{"missing state", func(v *view, _ *v1alpha1.Blip) { v.states = nil }},
 		{"missing pool", func(v *view, _ *v1alpha1.Blip) { delete(v.pools, ns+"/default") }},
 		{"missing Blip", func(v *view, _ *v1alpha1.Blip) { v.blips = nil }},
 		{"wrong pool namespace", func(v *view, _ *v1alpha1.Blip) {
@@ -103,9 +107,9 @@ func TestNetworkPolicyFailureRevokesGrantsAndPreservesDisks(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := newView()
-			b, d := imageBlip(v)
+			b, d := durableBlip(v)
 			v.pools[ns+"/default"].Spec.Network = allowCIDR("0.0.0.0/0")
-			readyDev(v, d, storage.Volume{ID: "r1"}, 7)
+			readyDev(v, d, storage.Volume{ID: "r1", StateUID: "uid-root"}, 7)
 			readyDev(v, d, storage.Volume{ID: "m1", ReadOnly: true}, 8)
 			b.Status.Mounts = []v1alpha1.MountStatus{{State: "data", Path: "/data", AttachmentID: "m1", Phase: v1alpha1.MountMounted}}
 			v.freezes = map[string][]string{pkey("p"): {"r1"}}
@@ -126,6 +130,57 @@ func TestNetworkPolicyFailureRevokesGrantsAndPreservesDisks(t *testing.T) {
 				t.Fatalf("missing preparation error: %+v", p.podErrs)
 			}
 		})
+	}
+}
+
+func TestLiveStateNetworkPrecedence(t *testing.T) {
+	v := newView()
+	b, d := durableBlip(v)
+	root := v.states[0]
+	root.Spec.Runtime = &v1alpha1.RuntimeDefaults{Network: allowCIDR("10.1.0.0/16")}
+	v.pools[ns+"/default"].Spec.Network = allowCIDR("10.0.0.0/8")
+	readyDev(v, d, storage.Volume{ID: "r1", StateUID: string(root.UID)}, 7)
+	initial := compute(v).desired[pkey("p")]
+	if initial.Claim == nil || !policyHasCIDR(initial.Network, "10.0.0.0/8") || !policyHasCIDR(initial.Network, "10.1.0.0/16") {
+		t.Fatalf("state policy must narrow the pool at claim: %+v", initial)
+	}
+	d.desired = &initial
+	d.observed.Phase = podapi.PhaseRunning
+	apply := func() podapi.Desired {
+		t.Helper()
+		got, changed := compute(v).desired[pkey("p")]
+		if !changed {
+			t.Fatal("live policy change did not update desired")
+		}
+		if !sameJSON(got.Claim, initial.Claim) {
+			t.Fatal("live policy change replaced the startup claim")
+		}
+		d.desired = &got
+		return got
+	}
+	root.Spec.Runtime.Network = allowCIDR("10.2.0.0/16")
+	if got := apply(); policyHasCIDR(got.Network, "10.1.0.0/16") || !policyHasCIDR(got.Network, "10.2.0.0/16") {
+		t.Fatalf("state edit did not replace live policy: %+v", got.Network)
+	}
+	b.Spec.Network = allowCIDR("10.3.0.0/16")
+	if got := apply(); policyHasCIDR(got.Network, "10.2.0.0/16") || !policyHasCIDR(got.Network, "10.3.0.0/16") || !policyHasCIDR(got.Network, "10.0.0.0/8") {
+		t.Fatalf("execution policy must replace state policy within the pool bound: %+v", got.Network)
+	}
+	root.Spec.Runtime.Network = &v1alpha1.NetworkPolicy{}
+	if p := compute(v); len(p.desired) != 0 {
+		t.Fatalf("state policy affected an execution override: %+v", p.desired)
+	}
+	b.Spec.Network = nil
+	requireDeny(t, apply().Network)
+	root.Spec.Runtime.Network = nil
+	if got := apply(); len(got.Network.Layers) != 1 || !policyHasCIDR(got.Network, "10.0.0.0/8") {
+		t.Fatalf("omitted state and execution policies must inherit pool: %+v", got.Network)
+	}
+	b.Spec.Network = &v1alpha1.NetworkPolicy{}
+	requireDeny(t, apply().Network)
+	root.Spec.Runtime.Network = allowCIDR("10.4.0.0/16")
+	if p := compute(v); len(p.desired) != 0 {
+		t.Fatalf("state policy broadened explicit execution deny: %+v", p.desired)
 	}
 }
 
@@ -156,6 +211,7 @@ func TestUnclaimedWarmNetworkDenied(t *testing.T) {
 func TestNetworkSnapshotAndLiveUpdates(t *testing.T) {
 	ctx := context.Background()
 	b := blip("b") // Empty pool name must resolve to default.
+	root := state("root")
 	pod := vmPod("p", string(b.UID))
 	pool := &v1alpha1.BlipPool{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "default"},
@@ -189,7 +245,7 @@ func TestNetworkSnapshotAndLiveUpdates(t *testing.T) {
 	delete(plainLocal.Labels, LabelPool)
 	// If either pod entered the management view, podMetaFor would clear this.
 	remoteVM.Labels[LabelWarm], plainLocal.Labels[LabelWarm] = "true", "true"
-	a, _, _ := testAgent(t, b, pod, pool, namespace, target, service, headless, endpoints, remoteVM, plainLocal)
+	a, _, _ := testAgent(t, b, root, pod, pool, namespace, target, service, headless, endpoints, remoteVM, plainLocal)
 	dir := a.podDirFor(pkey("p"))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)

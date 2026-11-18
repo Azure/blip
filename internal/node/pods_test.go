@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -53,27 +54,22 @@ func TestWarmLabelAndObservedAnnotation(t *testing.T) {
 	}
 }
 
-func imageBlip(v *view) (*v1alpha1.Blip, *podDir) {
-	b := blip("b")
-	b.Spec.Image = "img"
+func durableBlip(v *view) (*v1alpha1.Blip, *podDir) {
+	b, s, d := stateRoot(v)
+	b.Spec.Command = nil
 	b.Spec.Env = []v1alpha1.EnvVar{{Name: "A", Value: "1"}}
-	b.Status.ImageDigest = imageRef
-	b.Status.RootAttachmentID = "r1"
-	v.blips = append(v.blips, b)
-	v.pods[pkey("p")] = vmPod("p", string(b.UID))
-	d := dir(podapi.PhaseWarm)
-	v.dirs[pkey("p")] = d
-	v.configs[imageID] = &image.Config{Env: []string{"PATH=/bin"}, WorkingDir: "/w"}
-	v.volumes[imageID] = storage.Volume{ID: imageID, Kind: storage.KindImage}
+	s.Status.Writer.PodUID = "poduid-p"
+	s.Status.ImageConfig = &v1alpha1.ImageConfig{Env: []string{"PATH=/bin"}, WorkingDir: "/w"}
+	v.volumes["c1"] = commit("c1", string(s.UID))
 	return b, d
 }
 
-func TestImageRootClaim(t *testing.T) {
+func TestDurableRootClaim(t *testing.T) {
 	v := newView()
-	_, d := imageBlip(v)
+	_, d := durableBlip(v)
 	p := compute(v)
-	if len(p.prepares) != 1 || p.prepares[0].req.FromImage != imageID || p.prepares[0].req.AttachmentID != "r1" || p.prepares[0].pod != pkey("p") ||
-		p.prepares[0].req.SizeBytes != defaultRootSize {
+	if len(p.prepares) != 1 || p.prepares[0].req.FromCommit != "c1" || p.prepares[0].req.AttachmentID != "r1" || p.prepares[0].pod != pkey("p") ||
+		p.prepares[0].req.StateUID != "uid-root" || p.prepares[0].req.SizeBytes != 1<<30 {
 		t.Fatalf("prepares = %+v", p.prepares)
 	}
 	if got := p.desired[pkey("p")]; got.Claim != nil || got.Network == nil {
@@ -81,8 +77,8 @@ func TestImageRootClaim(t *testing.T) {
 	}
 
 	v = newView()
-	_, d = imageBlip(v)
-	readyDev(v, d, storage.Volume{ID: "r1"}, 7)
+	_, d = durableBlip(v)
+	readyDev(v, d, storage.Volume{ID: "r1", StateUID: "uid-root"}, 7)
 	p = compute(v)
 	if len(p.prepares) != 0 {
 		t.Fatalf("prepares = %+v", p.prepares)
@@ -106,8 +102,8 @@ func TestImageRootClaim(t *testing.T) {
 // the guest. A detached run has no annotation and starts at once.
 func TestClaimCarriesWaitForClient(t *testing.T) {
 	v := newView()
-	b, d := imageBlip(v)
-	readyDev(v, d, storage.Volume{ID: "r1"}, 7)
+	b, d := durableBlip(v)
+	readyDev(v, d, storage.Volume{ID: "r1", StateUID: "uid-root"}, 7)
 	if c := compute(v).desired[pkey("p")].Claim; c == nil || c.WaitForClient {
 		t.Fatalf("claim without the annotation = %+v", c)
 	}
@@ -120,12 +116,114 @@ func TestClaimCarriesWaitForClient(t *testing.T) {
 
 func TestIdleTimeoutOverride(t *testing.T) {
 	v := newView()
-	b, d := imageBlip(v)
+	b, d := durableBlip(v)
 	b.Spec.IdleTimeout = &metav1.Duration{Duration: 45 * time.Second}
-	readyDev(v, d, storage.Volume{ID: "r1"}, 7)
+	readyDev(v, d, storage.Volume{ID: "r1", StateUID: "uid-root"}, 7)
 	p := compute(v)
 	if c := p.desired[pkey("p")].Claim; c == nil || c.IdleTimeoutSeconds != 45 {
 		t.Fatalf("claim with idle timeout = %+v", c)
+	}
+}
+
+func TestRuntimeDefaultsPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		defaults *v1alpha1.RuntimeDefaults
+		override v1alpha1.BlipSpec
+		env      []string
+		dir      string
+		user     string
+		idle     int64
+	}{
+		{
+			name: "image metadata", env: []string{"PATH=/bin", "A=image"}, dir: "/image", user: "image-user", idle: 30,
+		},
+		{
+			name: "state defaults",
+			defaults: &v1alpha1.RuntimeDefaults{
+				Env: []v1alpha1.EnvVar{{Name: "A", Value: "state"}}, WorkingDir: "/state", User: "state-user",
+				IdleTimeout: &metav1.Duration{Duration: time.Minute},
+			},
+			env: []string{"PATH=/bin", "A=image", "A=state"}, dir: "/state", user: "state-user", idle: 60,
+		},
+		{
+			name: "execution overrides including zero timeout and empty env",
+			defaults: &v1alpha1.RuntimeDefaults{
+				Env: []v1alpha1.EnvVar{{Name: "A", Value: "state"}}, WorkingDir: "/state", User: "state-user",
+				IdleTimeout: &metav1.Duration{Duration: time.Minute},
+			},
+			override: v1alpha1.BlipSpec{
+				Env: []v1alpha1.EnvVar{{Name: "A"}}, WorkingDir: "/execution", User: "execution-user",
+				IdleTimeout: &metav1.Duration{},
+			},
+			env: []string{"PATH=/bin", "A=image", "A=state", "A="}, dir: "/execution", user: "execution-user",
+		},
+		{
+			name: "partial state defaults inherit image values",
+			defaults: &v1alpha1.RuntimeDefaults{
+				Env: []v1alpha1.EnvVar{{Name: "NEW", Value: "value"}}, User: "state-user",
+			},
+			env: []string{"PATH=/bin", "A=image", "NEW=value"}, dir: "/image", user: "state-user", idle: 30,
+		},
+		{
+			name: "primary command ignores idle timeout",
+			defaults: &v1alpha1.RuntimeDefaults{
+				IdleTimeout: &metav1.Duration{Duration: time.Minute},
+			},
+			override: v1alpha1.BlipSpec{Command: []string{"true"}},
+			env:      []string{"PATH=/bin", "A=image"}, dir: "/image", user: "image-user",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := newView()
+			b, s, d := stateRoot(v)
+			b.Spec = tc.override
+			b.Spec.State = s.Name
+			s.Spec.Runtime = tc.defaults
+			s.Status.ImageConfig = &v1alpha1.ImageConfig{
+				Env: []string{"PATH=/bin", "A=image"}, WorkingDir: "/image", User: "image-user",
+				Entrypoint: []string{"/entrypoint"}, Cmd: []string{"serve"},
+			}
+			s.Status.Writer.PodUID = "poduid-p"
+			readyDev(v, d, storage.Volume{ID: "r1", StateUID: string(s.UID)}, 7)
+			c := compute(v).desired[pkey("p")].Claim
+			// Env entries are ordered image -> state -> execution. The guest
+			// applies later entries last, including explicitly empty values.
+			if c == nil || !slices.Equal(c.Env, tc.env) || c.WorkingDir != tc.dir || c.User != tc.user || c.IdleTimeoutSeconds != tc.idle {
+				t.Fatalf("resolved claim = %+v", c)
+			}
+			if !slices.Equal(c.Command, tc.override.Command) {
+				t.Fatalf("image entrypoint/cmd changed execution semantics: %v", c.Command)
+			}
+		})
+	}
+}
+
+func TestRuntimeStartupDefaultsResolvedOnce(t *testing.T) {
+	v := newView()
+	_, d := durableBlip(v)
+	s := v.states[0]
+	s.Spec.Runtime = &v1alpha1.RuntimeDefaults{
+		Env: []v1alpha1.EnvVar{{Name: "B", Value: "initial"}}, WorkingDir: "/initial", User: "initial-user",
+		IdleTimeout: &metav1.Duration{Duration: time.Minute},
+	}
+	readyDev(v, d, storage.Volume{ID: "r1", StateUID: string(s.UID)}, 7)
+	initial := compute(v).desired[pkey("p")]
+	if initial.Claim == nil {
+		t.Fatal("missing initial claim")
+	}
+	d.desired = &initial
+	d.observed.Phase = podapi.PhaseRunning
+	s.Spec.Runtime.Env[0].Value = "updated"
+	s.Spec.Runtime.WorkingDir = "/updated"
+	s.Spec.Runtime.User = "updated-user"
+	s.Spec.Runtime.IdleTimeout.Duration = 2 * time.Minute
+	s.Status.ImageConfig.Env[0] = "PATH=/updated"
+	if p := compute(v); len(p.desired) != 0 {
+		t.Fatalf("startup defaults changed an existing claim: %+v", p.desired)
+	}
+	if initial.Claim.Env[0] != "PATH=/bin" || initial.Claim.Env[1] != "B=initial" {
+		t.Fatalf("claim aliases mutable defaults: %+v", initial.Claim)
 	}
 }
 
@@ -182,7 +280,7 @@ func TestStop(t *testing.T) {
 		d.observed.Phase = podapi.PhaseRunning
 		// Pin deny so this test exercises stop semantics, not the pool default.
 		v.pools[ns+"/default"].Spec.Network = &v1alpha1.NetworkPolicy{}
-		d.desired = &podapi.Desired{Claim: claimFor(b, disk("r1", false), nil), Network: denyNetwork()}
+		d.desired = &podapi.Desired{Claim: claimFor(b, disk("r1", false), nil, nil), Network: denyNetwork()}
 		return v, b, s, d
 	}
 
@@ -280,20 +378,24 @@ func TestMounts(t *testing.T) {
 // namespaces get separate plans, pod directories, and device nodes.
 func TestSamePodNameDifferentNamespaces(t *testing.T) {
 	v := newView()
-	v.configs[imageID] = &image.Config{Env: []string{"PATH=/bin"}}
-	v.volumes[imageID] = storage.Volume{ID: imageID, Kind: storage.KindImage}
 	for i, namespace := range []string{"one", "two"} {
 		b := &v1alpha1.Blip{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "b", UID: types.UID("uid-b-" + namespace)},
 		}
-		b.Spec.Image = "img"
-		b.Status.ImageDigest = imageRef
+		b.Spec.State = "root"
 		b.Status.RootAttachmentID = []string{"r1", "r2"}[i]
 		v.blips = append(v.blips, b)
 		pod := vmPod("p", string(b.UID))
 		pod.Namespace = namespace
+		pod.UID = types.UID("poduid-p-" + namespace)
 		v.pods[podKey(namespace, "p")] = pod
 		v.dirs[podKey(namespace, "p")] = dir(podapi.PhaseWarm)
+		s := state("root")
+		s.Namespace, s.UID = namespace, types.UID("uid-root-"+namespace)
+		s.Status.Committed = &v1alpha1.Commit{ID: "c-" + namespace, Generation: 1}
+		s.Status.Writer = &v1alpha1.Writer{AttachmentID: b.Status.RootAttachmentID, PodUID: string(pod.UID), Node: self, BaseCommit: s.Status.Committed.ID}
+		v.states = append(v.states, s)
+		v.volumes[s.Status.Committed.ID] = commit(s.Status.Committed.ID, string(s.UID))
 	}
 
 	p := compute(v)
@@ -315,7 +417,7 @@ func TestSamePodNameDifferentNamespaces(t *testing.T) {
 	}
 
 	for i, namespace := range []string{"one", "two"} {
-		readyDev(v, v.dirs[podKey(namespace, "p")], storage.Volume{ID: []string{"r1", "r2"}[i]}, uint64(10+i))
+		readyDev(v, v.dirs[podKey(namespace, "p")], storage.Volume{ID: []string{"r1", "r2"}[i], StateUID: "uid-root-" + namespace}, uint64(10+i))
 	}
 	p = compute(v)
 	if len(p.desired) != 2 {
@@ -404,7 +506,7 @@ func TestFreezeDesired(t *testing.T) {
 	s.Status.Writer.PodName = "p"
 	d.observed.Phase = podapi.PhaseRunning
 	readyDev(v, d, storage.Volume{ID: "r1", StateUID: "uid-root"}, 7)
-	d.desired = &podapi.Desired{Claim: claimFor(b, disk("r1", false), nil)}
+	d.desired = &podapi.Desired{Claim: claimFor(b, disk("r1", false), nil, nil)}
 	v.freezes = map[string][]string{pkey("p"): {"r1"}}
 	if got := compute(v).desired[pkey("p")]; len(got.Freeze) != 1 || got.Freeze[0] != "r1" || got.Claim == nil {
 		t.Fatalf("freeze desired = %+v", got)

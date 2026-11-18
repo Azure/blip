@@ -17,14 +17,17 @@ import (
 type Entry struct {
 	ID, UID, Name, Parent string
 	Running               bool
+	ForkOnly              bool // shared or imported base; cannot run directly
+	Shared                bool // cannot be deleted by this owner
 }
 
-// Backend supplies states and change notifications. Create creates a new state
-// from the configured image. Notifications may be coalesced: each notification
+// Backend supplies states and change notifications. Create forks the configured
+// shared base. Notifications may be coalesced: each notification
 // prompts a fresh List, with at most one List call in flight.
 type Backend interface {
 	List(context.Context) ([]Entry, error)
 	Create(context.Context, string) (Entry, error)
+	Fork(context.Context, Entry, string) (Entry, error)
 	Delete(context.Context, Entry) error
 	// ValidateName reports whether name may be created, without side effects.
 	ValidateName(string) error
@@ -71,6 +74,7 @@ type Model struct {
 	mode         mode
 	input        textinput.Model
 	deleteTarget Entry
+	forkTarget   *Entry
 	busy         action
 	loading      bool
 	loaded       bool
@@ -261,9 +265,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.err, m.notice, m.busy = "", "", createAction
 				m.input.Blur()
-				ctx, backend := m.ctx, m.backend
+				ctx, backend, source := m.ctx, m.backend, m.forkTarget
 				return m, func() tea.Msg {
-					entry, err := backend.Create(ctx, name)
+					var entry Entry
+					var err error
+					if source != nil {
+						entry, err = backend.Fork(ctx, *source, name)
+					} else {
+						entry, err = backend.Create(ctx, name)
+					}
 					return createdMsg{entry: entry, err: err}
 				}
 			}
@@ -297,14 +307,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = min(max(0, len(m.rows)-1), m.cursor+max(1, m.listHeight()))
 			case "enter":
 				if entry, ok := m.current(); ok {
+					if entry.ForkOnly {
+						return m, m.beginCreate(&entry)
+					}
 					return m, m.connect(entry)
 				}
 			case "n":
-				m.mode, m.err, m.notice = creating, "", ""
-				m.input.Reset()
-				return m, m.input.Focus()
+				return m, m.beginCreate(nil)
+			case "f":
+				if entry, ok := m.current(); ok {
+					return m, m.beginCreate(&entry)
+				}
 			case "d":
 				if entry, ok := m.current(); ok {
+					if entry.Shared {
+						m.err = "Fork this base to create your own blip."
+						return m, nil
+					}
 					m.mode, m.deleteTarget, m.err = confirming, entry, ""
 				}
 			case "?":
@@ -322,6 +341,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 	return m, nil
+}
+
+func (m *Model) beginCreate(source *Entry) tea.Cmd {
+	m.mode, m.err, m.notice = creating, "", ""
+	m.forkTarget = source
+	m.input.Reset()
+	return m.input.Focus()
 }
 
 func (m *Model) connect(entry Entry) tea.Cmd {

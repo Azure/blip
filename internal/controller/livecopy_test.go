@@ -177,9 +177,11 @@ func TestWarmPodsPreferWritableMounts(t *testing.T) {
 	e.newPool("default", 3, 0)
 	e.run(e.pool, ns, "default")
 	e.warmOn("n1", "n2", "n3")
-	e.newBlip("b", withImage("reg/img:v1"), withMount("ro", "/ro", false), withMount("data", "/data", true))
+	e.newBlip("b", e.withImage("reg/img:v1"), e.withMount("ro", "/ro", false), e.withMount("data", "/data", true))
 
 	states := map[string]*v1.BlipState{"ro": e.getState("ro"), "data": e.getState("data")}
+	root := e.getState(e.getBlip("b").Spec.State)
+	states[root.Name] = root
 	pods := e.warmPods("b", states)
 	if len(pods) != 3 || pods[0].Spec.NodeName != "n3" {
 		t.Fatalf("warm pods %+v", pods)

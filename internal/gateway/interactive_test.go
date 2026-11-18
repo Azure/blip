@@ -163,7 +163,7 @@ func (s *interactiveSSH) create(t *testing.T, e *env, name string) {
 func sandboxResources(t *testing.T, e *env) ([]v1alpha1.BlipState, []v1alpha1.Blip) {
 	t.Helper()
 	var states v1alpha1.BlipStateList
-	if err := e.kube.List(context.Background(), &states, client.InNamespace(ns)); err != nil {
+	if err := e.kube.List(context.Background(), &states, client.InNamespace(ns), client.MatchingLabels{ownerLabel: "alice"}); err != nil {
 		t.Fatal(err)
 	}
 	var blips v1alpha1.BlipList
@@ -183,6 +183,9 @@ func assertNoSandboxes(t *testing.T, e *env) {
 
 func TestSSHInteractiveEmptyMenuDoesNotAllocate(t *testing.T) {
 	e := newEnv(t)
+	if err := e.kube.Delete(context.Background(), gatewayBase()); err != nil {
+		t.Fatal(err)
+	}
 	s := startInteractiveSSH(t, e, "dev")
 	s.output.waitFor(t, 0, menuLogoLine)
 	s.output.waitFor(t, 0, "No blips yet.")
@@ -208,14 +211,14 @@ func TestSSHInteractiveZeroSizePTYMenuUsable(t *testing.T) {
 	e := newEnv(t)
 	s := startInteractiveSSHSize(t, e, "dev", 0, 0)
 	s.output.waitFor(t, 0, menuLogoLine)
-	s.output.waitFor(t, 0, "No blips yet.")
+	s.output.waitFor(t, 0, "gateway-base")
 	mark := s.output.mark()
 	s.typeKeys(t, "n")
 	s.output.waitFor(t, mark, "Name:")
 	assertNoSandboxes(t, e)
 	mark = s.output.mark()
 	s.typeKeys(t, "\x1b")
-	s.output.waitFor(t, mark, "No blips yet.")
+	s.output.waitFor(t, mark, "gateway-base")
 	s.quit(t)
 	assertNoSandboxes(t, e)
 }
@@ -282,7 +285,7 @@ func TestSSHInteractiveCreateReturnAndReconnect(t *testing.T) {
 	}
 	s := startInteractiveSSH(t, e, "dev")
 	s.output.waitFor(t, 0, menuLogoLine)
-	s.output.waitFor(t, 0, "No blips yet.")
+	s.output.waitFor(t, 0, "gateway-base")
 	assertNoSandboxes(t, e)
 
 	const stateName = "alice.created"
@@ -301,7 +304,7 @@ func TestSSHInteractiveCreateReturnAndReconnect(t *testing.T) {
 			t.Fatalf("round %d: states=%d blips=%d, want one of each", i+1, len(states), len(blips))
 		}
 		if states[0].Name != stateName || states[0].Labels[ownerLabel] != "alice" ||
-			states[0].Spec.Image != e.srv.Image || states[0].Spec.CopyFrom != "" || blips[0].Spec.State != stateName {
+			states[0].Spec.Image != "" || states[0].Spec.CopyFrom != e.srv.BaseState || blips[0].Spec.State != stateName {
 			t.Fatalf("round %d: state=%+v blip=%+v", i+1, states[0], blips[0])
 		}
 		// Likewise, a reader left in the menu must not consume guest bytes.
@@ -362,7 +365,11 @@ func TestSSHInteractiveResizeAndHangup(t *testing.T) {
 					}
 				}
 			}
-			s := startInteractiveSSH(t, e, "unrelated")
+			selected := "unrelated"
+			if existing {
+				selected = "saved"
+			}
+			s := startInteractiveSSH(t, e, selected)
 			s.output.waitFor(t, 0, menuLogoLine)
 			if existing {
 				s.output.waitFor(t, 0, "saved")

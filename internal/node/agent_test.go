@@ -524,13 +524,13 @@ func waitIdle(t *testing.T, a *Agent) {
 // pod, and a later success clears it.
 func TestPrepareErrorAnnotation(t *testing.T) {
 	b := blip("b")
-	b.Spec.Image = "img"
-	b.Status.ImageDigest = imageRef
 	b.Status.RootAttachmentID = "r1"
 	pod := vmPod("p", string(b.UID))
-	a, st, _ := testAgent(t, pod, b)
-	st.add(storage.Volume{ID: imageID, Kind: storage.KindImage})
-	a.configs[imageID] = &image.Config{}
+	s := state("root")
+	s.Status.Committed = &v1alpha1.Commit{ID: "c1", Generation: 1}
+	s.Status.Writer = &v1alpha1.Writer{AttachmentID: "r1", PodUID: string(pod.UID), PodName: pod.Name, BlipUID: string(b.UID), Node: self, BaseCommit: "c1"}
+	a, st, _ := testAgent(t, pod, b, s)
+	st.add(commit("c1", string(s.UID)))
 	a.mknod = func(string, string) error { return nil }
 	podDir := a.podDirFor(podKey(ns, "p"))
 	if err := os.MkdirAll(podDir, 0o755); err != nil {

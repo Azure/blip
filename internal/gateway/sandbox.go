@@ -6,12 +6,14 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/workspace"
 )
 
 // ownerLabel records the owner a sandbox resource belongs to. The gateway only
@@ -65,7 +67,7 @@ func (s *Server) ensureSandbox(ctx context.Context, owner, name string) (string,
 			continue
 		case err != nil:
 			return "", err
-		case b.Labels[ownerLabel] != owner:
+		case !ownedResource(&b, owner):
 			return "", fmt.Errorf("sandbox %s is not owned by the authenticated owner", name)
 		case b.DeletionTimestamp == nil && finished(&b):
 			if recreated {
@@ -96,28 +98,35 @@ func (s *Server) ensureSandbox(ctx context.Context, owner, name string) (string,
 }
 
 func (s *Server) ensureState(ctx context.Context, owner, name string) error {
-	size := s.StateSize
 	key := client.ObjectKey{Namespace: s.Namespace, Name: name}
 	for {
-		st := &v1alpha1.BlipState{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace, Labels: map[string]string{ownerLabel: owner}},
-			Spec:       v1alpha1.BlipStateSpec{Image: s.Image, Size: &size},
-		}
-		err := s.Kube.Create(ctx, st)
-		if err == nil {
-			s.Log.Info("created sandbox state", "state", name, "image", s.Image)
-			return nil
-		}
-		if !apierrors.IsAlreadyExists(err) {
-			return err
-		}
-		if err := s.Kube.Get(ctx, key, st); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
+		var st v1alpha1.BlipState
+		if err := s.Kube.Get(ctx, key, &st); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
 			}
-			return err
+			source, err := s.baseState(ctx)
+			if err != nil {
+				return err
+			}
+			if _, err := s.forkState(ctx, owner, name, source, true); err != nil {
+				if !apierrors.IsAlreadyExists(err) {
+					return err
+				}
+				// A child-name conflict is not a root creation race. Only
+				// accept a concurrent fork when its root actually exists.
+				if getErr := s.Kube.Get(ctx, key, &st); getErr != nil {
+					if apierrors.IsNotFound(getErr) {
+						return err
+					}
+					return getErr
+				}
+			} else {
+				s.Log.Info("created sandbox state", "state", name, "base-state", s.BaseState)
+				return nil
+			}
 		}
-		if st.Labels[ownerLabel] != owner {
+		if !ownedResource(&st, owner) {
 			return fmt.Errorf("sandbox state %s is not owned by the authenticated owner", name)
 		}
 		if st.DeletionTimestamp != nil {
@@ -131,8 +140,96 @@ func (s *Server) ensureState(ctx context.Context, owner, name string) error {
 		if st.Status.Phase == v1alpha1.StateFailed {
 			return fmt.Errorf("sandbox state %s failed: %s", name, st.Status.Message)
 		}
+		if st.Spec.Image != "" {
+			return fmt.Errorf("sandbox state %s is an imported base; fork it before running", name)
+		}
 		return nil
 	}
+}
+
+func (s *Server) baseState(ctx context.Context) (*v1alpha1.BlipState, error) {
+	if s.BaseState == "" {
+		return nil, fmt.Errorf("sandbox base state is not configured")
+	}
+	var st v1alpha1.BlipState
+	if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: s.BaseState}, &st); err != nil {
+		return nil, err
+	}
+	if !sharedImage(&st) {
+		return nil, fmt.Errorf("sandbox base state %s is not a shared image import", st.Name)
+	}
+	return &st, nil
+}
+
+func (s *Server) forkState(ctx context.Context, owner, name string, source *v1alpha1.BlipState, fromBase bool) (*v1alpha1.BlipState, error) {
+	if err := validateForkState(source, owner); err != nil {
+		return nil, err
+	}
+	// Check every inherited reference before Fork creates any states. The
+	// controller permits owner-prefixed states and shared image imports only.
+	for _, m := range source.Spec.Mounts {
+		if m.BlipUID != "" {
+			continue
+		}
+		var mounted v1alpha1.BlipState
+		if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: m.State}, &mounted); err != nil {
+			return nil, fmt.Errorf("read inherited mount %s: %w", m.State, err)
+		}
+		if err := validateForkState(&mounted, owner); err != nil {
+			return nil, fmt.Errorf("inherited mount %s: %w", m.State, err)
+		}
+	}
+	// Apply the gateway default to the copied runtime, leaving explicit source
+	// defaults (including a zero timeout) authoritative for future executions.
+	source = source.DeepCopy()
+	if s.IdleTimeout > 0 {
+		if source.Spec.Runtime == nil {
+			source.Spec.Runtime = &v1alpha1.RuntimeDefaults{}
+		}
+		if source.Spec.Runtime.IdleTimeout == nil {
+			source.Spec.Runtime.IdleTimeout = &metav1.Duration{Duration: s.IdleTimeout}
+		}
+	}
+	dest := &v1alpha1.BlipState{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace, Labels: map[string]string{ownerLabel: owner}},
+	}
+	if fromBase {
+		dest.Spec.Size = s.baseForkSize(source)
+	}
+	if err := workspace.Fork(ctx, s.Kube, source, dest); err != nil {
+		return nil, err
+	}
+	return dest, nil
+}
+
+func validateForkState(st *v1alpha1.BlipState, owner string) error {
+	if !accessibleState(st, owner) {
+		return fmt.Errorf("state %s is not owned by %s with its name prefix or a shared image import", st.Name, owner)
+	}
+	if st.DeletionTimestamp != nil {
+		return fmt.Errorf("state %s is being deleted", st.Name)
+	}
+	if st.Status.Phase == v1alpha1.StateFailed && st.Status.Committed == nil && st.Status.Pending == nil {
+		return fmt.Errorf("state %s failed: %s", st.Name, st.Status.Message)
+	}
+	return nil
+}
+
+func (s *Server) baseForkSize(source *v1alpha1.BlipState) *resource.Quantity {
+	// A workspace fork always inherits its source size. New sandboxes may
+	// request extra space, but never shrink an import. If an import has not
+	// resolved its size yet, let the controller inherit it once available.
+	if s.StateSize.Sign() <= 0 || source.Spec.Size == nil && source.Status.SizeBytes <= 0 {
+		return nil
+	}
+	size := s.StateSize.DeepCopy()
+	if source.Spec.Size != nil && source.Spec.Size.Cmp(size) > 0 {
+		size = source.Spec.Size.DeepCopy()
+	}
+	if source.Status.SizeBytes > size.Value() {
+		size = *resource.NewQuantity(source.Status.SizeBytes, resource.BinarySI)
+	}
+	return &size
 }
 
 // waitStateGone waits until the state is deleted. A state that stops being
@@ -155,14 +252,10 @@ func (s *Server) waitStateGone(ctx context.Context, key client.ObjectKey) error 
 }
 
 func (s *Server) sandboxBlip(owner, name string) *v1alpha1.Blip {
-	b := &v1alpha1.Blip{
+	return &v1alpha1.Blip{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace, Labels: map[string]string{ownerLabel: owner}},
 		Spec:       v1alpha1.BlipSpec{Pool: s.Pool, State: name},
 	}
-	if s.IdleTimeout > 0 {
-		b.Spec.IdleTimeout = &metav1.Duration{Duration: s.IdleTimeout}
-	}
-	return b
 }
 
 // waitChange returns when the blip's resource version differs from rv or the

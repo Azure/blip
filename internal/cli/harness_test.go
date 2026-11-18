@@ -12,6 +12,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -32,6 +33,36 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, objs ...client.Object) *harness {
+	// Running execution fixtures carry their initial mounts in status. Put
+	// that configuration on a durable root unless a test supplied one.
+	states := map[string]*v1alpha1.BlipState{}
+	for _, obj := range objs {
+		if st, ok := obj.(*v1alpha1.BlipState); ok {
+			states[st.Name] = st
+		}
+	}
+	for _, obj := range objs {
+		b, ok := obj.(*v1alpha1.Blip)
+		if !ok || b.Status.Phase != v1alpha1.BlipRunning || b.Spec.State == "" {
+			continue
+		}
+		root := states[b.Spec.State]
+		if root == nil {
+			root = readyState(b.Spec.State)
+			root.Labels = b.Labels
+			states[root.Name] = root
+			objs = append(objs, root)
+		}
+		if len(root.Spec.Mounts) == 0 {
+			for _, mount := range b.Status.Mounts {
+				root.Spec.Mounts = append(root.Spec.Mounts, v1alpha1.Mount{State: mount.State, Path: mount.Path, Writable: mount.Writable})
+			}
+		}
+		if root.Status.Writer == nil {
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Status.Phase = v1alpha1.StateInUse
+		}
+	}
 	for _, pool := range []string{"default", "big"} {
 		objs = append(objs, &v1alpha1.BlipPool{ObjectMeta: metav1.ObjectMeta{Name: pool, Namespace: ns}})
 	}
@@ -86,6 +117,11 @@ func (h *harness) blip(name string) *v1alpha1.Blip {
 	return &b
 }
 
+func (h *harness) rootState(name string) *v1alpha1.BlipState {
+	h.t.Helper()
+	return h.state(h.blip(name).Spec.State)
+}
+
 // apply creates an object as `kubectl apply` would.
 func (h *harness) apply(obj client.Object) {
 	h.t.Helper()
@@ -95,9 +131,8 @@ func (h *harness) apply(obj client.Object) {
 }
 
 func runningBlip(name string, mounts ...v1alpha1.Mount) *v1alpha1.Blip {
-	b := &v1alpha1.Blip{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
-	b.Spec.Image = "img"
-	b.Spec.Mounts = mounts
+	b := &v1alpha1.Blip{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID("uid-" + name)}}
+	b.Spec.State = name + "-root"
 	b.Status.Phase = v1alpha1.BlipRunning
 	b.Status.Pod = "pod-" + name
 	for _, m := range mounts {
@@ -207,7 +242,15 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 		st.ExitCode = &code
 		return true
 	}
-	for _, m := range b.Spec.Mounts {
+	var root v1alpha1.BlipState
+	_ = c.kube.Get(context.Background(), client.ObjectKey{Namespace: b.Namespace, Name: b.Spec.State}, &root)
+	var mounts []v1alpha1.Mount
+	for _, m := range root.Spec.Mounts {
+		if m.BlipUID == "" || m.BlipUID == string(b.UID) {
+			mounts = append(mounts, m)
+		}
+	}
+	for _, m := range mounts {
 		if findMount(st.Mounts, m.State) == nil {
 			ms := v1alpha1.MountStatus{State: m.State, Path: m.Path, Writable: m.Writable, Phase: v1alpha1.MountPending}
 			if !m.Writable {
@@ -223,7 +266,7 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 	}
 	for i := range st.Mounts {
 		m := &st.Mounts[i]
-		sm := specMount(b.Spec.Mounts, m.State)
+		sm := specMount(mounts, m.State)
 		switch {
 		case sm != nil && m.Phase == v1alpha1.MountMounted && (sm.Path != m.Path || sm.Writable != m.Writable):
 			m.Phase, m.Switching = v1alpha1.MountUnmounting, true
@@ -263,7 +306,7 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 	for i := range st.Mounts {
 		m := &st.Mounts[i]
 		inSpec := false
-		for _, sm := range b.Spec.Mounts {
+		for _, sm := range mounts {
 			inSpec = inSpec || sm.State == m.State
 		}
 		switch {

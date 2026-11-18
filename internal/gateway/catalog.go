@@ -17,10 +17,7 @@ import (
 	"github.com/Azure/blip/internal/gateway/menu"
 )
 
-const (
-	catalogOwnerIndex = "owner"
-	catalogStateIndex = "state"
-)
+const catalogOwnerIndex = "owner"
 
 // Catalog shares two namespace-wide informers across every menu session. Cached
 // objects are only used for display; actions recheck ownership against the API.
@@ -46,23 +43,7 @@ func NewCatalog(kube client.WithWatch, namespace string) *Catalog {
 	}), &v1alpha1.BlipState{}, 0, cache.Indexers{catalogOwnerIndex: ownerIndex})
 	c.blips = cache.NewSharedIndexInformer(catalogListWatch(kube, namespace, func() client.ObjectList {
 		return &v1alpha1.BlipList{}
-	}), &v1alpha1.Blip{}, 0, cache.Indexers{
-		catalogOwnerIndex: ownerIndex,
-		catalogStateIndex: func(obj any) ([]string, error) {
-			b := obj.(*v1alpha1.Blip)
-			var names []string
-			if b.Spec.State != "" {
-				names = append(names, b.Spec.State)
-			}
-			for _, m := range b.Spec.Mounts {
-				names = append(names, m.State)
-			}
-			for _, m := range b.Status.Mounts {
-				names = append(names, m.State)
-			}
-			return names, nil
-		},
-	})
+	}), &v1alpha1.Blip{}, 0, cache.Indexers{catalogOwnerIndex: ownerIndex})
 	handler := cache.ResourceEventHandlerFuncs{
 		AddFunc: c.changed,
 		UpdateFunc: func(old, next any) {
@@ -136,10 +117,17 @@ func (c *Catalog) changed(obj any) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for ch := range c.subs[o.GetLabels()[ownerLabel]] {
-		select {
-		case ch <- struct{}{}:
-		default:
+	owner := o.GetLabels()[ownerLabel]
+	_, isState := o.(*v1alpha1.BlipState)
+	for subscriber, channels := range c.subs {
+		if subscriber != owner && !(isState && owner == "") {
+			continue
+		}
+		for ch := range channels {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
@@ -172,17 +160,27 @@ func (c *Catalog) Subscribe(owner string) (<-chan struct{}, func()) {
 }
 
 func ownedResource(obj client.Object, owner string) bool {
-	// Existing CLI workers and states can predate owner-prefixed naming. The
-	// live owner label is authoritative; only creation imposes the prefix.
-	return owner != "" && obj.GetLabels()[ownerLabel] == owner
+	return owner != "" && obj.GetLabels()[ownerLabel] == owner && strings.HasPrefix(obj.GetName(), owner+".")
+}
+
+func sharedImage(st *v1alpha1.BlipState) bool {
+	return st.Labels[ownerLabel] == "" && st.Spec.Image != ""
+}
+
+func accessibleState(st *v1alpha1.BlipState, owner string) bool {
+	return ownedResource(st, owner) || sharedImage(st)
 }
 
 func stateEntry(st *v1alpha1.BlipState, owner string) menu.Entry {
-	return menu.Entry{ID: st.Name, UID: string(st.UID), Name: strings.TrimPrefix(st.Name, owner+".")}
+	return menu.Entry{
+		ID: st.Name, UID: string(st.UID), Name: strings.TrimPrefix(st.Name, owner+"."),
+		ForkOnly: !ownedResource(st, owner) || st.Spec.Image != "",
+		Shared:   !ownedResource(st, owner),
+	}
 }
 
-// List returns only this owner's states, including CLI-created copies. Missing
-// or inaccessible parents leave their children at the top level.
+// List returns this owner's states and shared fork sources. Missing or
+// inaccessible parents leave their children at the top level.
 func (c *Catalog) List(owner string) ([]menu.Entry, error) {
 	if !c.states.HasSynced() || !c.blips.HasSynced() {
 		return nil, fmt.Errorf("sandbox catalog is not ready")
@@ -196,12 +194,21 @@ func (c *Catalog) List(owner string) ([]menu.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
+	shared, err := c.states.GetIndexer().ByIndex(catalogOwnerIndex, "")
+	if err != nil {
+		return nil, err
+	}
+	objects = append(objects, shared...)
 	states := make(map[string]*v1alpha1.BlipState, len(objects))
 	for _, obj := range objects {
 		st := obj.(*v1alpha1.BlipState)
-		if ownedResource(st, owner) && st.DeletionTimestamp == nil {
+		if accessibleState(st, owner) && st.DeletionTimestamp == nil {
 			states[st.Name] = st
 		}
+	}
+	blips, err := c.blips.GetIndexer().ByIndex(catalogOwnerIndex, owner)
+	if err != nil {
+		return nil, err
 	}
 	entries := make([]menu.Entry, 0, len(states))
 	for _, st := range states {
@@ -209,13 +216,10 @@ func (c *Catalog) List(owner string) ([]menu.Entry, error) {
 		if parent := states[st.Spec.CopyFrom]; parent != nil && parent.Name != st.Name {
 			e.Parent = parent.Name
 		}
-		blips, err := c.blips.GetIndexer().ByIndex(catalogStateIndex, st.Name)
-		if err != nil {
-			return nil, err
-		}
 		for _, obj := range blips {
 			b := obj.(*v1alpha1.Blip)
-			if ownedResource(b, owner) && runningBlip(b) && stateAttached(b, st) {
+			root := states[b.Spec.State]
+			if !e.ForkOnly && ownedResource(b, owner) && runningBlip(b) && stateAttached(b, root, st) {
 				e.Running = true
 				break
 			}
@@ -232,11 +236,11 @@ func runningBlip(b *v1alpha1.Blip) bool {
 
 // writesState describes desired use, including mounts that have not attached
 // yet. Such a worker must be waited for rather than replaced by a new sandbox.
-func writesState(b *v1alpha1.Blip, st *v1alpha1.BlipState) bool {
+func writesState(b *v1alpha1.Blip, root, st *v1alpha1.BlipState) bool {
 	if b.Spec.State == st.Name {
 		return true
 	}
-	for _, m := range b.Spec.Mounts {
+	for _, m := range desiredMounts(b, root) {
 		if m.State == st.Name && m.Writable {
 			return true
 		}
@@ -246,8 +250,8 @@ func writesState(b *v1alpha1.Blip, st *v1alpha1.BlipState) bool {
 
 // stateAttached confirms that the selected filesystem is available in this
 // worker. A Running Blip can still be acquiring or unmounting a dynamic mount.
-func stateAttached(b *v1alpha1.Blip, st *v1alpha1.BlipState) bool {
-	if !writesState(b, st) {
+func stateAttached(b *v1alpha1.Blip, root, st *v1alpha1.BlipState) bool {
+	if !writesState(b, root, st) {
 		return false
 	}
 	w := st.Status.Writer
@@ -257,18 +261,18 @@ func stateAttached(b *v1alpha1.Blip, st *v1alpha1.BlipState) bool {
 	if b.Spec.State == st.Name {
 		return b.Status.RootAttachmentID == "" || w != nil && w.AttachmentID == b.Status.RootAttachmentID
 	}
-	m := selectedMountStatus(b, st)
+	m := selectedMountStatus(b, root, st)
 	return m != nil && m.StateUID != "" && m.StateUID == string(st.UID) && m.Phase == v1alpha1.MountMounted
 }
 
 // selectedMountStatus ignores an old path, access mode, or state incarnation.
 // A failed acquisition can have no UID yet, so callers deciding readiness must
 // additionally require the selected UID, while errors can still be surfaced.
-func selectedMountStatus(b *v1alpha1.Blip, st *v1alpha1.BlipState) *v1alpha1.MountStatus {
+func selectedMountStatus(b *v1alpha1.Blip, root, st *v1alpha1.BlipState) *v1alpha1.MountStatus {
 	if b.Spec.State == st.Name {
 		return nil
 	}
-	for _, desired := range b.Spec.Mounts {
+	for _, desired := range desiredMounts(b, root) {
 		if desired.State != st.Name || !desired.Writable {
 			continue
 		}
@@ -281,4 +285,17 @@ func selectedMountStatus(b *v1alpha1.Blip, st *v1alpha1.BlipState) *v1alpha1.Mou
 		}
 	}
 	return nil
+}
+
+func desiredMounts(b *v1alpha1.Blip, root *v1alpha1.BlipState) []v1alpha1.Mount {
+	if root == nil || root.Name != b.Spec.State {
+		return nil
+	}
+	var mounts []v1alpha1.Mount
+	for _, m := range root.Spec.Mounts {
+		if m.BlipUID == "" || m.BlipUID == string(b.UID) {
+			mounts = append(mounts, m)
+		}
+	}
+	return mounts
 }

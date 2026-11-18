@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -17,6 +18,8 @@ import (
 func writerBlocked(st *v1.BlipState) string {
 	s := st.Status
 	switch {
+	case st.Spec.Image != "":
+		return "is an immutable image template; fork it before writing"
 	case st.DeletionTimestamp != nil:
 		return "is being deleted"
 	case s.Committed == nil:
@@ -48,6 +51,9 @@ func (r *BlipReconciler) acquire(ctx context.Context, b *v1.Blip, states map[str
 	}
 	for _, n := range names {
 		st := states[n]
+		if msg := mountStateError(b, st, true); msg != "" {
+			return nil, msg, giveUp()
+		}
 		if w := st.Status.Writer; w != nil && w.BlipUID == string(b.UID) {
 			ids[n] = w.AttachmentID
 			continue
@@ -81,6 +87,60 @@ func setWriterPod(w *v1.Writer, name, uid, node string) {
 	w.PodName, w.PodUID, w.Node = name, uid, node
 }
 
+// releaseUnpublished runs only at the start of the owner's serialized Blip
+// reconcile. The state reconciler cannot release these reservations: another
+// root edit can arrive while this Blip is between acquiring and publishing one.
+func (r *BlipReconciler) releaseUnpublished(ctx context.Context, b *v1.Blip) error {
+	live := r.Live
+	if live == nil {
+		live = r.Client
+	}
+	fresh := &v1.Blip{}
+	if err := live.Get(ctx, client.ObjectKeyFromObject(b), fresh); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if fresh.UID != b.UID {
+		return nil
+	}
+	published := map[string]bool{fresh.Status.RootAttachmentID: true}
+	for _, m := range fresh.Status.Mounts {
+		published[m.AttachmentID] = true
+	}
+	wanted := map[string]bool{}
+	if fresh.Spec.State != "" && !finished(fresh) && !stopping(fresh) && fresh.Status.Phase != v1.BlipSaving {
+		root := &v1.BlipState{}
+		err := live.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: fresh.Spec.State}, root)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		if err == nil && root.DeletionTimestamp == nil {
+			wanted[root.Name] = true
+			for _, m := range desiredMounts(root, fresh) {
+				if m.Writable {
+					wanted[m.State] = true
+				}
+			}
+		}
+	}
+	var states v1.BlipStateList
+	if err := live.List(ctx, &states, client.InNamespace(b.Namespace)); err != nil {
+		return err
+	}
+	for i := range states.Items {
+		st := &states.Items[i]
+		w := st.Status.Writer
+		if w == nil || w.BlipUID != string(b.UID) || published[w.AttachmentID] || wanted[st.Name] {
+			continue
+		}
+		base := st.DeepCopy()
+		st.Status.Writer = nil
+		if err := patchStatus(ctx, r.Client, st, base); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+	}
+	return nil
+}
+
 // releaseWriter clears the writer slot if blip holds it and no pod uses it.
 // Once a pod has the slot only the node's seal (or node deletion) ends it.
 func releaseWriter(ctx context.Context, c client.Client, st *v1.BlipState, blip types.UID) error {
@@ -96,15 +156,15 @@ func releaseWriter(ctx context.Context, c client.Client, st *v1.BlipState, blip 
 // releaseHeld releases every slot the Blip holds without a pod, except on
 // states in keep.
 func (r *BlipReconciler) releaseHeld(ctx context.Context, b *v1.Blip, keep ...string) error {
-	for _, n := range stateRefs(b) {
-		if slices.Contains(keep, n) {
-			continue
-		}
-		st := &v1.BlipState{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: n}, st); err != nil {
-			if client.IgnoreNotFound(err) != nil {
-				return err
-			}
+	// Include unpublished reservations left by an interrupted acquisition,
+	// even when the root profile no longer references the state.
+	var states v1.BlipStateList
+	if err := r.List(ctx, &states, client.InNamespace(b.Namespace)); err != nil {
+		return err
+	}
+	for i := range states.Items {
+		st := &states.Items[i]
+		if slices.Contains(keep, st.Name) {
 			continue
 		}
 		if err := releaseWriter(ctx, r.Client, st, b.UID); err != nil {

@@ -22,7 +22,7 @@ import (
 // Config is the gateway's sandbox configuration.
 type Config struct {
 	Namespace   string
-	Image       string
+	BaseState   string
 	Pool        string
 	StateSize   resource.Quantity
 	IdleTimeout time.Duration

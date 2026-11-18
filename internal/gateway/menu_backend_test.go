@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/gateway/menu"
 	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/session/fakeguest"
 	"github.com/Azure/blip/internal/wire"
@@ -36,13 +38,13 @@ func backendServer(t *testing.T, kube client.WithWatch) *Server {
 		},
 	})
 	return &Server{
-		Config: Config{Namespace: ns, Image: "registry/configured:1", Pool: "small", StateSize: resource.MustParse("20Gi")},
+		Config: Config{Namespace: ns, BaseState: "gateway-base", Pool: "small", StateSize: resource.MustParse("20Gi")},
 		Kube:   kube, Catalog: startCatalog(t, kube),
 	}
 }
 
 func TestMenuBackendCreate(t *testing.T) {
-	s := backendServer(t, catalogClient(t, catalogState("alice", "existing", ""), catalogBlip("alice", "worker", "", v1alpha1.BlipPending)))
+	s := backendServer(t, catalogClient(t, gatewayBase(), catalogState("alice", "existing", ""), catalogBlip("alice", "worker", "", v1alpha1.BlipPending)))
 	b := s.menuBackend("alice")
 	ctx := context.Background()
 	for _, name := range []string{"", "Upper", "../other", "a.b", strings.Repeat("a", 64), "existing", "worker"} {
@@ -54,14 +56,14 @@ func TestMenuBackendCreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.ID != "alice.new" || e.Name != "new" || e.UID == "" || e.Parent != "" || e.Running {
+	if e.ID != "alice.new" || e.Name != "new" || e.UID == "" || e.Parent != s.BaseState || e.Running || e.ForkOnly {
 		t.Fatalf("created entry = %#v", e)
 	}
 	var st v1alpha1.BlipState
 	if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: e.ID}, &st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Spec.Image != s.Image || st.Spec.CopyFrom != "" || st.Spec.Size == nil || !st.Spec.Size.Equal(s.StateSize) || st.Labels[ownerLabel] != "alice" {
+	if st.Spec.Image != "" || st.Spec.CopyFrom != s.BaseState || st.Spec.Size == nil || !st.Spec.Size.Equal(s.StateSize) || st.Labels[ownerLabel] != "alice" || len(st.OwnerReferences) != 0 {
 		t.Fatalf("created state = %#v", st)
 	}
 	if err := s.Kube.Get(ctx, client.ObjectKeyFromObject(&st), &v1alpha1.Blip{}); !apierrors.IsNotFound(err) {
@@ -78,25 +80,121 @@ func TestMenuBackendCreate(t *testing.T) {
 	})
 }
 
+func TestMenuBackendForkCopiesWorkspace(t *testing.T) {
+	for _, explicitIdle := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit-idle=%t", explicitIdle), func(t *testing.T) {
+			source := catalogState("alice", "source", "gateway-base")
+			source.Spec.Runtime = &v1alpha1.RuntimeDefaults{
+				Env:        []v1alpha1.EnvVar{{Name: "WORKSPACE", Value: "inherited"}},
+				WorkingDir: "/work", User: "1000", Network: &v1alpha1.NetworkPolicy{},
+			}
+			if explicitIdle {
+				source.Spec.Runtime.IdleTimeout = &metav1.Duration{} // explicit zero wins
+			}
+			data := catalogState("alice", "data", "gateway-base")
+			tools := gatewayBase()
+			tools.Name = "shared-tools"
+			source.Spec.Mounts = []v1alpha1.Mount{
+				{State: data.Name, Path: "/work", Writable: true},
+				{State: "shared-tools", Path: "/tools"},
+				{State: "temporary", Path: "/tmp/work", Writable: true, BlipUID: "old-worker"},
+			}
+			s := backendServer(t, catalogClient(t, source, data, tools))
+			s.IdleTimeout = time.Minute
+			ctx := context.Background()
+			entry, err := s.menuBackend("alice").Fork(ctx, stateEntry(source, "alice"), "fork")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var root v1alpha1.BlipState
+			if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: entry.ID}, &root); err != nil {
+				t.Fatal(err)
+			}
+			wantRuntime := source.Spec.Runtime.DeepCopy()
+			if !explicitIdle {
+				wantRuntime.IdleTimeout = &metav1.Duration{Duration: time.Minute}
+			}
+			if root.Spec.Image != "" || root.Spec.CopyFrom != source.Name || root.Spec.Size != nil || len(root.OwnerReferences) != 0 || !reflect.DeepEqual(root.Spec.Runtime, wantRuntime) {
+				t.Fatalf("fork configuration: %#v", root)
+			}
+			if len(root.Spec.Mounts) != 2 || root.Spec.Mounts[0].State == data.Name || root.Spec.Mounts[1] != source.Spec.Mounts[1] {
+				t.Fatalf("fork mounts: %#v", root.Spec.Mounts)
+			}
+			var child v1alpha1.BlipState
+			if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: root.Spec.Mounts[0].State}, &child); err != nil {
+				t.Fatal(err)
+			}
+			if child.Spec.CopyFrom != data.Name || child.Labels[ownerLabel] != "alice" || len(child.OwnerReferences) != 0 {
+				t.Fatalf("writable mount was not copied independently: %#v", child)
+			}
+			var liveSource v1alpha1.BlipState
+			if err := s.Kube.Get(ctx, client.ObjectKeyFromObject(source), &liveSource); err != nil || !reflect.DeepEqual(liveSource.Spec, source.Spec) {
+				t.Fatalf("fork changed the shared source: %v", err)
+			}
+			if b := s.sandboxBlip("alice", root.Name); b.Spec.IdleTimeout != nil {
+				t.Fatal("execution overrides the durable runtime default")
+			}
+		})
+	}
+}
+
+func TestMenuBackendSharedAndImportedStatesRequireFork(t *testing.T) {
+	for _, owner := range []string{"", "alice", "bob"} {
+		t.Run("owner="+owner, func(t *testing.T) {
+			st := gatewayBase()
+			if owner != "" {
+				st.Labels = map[string]string{ownerLabel: owner}
+				st.Name = owner + ".base"
+			}
+			s := backendServer(t, catalogClient(t, st))
+			entry := stateEntry(st, "alice")
+			// The cached menu flag is only presentation; the API enforces this.
+			entry.ForkOnly = false
+			if _, err := s.startSelectedState(context.Background(), "alice", entry); err == nil {
+				t.Fatal("imported/shared state was run writable")
+			}
+			if owner != "alice" {
+				if err := s.menuBackend("alice").Delete(context.Background(), entry); err == nil {
+					t.Fatal("unowned state was deleted")
+				}
+			}
+			_, err := s.menuBackend("alice").Fork(context.Background(), entry, "fork")
+			if (err != nil) != (owner == "bob") {
+				t.Fatalf("fork owner %q: %v", owner, err)
+			}
+		})
+	}
+}
+
+func TestMenuBackendForkRejectsReplacedSource(t *testing.T) {
+	st := gatewayBase()
+	s := backendServer(t, catalogClient(t, st))
+	entry := menu.Entry{ID: st.Name, UID: "previous-base", ForkOnly: true}
+	if _, err := s.menuBackend("alice").Fork(context.Background(), entry, "fork"); err == nil {
+		t.Fatal("fork accepted a stale source selection")
+	}
+	var list v1alpha1.BlipStateList
+	if err := s.Kube.List(context.Background(), &list); err != nil || len(list.Items) != 1 {
+		t.Fatalf("stale fork created states: %v, %v", list.Items, err)
+	}
+}
+
 func TestMenuBackendDeleteAssociationsPreservesOthers(t *testing.T) {
 	st := catalogState("alice", "home", "")
 	st.Finalizers = []string{"blip.dev/test"}
 	root := catalogBlip("alice", "root-worker", st.Name, v1alpha1.BlipRunning)
 	writer := catalogBlip("alice", "mount-worker", "", v1alpha1.BlipRunning)
-	writer.Spec.Mounts = []v1alpha1.Mount{{State: st.Name, Path: "/work", Writable: true}}
+	writerRoot := mountRoot(writer, v1alpha1.Mount{State: st.Name, Path: "/work", Writable: true})
 	writer.Status.Mounts = []v1alpha1.MountStatus{{State: st.Name, StateUID: string(st.UID), Path: "/work", Writable: true, Phase: v1alpha1.MountMounted}}
 	reader := catalogBlip("alice", "reader", "", v1alpha1.BlipRunning)
-	reader.Spec.Mounts = []v1alpha1.Mount{{State: st.Name, Path: "/work"}}
-	reader.Status.Mounts = []v1alpha1.MountStatus{{State: st.Name, StateUID: string(st.UID), Path: "/work", Phase: v1alpha1.MountMounted}}
+	readerRoot := mountRoot(reader, v1alpha1.Mount{State: st.Name, Path: "/work"})
 	saving := catalogBlip("alice", "saving", "", v1alpha1.BlipSaving)
 	saving.Status.Mounts = []v1alpha1.MountStatus{{State: st.Name, StateUID: string(st.UID)}}
-	owner := catalogBlip("alice", "owner", "", v1alpha1.BlipSucceeded)
-	st.OwnerReferences = []metav1.OwnerReference{{APIVersion: v1alpha1.GroupVersion.String(), Kind: "Blip", Name: owner.Name, UID: owner.UID}}
 	foreign := catalogBlip("bob", "foreign", st.Name, v1alpha1.BlipRunning)
 	unrelated := catalogBlip("alice", "home", "alice.other", v1alpha1.BlipRunning)
 	child := catalogState("alice", "child", st.Name)
-	objects := []client.Object{st, root, writer, reader, saving, owner, foreign, unrelated, child}
-	for _, b := range []*v1alpha1.Blip{root, writer, reader, saving, owner} {
+	objects := []client.Object{st, root, writer, reader, saving, foreign, unrelated, child, writerRoot, readerRoot}
+	for _, b := range []*v1alpha1.Blip{root, writer, reader, saving} {
 		b.Finalizers = []string{"blip.dev/test"}
 	}
 	var deletes int
@@ -115,15 +213,15 @@ func TestMenuBackendDeleteAssociationsPreservesOthers(t *testing.T) {
 	if err := s.menuBackend("alice").Delete(context.Background(), stateEntry(st, "alice")); err != nil {
 		t.Fatal(err)
 	}
-	if deletes != 6 {
-		t.Fatalf("deleted %d resources, want state plus five associated Blips", deletes)
+	if deletes != 5 {
+		t.Fatalf("deleted %d resources, want state plus four associated Blips", deletes)
 	}
 	for _, obj := range objects {
 		live := obj.DeepCopyObject().(client.Object)
 		if err := s.Kube.Get(context.Background(), client.ObjectKeyFromObject(obj), live); err != nil {
 			t.Fatalf("finalized resource prematurely removed: %s: %v", obj.GetName(), err)
 		}
-		shouldDelete := obj != foreign && obj != unrelated && obj != child
+		shouldDelete := obj == st || obj == root || obj == writer || obj == reader || obj == saving
 		if (live.GetDeletionTimestamp() != nil) != shouldDelete {
 			t.Errorf("resource %s deletion = %v, want %v", obj.GetName(), live.GetDeletionTimestamp(), shouldDelete)
 		}
@@ -191,17 +289,14 @@ func TestOpenStateTargetsRunningWorkersByReference(t *testing.T) {
 	for _, mount := range []bool{false, true} {
 		t.Run(fmt.Sprintf("mount=%t", mount), func(t *testing.T) {
 			st := catalogState("alice", "fork", "alice.home")
-			st.Name = "legacy-fork"
 			worker := catalogBlip("alice", "worker", st.Name, v1alpha1.BlipRunning)
-			worker.Name = "legacy-worker"
+			objects := []client.Object{st, worker}
 			if mount {
-				worker.Spec.State = ""
-				worker.Spec.Mounts = []v1alpha1.Mount{{State: st.Name, Path: "/work", Writable: true}}
+				objects = append(objects, mountRoot(worker, v1alpha1.Mount{State: st.Name, Path: "/work", Writable: true}))
 				worker.Status.Mounts = []v1alpha1.MountStatus{{State: st.Name, StateUID: string(st.UID), Path: "/work", Writable: true, Phase: v1alpha1.MountMounted}}
 			}
-			st.OwnerReferences = []metav1.OwnerReference{{APIVersion: v1alpha1.GroupVersion.String(), Kind: "Blip", Name: worker.Name, UID: worker.UID}}
 			st.Status.Writer = &v1alpha1.Writer{BlipName: worker.Name, BlipUID: string(worker.UID)}
-			s := backendServer(t, catalogClient(t, st, worker))
+			s := backendServer(t, catalogClient(t, objects...))
 			guest := &fakeguest.Guest{}
 			var sessionCtx context.Context
 			s.Sessions = &session.Client{Connect: func(ctx context.Context, namespace, pod string) (io.ReadWriteCloser, error) {
@@ -227,10 +322,7 @@ func TestOpenStateTargetsRunningWorkersByReference(t *testing.T) {
 
 func TestOpenStateRetryReusesOpenID(t *testing.T) {
 	st := catalogState("alice", "fork", "alice.home")
-	st.Name = "legacy-fork"
 	worker := catalogBlip("alice", "worker", st.Name, v1alpha1.BlipRunning)
-	worker.Name = "legacy-worker"
-	st.OwnerReferences = []metav1.OwnerReference{{APIVersion: v1alpha1.GroupVersion.String(), Kind: "Blip", Name: worker.Name, UID: worker.UID}}
 	st.Status.Writer = &v1alpha1.Writer{BlipName: worker.Name, BlipUID: string(worker.UID)}
 	s := backendServer(t, catalogClient(t, st, worker))
 	guest := &fakeguest.Guest{}
@@ -278,14 +370,14 @@ func TestOpenStateWaitsForMountReadiness(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			st := catalogState("alice", "fork", "alice.home")
 			worker := catalogBlip("alice", "worker", "", v1alpha1.BlipRunning)
-			worker.Spec.Mounts = []v1alpha1.Mount{{State: st.Name, Path: "/work", Writable: true}}
+			root := mountRoot(worker, v1alpha1.Mount{State: st.Name, Path: "/work", Writable: true})
 			mount := v1alpha1.MountStatus{State: st.Name, StateUID: string(st.UID), Path: "/work", Writable: true, Phase: tt.initial}
 			if tt.initial != "" {
 				worker.Status.Mounts = []v1alpha1.MountStatus{mount}
 			}
 			var started atomic.Bool
 			listed := make(chan struct{}, 1)
-			kube := interceptor.NewClient(catalogClient(t, st, worker), interceptor.Funcs{
+			kube := interceptor.NewClient(catalogClient(t, st, worker, root), interceptor.Funcs{
 				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 					err := c.List(ctx, list, opts...)
 					if started.Load() {
@@ -299,7 +391,7 @@ func TestOpenStateWaitsForMountReadiness(t *testing.T) {
 			})
 			s := backendServer(t, kube)
 			entries, err := s.Catalog.List("alice")
-			if err != nil || len(entries) != 1 || entries[0].Running {
+			if err != nil || len(entries) != 2 || entries[0].Running {
 				t.Fatalf("unattached state has Running badge: %v, %v", entries, err)
 			}
 			changes, unsubscribe := s.Catalog.Subscribe("alice")
@@ -351,7 +443,7 @@ func TestOpenStateWaitsForMountReadiness(t *testing.T) {
 				t.Fatal("mount update did not wake startup")
 			}
 			entries, err = s.Catalog.List("alice")
-			if err != nil || len(entries) != 1 || entries[0].Running != (tt.next == v1alpha1.MountMounted) {
+			if err != nil || len(entries) != 2 || entries[0].Running != (tt.next == v1alpha1.MountMounted) {
 				t.Fatalf("updated mount badge incorrect: %v, %v", entries, err)
 			}
 		})
@@ -379,26 +471,34 @@ func TestOpenStateWaitsForCurrentRootAttachment(t *testing.T) {
 	}
 }
 
-func TestOpenStatePreservesFinishedWorkerForks(t *testing.T) {
+func TestOpenStateRestartsFinishedWorkerForks(t *testing.T) {
 	for _, mount := range []bool{false, true} {
 		t.Run(fmt.Sprintf("mount=%t", mount), func(t *testing.T) {
 			st := catalogState("alice", "worker", "alice.home")
 			worker := catalogBlip("alice", "worker", st.Name, v1alpha1.BlipSucceeded)
+			worker.Spec.Command = []string{"true"}
+			objects := []client.Object{st, worker}
 			if mount {
-				worker.Spec.State = ""
-				worker.Spec.Mounts = []v1alpha1.Mount{{State: st.Name, Writable: true}}
+				objects = append(objects, mountRoot(worker, v1alpha1.Mount{State: st.Name, Path: "/work", Writable: true}))
 			}
-			st.OwnerReferences = []metav1.OwnerReference{{APIVersion: v1alpha1.GroupVersion.String(), Kind: "Blip", Name: worker.Name, UID: worker.UID}}
-			s := backendServer(t, catalogClient(t, st, worker))
-			_, err := s.openState(context.Background(), "alice", stateEntry(st, "alice"), wire.Open{Mode: wire.OpenExec})
-			if err == nil || !strings.Contains(err.Error(), "preserved") {
-				t.Fatalf("expected preserved-worker error: %v", err)
+			kube := interceptor.NewClient(catalogClient(t, objects...), interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					b, ok := obj.(*v1alpha1.Blip)
+					if !ok || b.Spec.State != st.Name || len(b.Spec.Command) != 0 {
+						t.Fatalf("unexpected restart: %#v", obj)
+					}
+					b.Status = v1alpha1.BlipStatus{Phase: v1alpha1.BlipRunning, Pod: "restarted"}
+					return c.Create(ctx, obj, opts...)
+				},
+			})
+			s := backendServer(t, kube)
+			pod, err := s.startSelectedState(context.Background(), "alice", stateEntry(st, "alice"))
+			if err != nil || pod != "restarted" {
+				t.Fatalf("restart: pod=%q err=%v", pod, err)
 			}
-			for _, obj := range []client.Object{st, worker} {
-				live := obj.DeepCopyObject().(client.Object)
-				if err := s.Kube.Get(context.Background(), client.ObjectKeyFromObject(obj), live); err != nil || live.GetUID() != obj.GetUID() || live.GetDeletionTimestamp() != nil {
-					t.Fatalf("worker state was destroyed/replaced: %s: %v", obj.GetName(), err)
-				}
+			var live v1alpha1.BlipState
+			if err := s.Kube.Get(context.Background(), client.ObjectKeyFromObject(st), &live); err != nil || live.UID != st.UID || live.DeletionTimestamp != nil {
+				t.Fatalf("state was destroyed/replaced: %v", err)
 			}
 		})
 	}

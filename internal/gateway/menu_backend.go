@@ -58,6 +58,18 @@ func (b *catalogBackend) ValidateName(name string) error {
 }
 
 func (b *catalogBackend) Create(ctx context.Context, name string) (menu.Entry, error) {
+	return b.create(ctx, name, nil)
+}
+
+func (b *catalogBackend) Fork(ctx context.Context, entry menu.Entry, name string) (menu.Entry, error) {
+	source, err := b.srv.selectedSource(ctx, b.owner, entry, false)
+	if err != nil {
+		return menu.Entry{}, err
+	}
+	return b.create(ctx, name, source)
+}
+
+func (b *catalogBackend) create(ctx context.Context, name string, source *v1alpha1.BlipState) (menu.Entry, error) {
 	if err := b.ValidateName(name); err != nil {
 		return menu.Entry{}, err
 	}
@@ -77,23 +89,39 @@ func (b *catalogBackend) Create(ctx context.Context, name string) (menu.Entry, e
 			return menu.Entry{}, err
 		}
 	}
-	if s.Image == "" {
-		return menu.Entry{}, errors.New("sandbox image is not configured")
+	fromBase := source == nil
+	if fromBase {
+		source, err = s.baseState(ctx)
+		if err != nil {
+			return menu.Entry{}, err
+		}
 	}
-	size := s.StateSize.DeepCopy()
-	st := &v1alpha1.BlipState{
-		ObjectMeta: metav1.ObjectMeta{Namespace: s.Namespace, Name: full, Labels: map[string]string{ownerLabel: b.owner}},
-		Spec:       v1alpha1.BlipStateSpec{Image: s.Image, Size: &size},
-	}
-	if err := s.Kube.Create(ctx, st); err != nil {
+	st, err := s.forkState(ctx, b.owner, full, source, fromBase)
+	if err != nil {
 		return menu.Entry{}, err
 	}
-	return stateEntry(st, b.owner), nil
+	entry := stateEntry(st, b.owner)
+	entry.Parent = source.Name
+	return entry, nil
 }
 
 // selectedState validates the resource name, live owner, and incarnation. The
 // display name and cached Running flag are never used as authority.
 func (s *Server) selectedState(ctx context.Context, owner string, entry menu.Entry, deleting bool) (*v1alpha1.BlipState, error) {
+	st, err := s.selectedSource(ctx, owner, entry, deleting)
+	if err != nil {
+		return nil, err
+	}
+	if !ownedResource(st, owner) {
+		return nil, fmt.Errorf("sandbox state %s is not owned by the authenticated owner; fork it first", entry.ID)
+	}
+	if !deleting && st.Spec.Image != "" {
+		return nil, fmt.Errorf("sandbox state %s is an imported base; fork it before running", entry.ID)
+	}
+	return st, nil
+}
+
+func (s *Server) selectedSource(ctx context.Context, owner string, entry menu.Entry, deleting bool) (*v1alpha1.BlipState, error) {
 	if owner == "" || entry.ID == "" || entry.UID == "" {
 		return nil, errors.New("invalid sandbox selection; refresh the menu")
 	}
@@ -101,8 +129,8 @@ func (s *Server) selectedState(ctx context.Context, owner string, entry menu.Ent
 	if err := s.Kube.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: entry.ID}, &st); err != nil {
 		return nil, err
 	}
-	if !ownedResource(&st, owner) {
-		return nil, fmt.Errorf("sandbox state %s is not owned by the authenticated owner", entry.ID)
+	if !accessibleState(&st, owner) {
+		return nil, fmt.Errorf("sandbox state %s is not owned by the authenticated owner with its name prefix or a shared image import", entry.ID)
 	}
 	if string(st.UID) != entry.UID {
 		return nil, fmt.Errorf("sandbox state %s was replaced; refresh the menu", entry.ID)
@@ -113,23 +141,14 @@ func (s *Server) selectedState(ctx context.Context, owner string, entry menu.Ent
 	return &st, nil
 }
 
-func blipOwnsState(b *v1alpha1.Blip, st *v1alpha1.BlipState) bool {
-	for _, ref := range st.OwnerReferences {
-		if ref.APIVersion == v1alpha1.GroupVersion.String() && ref.Kind == "Blip" && ref.Name == b.Name && ref.UID == b.UID {
-			return true
-		}
-	}
-	return false
-}
-
-func referencesState(b *v1alpha1.Blip, st *v1alpha1.BlipState) bool {
-	if b.Spec.State == st.Name || blipOwnsState(b, st) {
+func referencesState(b *v1alpha1.Blip, root, st *v1alpha1.BlipState) bool {
+	if b.Spec.State == st.Name {
 		return true
 	}
 	if w := st.Status.Writer; w != nil && w.BlipName == b.Name && w.BlipUID == string(b.UID) {
 		return true
 	}
-	for _, m := range b.Spec.Mounts {
+	for _, m := range desiredMounts(b, root) {
 		if m.State == st.Name {
 			return true
 		}
@@ -141,6 +160,18 @@ func referencesState(b *v1alpha1.Blip, st *v1alpha1.BlipState) bool {
 		}
 	}
 	return false
+}
+
+func (s *Server) workerRoot(ctx context.Context, b *v1alpha1.Blip) (*v1alpha1.BlipState, error) {
+	var root v1alpha1.BlipState
+	if b.Spec.State == "" {
+		return nil, nil
+	}
+	err := s.Kube.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: b.Spec.State}, &root)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	return &root, err
 }
 
 func (b *catalogBackend) Delete(ctx context.Context, entry menu.Entry) error {
@@ -163,7 +194,14 @@ func (b *catalogBackend) Delete(ctx context.Context, entry menu.Entry) error {
 	}
 	for i := range list.Items {
 		candidate := &list.Items[i]
-		if !ownedResource(candidate, b.owner) || !referencesState(candidate, st) {
+		if !ownedResource(candidate, b.owner) {
+			continue
+		}
+		root, err := s.workerRoot(ctx, candidate)
+		if err != nil {
+			return err
+		}
+		if !referencesState(candidate, root, st) {
 			continue
 		}
 		var live v1alpha1.Blip
@@ -173,7 +211,14 @@ func (b *catalogBackend) Delete(ctx context.Context, entry menu.Entry) error {
 			}
 			return err
 		}
-		if live.UID != candidate.UID || !ownedResource(&live, b.owner) || !referencesState(&live, st) {
+		if live.UID != candidate.UID || !ownedResource(&live, b.owner) {
+			continue
+		}
+		root, err = s.workerRoot(ctx, &live)
+		if err != nil {
+			return err
+		}
+		if !referencesState(&live, root, st) {
 			continue
 		}
 		if err := s.Kube.Delete(ctx, &live,
@@ -238,12 +283,16 @@ func (s *Server) startSelectedState(ctx context.Context, owner string, entry men
 			if !ownedResource(b, owner) {
 				continue
 			}
+			root, err := s.workerRoot(ctx, b)
+			if err != nil {
+				return "", err
+			}
 			if !finished(b) {
-				if err := selectedMountError(b, st); err != nil {
+				if err := selectedMountError(b, root, st); err != nil {
 					mountErr = err
 				}
 			}
-			if runningBlip(b) && b.Status.Pod != "" && stateAttached(b, st) {
+			if runningBlip(b) && b.Status.Pod != "" && stateAttached(b, root, st) {
 				// Confirm that the target itself was not replaced or relabeled
 				// since the list, before reaching its guest.
 				var live v1alpha1.Blip
@@ -253,16 +302,20 @@ func (s *Server) startSelectedState(ctx context.Context, owner string, entry men
 				if live.UID != b.UID || !ownedResource(&live, owner) || !runningBlip(&live) || live.Status.Pod == "" {
 					return "", fmt.Errorf("sandbox worker %s changed; select the state again", b.Name)
 				}
-				if err := selectedMountError(&live, st); err != nil {
+				root, err = s.workerRoot(ctx, &live)
+				if err != nil {
 					return "", err
 				}
-				if stateAttached(&live, st) {
+				if err := selectedMountError(&live, root, st); err != nil {
+					return "", err
+				}
+				if stateAttached(&live, root, st) {
 					return live.Status.Pod, nil
 				}
 				// A dynamic mount changed after the list. Keep waiting for
 				// its shared informer update instead of connecting early.
 			}
-			if writesState(b, st) && !finished(b) {
+			if writesState(b, root, st) && !finished(b) {
 				pending = b
 			}
 		}
@@ -270,26 +323,6 @@ func (s *Server) startSelectedState(ctx context.Context, owner string, entry men
 		// already attached writer found later in the list.
 		if mountErr != nil {
 			return "", mountErr
-		}
-		// CLI fork states are GC-owned by their worker. Deleting/recreating
-		// that worker would delete the selected filesystem with it.
-		for _, ref := range st.OwnerReferences {
-			if ref.Kind != "Blip" || ref.APIVersion != v1alpha1.GroupVersion.String() {
-				continue
-			}
-			var worker *v1alpha1.Blip
-			for i := range list.Items {
-				if list.Items[i].Name == ref.Name && list.Items[i].UID == ref.UID && ownedResource(&list.Items[i], owner) {
-					worker = &list.Items[i]
-				}
-			}
-			if worker == nil || worker.DeletionTimestamp != nil || finished(worker) {
-				return "", fmt.Errorf("worker for state %s is no longer running; its saved state has been preserved", st.Name)
-			}
-			if !writesState(worker, st) {
-				return "", fmt.Errorf("worker %s no longer uses state %s", worker.Name, st.Name)
-			}
-			pending = worker
 		}
 		if w := st.Status.Writer; w != nil && pending == nil {
 			return "", fmt.Errorf("state %s is held by an unavailable worker", st.Name)
@@ -307,7 +340,7 @@ func (s *Server) startSelectedState(ctx context.Context, owner string, entry men
 				continue
 			case !ownedResource(sameName, owner):
 				return "", fmt.Errorf("sandbox %s is not owned by the authenticated owner", st.Name)
-			case sameName.Spec.State != st.Name || len(sameName.Spec.Command) != 0:
+			case sameName.Spec.State != st.Name && !finished(sameName):
 				return "", fmt.Errorf("sandbox name %s is used by a worker; its saved state has been preserved", st.Name)
 			case sameName.DeletionTimestamp == nil && finished(sameName):
 				if recreated {
@@ -333,8 +366,8 @@ func (s *Server) startSelectedState(ctx context.Context, owner string, entry men
 	}
 }
 
-func selectedMountError(b *v1alpha1.Blip, st *v1alpha1.BlipState) error {
-	if m := selectedMountStatus(b, st); m != nil && m.Phase == v1alpha1.MountFailed {
+func selectedMountError(b *v1alpha1.Blip, root, st *v1alpha1.BlipState) error {
+	if m := selectedMountStatus(b, root, st); m != nil && m.Phase == v1alpha1.MountFailed {
 		return fmt.Errorf("mount of state %s in worker %s failed: %s", st.Name, b.Name, m.Message)
 	}
 	return nil

@@ -3,13 +3,15 @@
 #   sa.<service account>: <pools>  every VM service account, with the
 #                                  space-separated pools that use it
 #   <vm pod>: <owner>              each claimed VM pod; "-" means unrestricted
+#   bases: <states>                space-separated shared, ownerless image states
 # A caller authenticated with a pod-bound token of a VM service account may
 # only connect to pods with `blip-runtime bridge 1025` in container vm (a blip
 # session; no other exec, attach, or port-forward). A restricted owner may
 # only do so into VM pods of the same owner, and may only create, change,
 # and delete blips and states named "<owner>.<name>" and labelled
 # blip.dev/owner=<owner> (before and after the change) that reference only
-# such states, set no imagePullSecrets, and create blips only in pools of
+# such states (or copy/read-only mount shared bases), set no imagePullSecrets,
+# and create blips only in pools of
 # its own service account. A VM pod without an entry (vacant, or unknown) is
 # denied, as is any other pod that uses a VM service account. Service account
 # keys are pruned only once no pool or VM pod uses the account, and a missing
@@ -60,6 +62,8 @@ spec:
       expression: request.operation == 'CREATE' || request.operation == 'UPDATE'
     - name: pools
       expression: "string(variables.data['sa.' + variables.callerSA]).split(' ')"
+    - name: bases
+      expression: "'bases' in variables.data ? string(variables.data['bases']).split(' ') : []"
   validations:
     - expression: "!variables.vm || variables.owner != ''"
       messageExpression: >-
@@ -114,16 +118,24 @@ spec:
       reason: Forbidden
     - expression: >-
         !variables.restricted || !variables.writes || request.resource.resource != 'blips' || !has(object.spec) ||
-        ((!has(object.spec.state) || object.spec.state.startsWith(variables.prefix)) &&
-        (!has(object.spec.mounts) || object.spec.mounts.all(m, m.state.startsWith(variables.prefix))))
+        has(object.spec.state) && object.spec.state.startsWith(variables.prefix)
       messageExpression: >-
         'owner ' + variables.owner + ' may only use states named ' + variables.prefix + '*'
       reason: Forbidden
     - expression: >-
-        !variables.restricted || !variables.writes || request.resource.resource != 'blipstates' || !has(object.spec) ||
-        !has(object.spec.copyFrom) || object.spec.copyFrom.startsWith(variables.prefix)
+        !variables.restricted || request.operation != 'CREATE' || request.resource.resource != 'blipstates' || !has(object.spec) ||
+        !has(object.spec.copyFrom) || object.spec.copyFrom.startsWith(variables.prefix) ||
+        object.spec.copyFrom in variables.bases
       messageExpression: >-
-        'owner ' + variables.owner + ' may only copy states named ' + variables.prefix + '*'
+        'owner ' + variables.owner + ' may only copy states named ' + variables.prefix + '* or shared bases'
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || !variables.writes || request.resource.resource != 'blipstates' || !has(object.spec) ||
+        !has(object.spec.mounts) || object.spec.mounts.all(m,
+          m.state.startsWith(variables.prefix) ||
+          ((!has(m.writable) || !m.writable) && m.state in variables.bases))
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only mount its own states or read-only shared bases'
       reason: Forbidden
     - expression: >-
         !variables.restricted || !variables.writes || !has(object.spec) ||

@@ -76,16 +76,9 @@ func (r *StateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Node{}, allStates, builder.WithPredicates(predicate.Funcs{
 			UpdateFunc: func(event.UpdateEvent) bool { return false },
 		})).
-		Watches(&v1.Blip{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
-			var out []reconcile.Request
-			for _, s := range stateRefs(o.(*v1.Blip)) {
-				out = append(out, req(o.GetNamespace(), s))
-				// Live copies wait for the writer's VM to run.
-				out = append(out, r.copiesOf(ctx, o.GetNamespace(), s)...)
-			}
-			return out
-		})).
+		Watches(&v1.Blip{}, handler.EnqueueRequestsFromMapFunc(r.blipStates)).
 		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.copies)).
+		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.profileStates)).
 		// A copy that commits or stops blocking can release its source's
 		// finalizer; wake the source instead of waiting for a resync.
 		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.copySource), builder.WithPredicates(copySourcePredicate())).
@@ -105,6 +98,50 @@ func (r *StateReconciler) allStates(ctx context.Context, _ client.Object) []reco
 	out := make([]reconcile.Request, len(states.Items))
 	for i, st := range states.Items {
 		out[i] = req(st.Namespace, st.Name)
+	}
+	return out
+}
+
+func (r *StateReconciler) blipStates(ctx context.Context, o client.Object) []reconcile.Request {
+	b := o.(*v1.Blip)
+	refs := stateRefs(b)
+	root := &v1.BlipState{}
+	if b.Spec.State != "" && r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.State}, root) == nil {
+		for _, m := range desiredMounts(root, b) {
+			if !slices.Contains(refs, m.State) {
+				refs = append(refs, m.State)
+			}
+		}
+	}
+	var out []reconcile.Request
+	for _, s := range refs {
+		out = append(out, req(b.Namespace, s))
+		out = append(out, r.copiesOf(ctx, b.Namespace, s)...)
+	}
+	// Wake profiles carrying this execution's temporary collect references.
+	var roots v1.BlipStateList
+	if r.List(ctx, &roots, client.InNamespace(b.Namespace), client.MatchingFields{indexMountUID: string(b.UID)}) == nil {
+		for _, st := range roots.Items {
+			out = append(out, req(st.Namespace, st.Name))
+		}
+	}
+	return out
+}
+
+// Root edits wake reservations on their children (including removed children
+// through the watch's old-object mapping). Child saves wake roots whose stale
+// temporary references were retained until the save completed.
+func (r *StateReconciler) profileStates(ctx context.Context, o client.Object) []reconcile.Request {
+	st := o.(*v1.BlipState)
+	var out []reconcile.Request
+	for _, m := range st.Spec.Mounts {
+		out = append(out, req(st.Namespace, m.State))
+	}
+	var roots v1.BlipStateList
+	if r.List(ctx, &roots, client.InNamespace(st.Namespace), client.MatchingFields{indexMounts: st.Name}) == nil {
+		for _, root := range roots.Items {
+			out = append(out, req(root.Namespace, root.Name))
+		}
 	}
 	return out
 }
@@ -169,6 +206,11 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 	deleting := st.DeletionTimestamp != nil
+	if !deleting {
+		if err := pruneTemporaryMounts(ctx, r.Client, r.Live, st); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
 	if !deleting && !controllerutil.ContainsFinalizer(st, Finalizer) {
 		base := st.DeepCopy()
 		controllerutil.AddFinalizer(st, Finalizer)
@@ -371,6 +413,11 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 			}
 			if err != nil {
 				return "", false, err
+			}
+			if owner := st.Labels[LabelOwner]; owner != "" && !ownedState(src, owner) &&
+				(src.Spec.Image == "" || src.Labels[LabelOwner] != "") {
+				s.Phase = v1.StateFailed
+				return fmt.Sprintf("copy source %q is not owned by %s or a shared image template", src.Name, owner), false, nil
 			}
 			switch {
 			case src.DeletionTimestamp != nil:
@@ -636,7 +683,9 @@ func (r *StateReconciler) pendingSource(ctx context.Context, st *v1.BlipState, c
 		// failed ones and replans when none remains.
 		return false, "", nil
 	}
-	if cl.usable(p.SourceNode, selector) && cl.holds(st, p.SourceNode, p.CommitID) {
+	// A draining writer still serves its sealed disk to replacement replicas.
+	// Draining forbids new placements, not completing an existing save.
+	if bn := cl.nodes[p.SourceNode]; bn != nil && cl.k8s[p.SourceNode] != nil && healthy(bn, cl.now) && cl.holds(st, p.SourceNode, p.CommitID) {
 		return false, "", nil
 	}
 	if n := usableHolder(st, cl, p, p.Replicas); n != "" {
@@ -768,15 +817,16 @@ func (r *StateReconciler) writer(ctx context.Context, st *v1.BlipState, cl *clus
 	return "", false, nil
 }
 
-// unpublishedWriter reports whether a writer with a pod was persisted before
+// unpublishedWriter reports whether a writer reservation was persisted before
 // its Blip published the attachment, for example when the controller
 // crashed between setting writer.podUID and writing Blip.status. The node
 // only prepares attachments named by the Blip, so such a writer guards no
-// disk and can be released. A Blip whose spec still needs the state keeps
-// the writer: it publishes the attachment on its next reconcile.
+// disk and can be released once its owner is gone or terminal. A live Blip may
+// be between acquire and status publication, even if its root intent changed
+// meanwhile. Only that Blip's serialized reconcile can release unused slots.
 func (r *StateReconciler) unpublishedWriter(ctx context.Context, st *v1.BlipState) (bool, error) {
 	w := st.Status.Writer
-	if w == nil || w.PodUID == "" {
+	if w == nil {
 		return false, nil
 	}
 	live := r.Live
@@ -796,16 +846,8 @@ func (r *StateReconciler) unpublishedWriter(ctx context.Context, st *v1.BlipStat
 				return false, nil
 			}
 		}
-		if finished(&b) {
-			continue
-		}
-		if b.Spec.State == st.Name {
+		if string(b.UID) == w.BlipUID && !finished(&b) {
 			return false, nil
-		}
-		for _, m := range b.Spec.Mounts {
-			if m.Writable && m.State == st.Name {
-				return false, nil
-			}
 		}
 	}
 	return true, nil
@@ -952,14 +994,9 @@ func blipBlocksDeletion(b *v1.Blip, st *v1.BlipState) bool {
 	if finished(b) {
 		return false
 	}
-	// A Blip that is running or saving owns a mounted disk or is
-	// committing one.
-	if b.Status.Phase == v1.BlipRunning || b.Status.Phase == v1.BlipSaving {
-		return true
-	}
-	// A claimed VM may already be preparing or attaching the disks, even
-	// before the Blip publishes them as mounted or reaches Running.
-	if b.Status.Pod != "" {
+	// Only actual root use counts; offline profile references never block
+	// deletion, even when some other filesystem is running or saving.
+	if b.Spec.State == st.Name && (b.Status.RootAttachmentID != "" || b.Status.Pod != "") {
 		return true
 	}
 	if w := st.Status.Writer; w != nil && w.BlipUID == string(b.UID) {

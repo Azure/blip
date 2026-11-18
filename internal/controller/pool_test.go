@@ -62,7 +62,7 @@ func TestPoolScaling(t *testing.T) {
 				e.create(p)
 			}
 			for i := range tt.demand {
-				e.pendingBlip(fmt.Sprintf("b%d", i), withImage("reg/img:v1"))
+				e.pendingBlip(fmt.Sprintf("b%d", i), e.withImage("reg/img:v1"))
 			}
 			e.run(e.pool, ns, "default")
 
@@ -726,7 +726,7 @@ func TestPoolMaxCountDemand(t *testing.T) {
 	e := newEnv(t)
 	e.newPool("default", 0, 1)
 	for i := range 3 {
-		e.pendingBlip(fmt.Sprintf("b%d", i), withImage("reg/img:v1"))
+		e.pendingBlip(fmt.Sprintf("b%d", i), e.withImage("reg/img:v1"))
 	}
 
 	e.run(e.pool, ns, "default")
@@ -749,7 +749,7 @@ func TestPoolMaxCountDemand(t *testing.T) {
 func TestPoolClaimDoesNotCreateDuplicate(t *testing.T) {
 	e := newEnv(t)
 	e.newPool("default", 1, 0)
-	e.pendingBlip("b0", withImage("reg/img:v1"))
+	e.pendingBlip("b0", e.withImage("reg/img:v1"))
 
 	e.run(e.pool, ns, "default")
 	pods := e.pods()
@@ -813,18 +813,17 @@ func TestPoolWarmSparesFollowRunningVMs(t *testing.T) {
 	}
 }
 
-// TestPoolPinsOnlyCopiedStates checks that a Blip whose data is an image
-// state (held by every node) is not pinned to locality.node, while a copied
-// state (held by one source node) is.
-func TestPoolPinsOnlyCopiedStates(t *testing.T) {
+// Copies of a shared image template each retain their own data locality.
+func TestPoolPinsDurableCopiesOfSharedBase(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2")
 	e.newPool("default", 0, 0)
 	e.newState("img", func(s *v1.BlipState) { s.Spec.Image = "reg/img:v1"; s.Spec.Replicas = 0 })
-	e.newState("copy", func(s *v1.BlipState) { s.Spec.CopyFrom = "img"; s.Spec.Replicas = 1 })
+	e.newState("copy0", func(s *v1.BlipState) { s.Spec.CopyFrom = "img"; s.Spec.Replicas = 1 })
+	e.newState("copy1", func(s *v1.BlipState) { s.Spec.CopyFrom = "img"; s.Spec.Replicas = 1 })
 
-	for name, state := range map[string]string{"b0": "img", "b1": "copy"} {
-		e.newBlip(name, func(b *v1.Blip) { b.Spec.State = state; b.Spec.Image = "" })
+	for name, state := range map[string]string{"b0": "copy0", "b1": "copy1"} {
+		e.newBlip(name, withRoot(state))
 		e.setBlipStatus(name, func(b *v1.Blip) {
 			b.Status.Phase = v1.BlipPending
 			b.Status.Locality = &v1.Locality{Node: "n1"}
@@ -842,8 +841,8 @@ func TestPoolPinsOnlyCopiedStates(t *testing.T) {
 			pinned++
 		}
 	}
-	if pinned != 1 {
-		t.Errorf("%d pods pinned, want only the copied state's VM", pinned)
+	if pinned != 2 {
+		t.Errorf("%d pods pinned, want a local VM for each durable copy", pinned)
 	}
 }
 
@@ -864,27 +863,27 @@ func TestPoolDemand(t *testing.T) {
 	e := newEnv(t)
 	e.newPool("default", 0, 0)
 
-	e.pendingBlip("waiting", withImage("reg/img:v1"))
+	e.pendingBlip("waiting", e.withImage("reg/img:v1"))
 
 	// A new Blip has no phase until the Blip reconciler observes it; it is
 	// pending and still needs a VM.
-	e.newBlip("fresh", withImage("reg/img:v1"))
+	e.newBlip("fresh", e.withImage("reg/img:v1"))
 
-	e.newBlip("running", withImage("reg/img:v1"))
+	e.newBlip("running", e.withImage("reg/img:v1"))
 	e.setBlipStatus("running", func(b *v1.Blip) {
 		b.Status.Phase = v1.BlipRunning
 		b.Status.Pod = "default-pod"
 	})
 
-	e.newBlip("succeeded", withImage("reg/img:v1"))
+	e.newBlip("succeeded", e.withImage("reg/img:v1"))
 	e.setBlipStatus("succeeded", func(b *v1.Blip) { b.Status.Phase = v1.BlipSucceeded })
 
-	e.newBlip("failed", withImage("reg/img:v1"))
+	e.newBlip("failed", e.withImage("reg/img:v1"))
 	e.setBlipStatus("failed", func(b *v1.Blip) { b.Status.Phase = v1.BlipFailed })
 
-	e.newBlip("foreign", withImage("reg/img:v1"), func(b *v1.Blip) { b.Spec.Pool = "gpu" })
+	e.newBlip("foreign", e.withImage("reg/img:v1"), func(b *v1.Blip) { b.Spec.Pool = "gpu" })
 
-	e.newBlip("deleting", withImage("reg/img:v1"))
+	e.newBlip("deleting", e.withImage("reg/img:v1"))
 	b := e.getBlip("deleting")
 	b.Finalizers = []string{Finalizer}
 	e.must(e.c.Update(e.ctx, b))

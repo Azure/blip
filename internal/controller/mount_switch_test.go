@@ -18,10 +18,10 @@ func TestMountSwitchWritableToReadOnly(t *testing.T) {
 	e.readyState("repo", "n1", "n2")
 	gen1 := e.getState("repo").Status.Committed.ID
 
-	git := e.startBlip("git", "n1", withImage("reg/img:v1"))
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"))
 	pod := git.Status.Pod
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts = []v1.Mount{{State: "repo", Path: "/src", Writable: true}} })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts = []v1.Mount{{State: "repo", Path: "/src", Writable: true}} })
 	e.run(e.blip, ns, "git")
 	m := mountOf(e.getBlip("git"), "repo")
 	e.observe(pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{{ID: m.AttachmentID, State: "repo", Phase: podapi.DiskMounted}}})
@@ -31,7 +31,7 @@ func TestMountSwitchWritableToReadOnly(t *testing.T) {
 	}
 
 	// Ask for read-only; the old disk must be unmounted before the save.
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = false })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = false })
 	e.run(e.blip, ns, "git")
 	m = mountOf(e.getBlip("git"), "repo")
 	if m == nil || m.Phase != v1.MountUnmounting || !m.Switching || !m.Writable {
@@ -86,7 +86,7 @@ func TestMountSwitchReadOnlyToWritable(t *testing.T) {
 	e.readyState("repo", "n1", "n2")
 	gen1 := e.getState("repo").Status.Committed.ID
 
-	git := e.startBlip("git", "n1", withImage("reg/img:v1"), withMount("repo", "/src", false))
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"), e.withMount("repo", "/src", false))
 	pod := git.Status.Pod
 	e.run(e.blip, ns, "git")
 	m := mountOf(e.getBlip("git"), "repo")
@@ -98,7 +98,7 @@ func TestMountSwitchReadOnlyToWritable(t *testing.T) {
 	m = mountOf(e.getBlip("git"), "repo")
 	oldAttachment := m.AttachmentID
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = true })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = true })
 	e.run(e.blip, ns, "git")
 	m = mountOf(e.getBlip("git"), "repo")
 	if m == nil || m.Phase != v1.MountUnmounting || !m.Switching || m.Writable {
@@ -135,7 +135,7 @@ func TestMountSwitchCancelDuringDemote(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.readyState("repo", "n1", "n2")
 
-	git := e.startBlip("git", "n1", withImage("reg/img:v1"), withMount("repo", "/src", true))
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"), e.withMount("repo", "/src", true))
 	pod := git.Status.Pod
 	e.run(e.blip, ns, "git")
 	m := mountOf(e.getBlip("git"), "repo")
@@ -144,7 +144,7 @@ func TestMountSwitchCancelDuringDemote(t *testing.T) {
 	m = mountOf(e.getBlip("git"), "repo")
 	oldAttachment := m.AttachmentID
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = false })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = false })
 	e.run(e.blip, ns, "git")
 	e.observe(pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{{ID: oldAttachment, State: "repo", Phase: podapi.DiskDetached}}})
 	e.run(e.blip, ns, "git")
@@ -153,7 +153,7 @@ func TestMountSwitchCancelDuringDemote(t *testing.T) {
 	}
 
 	// Change the spec back while the detached contents are being saved.
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = true })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = true })
 	e.run(e.blip, ns, "git")
 	if m = mountOf(e.getBlip("git"), "repo"); m.Phase != v1.MountSaving {
 		t.Fatalf("cancel dropped the save %+v", m)
@@ -193,7 +193,7 @@ func TestMountSwitchPromoteRejectsStaleMount(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.readyState("repo", "n1", "n2")
 
-	git := e.startBlip("git", "n1", withImage("reg/img:v1"), withMount("repo", "/src", false))
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"), e.withMount("repo", "/src", false))
 	e.run(e.blip, ns, "git")
 	m := mountOf(e.getBlip("git"), "repo")
 	e.observe(git.Status.Pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{{ID: m.AttachmentID, State: "repo", Phase: podapi.DiskMounted}}})
@@ -203,10 +203,10 @@ func TestMountSwitchPromoteRejectsStaleMount(t *testing.T) {
 	st.Status.Committed.ID = "ffffffffffffffff"
 	e.must(e.c.Status().Update(e.ctx, st))
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = true })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = true })
 	e.run(e.blip, ns, "git")
 	m = mountOf(e.getBlip("git"), "repo")
-	if m == nil || m.Phase != v1.MountMounted || m.Writable || !m.Switching || !strings.Contains(m.Message, "newer version") {
+	if m == nil || m.Phase != v1.MountMounted || m.Writable || m.Switching || !strings.Contains(m.Message, "newer version") {
 		t.Fatalf("stale promotion %+v", m)
 	}
 	if w := e.getState("repo").Status.Writer; w != nil {
@@ -222,7 +222,7 @@ func TestMountSwitchPromoteWaitsForPending(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.readyState("repo", "n1", "n2")
 
-	git := e.startBlip("git", "n1", withImage("reg/img:v1"), withMount("repo", "/src", false))
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"), e.withMount("repo", "/src", false))
 	e.run(e.blip, ns, "git")
 	m := mountOf(e.getBlip("git"), "repo")
 	e.observe(git.Status.Pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{{ID: m.AttachmentID, State: "repo", Phase: podapi.DiskMounted}}})
@@ -232,7 +232,7 @@ func TestMountSwitchPromoteWaitsForPending(t *testing.T) {
 	st.Status.Pending = &v1.PendingCommit{CommitID: "dddddddddddddddd", Generation: 2, SourceNode: "n1", AttachmentID: "x", Replicas: []string{"n1", "n2"}}
 	e.must(e.c.Status().Update(e.ctx, st))
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = true })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = true })
 	e.run(e.blip, ns, "git")
 	m = mountOf(e.getBlip("git"), "repo")
 	if m == nil || m.Phase != v1.MountMounted || m.Writable || m.Switching || !strings.Contains(m.Message, "saving a new version") {
@@ -251,7 +251,7 @@ func TestMountSwitchPromoteWriterBlocked(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.readyState("repo", "n1", "n2")
 
-	git := e.startBlip("git", "n1", withImage("reg/img:v1"), withMount("repo", "/src", false))
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"), e.withMount("repo", "/src", false))
 	e.run(e.blip, ns, "git")
 	m := mountOf(e.getBlip("git"), "repo")
 	e.observe(git.Status.Pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{{ID: m.AttachmentID, State: "repo", Phase: podapi.DiskMounted}}})
@@ -261,16 +261,16 @@ func TestMountSwitchPromoteWriterBlocked(t *testing.T) {
 	st.Status.Writer = &v1.Writer{AttachmentID: "other", BlipName: "other", BlipUID: "other", BaseCommit: st.Status.Committed.ID, PodName: "p", PodUID: "u", Node: "n2"}
 	e.must(e.c.Status().Update(e.ctx, st))
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = true })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = true })
 	e.run(e.blip, ns, "git")
 	m = mountOf(e.getBlip("git"), "repo")
-	if m == nil || m.Phase != v1.MountMounted || m.Writable || !m.Switching || !strings.Contains(m.Message, "in use by blip other") {
+	if m == nil || m.Phase != v1.MountMounted || m.Writable || m.Switching || !strings.Contains(m.Message, "in use by blip other") {
 		t.Fatalf("blocked promotion %+v", m)
 	}
 
 	// Removing the mount must not leave a latched Mounted entry.
 	oldAttachment := m.AttachmentID
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts = nil })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts = nil })
 	e.run(e.blip, ns, "git")
 	if m = mountOf(e.getBlip("git"), "repo"); m == nil || m.Phase != v1.MountUnmounting || m.Switching {
 		t.Fatalf("removed blocked mount %+v", m)
@@ -290,19 +290,19 @@ func TestMountSwitchPromoteCancelled(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.readyState("repo", "n1", "n2")
 
-	git := e.startBlip("git", "n1", withImage("reg/img:v1"), withMount("repo", "/src", false))
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"), e.withMount("repo", "/src", false))
 	e.run(e.blip, ns, "git")
 	m := mountOf(e.getBlip("git"), "repo")
 	e.observe(git.Status.Pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{{ID: m.AttachmentID, State: "repo", Phase: podapi.DiskMounted}}})
 	e.run(e.blip, ns, "git")
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = true })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = true })
 	e.run(e.blip, ns, "git")
 	if w := e.getState("repo").Status.Writer; w == nil {
 		t.Fatal("promotion did not acquire writer")
 	}
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = false })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = false })
 	e.run(e.blip, ns, "git")
 	m = mountOf(e.getBlip("git"), "repo")
 	if m == nil || m.Phase != v1.MountMounted || m.Writable || m.Switching {
@@ -321,7 +321,7 @@ func TestMountSwitchRemovedDuringPromote(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.readyState("repo", "n1", "n2")
 
-	git := e.startBlip("git", "n1", withImage("reg/img:v1"), withMount("repo", "/src", false))
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"), e.withMount("repo", "/src", false))
 	pod := git.Status.Pod
 	e.run(e.blip, ns, "git")
 	m := mountOf(e.getBlip("git"), "repo")
@@ -329,13 +329,13 @@ func TestMountSwitchRemovedDuringPromote(t *testing.T) {
 	e.run(e.blip, ns, "git")
 	oldAttachment := mountOf(e.getBlip("git"), "repo").AttachmentID
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts[0].Writable = true })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = true })
 	e.run(e.blip, ns, "git")
 	if w := e.getState("repo").Status.Writer; w == nil {
 		t.Fatal("promotion did not acquire writer")
 	}
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts = nil })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts = nil })
 	e.run(e.blip, ns, "git")
 	if w := e.getState("repo").Status.Writer; w != nil {
 		t.Fatalf("removed mount leaked writer %+v", w)
@@ -355,14 +355,14 @@ func TestMountSwitchNewReadOnlyWaitsWhileSaving(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.readyState("repo", "n1", "n2")
 
-	e.startBlip("git", "n1", withImage("reg/img:v1"))
+	e.startBlip("git", "n1", e.withImage("reg/img:v1"))
 	e.run(e.blip, ns, "git")
 
 	st := e.getState("repo")
 	st.Status.Pending = &v1.PendingCommit{CommitID: "eeeeeeeeeeeeeeee", Generation: 2, SourceNode: "n1", AttachmentID: "x", Replicas: []string{"n1", "n2"}}
 	e.must(e.c.Status().Update(e.ctx, st))
 
-	e.updateBlip("git", func(b *v1.Blip) { b.Spec.Mounts = []v1.Mount{{State: "repo", Path: "/src"}} })
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts = []v1.Mount{{State: "repo", Path: "/src"}} })
 	e.run(e.blip, ns, "git")
 	b := e.getBlip("git")
 	if m := mountOf(b, "repo"); m != nil {

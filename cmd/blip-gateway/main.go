@@ -49,7 +49,7 @@ func run() error {
 	var stateSize, listen, httpListen, identityHeader string
 	var tlsCert, tlsKey, tlsClientCA string
 	flag.StringVar(&cfg.Namespace, "namespace", os.Getenv("POD_NAMESPACE"), "namespace for users, host key, and sandboxes")
-	flag.StringVar(&cfg.Image, "image", "", "image for new sandbox states (required)")
+	flag.StringVar(&cfg.BaseState, "base-state", "", "shared base state for new sandboxes (required)")
 	flag.StringVar(&cfg.Pool, "pool", "default", "VM pool for sandboxes")
 	flag.StringVar(&stateSize, "state-size", "20Gi", "size of new sandbox states")
 	flag.DurationVar(&cfg.IdleTimeout, "idle-timeout", 30*time.Second, "stop idle sandboxes after this long")
@@ -62,8 +62,8 @@ func run() error {
 	flag.StringVar(&tlsClientCA, "tls-client-ca", "", "CA bundle that must sign the Envoy gateway's client certificate (required)")
 	klog.InitFlags(nil)
 	flag.Parse()
-	if cfg.Namespace == "" || cfg.Image == "" {
-		return fmt.Errorf("--namespace and --image are required")
+	if cfg.Namespace == "" || cfg.BaseState == "" {
+		return fmt.Errorf("--namespace and --base-state are required")
 	}
 	if strings.TrimSpace(identityHeader) == "" {
 		return fmt.Errorf("--identity-header is required")
@@ -149,7 +149,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Info("listening", "address", l.Addr(), "namespace", cfg.Namespace, "image", cfg.Image)
+	log.Info("listening", "address", l.Addr(), "namespace", cfg.Namespace, "base-state", cfg.BaseState)
 	srv := &gateway.Server{Config: cfg, Kube: kube, Catalog: catalog, Sessions: sessions, Users: users, HostKey: hostKey, CA: ca, ClientCAs: clientCAs, IdentityHeader: identityHeader, Log: log}
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

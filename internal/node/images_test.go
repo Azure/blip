@@ -7,7 +7,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/Azure/blip/api/v1alpha1"
 )
@@ -16,8 +15,8 @@ func digestRef(c string) string {
 	return "registry.local/img@" + "sha256:" + strings.Repeat(c, 64)
 }
 
-// TestImageRefsFiltering proves a node only imports images of states and blips
-// it may actually run, and merges their pull secrets.
+// TestImageRefsFiltering proves a node only imports images for state placements
+// and merges their state pull secrets, excluding infrastructure credentials.
 func TestImageRefsFiltering(t *testing.T) {
 	v := newView()
 	placed := state("placed")
@@ -47,52 +46,25 @@ func TestImageRefsFiltering(t *testing.T) {
 		Spec:       v1alpha1.BlipPoolSpec{ImagePullSecrets: []corev1.LocalObjectReference{{Name: "pool-secret"}}},
 	}
 	v.pools[ns+"/default"] = pool
-	assigned := &v1alpha1.Blip{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "assigned", UID: types.UID("uid-assigned")},
-	}
+	assigned := blip("assigned")
 	assigned.Spec.Pool = "default"
-	assigned.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "blip-secret"}}
+	assigned.Spec.State = other.Name
 	assigned.Status.Node = self
-	assigned.Status.ImageDigest = digestRef("f")
 	v.blips = append(v.blips, assigned)
 
-	podBlip := &v1alpha1.Blip{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pod", UID: types.UID("uid-pod")},
-	}
-	podBlip.Status.Pod = "vm"
-	podBlip.Status.ImageDigest = digestRef("7")
-	v.blips = append(v.blips, podBlip)
-	pod := vmPod("vm", string(podBlip.UID))
-	v.pods[podKey(ns, "vm")] = pod
-
-	remote := &v1alpha1.Blip{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "remote", UID: types.UID("uid-remote")},
-	}
-	remote.Status.Node = "n2"
-	remote.Status.ImageDigest = digestRef("8")
-	v.blips = append(v.blips, remote)
-
-	done := &v1alpha1.Blip{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "done", UID: types.UID("uid-done")},
-	}
-	done.Status.Node = self
-	done.Status.Phase = v1alpha1.BlipSucceeded
-	done.Status.ImageDigest = digestRef("9")
-	v.blips = append(v.blips, done)
-
-	// The same digest from a state and a blip merges their secrets.
-	same := &v1alpha1.Blip{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "same", UID: types.UID("uid-same")},
-	}
-	same.Status.Node = self
+	// The same digest from states in different namespaces merges their secrets.
+	same := state("same")
+	same.Namespace = "other"
+	same.Status.Placements = []string{self}
 	same.Status.ImageDigest = digestRef("a")
-	v.blips = append(v.blips, same)
+	same.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "second-secret"}}
+	v.states = append(v.states, same)
 
 	got := map[string][]pullSecret{}
 	for _, r := range v.imageRefs() {
 		got[r.Ref] = r.Secrets
 	}
-	want := []string{digestRef("a"), digestRef("b"), digestRef("d"), digestRef("f"), digestRef("7")}
+	want := []string{digestRef("a"), digestRef("b"), digestRef("d")}
 	var have []string
 	for ref := range got {
 		have = append(have, ref)
@@ -102,11 +74,12 @@ func TestImageRefsFiltering(t *testing.T) {
 	if !slices.Equal(have, want) {
 		t.Fatalf("refs = %v, want %v", have, want)
 	}
-	if secrets := got[digestRef("f")]; !slices.Contains(secrets, pullSecret{ns, "blip-secret"}) ||
-		!slices.Contains(secrets, pullSecret{ns, "pool-secret"}) {
-		t.Fatalf("assigned blip secrets = %v", secrets)
-	}
-	if secrets := got[digestRef("a")]; !slices.Contains(secrets, pullSecret{ns, "state-secret"}) {
+	if secrets := got[digestRef("a")]; !slices.Equal(secrets, []pullSecret{{ns, "state-secret"}, {"other", "second-secret"}}) {
 		t.Fatalf("merged state secrets = %v", secrets)
+	}
+	for _, secrets := range got {
+		if slices.Contains(secrets, pullSecret{ns, "pool-secret"}) {
+			t.Fatalf("state import uses infrastructure credentials: %v", secrets)
+		}
 	}
 }

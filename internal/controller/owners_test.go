@@ -49,9 +49,13 @@ func TestVMOwnersWrittenBeforeClaim(t *testing.T) {
 	e.newPool("default", 0, 0)
 	check := &claimCheck{Client: e.c, e: e}
 	e.blip.Client = check
+	root := e.readyState(testOwner+".root", "n1")
+	root.Labels = map[string]string{LabelOwner: testOwner}
+	e.must(e.c.Update(e.ctx, root))
+	e.readyState("plain-root", "n2")
 
-	b := e.startBlip(testOwner+"-a", "n1", withImage("reg/img:v1"), withOwner(testOwner))
-	plain := e.startBlip("plain", "n2", withImage("reg/img:v1"))
+	b := e.startBlip(testOwner+".a", "n1", withRoot(testOwner+".root"), withOwner(testOwner))
+	plain := e.startBlip("plain", "n2", withRoot("plain-root"))
 	if check.claims != 2 {
 		t.Fatalf("claims = %d", check.claims)
 	}
@@ -69,7 +73,10 @@ func TestVMOwnersSync(t *testing.T) {
 	if got := e.owners(); !maps.Equal(got, map[string]string{"sa.vm": "default"}) {
 		t.Fatalf("owners of an idle pool = %v", got)
 	}
-	b := e.startBlip(testOwner+"-a", "n1", withImage("reg/img:v1"), withOwner(testOwner))
+	root := e.readyState(testOwner+".root", "n1")
+	root.Labels = map[string]string{LabelOwner: testOwner}
+	e.must(e.c.Update(e.ctx, root))
+	b := e.startBlip(testOwner+".a", "n1", withRoot(testOwner+".root"), withOwner(testOwner))
 
 	// Rebuilt after loss, and stale entries are dropped.
 	cm := &corev1.ConfigMap{}
@@ -91,12 +98,45 @@ func TestVMOwnersSync(t *testing.T) {
 	}
 }
 
+func TestVMOwnersSharedBases(t *testing.T) {
+	e := newEnv(t)
+	e.newPool("default", 0, 0)
+	e.newState("base-tools", func(s *v1.BlipState) { s.Spec.Image = "reg/tools:v1" })
+	e.newState("base-dev", func(s *v1.BlipState) { s.Spec.Image = "reg/dev:v1" })
+	e.newState("private-base", func(s *v1.BlipState) {
+		s.Spec.Image = "reg/private:v1"
+		s.Labels = map[string]string{LabelOwner: testOwner}
+	})
+	e.newState("workspace", func(s *v1.BlipState) { s.Spec.CopyFrom = "base-dev" })
+	e.must(syncVMOwners(e.ctx, e.c, ns))
+	if got := e.owners()[ownersBasesKey]; got != "base-dev base-tools" {
+		t.Fatalf("shared bases = %q", got)
+	}
+	e.must(e.c.Delete(e.ctx, e.getState("base-tools")))
+	e.must(syncVMOwners(e.ctx, e.c, ns))
+	if got := e.owners()[ownersBasesKey]; got != "base-dev" {
+		t.Fatalf("shared bases after deletion = %q", got)
+	}
+	base := e.getState("base-dev")
+	base.Labels = map[string]string{LabelOwner: testOwner}
+	e.must(e.c.Update(e.ctx, base))
+	e.must(syncVMOwners(e.ctx, e.c, ns))
+	if _, ok := e.owners()[ownersBasesKey]; ok {
+		t.Fatal("private base remains shared")
+	}
+}
+
 func TestVMOwnersRestoredAfterLostClaim(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
+	e.readyState("first-root", "n1")
+	root := e.readyState(testOwner+".root", "n1")
+	root.Labels = map[string]string{LabelOwner: testOwner}
+	e.must(e.c.Update(e.ctx, root))
 	stale := func() corev1.Pod {
-		e.newBlip("first", withImage("reg/img:v1"))
+		e.newBlip("first", withRoot("first-root"))
+		e.run(e.blip, ns, "first")
 		e.run(e.pool, ns, "default")
 		e.warmOn("n1")
 		return e.pods()[0]
@@ -105,7 +145,7 @@ func TestVMOwnersRestoredAfterLostClaim(t *testing.T) {
 	expectPhase(t, e.getBlip("first"), v1.BlipRunning, "")
 
 	// A Blip working from a stale cache tries the pod that "first" holds.
-	e.newBlip(testOwner+"-b", withImage("reg/img:v1"), withOwner(testOwner))
+	e.newBlip(testOwner+"-b", withRoot(testOwner+".root"), withOwner(testOwner))
 	pod, err := e.blip.claim(e.ctx, e.getBlip(testOwner+"-b"), []corev1.Pod{stale})
 	if err != nil || pod != nil {
 		t.Fatalf("claim = %v, %v", pod, err)

@@ -265,7 +265,7 @@ func TestPoolKeepsPinnedPodsOverExcess(t *testing.T) {
 	}
 	mk("generic", "n2", "", 2*time.Minute)
 	mk("pinned", "", "n1", time.Minute)
-	e.newBlip("b", withImage("reg/img:v1"))
+	e.newBlip("b", e.withImage("reg/img:v1"))
 	b := e.getBlip("b")
 	b.Status.Phase = v1.BlipPending
 	b.Status.Locality = &v1.Locality{Node: "n1"}
@@ -294,7 +294,7 @@ func TestWarmPodsAvoidOthersPinnedPods(t *testing.T) {
 		p.Status.Phase = corev1.PodRunning
 		e.must(e.c.Status().Update(e.ctx, p))
 	}
-	e.newBlip("b", withImage("reg/img:v1"))
+	e.newBlip("b", e.withImage("reg/img:v1"))
 	if pods := e.warmPods("b", nil); len(pods) != 2 || pods[0].Name != "b-plain" {
 		t.Fatalf("warm pods %+v", pods)
 	}

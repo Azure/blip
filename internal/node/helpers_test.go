@@ -95,6 +95,7 @@ func vmPod(name string, blipUID string) *corev1.Pod {
 func blip(name string) *v1alpha1.Blip {
 	return &v1alpha1.Blip{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID("blipuid-" + name)},
+		Spec:       v1alpha1.BlipSpec{State: "root"},
 		Status:     v1alpha1.BlipStatus{Phase: v1alpha1.BlipRunning, Node: self},
 	}
 }

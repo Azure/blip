@@ -19,9 +19,8 @@ type imageSource struct {
 }
 
 // imageRefs returns the image references this node may need to import. It only
-// includes images of states placed on (or being placed on) this node and of
-// blips that run here, so a large cluster does not import every image on every
-// node.
+// includes images of states placed on (or being placed on) this node, so a
+// large cluster does not import every image on every node.
 func (v *view) imageRefs() []imageSource {
 	byID := map[string]*imageSource{}
 	add := func(ref string, secrets []corev1.LocalObjectReference, namespace string) {
@@ -44,16 +43,6 @@ func (v *view) imageRefs() []imageSource {
 			continue
 		}
 		add(s.Status.ImageDigest, s.Spec.ImagePullSecrets, s.Namespace)
-	}
-	for _, b := range v.blips {
-		if blipFinished(b) || !v.blipAssigned(b) {
-			continue
-		}
-		secrets := slices.Clone(b.Spec.ImagePullSecrets)
-		if p := v.pools[b.Namespace+"/"+b.Spec.Pool]; p != nil {
-			secrets = append(secrets, p.Spec.ImagePullSecrets...)
-		}
-		add(b.Status.ImageDigest, secrets, b.Namespace)
 	}
 	refs := make([]imageSource, 0, len(byID))
 	for _, r := range byID {
@@ -81,18 +70,6 @@ func (v *view) stateImageRelevant(s *v1alpha1.BlipState) bool {
 		return true
 	}
 	return len(st.Placements) == 0 && v.nodeMatches(s.Spec.NodeSelector)
-}
-
-// blipAssigned reports whether b runs on this node.
-func (v *view) blipAssigned(b *v1alpha1.Blip) bool {
-	if b.Status.Node == v.node {
-		return true
-	}
-	if b.Status.Pod == "" {
-		return false
-	}
-	pod := v.pods[podKey(b.Namespace, b.Status.Pod)]
-	return pod != nil && pod.Spec.NodeName == v.node
 }
 
 // nodeMatches reports whether this node's labels satisfy selector. Without a

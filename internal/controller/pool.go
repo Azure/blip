@@ -105,6 +105,7 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1.Blip{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
 			return []reconcile.Request{req(o.GetNamespace(), poolName(o.(*v1.Blip)))}
 		})).
+		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.statePools)).
 		Watches(&v1.BlipNode{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
 			var pools v1.BlipPoolList
 			if err := r.List(ctx, &pools); err != nil {
@@ -131,6 +132,20 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// State imports and deletions refresh shared-base authorization even when no
+// Blip currently waits for a VM.
+func (r *PoolReconciler) statePools(ctx context.Context, o client.Object) []reconcile.Request {
+	var pools v1.BlipPoolList
+	if err := r.List(ctx, &pools, client.InNamespace(o.GetNamespace())); err != nil {
+		return nil
+	}
+	var out []reconcile.Request
+	for _, p := range pools.Items {
+		out = append(out, req(p.Namespace, p.Name))
+	}
+	return out
+}
+
 func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (reconcile.Result, error) {
 	if err := syncVMOwners(ctx, r.Client, rq.Namespace); err != nil {
 		return reconcile.Result{}, err
@@ -155,20 +170,6 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	var blips v1.BlipList
 	if err := r.List(ctx, &blips, client.InNamespace(pool.Namespace), client.MatchingFields{indexPool: pool.Name}); err != nil {
 		return reconcile.Result{}, err
-	}
-	// Image states are held by every eligible node, so a Blip whose data is
-	// all image states can run anywhere. Pinning it to locality.node would
-	// reserve a VM on one arbitrary node and waste warm slots on the node
-	// where its sessions actually run.
-	var states v1.BlipStateList
-	if err := r.List(ctx, &states, client.InNamespace(pool.Namespace)); err != nil {
-		return reconcile.Result{}, err
-	}
-	replicated := map[string]bool{}
-	for i := range states.Items {
-		if states.Items[i].Spec.Image != "" {
-			replicated[states.Items[i].Name] = true
-		}
 	}
 	draining, err := drainingNodes(ctx, r)
 	if err != nil {
@@ -204,7 +205,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			continue
 		}
 		demand++
-		if loc := b.Status.Locality; loc != nil && !loc.Fallback && loc.Node != "" && !draining[loc.Node] && !replicatedData(b, replicated) {
+		if loc := b.Status.Locality; loc != nil && !loc.Fallback && loc.Node != "" && !draining[loc.Node] {
 			pinned[loc.Node]++
 		}
 	}

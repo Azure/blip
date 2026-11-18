@@ -195,7 +195,7 @@ func (e *env) newPool(name string, warm, max int32) {
 }
 
 func (e *env) newState(name string, mutate ...func(*v1.BlipState)) {
-	st := &v1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: v1.BlipStateSpec{Replicas: 2}}
+	st := &v1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: name, Generation: 1}, Spec: v1.BlipStateSpec{Replicas: 2}}
 	for _, m := range mutate {
 		m(st)
 	}
@@ -368,14 +368,44 @@ func withRoot(state string) func(*v1.Blip) {
 	return func(b *v1.Blip) { b.Spec.State = state }
 }
 
-func withImage(img string) func(*v1.Blip) {
-	return func(b *v1.Blip) { b.Spec.Image = img }
+// withImage creates a durable copy of an imported template. Tests concerned
+// with scheduling alone can use this fixture without running storage agents.
+func (e *env) withImage(img string) func(*v1.Blip) {
+	return func(b *v1.Blip) {
+		baseName, rootName := b.Name+"-base", b.Name+"-root"
+		e.newState(baseName, func(st *v1.BlipState) { st.Spec.Image, st.Spec.Replicas = img, 0 })
+		base := e.getState(baseName)
+		base.Status = v1.BlipStateStatus{Phase: v1.StateReady, SizeBytes: defaultStateSize,
+			ImageDigest: "reg/img@sha256:aaaa", ImageConfig: e.reg.configs[img].DeepCopy(),
+			Committed: &v1.Commit{ID: newID(), Generation: 1}}
+		e.must(e.c.Status().Update(e.ctx, base))
+		e.newState(rootName, func(st *v1.BlipState) { st.Spec.CopyFrom = baseName })
+		root := e.getState(rootName)
+		root.Status = v1.BlipStateStatus{Phase: v1.StateReady, SizeBytes: defaultStateSize,
+			ImageConfig: base.Status.ImageConfig.DeepCopy(),
+			CopiedFrom:  &v1.CopySource{StateUID: string(base.UID), CommitID: base.Status.Committed.ID},
+			Committed:   &v1.Commit{ID: newID(), Generation: 1}}
+		e.must(e.c.Status().Update(e.ctx, root))
+		b.Spec.State = rootName
+		b.Status.Locality = &v1.Locality{Fallback: true}
+	}
 }
 
-func withMount(state, path string, writable bool) func(*v1.Blip) {
+func (e *env) withMount(state, path string, writable bool) func(*v1.Blip) {
 	return func(b *v1.Blip) {
-		b.Spec.Mounts = append(b.Spec.Mounts, v1.Mount{State: state, Path: path, Writable: writable})
+		root := e.getState(b.Spec.State)
+		root.Spec.Mounts = append(root.Spec.Mounts, v1.Mount{State: state, Path: path, Writable: writable})
+		root.Generation++
+		e.must(e.c.Update(e.ctx, root))
 	}
+}
+
+func (e *env) updateRoot(blip string, mutate func(*v1.BlipState)) {
+	e.t.Helper()
+	root := e.getState(e.getBlip(blip).Spec.State)
+	mutate(root)
+	root.Generation++
+	e.must(e.c.Update(e.ctx, root))
 }
 
 func withCommand(cmd ...string) func(*v1.Blip) {

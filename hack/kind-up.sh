@@ -171,11 +171,19 @@ patches:
               - name: gateway
                 args:
                   - --namespace=blip-ssh
-                  - --image=${REGISTRY}:5000/blip/dev:latest
+                  - --base-state=gateway-base
                   - --identity-header=X-Forwarded-User
                   - --tls-cert=/etc/blip/tls/tls.crt
                   - --tls-key=/etc/blip/tls/tls.key
                   - --tls-client-ca=/etc/blip/tls/client-ca.crt
+  - patch: |-
+      apiVersion: blip.dev/v1alpha1
+      kind: BlipState
+      metadata:
+        name: gateway-base
+        namespace: blip-ssh
+      spec:
+        image: ${REGISTRY}:5000/blip/dev:latest
 EOF
 
 k apply -k deploy/crd
@@ -210,9 +218,15 @@ cat <<EOF
 
 blip-dev is ready. Always pass the context explicitly:
 
-  bin/kubectl-blip --context ${CTX} run hello --image ${REGISTRY}:5000/blip/dev:latest -- uname -a
-  bin/kubectl-blip --context ${CTX} run sandbox --image ${REGISTRY}:5000/blip/dev:latest
+  bin/kubectl-blip --context ${CTX} pull dev-base ${REGISTRY}:5000/blip/dev:latest
+  bin/kubectl-blip --context ${CTX} run hello --fork dev-base -- uname -a
+  bin/kubectl-blip --context ${CTX} run sandbox --fork dev-base -- sh -c 'echo kept > ~/notes.txt'
+  kubectl --context ${CTX} delete blip sandbox
+  bin/kubectl-blip --context ${CTX} run resumed --state sandbox -- cat /home/dev/notes.txt
   kubectl --context ${CTX} get blippools,blips,blipstates -A
+
+Root BlipState.spec.mounts and spec.runtime hold durable workspace configuration.
+Delete BlipStates explicitly when their data is no longer needed.
 
 SSH gateway (NodePort 30022 on every node). Add your key, then connect;
 the user name picks the sandbox:

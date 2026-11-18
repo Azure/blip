@@ -21,10 +21,6 @@ spec:
     - jsonPath: .spec.state
       name: Root
       type: string
-    - jsonPath: .spec.image
-      name: Image
-      priority: 1
-      type: string
     - jsonPath: .status.exitCode
       name: Exit
       type: integer
@@ -89,75 +85,11 @@ spec:
                 description: IdleTimeout applies to interactive blips. Default 30s.
                 pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
                 type: string
-              image:
-                description: |-
-                  Image gives the blip a throwaway root filesystem from a container
-                  image, converted to ext4 on the node. The root is 10Gi, or the
-                  converted image's size if larger.
-                type: string
-                x-kubernetes-validations:
-                - message: image is immutable
-                  rule: self == oldSelf
-              imagePullSecrets:
-                description: ImagePullSecrets authenticate image pulls for this blip's
-                  image root.
-                items:
-                  description: |-
-                    LocalObjectReference contains enough information to let you locate the
-                    referenced object inside the same namespace.
-                  properties:
-                    name:
-                      default: ""
-                      description: |-
-                        Name of the referent.
-                        This field is effectively required, but due to backwards compatibility is
-                        allowed to be empty. Instances of this type with an empty value here are
-                        almost certainly wrong.
-                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      type: string
-                  type: object
-                  x-kubernetes-map-type: atomic
-                type: array
-              mounts:
-                items:
-                  description: Mount attaches a state's filesystem inside a running
-                    blip.
-                  properties:
-                    path:
-                      description: |-
-                        Path is an absolute path inside the guest root. It must be clean: no
-                        trailing slash, repeated slash, or . and .. segments.
-                      maxLength: 4096
-                      pattern: ^/[^/]+(/[^/]+)*$
-                      type: string
-                      x-kubernetes-validations:
-                      - message: path must not contain . or .. segments
-                        rule: '!self.split(''/'').exists(s, s == ''.'' || s == ''..'')'
-                    state:
-                      description: State names a BlipState in the blip's namespace.
-                      pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
-                      type: string
-                    writable:
-                      description: |-
-                        Writable mounts take the state's single writer slot and save a new
-                        version when unmounted. Read-only mounts pin the committed version.
-                      type: boolean
-                  required:
-                  - path
-                  - state
-                  type: object
-                maxItems: 16
-                type: array
-                x-kubernetes-list-map-keys:
-                - state
-                x-kubernetes-list-type: map
-                x-kubernetes-validations:
-                - message: mount paths must be unique
-                  rule: self.all(m, self.exists_one(o, o.path == m.path))
               network:
                 description: |-
-                  Network narrows the pool's egress policy. Omitted inherits the pool;
-                  explicitly empty denies all. Changes apply to running blips.
+                  Network narrows the pool's egress policy. Omitted inherits the root
+                  state's runtime network policy, or the pool if neither is set.
+                  Explicitly empty denies all. Changes apply to running blips.
                 properties:
                   egress:
                     items:
@@ -410,7 +342,10 @@ spec:
               state:
                 description: |-
                   State gives the blip a durable root filesystem. A new version is
-                  saved when the blip stops.
+                  saved when the blip stops. Mounts and runtime defaults come from this
+                  state in the blip's namespace.
+                minLength: 1
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string
                 x-kubernetes-validations:
                 - message: state is immutable
@@ -431,14 +366,12 @@ spec:
                 x-kubernetes-validations:
                 - message: workingDir is immutable
                   rule: self == oldSelf
+            required:
+            - state
             type: object
             x-kubernetes-validations:
-            - message: set exactly one of image and state
-              rule: (has(self.image) && size(self.image) > 0) != (has(self.state)
-                && size(self.state) > 0)
-            - message: image, state, and command are immutable
-              rule: (has(self.image) && size(self.image) > 0) == (has(oldSelf.image)
-                && size(oldSelf.image) > 0) && has(self.command) == has(oldSelf.command)
+            - message: command is immutable
+              rule: has(self.command) == has(oldSelf.command)
             - message: env is immutable
               rule: (has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env
                 == oldSelf.env)
@@ -459,11 +392,6 @@ spec:
                 type: integer
               finishTime:
                 format: date-time
-                type: string
-              imageDigest:
-                description: |-
-                  ImageDigest is the resolved container image (digest reference
-                  repo@sha256:...) for image roots.
                 type: string
               locality:
                 description: |-
@@ -548,7 +476,14 @@ spec:
               startTime:
                 format: date-time
                 type: string
+              stateGeneration:
+                description: StateGeneration is the observed desired generation of
+                  the root state.
+                format: int64
+                type: integer
             type: object
+        required:
+        - spec
         type: object
     served: true
     storage: true

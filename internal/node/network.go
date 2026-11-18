@@ -36,7 +36,17 @@ func (v *view) networkFor(pod *corev1.Pod, b *v1alpha1.Blip) (*network.Policy, e
 	if poolPolicy == nil {
 		poolPolicy = network.Default()
 	}
-	policy, err := network.Compile(b.Namespace, poolPolicy, b.Spec.Network, v.destinations)
+	policySpec := b.Spec.Network
+	if policySpec == nil {
+		root := v.stateByName[b.Namespace+"/"+b.Spec.State]
+		if root == nil {
+			return denyNetwork(), fmt.Errorf("root BlipState %s/%s not found", b.Namespace, b.Spec.State)
+		}
+		if root.Spec.Runtime != nil {
+			policySpec = root.Spec.Runtime.Network
+		}
+	}
+	policy, err := network.Compile(b.Namespace, poolPolicy, policySpec, v.destinations)
 	if err != nil {
 		return denyNetwork(), err
 	}

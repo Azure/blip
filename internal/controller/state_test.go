@@ -261,12 +261,14 @@ func TestDrainRepair(t *testing.T) {
 
 	// A running VM pod keeps a draining node.
 	e.newPool("default", 0, 0)
-	b := e.startBlip("b", spare, withImage("reg/img:v1"))
+	b := e.startBlip("b", spare, e.withImage("reg/img:v1"))
 	e.setDrain(spare)
 	if e.safeToRemove(spare) {
 		t.Fatal("node with a running VM pod is safe to remove")
 	}
 	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{}})
+	e.run(e.blip, ns, "b")
+	e.saveWriter(b.Spec.State, newID())
 	e.run(e.blip, ns, "b")
 	expectPhase(t, e.getBlip("b"), v1.BlipSucceeded, "")
 	if e.safeToRemove(spare) {
@@ -302,7 +304,7 @@ func TestStateDeletionBlockedByBlip(t *testing.T) {
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
 	e.readyState("s", "n1")
-	b := e.startBlip("b", "n1", withImage("reg/img:v1"), withMount("s", "/s", false))
+	b := e.startBlip("b", "n1", e.withImage("reg/img:v1"), e.withMount("s", "/s", false))
 
 	e.must(e.c.Delete(e.ctx, e.getState("s")))
 	e.run(e.state, ns, "s")
@@ -311,6 +313,8 @@ func TestStateDeletionBlockedByBlip(t *testing.T) {
 		t.Fatalf("deletion not blocked: %+v", st.Status)
 	}
 	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{}})
+	e.run(e.blip, ns, "b")
+	e.saveWriter(b.Spec.State, newID())
 	e.run(e.blip, ns, "b")
 	expectPhase(t, e.getBlip("b"), v1.BlipSucceeded, "")
 	e.run(e.state, ns, "s")
@@ -428,7 +432,7 @@ func TestPendingBlipWithMountBlocksStateDeletion(t *testing.T) {
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
 	st := e.readyState("s", "n1")
-	e.newBlip("b", withImage("reg/img:v1"), withMount("s", "/s", false))
+	e.newBlip("b", e.withImage("reg/img:v1"), e.withMount("s", "/s", false))
 	e.setBlipStatus("b", func(b *v1.Blip) {
 		b.Status.Phase = v1.BlipPending
 		b.Status.Reason = ReasonWaitingForVM

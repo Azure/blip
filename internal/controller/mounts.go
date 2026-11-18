@@ -8,33 +8,134 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/podapi"
 )
 
-// validateSpec checks the root and every mount of a Blip.
-func validateSpec(b *v1.Blip) string {
-	if (b.Spec.Image == "") == (b.Spec.State == "") {
-		return "set exactly one of image and state"
-	}
-	for _, m := range b.Spec.Mounts {
-		if msg := mountError(b, m); msg != "" {
+// validateMounts validates the complete root topology before changing any disk.
+func validateMounts(root string, mounts []v1.Mount) string {
+	seen := map[string]bool{}
+	for _, m := range mounts {
+		if m.State == "" || seen[m.State] {
+			return "mount states must be nonempty and unique"
+		}
+		seen[m.State] = true
+		if msg := mountError(root, mounts, m); msg != "" {
 			return fmt.Sprintf("mount %s: %s", m.State, msg)
 		}
 	}
 	return ""
 }
 
+func immutableStateMessage(name string) string {
+	return fmt.Sprintf("state %q is an immutable image template; fork it before writing", name)
+}
+
+// Check the exact state object whose UID will be attached. An earlier profile
+// validation may have observed a shared base that was since deleted/recreated.
+func mountStateError(b *v1.Blip, st *v1.BlipState, writable bool) string {
+	if writable && st.Spec.Image != "" {
+		return immutableStateMessage(st.Name)
+	}
+	if owner := b.Labels[LabelOwner]; owner != "" && !ownedState(st, owner) &&
+		(writable || st.Spec.Image == "" || st.Labels[LabelOwner] != "") {
+		return fmt.Sprintf("mount %q is not owned by %s or a shared read-only image template", st.Name, owner)
+	}
+	return ""
+}
+
+func ownedState(st *v1.BlipState, owner string) bool {
+	return strings.HasPrefix(st.Name, owner+".") && st.Labels[LabelOwner] == owner
+}
+
+// rootIntent reads only the root profile. Auxiliary profiles never expand.
+// Invalid edits leave a running Blip's current attachments intact.
+func (r *BlipReconciler) rootIntent(ctx context.Context, b *v1.Blip) (*v1.BlipState, []v1.Mount, string, string, error) {
+	root := &v1.BlipState{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.State}, root); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil, ReasonStateNotFound, fmt.Sprintf("state %q not found", b.Spec.State), nil
+		}
+		return nil, nil, "", "", err
+	}
+	if root.DeletionTimestamp != nil {
+		return root, nil, reasonStateDeleting, fmt.Sprintf("state %q is being deleted", root.Name), nil
+	}
+	if root.Spec.Image != "" {
+		return root, nil, ReasonInvalidSpec, immutableStateMessage(root.Name), nil
+	}
+	if msg := mountStateError(b, root, true); msg != "" {
+		return root, nil, ReasonInvalidSpec, msg, nil
+	}
+	if err := pruneTemporaryMounts(ctx, r.Client, r.Live, root); err != nil {
+		return nil, nil, "", "", err
+	}
+	mounts := desiredMounts(root, b)
+	if msg := validateMounts(root.Name, mounts); msg != "" {
+		return root, nil, ReasonInvalidSpec, msg, nil
+	}
+	for _, m := range mounts {
+		owner := b.Labels[LabelOwner]
+		owned := owner == "" || strings.HasPrefix(m.State, owner+".")
+		if !m.Writable && owner == "" {
+			continue
+		}
+		st := &v1.BlipState{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: m.State}, st); err != nil {
+			if apierrors.IsNotFound(err) {
+				if !owned {
+					return root, nil, ReasonInvalidSpec, fmt.Sprintf("mount %q is not owned by %s or a shared read-only image template", m.State, owner), nil
+				}
+				continue
+			}
+			return nil, nil, "", "", err
+		}
+		if msg := mountStateError(b, st, m.Writable); msg != "" {
+			return root, nil, ReasonInvalidSpec, msg, nil
+		}
+	}
+	return root, mounts, "", "", nil
+}
+
+func desiredMounts(root *v1.BlipState, b *v1.Blip) []v1.Mount {
+	var mounts []v1.Mount
+	for _, m := range root.Spec.Mounts {
+		if m.BlipUID == "" || m.BlipUID == string(b.UID) {
+			mounts = append(mounts, m)
+		}
+	}
+	return mounts
+}
+
+// Only acknowledge a generation after its desired topology is mounted, and
+// every removed writable attachment has finished saving.
+func mountsReconciled(b *v1.Blip, mounts []v1.Mount) bool {
+	if len(b.Status.Mounts) != len(mounts) || b.Status.Message != "" {
+		return false
+	}
+	for _, desired := range mounts {
+		if !slices.ContainsFunc(b.Status.Mounts, func(m v1.MountStatus) bool {
+			return m.State == desired.State && m.Path == desired.Path && m.Writable == desired.Writable &&
+				m.Phase == v1.MountMounted && !m.Switching && m.Message == ""
+		}) {
+			return false
+		}
+	}
+	return true
+}
+
 // mountError validates one spec mount against the rest of the spec.
-func mountError(b *v1.Blip, m v1.Mount) string {
+func mountError(root string, mounts []v1.Mount, m v1.Mount) string {
 	if msg := pathError(m.Path); msg != "" {
 		return msg
 	}
-	if m.State == b.Spec.State {
+	if m.State == root {
 		return "the root state cannot also be mounted"
 	}
-	for _, o := range b.Spec.Mounts {
+	for _, o := range mounts {
 		if o.State != m.State && overlaps(o.Path, m.Path) {
 			return fmt.Sprintf("path %s overlaps mount %s at %s", m.Path, o.State, o.Path)
 		}
@@ -62,13 +163,13 @@ func overlaps(a, b string) bool {
 
 // syncMounts moves status mounts through their phases from the runtime's
 // observations and spec changes, and acquires newly added mounts.
-func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, pod *corev1.Pod, obs *podapi.Observed) error {
+func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1.Mount, pod *corev1.Pod, obs *podapi.Observed) error {
 	disks := map[string]podapi.DiskStatus{}
 	for _, d := range obs.Mounts {
 		disks[d.ID] = d
 	}
 	spec := map[string]v1.Mount{}
-	for _, m := range b.Spec.Mounts {
+	for _, m := range mounts {
 		spec[m.State] = m
 	}
 	stop := stopping(b)
@@ -125,9 +226,9 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, pod *corev1
 							m.Phase, m.Message = v1.MountMounted, "waiting to switch to writable: "+msg
 							break
 						}
-						// Keep the read-only mount usable; the CLI
-						// reports the failed switch and reverts the spec.
-						m.Phase, m.Message, m.Switching = v1.MountMounted, "cannot switch to writable: "+msg, true
+						// Keep the old disk usable and retry accepted intent.
+						// A busy writer can disappear without another spec edit.
+						m.Phase, m.Message, m.Switching = v1.MountMounted, "cannot switch to writable: "+msg, false
 						break
 					}
 				}
@@ -246,12 +347,8 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, pod *corev1
 	}
 
 	var waits []string
-	for _, sm := range b.Spec.Mounts {
+	for _, sm := range mounts {
 		if stop || present[sm.State] {
-			continue
-		}
-		if msg := mountError(b, sm); msg != "" {
-			out = append(out, v1.MountStatus{State: sm.State, Path: sm.Path, Writable: sm.Writable, Phase: v1.MountFailed, Message: msg})
 			continue
 		}
 		if busy := busyPath(out, sm); busy != "" {
@@ -268,6 +365,10 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, pod *corev1
 		}
 		if reason != "" {
 			waits = append(waits, "mount "+sm.State+": "+msg)
+			continue
+		}
+		if msg := mountStateError(b, st, sm.Writable); msg != "" {
+			waits = append(waits, msg)
 			continue
 		}
 		var id string

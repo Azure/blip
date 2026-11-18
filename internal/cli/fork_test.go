@@ -22,21 +22,21 @@ import (
 func ownedBlip(name, root string, mounts ...v1alpha1.Mount) *v1alpha1.Blip {
 	b := runningBlip(name, mounts...)
 	b.Labels = map[string]string{ownerLabel: "alice"}
-	b.Spec.Image, b.Spec.State = "", root
+	b.Spec.State = root
 	return b
 }
 
 func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	h := newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.repo"))
 	h.self = "alice.box"
-	code, out, errOut := h.run("", "run", "w1", "--image", "img", "-d", "--mount", "repo:/r", "--", "true")
+	code, out, errOut := h.run("", "run", "w1", "--state", "repo", "-d", "--", "true")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	mustContain(t, out, "blip/w1 created")
 	b := h.blip("alice.w1")
-	if b.Labels[ownerLabel] != "alice" || b.Spec.Mounts[0].State != "alice.repo" {
-		t.Fatalf("labels %v mounts %+v", b.Labels, b.Spec.Mounts)
+	if b.Labels[ownerLabel] != "alice" || b.Spec.State != "alice.repo" {
+		t.Fatalf("labels %v spec %+v", b.Labels, b.Spec)
 	}
 	h.ctrl.set(func(c *fakeController) { c.exited["alice.w1"] = 0 })
 	code, out, _ = h.run("", "wait", "alice.w1")
@@ -47,7 +47,7 @@ func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	// The separator is always ".", whatever the caller's own name.
 	h2 := newHarness(t, ownedBlip("alice-box", "alice.home"))
 	h2.self = "alice-box"
-	if code, _, errOut := h2.run("", "run", "w1", "--image", "img", "-d"); code != 0 {
+	if code, _, errOut := h2.run("", "run", "w1", "--fork", "home", "-d"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	h2.blip("alice.w1")
@@ -55,7 +55,7 @@ func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	// Without an owner, names are not scoped.
 	h3 := newHarness(t, runningBlip("agent"))
 	h3.self = "agent"
-	if code, _, errOut := h3.run("", "run", "w1", "--image", "img", "-d"); code != 0 {
+	if code, _, errOut := h3.run("", "run", "w1", "--fork", "agent-root", "-d"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	if b := h3.blip("w1"); b.Labels[ownerLabel] != "" {
@@ -66,7 +66,9 @@ func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 func TestForkRoot(t *testing.T) {
 	self := ownedBlip("alice.box", "alice.home")
 	self.Spec.Pool, self.Spec.User = "big", "dev"
-	h := newHarness(t, self, readyState("alice.home"))
+	home := readyState("alice.home")
+	home.Spec.Runtime = &v1alpha1.RuntimeDefaults{User: "workspace-user", WorkingDir: "/work"}
+	h := newHarness(t, self, home)
 	h.self = "alice.box"
 	code, out, errOut := h.run("", "run", "w1", "--fork", "/", "-d", "--", "sh", "-c", "make")
 	if code != 0 {
@@ -74,15 +76,14 @@ func TestForkRoot(t *testing.T) {
 	}
 	mustContain(t, out, "blip/w1 created")
 	b := h.blip("alice.w1")
-	wd, _ := os.Getwd()
-	if b.Spec.State != "alice.w1" || b.Spec.Image != "" || b.Spec.Pool != "big" || b.Spec.User != "dev" || b.Spec.WorkingDir != wd {
+	if b.Spec.State != "alice.w1" || b.Spec.Pool != "big" || b.Spec.User != "" || b.Spec.WorkingDir != "" {
 		t.Fatalf("spec = %+v", b.Spec)
 	}
 	s := h.state("alice.w1")
-	if s.Spec.CopyFrom != "alice.home" || s.Spec.Replicas != 1 || s.Labels[ownerLabel] != "alice" {
+	if s.Spec.CopyFrom != "alice.home" || s.Spec.Replicas != 0 || s.Labels[ownerLabel] != "alice" || s.Spec.Runtime.User != "workspace-user" {
 		t.Fatalf("state = %+v %v", s.Spec, s.Labels)
 	}
-	if refs := s.OwnerReferences; len(refs) != 1 || refs[0].Kind != "Blip" || refs[0].Name != "alice.w1" || refs[0].UID != b.UID || *refs[0].Controller {
+	if refs := s.OwnerReferences; len(refs) != 0 {
 		t.Fatalf("owner refs = %+v", refs)
 	}
 }
@@ -92,7 +93,7 @@ func TestForkCreatesNothingOnStateFailure(t *testing.T) {
 	h := newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.home"), readyState("alice.w1"))
 	h.self = "alice.box"
 	code, _, errOut := h.run("", "run", "w1", "--fork", "/", "-d")
-	if code != 1 || !strings.Contains(errOut, `state "w1" already exists`) {
+	if code != 1 || !strings.Contains(errOut, `workspace "w1" already exists`) {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	var b v1alpha1.Blip
@@ -100,7 +101,7 @@ func TestForkCreatesNothingOnStateFailure(t *testing.T) {
 		t.Fatalf("blip created: %v", err)
 	}
 
-	// The worker is deleted if its copy cannot be created.
+	// The execution is never created if its workspace cannot be created.
 	h = newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.home"))
 	h.self = "alice.box"
 	h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
@@ -118,58 +119,17 @@ func TestForkCreatesNothingOnStateFailure(t *testing.T) {
 	}
 }
 
-func TestForkMountDefaultsImageThroughCopies(t *testing.T) {
-	base := readyState("alice.base")
-	base.Spec.Image = "reg/dev:1"
-	home := readyState("alice.home")
-	home.Spec.CopyFrom = "alice.base"
-	h := newHarness(t, ownedBlip("alice.box", "alice.home", v1alpha1.Mount{State: "alice.repo", Path: "/work", Writable: true}),
-		base, home, readyState("alice.repo"))
-	h.self = "alice.box"
-	code, _, errOut := h.run("", "run", "w2", "--fork", "/work/", "-w", "/work/src", "-d", "--", "true")
-	if code != 0 {
-		t.Fatalf("code %d: %s", code, errOut)
-	}
-	b := h.blip("alice.w2")
-	want := v1alpha1.Mount{State: "alice.w2", Path: "/work", Writable: true}
-	if b.Spec.Image != "reg/dev:1" || b.Spec.State != "" || b.Spec.WorkingDir != "/work/src" || len(b.Spec.Mounts) != 1 || b.Spec.Mounts[0] != want {
-		t.Fatalf("spec = %+v", b.Spec)
-	}
-	if s := h.state("alice.w2"); s.Spec.CopyFrom != "alice.repo" {
-		t.Fatalf("state = %+v", s.Spec)
-	}
-}
-
-func TestForkMountCwdOutsideFallsBackToMount(t *testing.T) {
-	home := readyState("alice.home")
-	home.Spec.Image = "reg/dev:1"
-	h := newHarness(t, ownedBlip("alice.box", "alice.home", v1alpha1.Mount{State: "alice.repo", Path: "/work", Writable: true}),
-		home, readyState("alice.repo"))
-	h.self = "alice.box"
-	code, _, errOut := h.run("", "run", "w1", "--fork", "/work", "-d", "--", "true")
-	if code != 0 {
-		t.Fatalf("code %d: %s", code, errOut)
-	}
-	if got := h.blip("alice.w1").Spec.WorkingDir; got != "/work" {
-		t.Fatalf("working dir = %q, want fork mount", got)
-	}
-}
-
 func TestForkRejections(t *testing.T) {
-	imageRooted := runningBlip("imgbox", v1alpha1.Mount{State: "repo", Path: "/work"})
-	bare := readyState("alice.bare")
-	h := newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.home"), imageRooted, ownedBlip("alice.nobase", "alice.bare", v1alpha1.Mount{State: "alice.repo", Path: "/w"}), bare)
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.home"))
 	for _, tc := range []struct {
 		self string
 		args []string
 		want string
 	}{
-		{"", []string{"run", "x", "--fork", "/", "-d"}, "--fork only works inside a blip"},
-		{"alice.box", []string{"run", "x", "--fork", "/", "--state", "s", "-d"}, "--fork and --state cannot be combined"},
-		{"alice.box", []string{"run", "x", "--fork", "/", "--image", "i", "-d"}, "--image cannot be combined with --fork /"},
-		{"imgbox", []string{"run", "x", "--fork", "/", "-d"}, "--fork / needs a blip with a state root"},
-		{"alice.box", []string{"run", "x", "--fork", "/nope", "-d"}, "no state is mounted at /nope"},
-		{"alice.nobase", []string{"run", "x", "--fork", "/w", "-d"}, "set --image"},
+		{"", []string{"run", "x", "--fork", "/", "-d"}, "--fork / only works inside a blip"},
+		{"alice.box", []string{"run", "x", "--fork", "/", "--state", "s", "-d"}, "exactly one of --state"},
+		{"alice.box", []string{"run", "x", "--fork", "/", "--image", "i", "-d"}, "unknown flag: --image"},
+		{"alice.box", []string{"run", "x", "--fork", "missing", "-d"}, `state "missing" not found`},
 	} {
 		h.self = tc.self
 		code, _, errOut := h.run("", tc.args...)
@@ -179,7 +139,7 @@ func TestForkRejections(t *testing.T) {
 	}
 	var states v1alpha1.BlipStateList
 	h.kube.List(context.Background(), &states)
-	if len(states.Items) != 2 {
+	if len(states.Items) != 1 {
 		t.Fatalf("rejected forks created states: %d", len(states.Items))
 	}
 }
@@ -187,7 +147,7 @@ func TestForkRejections(t *testing.T) {
 func TestMountDefaultsToSelf(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"), readyState("repo"))
 	code, _, errOut := h.run("", "mount", "repo", "--path", "/work")
-	if code != 1 || !strings.Contains(errOut, "--blip is required outside a blip") {
+	if code != 1 || !strings.Contains(errOut, "ROOT_STATE is required outside a blip") {
 		t.Fatalf("code %d err %q", code, errOut)
 	}
 	h.self = "agent"
@@ -229,13 +189,14 @@ func TestParseCollectOpsAndState(t *testing.T) {
 		v1alpha1.Mount{State: "nested", Path: "/work/repo/deep"},
 	)
 	b.Spec.State = "root"
+	root := readyState("root")
 	for dir, want := range map[string][2]string{
 		"/work/repo/sub":    {"repo", "/repo/sub"},
 		"/work/repo/deep/x": {"nested", "/x"},
 		"/work":             {"repo", ""},
 		"/home/dev":         {"root", "/home/dev"},
 	} {
-		if s, rel := stateForPath(b, dir); s != want[0] || rel != want[1] {
+		if s, rel := stateForPath(b, root, dir); s != want[0] || rel != want[1] {
 			t.Errorf("%s: got %q %q, want %q %q", dir, s, rel, want[0], want[1])
 		}
 	}
@@ -281,7 +242,7 @@ func TestCollectMountSharesAndReusesMounts(t *testing.T) {
 	}
 	// Concurrent collects share the mount; the last one removes it.
 	dir1, done1 := checkout()
-	if m := findSpecMount(h.blip("alice.box").Spec.Mounts, "alice.w1"); m == nil || m.Writable {
+	if m := findSpecMount(h.rootState("alice.box").Spec.Mounts, "alice.w1"); m == nil || m.Writable || m.BlipUID == "" {
 		t.Fatalf("new mount is not read-only: %+v", m)
 	}
 	dir2, done2 := checkout()
@@ -289,11 +250,11 @@ func TestCollectMountSharesAndReusesMounts(t *testing.T) {
 		t.Fatalf("dirs %q %q", dir1, dir2)
 	}
 	done1()
-	if m := h.blip("alice.box").Spec.Mounts; len(m) != 1 {
+	if m := h.rootState("alice.box").Spec.Mounts; len(m) != 1 {
 		t.Fatalf("mount removed under another collect: %+v", m)
 	}
 	done2()
-	if b := h.blip("alice.box"); len(b.Spec.Mounts) != 0 || b.Annotations[collectMountsAnnotation] != "" {
+	if b := h.rootState("alice.box"); len(b.Spec.Mounts) != 0 || b.Annotations[collectMountsAnnotation] != "" {
 		t.Fatalf("mounts %+v annotations %v", b.Spec.Mounts, b.Annotations)
 	}
 	waitForCond(t, func() bool { return len(h.blip("alice.box").Status.Mounts) == 0 })
@@ -304,7 +265,7 @@ func TestCollectMountSharesAndReusesMounts(t *testing.T) {
 	}
 	dir, done := checkout()
 	done()
-	if m := h.blip("alice.box").Spec.Mounts; dir != "/w1" || len(m) != 1 || !m[0].Writable {
+	if m := h.rootState("alice.box").Spec.Mounts; dir != "/w1" || len(m) != 1 || !m[0].Writable {
 		t.Fatalf("dir %q mounts %+v", dir, m)
 	}
 }
@@ -359,7 +320,7 @@ func gitRun(t *testing.T, dir string, args ...string) string {
 // count from the caller blip.
 func assertCollectReleased(t *testing.T, h *harness, blip, state string) {
 	t.Helper()
-	b := h.blip(blip)
+	b := h.rootState(blip)
 	if m := findSpecMount(b.Spec.Mounts, state); m != nil {
 		t.Fatalf("%s still mounts %s: %+v", blip, state, b.Spec.Mounts)
 	}
@@ -501,13 +462,6 @@ func TestCollectRejections(t *testing.T) {
 			`blip "alice.nope" not found`},
 		{"blip with path", gitObjects(), "alice.box", []string{"collect", "w1:/src", "/:./out"},
 			`invalid blip "w1:/src"`},
-		{"image root", []client.Object{ownedBlip("alice.box", "alice.home"), func() *v1alpha1.Blip {
-			b := runningBlip("alice.imgbox")
-			b.Labels = map[string]string{ownerLabel: "alice"}
-			return b
-		}()},
-			"alice.box", []string{"collect", "imgbox", "/:./out"},
-			"is not on a state of blip imgbox"},
 		{"invalid operation", gitObjects(), "alice.box", []string{"collect", "w1", "nonsense"},
 			`invalid operation "nonsense"`},
 		{"failed state", []client.Object{ownedBlip("alice.box", "alice.home"), worker, failed},

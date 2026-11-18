@@ -52,6 +52,17 @@ metadata:
   name: blip-ssh-users
   namespace: blip-ssh
 ---
+# Shared, read-only import. Each sandbox forks this state into its own durable
+# workspace; the gateway never runs this base as a writable root.
+apiVersion: blip.dev/v1alpha1
+kind: BlipState
+metadata:
+  name: gateway-base
+  namespace: blip-ssh
+spec:
+  image: ghcr.io/azure/dev:latest
+  size: 20Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -79,8 +90,7 @@ spec:
           command: [/usr/local/bin/blip-gateway]
           args:
             - --namespace=blip-ssh
-            # The container image new sandboxes start from. Overlays replace it.
-            - --image=ghcr.io/azure/dev:latest
+            - --base-state=gateway-base
             # The authenticated identity header set by the Envoy gateway.
             - --identity-header=X-Forwarded-User
             # The certificate API only accepts clients that present a

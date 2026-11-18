@@ -107,15 +107,15 @@ func TestDurableSaveFlow(t *testing.T) {
 	e.addNodes("n1", "n2", "n3")
 	e.newPool("default", 2, 0)
 	e.label("zone", "a", "n1", "n2")
-	e.newState("home", func(st *v1.BlipState) {
+	e.newState("base", func(st *v1.BlipState) {
 		st.Spec.Image = "reg/img:v1"
 		st.Spec.Replicas = 0
 		st.Spec.NodeSelector = map[string]string{"zone": "a"}
 	})
 
 	// Initial version.
-	e.run(e.state, ns, "home")
-	st := e.getState("home")
+	e.run(e.state, ns, "base")
+	st := e.getState("base")
 	p := st.Status.Pending
 	if p == nil || p.Generation != 1 || !hexID.MatchString(p.CommitID) || len(p.Replicas) != 2 || p.SourceNode != p.Replicas[0] {
 		t.Fatalf("initial pending %+v", p)
@@ -123,17 +123,27 @@ func TestDurableSaveFlow(t *testing.T) {
 	if st.Status.ImageDigest != "reg/img@sha256:aaaa" || st.Status.SizeBytes != 10<<30 || st.Status.Phase != v1.StatePending || len(st.Finalizers) != 1 {
 		t.Fatalf("initial status %+v", st.Status)
 	}
-	e.hold("home", p.CommitID, p.Replicas[0])
-	e.run(e.state, ns, "home")
-	if st = e.getState("home"); st.Status.Committed != nil {
+	e.hold("base", p.CommitID, p.Replicas[0])
+	e.run(e.state, ns, "base")
+	if st = e.getState("base"); st.Status.Committed != nil {
 		t.Fatalf("committed before every replica reported: %+v", st.Status)
 	}
-	e.hold("home", p.CommitID, p.Replicas[1])
-	e.run(e.state, ns, "home")
-	st = e.getState("home")
+	e.hold("base", p.CommitID, p.Replicas[1])
+	e.run(e.state, ns, "base")
+	st = e.getState("base")
 	if c := st.Status.Committed; c == nil || c.ID != p.CommitID || c.Generation != 1 || st.Status.Pending != nil || st.Status.Phase != v1.StateReady {
 		t.Fatalf("initial commit %+v", st.Status)
 	}
+	// Imported templates remain immutable; executions write a durable copy.
+	e.newState("home", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "base"
+		st.Spec.NodeSelector = map[string]string{"zone": "a"}
+	})
+	e.run(e.state, ns, "home")
+	st = e.getState("home")
+	e.hold("home", st.Status.Pending.CommitID, st.Status.Pending.Replicas...)
+	e.run(e.state, ns, "home")
+	st = e.getState("home")
 	placements := st.Status.Placements
 	gen1 := st.Status.Committed.ID
 
@@ -249,8 +259,8 @@ func TestClaimRace(t *testing.T) {
 	e.newPool("default", 1, 1)
 	e.run(e.pool, ns, "default")
 	e.warmOn("n1")
-	e.newBlip("a", withImage("reg/img:v1"))
-	e.newBlip("b", withImage("reg/img:v1"))
+	e.newBlip("a", e.withImage("reg/img:v1"))
+	e.newBlip("b", e.withImage("reg/img:v1"))
 
 	// Both controllers saw the same vacant pod; only one claim may win.
 	snapshot := e.pods()
@@ -302,7 +312,7 @@ func TestBlipRejectsStaleWarmPodsBeforePoolCleanup(t *testing.T) {
 			}
 			e.create(old)
 			e.warmOn("n1")
-			e.newBlip("b", withImage("reg/img:v1"))
+			e.newBlip("b", e.withImage("reg/img:v1"))
 
 			// Run only the Blip reconciler: the pool has not yet retired the
 			// old pod. Both selection and reconciliation must reject it.
@@ -365,7 +375,7 @@ func TestClaimRechecksLivePool(t *testing.T) {
 			e.newPool("default", 1, 0)
 			e.run(e.pool, ns, "default")
 			e.warmOn("n1")
-			e.newBlip("b", withImage("reg/img:v1"))
+			e.newBlip("b", e.withImage("reg/img:v1"))
 			candidates := e.warmPods("b", nil)
 			if len(candidates) != 1 {
 				t.Fatalf("initial candidates = %d, want 1", len(candidates))
@@ -406,7 +416,7 @@ func TestClaimRejectsConcurrentTemplateChange(t *testing.T) {
 	e.newPool("default", 1, 0)
 	e.run(e.pool, ns, "default")
 	e.warmOn("n1")
-	e.newBlip("b", withImage("reg/img:v1"))
+	e.newBlip("b", e.withImage("reg/img:v1"))
 	candidates := e.warmPods("b", nil)
 	if len(candidates) != 1 {
 		t.Fatalf("initial candidates = %d, want 1", len(candidates))
@@ -431,8 +441,8 @@ func TestWriterAcquisition(t *testing.T) {
 	for _, s := range []string{"a", "b", "c", "d"} {
 		e.readyState(s, "n1")
 	}
-	e.newBlip("x", withRoot("a"), withMount("b", "/b", true))
-	e.newBlip("y", withRoot("b"), withMount("a", "/a", true))
+	e.newBlip("x", withRoot("a"), e.withMount("b", "/b", true))
+	e.newBlip("y", withRoot("b"), e.withMount("a", "/a", true))
 	x := e.getBlip("x")
 
 	// x is mid-acquisition: it holds a (sorted first) but not b yet.
@@ -466,7 +476,7 @@ func TestWriterAcquisition(t *testing.T) {
 	base = st.DeepCopy()
 	st.Status.Writer = &v1.Writer{AttachmentID: "2222222222222222", BlipName: "other", BlipUID: "other"}
 	e.must(patchStatus(e.ctx, e.c, st, base))
-	e.newBlip("z", withRoot("c"), withMount("d", "/d", true))
+	e.newBlip("z", withRoot("c"), e.withMount("d", "/d", true))
 	e.run(e.blip, ns, "z")
 	z := e.getBlip("z")
 	expectPhase(t, z, v1.BlipPending, ReasonStateBusy)
@@ -481,13 +491,13 @@ func TestReadOnlyMountPin(t *testing.T) {
 	e.newPool("default", 0, 0)
 	gen1 := e.readyState("data", "n1").Status.Committed.ID
 
-	x := e.startBlip("reader", "n1", withImage("reg/img:v1"), withMount("data", "/data", false))
+	x := e.startBlip("reader", "n1", e.withImage("reg/img:v1"), e.withMount("data", "/data", false))
 	m := mountOf(x, "data")
 	if m == nil || m.Writable || m.CommitID != gen1 || m.Phase != v1.MountPending || !hexID.MatchString(m.AttachmentID) || m.StateUID == "" {
 		t.Fatalf("ro mount %+v", m)
 	}
-	if !hexID.MatchString(x.Status.RootAttachmentID) || x.Status.ImageDigest != "reg/img@sha256:aaaa" {
-		t.Errorf("image root %+v", x.Status)
+	if !hexID.MatchString(x.Status.RootAttachmentID) || e.getState(x.Spec.State).Spec.CopyFrom == "" {
+		t.Errorf("durable copied root %+v", x.Status)
 	}
 	if w := e.getState("data").Status.Writer; w != nil {
 		t.Fatalf("read-only mount took the writer: %+v", w)
@@ -499,10 +509,11 @@ func TestReadOnlyMountPin(t *testing.T) {
 	}
 
 	// A writer saves a new version; the reader keeps its pinned version.
-	w := e.startBlip("writer", "n1", withImage("reg/img:v1"), withMount("data", "/data", true))
+	w := e.startBlip("writer", "n1", e.withImage("reg/img:v1"), e.withMount("data", "/data", true))
 	e.observe(w.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{}})
 	e.run(e.blip, ns, "writer")
 	e.saveWriter("data", "d2d2d2d2d2d2d2d2")
+	e.saveWriter(w.Spec.State, newID())
 	e.run(e.blip, ns, "writer")
 	expectPhase(t, e.getBlip("writer"), v1.BlipSucceeded, "")
 	e.run(e.blip, ns, "reader")
@@ -514,28 +525,26 @@ func TestReadOnlyMountPin(t *testing.T) {
 func TestBlipValidationAndWaiting(t *testing.T) {
 	tests := []struct {
 		name   string
-		blip   []func(*v1.Blip)
+		root   string
+		mounts []v1.Mount
 		phase  string
 		reason string
 	}{
-		{"relative mount path", []func(*v1.Blip){withImage("reg/img:v1"), withMount("data", "data", false)}, v1.BlipFailed, ReasonInvalidSpec},
-		{"mount at /", []func(*v1.Blip){withImage("reg/img:v1"), withMount("data", "/", false)}, v1.BlipFailed, ReasonInvalidSpec},
-		{"dotdot", []func(*v1.Blip){withImage("reg/img:v1"), withMount("data", "/a/../etc", false)}, v1.BlipFailed, ReasonInvalidSpec},
-		{"dot segment", []func(*v1.Blip){withImage("reg/img:v1"), withMount("data", "/a/./b", false)}, v1.BlipFailed, ReasonInvalidSpec},
-		{"trailing slash", []func(*v1.Blip){withImage("reg/img:v1"), withMount("data", "/data/", false)}, v1.BlipFailed, ReasonInvalidSpec},
-		{"duplicate path", []func(*v1.Blip){withImage("reg/img:v1"), withMount("data", "/data", false), withMount("other", "/data", false)}, v1.BlipFailed, ReasonInvalidSpec},
-		{"overlap", []func(*v1.Blip){withImage("reg/img:v1"), withMount("data", "/a", false), withMount("other", "/a/b", false)}, v1.BlipFailed, ReasonInvalidSpec},
-		{"root also mounted", []func(*v1.Blip){withRoot("data"), withMount("data", "/data", false)}, v1.BlipFailed, ReasonInvalidSpec},
-		{"image and state", []func(*v1.Blip){withRoot("data"), withImage("reg/img:v1")}, v1.BlipFailed, ReasonInvalidSpec},
-		{"empty image", []func(*v1.Blip){withImage("")}, v1.BlipFailed, ReasonInvalidSpec},
-		{"empty state", []func(*v1.Blip){withRoot("")}, v1.BlipFailed, ReasonInvalidSpec},
-		{"empty image and state", []func(*v1.Blip){withImage(""), withRoot("")}, v1.BlipFailed, ReasonInvalidSpec},
-		{"missing image", []func(*v1.Blip){withImage("reg/missing:v1")}, v1.BlipFailed, ReasonImageNotFound},
-		{"invalid image", []func(*v1.Blip){withImage("bad image!!")}, v1.BlipFailed, ReasonInvalidSpec},
-		{"missing state", []func(*v1.Blip){withRoot("nope")}, v1.BlipPending, ReasonStateNotFound},
-		{"uncommitted state", []func(*v1.Blip){withRoot("fresh")}, v1.BlipPending, ReasonStateNotReady},
-		{"missing pool", []func(*v1.Blip){withImage("reg/img:v1"), func(b *v1.Blip) { b.Spec.Pool = "gpu" }}, v1.BlipPending, ReasonPoolNotFound},
-		{"no warm VM", []func(*v1.Blip){withImage("reg/img:v1")}, v1.BlipPending, ReasonWaitingForVM},
+		{"relative mount path", "home", []v1.Mount{{State: "data", Path: "data"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"mount at /", "home", []v1.Mount{{State: "data", Path: "/"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"dotdot", "home", []v1.Mount{{State: "data", Path: "/a/../etc"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"dot segment", "home", []v1.Mount{{State: "data", Path: "/a/./b"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"trailing slash", "home", []v1.Mount{{State: "data", Path: "/data/"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"duplicate path", "home", []v1.Mount{{State: "data", Path: "/data"}, {State: "other", Path: "/data"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"duplicate state", "home", []v1.Mount{{State: "data", Path: "/data"}, {State: "data", Path: "/other"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"empty mount state", "home", []v1.Mount{{Path: "/data"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"overlap", "home", []v1.Mount{{State: "data", Path: "/a"}, {State: "other", Path: "/a/b"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"root also mounted", "home", []v1.Mount{{State: "home", Path: "/data"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"empty state", "", nil, v1.BlipFailed, ReasonInvalidSpec},
+		{"missing state", "nope", nil, v1.BlipPending, ReasonStateNotFound},
+		{"uncommitted state", "fresh", nil, v1.BlipPending, ReasonStateNotReady},
+		{"missing pool", "home", nil, v1.BlipPending, ReasonPoolNotFound},
+		{"no warm VM", "home", nil, v1.BlipPending, ReasonWaitingForVM},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -543,8 +552,16 @@ func TestBlipValidationAndWaiting(t *testing.T) {
 			e.addNodes("n1")
 			e.newPool("default", 0, 0)
 			e.readyState("data", "n1")
+			e.readyState("home", "n1")
 			e.newState("fresh")
-			e.newBlip("b", tt.blip...)
+			e.newBlip("b", withRoot(tt.root), func(b *v1.Blip) {
+				if tt.name == "missing pool" {
+					b.Spec.Pool = "gpu"
+				}
+			})
+			if tt.mounts != nil {
+				e.updateRoot("b", func(st *v1.BlipState) { st.Spec.Mounts = tt.mounts })
+			}
 			e.run(e.blip, ns, "b")
 			b := e.getBlip("b")
 			expectPhase(t, b, tt.phase, tt.reason)
@@ -602,13 +619,14 @@ func TestStoppedCommandSucceedsWithoutExitCode(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
-	e.newBlip("job", withImage("reg/img:v1"), withCommand("sleep", "600"))
+	e.newBlip("job", e.withImage("reg/img:v1"), withCommand("sleep", "600"))
 	e.run(e.pool, ns, "default")
 	e.warmOn("n1")
 	e.run(e.blip, ns, "job")
 	b := e.getBlip("job")
 	e.updateBlip("job", func(b *v1.Blip) { b.Spec.Stop = true })
 	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
+	e.saveWriter(b.Spec.State, newID())
 	e.settle()
 	b = e.getBlip("job")
 	expectPhase(t, b, v1.BlipSucceeded, ReasonStopped)
@@ -621,12 +639,13 @@ func TestFailedCommandReportsError(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")
 	e.newPool("default", 0, 0)
-	e.newBlip("job", withImage("reg/img:v1"), withCommand("false"))
+	e.newBlip("job", e.withImage("reg/img:v1"), withCommand("false"))
 	e.run(e.pool, ns, "default")
 	e.warmOn("n1")
 	e.run(e.blip, ns, "job")
 	b := e.getBlip("job")
 	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Code: 1, Reason: "Completed", Output: "boom"}})
+	e.saveWriter(b.Spec.State, newID())
 	e.settle()
 	b = e.getBlip("job")
 	expectPhase(t, b, v1.BlipFailed, ReasonError)

@@ -61,8 +61,8 @@ type BlipPoolSpec struct {
 	// +kubebuilder:validation:MinProperties=1
 	NodeSelector map[string]string   `json:"nodeSelector"`
 	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
-	// ImagePullSecrets are merged into the image root of blips claimed
-	// through this pool. Image states use their own imagePullSecrets.
+	// ImagePullSecrets authenticate pulls of the pool's infrastructure pod
+	// images. Image states use their own imagePullSecrets.
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 	// Network is the maximum egress allowed for this pool. Omitted applies the
 	// default policy: public internet egress on any port, LAN and other
@@ -136,16 +136,23 @@ type BlipPoolList struct {
 // BlipState
 
 // BlipStateSpec is one durable ext4 filesystem. A state can be a blip's root
-// filesystem or an auxiliary mount. All fields are immutable.
+// filesystem or an auxiliary mount. Provisioning fields are immutable;
+// mounts and runtime defaults can be updated for subsequent or running blips.
 //
 // +kubebuilder:validation:XValidation:rule="!(has(self.image) && has(self.copyFrom))",message="set at most one of image and copyFrom"
 // +kubebuilder:validation:XValidation:rule="!(has(self.image) && has(self.replicas))",message="replicas cannot be set for image states; they are held by every eligible node"
-// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.image) == has(oldSelf.image) && (!has(self.image) || self.image == oldSelf.image)",message="image is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.copyFrom) == has(oldSelf.copyFrom) && (!has(self.copyFrom) || self.copyFrom == oldSelf.copyFrom)",message="copyFrom is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size == oldSelf.size)",message="size is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas) || self.replicas == oldSelf.replicas)",message="replicas is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.nodeSelector) == has(oldSelf.nodeSelector) && (!has(self.nodeSelector) || self.nodeSelector == oldSelf.nodeSelector)",message="nodeSelector is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.imagePullSecrets) == has(oldSelf.imagePullSecrets) && (!has(self.imagePullSecrets) || self.imagePullSecrets == oldSelf.imagePullSecrets)",message="imagePullSecrets is immutable"
 type BlipStateSpec struct {
 	// Image initializes the filesystem from a container image, which each
 	// node converts to ext4 itself. Every eligible node (matching
 	// nodeSelector) holds an image state. Without image or copyFrom the
-	// state starts as an empty ext4 filesystem.
+	// state starts as an empty ext4 filesystem. Image states may only be
+	// attached read-only; copy one to create a writable root.
 	Image string `json:"image,omitempty"`
 	// CopyFrom names a state in the same namespace. The copy pins the
 	// source when created: its committed version, or a live snapshot of an
@@ -170,6 +177,16 @@ type BlipStateSpec struct {
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 	// ImagePullSecrets authenticate the image pull when Image is set.
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+	// Mounts attaches states when this state is used as a blip's root.
+	// Changes apply to the running blip.
+	// +kubebuilder:validation:XValidation:rule="self.all(m, self.exists_one(o, o.path == m.path))",message="mount paths must be unique"
+	// +listType=map
+	// +listMapKey=state
+	// +kubebuilder:validation:MaxItems=16
+	Mounts []Mount `json:"mounts,omitempty"`
+	// Runtime supplies execution defaults over the imported image metadata.
+	// Blip execution overrides take precedence.
+	Runtime *RuntimeDefaults `json:"runtime,omitempty"`
 }
 
 const (
@@ -317,7 +334,7 @@ type BlipStateStatus struct {
 type BlipState struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              BlipStateSpec   `json:"spec,omitempty"`
+	Spec              BlipStateSpec   `json:"spec"`
 	Status            BlipStateStatus `json:"status,omitempty"`
 }
 
@@ -415,6 +432,9 @@ type Mount struct {
 	// Writable mounts take the state's single writer slot and save a new
 	// version when unmounted. Read-only mounts pin the committed version.
 	Writable bool `json:"writable,omitempty"`
+	// BlipUID scopes a temporary mount to one execution. Empty keeps the
+	// mount across executions of the root state.
+	BlipUID string `json:"blipUID,omitempty"`
 }
 
 type EnvVar struct {
@@ -422,11 +442,26 @@ type EnvVar struct {
 	Value string `json:"value,omitempty"`
 }
 
+// RuntimeDefaults supplies defaults for executions of a root state. Startup
+// values are resolved once at claim; Network changes apply to running blips
+// that do not override it.
+type RuntimeDefaults struct {
+	Env        []EnvVar `json:"env,omitempty"`
+	WorkingDir string   `json:"workingDir,omitempty"`
+	User       string   `json:"user,omitempty"`
+	// IdleTimeout applies to interactive blips. Default 30s.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`
+	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
+	// Network narrows the pool's egress policy. Omitted inherits the pool;
+	// explicitly empty denies all.
+	Network *NetworkPolicy `json:"network,omitempty"`
+}
+
 // BlipSpec is one VM lifetime: either one command, or an interactive
 // sandbox that lives while sessions or processes are active.
 //
-// +kubebuilder:validation:XValidation:rule="(has(self.image) && size(self.image) > 0) != (has(self.state) && size(self.state) > 0)",message="set exactly one of image and state"
-// +kubebuilder:validation:XValidation:rule="(has(self.image) && size(self.image) > 0) == (has(oldSelf.image) && size(oldSelf.image) > 0) && has(self.command) == has(oldSelf.command)",message="image, state, and command are immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.command) == has(oldSelf.command)",message="command is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env == oldSelf.env)",message="env is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.workingDir) == has(oldSelf.workingDir)) && (!has(self.workingDir) || self.workingDir == oldSelf.workingDir)",message="workingDir is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user == oldSelf.user)",message="user is immutable"
@@ -436,15 +471,13 @@ type BlipSpec struct {
 	// +kubebuilder:default=default
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="pool is immutable"
 	Pool string `json:"pool,omitempty"`
-	// Image gives the blip a throwaway root filesystem from a container
-	// image, converted to ext4 on the node. The root is 10Gi, or the
-	// converted image's size if larger.
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="image is immutable"
-	Image string `json:"image,omitempty"`
 	// State gives the blip a durable root filesystem. A new version is
-	// saved when the blip stops.
+	// saved when the blip stops. Mounts and runtime defaults come from this
+	// state in the blip's namespace.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="state is immutable"
-	State string `json:"state,omitempty"`
+	State string `json:"state"`
 	// Command runs as the primary session. The blip ends when it exits.
 	// Without a command the blip is an interactive sandbox that stops after
 	// IdleTimeout without sessions or running processes.
@@ -457,21 +490,15 @@ type BlipSpec struct {
 	User string `json:"user,omitempty"`
 	// TTY gives the primary command a terminal.
 	TTY bool `json:"tty,omitempty"`
-	// ImagePullSecrets authenticate image pulls for this blip's image root.
-	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
-	// +kubebuilder:validation:XValidation:rule="self.all(m, self.exists_one(o, o.path == m.path))",message="mount paths must be unique"
-	// +listType=map
-	// +listMapKey=state
-	// +kubebuilder:validation:MaxItems=16
-	Mounts []Mount `json:"mounts,omitempty"`
 	// IdleTimeout applies to interactive blips. Default 30s.
 	// +kubebuilder:validation:Type=string
 	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`
 	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
 	// Stop asks the blip to shut down gracefully and save.
 	Stop bool `json:"stop,omitempty"`
-	// Network narrows the pool's egress policy. Omitted inherits the pool;
-	// explicitly empty denies all. Changes apply to running blips.
+	// Network narrows the pool's egress policy. Omitted inherits the root
+	// state's runtime network policy, or the pool if neither is set.
+	// Explicitly empty denies all. Changes apply to running blips.
 	Network *NetworkPolicy `json:"network,omitempty"`
 }
 
@@ -516,9 +543,8 @@ type BlipStatus struct {
 	Pod     string `json:"pod,omitempty"`
 	PodUID  string `json:"podUID,omitempty"`
 	Node    string `json:"node,omitempty"`
-	// ImageDigest is the resolved container image (digest reference
-	// repo@sha256:...) for image roots.
-	ImageDigest string `json:"imageDigest,omitempty"`
+	// StateGeneration is the observed desired generation of the root state.
+	StateGeneration int64 `json:"stateGeneration,omitempty"`
 	// RootAttachmentID is the writer attachment of a durable root.
 	RootAttachmentID string       `json:"rootAttachmentID,omitempty"`
 	StartTime        *metav1.Time `json:"startTime,omitempty"`
@@ -555,7 +581,6 @@ const AnnotationWaitForClient = "blip.dev/wait-for-client"
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Root",type=string,JSONPath=`.spec.state`
-// +kubebuilder:printcolumn:name="Image",type=string,JSONPath=`.spec.image`,priority=1
 // +kubebuilder:printcolumn:name="Exit",type=integer,JSONPath=`.status.exitCode`
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.node`
 // +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.reason`
@@ -563,7 +588,7 @@ const AnnotationWaitForClient = "blip.dev/wait-for-client"
 type Blip struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              BlipSpec   `json:"spec,omitempty"`
+	Spec              BlipSpec   `json:"spec"`
 	Status            BlipStatus `json:"status,omitempty"`
 }
 

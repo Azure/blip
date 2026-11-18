@@ -41,6 +41,8 @@ const (
 	indexPool     = "spec.pool"
 	indexStates   = "blip.stateRefs"
 	indexCopyFrom = "spec.copyFrom"
+	indexMounts   = "state.mountRefs"
+	indexMountUID = "state.mountBlipUIDs"
 )
 
 // Config configures the controllers.
@@ -71,6 +73,22 @@ var Indexes = []struct {
 			return []string{s}
 		}
 		return nil
+	}},
+	{&v1.BlipState{}, indexMounts, func(o client.Object) []string {
+		var refs []string
+		for _, m := range o.(*v1.BlipState).Spec.Mounts {
+			refs = append(refs, m.State)
+		}
+		return refs
+	}},
+	{&v1.BlipState{}, indexMountUID, func(o client.Object) []string {
+		var refs []string
+		for _, m := range o.(*v1.BlipState).Spec.Mounts {
+			if m.BlipUID != "" {
+				refs = append(refs, m.BlipUID)
+			}
+		}
+		return refs
 	}},
 }
 
@@ -115,9 +133,6 @@ func stateRefs(b *v1.Blip) []string {
 		}
 	}
 	add(b.Spec.State)
-	for _, m := range b.Spec.Mounts {
-		add(m.State)
-	}
 	for _, m := range b.Status.Mounts {
 		add(m.State)
 	}

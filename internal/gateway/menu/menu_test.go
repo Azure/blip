@@ -21,6 +21,7 @@ type fakeBackend struct {
 	changes      chan struct{}
 	listCalls    int
 	createNames  []string
+	forkSources  []Entry
 	deleted      []Entry
 	created      Entry
 	listErr      error
@@ -41,6 +42,11 @@ func (b *fakeBackend) Create(ctx context.Context, name string) (Entry, error) {
 	b.contexts = append(b.contexts, ctx)
 	b.createNames = append(b.createNames, name)
 	return b.created, b.createErr
+}
+
+func (b *fakeBackend) Fork(ctx context.Context, entry Entry, name string) (Entry, error) {
+	b.forkSources = append(b.forkSources, entry)
+	return b.Create(ctx, name)
 }
 
 func (b *fakeBackend) Delete(ctx context.Context, entry Entry) error {
@@ -263,6 +269,51 @@ func TestCreateIsAsyncAndConnectsReturnedEntry(t *testing.T) {
 	}
 	if _, ok := quit().(tea.QuitMsg); !ok {
 		t.Fatal("successful create did not connect")
+	}
+}
+
+func TestForkSelectedState(t *testing.T) {
+	for _, key := range []string{"enter", "f"} {
+		t.Run(key, func(t *testing.T) {
+			base := Entry{ID: "shared-base", UID: "base-uid", Name: "shared-base", ForkOnly: key == "enter"}
+			m, b := testModel(t, []Entry{base}, base.ID)
+			b.created = Entry{ID: "alice.fork", UID: "fork-uid", Name: "fork", Parent: base.ID}
+			press(m, key)
+			if m.mode != creating || m.Selected != nil || m.forkTarget == nil || *m.forkTarget != base {
+				t.Fatal("fork did not prompt for an independent workspace")
+			}
+			m.input.SetValue("fork")
+			cmd := press(m, "enter")
+			if cmd == nil || len(b.forkSources) != 0 {
+				t.Fatal("fork did not defer backend work")
+			}
+			m.Update(cmd())
+			if len(b.forkSources) != 1 || b.forkSources[0] != base || m.Selected == nil || *m.Selected != b.created {
+				t.Fatalf("fork selection: sources=%v selected=%v", b.forkSources, m.Selected)
+			}
+		})
+	}
+}
+
+func TestSharedBaseCannotBeDeleted(t *testing.T) {
+	m, b := testModel(t, []Entry{{ID: "shared-base", UID: "uid", ForkOnly: true, Shared: true}}, "")
+	press(m, "d")
+	if m.mode != browsing || m.err == "" || len(b.deleted) != 0 {
+		t.Fatal("delete offered for a shared base")
+	}
+	press(m, "enter")
+	press(m, "esc")
+	press(m, "n")
+	if m.forkTarget != nil {
+		t.Fatal("new workspace retained a canceled fork source")
+	}
+}
+
+func TestOwnedImportedBaseCanBeDeleted(t *testing.T) {
+	m, _ := testModel(t, []Entry{{ID: "alice.base", UID: "uid", ForkOnly: true}}, "")
+	press(m, "d")
+	if m.mode != confirming {
+		t.Fatal("owner cannot delete their imported base")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -12,12 +13,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/workspace"
 )
 
 type createStateFlags struct {
-	image, from, size string
-	replicas          int32
-	detach            bool
+	from, size    string
+	replicas      int32
+	detach        bool
+	mounts, env   []string
+	workdir, user string
+	idle          time.Duration
+	idleSet       bool
 }
 
 func (a *app) createCommand() *cobra.Command {
@@ -37,37 +43,37 @@ func (a *app) createStateCommand() *cobra.Command {
 		Short:   "Create a durable state",
 		Long: `Create a BlipState: one durable ext4 filesystem for a root or a mount.
 
-With no source flag the state starts empty. --image initializes it from a
-container image; --from copies an existing state, including a live snapshot
-when that state is being written.`,
+With no source flag the state starts empty. --from copies a workspace's root,
+runtime defaults and persistent mounts, including a separate live snapshot of
+each writable filesystem. Read-only mounts keep their references. Use blip pull
+to import a container image as a shared base.`,
 		Example: `  kubectl blip create blipstate repo --from base
-  kubectl blip create blipstate dev --image ghcr.io/me/dev:latest --size 20Gi
+  kubectl blip create blipstate dev --from base --size 20Gi --env EDITOR=vim
   blip create blipstate scratch -d`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			f.idleSet = cmd.Flags().Changed("idle-timeout")
 			return a.createState(cmd.Context(), args[0], f, cmd.Flags().Changed("replicas"))
 		},
 	}
 	fl := cmd.Flags()
-	fl.StringVar(&f.image, "image", "", "initialize the filesystem from a container image")
-	fl.StringVar(&f.from, "from", "", "copy an existing state (fork)")
+	fl.StringVar(&f.from, "from", "", "fork an existing workspace or imported base")
 	fl.StringVar(&f.size, "size", "", "filesystem size, e.g. 20Gi (default 10Gi, or the source size)")
 	fl.Int32Var(&f.replicas, "replicas", 0, "nodes holding each committed version, 1-3 (default 3)")
 	fl.BoolVarP(&f.detach, "detach", "d", false, "return right after creating the state")
+	fl.StringArrayVar(&f.mounts, "mount", nil, "persistent mount STATE:/path[:rw] (repeatable; writable mounts are copied with --from)")
+	fl.StringArrayVarP(&f.env, "env", "e", nil, "default environment variable KEY=VALUE (repeatable)")
+	fl.StringVarP(&f.workdir, "workdir", "w", "", "default working directory")
+	fl.StringVarP(&f.user, "user", "u", "", "default user name or uid")
+	fl.DurationVar(&f.idle, "idle-timeout", 0, "default interactive idle timeout")
 	return cmd
 }
 
 func stateFromFlags(name, namespace string, f *createStateFlags, replicasSet bool) (*v1alpha1.BlipState, error) {
-	if f.image != "" && f.from != "" {
-		return nil, errors.New("set at most one of --image and --from")
-	}
-	if f.image != "" && replicasSet {
-		return nil, errors.New("--replicas cannot be set with --image: image states are held by every eligible node")
-	}
 	if replicasSet && (f.replicas < 1 || f.replicas > 3) {
 		return nil, errors.New("--replicas must be between 1 and 3")
 	}
-	spec := v1alpha1.BlipStateSpec{Image: f.image, CopyFrom: f.from}
+	spec := v1alpha1.BlipStateSpec{CopyFrom: f.from}
 	if replicasSet {
 		spec.Replicas = f.replicas
 	}
@@ -81,10 +87,70 @@ func stateFromFlags(name, namespace string, f *createStateFlags, replicasSet boo
 		}
 		spec.Size = &size
 	}
-	return &v1alpha1.BlipState{
+	st := &v1alpha1.BlipState{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec:       spec,
-	}, nil
+	}
+	if err := applyStateSettings(st, f); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+func applyStateSettings(st *v1alpha1.BlipState, f *createStateFlags) error {
+	if f.idle < 0 {
+		return errors.New("--idle-timeout must not be negative")
+	}
+	env, err := parseEnv(f.env)
+	if err != nil {
+		return err
+	}
+	if len(env) > 0 || f.workdir != "" || f.user != "" || f.idleSet || f.idle > 0 {
+		if st.Spec.Runtime == nil {
+			st.Spec.Runtime = &v1alpha1.RuntimeDefaults{}
+		}
+		rt := st.Spec.Runtime
+		for _, e := range env {
+			found := false
+			for i := range rt.Env {
+				if rt.Env[i].Name == e.Name {
+					rt.Env[i], found = e, true
+					break
+				}
+			}
+			if !found {
+				rt.Env = append(rt.Env, e)
+			}
+		}
+		if f.workdir != "" {
+			rt.WorkingDir = f.workdir
+		}
+		if f.user != "" {
+			rt.User = f.user
+		}
+		if f.idleSet || f.idle > 0 {
+			rt.IdleTimeout = &metav1.Duration{Duration: f.idle}
+		}
+	}
+	for _, value := range f.mounts {
+		m, err := parseMount(value)
+		if err != nil {
+			return err
+		}
+		for _, existing := range st.Spec.Mounts {
+			if existing.BlipUID != "" {
+				continue
+			}
+			if existing.State == m.State {
+				return fmt.Errorf("state %q is mounted twice", m.State)
+			}
+			if existing.Path == m.Path {
+				return fmt.Errorf("mount path %q is used twice", m.Path)
+			}
+		}
+		st.Spec.Mounts = append(st.Spec.Mounts, m)
+	}
+	return nil
 }
 
 func (a *app) createState(ctx context.Context, name string, f *createStateFlags, replicasSet bool) error {
@@ -95,29 +161,55 @@ func (a *app) createState(ctx context.Context, name string, f *createStateFlags,
 	if err != nil {
 		return err
 	}
-	f.from = a.full(f.from)
 	st, err := stateFromFlags(name, c.Namespace, f, replicasSet)
 	if err != nil {
 		return err
 	}
+	a.label(st)
+	var src *v1alpha1.BlipState
 	if f.from != "" {
-		// Fail a typo before creating anything. A live source is allowed:
-		// the controller freezes it and takes a snapshot.
-		src, err := a.getState(ctx, f.from)
+		src, err = a.resolveState(ctx, f.from)
 		if err != nil {
 			return err
 		}
-		if src.DeletionTimestamp != nil {
-			return fmt.Errorf("copy source %q is being deleted", a.short(f.from))
-		}
-		if src.Status.Committed == nil {
-			if msg := stateFailure(src); msg != "" {
-				return fmt.Errorf("copy source %q failed: %s", a.short(f.from), msg)
-			}
+		// Configure the snapshot before creating it. Fork will copy each
+		// persistent writable mount, including mounts supplied with --mount.
+		if err := applyStateSettings(src, f); err != nil {
+			return err
 		}
 	}
-	a.label(st)
-	if err := c.Kube.Create(ctx, st); err != nil {
+	settings := st
+	if src != nil {
+		settings = src
+	}
+	for i := range settings.Spec.Mounts {
+		mount := &settings.Spec.Mounts[i]
+		if mount.BlipUID != "" {
+			continue
+		}
+		var mounted *v1alpha1.BlipState
+		var err error
+		if src != nil && i < len(settings.Spec.Mounts)-len(f.mounts) {
+			// Existing references are already namespace-qualified names;
+			// owner-local names must not shadow shared mount references.
+			mounted, err = a.getState(ctx, mount.State)
+		} else {
+			mounted, err = a.resolveState(ctx, mount.State)
+		}
+		if err != nil {
+			return err
+		}
+		mount.State = mounted.Name
+		if src == nil && mount.Writable && mounted.Spec.Image != "" {
+			return fmt.Errorf("state %q is an imported base; fork it before mounting writable", a.short(mounted.Name))
+		}
+	}
+	if src != nil {
+		err = workspace.Fork(ctx, c.Kube, src, st)
+	} else {
+		err = c.Kube.Create(ctx, st)
+	}
+	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("state %q already exists; delete it or choose another name", a.short(name))
 		}
@@ -126,6 +218,15 @@ func (a *app) createState(ctx context.Context, name string, f *createStateFlags,
 	if f.detach {
 		fmt.Fprintf(a.env.Out, "blipstate/%s created\n", a.short(name))
 		return nil
+	}
+	if src != nil {
+		for _, mount := range st.Spec.Mounts {
+			if mount.Writable {
+				if _, err := a.waitState(ctx, mount.State); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	st, err = a.waitState(ctx, name)
 	if err != nil {

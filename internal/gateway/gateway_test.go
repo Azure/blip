@@ -55,6 +55,7 @@ type env struct {
 func newEnv(t *testing.T, objs ...client.Object) *env {
 	scheme := runtime.NewScheme()
 	v1alpha1.AddToScheme(scheme)
+	objs = append(objs, gatewayBase())
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(interceptor.Funcs{
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 			// The API server assigns UIDs, but the fake client does not. Menu
@@ -72,7 +73,7 @@ func newEnv(t *testing.T, objs ...client.Object) *env {
 	e := &env{t: t, kube: kube, guest: &fakeguest.Guest{}, userKey: userKey}
 	e.started.Store(true)
 	e.srv = &Server{
-		Config:   Config{Namespace: ns, Image: "reg/dev:1", Pool: "small", StateSize: resource.MustParse("20Gi"), IdleTimeout: 45 * time.Minute},
+		Config:   Config{Namespace: ns, BaseState: "gateway-base", Pool: "small", StateSize: resource.MustParse("20Gi"), IdleTimeout: 45 * time.Minute},
 		Kube:     kube,
 		Sessions: &session.Client{Connect: e.guest.Connect},
 		Users:    users,
@@ -236,31 +237,32 @@ func TestLoadHostKeyCreatesOnce(t *testing.T) {
 func TestEnsureSandboxIsIdempotentAndRecreatesFinished(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	pod, err := e.srv.ensureSandbox(ctx, "alice", "alice-dev")
-	if err != nil || pod != "pod-alice-dev" {
+	pod, err := e.srv.ensureSandbox(ctx, "alice", "alice.dev")
+	if err != nil || pod != "pod-alice.dev" {
 		t.Fatalf("pod %q err %v", pod, err)
 	}
 	var st v1alpha1.BlipState
-	if err := e.kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: "alice-dev"}, &st); err != nil {
+	if err := e.kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: "alice.dev"}, &st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Spec.Image != "reg/dev:1" || st.Spec.Size.String() != "20Gi" || st.Labels[ownerLabel] != "alice" {
+	if st.Spec.Image != "" || st.Spec.CopyFrom != e.srv.BaseState || st.Spec.Size.String() != "20Gi" || st.Labels[ownerLabel] != "alice" || len(st.OwnerReferences) != 0 ||
+		st.Spec.Runtime == nil || st.Spec.Runtime.IdleTimeout.Duration != 45*time.Minute {
 		t.Fatalf("state spec %+v labels %v", st.Spec, st.Labels)
 	}
 	var b v1alpha1.Blip
-	e.kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: "alice-dev"}, &b)
-	if b.Spec.State != "alice-dev" || b.Spec.Pool != "small" || b.Spec.Image != "" || len(b.Spec.Command) != 0 || b.Spec.IdleTimeout.Duration != 45*time.Minute || b.Labels[ownerLabel] != "alice" {
+	e.kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: "alice.dev"}, &b)
+	if b.Spec.State != "alice.dev" || b.Spec.Pool != "small" || len(b.Spec.Command) != 0 || b.Spec.IdleTimeout != nil || b.Labels[ownerLabel] != "alice" {
 		t.Fatalf("blip spec %+v labels %v", b.Spec, b.Labels)
 	}
-	if pod, err := e.srv.ensureSandbox(ctx, "alice", "alice-dev"); err != nil || pod != "pod-alice-dev" {
+	if pod, err := e.srv.ensureSandbox(ctx, "alice", "alice.dev"); err != nil || pod != "pod-alice.dev" {
 		t.Fatalf("second call: %q %v", pod, err)
 	}
 
 	b.Status.Phase = v1alpha1.BlipSucceeded
 	b.Status.Pod = "old-pod"
 	e.kube.Update(ctx, &b)
-	pod, err = e.srv.ensureSandbox(ctx, "alice", "alice-dev")
-	if err != nil || pod != "pod-alice-dev" {
+	pod, err = e.srv.ensureSandbox(ctx, "alice", "alice.dev")
+	if err != nil || pod != "pod-alice.dev" {
 		t.Fatalf("recreate: %q %v", pod, err)
 	}
 	var list v1alpha1.BlipList
@@ -271,10 +273,10 @@ func TestEnsureSandboxIsIdempotentAndRecreatesFinished(t *testing.T) {
 }
 
 func TestEnsureSandboxFailedState(t *testing.T) {
-	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: "alice-dev", Namespace: ns, Labels: map[string]string{ownerLabel: "alice"}}}
+	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: "alice.dev", Namespace: ns, Labels: map[string]string{ownerLabel: "alice"}}}
 	st.Status.Phase, st.Status.Message = v1alpha1.StateFailed, "image not found"
 	e := newEnv(t, st)
-	_, err := e.srv.ensureSandbox(context.Background(), "alice", "alice-dev")
+	_, err := e.srv.ensureSandbox(context.Background(), "alice", "alice.dev")
 	if err == nil || !strings.Contains(err.Error(), "image not found") {
 		t.Fatal(err)
 	}
@@ -734,7 +736,7 @@ func TestEnsureStateWaitsForDeletion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	st := &v1alpha1.BlipState{
-		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: ns, Labels: map[string]string{ownerLabel: "alice"}, Finalizers: []string{"test"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "alice.default", Namespace: ns, Labels: map[string]string{ownerLabel: "alice"}, Finalizers: []string{"test"}},
 		Spec:       v1alpha1.BlipStateSpec{Image: "reg/dev:1"},
 	}
 	if err := e.kube.Create(ctx, st); err != nil {
@@ -745,7 +747,7 @@ func TestEnsureStateWaitsForDeletion(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- e.srv.ensureState(ctx, "alice", "default") }()
+	go func() { done <- e.srv.ensureState(ctx, "alice", "alice.default") }()
 	select {
 	case err := <-done:
 		t.Fatalf("ensureState returned while the state was deleting: %v", err)

@@ -63,12 +63,14 @@ func statePlacements(st *v1.BlipState) []string {
 // hold: the root state outweighs all writable mounts together.
 func placementScores(b *v1.Blip, states map[string]*v1.BlipState) map[string]int {
 	score := map[string]int{}
+	var mounts []v1.Mount
 	if root := states[b.Spec.State]; root != nil && b.Spec.State != "" {
+		mounts = desiredMounts(root, b)
 		for _, n := range statePlacements(root) {
-			score[n] += len(b.Spec.Mounts) + 1
+			score[n] += len(mounts) + 1
 		}
 	}
-	for _, m := range b.Spec.Mounts {
+	for _, m := range mounts {
 		if st := states[m.State]; m.Writable && st != nil {
 			for _, n := range statePlacements(st) {
 				score[n]++
@@ -98,43 +100,9 @@ func homeNodes(score map[string]int, cl *cluster, selector map[string]string) []
 	return out
 }
 
-// hasDurableData reports whether the Blip reads or writes data that lives on
-// a node. An ephemeral Blip with an image root has no locality; a Blip with a
-// state root or a writable mount does, once the controller knows where the
-// state is.
+// Every valid Blip owns a durable root.
 func hasDurableData(b *v1.Blip) bool {
-	if b.Spec.State != "" {
-		return true
-	}
-	for _, m := range b.Spec.Mounts {
-		if m.Writable {
-			return true
-		}
-	}
-	return false
-}
-
-// replicatedData reports whether every durable filesystem b uses is an image
-// state. Every eligible node holds an image state, so such a Blip can run on
-// any of them and must not pin a VM to one node.
-func replicatedData(b *v1.Blip, imageStates map[string]bool) bool {
-	data := false
-	if b.Spec.State != "" {
-		if !imageStates[b.Spec.State] {
-			return false
-		}
-		data = true
-	}
-	for _, m := range b.Spec.Mounts {
-		if !m.Writable {
-			continue
-		}
-		if !imageStates[m.State] {
-			return false
-		}
-		data = true
-	}
-	return data
+	return b.Spec.State != ""
 }
 
 // updateLocality records the node the Blip's data lives on. A Blip that
