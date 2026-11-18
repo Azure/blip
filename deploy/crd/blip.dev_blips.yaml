@@ -124,9 +124,14 @@ spec:
                     blip.
                   properties:
                     path:
-                      description: Path is an absolute path inside the guest root.
-                      pattern: ^/.+
+                      description: |-
+                        Path is an absolute path inside the guest root. It must be clean: no
+                        trailing slash, repeated slash, or . and .. segments.
+                      pattern: ^/[^/]+(/[^/]+)*$
                       type: string
+                      x-kubernetes-validations:
+                      - message: path must not contain . or .. segments
+                        rule: '!self.split(''/'').exists(s, s == ''.'' || s == ''..'')'
                     state:
                       description: State names a BlipState in the blip's namespace.
                       pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
@@ -145,6 +150,9 @@ spec:
                 x-kubernetes-list-map-keys:
                 - state
                 x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: mount paths must be unique
+                  rule: self.all(m, self.exists_one(o, o.path == m.path))
               network:
                 description: |-
                   Network narrows the pool's egress policy. Omitted inherits the pool;

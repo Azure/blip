@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,5 +144,62 @@ func TestBlipStateSizeCRDRule(t *testing.T) {
 	const want = "type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0"
 	if rule := ruleFor(t, size.XValidations, "size must be greater than 0"); rule != want {
 		t.Errorf("size rule %q, want %q", rule, want)
+	}
+}
+
+// TestMountPathCRDRules guards admission of Blip.spec.mounts paths. Paths used
+// to be validated only by the controller after it had claimed a VM.
+func TestMountPathCRDRules(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blips.yaml")
+	mounts, ok := spec.Properties["mounts"]
+	if !ok || mounts.Items == nil {
+		t.Fatal("generated CRD has no spec.mounts items")
+	}
+	path, ok := mounts.Items.Properties["path"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.mounts.path property")
+	}
+
+	const pathPattern = `^/[^/]+(/[^/]+)*$`
+	if path.Pattern != pathPattern {
+		t.Errorf("mount path pattern %q, want %q", path.Pattern, pathPattern)
+	}
+	const segments = "!self.split('/').exists(s, s == '.' || s == '..')"
+	if rule := ruleFor(t, path.XValidations, "path must not contain . or .. segments"); rule != segments {
+		t.Errorf("mount path segment rule %q, want %q", rule, segments)
+	}
+	const unique = "self.all(m, self.exists_one(o, o.path == m.path))"
+	if rule := ruleFor(t, mounts.XValidations, "mount paths must be unique"); rule != unique {
+		t.Errorf("mount path uniqueness rule %q, want %q", rule, unique)
+	}
+
+	re, err := regexp.Compile(path.Pattern)
+	if err != nil {
+		t.Fatalf("compile mount path pattern %q: %v", path.Pattern, err)
+	}
+	// validMountPath mirrors the generated pattern plus the segment rule.
+	validMountPath := func(p string) bool {
+		if !re.MatchString(p) {
+			return false
+		}
+		for _, segment := range strings.Split(p, "/") {
+			if segment == "." || segment == ".." {
+				return false
+			}
+		}
+		return true
+	}
+
+	accept := []string{"/mnt/a", "/tmp", "/a", "/a b/c", "/nested/path/here", "/.hidden", "/a.b/c"}
+	for _, value := range accept {
+		if !validMountPath(value) {
+			t.Errorf("mount path validation rejects valid path %q", value)
+		}
+	}
+	reject := []string{"", "data", "/", "/mnt/a/", "//mnt/a", "/mnt//a", "/a/./b", "/a/../b", "/.", "/..", "/a/.."}
+	for _, value := range reject {
+		if validMountPath(value) {
+			t.Errorf("mount path validation accepts invalid path %q", value)
+		}
 	}
 }

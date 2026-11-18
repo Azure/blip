@@ -406,8 +406,10 @@ type Mount struct {
 	// State names a BlipState in the blip's namespace.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	State string `json:"state"`
-	// Path is an absolute path inside the guest root.
-	// +kubebuilder:validation:Pattern=`^/.+`
+	// Path is an absolute path inside the guest root. It must be clean: no
+	// trailing slash, repeated slash, or . and .. segments.
+	// +kubebuilder:validation:Pattern=`^/[^/]+(/[^/]+)*$`
+	// +kubebuilder:validation:XValidation:rule="!self.split('/').exists(s, s == '.' || s == '..')",message="path must not contain . or .. segments"
 	Path string `json:"path"`
 	// Writable mounts take the state's single writer slot and save a new
 	// version when unmounted. Read-only mounts pin the committed version.
@@ -456,6 +458,7 @@ type BlipSpec struct {
 	TTY bool `json:"tty,omitempty"`
 	// ImagePullSecrets authenticate image pulls for this blip's image root.
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="self.all(m, self.exists_one(o, o.path == m.path))",message="mount paths must be unique"
 	// +listType=map
 	// +listMapKey=state
 	// +kubebuilder:validation:MaxItems=16
