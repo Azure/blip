@@ -26,6 +26,7 @@ type fakeBackend struct {
 	listErr      error
 	createErr    error
 	deleteErr    error
+	validateErr  error
 	contexts     []context.Context
 	unsubscribed atomic.Int32
 }
@@ -48,6 +49,13 @@ func (b *fakeBackend) Delete(ctx context.Context, entry Entry) error {
 	return b.deleteErr
 }
 
+func (b *fakeBackend) ValidateName(name string) error {
+	if b.validateErr != nil {
+		return b.validateErr
+	}
+	return nil
+}
+
 func (b *fakeBackend) Subscribe() (<-chan struct{}, func()) {
 	return b.changes, func() { b.unsubscribed.Add(1) }
 }
@@ -55,7 +63,7 @@ func (b *fakeBackend) Subscribe() (<-chan struct{}, func()) {
 func testModel(t *testing.T, entries []Entry, selected string) (*Model, *fakeBackend) {
 	t.Helper()
 	b := &fakeBackend{entries: entries, changes: make(chan struct{}, 1)}
-	m := New(context.Background(), b, selected, 80, 24, "")
+	m := New(context.Background(), b, selected, 80, 24, "", "alice")
 	t.Cleanup(m.Close)
 	m.Update(m.reload()())
 	return m, b
@@ -323,7 +331,7 @@ func TestDeleteConfirmationInvalidatedByReplacement(t *testing.T) {
 
 func TestNotificationsCoalesceAndRearm(t *testing.T) {
 	b := &fakeBackend{entries: []Entry{{ID: "a", Name: "a"}}, changes: make(chan struct{}, 1)}
-	m := New(context.Background(), b, "", 80, 24, "")
+	m := New(context.Background(), b, "", 80, 24, "", "alice")
 	t.Cleanup(m.Close)
 	initial := m.Init()().(tea.BatchMsg)
 	if len(initial) != 2 || b.listCalls != 0 {
@@ -415,11 +423,11 @@ func TestResizeAndScrollingKeepSelectionVisible(t *testing.T) {
 		if m.cursor < start || m.cursor >= end || selectedID(m) != entries[40].ID {
 			t.Fatalf("selection not visible/preserved at size %v: range %d:%d", size, start, end)
 		}
-		if !strings.Contains(ansi.Strip(content), ">") {
+		if !strings.Contains(ansi.Strip(content), "▸") {
 			t.Fatalf("selection marker missing at size %v", size)
 		}
-		if size[0] >= 12 && !strings.Contains(ansi.Strip(content), "Running") {
-			t.Fatalf("deeply nested Running indicator hidden at size %v", size)
+		if size[0] >= 20 && !strings.Contains(ansi.Strip(content), "running") {
+			t.Fatalf("deeply nested running indicator hidden at size %v", size)
 		}
 	}
 	m.Update(tea.WindowSizeMsg{Width: 40, Height: 10})
@@ -440,7 +448,7 @@ func TestResizeAndScrollingKeepSelectionVisible(t *testing.T) {
 func TestViewOnlyLabelsRunningStatesAndHasASCIIArt(t *testing.T) {
 	m, _ := testModel(t, []Entry{{ID: "a", Name: "alpha", Running: true}, {ID: "b", Name: "beta"}}, "")
 	view := ansi.Strip(m.View().Content)
-	if !strings.Contains(view, "alpha Running") || !strings.Contains(view, "beta") || strings.Count(view, "Running") != 1 {
+	if !strings.Contains(view, "alpha") || !strings.Contains(view, "● running") || strings.Count(view, "running") != 1 {
 		t.Fatalf("unexpected running labels: %s", view)
 	}
 	for _, status := range []string{"Stopped", "Pending", "Ready", "Idle", "Sealed", "Failed", "Unknown"} {
@@ -462,23 +470,136 @@ func TestViewOnlyLabelsRunningStatesAndHasASCIIArt(t *testing.T) {
 			t.Fatalf("logo rows are ragged: %q", logo)
 		}
 	}
-	if !strings.Contains(view, logo) {
+	if !strings.Contains(view, logoLines[0]) || !strings.Contains(view, logoLines[5]) {
 		t.Fatal("normal-size view did not display the logo")
 	}
-	if !strings.Contains(view, description) {
-		t.Fatal("normal-size view did not describe the list")
+	for _, frame := range []string{"┌", "┐", "└", "┘", "├", "alice"} {
+		if !strings.Contains(view, frame) {
+			t.Fatalf("normal-size view is missing frame or owner %q", frame)
+		}
 	}
-	if strings.Contains(view, "? help") {
-		t.Fatal("footer still advertises help")
+	if !strings.Contains(view, "? help") {
+		t.Fatal("status line does not advertise help")
 	}
 	press(m, "?")
 	if !strings.Contains(ansi.Strip(m.View().Content), "j/k") || m.mode != helping {
 		t.Fatal("help did not describe navigation")
 	}
-	press(m, "esc")
+	press(m, "x")
 	if m.mode != browsing {
-		t.Fatal("Escape did not dismiss help")
+		t.Fatal("any key should dismiss help without acting")
 	}
+}
+
+func TestCreateDialogValidatesBeforeCreating(t *testing.T) {
+	m, b := testModel(t, nil, "")
+	press(m, "n")
+	for _, r := range "Dev" {
+		press(m, string(r))
+	}
+	b.validateErr = errors.New("use lowercase letters, digits and '-'")
+	view := ansi.Strip(m.View().Content)
+	if !strings.Contains(view, b.validateErr.Error()) || !strings.Contains(view, "new blip") {
+		t.Fatalf("create dialog did not show inline validation:\n%s", view)
+	}
+	if cmd := press(m, "enter"); cmd != nil || len(b.createNames) != 0 {
+		t.Fatal("invalid name reached the backend")
+	}
+	if m.mode != creating || !m.input.Focused() {
+		t.Fatal("invalid name closed the create dialog")
+	}
+	b.validateErr = nil
+	view = ansi.Strip(m.View().Content)
+	if !strings.Contains(view, "Lowercase letters") {
+		t.Fatalf("create dialog lost its name guidance:\n%s", view)
+	}
+}
+
+func TestDeleteDialogExplainsRunningSessions(t *testing.T) {
+	m, _ := testModel(t, []Entry{{ID: "a", Name: "dev", Running: true}}, "a")
+	press(m, "d")
+	view := ansi.Strip(m.View().Content)
+	if !strings.Contains(view, `Delete "dev"?`) || !strings.Contains(view, "running session will end") {
+		t.Fatalf("delete dialog did not warn about the running session:\n%s", view)
+	}
+	if !strings.Contains(view, "y delete") || !strings.Contains(view, "n cancel") {
+		t.Fatalf("delete dialog did not show its keys:\n%s", view)
+	}
+
+	m, _ = testModel(t, []Entry{{ID: "b", Name: "idle"}}, "b")
+	press(m, "d")
+	if view := ansi.Strip(m.View().Content); strings.Contains(view, "running session") {
+		t.Fatalf("stopped blip got a running warning:\n%s", view)
+	}
+}
+
+func TestNarrowTerminalDropsTheFrame(t *testing.T) {
+	m, _ := testModel(t, []Entry{{ID: "a", Name: "alpha"}, {ID: "b", Name: "beta"}}, "")
+	m.Update(tea.WindowSizeMsg{Width: 24, Height: 8})
+	view := ansi.Strip(m.View().Content)
+	if strings.ContainsAny(view, "┌┐└┘│├─") {
+		t.Fatalf("narrow view kept frame drawing:\n%s", view)
+	}
+	if !strings.Contains(view, "alpha") || !strings.Contains(view, "enter connect") {
+		t.Fatalf("narrow view lost its list or keys:\n%s", view)
+	}
+}
+
+func checkViewBounds(t *testing.T, m *Model, width, height int) {
+	t.Helper()
+	content := m.View().Content
+	if lipgloss.Height(content) > height {
+		t.Fatalf("view height exceeds %dx%d:\n%s", width, height, ansi.Strip(content))
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if lipgloss.Width(line) > width {
+			t.Fatalf("view width exceeds %dx%d: %q", width, height, ansi.Strip(line))
+		}
+	}
+}
+
+func TestDialogsKeepScrollAndStayInBounds(t *testing.T) {
+	entries := make([]Entry, 60)
+	for i := range entries {
+		entries[i] = Entry{ID: fmt.Sprintf("id-%02d", i), Name: fmt.Sprintf("blip-%02d", i), Running: i%3 == 0}
+	}
+	m, _ := testModel(t, entries, "")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	press(m, "end")
+	last, offset := selectedID(m), m.offset
+	for _, tc := range []struct{ open, close string }{{"n", "esc"}, {"d", "esc"}, {"?", "x"}} {
+		press(m, tc.open)
+		checkViewBounds(t, m, 80, 24)
+		press(m, tc.close)
+		if m.mode != browsing {
+			t.Fatalf("%q did not close its dialog", tc.open)
+		}
+		if m.offset != offset || selectedID(m) != last {
+			t.Fatalf("dialog %q changed the list window: offset %d -> %d", tc.open, offset, m.offset)
+		}
+	}
+	for _, size := range [][2]int{{40, 10}, {32, 10}, {24, 8}, {12, 4}, {1, 1}, {120, 40}} {
+		m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		for _, tc := range []struct{ open, close string }{{"n", "esc"}, {"d", "esc"}, {"?", "x"}} {
+			press(m, tc.open)
+			checkViewBounds(t, m, size[0], size[1])
+			press(m, tc.close)
+		}
+	}
+}
+
+func TestBusyDialogsStayInBounds(t *testing.T) {
+	entries := []Entry{{ID: "a", Name: "alpha"}}
+	creating, _ := testModel(t, entries, "")
+	press(creating, "n")
+	creating.input.SetValue("busy")
+	press(creating, "enter")
+	checkViewBounds(t, creating, 80, 24)
+
+	deleting, _ := testModel(t, entries, "")
+	press(deleting, "d")
+	press(deleting, "y")
+	checkViewBounds(t, deleting, 80, 24)
 }
 
 func TestEmptyStateAndBackendErrors(t *testing.T) {

@@ -26,6 +26,8 @@ type Backend interface {
 	List(context.Context) ([]Entry, error)
 	Create(context.Context, string) (Entry, error)
 	Delete(context.Context, Entry) error
+	// ValidateName reports whether name may be created, without side effects.
+	ValidateName(string) error
 	Subscribe() (<-chan struct{}, func())
 }
 
@@ -63,6 +65,7 @@ type Model struct {
 	cursor       int
 	offset       int
 	preselect    string
+	owner        string
 	width        int
 	height       int
 	mode         mode
@@ -80,12 +83,13 @@ type Model struct {
 var _ tea.Model = (*Model)(nil)
 
 // New subscribes before the first list so changes during initialization cannot
-// be missed. selected is the full resource ID supplied by the SSH connection.
-func New(ctx context.Context, backend Backend, selected string, width, height int, notice string) *Model {
+// be missed. selected is the full resource ID supplied by the SSH connection;
+// owner is the authenticated name shown in the frame.
+func New(ctx context.Context, backend Backend, selected string, width, height int, notice, owner string) *Model {
 	ctx, cancel := context.WithCancel(ctx)
 	changes, unsubscribe := backend.Subscribe()
 	input := textinput.New()
-	input.Prompt = "Name: "
+	input.Prompt = "> "
 	input.Placeholder = "my-blip"
 	input.CharLimit = 63
 	// Clipboard subprocesses read the gateway host's clipboard, not the SSH
@@ -93,6 +97,8 @@ func New(ctx context.Context, backend Backend, selected string, width, height in
 	input.KeyMap.Paste.SetEnabled(false)
 	styles := input.Styles()
 	styles.Cursor.Blink = false
+	styles.Focused.Prompt = promptStyle
+	styles.Blurred.Prompt = promptStyle
 	input.SetStyles(styles)
 	if width <= 0 {
 		width = 80
@@ -100,13 +106,18 @@ func New(ctx context.Context, backend Backend, selected string, width, height in
 	if height <= 0 {
 		height = 24
 	}
-	input.SetWidth(max(1, width-len(input.Prompt)-1))
-	return &Model{
+	m := &Model{
 		ctx: ctx, cancel: cancel, backend: backend,
 		changes: changes, unsubscribe: unsubscribe,
-		preselect: selected, width: width, height: height,
+		preselect: selected, owner: owner, width: width, height: height,
 		input: input, notice: notice,
 	}
+	m.resizeInput()
+	return m
+}
+
+func (m *Model) resizeInput() {
+	m.input.SetWidth(max(1, m.contentWidth()-6))
 }
 
 // Close cancels outstanding commands and releases the backend subscription.
@@ -173,11 +184,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.quitting {
 		return m, nil
 	}
-	defer m.ensureVisible()
+	// Keep the browse window stable while a dialog is open; re-clamping it
+	// against the dialog's shorter content area would jump the list.
+	defer func() {
+		if m.mode == browsing && m.busy == noAction {
+			m.ensureVisible()
+		}
+	}()
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(0, msg.Width), max(0, msg.Height)
-		m.input.SetWidth(max(1, m.width-len(m.input.Prompt)-1))
+		m.resizeInput()
 	case changedMsg:
 		return m, tea.Batch(m.reload(), m.waitForChange())
 	case subscriptionClosedMsg:
@@ -238,6 +255,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.err = "Enter a name for the new blip."
 					return m, nil
 				}
+				if err := m.backend.ValidateName(name); err != nil {
+					m.err = err.Error()
+					return m, nil
+				}
 				m.err, m.notice, m.busy = "", "", createAction
 				m.input.Blur()
 				ctx, backend := m.ctx, m.backend
@@ -257,9 +278,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case helping:
-			if key == "?" || key == "esc" || key == "enter" {
-				m.mode = browsing
-			}
+			// Any key dismisses help without performing its action.
+			m.mode = browsing
 			return m, nil
 		default:
 			switch key {
@@ -294,6 +314,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	if m.mode == creating && m.busy == noAction {
+		// Editing the name clears the previous submit error; the inline hint
+		// reflects the current value immediately.
+		m.err = ""
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		return m, cmd
@@ -336,6 +359,7 @@ func (m *Model) replaceEntries(entries []Entry) {
 	if m.mode == confirming && m.busy == noAction {
 		for _, row := range m.rows {
 			if row.ID == m.deleteTarget.ID && row.UID == m.deleteTarget.UID {
+				m.deleteTarget = row.Entry
 				return
 			}
 		}

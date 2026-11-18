@@ -43,15 +43,23 @@ func (b *catalogBackend) Subscribe() (<-chan struct{}, func()) {
 	return b.srv.Catalog.Subscribe(b.owner)
 }
 
-func (b *catalogBackend) Create(ctx context.Context, name string) (menu.Entry, error) {
+func (b *catalogBackend) ValidateName(name string) error {
 	if name == "" {
-		return menu.Entry{}, errors.New("sandbox name is required")
+		return errors.New("sandbox name is required")
 	}
 	if _, err := SandboxName(name); err != nil {
-		return menu.Entry{}, err
+		return err
 	}
 	if !dnsLabel.MatchString(b.owner) {
-		return menu.Entry{}, errors.New("invalid sandbox owner")
+		return errors.New("invalid sandbox owner")
+	}
+	_, err := fullSandboxName(b.owner, name)
+	return err
+}
+
+func (b *catalogBackend) Create(ctx context.Context, name string) (menu.Entry, error) {
+	if err := b.ValidateName(name); err != nil {
+		return menu.Entry{}, err
 	}
 	full, err := fullSandboxName(b.owner, name)
 	if err != nil {

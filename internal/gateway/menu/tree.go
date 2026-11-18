@@ -82,16 +82,16 @@ func buildTree(entries []Entry) []row {
 		rows = append(rows, row{Entry: node.entry, prefix: node.prefix + node.branch})
 		prefix := node.prefix
 		switch node.branch {
-		case "+- ":
-			prefix += "|  "
-		case "`- ":
+		case "├─ ":
+			prefix += "│  "
+		case "└─ ":
 			prefix += "   "
 		}
 		forks := children[node.entry.ID]
 		for i := len(forks) - 1; i >= 0; i-- {
-			branch := "+- "
+			branch := "├─ "
 			if i == len(forks)-1 {
-				branch = "`- "
+				branch = "└─ "
 			}
 			stack = append(stack, frame{entry: forks[i], prefix: prefix, branch: branch})
 		}

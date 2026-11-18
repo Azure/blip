@@ -215,7 +215,7 @@ func TestSSHInteractiveZeroSizePTYMenuUsable(t *testing.T) {
 	assertNoSandboxes(t, e)
 	mark = s.output.mark()
 	s.typeKeys(t, "\x1b")
-	s.output.waitFor(t, mark, "Enter connect")
+	s.output.waitFor(t, mark, "No blips yet.")
 	s.quit(t)
 	assertNoSandboxes(t, e)
 }

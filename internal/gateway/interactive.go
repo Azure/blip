@@ -67,7 +67,7 @@ func (c *sessionChannel) showMenu(ctx context.Context, input *channelInput, sele
 	o := c.open
 	c.mu.Unlock()
 	width, height := menuSize(o.Rows, o.Cols)
-	m := menu.New(ctx, c.srv.menuBackend(c.owner), selected, width, height, notice)
+	m := menu.New(ctx, c.srv.menuBackend(c.owner), selected, width, height, notice, c.owner)
 	defer m.Close()
 	p := tea.NewProgram(m,
 		tea.WithInput(nil), tea.WithOutput(&crlfWriter{w: c.ch}), tea.WithContext(ctx),
