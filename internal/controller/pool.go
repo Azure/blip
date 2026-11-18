@@ -697,6 +697,12 @@ func addAPIProxy(pod *corev1.Pod, image string, gateway *v1.GatewaySpec) {
 		Image:         image,
 		Command:       []string{"blip-runtime", "api-proxy"},
 		RestartPolicy: &restart,
+		Env: []corev1.EnvVar{
+			// Trusted identity for owner-scoped reads. The guest cannot set
+			// these; they come from the pod's own metadata.
+			{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+		},
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                &uid,
 			RunAsGroup:               &uid,

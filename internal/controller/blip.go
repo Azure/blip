@@ -644,7 +644,11 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 			continue
 		}
 		p := base.DeepCopy()
+		if p.Labels == nil {
+			p.Labels = map[string]string{}
+		}
 		p.Labels[LabelBlipUID] = string(b.UID)
+		p.Labels[LabelOwner] = blipOwner(b)
 		if p.Annotations == nil {
 			p.Annotations = map[string]string{}
 		}
@@ -653,6 +657,8 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 		if err := setVMOwner(ctx, r.Client, p, b); err != nil {
 			return nil, err
 		}
+		// The claim patch is atomic: a lost race leaves the live pod, including
+		// its owner label, unchanged. Only the admission table needs restoring.
 		err := patchObject(ctx, r.Client, p, base)
 		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 			if err := restoreVMOwner(ctx, r.Client, r.Live, p.Namespace, p.Name); err != nil {

@@ -387,8 +387,19 @@ func TestPoolPodCredentials(t *testing.T) {
 			if memory := proxy.Resources.Limits.Memory(); memory.Sign() <= 0 || memory.Value() > 128<<20 {
 				t.Errorf("proxy memory limit = %s", memory.String())
 			}
-			if len(proxy.Env) != 0 {
-				t.Errorf("proxy should use Kubernetes service autoenv: %+v", proxy.Env)
+			if len(proxy.Env) != 2 {
+				t.Fatalf("proxy should only carry its trusted identity: %+v", proxy.Env)
+			}
+			wantProxyEnv := map[string]string{"POD_NAME": "metadata.name", "POD_NAMESPACE": "metadata.namespace"}
+			for _, env := range proxy.Env {
+				if env.Value != "" || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil ||
+					env.ValueFrom.FieldRef.FieldPath != wantProxyEnv[env.Name] {
+					t.Errorf("proxy identity must come from the DownwardAPI: %+v", env)
+				}
+				delete(wantProxyEnv, env.Name)
+			}
+			if len(wantProxyEnv) != 0 {
+				t.Errorf("missing proxy identity env: %v", wantProxyEnv)
 			}
 			if len(proxy.VolumeMounts) != 2 {
 				t.Fatalf("proxy should mount only sockets and credentials: %+v", proxy.VolumeMounts)
@@ -476,8 +487,13 @@ func TestPoolPodGateway(t *testing.T) {
 			proxyEnv := map[string]string{}
 			for _, v := range proxy.Env {
 				proxyEnv[v.Name] = v.Value
+				if v.ValueFrom != nil && v.ValueFrom.FieldRef != nil {
+					proxyEnv[v.Name] = v.ValueFrom.FieldRef.FieldPath
+				}
 			}
 			wantEnv := map[string]string{
+				"POD_NAME":                "metadata.name",
+				"POD_NAMESPACE":           "metadata.namespace",
 				"BLIP_GATEWAY_ADDRESS":    gateway.Address,
 				"BLIP_GATEWAY_TOKEN_FILE": gatewayTokenPath + "/token",
 			}

@@ -1,6 +1,8 @@
 // Package apiproxy serves the pod's Kubernetes API identity over the
 // guest-to-host vsock Unix socket. The service account credential stays in
-// the sidecar; the API server remains responsible for authorization.
+// the sidecar; the API server remains responsible for authorization. Reads of
+// Blips, BlipStates and Pods from a claimed VM are additionally scoped to the
+// owner recorded on the pod and its Blip.
 package apiproxy
 
 import (
@@ -36,6 +38,12 @@ type Config struct {
 	APIAddress string
 	TokenFile  string
 	CAFile     string
+	// PodName and PodNamespace identify this API proxy's own pod. They come
+	// from the downward API, never from the guest, and let the proxy derive
+	// the owner it acts for. When both are empty, Kubernetes object reads are
+	// not scoped (compatibility for direct local runs and unit tests).
+	PodName      string
+	PodNamespace string
 	// Gateway, when non-nil, adds a second listener that proxies to a fixed
 	// cluster gateway and injects its own projected service account token.
 	Gateway *GatewayConfig
@@ -65,10 +73,18 @@ func ConfigFromEnv() (Config, error) {
 		dir = podapi.MountPath
 	}
 	cfg := Config{
-		SocketPath: filepath.Join(dir, podapi.VsockSocket) + "_" + strconv.FormatUint(uint64(wire.APIPort), 10),
-		APIAddress: address,
-		TokenFile:  filepath.Join(serviceAccountDir, "token"),
-		CAFile:     filepath.Join(serviceAccountDir, "ca.crt"),
+		SocketPath:   filepath.Join(dir, podapi.VsockSocket) + "_" + strconv.FormatUint(uint64(wire.APIPort), 10),
+		APIAddress:   address,
+		TokenFile:    filepath.Join(serviceAccountDir, "token"),
+		CAFile:       filepath.Join(serviceAccountDir, "ca.crt"),
+		PodName:      os.Getenv("POD_NAME"),
+		PodNamespace: os.Getenv("POD_NAMESPACE"),
+	}
+	if (cfg.PodName == "") != (cfg.PodNamespace == "") {
+		return Config{}, errors.New("POD_NAME and POD_NAMESPACE must both be set")
+	}
+	if cfg.PodName != "" && (!validPodIdentity(cfg.PodName) || !validPodIdentity(cfg.PodNamespace)) {
+		return Config{}, errors.New("invalid POD_NAME or POD_NAMESPACE")
 	}
 	if gatewayAddress := os.Getenv("BLIP_GATEWAY_ADDRESS"); gatewayAddress != "" {
 		gatewayToken := os.Getenv("BLIP_GATEWAY_TOKEN_FILE")
@@ -235,7 +251,7 @@ func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return newUpstreamProxy(upstreamOptions{
+	handler, transport, err := newUpstreamProxy(upstreamOptions{
 		address:    address,
 		serverName: host,
 		hostHeader: address,
@@ -244,6 +260,16 @@ func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
 		tokenFile:  cfg.TokenFile,
 		errorBody:  "Kubernetes API unavailable",
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if (cfg.PodName == "") != (cfg.PodNamespace == "") {
+		return nil, nil, errors.New("API proxy pod identity is incomplete")
+	}
+	if cfg.PodName != "" {
+		handler = newOwnerScope(cfg, transport, handler)
+	}
+	return handler, transport, nil
 }
 
 func newGatewayProxy(cfg GatewayConfig) (http.Handler, *http.Transport, error) {
