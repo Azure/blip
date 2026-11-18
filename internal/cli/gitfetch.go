@@ -201,7 +201,8 @@ func (a *app) gitCheckout(ctx context.Context, name, dir string) (string, func()
 	if shared {
 		cleanup = func() { a.gitRelease(context.WithoutCancel(ctx), self, state, mountPath) }
 	}
-	if err := a.mountState(ctx, state, self, mountPath, writable); err != nil {
+	mode := writable
+	if err := a.mountState(ctx, state, self, mountPath, &mode); err != nil {
 		cleanup()
 		return "", nil, err
 	}

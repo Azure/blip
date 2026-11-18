@@ -490,6 +490,10 @@ type MountStatus struct {
 	AttachmentID string `json:"attachmentID,omitempty"`
 	Phase        string `json:"phase"`
 	Message      string `json:"message,omitempty"`
+	// Switching is set while the mount is being changed between read-only
+	// and writable. It remains set if the switch fails so the previous
+	// mode stays visible.
+	Switching bool `json:"switching,omitempty"`
 }
 
 type BlipStatus struct {

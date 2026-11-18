@@ -61,7 +61,11 @@ func (a *app) updateBlip(ctx context.Context, name string, change func(*v1alpha1
 
 var errUnchanged = errors.New("unchanged")
 
-func (a *app) mountState(ctx context.Context, state, blip, mountPath string, write bool) error {
+// switchBusyTimeout is how long a mode switch waits for processes to stop
+// using the old mount before it gives up and leaves the mount as it was.
+var switchBusyTimeout = 30 * time.Second
+
+func (a *app) mountState(ctx context.Context, state, blip, mountPath string, target *bool) error {
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return fmt.Errorf("invalid path %q: must be a clean absolute path other than /", mountPath)
 	}
@@ -69,31 +73,51 @@ func (a *app) mountState(ctx context.Context, state, blip, mountPath string, wri
 	if err != nil {
 		return err
 	}
-	if w := s.Status.Writer; write && w != nil && w.BlipName != blip {
-		return fmt.Errorf("state %q is busy: blip %q is writing to it", state, w.BlipName)
+	if target != nil && *target {
+		if w := s.Status.Writer; w != nil && w.BlipName != blip {
+			return fmt.Errorf("state %q is busy: blip %q is writing to it", state, w.BlipName)
+		}
 	}
 	if s.Status.Phase == v1alpha1.StateFailed {
 		return fmt.Errorf("state %q failed: %s", state, s.Status.Message)
+	}
+	var previous, want bool
+	var changed bool
+	baseGeneration := int64(0)
+	if s.Status.Committed != nil {
+		baseGeneration = s.Status.Committed.Generation
 	}
 	_, err = a.updateBlip(ctx, blip, func(b *v1alpha1.Blip) error {
 		if finished(b) || b.DeletionTimestamp != nil || b.Spec.Stop {
 			return fmt.Errorf("blip %q is stopping or has finished", blip)
 		}
-		for _, m := range b.Spec.Mounts {
+		previous, want, changed = false, false, false
+		for i := range b.Spec.Mounts {
+			m := &b.Spec.Mounts[i]
 			if m.State != state {
 				continue
 			}
-			if m.Path == mountPath && m.Writable == write {
+			if m.Path != mountPath {
+				return fmt.Errorf("state %q is already mounted on blip %q at %s; unmount it first", state, blip, m.Path)
+			}
+			previous, want = m.Writable, m.Writable
+			if target == nil || *target == m.Writable {
 				return errUnchanged
 			}
-			return fmt.Errorf("state %q is already mounted on blip %q at %s; unmount it first", state, blip, m.Path)
+			want = *target
+			m.Writable = want
+			changed = true
+			return nil
 		}
 		for _, m := range b.Spec.Mounts {
 			if m.Path == mountPath {
 				return fmt.Errorf("blip %q already has state %q mounted at %s", blip, m.State, mountPath)
 			}
 		}
-		b.Spec.Mounts = append(b.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath, Writable: write})
+		if target != nil {
+			want = *target
+		}
+		b.Spec.Mounts = append(b.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath, Writable: want})
 		return nil
 	})
 	if err != nil && !errors.Is(err, errUnchanged) {
@@ -101,6 +125,7 @@ func (a *app) mountState(ctx context.Context, state, blip, mountPath string, wri
 	}
 	r := &reporter{a: a}
 	defer r.stop()
+	start := time.Now()
 	err = a.waitBlip(ctx, blip, func(b *v1alpha1.Blip) (bool, error) {
 		if b == nil {
 			return false, fmt.Errorf("blip %q was deleted", blip)
@@ -113,11 +138,58 @@ func (a *app) mountState(ctx context.Context, state, blip, mountPath string, wri
 			r.say("mounting %s on %s...", state, blip)
 			return false, nil
 		}
-		switch m.Phase {
-		case v1alpha1.MountMounted:
-			return true, nil
-		case v1alpha1.MountFailed:
+		if m.Phase == v1alpha1.MountFailed {
+			if changed {
+				a.revertMount(ctx, blip, state, mountPath, previous)
+			}
+			if strings.Contains(m.Message, "busy") {
+				return false, fmt.Errorf("could not switch state %q on blip %q: processes are still using %s (stop them, then run the command again)", state, blip, mountPath)
+			}
 			return false, fmt.Errorf("mount of state %q on blip %q failed: %s (unmount it, then mount again to retry)", state, blip, m.Message)
+		}
+		if m.Switching && m.Writable != want {
+			if strings.HasPrefix(m.Message, "cannot switch") {
+				if changed {
+					a.revertMount(ctx, blip, state, mountPath, previous)
+				}
+				return false, fmt.Errorf("switch of state %q on blip %q failed: %s", state, blip, m.Message)
+			}
+			if m.Message != "" {
+				r.say("switching %s on %s: %s", state, blip, m.Message)
+			} else {
+				r.say("switching %s on %s to %s...", state, blip, modeName(want))
+			}
+			if m.Message != "" && !strings.Contains(m.Message, "busy") {
+				if changed {
+					a.revertMount(ctx, blip, state, mountPath, previous)
+				}
+				return false, fmt.Errorf("switch of state %q on blip %q failed: %s", state, blip, m.Message)
+			}
+			if strings.Contains(m.Message, "busy") && time.Since(start) > switchBusyTimeout {
+				if changed {
+					a.revertMount(ctx, blip, state, mountPath, previous)
+				}
+				return false, fmt.Errorf("could not switch state %q on blip %q: processes are still using %s (stop them, then run the command again)", state, blip, mountPath)
+			}
+			return false, nil
+		}
+		if m.Phase == v1alpha1.MountMounted && m.Writable == want {
+			if !want && changed {
+				st, err := a.getState(ctx, state)
+				if err != nil {
+					return false, err
+				}
+				landed := st.Status.Committed != nil &&
+					(baseGeneration == 0 || st.Status.Committed.Generation > baseGeneration)
+				if m.CommitID != "" && st.Status.Committed != nil && st.Status.Committed.ID == m.CommitID {
+					landed = true
+				}
+				if !landed {
+					r.say("saving new version of %s...", state)
+					return false, nil
+				}
+			}
+			return true, nil
 		}
 		if m.Message != "" {
 			r.say("mounting %s on %s: %s", state, blip, m.Message)
@@ -127,12 +199,29 @@ func (a *app) mountState(ctx context.Context, state, blip, mountPath string, wri
 	if err != nil {
 		return err
 	}
-	mode := "read-only"
-	if write {
-		mode = "writable"
-	}
-	fmt.Fprintf(a.env.Out, "state %s mounted on blip %s at %s (%s)\n", a.short(state), a.short(blip), mountPath, mode)
+	fmt.Fprintf(a.env.Out, "state %s mounted on blip %s at %s (%s)\n", a.short(state), a.short(blip), mountPath, modeName(want))
 	return nil
+}
+
+func modeName(write bool) string {
+	if write {
+		return "writable"
+	}
+	return "read-only"
+}
+
+// revertMount puts a mount back in the mode it had before a failed switch.
+func (a *app) revertMount(ctx context.Context, blip, state, mountPath string, writable bool) {
+	_, _ = a.updateBlip(ctx, blip, func(b *v1alpha1.Blip) error {
+		for i := range b.Spec.Mounts {
+			m := &b.Spec.Mounts[i]
+			if m.State == state && m.Path == mountPath && m.Writable != writable {
+				m.Writable = writable
+				return nil
+			}
+		}
+		return errUnchanged
+	})
 }
 
 func (a *app) unmountState(ctx context.Context, state, blip string) error {
@@ -149,6 +238,24 @@ func (a *app) unmountState(ctx context.Context, state, blip string) error {
 		if cp.Spec.CopyFrom == state && cp.Status.Committed == nil && cp.DeletionTimestamp == nil &&
 			cp.Status.Phase != v1alpha1.StateFailed {
 			return fmt.Errorf("state %q is being forked by %q; wait for the fork to finish before unmounting", state, a.short(cp.Name))
+		}
+	}
+	if b, err := a.getBlip(ctx, blip); err == nil {
+		if m := findMount(b.Status.Mounts, state); m != nil && m.Switching {
+			r := &reporter{a: a}
+			err := a.waitBlip(ctx, blip, func(b *v1alpha1.Blip) (bool, error) {
+				m := findMount(b.Status.Mounts, state)
+				if m == nil || !m.Switching || m.Phase == v1alpha1.MountFailed ||
+					m.Phase == v1alpha1.MountMounted && m.Message != "" {
+					return true, nil
+				}
+				r.say("waiting for %s to finish switching...", state)
+				return false, nil
+			})
+			r.stop()
+			if err != nil {
+				return err
+			}
 		}
 	}
 	var before *v1alpha1.MountStatus
@@ -228,9 +335,9 @@ func (a *app) mountTarget(state, blip *string) error {
 
 func (a *app) mountCommand() *cobra.Command {
 	var blip, mountPath string
-	var write bool
+	var write, readOnly bool
 	cmd := &cobra.Command{
-		Use:     "mount STATE [--blip NAME] --path PATH [--write]",
+		Use:     "mount STATE [--blip NAME] --path PATH [--write|--read-only]",
 		Short:   "Mount a state into a running blip",
 		Example: "  kubectl blip mount repo --blip agent --path /work --write",
 		Args:    cobra.ExactArgs(1),
@@ -238,12 +345,24 @@ func (a *app) mountCommand() *cobra.Command {
 			if err := a.mountTarget(&args[0], &blip); err != nil {
 				return err
 			}
-			return a.mountState(cmd.Context(), args[0], blip, mountPath, write)
+			if write && readOnly {
+				return errors.New("--write and --read-only cannot be used together")
+			}
+			var target *bool
+			if cmd.Flags().Changed("write") {
+				v := true
+				target = &v
+			} else if cmd.Flags().Changed("read-only") {
+				v := false
+				target = &v
+			}
+			return a.mountState(cmd.Context(), args[0], blip, mountPath, target)
 		},
 	}
 	cmd.Flags().StringVar(&blip, "blip", "", "blip to mount into (default: the blip this runs in)")
 	cmd.Flags().StringVar(&mountPath, "path", "", "absolute mount path in the blip (required)")
-	cmd.Flags().BoolVar(&write, "write", false, "mount writable (saves a new version on unmount)")
+	cmd.Flags().BoolVar(&write, "write", false, "mount writable (takes the state's writer and saves on unmount)")
+	cmd.Flags().BoolVar(&readOnly, "read-only", false, "mount read-only (the default for a new mount)")
 	_ = cmd.MarkFlagRequired("path")
 	return cmd
 }

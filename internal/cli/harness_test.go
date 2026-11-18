@@ -35,7 +35,7 @@ func newHarness(t *testing.T, objs ...client.Object) *harness {
 	for _, pool := range []string{"default", "big"} {
 		objs = append(objs, &v1alpha1.BlipPool{ObjectMeta: metav1.ObjectMeta{Name: pool, Namespace: ns}})
 	}
-	kube := fake.NewClientBuilder().WithScheme(Scheme).WithObjects(objs...).Build()
+	kube := fake.NewClientBuilder().WithScheme(Scheme).WithStatusSubresource(&v1alpha1.Blip{}, &v1alpha1.BlipState{}).WithObjects(objs...).Build()
 	h := &harness{t: t, kube: kube, guest: &fakeguest.Guest{}, ctrl: &fakeController{kube: kube, exited: map[string]int32{}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -163,12 +163,12 @@ func (c *fakeController) tick(ctx context.Context) {
 				s.Status.Phase = v1alpha1.StateReady
 				s.Status.Committed = &v1alpha1.Commit{ID: "0123456789abcdef", Generation: 1}
 			}
-			c.kube.Update(ctx, s)
+			c.kube.Status().Update(ctx, s)
 		case s.Status.Phase == v1alpha1.StateFailed && s.Status.Pending != nil:
 			s.Status.Phase = v1alpha1.StateReady
 			s.Status.Pending = nil
 			s.Status.Committed = &v1alpha1.Commit{ID: "0123456789abcdef", Generation: 1}
-			c.kube.Update(ctx, s)
+			c.kube.Status().Update(ctx, s)
 		}
 	}
 	var blips v1alpha1.BlipList
@@ -176,7 +176,7 @@ func (c *fakeController) tick(ctx context.Context) {
 	for i := range blips.Items {
 		b := &blips.Items[i]
 		if c.step(b) {
-			c.kube.Update(ctx, b)
+			c.kube.Status().Update(ctx, b)
 		}
 	}
 }
@@ -215,6 +215,36 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 	}
 	for i := range st.Mounts {
 		m := &st.Mounts[i]
+		sm := specMount(b.Spec.Mounts, m.State)
+		switch {
+		case sm != nil && m.Phase == v1alpha1.MountMounted && (sm.Path != m.Path || sm.Writable != m.Writable):
+			m.Phase, m.Switching = v1alpha1.MountUnmounting, true
+		case sm != nil && m.Phase == v1alpha1.MountUnmounting && m.Switching:
+			if c.unmountFail != "" {
+				m.Phase, m.Message = v1alpha1.MountFailed, c.unmountFail
+			} else if m.Writable {
+				m.Phase = v1alpha1.MountSaving
+			} else {
+				st.Mounts = append(st.Mounts[:i], st.Mounts[i+1:]...)
+			}
+		case sm != nil && m.Phase == v1alpha1.MountSaving && m.Switching:
+			m.Writable, m.Phase, m.Switching = sm.Writable, v1alpha1.MountPending, false
+			if !m.Writable {
+				m.CommitID = "fedcba9876543210"
+				var s v1alpha1.BlipState
+				if err := c.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: m.State}, &s); err == nil {
+					s.Status.Pending = nil
+					s.Status.Committed = &v1alpha1.Commit{ID: m.CommitID, Generation: 2}
+					c.kube.Status().Update(context.Background(), &s)
+				}
+			}
+		default:
+			continue
+		}
+		return true
+	}
+	for i := range st.Mounts {
+		m := &st.Mounts[i]
 		inSpec := false
 		for _, sm := range b.Spec.Mounts {
 			inSpec = inSpec || sm.State == m.State
@@ -238,6 +268,15 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 		return true
 	}
 	return false
+}
+
+func specMount(mounts []v1alpha1.Mount, state string) *v1alpha1.Mount {
+	for i := range mounts {
+		if mounts[i].State == state {
+			return &mounts[i]
+		}
+	}
+	return nil
 }
 
 func mustContain(t *testing.T, got string, want ...string) {

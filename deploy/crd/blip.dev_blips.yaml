@@ -500,6 +500,12 @@ spec:
                         StateUID and CommitID pin the version: the mounted version for
                         read-only mounts, the base version for writable mounts.
                       type: string
+                    switching:
+                      description: |-
+                        Switching is set while the mount is being changed between read-only
+                        and writable. It remains set if the switch fails so the previous
+                        mode stays visible.
+                      type: boolean
                     writable:
                       type: boolean
                   required:

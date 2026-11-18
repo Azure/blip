@@ -464,8 +464,57 @@ func (r *BlipReconciler) usableState(ctx context.Context, ns, name string) (*v1.
 		return nil, ReasonStateFailed, fmt.Sprintf("state %q failed: %s", name, st.Status.Message), nil
 	case st.Status.Committed == nil:
 		return st, ReasonStateNotReady, fmt.Sprintf("state %q has no committed version yet", name), nil
+	case st.Status.Pending != nil:
+		return st, ReasonStateNotReady, fmt.Sprintf("state %q is saving a new version", name), nil
 	}
 	return st, "", "", nil
+}
+
+// preparePromote checks that a read-only mount can become writable and
+// acquires the writer before the old mount is torn down.
+func (r *BlipReconciler) preparePromote(ctx context.Context, b *v1.Blip, sm v1.Mount, m v1.MountStatus) (string, error) {
+	st, reason, msg, err := r.usableState(ctx, b.Namespace, sm.State)
+	if err != nil {
+		return "", err
+	}
+	if reason != "" {
+		return msg, nil
+	}
+	if m.CommitID != st.Status.Committed.ID {
+		return fmt.Sprintf("state %q has a newer version; unmount and mount it again", sm.State), nil
+	}
+	if w := st.Status.Writer; w != nil && (w.BlipUID != string(b.UID) || w.BaseCommit != m.CommitID) {
+		return fmt.Sprintf("state %q is in use by blip %s", sm.State, w.BlipName), nil
+	}
+	_, blocked, err := r.acquire(ctx, b, map[string]*v1.BlipState{sm.State: st}, []string{sm.State}, nil)
+	if err != nil {
+		return "", err
+	}
+	return blocked, nil
+}
+
+// sealResult returns the node's seal report for an attachment.
+func (r *BlipReconciler) sealResult(ctx context.Context, ns, state, id string) (v1.SealResult, bool, error) {
+	st := &v1.BlipState{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: state}, st); err != nil {
+		if apierrors.IsNotFound(err) {
+			return v1.SealResult{AttachmentID: id, Error: "state was deleted"}, true, nil
+		}
+		return v1.SealResult{}, false, err
+	}
+	for _, sr := range st.Status.Seals {
+		if sr.AttachmentID == id {
+			return sr, true, nil
+		}
+	}
+	return v1.SealResult{}, false, nil
+}
+
+func sealError(sr v1.SealResult) string {
+	if sr.Error != "" {
+		return sr.Error
+	}
+	return "save failed without an error"
 }
 
 // claimedPod finds a pod this Blip already claimed.

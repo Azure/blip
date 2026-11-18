@@ -114,6 +114,19 @@ func (r *BlipReconciler) releaseHeld(ctx context.Context, b *v1.Blip, keep ...st
 	return nil
 }
 
+// releaseSwitchWriter returns a writer slot pre-acquired for a promotion that
+// was cancelled before the writable mount appeared.
+func (r *BlipReconciler) releaseSwitchWriter(ctx context.Context, b *v1.Blip, state string) error {
+	st := &v1.BlipState{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: state}, st); err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			return err
+		}
+		return nil
+	}
+	return releaseWriter(ctx, r.Client, st, b.UID)
+}
+
 // ensureWriterPods records the claimed pod in each writer slot the Blip
 // holds; the node acts only when writer.podUID matches the pod.
 func (r *BlipReconciler) ensureWriterPods(ctx context.Context, b *v1.Blip) error {

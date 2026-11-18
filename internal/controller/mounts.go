@@ -78,55 +78,160 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, pod *corev1
 	present := map[string]bool{}
 	for _, m := range b.Status.Mounts {
 		sm, inSpec := spec[m.State]
-		same := inSpec && sm.Path == m.Path && sm.Writable == m.Writable
+		pathSame := inSpec && sm.Path == m.Path
+		same := pathSame && sm.Writable == m.Writable
+		switchTo := pathSame && !same && !stop
+		if !pathSame && m.Switching {
+			// Removing the mount or changing its path cancels a switch in
+			// progress. A writable mount still goes through the normal
+			// save path below.
+			if !m.Writable {
+				if err := r.releaseSwitchWriter(ctx, b, m.State); err != nil {
+					return err
+				}
+			}
+			m.Switching, m.Message = false, ""
+		}
 		d, seen := disks[m.AttachmentID]
 		switch m.Phase {
 		case v1.MountPending, v1.MountMounted:
 			switch {
-			case !same && !stop:
+			case switchTo && !m.Switching:
+				if m.Phase == v1.MountPending {
+					// Wait until the current mount is actually up
+					// before checking promotion preconditions or
+					// tearing it down for a demotion.
+					switch {
+					case seen && d.Phase == podapi.DiskMounted:
+						m.Phase = v1.MountMounted
+					case seen && d.Phase == podapi.DiskFailed:
+						m.Phase, m.Message = v1.MountFailed, d.Message
+					}
+					break
+				}
+				if sm.Writable {
+					msg, err := r.preparePromote(ctx, b, sm, m)
+					if err != nil {
+						return err
+					}
+					if msg != "" {
+						if strings.Contains(msg, "saving a new version") {
+							// The version this mount would promote from
+							// is briefly unavailable. Keep the mount
+							// usable and retry on the next reconcile.
+							m.Phase, m.Message = v1.MountMounted, "waiting to switch to writable: "+msg
+							break
+						}
+						// Keep the read-only mount usable; the CLI
+						// reports the failed switch and reverts the spec.
+						m.Phase, m.Message, m.Switching = v1.MountMounted, "cannot switch to writable: "+msg, true
+						break
+					}
+				}
+				m.Phase, m.Message, m.Switching = v1.MountUnmounting, "", true
+			case !same && !stop && !m.Switching:
 				m.Phase, m.Message = v1.MountUnmounting, ""
 			case seen && d.Phase == podapi.DiskMounted:
-				m.Phase, m.Message = v1.MountMounted, ""
+				m.Phase = v1.MountMounted
+				if same {
+					m.Message, m.Switching = "", false
+				}
 			case seen && d.Phase == podapi.DiskFailed && m.Phase == v1.MountPending:
 				m.Phase, m.Message = v1.MountFailed, d.Message
 			}
 		case v1.MountUnmounting:
-			switch {
-			case !seen || d.Phase == podapi.DiskDetached:
-				if !m.Writable {
-					continue
-				}
-				m.Phase, m.Message = v1.MountSaving, ""
-			case d.Phase == podapi.DiskFailed:
-				m.Message = d.Message
-			}
-		}
-		if m.Phase == v1.MountSaving || m.Phase == v1.MountFailed {
-			done, msg := true, ""
-			if m.Writable && m.AttachmentID != "" {
-				var err error
-				if done, msg, err = r.attachment(ctx, b.Namespace, m.State, m.AttachmentID); err != nil {
+			if m.Switching && !m.Writable && !switchTo {
+				// A promotion was cancelled before the new writable
+				// mount appeared; return the pre-acquired slot.
+				if err := r.releaseSwitchWriter(ctx, b, m.State); err != nil {
 					return err
 				}
 			}
 			switch {
-			case !done:
-			case msg != "":
-				m.Phase, m.Message = v1.MountFailed, "save failed: "+msg
-				if !same {
-					// The mount was removed from the spec, but the
-					// failure must stay visible (and fail the Blip)
-					// instead of disappearing with the entry.
-					saveErrs = append(saveErrs, fmt.Sprintf("save of state %s failed: %s", m.State, msg))
+			case same && seen && (d.Phase == podapi.DiskMounted || d.Phase == podapi.DiskFailed):
+				// The spec was reverted while the old mount was still up.
+				m.Phase, m.Message, m.Switching = v1.MountMounted, "", false
+			case !seen || d.Phase == podapi.DiskDetached:
+				if m.Writable && (m.Switching || !same) {
+					// A detached writable mount must be saved even if
+					// the spec was changed back while it was going
+					// away; its contents are no longer reachable
+					// through the old disk.
+					m.Phase, m.Message = v1.MountSaving, ""
+				} else {
+					// A read-only mount (or a cancelled switch) is
+					// replaced by the spec loop below.
+					continue
 				}
-			case m.Phase == v1.MountSaving:
-				continue
+			case d.Phase == podapi.DiskFailed:
+				m.Message = d.Message
+			case d.Phase == podapi.DiskUnmounting:
+				// The retry succeeded; stop reporting the old busy error.
+				m.Message = ""
+			}
+		}
+		if m.Phase == v1.MountSaving || m.Phase == v1.MountFailed {
+			switch {
+			case m.Switching && m.Writable && m.Phase == v1.MountSaving:
+				sr, found, err := r.sealResult(ctx, b.Namespace, m.State, m.AttachmentID)
+				if err != nil {
+					return err
+				}
+				if !found {
+					break
+				}
+				if sr.CommitID == "" {
+					m.Phase, m.Message = v1.MountFailed, "switch failed: "+sealError(sr)
+					break
+				}
+				// Demote in place: the same path becomes read-only at
+				// the version just saved. This does not wait for the
+				// commit to replicate so the mount comes back sooner.
+				// If the spec was changed back to writable while the
+				// save was in flight, the next reconcile promotes the
+				// read-only mount once the saved version lands.
+				m.Writable, m.CommitID, m.AttachmentID = false, sr.CommitID, newID()
+				m.Phase, m.Message, m.Switching = v1.MountPending, "", false
+			case m.Switching && same:
+				// The switch was cancelled before anything was torn
+				// down. Recreate the mount in its current mode.
+				if seen && d.Phase == podapi.DiskMounted {
+					m.Phase, m.Message, m.Switching = v1.MountMounted, "", false
+				} else if !m.Writable {
+					continue
+				}
+				// A writable save that failed stays visible: recreating
+				// it from the old committed version would hide the loss.
+			case m.Switching:
+				// A failed switch keeps its old mount or failure visible.
+			default:
+				done, msg := true, ""
+				if m.Writable && m.AttachmentID != "" {
+					var err error
+					if done, msg, err = r.attachment(ctx, b.Namespace, m.State, m.AttachmentID); err != nil {
+						return err
+					}
+				}
+				switch {
+				case !done:
+				case msg != "":
+					m.Phase, m.Message = v1.MountFailed, "save failed: "+msg
+					if !same {
+						// The mount was removed from the spec, but the
+						// failure must stay visible (and fail the Blip)
+						// instead of disappearing with the entry.
+						saveErrs = append(saveErrs, fmt.Sprintf("save of state %s failed: %s", m.State, msg))
+					}
+				case m.Phase == v1.MountSaving:
+					continue
+				}
 			}
 		}
 		out = append(out, m)
 		// A failed removed mount is kept for the CLI but must not stop
-		// the same state from being mounted again.
-		if m.Phase != v1.MountFailed || same {
+		// the same state from being mounted again. A switch keeps its
+		// entry while it is in progress or failed.
+		if m.Phase != v1.MountFailed || same || m.Switching {
 			present[m.State] = true
 		}
 	}

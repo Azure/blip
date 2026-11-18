@@ -202,6 +202,53 @@ func TestMountAddsSpecAndWaitsMounted(t *testing.T) {
 	}
 }
 
+func TestMountSwitchesExistingMode(t *testing.T) {
+	h := newHarness(t, runningBlip("agent", v1alpha1.Mount{State: "repo", Path: "/work"}), readyState("repo"))
+
+	code, out, errOut := h.run("", "mount", "repo", "--blip", "agent", "--path", "/work", "--write")
+	if code != 0 {
+		t.Fatalf("promote code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state repo mounted on blip agent at /work (writable)")
+	b := h.blip("agent")
+	if len(b.Spec.Mounts) != 1 || !b.Spec.Mounts[0].Writable || len(b.Status.Mounts) != 1 || !b.Status.Mounts[0].Writable {
+		t.Fatalf("promoted mounts = %+v %+v", b.Spec.Mounts, b.Status.Mounts)
+	}
+
+	code, out, errOut = h.run("", "mount", "repo", "--blip", "agent", "--path", "/work", "--read-only")
+	if code != 0 {
+		t.Fatalf("demote code %d: %s", code, errOut)
+	}
+	b = h.blip("agent")
+	mustContain(t, out, "state repo mounted on blip agent at /work (read-only)")
+	if len(b.Spec.Mounts) != 1 || b.Spec.Mounts[0].Writable || len(b.Status.Mounts) != 1 || b.Status.Mounts[0].Writable {
+		t.Fatalf("demoted mounts = %+v %+v", b.Spec.Mounts, b.Status.Mounts)
+	}
+	if st := h.state("repo"); st.Status.Committed == nil || st.Status.Committed.ID != b.Status.Mounts[0].CommitID {
+		t.Fatalf("state did not commit demoted version: %+v", st.Status)
+	}
+
+	// No flag leaves the existing mode alone.
+	code, out, errOut = h.run("", "mount", "repo", "--blip", "agent", "--path", "/work")
+	if code != 0 {
+		t.Fatalf("unchanged code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "(read-only)")
+}
+
+func TestMountSwitchBusyRevertsSpec(t *testing.T) {
+	h := newHarness(t, runningBlip("agent", v1alpha1.Mount{State: "repo", Path: "/work", Writable: true}), readyState("repo"))
+	h.ctrl.set(func(c *fakeController) { c.unmountFail = "target is busy" })
+	code, _, errOut := h.run("", "mount", "repo", "--blip", "agent", "--path", "/work", "--read-only")
+	if code != 1 || !strings.Contains(errOut, "processes are still using /work") {
+		t.Fatalf("code %d err %q", code, errOut)
+	}
+	b := h.blip("agent")
+	if len(b.Spec.Mounts) != 1 || !b.Spec.Mounts[0].Writable {
+		t.Fatalf("spec not reverted: %+v", b.Spec.Mounts)
+	}
+}
+
 func TestMountFailureIsReported(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"), readyState("repo"))
 	h.ctrl.set(func(c *fakeController) { c.mountFail = "no space left on device" })
