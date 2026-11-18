@@ -146,6 +146,49 @@ func TestVMOwnersPools(t *testing.T) {
 	}
 }
 
+// A pool without a service account still materializes the table. The
+// blip-write policy binding has parameterNotFoundAction Deny, so a missing
+// table would reject every Blip and BlipState change in the namespace.
+func TestVMOwnersEmptyServiceAccount(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.create(&v1.BlipPool{
+		ObjectMeta: metadata("open"),
+		Spec:       v1.BlipPoolSpec{Hypervisor: "kvm", CPUs: 2, Memory: resource.MustParse("2Gi")},
+	})
+
+	e.run(e.pool, ns, "open")
+	if got := e.owners(); len(got) != 0 {
+		t.Fatalf("table of a pool without a service account = %v", got)
+	}
+
+	// A deleted table is recreated, still empty.
+	cm := &corev1.ConfigMap{}
+	e.must(e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: VMOwnersConfigMap}, cm))
+	e.must(e.c.Delete(e.ctx, cm))
+	e.run(e.pool, ns, "open")
+	if got := e.owners(); len(got) != 0 {
+		t.Fatalf("recreated table = %v", got)
+	}
+
+	// A service account added later is listed in the same table.
+	pool := e.getPool("open")
+	pool.Spec.ServiceAccountName = "vm"
+	e.must(e.c.Update(e.ctx, pool))
+	e.run(e.pool, ns, "open")
+	if got, want := e.owners(), map[string]string{"sa.vm": "open"}; !maps.Equal(got, want) {
+		t.Fatalf("table after pool update = %v, want %v", got, want)
+	}
+
+	// Removing the last pool prunes the entry; the (empty) table stays,
+	// since the controller has no permission to delete it.
+	e.must(e.c.Delete(e.ctx, e.getPool("open")))
+	e.run(e.pool, ns, "open")
+	if got := e.owners(); len(got) != 0 {
+		t.Fatalf("table after pool removal = %v", got)
+	}
+}
+
 func TestPodServiceAccount(t *testing.T) {
 	e := newEnv(t)
 	pool := &v1.BlipPool{ObjectMeta: metadata("default"), Spec: v1.BlipPoolSpec{ServiceAccountName: "vm"}}

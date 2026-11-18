@@ -157,9 +157,10 @@ func restoreVMOwner(ctx context.Context, c client.Client, live client.Reader, ns
 
 // syncVMOwners reconciles the table of ns with the cluster: every pool and
 // VM pod service account is listed with its pools, claimed pods carry their Blip's owner,
-// and entries of deleted pods are removed. Vacant pods keep any entry: the
-// cache may not show a claim yet, and the claim path overwrites the entry
-// before the next claim.
+// and entries of deleted pods are removed. A namespace with a pool always
+// has the table, empty if no pool names a service account. Vacant pods keep
+// any entry: the cache may not show a claim yet, and the claim path
+// overwrites the entry before the next claim.
 func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 	var pools v1.BlipPoolList
 	if err := c.List(ctx, &pools, client.InNamespace(ns)); err != nil {
@@ -195,6 +196,17 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 
 	cm := &corev1.ConfigMap{}
 	err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: VMOwnersConfigMap}, cm)
+	if apierrors.IsNotFound(err) && len(pools.Items) > 0 {
+		// The blip-write policy binding denies every change when its
+		// params are missing, so a namespace with a pool always has a
+		// table, even when no pool names a service account and the table
+		// is empty.
+		err = c.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: VMOwnersConfigMap}})
+		if apierrors.IsAlreadyExists(err) {
+			// Another writer created it; read it so stale keys are pruned.
+			err = c.Get(ctx, types.NamespacedName{Namespace: ns, Name: VMOwnersConfigMap}, cm)
+		}
+	}
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
