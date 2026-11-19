@@ -181,7 +181,7 @@ func (r *BlipReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	case "", v1.BlipPending:
 		result, err = r.pending(ctx, b, base)
 	case v1.BlipRunning:
-		result, err = r.running(ctx, b)
+		result, err = r.running(ctx, b, base)
 	}
 	if err == nil && b.Status.Phase == v1.BlipSaving {
 		err = r.saving(ctx, b)
@@ -364,6 +364,23 @@ func (r *BlipReconciler) cleanup(ctx context.Context, b *v1.Blip) error {
 
 func stopping(b *v1.Blip) bool { return b.Spec.Stop || b.DeletionTimestamp != nil }
 
+// deletedByOwner reports whether st is being deleted while an owner other
+// than b is responsible. Owner references created by the CLI do not set the
+// controller flag, so every owner UID matters rather than only the controller
+// reference. Deleting a workspace through its owner removes the data, so a
+// borrowed writer cannot preserve a save into it.
+func deletedByOwner(st *v1.BlipState, b *v1.Blip) bool {
+	if len(st.OwnerReferences) == 0 {
+		return false
+	}
+	for _, owner := range st.OwnerReferences {
+		if owner.UID == b.UID {
+			return false
+		}
+	}
+	return true
+}
+
 func wait(b *v1.Blip, reason, msg string) {
 	b.Status.Phase = v1.BlipPending
 	b.Status.Reason = reason
@@ -393,17 +410,22 @@ func (r *BlipReconciler) deadlineExceeded(b *v1.Blip) bool {
 // stopForDeadline sets spec.stop as an expired deadline would. A conflict is
 // retried against the latest object, so a concurrent spec edit is not lost.
 func (r *BlipReconciler) stopForDeadline(ctx context.Context, b *v1.Blip) error {
+	return r.stop(ctx, b, "DeadlineExceeded")
+}
+
+// stop sets spec.stop and records why, retrying against a concurrent edit.
+// The stop reason is only recorded once, so a later cause does not overwrite
+// the first.
+func (r *BlipReconciler) stop(ctx context.Context, b *v1.Blip, reason string) error {
 	key := client.ObjectKeyFromObject(b)
 	for attempt := 0; ; attempt++ {
 		base := b.DeepCopy()
 		b.Spec.Stop = true
-		// Record only the first cause: a later stop must not overwrite why
-		// the Blip was already stopping.
 		if b.Annotations[v1.AnnotationStopReason] == "" {
 			if b.Annotations == nil {
 				b.Annotations = map[string]string{}
 			}
-			b.Annotations[v1.AnnotationStopReason] = "DeadlineExceeded"
+			b.Annotations[v1.AnnotationStopReason] = reason
 		}
 		err := patchObject(ctx, r.Client, b, base)
 		if err == nil || !apierrors.IsConflict(err) || attempt >= 4 {
@@ -952,7 +974,7 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 }
 
 // running mirrors the pod's observed state and applies mount changes.
-func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Result, error) {
+func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip) (reconcile.Result, error) {
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.Pod}, pod)
 	if apierrors.IsNotFound(err) || err == nil && string(pod.UID) != b.Status.PodUID {
@@ -1010,6 +1032,19 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Res
 				return reconcile.Result{}, err
 			}
 			if reason != "" {
+				if reason == reasonStateDeleting && b.DeletionTimestamp == nil && root != nil && deletedByOwner(root, b) {
+					// The owner Blip (or its TTL) is removing the
+					// workspace. Its deletion also removes the data this
+					// Blip would save, so stop now and fail the save
+					// instead of reporting success for a discarded result.
+					if err := r.stop(ctx, b, reasonStateDeleting); err != nil {
+						return reconcile.Result{}, err
+					}
+					*base = *b.DeepCopy()
+					b.Status.Reason, b.Status.Message = ReasonStateNotFound,
+						fmt.Sprintf("state %q is being deleted by its owner; stopping before the workspace is removed", root.Name)
+					return reconcile.Result{}, nil
+				}
 				b.Status.Reason, b.Status.Message = reason, msg
 				return reconcile.Result{RequeueAfter: retryAfter}, nil
 			}
@@ -1168,6 +1203,21 @@ func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
 			b.Status.Reason, b.Status.Message = ReasonSaveFailed, saveErr
 		}
 		return nil
+	}
+	// A workspace being removed by its owner's deletion or TTL cannot keep
+	// this save. attachment deliberately treats a deleting state as resolved
+	// so the finalizer cannot deadlock with the Blip; without this check the
+	// borrower would report Succeeded for data that is about to disappear.
+	if b.Spec.State != "" && saveErr == "" {
+		st := &v1.BlipState{}
+		switch err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.State}, st); {
+		case apierrors.IsNotFound(err):
+			// attachment already reports a deleted state as a failed save.
+		case err != nil:
+			return err
+		case st.DeletionTimestamp != nil && deletedByOwner(st, b):
+			saveErr = fmt.Sprintf("state %q was deleted by its owner while in use; the save was discarded", st.Name)
+		}
 	}
 	// Every attachment is resolved. A writable mount still marked Saving was
 	// saved successfully, so show its final ready phase instead of leaving
