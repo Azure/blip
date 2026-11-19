@@ -2015,6 +2015,61 @@ func TestRemoveUnusedCreatedStatesKeepsReferencedState(t *testing.T) {
 	})
 }
 
+// TestMountDeletedSourceWhileWriterStopsRollsBack reproduces a source deleted
+// while the mount waits. The controller sets spec.stop before it publishes the
+// deletion cause, so the CLI must re-read the source and remove the intent this
+// command added instead of leaving a mount that later runs cannot resolve.
+func TestMountDeletedSourceWhileWriterStopsRollsBack(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	data := readyState("data")
+	a := mountTestApp(t, b, root, data)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	writable := true
+	done := make(chan error, 1)
+	go func() { done <- a.mountState(ctx, "data", root.Name, "/data", &writable) }()
+	waitForCond(t, func() bool {
+		s, err := a.getState(ctx, root.Name)
+		return err == nil && findSpecMount(s.Spec.Mounts, "data") != nil
+	})
+
+	// Delete the source, then stop the writer without a status message, as
+	// the controller's two-step stop does.
+	if err := a.c.Kube.Delete(ctx, data); err != nil {
+		t.Fatal(err)
+	}
+	cur, err := a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.Spec.Stop = true
+	if err := a.c.Kube.Update(ctx, cur); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), `state "data" not found`) {
+			t.Fatalf("mount returned %v, want the deleted-source cause", err)
+		}
+		if !strings.Contains(err.Error(), "desired mount was removed") {
+			t.Fatalf("deleted source left intent: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mount did not notice the deleted source")
+	}
+	s, err := a.getState(ctx, root.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findSpecMount(s.Spec.Mounts, "data") != nil {
+		t.Fatalf("deleted source left desired intent: %+v", s.Spec.Mounts)
+	}
+}
+
 // TestMountNewMountFailureLeavesState ports create's attach-failure coverage:
 // the created state keeps its first commit even when mounting it fails.
 func TestMountNewMountFailureLeavesState(t *testing.T) {

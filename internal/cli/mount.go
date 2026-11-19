@@ -466,6 +466,27 @@ type mountStateGoneError struct{ msg string }
 
 func (e *mountStateGoneError) Error() string { return e.msg }
 
+// mountSourceGone reports why the mount's source state can no longer attach,
+// reading the state directly. A stopped writer may not have published its
+// status message yet, so the CLI cannot rely on the Blip alone when a source
+// is deleted mid-wait. An empty result means the source is still usable.
+func (a *app) mountSourceGone(ctx context.Context, state string) string {
+	c, err := a.clients()
+	if err != nil {
+		return ""
+	}
+	var s v1alpha1.BlipState
+	switch err := c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: state}, &s); {
+	case apierrors.IsNotFound(err):
+		return fmt.Sprintf("state %q not found", state)
+	case err != nil:
+		return ""
+	case s.DeletionTimestamp != nil:
+		return fmt.Sprintf("state %q is being deleted", state)
+	}
+	return ""
+}
+
 // mountRejectedError marks a mount the guest refused to create, usually
 // because an ancestor of the mount point is a symlink to a file or a regular
 // file. Retrying cannot help, so mountState rolls back the desired mount it
@@ -666,6 +687,13 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			return false, &mountStateGoneError{msg: fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, gone)}
 		}
 		if v1alpha1.Finished(b) || b.Spec.Stop || b.DeletionTimestamp != nil || b.Status.Phase == v1alpha1.BlipSaving {
+			// The controller sets spec.stop before it publishes the reason.
+			// A source deleted while this mount waited would therefore look
+			// like a plain stop. Re-read the source so the deletion cause
+			// still wins and the caller rolls back the intent it added.
+			if gone := a.mountSourceGone(ctx, state); gone != "" {
+				return false, &mountStateGoneError{msg: fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, gone)}
+			}
 			return false, fmt.Errorf("blip %q stopped before the mount completed; desired mount remains on root state %q", writer.Name, writer.Spec.State)
 		}
 		root, err := a.getState(ctx, writer.Spec.State)
@@ -1036,13 +1064,13 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		// and release the state's finalizer.
 		return fmt.Errorf("state %q is being deleted", a.short(f.root))
 	}
-	if hasAdds && root.Spec.Image != "" {
+	if hasAdds {
 		// An imported base is a shared template; edits to its mounts would
 		// be inherited by every later fork. Reject it as a mount target, as
 		// run --state does. A removal-only command stays legal for cleanup.
-		return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(f.root), a.short(f.root))
-	}
-	if hasAdds {
+		if root.Spec.Image != "" {
+			return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(f.root), a.short(f.root))
+		}
 		// A root that can never commit cannot run the mount either. Reject
 		// it before any state is created or intent is written.
 		if msg := usableStateFailure(root); msg != "" {
