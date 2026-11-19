@@ -179,6 +179,24 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 		// A failed save stays visible even after its mount leaves the spec;
 		// a mount that merely never attached is forgotten with it.
 		saveFailure := strings.HasPrefix(m.Message, "save failed:")
+		if m.Writable && !stop {
+			// attachment treats a deleting state as resolved so its
+			// finalizers cannot deadlock with this Blip. Never let an
+			// already-attached mount keep writing into it (and keep the
+			// state's finalizer waiting) after its owner deletes it.
+			name, err := r.deletingOwnedState(ctx, b, m.State)
+			if err != nil {
+				return err
+			}
+			if name != "" {
+				msg := fmt.Sprintf("state %q was deleted by its owner while in use; the save was discarded", name)
+				m.Phase, m.Message = v1.MountFailed, "save failed: "+msg
+				saveErrs = append(saveErrs, msg)
+				out = append(out, m)
+				present[m.State] = true
+				continue
+			}
+		}
 		if !pathSame && m.Switching {
 			// Removing the mount or changing its path cancels a switch in
 			// progress. A writable mount still goes through the normal
