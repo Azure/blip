@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"reflect"
@@ -224,4 +225,60 @@ func TestRunSurfacesForkStateFailure(t *testing.T) {
 	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "worker"}, &b); !apierrors.IsNotFound(err) {
 		t.Fatalf("blip kept after failed fork: %v", err)
 	}
+}
+
+func TestRunInterruptedDuringForkRemovesBlip(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{
+		Create: func(c context.Context, w client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			err := w.Create(c, obj, opts...)
+			// Interrupt after the fork's workspace exists but before the
+			// CLI has waited for it to become usable.
+			if err == nil {
+				if _, ok := obj.(*v1alpha1.BlipState); ok {
+					cancel()
+				}
+			}
+			return err
+		},
+	})
+	var out, errb bytes.Buffer
+	err := h.app(strings.NewReader(""), &out, &errb).run(ctx, []string{"true"}, &runFlags{name: "worker", from: "base"})
+	if err == nil {
+		t.Fatal("interrupted run succeeded")
+	}
+	if !h.gone("worker") {
+		t.Fatal("interrupted run leaked its blip")
+	}
+}
+
+func TestRunInterruptedWithStateKeepsWorkspace(t *testing.T) {
+	h := newHarness(t, readyState("ws"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{
+		Create: func(c context.Context, w client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			err := w.Create(c, obj, opts...)
+			// Interrupt once the blip exists. launch is a no-op for
+			// --state, so the CLI must notice the interrupt itself.
+			if err == nil {
+				if _, ok := obj.(*v1alpha1.Blip); ok {
+					cancel()
+				}
+			}
+			return err
+		},
+	})
+	var out, errb bytes.Buffer
+	err := h.app(strings.NewReader(""), &out, &errb).run(ctx, []string{"true"}, &runFlags{name: "worker", state: "ws"})
+	if err == nil {
+		t.Fatal("interrupted run succeeded")
+	}
+	if !h.gone("worker") {
+		t.Fatal("interrupted run leaked its blip")
+	}
+	// The workspace existed before the run and is still owned by its owner.
+	h.state("ws")
 }

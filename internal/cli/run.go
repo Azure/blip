@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -61,7 +63,12 @@ they finish, so an abandoned fork cannot leak its workspace.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			f.timeoutSet = cmd.Flags().Changed("timeout")
 			f.ttlSet = cmd.Flags().Changed("ttl")
-			return a.run(cmd.Context(), args, f)
+			// A run that is interrupted before it returns must not leave a
+			// VM behind, so turn the signal into cancellation instead of
+			// letting the default handler kill the process.
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			return a.run(ctx, args, f)
 		},
 	}
 	fl := cmd.Flags()
@@ -319,6 +326,16 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	}
 	if err := a.launch(ctx, b, source, !f.keep); err != nil {
 		// The blip owns its workspace; deleting it removes the copies too.
+		delErr := c.Kube.Delete(context.WithoutCancel(ctx), b)
+		if delErr != nil && !apierrors.IsNotFound(delErr) {
+			err = errors.Join(err, fmt.Errorf("remove blip %q: %w", a.short(name), delErr))
+		}
+		return err
+	}
+	// An interrupt can arrive after the last wait. Remove the blip before
+	// returning so an interrupted run does not leave a VM running. With
+	// --keep its workspace has no owner, so only the blip is removed.
+	if err := ctx.Err(); err != nil {
 		delErr := c.Kube.Delete(context.WithoutCancel(ctx), b)
 		if delErr != nil && !apierrors.IsNotFound(delErr) {
 			err = errors.Join(err, fmt.Errorf("remove blip %q: %w", a.short(name), delErr))
