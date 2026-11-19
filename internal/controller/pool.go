@@ -42,11 +42,10 @@ func (r *PoolReconciler) recordWarning(obj client.Object, reason string, err err
 	}
 }
 
-// invalidPool records an endpoint validation failure in pool status and, when
-// a recorder is configured, as a Warning Event. Status is written only when it
-// changes, so the error-driven requeue does not patch forever.
-func (r *PoolReconciler) invalidPool(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
-	err = fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
+// recordPoolProblem writes a pool problem to status and, when a recorder is
+// configured, as a Warning Event. Status is written only when it changes, so
+// the error-driven requeue does not patch forever.
+func (r *PoolReconciler) recordPoolProblem(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
 	if pool.Status.Reason != poolInvalidConfiguration || pool.Status.Message != err.Error() {
 		base := pool.DeepCopy()
 		pool.Status.Reason = poolInvalidConfiguration
@@ -57,6 +56,19 @@ func (r *PoolReconciler) invalidPool(ctx context.Context, pool *v1.BlipPool, rea
 	}
 	r.recordWarning(pool, reason, err)
 	return err
+}
+
+// invalidPool records an endpoint validation failure in pool status and as a
+// Warning Event.
+func (r *PoolReconciler) invalidPool(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
+	return r.recordPoolProblem(ctx, pool, reason, fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err))
+}
+
+// invalidPoolSpec records a non-endpoint spec failure, such as a negative
+// memory request. Without it the pool retries a Pod create forever with empty
+// status and no Event, while Blips wait for a VM that can never exist.
+func (r *PoolReconciler) invalidPoolSpec(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
+	return r.recordPoolProblem(ctx, pool, reason, fmt.Errorf("invalid pool %s/%s: %w", pool.Namespace, pool.Name, err))
 }
 
 // expectTimeout bounds how long a created or deleted pod that the cache does
@@ -239,6 +251,13 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	}
 	if pool.DeletionTimestamp != nil {
 		return reconcile.Result{}, nil
+	}
+	// A negative memory makes the Pod request invalid (the VMM overhead is
+	// added to it), and the Pod would be rejected on every retry. Admission
+	// rejects it, but an object stored before that rule existed must fail
+	// visibly instead of leaving empty status and no Event.
+	if err := validatePoolResources(pool); err != nil {
+		return reconcile.Result{}, r.invalidPoolSpec(ctx, pool, "InvalidConfiguration", err)
 	}
 	// Refuse to create pods whose api-proxy sidecar would exit at startup.
 	// The failure is recorded in pool status and as an Event on the pool, so
@@ -1065,6 +1084,18 @@ func addAPIProxy(pod *corev1.Pod, pool *v1.BlipPool, image string) {
 		proxy.Env = append(proxy.Env, corev1.EnvVar{Name: endpointsEnv, Value: string(data)})
 	}
 	pod.Spec.InitContainers = []corev1.Container{proxy}
+}
+
+// validatePoolResources rejects a pool shape that cannot become a valid Pod.
+// Admission rejects non-positive spec.memory, but the controller also checks a
+// negative value so one stored before that rule existed fails with a visible
+// status and Event instead of retrying the Pod create forever. A zero quantity
+// is the unset Go value and poolShape defaults it, so it stays accepted here.
+func validatePoolResources(pool *v1.BlipPool) error {
+	if pool.Spec.Memory.Sign() < 0 {
+		return fmt.Errorf("spec.memory must be greater than 0, got %s", pool.Spec.Memory.String())
+	}
+	return nil
 }
 
 // poolShape returns the effective VM shape of pool.

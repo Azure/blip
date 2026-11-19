@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/podapi"
@@ -1305,5 +1306,36 @@ func TestPoolRetiresPermanentlyNotReadySpare(t *testing.T) {
 	e.run(e.pool, ns, "default")
 	if n := len(e.pods()); n != 1 {
 		t.Fatalf("%d pods after the replacement, want no churn", n)
+	}
+}
+
+// TestPoolNegativeMemoryIsInvalid guards that a pool with negative guest memory
+// reports InvalidConfiguration and an Event instead of retrying a Pod create
+// forever with empty status. Admission rejects the value; the controller check
+// covers objects stored before that rule existed.
+func TestPoolNegativeMemoryIsInvalid(t *testing.T) {
+	e := newEnv(t)
+	e.newPool("default", 1, 0)
+	e.updatePool("default", func(p *v1.BlipPool) { p.Spec.Memory = resource.MustParse("-1Gi") })
+	recorder := record.NewFakeRecorder(10)
+	e.pool.Recorder = recorder
+
+	_, err := e.pool.Reconcile(e.ctx, req(ns, "default"))
+	if err == nil || !strings.Contains(err.Error(), "spec.memory must be greater than 0") {
+		t.Fatalf("reconcile error %v, want a memory validation error", err)
+	}
+	event := waitForEvent(t, recorder)
+	if !strings.Contains(event, corev1.EventTypeWarning+" InvalidConfiguration") {
+		t.Errorf("event = %q, want a Warning InvalidConfiguration event", event)
+	}
+	pool := e.getPool("default")
+	if pool.Status.Reason != poolInvalidConfiguration {
+		t.Errorf("status reason %q, want %s", pool.Status.Reason, poolInvalidConfiguration)
+	}
+	if !strings.Contains(pool.Status.Message, "spec.memory must be greater than 0") {
+		t.Errorf("status message %q does not report the memory problem", pool.Status.Message)
+	}
+	if n := len(e.pods()); n != 0 {
+		t.Errorf("%d pods created for an invalid pool", n)
 	}
 }

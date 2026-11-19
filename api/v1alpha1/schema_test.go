@@ -702,3 +702,35 @@ func TestActiveDeadlineOverflowRejected(t *testing.T) {
 		}
 	}
 }
+
+// TestBlipPoolMemoryMustBePositive guards that a negative or zero guest memory
+// fails at admission. A negative value made the Pod request negative (the VMM
+// overhead is added), so the pool retried forever with empty status and no
+// Event while Blips waited for a VM that could never exist.
+func TestBlipPoolMemoryMustBePositive(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blippools.yaml")
+	memory, ok := spec.Properties["memory"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.memory property")
+	}
+	const rule = "type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0"
+	if got := ruleFor(t, memory.XValidations, "memory must be greater than 0"); got != rule {
+		t.Errorf("memory rule %q, want %q", got, rule)
+	}
+
+	validate := admissionValidator(t, "blippools")
+	for _, value := range []string{`"0"`, `"-1Gi"`, `0`, `-1`} {
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"blip.dev/node-pool":"default"},"memory":%s}}`, value)
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted pool memory %s", value)
+		}
+	}
+	// Omitted memory is defaulted to 2Gi by the API server; the raw schema test
+	// cannot default, and a defaulted object is a valid positive quantity.
+	for _, value := range []string{`"2Gi"`, `"512Mi"`, `1`} {
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"blip.dev/node-pool":"default"},"memory":%s}}`, value)
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected valid pool memory %s: %v", value, errs.ToAggregate())
+		}
+	}
+}

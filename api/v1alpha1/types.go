@@ -45,7 +45,11 @@ type BlipPoolSpec struct {
 	// +kubebuilder:validation:Maximum=2147483647
 	// +kubebuilder:default=2
 	CPUs int32 `json:"cpus,omitempty"`
+	// Memory is the guest RAM. It must be positive: the controller adds the
+	// VMM overhead, so a negative value would make the pod request negative
+	// memory and the pool would never create a VM.
 	// +kubebuilder:default="2Gi"
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="memory must be greater than 0"
 	Memory resource.Quantity `json:"memory,omitempty"`
 	// WarmCount is the number of vacant, booted VMs to keep ready.
 	// +kubebuilder:validation:Minimum=0
