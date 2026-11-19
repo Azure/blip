@@ -116,6 +116,13 @@ spec:
                     description: Turns is how long processed turns are kept.
                     type: string
                 type: object
+              systemPrompt:
+                description: |-
+                  SystemPrompt is the full system prompt for coordinator steps. When
+                  empty, blipchat uses its built-in coordinator prompt. The charter is
+                  appended after this text.
+                maxLength: 16384
+                type: string
             required:
             - pool
             type: object

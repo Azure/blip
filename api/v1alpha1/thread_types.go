@@ -18,6 +18,11 @@ type BlipThreadSpec struct {
 	// interprets attributes, so conventions live here.
 	// +kubebuilder:validation:MaxLength=16384
 	Charter string `json:"charter,omitempty"`
+	// SystemPrompt is the full system prompt for coordinator steps. When
+	// empty, blipchat uses its built-in coordinator prompt. The charter is
+	// appended after this text.
+	// +kubebuilder:validation:MaxLength=16384
+	SystemPrompt string `json:"systemPrompt,omitempty"`
 	// Pool is the BlipPool tasks run in.
 	// +kubebuilder:validation:MinLength=1
 	Pool string `json:"pool"`

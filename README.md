@@ -123,9 +123,11 @@ Pod as node-local, replicated, encrypted block storage.
 - **`BlipNode`** — cluster-scoped node inventory: endpoint, hypervisors,
   incarnation, heartbeat, drain and safe-to-remove state.
 - **`BlipThread`** — one project's long-running coordinator. Administrators
-  write the charter, pool, base state, concurrency cap, model, daily token
-  budget, heartbeat, and retention. Blipchat writes status: turn sequence,
-  rolling summary, timers, task board, token spend, and pause state.
+  write the system prompt, charter, pool, base state, concurrency cap, model,
+  daily token budget, heartbeat, and retention. An empty system prompt uses
+  blipchat's built-in coordinator prompt; the charter is always appended.
+  Blipchat writes status: turn sequence, rolling summary, timers, task board,
+  token spend, and pause state.
 - **`BlipTurn`** — one event in a thread: a user message, a blip report, a
   finished blip, or a coordinator step. Turns are immutable, carry a bounded
   text and free-form attributes, and blipchat stamps `status.seq` to put all
@@ -221,7 +223,8 @@ Blipchat is a stateless Deployment with one elected leader. The leader
 sequences turns, turns blip reports and finished blips into turns, and runs
 coordinator steps; every replica serves the engineer chat. Steps are driven by
 `wake=Now` turns, a short debounce for `wake=Batch`, status timers, and a
-heartbeat while tasks are open. A step reads the charter, a compact task board,
+heartbeat while tasks are open. A step reads its system prompt (the thread's
+`spec.systemPrompt`, or the built-in default) and charter, a compact task board,
 the rolling summary and new turns, may call asynchronous tools (start, watch,
 exec and stop blips; manage tasks and timers), and then writes its turns and
 one status update. One worker per thread serializes status writes. The model

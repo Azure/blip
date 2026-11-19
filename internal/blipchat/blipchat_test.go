@@ -51,6 +51,37 @@ func testThread() *v1.BlipThread {
 	}
 }
 
+func TestSystemPromptDefault(t *testing.T) {
+	thread := testThread()
+	thread.Spec.Charter = "Use state:ready for ready tasks."
+	prompt := systemPrompt(thread)
+	for _, want := range []string{
+		`You are the coordinator for the Blip project "ns/proj".`,
+		"You own the task board",
+		"Charter:\nUse state:ready for ready tasks.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("default prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestSystemPromptFromThread(t *testing.T) {
+	thread := testThread()
+	thread.Spec.SystemPrompt = "Custom coordinator prompt: spend 100% of the budget."
+	thread.Spec.Charter = "Project conventions."
+	prompt := systemPrompt(thread)
+	if !strings.HasPrefix(prompt, thread.Spec.SystemPrompt) {
+		t.Errorf("prompt does not start with spec.systemPrompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Charter:\nProject conventions.") {
+		t.Errorf("prompt missing charter:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "You own the task board") {
+		t.Errorf("custom prompt still contains the built-in text:\n%s", prompt)
+	}
+}
+
 func testTurn(name, thread string) *v1.BlipTurn {
 	return &v1.BlipTurn{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"},
@@ -160,8 +191,15 @@ func TestWatcherTurnsReportsIntoMessages(t *testing.T) {
 	}
 }
 
-// llmServer replies with the given messages in order and records requests.
+// llmServer replies with the given messages in order.
 func llmServer(t *testing.T, replies ...Message) *httptest.Server {
+	t.Helper()
+	server, _ := llmServerWithRequests(t, replies...)
+	return server
+}
+
+// llmServerWithRequests also records the request bodies.
+func llmServerWithRequests(t *testing.T, replies ...Message) (*httptest.Server, *[]map[string]any) {
 	t.Helper()
 	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +218,7 @@ func llmServer(t *testing.T, replies ...Message) *httptest.Server {
 		})
 	}))
 	t.Cleanup(server.Close)
-	return server
+	return server, &requests
 }
 
 func toolCall(name, arguments string) ToolCall {
@@ -244,6 +282,45 @@ func TestStepUpdatesBoardAndConsumesTurns(t *testing.T) {
 	}
 	if !found {
 		t.Error("coordinator note turn was not created")
+	}
+}
+
+func TestStepUsesSystemPromptFromThread(t *testing.T) {
+	thread := testThread()
+	thread.Spec.SystemPrompt = "Custom coordinator prompt."
+	thread.Spec.Charter = "Project conventions."
+	turn := testTurn("one", "proj")
+	turn.Status.Seq = 1
+	server, requests := llmServerWithRequests(t, Message{Role: "assistant", Content: "ok"})
+	c := testClient(t, thread, turn)
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	if err := s.step(context.Background(), thread); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) == 0 {
+		t.Fatal("no LLM request recorded")
+	}
+	messages, ok := (*requests)[0]["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		t.Fatalf("request messages = %#v", (*requests)[0]["messages"])
+	}
+	first, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first message = %#v", messages[0])
+	}
+	if first["role"] != "system" {
+		t.Errorf("first message role = %v", first["role"])
+	}
+	content, _ := first["content"].(string)
+	if !strings.Contains(content, thread.Spec.SystemPrompt) {
+		t.Errorf("system message missing spec.systemPrompt:\n%s", content)
+	}
+	if !strings.Contains(content, thread.Spec.Charter) {
+		t.Errorf("system message missing spec.charter:\n%s", content)
 	}
 }
 

@@ -341,8 +341,7 @@ func nextWake(st *step, now time.Time) *metav1.Time {
 	return &metav1.Time{Time: next}
 }
 
-func systemPrompt(thread *v1.BlipThread) string {
-	return fmt.Sprintf(`You are the coordinator for the Blip project "%s/%s".
+const defaultCoordinatorSystemPrompt = `You are the coordinator for the Blip project "%s/%s".
 
 You own the task board and decide what work happens, in what order, and with what concurrency. Work happens in blips: start_task forks the thread's base workspace and runs one agent command which ends by itself and reports a bounded summary.
 
@@ -352,10 +351,14 @@ Rules:
 - Reports and finished blips arrive as turns. Do not poll for them. Use exec only when a report is not enough.
 - Every step should end with set_timer or idle.
 - Use reply to answer the turns you were given and note to record a decision.
-- Keep prompts to agents specific and self-contained.
+- Keep prompts to agents specific and self-contained.`
 
-Charter:
-%s`, thread.Namespace, thread.Name, thread.Spec.Charter)
+func systemPrompt(thread *v1.BlipThread) string {
+	prompt := thread.Spec.SystemPrompt
+	if prompt == "" {
+		prompt = fmt.Sprintf(defaultCoordinatorSystemPrompt, thread.Namespace, thread.Name)
+	}
+	return prompt + "\n\nCharter:\n" + thread.Spec.Charter
 }
 
 func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTurn, timers []v1.ThreadTimer, summary string) string {
