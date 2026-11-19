@@ -432,7 +432,24 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	if err := readOnly(argv); err != nil {
 		return "", err
 	}
-	return c.s.execIn(ctx, c.thread, name, argv, maxExecTimeout)
+	return c.s.execIn(ctx, c.thread, name, hardenGitArgs(argv), maxExecTimeout)
+}
+
+// hardenGitArgs disables repository configuration that can run commands while
+// an inspection command runs. core.fsmonitor makes `git status` execute a
+// configured helper, and diff textconv filters run for `git diff` and
+// `git log -p`. Neither is part of looking, so override both even though the
+// workspace controls its own config.
+func hardenGitArgs(argv []string) []string {
+	if len(argv) < 2 || argv[0] != "git" {
+		return argv
+	}
+	out := []string{"git", "-c", "core.fsmonitor=false", argv[1]}
+	switch argv[1] {
+	case "diff", "log", "show":
+		out = append(out, "--no-ext-diff", "--no-textconv")
+	}
+	return append(out, argv[2:]...)
 }
 
 // readOnly reports whether argv is safe to run as an inspection command. It
