@@ -402,9 +402,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		// A fallback Blip has not claimed a VM yet. Its data node is still
 		// the right place to boot one once capacity allows: falling back
 		// under transient maxCount pressure is not a reason to start the
-		// replacement away from the data.
+		// replacement away from the data. A home node the scheduler cannot
+		// place a VM on (cordon or an untolerated taint) is not a home: use
+		// another data node or a generic placement instead.
 		loc := b.Status.Locality
-		if loc == nil || loc.Node == "" || !usable(loc.Node) {
+		if loc == nil || loc.Node == "" || !schedulable(loc.Node) {
 			continue
 		}
 		if !loc.Fallback {
@@ -416,7 +418,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			// holds the same data before falling back to a remote/unpinned
 			// start.
 			node = ""
-			for _, n := range homeNodes(placementScores(b, states), cl, poolSelector(pool)) {
+			for _, n := range homeNodes(placementScores(b, states), cl, poolSelector(pool), pool.Spec.Tolerations) {
 				if !blocked[n] {
 					node = n
 					break

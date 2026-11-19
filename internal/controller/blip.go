@@ -705,7 +705,7 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	home := homeNodes(placementScores(b, all), cl, poolSelector(pool))
+	home := homeNodes(placementScores(b, all), cl, poolSelector(pool), pool.Spec.Tolerations)
 	updateLocality(b, home, waitReason == "")
 	if waitReason != "" {
 		wait(b, waitReason, waitMsg)

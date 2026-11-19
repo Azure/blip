@@ -80,13 +80,15 @@ func placementScores(b *v1.Blip, states map[string]*v1.BlipState) map[string]int
 	return score
 }
 
-// homeNodes are the usable nodes of the pool with the highest positive
-// score, sorted by name.
-func homeNodes(score map[string]int, cl *cluster, selector map[string]string) []string {
+// homeNodes are the schedulable nodes of the pool with the highest positive
+// score, sorted by name. A node the scheduler cannot place a VM on (cordon, an
+// untolerated taint, or a selector mismatch) is not a home: the Blip uses
+// another data node or falls back to a generic VM instead of waiting there.
+func homeNodes(score map[string]int, cl *cluster, selector map[string]string, tolerations []corev1.Toleration) []string {
 	best := 0
 	var out []string
 	for n, s := range score {
-		if s <= 0 || !cl.usable(n, selector) {
+		if s <= 0 || !cl.schedulable(n, selector, tolerations) {
 			continue
 		}
 		if s > best {
