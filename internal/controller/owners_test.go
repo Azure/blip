@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -374,4 +375,27 @@ func TestPodOwnerLabelTracksBlip(t *testing.T) {
 	setOwner("u-other")
 	// Removing the owner makes the Blip unrestricted again.
 	setOwner("")
+}
+
+// Threads are published with their project owner hash so the turn policy can
+// bind a pod-bound producer to its own thread without trusting turn labels.
+func TestVMOwnersThreadOwners(t *testing.T) {
+	e := newEnv(t)
+	e.newPool("default", 0, 0)
+	thread := &v1.BlipThread{
+		ObjectMeta: metav1.ObjectMeta{Name: "proj", Namespace: ns},
+		Spec:       v1.BlipThreadSpec{Pool: "default"},
+	}
+	e.create(thread)
+	e.must(syncVMOwners(e.ctx, e.c, ns))
+	if got, want := e.owners()["thread.proj"], v1.ThreadOwner(ns, "proj"); got != want {
+		t.Fatalf("thread owner key = %q, want %q", got, want)
+	}
+	if err := e.c.Delete(e.ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	e.must(syncVMOwners(e.ctx, e.c, ns))
+	if got, ok := e.owners()["thread.proj"]; ok {
+		t.Fatalf("deleted thread left owner key %q", got)
+	}
 }

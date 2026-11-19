@@ -104,7 +104,9 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1.Blip{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
 			return []reconcile.Request{req(o.GetNamespace(), poolName(o.(*v1.Blip)))}
 		})).
-		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.statePools)).
+		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.namespacePools)).
+		// Thread creation and deletion changes the turn-owner table.
+		Watches(&v1.BlipThread{}, handler.EnqueueRequestsFromMapFunc(r.namespacePools)).
 		// A stale heartbeat is a status-only change, and an agent that dies
 		// sends no event at all; reconcile also requeues itself while a node
 		// it uses is still healthy (see nextCrossing).
@@ -126,9 +128,9 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// State imports and deletions refresh shared-base authorization even when no
-// Blip currently waits for a VM.
-func (r *PoolReconciler) statePools(ctx context.Context, o client.Object) []reconcile.Request {
+// State imports and deletions, and thread changes, refresh the authorization
+// table even when no Blip currently waits for a VM.
+func (r *PoolReconciler) namespacePools(ctx context.Context, o client.Object) []reconcile.Request {
 	return r.poolRequests(ctx, o.GetNamespace())
 }
 

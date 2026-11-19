@@ -3,6 +3,11 @@
 # acting for an external front end. A producer that is not blipchat must name
 # its own identity, so a turn can never claim to be a user without going
 # through the authenticated front end.
+#
+# A pod-bound VM token is additionally bound to its own project: the
+# controller records each thread's owner hash in blip-vm-owners, and the
+# caller's claimed pod maps to the same hash. This keeps a VM from injecting
+# turns into another owner's thread.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -73,3 +78,70 @@ metadata:
 spec:
   policyName: blip-turn-status
   validationActions: [Deny]
+---
+# Pod-bound producers may only author turns for their own project. The
+# controller maintains thread.<name>: <owner> in blip-vm-owners; the caller's
+# pod entry must carry the same owner. blipchat and unrestricted VMs are not
+# bound. A missing table skips this policy (and already denies new blips and
+# states), so it cannot be used to widen a VM's reach.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-turn-owner
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: ["*"]
+        resources: [blipturns]
+        operations: [CREATE]
+  matchConditions:
+    - name: pod-bound-service-account-token
+      expression: >-
+        has(request.userInfo.extra) &&
+        'authentication.kubernetes.io/pod-name' in request.userInfo.extra
+  variables:
+    - name: blipchat
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:blip-system:blipchat'
+    - name: data
+      expression: "has(params.data) ? params.data : {}"
+    - name: callerPod
+      expression: request.userInfo.extra['authentication.kubernetes.io/pod-name'][0]
+    - name: owner
+      expression: >-
+        variables.callerPod in variables.data ?
+        string(variables.data[variables.callerPod]) : ''
+    - name: threadKey
+      expression: "'thread.' + object.spec.thread"
+    - name: threadOwner
+      expression: >-
+        variables.threadKey in variables.data ?
+        string(variables.data[variables.threadKey]) : ''
+  validations:
+    - expression: >-
+        variables.blipchat || variables.owner == '-' ||
+        (variables.owner != '' && variables.threadOwner == variables.owner)
+      messageExpression: >-
+        'pod-bound producer ' + request.userInfo.username +
+        ' may only author turns for a thread of its own project; ' +
+        (variables.threadOwner == '' ?
+        'thread ' + object.spec.thread + ' has no recorded owner' :
+        'owner ' + variables.owner + ' does not own thread ' + object.spec.thread)
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-turn-owner
+spec:
+  policyName: blip-turn-owner
+  validationActions: [Deny]
+  paramRef:
+    name: blip-vm-owners
+    parameterNotFoundAction: Allow

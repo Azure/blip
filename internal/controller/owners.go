@@ -19,14 +19,17 @@ import (
 // ValidatingAdmissionPolicy (deploy/base/vm-owner-policy.yaml). Keys are
 // "sa.<service account>" for every VM service account, with the sorted,
 // space-separated names of the pools using it, and "<pod>" with the owner of
-// each claimed VM pod ("-" for an unrestricted Blip). "bases" lists the
-// ownerless imported states available for shared read-only use and copying.
+// each claimed VM pod ("-" for an unrestricted Blip). "thread.<name>" maps a
+// thread to the owner hash of its project, so the turn policy can bind turns
+// to a producer's own thread. "bases" lists the ownerless imported states
+// available for shared read-only use and copying.
 const VMOwnersConfigMap = "blip-vm-owners"
 
 const (
-	ownersSAPrefix = "sa."
-	ownersBasesKey = "bases"
-	ownerAny       = "-"
+	ownersSAPrefix     = "sa."
+	ownersThreadPrefix = "thread."
+	ownersBasesKey     = "bases"
+	ownerAny           = "-"
 )
 
 // blipOwner is the owner a Blip's VM acts for, or "" for an unrestricted
@@ -168,10 +171,11 @@ func restoreVMOwner(ctx context.Context, c client.Client, live client.Reader, ns
 
 // syncVMOwners reconciles the table of ns with the cluster: every pool and
 // VM pod service account is listed with its pools, claimed pods carry their Blip's owner,
-// and entries of deleted pods are removed. A namespace with a pool always
-// has the table, empty if no pool names a service account. Vacant pods keep
-// any entry: the cache may not show a claim yet, and the claim path
-// overwrites the entry before the next claim.
+// every thread carries its project's owner hash, and entries of deleted pods
+// and threads are removed. A namespace with a pool always has the table, empty
+// if no pool names a service account. Vacant pods keep any entry: the cache
+// may not show a claim yet, and the claim path overwrites the entry before the
+// next claim.
 func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 	var pools v1.BlipPoolList
 	if err := c.List(ctx, &pools, client.InNamespace(ns)); err != nil {
@@ -205,6 +209,15 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 	if len(bases) > 0 {
 		slices.Sort(bases)
 		want[ownersBasesKey] = strings.Join(bases, " ")
+	}
+	// Thread ownership lets the turn policy bind a pod-bound producer to its
+	// own project without trusting labels on the turn.
+	var threads v1.BlipThreadList
+	if err := c.List(ctx, &threads, client.InNamespace(ns)); err != nil {
+		return err
+	}
+	for i := range threads.Items {
+		want[ownersThreadPrefix+threads.Items[i].Name] = v1.ThreadOwner(ns, threads.Items[i].Name)
 	}
 	exists := map[string]bool{}
 	for i := range pods.Items {

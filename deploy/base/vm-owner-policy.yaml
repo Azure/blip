@@ -3,6 +3,7 @@
 #   sa.<service account>: <pools>  every VM service account, with the
 #                                  space-separated pools that use it
 #   <vm pod>: <owner>              each claimed VM pod; "-" means unrestricted
+#   thread.<thread>: <owner>       each thread's project owner hash
 #   bases: <states>                space-separated shared, ownerless image states
 # A caller authenticated with a pod-bound token of a VM service account may
 # only connect to pods with `blip-runtime bridge 1025` in container vm (a blip

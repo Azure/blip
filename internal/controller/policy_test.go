@@ -103,15 +103,14 @@ func loadVMOwnerPolicy(t *testing.T) validating.Validator {
 	)
 }
 
-// loadPolicy compiles one policy from a multi-document policy file the way the
-// API server's validating admission policy plugin does.
-func loadPolicy(t *testing.T, file, name string) validating.Validator {
+// readPolicyDocs parses every policy and binding document in path.
+func readPolicyDocs(t *testing.T, path string) ([]*admissionv1.ValidatingAdmissionPolicy, []*admissionv1.ValidatingAdmissionPolicyBinding) {
 	t.Helper()
-	raw, err := os.ReadFile(file)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var policy *admissionv1.ValidatingAdmissionPolicy
+	var policies []*admissionv1.ValidatingAdmissionPolicy
 	var bindings []*admissionv1.ValidatingAdmissionPolicyBinding
 	r := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(raw)))
 	for {
@@ -125,31 +124,64 @@ func loadPolicy(t *testing.T, file, name string) validating.Validator {
 		switch {
 		case bytes.Contains(doc, []byte("kind: ValidatingAdmissionPolicyBinding")):
 			b := &admissionv1.ValidatingAdmissionPolicyBinding{}
-			if err = yaml.UnmarshalStrict(doc, b); err == nil && b.Spec.PolicyName == name {
-				bindings = append(bindings, b)
+			if err = yaml.UnmarshalStrict(doc, b); err != nil {
+				t.Fatal(err)
 			}
+			bindings = append(bindings, b)
 		case bytes.Contains(doc, []byte("kind: ValidatingAdmissionPolicy")):
 			p := &admissionv1.ValidatingAdmissionPolicy{}
-			if err = yaml.UnmarshalStrict(doc, p); err == nil && p.Name == name {
-				policy = p
+			if err = yaml.UnmarshalStrict(doc, p); err != nil {
+				t.Fatal(err)
 			}
-		}
-		if err != nil {
-			t.Fatal(err)
+			policies = append(policies, p)
 		}
 	}
-	if policy == nil || len(bindings) != 1 ||
-		len(bindings[0].Spec.ValidationActions) != 1 ||
-		bindings[0].Spec.ValidationActions[0] != admissionv1.Deny {
-		t.Fatalf("policy %v bindings %v", policy, bindings)
-	}
+	return policies, bindings
+}
 
+// loadPolicy compiles one policy from a multi-document policy file the way the
+// API server's validating admission policy plugin does.
+func loadPolicy(t *testing.T, file, name string) validating.Validator {
+	t.Helper()
+	policies, bindings := readPolicyDocs(t, file)
+	policy := findPolicy(t, policies, name)
+	var found int
+	for _, b := range bindings {
+		if b.Spec.PolicyName != name {
+			continue
+		}
+		found++
+		if len(b.Spec.ValidationActions) != 1 || b.Spec.ValidationActions[0] != admissionv1.Deny {
+			t.Fatalf("policy %v binding actions %v", name, b.Spec.ValidationActions)
+		}
+	}
+	if found != 1 {
+		t.Fatalf("policy %v has %d bindings", name, found)
+	}
+	return compilePolicy(t, policy, false)
+}
+
+func findPolicy(t *testing.T, policies []*admissionv1.ValidatingAdmissionPolicy, name string) *admissionv1.ValidatingAdmissionPolicy {
+	t.Helper()
+	for _, p := range policies {
+		if p.Name == name {
+			return p
+		}
+	}
+	t.Fatalf("policy %q not found", name)
+	return nil
+}
+
+// compilePolicy compiles one policy the way the API server's validating
+// admission policy plugin does.
+func compilePolicy(t *testing.T, policy *admissionv1.ValidatingAdmissionPolicy, hasParams bool) validating.Validator {
+	t.Helper()
 	env, err := plugincel.NewCompositionEnv(plugincel.VariablesTypeName, environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion(), true))
 	if err != nil {
 		t.Fatal(err)
 	}
 	compiler := plugincel.NewCompositedCompilerFromTemplate(env)
-	opts := plugincel.OptionalVariableDeclarations{StrictCost: true}
+	opts := plugincel.OptionalVariableDeclarations{StrictCost: true, HasParams: hasParams}
 	var vars []plugincel.NamedExpressionAccessor
 	for _, v := range policy.Spec.Variables {
 		vars = append(vars, &validating.Variable{Name: v.Name, Expression: v.Expression})
@@ -174,9 +206,29 @@ func loadPolicy(t *testing.T, file, name string) validating.Validator {
 	)
 }
 
-// loadTurnPolicy compiles the turn author policy.
-func loadTurnPolicy(t *testing.T) validating.Validator {
-	return loadPolicy(t, "../../deploy/base/turn-policy.yaml", "blip-turn-author")
+// loadTurnPolicy compiles both policies in deploy/base/turn-policy.yaml: the
+// author identity check and the project ownership check.
+func loadTurnPolicy(t *testing.T) (validating.Validator, validating.Validator) {
+	t.Helper()
+	policies, bindings := readPolicyDocs(t, "../../deploy/base/turn-policy.yaml")
+	author := findPolicy(t, policies, "blip-turn-author")
+	owner := findPolicy(t, policies, "blip-turn-owner")
+	byPolicy := map[string]*admissionv1.ValidatingAdmissionPolicyBinding{}
+	for _, b := range bindings {
+		byPolicy[b.Spec.PolicyName] = b
+	}
+	for _, name := range []string{"blip-turn-author", "blip-turn-owner"} {
+		b := byPolicy[name]
+		if b == nil || len(b.Spec.ValidationActions) != 1 || b.Spec.ValidationActions[0] != admissionv1.Deny {
+			t.Fatalf("binding for %s = %v", name, b)
+		}
+	}
+	if ref := byPolicy["blip-turn-owner"].Spec.ParamRef; ref == nil ||
+		ref.Name != VMOwnersConfigMap || ref.ParameterNotFoundAction == nil ||
+		*ref.ParameterNotFoundAction != admissionv1.AllowAction {
+		t.Fatalf("turn owner binding params = %v", byPolicy["blip-turn-owner"].Spec.ParamRef)
+	}
+	return compilePolicy(t, author, false), compilePolicy(t, owner, true)
 }
 
 type policyRequest struct {
@@ -208,7 +260,8 @@ func blipObj(name, owner string, mutate ...func(spec map[string]any)) map[string
 	return map[string]any{"apiVersion": "blip.dev/v1alpha1", "kind": "Blip", "metadata": meta, "spec": spec}
 }
 
-func stateObj(name, owner, copyFrom string, mutate ...func(map[string]any)) map[string]any {	o := blipObj(name, owner)
+func stateObj(name, owner, copyFrom string, mutate ...func(map[string]any)) map[string]any {
+	o := blipObj(name, owner)
 	o["kind"] = "BlipState"
 	o["spec"] = map[string]any{}
 	if copyFrom != "" {
@@ -474,12 +527,16 @@ func TestVMOwnerPolicyOwnerReferences(t *testing.T) {
 }
 
 func turnObj(authorKind, authorName string) map[string]any {
+	return turnFor("project", authorKind, authorName)
+}
+
+func turnFor(thread, authorKind, authorName string) map[string]any {
 	return map[string]any{
 		"apiVersion": "blip.dev/v1alpha1",
 		"kind":       "BlipTurn",
 		"metadata":   map[string]any{"name": "turn", "namespace": ns},
 		"spec": map[string]any{
-			"thread": "project",
+			"thread": thread,
 			"author": map[string]any{"kind": authorKind, "name": authorName},
 		},
 	}
@@ -522,7 +579,7 @@ func TestTurnStatusPolicy(t *testing.T) {
 }
 
 func TestTurnAuthorPolicy(t *testing.T) {
-	v := loadTurnPolicy(t)
+	v, _ := loadTurnPolicy(t)
 	const blipchat = "system:serviceaccount:blip-system:blipchat"
 	other := func(sa string) user.Info {
 		return &user.DefaultInfo{Name: "system:serviceaccount:hunt-p6-chat:" + sa}
@@ -548,6 +605,46 @@ func TestTurnAuthorPolicy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			req := policyRequest{user: tc.user, op: admission.Create, resource: "blipturns", name: "turn", object: tc.obj}
 			allow, msg := req.evaluate(t, v, nil)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+}
+
+// TestTurnOwnerPolicy guards the project binding for pod-bound turn
+// producers: a VM may only write to the thread whose derived owner owns it.
+func TestTurnOwnerPolicy(t *testing.T) {
+	_, v := loadTurnPolicy(t)
+	const blipchat = "system:serviceaccount:blip-system:blipchat"
+	self := "system:serviceaccount:" + ns + ":vm"
+	project := v1.ThreadOwner(ns, "proj")
+	victim := v1.ThreadOwner(ns, "victim")
+	params := map[string]string{
+		"sa.vm":         "default",
+		"vm-pod":        project,
+		"admin-pod":     "-",
+		"thread.proj":   project,
+		"thread.victim": victim,
+	}
+
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		obj   map[string]any
+		allow bool
+		msg   string
+	}{
+		{"own project", vmUser("vm", "vm-pod"), turnFor("proj", "ServiceAccount", self), true, ""},
+		{"other project", vmUser("vm", "vm-pod"), turnFor("victim", "ServiceAccount", self), false, "does not own thread"},
+		{"unknown thread", vmUser("vm", "vm-pod"), turnFor("missing", "ServiceAccount", self), false, "no recorded owner"},
+		{"unclaimed pod", vmUser("vm", "vacant"), turnFor("proj", "ServiceAccount", self), false, "may only author"},
+		{"unrestricted VM", vmUser("vm", "admin-pod"), turnFor("victim", "ServiceAccount", self), true, ""},
+		{"non-pod producer is left to the author policy", &user.DefaultInfo{Name: blipchat}, turnFor("victim", "User", "ceo@example.com"), true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{user: tc.user, op: admission.Create, resource: "blipturns", name: "turn", object: tc.obj}
+			allow, msg := req.evaluate(t, v, params)
 			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
 				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
 			}
