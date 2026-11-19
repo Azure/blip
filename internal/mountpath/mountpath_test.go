@@ -28,6 +28,15 @@ func TestValidate(t *testing.T) {
 		{"/usr/lib/ssl/certs/x", false},
 		{"/usr/lib/ssl/private/x", false},
 		{"/usr/share/perl/5.38/x", false},
+		// Package-specific directory symlinks shipped in the dev/base image.
+		// They are not usr-merge aliases, but the guest still refuses a mount
+		// point below them.
+		{"/usr/share/doc/gcc", false},
+		{"/usr/share/doc/gcc/x", false},
+		{"/usr/share/doc/libatomic1/y", false},
+		{"/usr/share/doc/git/contrib/hooks/z", false},
+		{"/usr/lib/x86_64-linux-gnu/perl/5.38/x", false},
+		{"/usr/lib/aarch64-linux-gnu/perl/5.38/x", false},
 		{"/run/data", true},
 		{"/procdata", true},
 		{"/lib64x", true},
@@ -47,6 +56,10 @@ func TestValidate(t *testing.T) {
 		{"/usr/local", true},
 		{"/usr/share/perl", true},
 		{"/usr/share", true},
+		{"/usr/share/doc", true},
+		{"/usr/share/doc/git", true},
+		{"/usr/share/doc/git/contrib", true},
+		{"/usr/lib/x86_64-linux-gnu/perl", true},
 	} {
 		err := Validate(tc.path)
 		if (err == nil) != tc.ok {

@@ -1512,6 +1512,58 @@ func TestMountRejectsMailSpoolSymlink(t *testing.T) {
 	}
 }
 
+// TestMountRejectsBaseImageDirectorySymlinks reproduces paths that are
+// directory symlinks in the shipped dev/base image but are not usr-merge
+// aliases: /usr/share/doc/gcc, /usr/share/doc/libatomic1,
+// /usr/share/doc/git/contrib/hooks and the versioned perl tree under
+// /usr/lib/<triplet>. The guest cannot create a mount point below them, so an
+// offline mount must not create a state or write intent that poisons the root.
+func TestMountRejectsBaseImageDirectorySymlinks(t *testing.T) {
+	for _, path := range []string{
+		"/usr/share/doc/gcc/x",
+		"/usr/share/doc/libatomic1/x",
+		"/usr/share/doc/git/contrib/hooks/x",
+		"/usr/lib/x86_64-linux-gnu/perl/5.38/x",
+	} {
+		t.Run(path, func(t *testing.T) {
+			for _, live := range []bool{false, true} {
+				name := "offline"
+				var root *v1alpha1.BlipState
+				objs := []client.Object{readyState("data")}
+				if live {
+					name = "live"
+					b := runningBlip("agent")
+					root = readyState(b.Spec.State)
+					objs = append(objs, b, root)
+				} else {
+					root = readyState("home")
+					objs = append(objs, root)
+				}
+				t.Run(name, func(t *testing.T) {
+					h := newHarness(t, objs...)
+					code, _, errOut := h.run("", "mount", "data:"+path, "--root", root.Name)
+					if code != 1 || !strings.Contains(errOut, "symlink in the image") {
+						t.Fatalf("mount %s: code %d: %s", path, code, errOut)
+					}
+					if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+						t.Fatalf("mount %s left desired intent: %+v", path, mounts)
+					}
+					code, _, errOut = h.run("", "mount", "--new", "leak:"+path, "--root", root.Name)
+					if code != 1 || !strings.Contains(errOut, "symlink in the image") {
+						t.Fatalf("--new %s: code %d: %s", path, code, errOut)
+					}
+					if !stateNotFound(t, h, "leak") {
+						t.Fatalf("rejected --new %s left its state behind", path)
+					}
+					if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+						t.Fatalf("rejected --new %s left desired intent: %+v", path, mounts)
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestMountNewMountFailureLeavesState ports create's attach-failure coverage:
 // the created state keeps its first commit even when mounting it fails.
 func TestMountNewMountFailureLeavesState(t *testing.T) {
