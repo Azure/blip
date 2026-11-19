@@ -136,6 +136,36 @@ func TestGatherSelector(t *testing.T) {
 	}
 }
 
+// A blip that finished before gather began is finished even if --wait expires
+// before the watcher observes it; gather must collect it instead of reporting
+// it as "not finished".
+func TestGatherWaitCollectsFinishedBlipsAtTimeout(t *testing.T) {
+	for _, any := range []bool{false, true} {
+		name := "wait"
+		if any {
+			name = "any"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
+			args := []string{"gather", "w1", "--wait", "1ns"}
+			if any {
+				args = append(args, "--any")
+			}
+			code, out, errOut := h.run("", args...)
+			if code != 0 {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			mustContain(t, out, "blip/w1 Succeeded (exit 0)")
+			if strings.Contains(errOut, "not finished") {
+				t.Fatalf("finished blip reported as waiting: %q", errOut)
+			}
+			if !h.gone("w1") {
+				t.Fatal("finished blip kept")
+			}
+		})
+	}
+}
+
 func TestGatherWaitGivesUpOnRunningBlips(t *testing.T) {
 	h := newHarness(t, runningBlip("w1"))
 	code, _, errOut := h.run("", "gather", "w1", "--wait", "50ms")

@@ -269,7 +269,12 @@ func (a *app) awaitTargets(ctx context.Context, f *gatherFlags, targets []*v1alp
 	for len(left) > 0 {
 		select {
 		case <-ctx.Done():
-			errs = append(errs, a.stillWaiting(ctx, left)...)
+			// The wait can expire before the watcher's first Get. A blip that
+			// already finished is not "still waiting"; collect those and only
+			// report the ones that really are unfinished.
+			finished, waiting := a.stillWaiting(ctx, left)
+			done = append(done, finished...)
+			errs = append(errs, waiting...)
 			return done, errs
 		case o := <-ch:
 			delete(left, o.name)
@@ -286,17 +291,25 @@ func (a *app) awaitTargets(ctx context.Context, f *gatherFlags, targets []*v1alp
 	return done, errs
 }
 
-// stillWaiting describes the blips that had not finished when the wait ended,
-// grouped by their current phase. Pending and Saving blips are not running, so
-// the message says what they are actually doing.
-func (a *app) stillWaiting(ctx context.Context, left map[string]bool) []error {
+// stillWaiting splits the blips that were still outstanding when the wait
+// ended into those that actually finished (they are returned so they can be
+// reported and collected) and errors describing the rest, grouped by their
+// current phase. Pending and Saving blips are not running, so the message says
+// what they are actually doing.
+func (a *app) stillWaiting(ctx context.Context, left map[string]bool) ([]*v1alpha1.Blip, []error) {
 	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	labels := []string{"still running", "still pending", "still saving", "not finished"}
 	groups := map[string][]string{}
+	var finished []*v1alpha1.Blip
 	for name := range left {
+		b, err := a.getBlip(qctx, name)
+		if err == nil && v1alpha1.Finished(b) {
+			finished = append(finished, b)
+			continue
+		}
 		label := "not finished"
-		if b, err := a.getBlip(qctx, name); err == nil {
+		if err == nil {
 			switch b.Status.Phase {
 			case v1alpha1.BlipRunning:
 				label = "still running"
@@ -317,7 +330,7 @@ func (a *app) stillWaiting(ctx context.Context, left map[string]bool) []error {
 		sort.Strings(names)
 		errs = append(errs, fmt.Errorf("%s: %s", label, strings.Join(names, ", ")))
 	}
-	return errs
+	return finished, errs
 }
 
 // gatherOne reports one finished blip, collects its results when asked, and
