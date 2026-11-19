@@ -542,9 +542,11 @@ func TestTTYRawEOFEmptyInput(t *testing.T) {
 
 // TestTTYRawEOFAfterStartupDelay covers a program that enters raw mode after
 // the client already sent its input and EOF. The bytes must arrive unchanged
-// (no NULs from VEOF) and the reader must still see EOF.
+// (no NULs from VEOF) and the reader must still see EOF. The delays reach past
+// the old fixed settle and recovery windows so a startup that thinks for
+// seconds before switching to raw mode is covered too.
 func TestTTYRawEOFAfterStartupDelay(t *testing.T) {
-	for _, delay := range []string{"0.1", "0.4"} {
+	for _, delay := range []string{"0.1", "0.4", "0.7", "1.0", "1.5", "3.0"} {
 		t.Run("sleep-"+delay, func(t *testing.T) {
 			r := startTTYReader(t, "sleep "+delay+"; stty raw -echo; cat; echo DONE=$?")
 			r.feed(t, "abc")
@@ -552,6 +554,35 @@ func TestTTYRawEOFAfterStartupDelay(t *testing.T) {
 			assertNoNUL(t, out)
 			if out != "abcDONE=0\n" {
 				t.Fatalf("output = %q, want %q", out, "abcDONE=0\n")
+			}
+		})
+	}
+}
+
+// TestTTYCanonicalEOFIsPrompt verifies that a canonical reader whose stdin
+// already ended gets EOF without paying a fixed startup-settle delay. It also
+// covers the partial-line case, which needs a second marker after the first
+// one delivers the buffered line.
+func TestTTYCanonicalEOFIsPrompt(t *testing.T) {
+	for _, input := range []string{"", "abc"} {
+		name := "empty"
+		if input != "" {
+			name = "partial-line"
+		}
+		t.Run(name, func(t *testing.T) {
+			r := startTTYReader(t, "cat; echo DONE=$?")
+			start := time.Now()
+			r.feed(t, input)
+			out := r.waitFor(t, "DONE=")
+			elapsed := time.Since(start)
+			assertNoNUL(t, out)
+			if out != input+"DONE=0\n" {
+				t.Fatalf("output = %q, want %q", out, input+"DONE=0\n")
+			}
+			// The previous implementation always waited ttyEOFSettle (500ms)
+			// before it would deliver a canonical EOF.
+			if elapsed >= 400*time.Millisecond {
+				t.Fatalf("canonical EOF took %v; it should not wait for a startup settle", elapsed)
 			}
 		})
 	}

@@ -1,6 +1,7 @@
 package guest
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -50,8 +51,6 @@ type session struct {
 	inDone    bool      // no more input will be queued
 	inDropped bool      // input was discarded because the process is not reading
 	inNotice  time.Time // when the stdin-discarded notice was last sent
-	inWrote   bool      // input has reached the process
-	inLast    byte      // last input byte written, for terminal EOF handling
 
 	// Exec sessions hold output pumps until the client is attached (right
 	// after TOpened), so output produced during the open handshake cannot
@@ -80,29 +79,30 @@ const (
 	// granularity keeps a slow reader from looking stalled while it drains
 	// a large dequeued batch.
 	inputWriteChunk = 32 << 10
-	// ttyEOFSettle bounds how long the guest waits for a program that is
-	// about to switch its terminal to raw mode. Programs that use raw mode
-	// (line editors, TUIs) usually do it during startup, sometimes after the
-	// client has already sent its input and end of input. Waiting for the
-	// observed transition keeps VEOF bytes out of a raw input stream, where
-	// they would be delivered as NUL data.
-	ttyEOFSettle = 500 * time.Millisecond
-	// ttyEOFRecover bounds how long the guest keeps watching for a raw-mode
-	// switch after EOF was delivered. A late switch turns a queued VEOF into
-	// NUL data; re-asserting canonical mode while the group is stopped turns
-	// the trailing NUL back into an EOF marker before it can be read.
-	ttyEOFRecover = 2 * time.Second
-	// ttyEOFPoll is the terminal-state sampling interval used while waiting
-	// for a raw-mode transition or a late recovery.
+	// ttyEOFPoll is how often the guest samples whether the command is
+	// blocked reading its terminal.
 	ttyEOFPoll = 10 * time.Millisecond
+	// ttyEOFGap keeps one VEOF from being queued before the read it woke had
+	// a chance to consume it. A queued marker that survives a later raw-mode
+	// switch is delivered as NUL data, so at most one is outstanding.
+	ttyEOFGap = 20 * time.Millisecond
+	// ttyEOFDeliveries bounds how many markers are queued for a command that
+	// keeps reading after end of input, so it is not stopped and resumed
+	// forever.
+	ttyEOFDeliveries = 8
+	// ttyEOFTimeout bounds the wait for a command that never waits on its
+	// terminal in a way the guest can observe (for example one waiting in
+	// epoll). It must exceed any startup delay after which a program may
+	// still switch to raw mode.
+	ttyEOFTimeout = 5 * time.Second
+	// ttyEOFSettle is the fallback wait when /proc cannot report the
+	// command's state. The guest behaves as it did before the state check:
+	// give a startup raw-mode switch a short chance, then queue the marker.
+	ttyEOFSettle = 500 * time.Millisecond
 	// ttyEOFStopDelay lets SIGSTOP reach the whole process group before the
 	// VEOF is queued. A SIGCONT that overtakes the pending stop would leave
 	// the command stopped forever.
 	ttyEOFStopDelay = 5 * time.Millisecond
-	// ttyEOFRecoveries bounds how many times a late raw-mode switch is
-	// repaired, so a program that toggles raw mode continuously is not
-	// stopped and resumed in a loop.
-	ttyEOFRecoveries = 5
 	// ttyEOFWriteTimeout bounds the VEOF write. A stopped process cannot
 	// drain a full terminal input queue, so an unbounded write would leave
 	// the group stopped forever.
@@ -473,8 +473,6 @@ func (s *session) writeInput(b []byte) {
 		} else {
 			_, _ = p.stdin.Write(b[:n])
 		}
-		s.inWrote = true
-		s.inLast = b[n-1]
 		b = b[n:]
 
 		s.inMu.Lock()
@@ -505,12 +503,18 @@ func (s *session) endInput() {
 //
 // A VEOF is only an EOF marker while the terminal is canonical; in raw mode it
 // is stored as NUL data. A program that is about to enter raw mode may have
-// already received the client's input and end of input, so the guest waits for
-// the observed raw-mode transition (bounded by ttyEOFSettle) before deciding.
-// The VEOF is then queued while the command's process group is stopped, which
-// guarantees a read that was already blocked in raw mode cannot consume it as
-// data: the stop restarts the read, which re-enters the line discipline with
-// the terminal canonical and observes EOF.
+// already received the client's input and end of input, so a marker queued too
+// early would be consumed as data after it switches. Instead of guessing when
+// the program is done starting up, the guest waits until a task in the
+// command's session is waiting for terminal input. A blocked read is the
+// safest form: the read itself consumes the marker, and only one marker is
+// queued at a time, so none is left behind for a later raw-mode read. A
+// select or poll waiter is also served; the marker makes the descriptor
+// readable and the read that follows consumes it.
+//
+// A VEOF is queued only while the process group is stopped, so a read that was
+// blocked in raw mode restarts with the terminal canonical and observes EOF
+// instead of the marker as data.
 func (s *session) endTTYInput(master *os.File) {
 	// Hold our own descriptor: the process reaper closes the session's master
 	// as soon as the command exits. Writing to a closed descriptor could hit a
@@ -532,26 +536,135 @@ func (s *session) endTTYInput(master *os.File) {
 		return
 	}
 	defer f.Close()
-	waitRaw := time.Now().Add(ttyEOFSettle)
-	for !s.processDone() && time.Now().Before(waitRaw) {
-		if canonical, ok := ttyCanonical(f); ok && !canonical {
-			break
+	started := time.Now()
+	var last time.Time
+	deliveries := 0
+	probed := false
+	// The command is started with setsid, so its process id is the session
+	// id of every task that shares its terminal.
+	sid := s.proc.pid
+	for !s.processDone() && deliveries < ttyEOFDeliveries {
+		blocked, ok := ttyReaderBlocked(sid)
+		if ok {
+			probed = true
 		}
-		time.Sleep(ttyEOFPoll)
-	}
-	s.deliverTTYEOF(f)
-	// A program can still switch to raw mode after EOF was delivered. Re-assert
-	// canonical while the group is stopped so any VEOF the program has not read
-	// yet becomes an EOF marker again instead of NUL data. If the reader already
-	// consumed it in raw mode, a fresh VEOF and read restart ends the session.
-	deadline := time.Now().Add(ttyEOFRecover)
-	for recovered := 0; recovered < ttyEOFRecoveries && !s.processDone() && time.Now().Before(deadline); {
-		time.Sleep(ttyEOFPoll)
-		if canonical, ok := ttyCanonical(f); ok && !canonical {
+		// Without a readable state, keep the pre-existing behavior: give a
+		// startup raw-mode switch a short chance, then queue markers.
+		if !probed && time.Since(started) >= ttyEOFSettle {
+			blocked = true
+		}
+		if blocked {
+			if time.Since(last) < ttyEOFGap {
+				time.Sleep(ttyEOFPoll)
+				continue
+			}
 			s.deliverTTYEOF(f)
-			recovered++
+			deliveries++
+			last = time.Now()
+			continue
+		}
+		// A command that waits in some other way (epoll, wait) may still
+		// need EOF, but it cannot be relied on to consume a marker before a
+		// later raw-mode switch. Queue one after the bound and stop.
+		if time.Since(started) >= ttyEOFTimeout {
+			s.deliverTTYEOF(f)
+			return
+		}
+		time.Sleep(ttyEOFPoll)
+	}
+}
+
+// ttyReaderBlocked reports whether a task in the session sid is waiting for
+// its standard input to become readable. ok is false when the process table
+// cannot be inspected, in which case the caller falls back to the timed path.
+func ttyReaderBlocked(sid int) (blocked, ok bool) {
+	if sid <= 0 {
+		return false, false
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return false, false
+	}
+	probes := 0
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		base := "/proc/" + e.Name()
+		stat, err := os.ReadFile(base + "/stat")
+		if err != nil {
+			continue
+		}
+		fields, ok := procStatFields(stat)
+		if !ok || len(fields) < 4 {
+			continue
+		}
+		session, err := strconv.Atoi(fields[3])
+		if err != nil || session != sid {
+			continue
+		}
+		tasks, err := os.ReadDir(base + "/task")
+		if err != nil {
+			continue
+		}
+		for _, task := range tasks {
+			call, err := os.ReadFile(base + "/task/" + task.Name() + "/syscall")
+			if err != nil {
+				continue
+			}
+			probes++
+			if blockedOnStdin(call) {
+				return true, true
+			}
 		}
 	}
+	return false, probes > 0
+}
+
+// procStatFields returns the fields after the comm field of /proc/PID/stat.
+// comm can contain spaces and parentheses, so it is skipped by its last ')'.
+func procStatFields(stat []byte) ([]string, bool) {
+	i := bytes.LastIndexByte(stat, ')')
+	if i < 0 || i+1 >= len(stat) {
+		return nil, false
+	}
+	return strings.Fields(string(stat[i+1:])), true
+}
+
+// blockedOnStdin reports whether a /proc/PID/syscall line is waiting for
+// input on fd 0. Besides read, this covers the select/poll forms used by
+// programs (and shells) that wait for terminal readability before reading.
+func blockedOnStdin(call []byte) bool {
+	fields := strings.Fields(string(call))
+	if len(fields) < 2 {
+		return false
+	}
+	nr, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return false
+	}
+	arg := func(i int) int64 {
+		if i+1 >= len(fields) {
+			return -1
+		}
+		n, err := strconv.ParseInt(fields[i+1], 0, 64)
+		if err != nil {
+			return -1
+		}
+		return n
+	}
+	switch nr {
+	case int(unix.SYS_READ), int(unix.SYS_READV):
+		return arg(0) == 0
+	case int(unix.SYS_PSELECT6):
+		// pselect6(nfds, readfds, ...): fd 0 is in range when nfds > 0.
+		return arg(0) > 0
+	case int(unix.SYS_PPOLL):
+		// ppoll(fds, nfds, ...).
+		return arg(1) > 0
+	}
+	return false
 }
 
 // processDone reports whether the process has been reaped.
@@ -578,36 +691,16 @@ func (s *session) deliverTTYEOF(f *os.File) {
 		}
 		return
 	}
-	// A partial line needs one VEOF to make it available and a second to end
-	// the read. A line that already ended with a newline only needs the EOF.
-	eof := []byte{4}
-	if s.inWrote && s.inLast != '\n' {
-		eof = []byte{4, 4}
-	}
-	// The master is pollable, so the deadline bounds a write that cannot
-	// complete while the group is stopped and the input queue is full.
+	// Queue one marker. A partial line needs a second marker to reach EOF,
+	// but endTTYInput waits until the read that consumes this one blocks
+	// again before sending it: a marker left in the queue when a program
+	// switches to raw mode is delivered as NUL data.
 	_ = f.SetWriteDeadline(time.Now().Add(ttyEOFWriteTimeout))
-	_, _ = f.Write(eof)
+	_, _ = f.Write([]byte{4})
 	_ = f.SetWriteDeadline(time.Time{})
 	if stopped {
 		s.signalGroup(unix.SIGCONT)
 	}
-}
-
-// ttyCanonical reports whether the terminal currently uses canonical input.
-// ok is false when the terminal settings cannot be read; callers then keep the
-// historical canonical-VEOF behavior.
-func ttyCanonical(f *os.File) (canonical, ok bool) {
-	var st *unix.Termios
-	err := withFD(f, func(fd int) error {
-		var err error
-		st, err = unix.IoctlGetTermios(fd, unix.TCGETS)
-		return err
-	})
-	if err != nil || st == nil {
-		return true, false
-	}
-	return st.Lflag&unix.ICANON != 0, true
 }
 
 // ttySetCanonical switches a terminal to canonical input so a VEOF is
