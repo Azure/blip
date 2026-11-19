@@ -274,12 +274,18 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 		if source, err = a.resolveState(ctx, src); err != nil {
 			return err
 		}
+		if msg := usableStateFailure(source); msg != "" {
+			return fmt.Errorf("state %q failed: %s", a.short(source.Name), msg)
+		}
 		// The fork root takes the blip's name.
 		b.Spec.State = name
 	} else {
 		root, err := a.resolveState(ctx, state)
 		if err != nil {
 			return err
+		}
+		if msg := usableStateFailure(root); msg != "" {
+			return fmt.Errorf("state %q failed: %s", a.short(root.Name), msg)
 		}
 		if root.Spec.Image != "" {
 			return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(root.Name), a.short(root.Name))

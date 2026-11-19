@@ -168,9 +168,12 @@ type fakeController struct {
 	paused           bool
 	stateFail        string
 	stateFailPending bool
-	mountFail        string
-	unmountFail      string
-	exited           map[string]int32
+	// stateFailStuck leaves a failed initial version pending, modelling an
+	// immutable failure such as an image larger than the requested size.
+	stateFailStuck bool
+	mountFail      string
+	unmountFail    string
+	exited         map[string]int32
 }
 
 func (c *fakeController) set(f func(c *fakeController)) {
@@ -208,7 +211,7 @@ func (c *fakeController) tick(ctx context.Context) {
 				s.Status.Committed = &v1alpha1.Commit{ID: "0123456789abcdef", Generation: 1}
 			}
 			c.kube.Status().Update(ctx, s)
-		case s.Status.Phase == v1alpha1.StateFailed && s.Status.Pending != nil:
+		case s.Status.Phase == v1alpha1.StateFailed && s.Status.Pending != nil && !c.stateFailStuck:
 			s.Status.Phase = v1alpha1.StateReady
 			s.Status.Pending = nil
 			s.Status.Committed = &v1alpha1.Commit{ID: "0123456789abcdef", Generation: 1}

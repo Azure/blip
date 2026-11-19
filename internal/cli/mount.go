@@ -740,7 +740,7 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 		}
 		return err
 	}
-	if _, err := a.waitStateCommitted(ctx, name); err != nil {
+	if _, err := a.waitStateCommittedWhilePending(ctx, name); err != nil {
 		a.removeCreatedState(ctx, st)
 		return err
 	}
