@@ -539,8 +539,14 @@ type MountStatus struct {
 	CommitID string `json:"commitID,omitempty"`
 	// AttachmentID is unique per mount operation.
 	AttachmentID string `json:"attachmentID,omitempty"`
-	Phase        string `json:"phase"`
-	Message      string `json:"message,omitempty"`
+	// InClaim records that this writable mount was part of the claim the
+	// guest accepted. The guest only accepts a claim after every such mount
+	// is attached, so its disk must be saved on stop even if the last
+	// observation predates the attachment. A mount added to a running Blip
+	// is not in the claim and may never attach.
+	InClaim bool   `json:"inClaim,omitempty"`
+	Phase   string `json:"phase"`
+	Message string `json:"message,omitempty"`
 	// Switching is set while the mount is being changed between read-only
 	// and writable. It remains set if the switch fails so the previous
 	// mode stays visible.

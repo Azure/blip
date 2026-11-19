@@ -433,6 +433,14 @@ spec:
                       type: string
                     commitID:
                       type: string
+                    inClaim:
+                      description: |-
+                        InClaim records that this writable mount was part of the claim the
+                        guest accepted. The guest only accepts a claim after every such mount
+                        is attached, so its disk must be saved on stop even if the last
+                        observation predates the attachment. A mount added to a running Blip
+                        is not in the claim and may never attach.
+                      type: boolean
                     message:
                       type: string
                     path:

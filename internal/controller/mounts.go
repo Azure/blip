@@ -210,7 +210,7 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 			m.Switching, m.Message = false, ""
 		}
 		d, seen := disks[m.AttachmentID]
-		neverAttached := !seen || d.Phase == podapi.DiskAttaching || d.Phase == podapi.DiskFailed
+		neverAttached := diskNeverAttached(obs, m.AttachmentID)
 		if m.Phase == v1.MountPending && m.Writable && neverAttached && !same && !stop && !m.Switching {
 			// The writable mount never attached (no disk, or only an
 			// attaching/failed one) and is being removed or changed,
@@ -432,6 +432,19 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 		b.Status.Message = strings.Join(waits, "; ")
 	}
 	return nil
+}
+
+// diskNeverAttached reports whether the node's last observation shows no
+// attached disk for id: either no entry, or one that only reached Attaching or
+// Failed. Such a mount was never writable on the VM, so there is nothing to
+// save for it.
+func diskNeverAttached(obs *podapi.Observed, id string) bool {
+	for _, d := range obs.Mounts {
+		if d.ID == id {
+			return d.Phase == podapi.DiskAttaching || d.Phase == podapi.DiskFailed
+		}
+	}
+	return true
 }
 
 // busyPath reports an active mount of another state that overlaps m.

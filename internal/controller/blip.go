@@ -1059,6 +1059,17 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 		wait(b, reason, msg)
 		return nil
 	}
+	// A mount in status when the guest accepts the claim had to be attached
+	// first, so its disk holds data even if the last observation did not
+	// include it. Mounts added later to the running Blip are not in the claim
+	// and may never attach.
+	if obs.ClaimID != "" {
+		for i := range b.Status.Mounts {
+			if b.Status.Mounts[i].Writable {
+				b.Status.Mounts[i].InClaim = true
+			}
+		}
+	}
 	b.Status.Phase = v1.BlipRunning
 	b.Status.Reason = ""
 	b.Status.Message = ""
@@ -1190,6 +1201,17 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 	var mounts []v1.MountStatus
 	for _, m := range b.Status.Mounts {
 		switch {
+		case m.Writable && m.Phase == v1.MountPending && !m.InClaim && !m.Switching && diskNeverAttached(&obs, m.AttachmentID):
+			// The node never observed an attached disk, so the guest could
+			// not have written this mount. Release its writer and drop it
+			// instead of sealing a filesystem that was never mounted. A
+			// mount that was part of the accepted claim is excluded: the
+			// guest only accepted the claim after attaching it.
+			if m.AttachmentID != "" {
+				if err := r.releaseUnattachedWriter(ctx, b, m.State, m.AttachmentID); err != nil {
+					return reconcile.Result{}, err
+				}
+			}
 		case m.Writable && m.Phase != v1.MountFailed:
 			m.Phase = v1.MountSaving
 			mounts = append(mounts, m)
