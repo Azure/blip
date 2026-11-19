@@ -51,6 +51,26 @@ type crdDocument struct {
 	} `json:"spec"`
 }
 
+// loadCRDRoot reads the generated CRD and returns the v1alpha1 root schema.
+func loadCRDRoot(t *testing.T, file string) crdSchema {
+	t.Helper()
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read generated CRD: %v", err)
+	}
+	var doc crdDocument
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse generated CRD: %v", err)
+	}
+	for _, version := range doc.Spec.Versions {
+		if version.Name == "v1alpha1" {
+			return version.Schema.OpenAPIV3Schema
+		}
+	}
+	t.Fatalf("%s has no v1alpha1 version", file)
+	return crdSchema{}
+}
+
 // loadCRDSpec reads the generated CRD and returns the v1alpha1 spec schema.
 func loadCRDSpec(t *testing.T, file string) crdSchema {
 	t.Helper()
@@ -405,6 +425,35 @@ func TestBlipThreadDurationRules(t *testing.T) {
 	} {
 		if errs := validate(object, ""); len(errs) != 0 {
 			t.Errorf("rejected thread with a valid duration: %s: %v", object, errs.ToAggregate())
+		}
+	}
+}
+
+// TestBlipThreadSpecRequired guards that every thread has a spec. Without the
+// root requirement Kubernetes accepts an object with no spec at all and skips
+// the nested required fields, so required spec.pool could be bypassed.
+func TestBlipThreadSpecRequired(t *testing.T) {
+	root := loadCRDRoot(t, "../../deploy/crd/blip.dev_blipthreads.yaml")
+	if !slices.Contains(root.Required, "spec") {
+		t.Errorf("BlipThread schema required = %v, want spec", root.Required)
+	}
+	validate := admissionValidator(t, "blipthreads")
+	for _, object := range []string{
+		`{}`,
+		`{"metadata":{"name":"thread"}}`,
+		`{"spec":{}}`,
+		`{"spec":{"retention":{}}}`,
+	} {
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted thread without spec.pool: %s", object)
+		}
+	}
+	for _, object := range []string{
+		`{"spec":{"pool":"p"}}`,
+		`{"spec":{"pool":"p","heartbeat":"30m"}}`,
+	} {
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected thread with a valid spec: %s: %v", object, errs.ToAggregate())
 		}
 	}
 }

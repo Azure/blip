@@ -143,7 +143,7 @@ type ThreadTask struct {
 type BlipThread struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              BlipThreadSpec   `json:"spec,omitempty"`
+	Spec              BlipThreadSpec   `json:"spec"`
 	Status            BlipThreadStatus `json:"status,omitempty"`
 }
 
