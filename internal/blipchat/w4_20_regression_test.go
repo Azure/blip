@@ -17,6 +17,52 @@ import (
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
 
+// A Blip whose owner label is not the thread's derived owner must be neither
+// listed to the model nor counted against maxRunning, even when it carries the
+// thread's label.
+func TestBlipListAndMaxRunningIgnoreForeignOwner(t *testing.T) {
+	thread := testThread()
+	thread.Spec.MaxRunning = 1
+	thread.Status.Tasks = []v1.ThreadTask{{ID: "work", Title: "work", Open: true}}
+	owner := Owner(&ThreadKey{Namespace: "ns", Name: "proj"})
+	owned := &v1.Blip{
+		ObjectMeta: metav1.ObjectMeta{Name: "owned", Namespace: "ns", Labels: map[string]string{
+			v1.LabelThread: v1.ThreadLabel("proj"), v1.LabelOwner: owner,
+		}},
+		Status: v1.BlipStatus{Phase: v1.BlipSucceeded},
+	}
+	foreign := &v1.Blip{
+		ObjectMeta: metav1.ObjectMeta{Name: "foreign", Namespace: "ns", Labels: map[string]string{
+			v1.LabelThread: v1.ThreadLabel("proj"), v1.LabelOwner: "u-evil",
+		}},
+		Status: v1.BlipStatus{Report: &v1.BlipReport{Seq: 1, Text: "INJECTED attacker text"}},
+	}
+	c := testClient(t, thread, owned, foreign)
+	s := &Server{Client: c}
+	ctx := context.Background()
+	list, err := s.blipList(ctx, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(list, "owned") {
+		t.Errorf("blipList omitted the thread's own blip:\n%s", list)
+	}
+	if strings.Contains(list, "foreign") || strings.Contains(list, "INJECTED") {
+		t.Errorf("blipList exposed a foreign-owner blip:\n%s", list)
+	}
+	st := &step{s: s, thread: thread, tasks: append([]v1.ThreadTask{}, thread.Status.Tasks...)}
+	_, err = st.call(ctx, "start_task", `{"task":"work","prompt":"do it"}`)
+	if err == nil {
+		t.Fatal("start_task succeeded without a base state")
+	}
+	if strings.Contains(err.Error(), "maxRunning") {
+		t.Errorf("foreign-owner blip consumed the thread's running budget: %v", err)
+	}
+	if !strings.Contains(err.Error(), "spec.base") {
+		t.Errorf("start_task error = %v, want the base-state error after the budget check", err)
+	}
+}
+
 // Coordinator notes and replies are never pending input (pendingTurns
 // excludes them), so retention must be able to age them out even though their
 // sequence is above consumedSeq.
