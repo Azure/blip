@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -255,8 +256,8 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 	if err != nil {
 		return err
 	}
-	parent := filepath.Dir(absDst)
 	if !exists {
+		parent := filepath.Dir(absDst)
 		if err := os.MkdirAll(parent, 0o755); err != nil {
 			return err
 		}
@@ -270,24 +271,81 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 		}
 		return os.Rename(staging, absDst)
 	}
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return err
-	}
-	staging, err := os.MkdirTemp(parent, collectTempPattern)
+	staging, atomic, err := stageTree(ctx, src, absDst, info)
 	if err != nil {
 		return err
 	}
 	defer removeTree(staging)
-	if err := copyTreeInto(ctx, src, staging, info); err != nil {
-		return err
-	}
 	// Swapping the destination itself is not safe when it contains the
 	// process's working directory: the old tree is removed after the swap,
 	// leaving the caller in a deleted directory.
-	if !cwdInside(absDst) {
-		return mergeTree(ctx, staging, absDst)
+	if atomic && !cwdInside(absDst) {
+		err := mergeTree(ctx, staging, absDst)
+		if err == nil {
+			return nil
+		}
+		if !swapUnsupported(err) {
+			return err
+		}
+		// A mountpoint cannot be renamed even when its parent is writable
+		// and on the same filesystem. Only merge in place if the failed
+		// swap left the destination where it was.
+		if _, statErr := os.Lstat(absDst); statErr != nil {
+			return err
+		}
 	}
 	return mergeInPlace(ctx, staging, absDst)
+}
+
+// stageTree copies src into a temporary directory used to merge into dst,
+// which must exist and be a directory. It prefers a directory beside dst so
+// mergeTree can swap the result atomically. When the parent is not writable or
+// is on another filesystem (a mount root, for example), staging happens inside
+// dst, on the filesystem the merge writes to.
+func stageTree(ctx context.Context, src, dst string, info os.FileInfo) (string, bool, error) {
+	parent := filepath.Dir(dst)
+	if parent != dst && copyStageDevice(parent, dst) {
+		if staging, err := os.MkdirTemp(parent, collectTempPattern); err == nil {
+			if err := copyTreeInto(ctx, src, staging, info); err != nil {
+				removeTree(staging)
+				return "", false, err
+			}
+			return staging, true, nil
+		}
+	}
+	staging, err := os.MkdirTemp(dst, collectTempPattern)
+	if err != nil {
+		return "", false, err
+	}
+	if err := copyTreeInto(ctx, src, staging, info); err != nil {
+		removeTree(staging)
+		return "", false, err
+	}
+	return staging, false, nil
+}
+
+// copyStageDevice reports whether two paths are on the same filesystem. It is
+// a variable so tests can simulate a mount boundary.
+var copyStageDevice = sameDevice
+
+func sameDevice(a, b string) bool {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	as, ok := ai.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	bs, ok := bi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return as.Dev == bs.Dev
 }
 
 // cwdInside reports whether the process's working directory is dst or below
@@ -300,8 +358,9 @@ func cwdInside(dst string) bool {
 	return cwd == dst || underDir(dst, cwd)
 }
 
-// swapUnsupported reports whether a rename failed because the paths are on
-// different filesystems.
+// swapUnsupported reports whether an atomic swap failed because the
+// destination cannot be renamed in its parent, which is normal for a
+// mountpoint or a boundary between filesystems.
 func swapUnsupported(err error) bool {
 	return errors.Is(err, unix.EXDEV) || errors.Is(err, unix.EBUSY)
 }
@@ -475,12 +534,11 @@ func overlayTree(ctx context.Context, staged, dst string) error {
 }
 
 // mergeInPlace merges a complete staged tree into an existing destination
-// without renaming the destination itself. It is used when the destination
-// contains the process's working directory, where the atomic swap in mergeTree
-// would leave the caller in a deleted directory. Files are replaced by a
-// rename when staging is on the destination's filesystem, so a partially
-// written file is never visible. Unlike mergeTree, a failure can leave earlier
-// children merged.
+// without renaming the destination itself. It is used when the destination is
+// a mountpoint or lives at a filesystem boundary, where the atomic swap in
+// mergeTree cannot work. Files are replaced by a rename when staging is on the
+// destination's filesystem, so a partially written file is never visible.
+// Unlike mergeTree, a failure can leave earlier children merged.
 func mergeInPlace(ctx context.Context, staged, dst string) error {
 	if err := ctx.Err(); err != nil {
 		return err
