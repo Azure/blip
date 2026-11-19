@@ -65,6 +65,10 @@ type streamOpts struct {
 	blip string
 	// sendEOF forwards the end of local stdin to the session.
 	sendEOF bool
+	// raw reports that the caller already put the local terminal in raw mode
+	// and will restore it. stream must not change it: startup input stays
+	// buffered as ordinary bytes across the session open.
+	raw bool
 }
 
 // stream connects the local terminal or stdio to s until the session exits.
@@ -76,11 +80,13 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 	tty := s.Opened.TTY
 	f := a.terminal()
 	if tty && f != nil {
-		old, err := term.MakeRaw(int(f.Fd()))
-		if err != nil {
-			return err
+		if !opts.raw {
+			old, err := term.MakeRaw(int(f.Fd()))
+			if err != nil {
+				return err
+			}
+			defer term.Restore(int(f.Fd()), old)
 		}
-		defer term.Restore(int(f.Fd()), old)
 		if rows, cols := a.termSize(); rows > 0 {
 			s.Resize(rows, cols)
 		}

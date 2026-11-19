@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/session"
@@ -186,6 +187,23 @@ func (a *app) execSession(ctx context.Context, name, pod string, argv []string, 
 	}
 	o := wire.Open{Mode: wire.OpenExec, Argv: argv, WorkingDir: f.workdir, User: f.user, Env: envStrings(env)}
 	a.ttyOpen(&o, tty)
+	// Make the local terminal raw before opening the session. The open takes
+	// long enough for the user to type, and a canonical terminal would
+	// interpret those keystrokes locally: Ctrl-C and Ctrl-\ would kill or dump
+	// the CLI before signal forwarding is installed, and Ctrl-D would turn
+	// into a NUL byte sent as data instead of a remote EOF. Raw mode buffers
+	// startup input as ordinary bytes until stream can deliver it.
+	var raw bool
+	if tty {
+		if ft := a.terminal(); ft != nil {
+			old, err := term.MakeRaw(int(ft.Fd()))
+			if err != nil {
+				return err
+			}
+			raw = true
+			defer term.Restore(int(ft.Fd()), old)
+		}
+	}
 	s, err := a.open(ctx, pod, o)
 	if err != nil {
 		// A start failure has a conventional shell status. Print the
@@ -199,7 +217,7 @@ func (a *app) execSession(ctx context.Context, name, pod string, argv []string, 
 		}
 		return err
 	}
-	return a.stream(ctx, s, streamOpts{blip: name, sendEOF: true})
+	return a.stream(ctx, s, streamOpts{blip: name, sendEOF: true, raw: raw})
 }
 
 type execFlags struct {

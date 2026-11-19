@@ -249,3 +249,96 @@ func TestStreamTTYSignalIgnoredByGuestDetaches(t *testing.T) {
 		t.Fatalf("terminal left raw after detach: lflag=%#x, want ICANON and ECHO", st.Lflag)
 	}
 }
+
+// exec -t must make the local terminal raw before opening the session. A
+// terminal that is still canonical when the open begins interprets startup
+// keystrokes locally: Ctrl-C would signal this process instead of becoming a
+// byte for the guest. The live timing bug needs a real user typing into the
+// CLI's controlling terminal; here a PTY stands in for that terminal and the
+// connector injects a keystroke at the start of the open.
+func TestExecSessionRawBeforeOpenKeepsStartupInput(t *testing.T) {
+	master, slave := openTestPTY(t)
+
+	// A misdirected Ctrl-C belongs to the pty, not this test process.
+	own := make(chan os.Signal, 1)
+	signal.Notify(own, syscall.SIGINT)
+	defer signal.Stop(own)
+
+	got := make(chan string, 1)
+	guest := &fakeguest.Guest{Run: func(s *fakeguest.Session) wire.Exit {
+		buf := make([]byte, 1)
+		if _, err := io.ReadFull(s.Stdin, buf); err != nil {
+			got <- ""
+			return wire.Exit{}
+		}
+		got <- string(buf)
+		return wire.Exit{}
+	}}
+	connect := session.Connector(func(ctx context.Context, namespace, pod string) (io.ReadWriteCloser, error) {
+		st, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+		if err != nil {
+			return nil, err
+		}
+		if st.Lflag&unix.ICANON != 0 {
+			return nil, errors.New("terminal still canonical during session open")
+		}
+		// Type Ctrl-C while the session is opening. With the terminal already
+		// raw it stays queued as a byte for the guest's stdin.
+		if _, err := master.Write([]byte{0x03}); err != nil {
+			return nil, err
+		}
+		return guest.Connect(ctx, namespace, pod)
+	})
+	a := &app{env: &Env{
+		In: slave, Out: io.Discard, Err: io.Discard, Terminal: true,
+		Connect: func(KubeFlags) (*Clients, error) {
+			return &Clients{Sessions: &session.Client{Connect: connect}, Namespace: ns}, nil
+		},
+	}}
+	if err := a.execSession(context.Background(), "agent", "pod-agent", []string{"cat"}, &execFlags{}, true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case in := <-got:
+		if in != "\x03" {
+			t.Fatalf("guest stdin = %q, want the startup Ctrl-C byte", in)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("guest session never finished")
+	}
+}
+
+// A failed open must restore the terminal that execSession made raw before it
+// started waiting on the cluster.
+func TestExecSessionRestoresTerminalWhenOpenFails(t *testing.T) {
+	master, slave := openTestPTY(t)
+	_ = master
+
+	rawDuringOpen := false
+	connect := session.Connector(func(context.Context, string, string) (io.ReadWriteCloser, error) {
+		st, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+		if err == nil && st.Lflag&unix.ICANON == 0 {
+			rawDuringOpen = true
+		}
+		return nil, errors.New("no API server in test")
+	})
+	a := &app{env: &Env{
+		In: slave, Out: io.Discard, Err: io.Discard, Terminal: true,
+		Connect: func(KubeFlags) (*Clients, error) {
+			return &Clients{Sessions: &session.Client{Connect: connect}, Namespace: ns}, nil
+		},
+	}}
+	if err := a.execSession(context.Background(), "agent", "pod-agent", []string{"sh"}, &execFlags{}, true); err == nil {
+		t.Fatal("execSession succeeded with no API server")
+	}
+	if !rawDuringOpen {
+		t.Fatal("terminal was not raw while the session opened")
+	}
+	st, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Lflag&unix.ICANON == 0 || st.Lflag&unix.ECHO == 0 {
+		t.Fatalf("terminal left raw after a failed open: lflag=%#x, want ICANON and ECHO", st.Lflag)
+	}
+}
