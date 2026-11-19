@@ -174,10 +174,11 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 // each destination unique.
 //
 // A destination is compared with symlinks in the existing part resolved, and
-// a destination nested under another is treated as part of that tree. The
-// sources are not mounted yet, so this check cannot tell a file source from a
-// directory source; collect re-checks the effective writes against the
-// mounted sources before copying anything.
+// a destination nested under another is treated as part of that tree. Git
+// operations share the caller's repository, so a branch name is a destination
+// too. The sources are not mounted yet, so this check cannot tell a file
+// source from a directory source; collect re-checks the effective writes
+// against the mounted sources before copying anything.
 func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) error {
 	if len(raw) == 0 {
 		return nil
@@ -187,9 +188,9 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 		return err
 	}
 	type use struct {
-		blip, source, dest string
+		blip, source, dest, branch string
 	}
-	var seen []use
+	var seen, seenGit []use
 	for _, b := range done {
 		ops := make([]string, len(raw))
 		for i, op := range raw {
@@ -200,8 +201,19 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 			// The per-blip collect reports parse errors with its name.
 			continue
 		}
+		blip := a.short(b.Name)
 		for _, op := range parsed {
 			if op.git {
+				// Every git operation fetches into the caller's repository,
+				// so a branch name is a destination shared by the whole
+				// gather. A second fetch of the same branch fails after the
+				// first blip has already been collected and deleted.
+				for _, prev := range seenGit {
+					if prev.branch == op.branch {
+						return fmt.Errorf("collect destination branch %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct BRANCH", op.branch, prev.blip, prev.source, blip, op.source)
+					}
+				}
+				seenGit = append(seenGit, use{blip: blip, source: op.source, branch: op.branch})
 				continue
 			}
 			dst, err := resolvePath(op.dest)
@@ -223,16 +235,16 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 					if filepath.Base(prev.source) != filepath.Base(op.source) {
 						continue
 					}
-					return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, a.short(b.Name), op.source)
+					return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, blip, op.source)
 				}
 				// A directory destination covers everything below it: the
 				// tree is merged into place, and a file source is stored at
 				// DEST/basename(SRC).
 				if underDir(prev.dest, dst) || underDir(dst, prev.dest) {
-					return fmt.Errorf("collect destinations %s for blip %s (%s) and %s for blip %s (%s) overlap; add {name} or give each blip a distinct DEST", prev.dest, prev.blip, prev.source, dst, a.short(b.Name), op.source)
+					return fmt.Errorf("collect destinations %s for blip %s (%s) and %s for blip %s (%s) overlap; add {name} or give each blip a distinct DEST", prev.dest, prev.blip, prev.source, dst, blip, op.source)
 				}
 			}
-			seen = append(seen, use{blip: a.short(b.Name), source: op.source, dest: dst})
+			seen = append(seen, use{blip: blip, source: op.source, dest: dst})
 		}
 	}
 	return nil
