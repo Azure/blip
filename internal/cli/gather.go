@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -107,12 +108,20 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		fmt.Fprintln(a.env.Out, "no blips to gather")
 		return nil
 	}
+	waitCtx := ctx
+	if f.wait > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, f.wait)
+		defer cancel()
+	}
 	var followWG sync.WaitGroup
 	followDone := map[string]chan struct{}{}
 	var followCancel context.CancelFunc
 	if f.follow {
 		var fctx context.Context
-		fctx, followCancel = context.WithCancel(ctx)
+		// Followers share the wait deadline, so an expired --wait also stops
+		// their retained-output replay instead of delaying the drain.
+		fctx, followCancel = context.WithCancel(waitCtx)
 		defer followCancel()
 		for _, b := range targets {
 			ch := make(chan struct{})
@@ -126,12 +135,6 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		}
 	}
 
-	waitCtx := ctx
-	if f.wait > 0 {
-		var cancel context.CancelFunc
-		waitCtx, cancel = context.WithTimeout(ctx, f.wait)
-		defer cancel()
-	}
 	done, errs := a.awaitTargets(waitCtx, f, targets)
 	if f.follow {
 		// Drain finished blips' replay before deleting them, then stop the
@@ -464,10 +467,23 @@ func (a *app) follow(ctx context.Context, name string) {
 		// command to the serial console, and the controller retains the tail
 		// in status. Try both even when our cached view still says Running:
 		// the pod can disappear between the wait and this attach.
-		if a.replayLogs(ctx, pod, short) || a.printRetainedFor(ctx, name, short, 3*time.Second) {
+		if a.replayLogs(ctx, pod, short) {
 			return
 		}
-		if ending || a.blipEnding(ctx, name) {
+		ending = ending || a.blipEnding(ctx, name)
+		// A finished, empty-output Blip whose pod is gone cannot publish
+		// output later: the controller writes status.output before it deletes
+		// the pod. Do not spend the retained-output grace on it.
+		if ending && a.outputFinal(ctx, name, pod) {
+			return
+		}
+		if a.printRetainedFor(ctx, name, short, 3*time.Second) {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if ending {
 			if !a.endedWithoutOutput(ctx, name) {
 				a.progress("%s: output is no longer available: %v", short, err)
 			}
@@ -542,6 +558,27 @@ func (a *app) endedWithoutOutput(ctx context.Context, name string) bool {
 		return false
 	}
 	return (v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving) && b.Status.Output == ""
+}
+
+// outputFinal reports that a finished, empty-output blip can no longer
+// publish retained output because the VM pod that would hold it is gone. The
+// controller writes status.output before it deletes the pod, so this is safe
+// even when the client's cached view lags. While the pod still exists the
+// follower keeps polling: the controller may not have published the output
+// yet.
+func (a *app) outputFinal(ctx context.Context, name, pod string) bool {
+	b, err := a.getBlip(ctx, name)
+	if err != nil || b.Status.Pod != pod || b.Status.Output != "" ||
+		!(v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving) {
+		return false
+	}
+	c, err := a.clients()
+	if err != nil {
+		return false
+	}
+	p := &corev1.Pod{}
+	err = c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: pod}, p)
+	return apierrors.IsNotFound(err) || (err == nil && p.DeletionTimestamp != nil)
 }
 
 // retainedOutputWait bounds how long gather waits for the controller to

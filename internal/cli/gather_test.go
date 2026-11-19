@@ -14,6 +14,7 @@ import (
 	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/session/fakeguest"
 	"github.com/Azure/blip/internal/wire"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -678,6 +679,50 @@ func TestGatherFollowDoesNotWarnWhenEmptyReplayHasNoOutput(t *testing.T) {
 	mustContain(t, out, "blip/empty Succeeded (exit 0)")
 	if strings.Contains(errOut, "output is no longer available") {
 		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}
+
+// A finished command that printed nothing and whose VM pod is already gone
+// cannot gain retained output later. gather -f must not spend the
+// retained-output grace on it, and --wait must still bound the command.
+func TestGatherFollowFinishedEmptyOutputReturnsPromptly(t *testing.T) {
+	h := newHarness(t, finishedBlip("empty", v1alpha1.BlipSucceeded, 0))
+	// The session is gone and the serial log is unavailable.
+	h.guest.OpenError = "no session"
+	start := time.Now()
+	code, out, errOut := h.run("", "gather", "empty", "-f", "--wait", "200ms")
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("gather -f took %s for a finished empty-output blip", elapsed)
+	}
+	mustContain(t, out, "blip/empty Succeeded (exit 0)")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}
+
+// Even while the VM pod outlives the finished session, --wait bounds the
+// follower's retained-output poll instead of letting it run out its grace.
+func TestGatherFollowWaitBoundsFinishedEmptyReplay(t *testing.T) {
+	b := finishedBlip("empty", v1alpha1.BlipSucceeded, 0)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: b.Status.Pod, Namespace: ns}}
+	h := newHarness(t, b, pod)
+	h.guest.OpenError = "no session"
+	start := time.Now()
+	code, out, errOut := h.run("", "gather", "empty", "-f", "--wait", "200ms")
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("gather -f ignored --wait for %s", elapsed)
+	}
+	mustContain(t, out, "blip/empty Succeeded (exit 0)")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message after --wait: %q", errOut)
 	}
 }
 
