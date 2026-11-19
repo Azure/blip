@@ -290,6 +290,57 @@ func TestCopyPathRejectsOverlap(t *testing.T) {
 	})
 }
 
+// Collecting a directory into ".", "..", or "/" must not stage inside the
+// destination it is walking: the staging tree would be copied into itself
+// until the path exceeds PATH_MAX.
+func TestCopyTreeIntoDotAndDotDot(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cwd  string
+		dst  string
+	}{
+		{name: "dot", cwd: "work", dst: "."},
+		{name: "dotdot", cwd: "work/deep", dst: ".."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			src := filepath.Join(base, "src")
+			if err := os.MkdirAll(filepath.Join(src, "sub"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(src, "root.txt"), []byte("ROOT\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(src, "sub", "child.txt"), []byte("CHILD\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cwd := filepath.Join(base, tc.cwd)
+			if err := os.MkdirAll(cwd, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(cwd)
+
+			if err := copyPath(context.Background(), src, tc.dst); err != nil {
+				t.Fatal(err)
+			}
+			dst := filepath.Join(base, "work")
+			if got := readFile(t, filepath.Join(dst, "root.txt")); got != "ROOT\n" {
+				t.Fatalf("root.txt = %q", got)
+			}
+			if got := readFile(t, filepath.Join(dst, "sub", "child.txt")); got != "CHILD\n" {
+				t.Fatalf("sub/child.txt = %q", got)
+			}
+			// The destination contains the working directory, so it must
+			// still be a real, reachable path after the merge.
+			if wd, err := os.Getwd(); err != nil || wd != cwd {
+				t.Fatalf("cwd = %q, %v; want %q", wd, err, cwd)
+			}
+			assertNoTempFiles(t, dst)
+			assertNoTempFiles(t, base)
+		})
+	}
+}
+
 func TestCopyTreePreservesExistingDestination(t *testing.T) {
 	base := t.TempDir()
 	src := filepath.Join(base, "src")

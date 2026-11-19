@@ -248,7 +248,28 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 			return err
 		}
 	}
-	parent := filepath.Dir(dst)
+	// Work with the resolved path so a destination such as "." or ".." has a
+	// staging directory outside itself: filepath.Dir(".") is ".", which would
+	// make the snapshot walk the staging tree it is still creating.
+	absDst, err := resolvePath(dst)
+	if err != nil {
+		return err
+	}
+	parent := filepath.Dir(absDst)
+	if !exists {
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return err
+		}
+		staging, err := os.MkdirTemp(parent, collectTempPattern)
+		if err != nil {
+			return err
+		}
+		defer removeTree(staging)
+		if err := copyTreeInto(ctx, src, staging, info); err != nil {
+			return err
+		}
+		return os.Rename(staging, absDst)
+	}
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
 	}
@@ -256,23 +277,33 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 	if err != nil {
 		return err
 	}
-	keep := false
-	defer func() {
-		if !keep {
-			removeTree(staging)
-		}
-	}()
+	defer removeTree(staging)
 	if err := copyTreeInto(ctx, src, staging, info); err != nil {
 		return err
 	}
-	if !exists {
-		if err := os.Rename(staging, dst); err != nil {
-			return err
-		}
-		keep = true
-		return nil
+	// Swapping the destination itself is not safe when it contains the
+	// process's working directory: the old tree is removed after the swap,
+	// leaving the caller in a deleted directory.
+	if !cwdInside(absDst) {
+		return mergeTree(ctx, staging, absDst)
 	}
-	return mergeTree(ctx, staging, dst)
+	return mergeInPlace(ctx, staging, absDst)
+}
+
+// cwdInside reports whether the process's working directory is dst or below
+// it, so renaming dst would move the working directory out from under us.
+func cwdInside(dst string) bool {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	return cwd == dst || underDir(dst, cwd)
+}
+
+// swapUnsupported reports whether a rename failed because the paths are on
+// different filesystems.
+func swapUnsupported(err error) bool {
+	return errors.Is(err, unix.EXDEV) || errors.Is(err, unix.EBUSY)
 }
 
 // copyTreeInto copies a source tree into an empty, writable directory. The
@@ -437,6 +468,88 @@ func overlayTree(ctx context.Context, staged, dst string) error {
 			}
 		}
 		if err := os.Rename(s, d); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeInPlace merges a complete staged tree into an existing destination
+// without renaming the destination itself. It is used when the destination
+// contains the process's working directory, where the atomic swap in mergeTree
+// would leave the caller in a deleted directory. Files are replaced by a
+// rename when staging is on the destination's filesystem, so a partially
+// written file is never visible. Unlike mergeTree, a failure can leave earlier
+// children merged.
+func mergeInPlace(ctx context.Context, staged, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(staged)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s := filepath.Join(staged, e.Name())
+		d := filepath.Join(dst, e.Name())
+		si, err := os.Lstat(s)
+		if err != nil {
+			return err
+		}
+		di, derr := os.Lstat(d)
+		if derr != nil && !os.IsNotExist(derr) {
+			return derr
+		}
+		if si.IsDir() {
+			if derr == nil && di.IsDir() {
+				if err := mergeInPlace(ctx, s, d); err != nil {
+					return err
+				}
+				continue
+			}
+			if derr == nil {
+				if err := removeTree(d); err != nil {
+					return err
+				}
+			}
+			if err := os.Rename(s, d); err == nil {
+				continue
+			} else if !swapUnsupported(err) {
+				return err
+			}
+			// Staging is on another filesystem: create the directory and
+			// merge its children across the boundary.
+			if err := os.Mkdir(d, 0o700); err != nil && !os.IsExist(err) {
+				return err
+			}
+			if err := mergeInPlace(ctx, s, d); err != nil {
+				return err
+			}
+			if err := os.Remove(s); err != nil {
+				return err
+			}
+			if err := os.Chmod(d, si.Mode().Perm()); err != nil {
+				return err
+			}
+			if err := os.Chtimes(d, si.ModTime(), si.ModTime()); err != nil {
+				return err
+			}
+			continue
+		}
+		if derr == nil && di.IsDir() {
+			if err := removeTree(d); err != nil {
+				return err
+			}
+		}
+		if err := os.Rename(s, d); err == nil {
+			continue
+		} else if !swapUnsupported(err) {
+			return err
+		}
+		if err := copyEntry(ctx, s, d, si); err != nil {
 			return err
 		}
 	}
