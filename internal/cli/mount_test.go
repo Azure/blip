@@ -534,6 +534,94 @@ func TestWaitMountIgnoresRevivedAttachment(t *testing.T) {
 	}
 }
 
+// TestUnmountWritableEndsWhenWriterFinishes reproduces mount --rm of a
+// writable mount whose writer Blip finishes while the removed mount is saving.
+// The stale status entry must not keep the command polling after the Blip is
+// terminal; a failed save on the finished Blip must still be reported.
+func TestUnmountWritableEndsWhenWriterFinishes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		phase   string
+		message string
+		wantErr bool
+	}{
+		{name: "saved entry remains mounted", phase: v1alpha1.MountMounted},
+		{name: "save failed", phase: v1alpha1.MountFailed, message: "save failed: node is gone", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBlip("writer")
+			root := readyState(b.Spec.State)
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+			b.Status.Mounts = []v1alpha1.MountStatus{{
+				State: "data", Path: "/data", Writable: true, Phase: v1alpha1.MountMounted, AttachmentID: "attachment",
+			}}
+			a := mountTestApp(t, b, root)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			done := make(chan error, 1)
+			go func() { done <- a.unmountState(ctx, "data", root.Name) }()
+			waitForCond(t, func() bool {
+				s, err := a.getState(ctx, root.Name)
+				return err == nil && len(s.Spec.Mounts) == 0
+			})
+
+			setPhase := func(phase string) {
+				t.Helper()
+				cur, err := a.getBlip(ctx, b.Name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cur.Status.Phase = phase
+				if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The writer stops; the controller fences the VM and saves.
+			cur, err := a.getBlip(ctx, b.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cur.Spec.Stop = true
+			if err := a.c.Kube.Update(ctx, cur); err != nil {
+				t.Fatal(err)
+			}
+			setPhase(v1alpha1.BlipSaving)
+			select {
+			case err := <-done:
+				t.Fatalf("unmount returned while the save was still running: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			// The finished Blip may still show the removed entry.
+			cur, err = a.getBlip(ctx, b.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cur.Status.Phase = v1alpha1.BlipSucceeded
+			cur.Status.Mounts[0].Phase = tc.phase
+			cur.Status.Mounts[0].Message = tc.message
+			if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case err := <-done:
+				if tc.wantErr {
+					if err == nil || !strings.Contains(err.Error(), tc.message) {
+						t.Fatalf("finished save failure returned %v", err)
+					}
+				} else if err != nil {
+					t.Fatalf("finished writer did not complete the removal: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("unmount kept waiting after the writer finished")
+			}
+		})
+	}
+}
+
 func TestMountListsRootMounts(t *testing.T) {
 	root := readyState("home")
 	root.Spec.Mounts = []v1alpha1.Mount{

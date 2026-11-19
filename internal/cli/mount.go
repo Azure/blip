@@ -504,6 +504,22 @@ func (a *app) unmountState(ctx context.Context, state, root string) error {
 		if m == nil {
 			return true, nil
 		}
+		if v1alpha1.Finished(current) {
+			// saving resolves every writable attachment before a Blip
+			// finishes, so an entry that is still visible is not a live
+			// mount. Report the removal instead of polling forever.
+			if m.Phase == v1alpha1.MountFailed && m.Message != "" {
+				return false, fmt.Errorf("could not unmount state %q from blip %q: %s; desired removal remains applied", state, b.Name, m.Message)
+			}
+			return true, nil
+		}
+		if current.Status.Phase == v1alpha1.BlipSaving {
+			// The writer stopped and the removal has left desired intent;
+			// the controller is now saving the last version. Wait for the
+			// Blip to finish rather than for the status entry to disappear.
+			r.say("saving %s on %s...", state, b.Name)
+			return false, nil
+		}
 		if (m.Phase == v1alpha1.MountFailed || m.Phase == v1alpha1.MountUnmounting) && m.Message != "" &&
 			(before == nil || before.Message != m.Message || time.Since(start) > 5*time.Second) {
 			if strings.Contains(m.Message, "busy") {
