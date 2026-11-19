@@ -589,6 +589,10 @@ type BlipStatus struct {
 	// it. A root that disappears after that was deleted; it is never
 	// recreated for this Blip, so waiting for it cannot succeed.
 	RootStateUID string `json:"rootStateUID,omitempty"`
+	// MountStateUIDs pins the mount states a pending Blip has seen. A state
+	// deleted and recreated under the same name is a different filesystem;
+	// attaching it would silently substitute data the Blip never saw.
+	MountStateUIDs map[string]string `json:"mountStateUIDs,omitempty"`
 	// RootAttachmentID is the writer attachment of a durable root.
 	RootAttachmentID string       `json:"rootAttachmentID,omitempty"`
 	StartTime        *metav1.Time `json:"startTime,omitempty"`

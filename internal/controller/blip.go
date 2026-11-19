@@ -638,6 +638,20 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 			// The root was deleted and recreated between the two reads.
 			return fail(ReasonStateNotFound, rootReplacedMessage(b.Spec.State, b.Status.RootStateUID, string(st.UID)))
 		}
+		if i > 0 && st != nil {
+			// A mount state deleted and recreated under the same name is a
+			// different filesystem. Pinning its UID keeps a pending Blip
+			// from silently attaching data it never saw.
+			if want := b.Status.MountStateUIDs[n]; want != "" && want != string(st.UID) {
+				res, err := fail(ReasonStateNotFound, mountReplacedMessage(n, want, string(st.UID)))
+				res.RequeueAfter = retryAfter
+				return res, err
+			}
+			if b.Status.MountStateUIDs == nil {
+				b.Status.MountStateUIDs = map[string]string{}
+			}
+			b.Status.MountStateUIDs[n] = string(st.UID)
+		}
 		if reason == ReasonStateFailed {
 			return fail(reason, msg)
 		}
@@ -785,6 +799,10 @@ func rootReplaced(b *v1.Blip, root *v1.BlipState) bool {
 
 func rootReplacedMessage(name, want, got string) string {
 	return fmt.Sprintf("state %q was replaced while the Blip was pending (was %s, now %s); refusing to use the substituted workspace", name, want, got)
+}
+
+func mountReplacedMessage(name, want, got string) string {
+	return fmt.Sprintf("mount state %q was replaced while the Blip was pending (was %s, now %s); refusing to use the substituted workspace", name, want, got)
 }
 
 // unclaim gives up everything a Blip acquired before claiming a pod.

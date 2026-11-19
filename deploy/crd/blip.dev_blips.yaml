@@ -436,6 +436,14 @@ spec:
                 type: object
               message:
                 type: string
+              mountStateUIDs:
+                additionalProperties:
+                  type: string
+                description: |-
+                  MountStateUIDs pins the mount states a pending Blip has seen. A state
+                  deleted and recreated under the same name is a different filesystem;
+                  attaching it would silently substitute data the Blip never saw.
+                type: object
               mounts:
                 items:
                   properties:
