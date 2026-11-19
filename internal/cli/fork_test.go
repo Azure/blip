@@ -527,8 +527,8 @@ func TestCollectGit(t *testing.T) {
 		h.self = "alice.box"
 		t.Chdir(dst)
 		code, _, errOut := h.collect("w1", "git:"+dst+":nope")
-		if code == 0 {
-			t.Fatalf("fetch of a nonexistent ref succeeded: %s", errOut)
+		if code != 1 || !strings.Contains(errOut, "git fetch") {
+			t.Fatalf("code %d stderr %q, want 1 with a git fetch error", code, errOut)
 		}
 		assertCollectReleased(t, h, "alice.box", "alice.w1")
 	})

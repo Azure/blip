@@ -172,9 +172,11 @@ func fetchBranch(ctx context.Context, in io.Reader, out, errOut io.Writer, cwd, 
 	if err := cmd.Run(); err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
-			return &ExitError{Code: exit.ExitCode()}
+			// Report this as a collect error, not as the process exit code.
+			// gather must keep exit status 1 and print every blip's error.
+			return fmt.Errorf("git fetch %s %s: exit status %d", repo, branch, exit.ExitCode())
 		}
-		return fmt.Errorf("git fetch: %w", err)
+		return fmt.Errorf("git fetch %s %s: %w", repo, branch, err)
 	}
 	return nil
 }

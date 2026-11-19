@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -177,6 +178,47 @@ func TestGatherCollectFailureKeepsBlip(t *testing.T) {
 	}
 	if h.gone("alice.w1") {
 		t.Fatal("blip deleted after failed collect")
+	}
+}
+
+// A failed git collect must not replace gather's exit status or hide the
+// original command failure.
+func TestGatherGitCollectFailureKeepsBlipError(t *testing.T) {
+	requireGit(t)
+	withCollectMountRoot(t)
+
+	callerRepo := filepath.Join(t.TempDir(), "caller")
+	gitInit(t, callerRepo)
+	gitRun(t, callerRepo, "-c", "user.name=t", "-c", "user.email=t@t",
+		"commit", "-q", "--allow-empty", "-m", "base")
+	src := filepath.Join(collectMountRoot, "alice.w1", "home/dev/src")
+	gitInit(t, src)
+	gitRun(t, src, "-c", "user.name=t", "-c", "user.email=t@t",
+		"commit", "-q", "--allow-empty", "-m", "src")
+
+	objs := gitObjects()
+	for _, o := range objs {
+		b, ok := o.(*v1alpha1.Blip)
+		if !ok || b.Name != "alice.w1" {
+			continue
+		}
+		code := int32(9)
+		b.Status.Phase = v1alpha1.BlipFailed
+		b.Status.ExitCode = &code
+		b.Status.Message = "exit code 9"
+	}
+	h := newHarness(t, objs...)
+	h.self = "alice.box"
+	t.Chdir(callerRepo)
+
+	// Fetching into the branch the caller has checked out is refused by git.
+	code, _, errOut := h.run("", "gather", "w1", "--collect", "git:/home/dev/src:main")
+	if code != 1 {
+		t.Fatalf("code %d, want 1 for a failed gather: %s", code, errOut)
+	}
+	mustContain(t, errOut, "blip w1 failed: exit code 9", "collect from w1", "git fetch")
+	if h.gone("alice.w1") {
+		t.Fatal("blip deleted after a failed collect")
 	}
 }
 

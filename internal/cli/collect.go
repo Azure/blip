@@ -95,7 +95,7 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 			}
 			warnGitWorktree(ctx, src, op.source, op.branch, a.env.Err)
 			if err := fetchBranch(ctx, a.env.In, a.env.Out, a.env.Err, cwd, src, op.branch); err != nil {
-				return err
+				return fmt.Errorf("collect %s: %w", op.source, err)
 			}
 			continue
 		}
