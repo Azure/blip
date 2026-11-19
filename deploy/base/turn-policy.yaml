@@ -23,8 +23,8 @@ spec:
   validations:
     - expression: >-
         variables.blipchat ||
-        (request.object.spec.author.kind == 'ServiceAccount' &&
-        request.object.spec.author.name == request.userInfo.username)
+        (object.spec.author.kind == 'ServiceAccount' &&
+        object.spec.author.name == request.userInfo.username)
       messageExpression: >-
         'turns must be created by blipchat or by a service account that names
         itself; ' + request.userInfo.username + ' must set
