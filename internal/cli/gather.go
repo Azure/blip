@@ -167,7 +167,14 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 }
 
 // checkCollectDestinations rejects a gather whose expanded operations would
-// copy two blips to the same path. {name} makes each destination unique.
+// copy two blips to the same path or into overlapping trees. {name} makes
+// each destination unique.
+//
+// A destination is compared the way copyPath will use it: symlinks in the
+// existing part are resolved, and a destination that is already a directory
+// receives a file under the source's basename. Comparing the declared strings
+// alone missed both that rewrite (DEST and DEST/basename(SRC)) and a
+// directory merge spreading over everything below DEST.
 func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) error {
 	if len(raw) == 0 {
 		return nil
@@ -177,9 +184,9 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 		return err
 	}
 	type use struct {
-		blip, source string
+		blip, source, dest string
 	}
-	seen := map[string]use{}
+	var seen []use
 	for _, b := range done {
 		ops := make([]string, len(raw))
 		for i, op := range raw {
@@ -194,15 +201,36 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 			if op.git {
 				continue
 			}
-			dst, err := filepath.Abs(op.dest)
+			dst, err := resolvePath(op.dest)
 			if err != nil {
-				dst = op.dest
+				// A destination that cannot be resolved can still be
+				// compared literally.
+				if dst, err = filepath.Abs(op.dest); err != nil {
+					dst = op.dest
+				}
 			}
 			dst = filepath.Clean(dst)
-			if prev, ok := seen[dst]; ok {
-				return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, a.short(b.Name), op.source)
+			isDir := false
+			if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
+				isDir = true
 			}
-			seen[dst] = use{blip: a.short(b.Name), source: op.source}
+			for _, prev := range seen {
+				if prev.dest == dst {
+					// Two files with distinct basenames can share an
+					// existing directory without colliding.
+					if isDir && filepath.Base(prev.source) != filepath.Base(op.source) {
+						continue
+					}
+					return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, a.short(b.Name), op.source)
+				}
+				// A directory destination covers everything below it: the
+				// tree is merged into place, and a file source is stored at
+				// DEST/basename(SRC).
+				if underDir(prev.dest, dst) || underDir(dst, prev.dest) {
+					return fmt.Errorf("collect destinations %s for blip %s (%s) and %s for blip %s (%s) overlap; add {name} or give each blip a distinct DEST", prev.dest, prev.blip, prev.source, dst, a.short(b.Name), op.source)
+				}
+			}
+			seen = append(seen, use{blip: a.short(b.Name), source: op.source, dest: dst})
 		}
 	}
 	return nil

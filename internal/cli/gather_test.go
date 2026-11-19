@@ -342,6 +342,107 @@ func TestGatherRejectsDuplicateCollectDestinations(t *testing.T) {
 	}
 }
 
+// A file collected onto an existing directory is stored under its basename,
+// so a destination that looks distinct can be the same file. gather must
+// reject the pair before copying instead of letting the second overwrite the
+// first.
+func TestGatherRejectsCollectIntoExistingDirectoryCollision(t *testing.T) {
+	root := withCollectMountRoot(t)
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/src/marker", "MARKER1\n", 0o644)
+	writeCollectFile(t, root, "alice.w1", "/home/dev/big", "BIG-DATA\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir("out", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := h.run("", "gather", "w1",
+		"--collect", "/home/dev/src/marker:./out",
+		"--collect", "/home/dev/big:./out/marker")
+	if code != 1 {
+		t.Fatalf("code %d, want 1: %s", code, errOut)
+	}
+	mustContain(t, errOut, "destination", "/home/dev/src/marker", "/home/dev/big")
+	if _, err := os.Stat(filepath.Join(dir, "out/marker")); !os.IsNotExist(err) {
+		t.Fatalf("a colliding destination was written: %v", err)
+	}
+	if h.gone("alice.w1") {
+		t.Fatal("blip deleted despite the collision")
+	}
+}
+
+// A directory merge spreads over everything below its destination, so a
+// second operation beneath that destination overlaps it even though the two
+// declared destinations differ.
+func TestGatherRejectsCollectDirectoryOverlap(t *testing.T) {
+	root := withCollectMountRoot(t)
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/tree/sub/marker", "TREE\n", 0o644)
+	writeCollectFile(t, root, "alice.w1", "/home/dev/marker", "MARKER2\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir("out", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := h.run("", "gather", "w1",
+		"--collect", "/home/dev/tree:./out",
+		"--collect", "/home/dev/marker:./out/sub")
+	if code != 1 {
+		t.Fatalf("code %d, want 1: %s", code, errOut)
+	}
+	mustContain(t, errOut, "destination", "/home/dev/tree", "/home/dev/marker")
+	if _, err := os.Stat(filepath.Join(dir, "out/sub")); !os.IsNotExist(err) {
+		t.Fatalf("an overlapping destination was written: %v", err)
+	}
+	if h.gone("alice.w1") {
+		t.Fatal("blip deleted despite the overlap")
+	}
+}
+
+// Files with distinct names still share an existing destination directory;
+// their effective destinations do not collide.
+func TestGatherAllowsDistinctFilesIntoExistingDirectory(t *testing.T) {
+	root := withCollectMountRoot(t)
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/src/a", "AAA\n", 0o644)
+	writeCollectFile(t, root, "alice.w1", "/home/dev/src/b", "BBB\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir("out", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := h.run("", "gather", "w1",
+		"--collect", "/home/dev/src/a:./out/a",
+		"--collect", "/home/dev/src/b:./out/b")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if got := readFile(t, filepath.Join(dir, "out/a")); got != "AAA\n" {
+		t.Fatalf("a = %q", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "out/b")); got != "BBB\n" {
+		t.Fatalf("b = %q", got)
+	}
+	if !h.gone("alice.w1") {
+		t.Fatal("blip kept")
+	}
+}
+
 func TestGatherCollectNeedsBlip(t *testing.T) {
 	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
 	code, _, errOut := h.run("", "gather", "w1", "--collect", "/out:./out")
