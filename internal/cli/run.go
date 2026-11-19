@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -17,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/workspace"
 )
 
@@ -188,6 +190,21 @@ func wholeSeconds(flag string, d time.Duration) error {
 	return nil
 }
 
+// validateRun rejects a run request whose strings JSON would silently rewrite.
+// argv, workingDir and user follow the same rules as a session Open; env is
+// checked as name/value pairs so the error names the invalid part.
+func validateRun(command []string, env []v1alpha1.EnvVar, workdir, user string) error {
+	for i, e := range env {
+		if !utf8.ValidString(e.Name) {
+			return fmt.Errorf("%w: env[%d] name contains invalid UTF-8", session.ErrInvalidUTF8, i)
+		}
+		if !utf8.ValidString(e.Value) {
+			return fmt.Errorf("%w: env[%d] value contains invalid UTF-8", session.ErrInvalidUTF8, i)
+		}
+	}
+	return session.ValidateStrings(command, envStrings(env), workdir, user)
+}
+
 func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	if len(command) == 0 {
 		return errors.New("a command is required: blip run -- CMD [ARG...]")
@@ -200,6 +217,15 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	}
 	if f.from != "" && f.state != "" {
 		return errors.New("set only one of --from and --state")
+	}
+	env, err := parseEnv(f.env)
+	if err != nil {
+		return err
+	}
+	// Reject a request the API server would silently alter before clients()
+	// can read the caller's blip or create anything.
+	if err := validateRun(command, env, f.workdir, f.user); err != nil {
+		return err
 	}
 	c, err := a.clients()
 	if err != nil {
@@ -218,16 +244,17 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	if err := a.validateName("blip", name); err != nil {
 		return err
 	}
-	env, err := parseEnv(f.env)
-	if err != nil {
-		return err
-	}
 	workdir := f.workdir
 	if workdir == "" && a.self != nil {
 		// The caller's root is the fork's root, so its directory exists.
 		if cwd, err := cwdPath(); err == nil {
 			workdir = cwd
 		}
+	}
+	// The inherited directory is local, not a flag, so it is validated after
+	// the caller's blip is known but still before the Blip is created.
+	if workdir != f.workdir && !utf8.ValidString(workdir) {
+		return fmt.Errorf("%w: workingDir contains invalid UTF-8", session.ErrInvalidUTF8)
 	}
 	b := &v1alpha1.Blip{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace},

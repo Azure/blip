@@ -307,6 +307,62 @@ func TestRunFromRejectsDanglingReadOnlyMount(t *testing.T) {
 	}
 }
 
+// JSON would replace invalid UTF-8 with U+FFFD, so run must reject each
+// user-supplied field before creating the Blip or any workspace.
+func TestRunRejectsInvalidUTF8(t *testing.T) {
+	bad := string([]byte{0xff})
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"argv", []string{"--", "sh", bad}, "argv[1]"},
+		{"env value", []string{"--env", "BAD=" + bad, "--", "true"}, "env[0] value"},
+		{"env name", []string{"--env", "BAD" + bad + "=x", "--", "true"}, "env[0] name"},
+		{"workdir", []string{"--workdir", "/tmp/" + bad, "--", "true"}, "workingDir"},
+		{"user", []string{"--user", "d" + bad + "v", "--", "true"}, "user"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("base"))
+			var creates int
+			h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				creates++
+				return c.Create(ctx, obj, opts...)
+			}})
+			args := append([]string{"run", "--name", "worker", "--from", "base"}, tc.args...)
+			code, _, errOut := h.run("", args...)
+			if code != 1 || !strings.Contains(errOut, "valid UTF-8") || !strings.Contains(errOut, tc.want) {
+				t.Fatalf("code %d, stderr %q; want %q", code, errOut, tc.want)
+			}
+			if creates != 0 {
+				t.Fatalf("%d Create calls despite the invalid request", creates)
+			}
+			if !h.gone("worker") {
+				t.Fatal("invalid request created a blip")
+			}
+		})
+	}
+}
+
+func TestRunAcceptsValidUTF8(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	code, out, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--env", "GREETING=é", "--", "true", "é")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if strings.TrimSpace(out) != "worker" {
+		t.Fatalf("output %q", out)
+	}
+	b := h.blip("worker")
+	if len(b.Spec.Command) != 2 || b.Spec.Command[1] != "é" {
+		t.Fatalf("command %q", b.Spec.Command)
+	}
+	if len(b.Spec.Env) != 1 || b.Spec.Env[0].Value != "é" {
+		t.Fatalf("env %+v", b.Spec.Env)
+	}
+}
+
 func TestRunLabelsAndNameCollision(t *testing.T) {
 	h := newHarness(t, readyState("base"))
 	if code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--label", "team=a", "--", "true"); code != 0 {

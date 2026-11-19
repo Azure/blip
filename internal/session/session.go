@@ -31,24 +31,25 @@ var ErrRequestTooLarge = errors.New("request too large")
 // environment, working directory or user than the caller asked for.
 var ErrInvalidUTF8 = errors.New("session open requires valid UTF-8")
 
-// validateOpen rejects strings that JSON cannot carry without changing them.
-// It runs before a connection is made, so a malformed request is a local
-// validation error and not a VM lifecycle failure.
-func validateOpen(o wire.Open) error {
-	for i, s := range o.Argv {
+// ValidateStrings rejects request strings that JSON cannot carry without
+// changing them. An Open validates its argv, env, working directory and user
+// with it, and a Blip created by run uses it for the same fields so the two
+// paths reject the same bytes before any object exists.
+func ValidateStrings(argv, env []string, workingDir, user string) error {
+	for i, s := range argv {
 		if !utf8.ValidString(s) {
 			return fmt.Errorf("%w: argv[%d] contains invalid UTF-8", ErrInvalidUTF8, i)
 		}
 	}
-	for i, s := range o.Env {
+	for i, s := range env {
 		if !utf8.ValidString(s) {
 			return fmt.Errorf("%w: env[%d] contains invalid UTF-8", ErrInvalidUTF8, i)
 		}
 	}
-	if !utf8.ValidString(o.WorkingDir) {
+	if !utf8.ValidString(workingDir) {
 		return fmt.Errorf("%w: workingDir contains invalid UTF-8", ErrInvalidUTF8)
 	}
-	if !utf8.ValidString(o.User) {
+	if !utf8.ValidString(user) {
 		return fmt.Errorf("%w: user contains invalid UTF-8", ErrInvalidUTF8)
 	}
 	return nil
@@ -70,7 +71,7 @@ type Client struct {
 // attaches to a session it already started instead of running the command
 // again. An empty OpenID preserves the old behavior for existing clients.
 func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (*Session, error) {
-	if err := validateOpen(o); err != nil {
+	if err := ValidateStrings(o.Argv, o.Env, o.WorkingDir, o.User); err != nil {
 		return nil, err
 	}
 	rwc, err := c.Connect(ctx, namespace, pod)
