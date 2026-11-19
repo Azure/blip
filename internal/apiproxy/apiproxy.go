@@ -173,6 +173,14 @@ type proxyServer struct {
 	cleanup func()
 }
 
+// connectionLifetimeKey carries the connection-scoped context. A client may
+// half-close its write side after sending a complete request; net/http
+// cancels the per-request context when the read side reaches EOF, even
+// though the connection is still open for the response. Proxying against the
+// connection lifetime (which follows server shutdown) keeps the in-flight
+// request and response alive.
+type connectionLifetimeKey struct{}
+
 func newProxyServer(ctx context.Context, socketPath string, handler http.Handler) (*proxyServer, error) {
 	listener, cleanup, err := listenUnix(socketPath)
 	if err != nil {
@@ -180,10 +188,18 @@ func newProxyServer(ctx context.Context, socketPath string, handler http.Handler
 	}
 	tracked := &trackedListener{Listener: listener, connections: make(map[*trackedConn]struct{})}
 	server := &http.Server{
-		Handler:           handler,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if lifetime, ok := r.Context().Value(connectionLifetimeKey{}).(context.Context); ok {
+				r = r.WithContext(lifetime)
+			}
+			handler.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
-		ErrorLog:          log.New(io.Discard, "", 0),
+		ConnContext: func(connCtx context.Context, _ net.Conn) context.Context {
+			return context.WithValue(connCtx, connectionLifetimeKey{}, connCtx)
+		},
+		ErrorLog: log.New(io.Discard, "", 0),
 	}
 	return &proxyServer{server: server, tracked: tracked, cleanup: cleanup}, nil
 }
