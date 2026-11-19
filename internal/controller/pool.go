@@ -74,6 +74,11 @@ type PoolReconciler struct {
 	client.Client
 	Config
 
+	// APIAudiences are the cluster's accepted service-account audiences, as
+	// discovered at startup. validateEndpoints rejects an endpoint token
+	// projected for any of them.
+	APIAudiences []string
+
 	mu sync.Mutex
 	// created and deleted hold pod names (per pool) whose change the
 	// cache may not show yet.
@@ -165,7 +170,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// Refuse to create pods whose api-proxy sidecar would exit at startup.
 	// The error is visible on the controller and in events; the alternative
 	// is a Blip that waits for a VM that can never become ready.
-	if err := validateEndpoints(pool); err != nil {
+	if err := validateEndpoints(pool, r.APIAudiences...); err != nil {
 		return reconcile.Result{}, fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
 	}
 	var pods corev1.PodList

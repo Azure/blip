@@ -110,7 +110,8 @@ func Setup(ctx context.Context, mgr ctrl.Manager, cfg Config) error {
 	if err := (&NodeReconciler{Client: c}).SetupWithManager(mgr); err != nil {
 		return err
 	}
-	if err := (&PoolReconciler{Client: c, Config: cfg}).SetupWithManager(mgr); err != nil {
+	audiences := discoverAPIServerAudiences(ctx, mgr.GetConfig())
+	if err := (&PoolReconciler{Client: c, Config: cfg, APIAudiences: audiences}).SetupWithManager(mgr); err != nil {
 		return err
 	}
 	if err := (&StateReconciler{Client: c, Live: mgr.GetAPIReader(), Config: cfg}).SetupWithManager(mgr); err != nil {

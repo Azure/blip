@@ -205,7 +205,13 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
   header: `kube-apiserver` goes to the API server with reads scoped to the
   Blip's owner; each `spec.endpoints` name goes to its configured HTTPS URL
   (optionally with its own token audience and CA). It strips caller identity
-  headers, rejects `CONNECT`, and answers unknown hosts with `421`.
+  headers, rejects `CONNECT`, and answers unknown hosts with `421`. Endpoint
+  tokens are projected only for the configured audience, and the controller
+  rejects an audience the cluster API server accepts: the default
+  `kubernetes.default.svc[.cluster.local]` names and the service-account
+  issuer discovered from the API server's OpenID configuration. A cluster
+  that overrides `--api-audiences` with an unrelated value is not covered by
+  that check, so keep endpoint URLs off the API server on such clusters.
 
 ### Guest (`blip-guest`)
 

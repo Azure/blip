@@ -29,11 +29,11 @@ var reservedEndpointNames = map[string]bool{
 // make the proxy exit or, worse, send a workload's credentials to the wrong
 // host. Running it before creating pods keeps an invalid pool from producing
 // sidecars that crash-loop while Blips wait for a VM forever.
-func validateEndpoints(pool *v1.BlipPool) error {
+func validateEndpoints(pool *v1.BlipPool, clusterAudiences ...string) error {
 	seen := map[string]bool{}
 	for i := range pool.Spec.Endpoints {
 		e := &pool.Spec.Endpoints[i]
-		err := validateEndpoint(pool, e)
+		err := validateEndpoint(pool, e, clusterAudiences)
 		if err == nil && seen[e.Name] {
 			err = errors.New("duplicate endpoint name")
 		}
@@ -45,7 +45,7 @@ func validateEndpoints(pool *v1.BlipPool) error {
 	return nil
 }
 
-func validateEndpoint(pool *v1.BlipPool, e *v1.PoolEndpoint) error {
+func validateEndpoint(pool *v1.BlipPool, e *v1.PoolEndpoint, clusterAudiences []string) error {
 	if len(e.Name) > 63 || !endpointNameRE.MatchString(e.Name) {
 		return errors.New("name must be a lowercase DNS label of at most 63 characters")
 	}
@@ -59,7 +59,7 @@ func validateEndpoint(pool *v1.BlipPool, e *v1.PoolEndpoint) error {
 		if pool.Spec.ServiceAccountName == "" {
 			return errors.New("audience requires spec.serviceAccountName")
 		}
-		if isAPIServerAudience(e.Audience) {
+		if isAPIServerAudience(e.Audience, clusterAudiences...) {
 			return errors.New("audience must not be a Kubernetes API server audience; the endpoint token would authenticate to the API server")
 		}
 	}
@@ -145,7 +145,22 @@ var apiServerAudiences = map[string]struct{}{
 	"kubernetes.default.svc.cluster.local": {},
 }
 
-func isAPIServerAudience(audience string) bool {
+func isAPIServerAudience(audience string, clusterAudiences ...string) bool {
+	s := normalizeAudience(audience)
+	if _, ok := apiServerAudiences[s]; ok {
+		return true
+	}
+	for _, known := range clusterAudiences {
+		if known != "" && s == normalizeAudience(known) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeAudience compares audiences the way the API server does after
+// ignoring a scheme, surrounding space, a port, and trailing slashes or dots.
+func normalizeAudience(audience string) string {
 	s := strings.ToLower(strings.TrimSpace(audience))
 	s = strings.TrimPrefix(s, "https://")
 	s = strings.TrimPrefix(s, "http://")
@@ -155,7 +170,5 @@ func isAPIServerAudience(audience string) bool {
 	if host, _, err := net.SplitHostPort(s); err == nil {
 		s = host
 	}
-	s = strings.TrimSuffix(s, ".")
-	_, ok := apiServerAudiences[s]
-	return ok
+	return strings.TrimSuffix(s, ".")
 }
