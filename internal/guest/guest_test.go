@@ -565,32 +565,32 @@ func TestMountPointInRoot(t *testing.T) {
 
 	// The dev image's package documentation alias resolves to a directory
 	// inside the root, so the mount point is created in the real directory.
-	fd, target, err := mountPointInRoot(root, "/usr/share/doc/gcc-13/probe")
+	fd, target, err := mountPointInRoot(root, "/usr/share/doc/gcc-13/probe", nil)
 	must(err)
 	syscall.Close(fd)
 	if target != filepath.Join(root, "usr/share/doc/gcc-13-x86-64-linux-gnu/probe") {
 		t.Fatalf("mount point resolved to %s", target)
 	}
 	// Collect's generated mounts are allowed below its reserved root.
-	fd, target, err = mountPointInRoot(root, "/run/blip-collect/data")
+	fd, target, err = mountPointInRoot(root, "/run/blip-collect/data", nil)
 	must(err)
 	syscall.Close(fd)
 	if target != filepath.Join(root, "run/blip-collect/data") {
 		t.Fatalf("collect mount point resolved to %s", target)
 	}
 	// A symlink to a regular file is not a directory.
-	if _, _, err := mountPointInRoot(root, "/etc/hosts-link/x"); err == nil ||
+	if _, _, err := mountPointInRoot(root, "/etc/hosts-link/x", nil); err == nil ||
 		!strings.Contains(err.Error(), "is a symlink or not a directory") {
 		t.Fatalf("file symlink mount point: %v", err)
 	}
 	// A symlink that resolves to a guest-reserved directory is rejected.
-	if _, _, err := mountPointInRoot(root, "/reserved-link/x"); err == nil ||
+	if _, _, err := mountPointInRoot(root, "/reserved-link/x", nil); err == nil ||
 		!strings.Contains(err.Error(), "reserves") {
 		t.Fatalf("reserved symlink mount point: %v", err)
 	}
 	// An absolute symlink resolves inside the root and never creates the
 	// directory outside it.
-	if fd, target, err = mountPointInRoot(root, "/escape/y"); err == nil {
+	if fd, target, err = mountPointInRoot(root, "/escape/y", nil); err == nil {
 		syscall.Close(fd)
 		if !strings.HasPrefix(target, root+"/") {
 			t.Fatalf("absolute symlink escaped the root: %s", target)
@@ -598,6 +598,40 @@ func TestMountPointInRoot(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, "y")); err == nil {
 		t.Fatalf("directory created outside the root")
+	}
+}
+
+// TestMountPointInRootRejectsOverlapBeforeCreating reproduces an alias-overlap
+// rejection inside an already-mounted writable state. The written path is
+// disjoint from the existing mount, but its parent resolves through the image
+// symlink into the mounted filesystem. The rejected mount must not create its
+// probe directory there, or the mutation is saved with the state.
+func TestMountPointInRootRejectsOverlapBeforeCreating(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "usr/share/doc/gcc-13-base"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("gcc-13-base", filepath.Join(root, "usr/share/doc/gcc-13")); err != nil {
+		t.Fatal(err)
+	}
+	existing := []*mount{{
+		id:     "writable",
+		path:   "/usr/share/doc/gcc-13",
+		target: filepath.Join(root, "usr/share/doc/gcc-13-base"),
+	}}
+	for _, p := range []string{
+		"/usr/share/doc/gcc-13-base/w8-06-probe",
+		"/usr/share/doc/gcc-13-base/w8-06-nested/probe",
+	} {
+		if _, _, err := mountPointInRoot(root, p, existing); err == nil ||
+			!strings.Contains(err.Error(), "overlaps mount writable") {
+			t.Fatalf("mountPointInRoot(%q) = %v", p, err)
+		}
+	}
+	for _, probe := range []string{"w8-06-probe", "w8-06-nested"} {
+		if _, err := os.Stat(filepath.Join(root, "usr/share/doc/gcc-13-base", probe)); !os.IsNotExist(err) {
+			t.Fatalf("rejected mount left %s in the mounted state: %v", probe, err)
+		}
 	}
 }
 

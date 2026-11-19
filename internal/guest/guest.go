@@ -801,21 +801,19 @@ func (g *Guest) doMount(m wire.Mount) error {
 	if err != nil {
 		return err
 	}
-	fd, target, err := mountPointInRoot(g.root, p)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(fd)
 	// The written paths may be disjoint while the guest resolves them through
-	// an image symlink to one directory. Reject that before stacking two
-	// filesystems there; unmount is path-based and would detach the top one.
+	// an image symlink to one directory. mountPointInRoot checks that resolved
+	// target before creating the directory, so the rejection cannot mutate an
+	// existing mount; unmount is path-based and would detach the top one.
 	var attached []*mount
 	for _, x := range g.mounts {
 		attached = append(attached, x)
 	}
-	if err := checkMountTarget(g.root, p, target, attached); err != nil {
+	fd, target, err := mountPointInRoot(g.root, p, attached)
+	if err != nil {
 		return err
 	}
+	defer unix.Close(fd)
 	var flags uintptr
 	data := ""
 	if m.ReadOnly {

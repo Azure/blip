@@ -81,8 +81,24 @@ func guestPath(root, p string) string {
 // Unlike the guest's own directories, user mount points follow symlinks inside
 // the root as Linux mount does, so image aliases such as
 // /usr/share/doc/gcc-13 work. Symlinks to files, escapes, and reserved targets
-// are still rejected.
-func mountPointInRoot(root, p string) (int, string, error) {
+// are still rejected. existing are the paths of current auxiliary mounts;
+// their resolved targets are checked before anything is created so a rejected
+// alias overlap cannot leave a directory in a mounted filesystem.
+func mountPointInRoot(root, p string, existing []*mount) (int, string, error) {
+	// Resolve the directory p would create before creating it. Written paths
+	// can look disjoint while an image symlink resolves the new mount point
+	// into an existing mount's target; creating the directory first would
+	// mutate that (possibly writable) filesystem even though the mount is
+	// rejected. If resolution fails, mkdirInRoot below reports the fixed
+	// symlink and non-directory errors instead.
+	if target, err := resolveMountTargetInRoot(root, p); err == nil {
+		if err := validateResolvedMountTarget(p, guestPath(root, target)); err != nil {
+			return -1, "", err
+		}
+		if err := checkMountTarget(root, p, target, existing); err != nil {
+			return -1, "", err
+		}
+	}
 	fd, err := mkdirInRoot(root, p, true)
 	if err != nil {
 		return -1, "", err
@@ -96,7 +112,54 @@ func mountPointInRoot(root, p string) (int, string, error) {
 		unix.Close(fd)
 		return -1, "", err
 	}
+	// Re-check the opened directory: it is authoritative if the tree changed
+	// between the pre-check and the mkdir above.
+	if err := checkMountTarget(root, p, target, existing); err != nil {
+		unix.Close(fd)
+		return -1, "", err
+	}
 	return fd, target, nil
+}
+
+// resolveMountTargetInRoot returns the host path of the directory mount point p
+// would attach to once it exists, without creating it. The deepest existing
+// ancestor is resolved through symlinks as in resolveInRoot and the still
+// missing suffix is appended literally: a path that does not exist yet cannot
+// contain a symlink. Resolution errors are returned so the caller can fall back
+// to mkdirInRoot, which reports the fixed symlink and non-directory errors.
+func resolveMountTargetInRoot(root, p string) (string, error) {
+	rel := strings.TrimPrefix(filepath.Clean(p), "/")
+	var parts []string
+	if rel != "" {
+		parts = strings.Split(rel, "/")
+	}
+	for i := len(parts); i >= 0; i-- {
+		prefix := "/"
+		if i > 0 {
+			prefix = "/" + strings.Join(parts[:i], "/")
+		}
+		guest, err := resolveInRoot(root, prefix)
+		if err != nil {
+			if errors.Is(err, unix.ENOENT) && i > 0 {
+				continue
+			}
+			return "", err
+		}
+		if i < len(parts) {
+			guest = strings.TrimSuffix(guest, "/") + "/" + strings.Join(parts[i:], "/")
+		}
+		rootfd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return "", err
+		}
+		rootPath, err := fdPath(rootfd)
+		unix.Close(rootfd)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(rootPath, strings.TrimPrefix(guest, "/")), nil
+	}
+	return "", errors.New("unreachable")
 }
 
 // validateMountTarget reports why the directory p resolves to inside root
@@ -108,6 +171,12 @@ func validateMountTarget(root, p string) error {
 	if err != nil {
 		return fmt.Errorf("resolve mount path %s: %w", p, err)
 	}
+	return validateResolvedMountTarget(p, resolved)
+}
+
+// validateResolvedMountTarget reports why the guest path a mount point resolves
+// to cannot receive a user mount.
+func validateResolvedMountTarget(p, resolved string) error {
 	if resolved == "/" {
 		return fmt.Errorf("mount path %s resolves to /", p)
 	}
