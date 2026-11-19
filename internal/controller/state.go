@@ -1066,6 +1066,15 @@ func (r *StateReconciler) writer(ctx context.Context, st *v1.BlipState, cl *clus
 		if o.Node != w.Node {
 			continue
 		}
+		// A seal from an earlier incarnation describes storage the recreated
+		// node no longer has. Only the current incarnation can confirm that
+		// the writer stopped and the reported commit still exists. When the
+		// BlipNode is gone there is no current incarnation to compare; a late
+		// seal is still the writer node's only report, and the pending it
+		// creates fails cleanly if no node holds the commit.
+		if bn := cl.nodes[o.Node]; bn != nil && !cl.currentObservation(o) {
+			continue
+		}
 		for _, sr := range o.Sealed {
 			if sr.AttachmentID != w.AttachmentID {
 				continue
