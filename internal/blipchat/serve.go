@@ -175,8 +175,10 @@ func hasOpenTask(tasks []v1.ThreadTask) bool {
 	return false
 }
 
-// pendingTurns returns the turns not yet consumed, in sequence order,
-// excluding the coordinator's own output.
+// pendingTurns returns every turn not yet consumed, in sequence order,
+// excluding the coordinator's own output. It deliberately keeps turns older
+// than any fixed window: a step must never consume a turn it did not show to
+// the coordinator, and an old Wake=Now turn must still be able to wake it.
 func (s *Server) pendingTurns(ctx context.Context, thread *v1.BlipThread) ([]v1.BlipTurn, error) {
 	var turns v1.BlipTurnList
 	if err := s.List(ctx, &turns, client.InNamespace(thread.Namespace), client.MatchingFields{turnField: thread.Name}); err != nil {
@@ -190,9 +192,6 @@ func (s *Server) pendingTurns(ctx context.Context, thread *v1.BlipThread) ([]v1.
 		out = append(out, t)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Status.Seq < out[j].Status.Seq })
-	if len(out) > 50 {
-		out = out[len(out)-50:]
-	}
 	return out, nil
 }
 

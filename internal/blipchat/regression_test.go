@@ -2,6 +2,8 @@ package blipchat
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,5 +91,59 @@ func TestDailyTokenBudgetRollsOverAtDayBoundary(t *testing.T) {
 		if updated.Status.Paused != nil {
 			t.Errorf("after step %d paused = %+v; today's spend is under the budget", step, updated.Status.Paused)
 		}
+	}
+}
+
+// The pending window must not hide an older Wake=Now turn from shouldStep, nor
+// let a step consume turns it never showed to the coordinator.
+func TestOlderWakeNowTurnStillStepsAndAppearsInPrompt(t *testing.T) {
+	fresh := metav1.NewTime(timeNow())
+	objs := []client.Object{}
+	for i := 1; i <= 51; i++ {
+		turn := testTurn(fmt.Sprintf("turn-%02d", i), "proj")
+		turn.Status.Seq = int64(i)
+		turn.Status.AcceptedTime = &fresh
+		turn.Spec.Wake = v1.WakeBatch
+		turn.Spec.Text = fmt.Sprintf("turn-%d", i)
+		objs = append(objs, turn)
+	}
+	objs[0].(*v1.BlipTurn).Spec.Wake = v1.WakeNow
+	thread := testThread()
+	objs = append(objs, thread)
+	c := testClient(t, objs...)
+	server, requests := llmServerWithRequests(t, Message{Role: "assistant", Content: "ok"})
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	ctx := context.Background()
+	if !s.shouldStep(ctx, thread) {
+		t.Error("an older Wake=Now turn did not wake the thread")
+	}
+	if err := s.step(ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.ConsumedSeq != 51 {
+		t.Errorf("consumedSeq = %d, want 51", updated.Status.ConsumedSeq)
+	}
+	if len(*requests) == 0 {
+		t.Fatal("no LLM request recorded")
+	}
+	messages, ok := (*requests)[0]["messages"].([]any)
+	if !ok || len(messages) < 2 {
+		t.Fatalf("request messages = %#v", (*requests)[0]["messages"])
+	}
+	user, ok := messages[1].(map[string]any)
+	if !ok {
+		t.Fatalf("user message = %#v", messages[1])
+	}
+	content, _ := user["content"].(string)
+	if !strings.Contains(content, "#1 ") || !strings.Contains(content, "turn-1") {
+		t.Errorf("prompt dropped the oldest turn (Wake=Now):\n%s", content)
 	}
 }
