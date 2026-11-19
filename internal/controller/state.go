@@ -905,12 +905,15 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 	if len(waiting) > 0 {
 		msg := fmt.Sprintf("saving generation %d: waiting for %s", p.Generation, strings.Join(waiting, ", "))
 		if p.Generation == 1 && len(errs) > 0 && initialSourceSettled(st, cl, p) {
-			// Keep pending so a retry or a recovered node can still
-			// complete it, but surface a failing initial build (for
-			// example an image larger than the requested size). Until
-			// the source reports the commit or an error, replicas that
-			// cannot see it are only waiting for it to publish.
+			// Surface a failing initial build. Most node errors may be
+			// transient (a fetch, a busy device), so keep pending for a
+			// retry or a recovered node. A permanent build error cannot
+			// change on retry, so fail terminally instead of leaving
+			// pull and copies waiting forever.
 			s.Phase = v1.StateFailed
+			if permanentBuildError(errs) {
+				s.Pending = nil
+			}
 			return "initial version failed: " + s.LastError, nil
 		}
 		return joinMessages(append([]string{msg}, errs...)), nil
@@ -979,6 +982,20 @@ func saveHeld(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
 	}
 	for _, n := range p.Replicas {
 		if cl.liveHolder(st, n, p.CommitID) {
+			return true
+		}
+	}
+	return false
+}
+
+// permanentBuildError reports whether an initial build error cannot succeed on
+// retry. The converted image size and spec.size are both immutable, so a node
+// error saying the image needs more bytes than the requested size makes every
+// retry fail the same way. Such a state must clear pending and fail
+// terminally; a fetch or device error may still recover.
+func permanentBuildError(errs []string) bool {
+	for _, e := range errs {
+		if strings.Contains(e, "needs") && strings.Contains(e, "than the requested") {
 			return true
 		}
 	}

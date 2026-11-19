@@ -1361,6 +1361,69 @@ func TestImageStateOnEveryEligibleNode(t *testing.T) {
 	}
 }
 
+// TestImageBuildSizeErrorIsTerminal: the converted image size and spec.size
+// are immutable, so "needs more bytes" can never succeed on retry. Clear
+// pending and fail, otherwise pull and copies wait forever.
+func TestImageBuildSizeErrorIsTerminal(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newState("s", func(st *v1.BlipState) { st.Spec.Image = "reg/img:v1"; st.Spec.Replicas = 1 })
+	e.run(e.state, ns, "s")
+	if p := e.getState("s").Status.Pending; p == nil {
+		t.Fatal("no pending initial version")
+	}
+	e.report("s", "n1", func(o *v1.NodeObservation) {
+		o.Error = "storage: image sha256:ce60 needs 1186988032 bytes, more than the requested 536870912"
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("permanent size error not terminal: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "initial version failed: ") ||
+		!strings.Contains(st.Status.Message, "needs 1186988032 bytes, more than the requested 536870912") {
+		t.Fatalf("terminal message %q", st.Status.Message)
+	}
+	if !strings.Contains(st.Status.LastError, "needs 1186988032 bytes") {
+		t.Fatalf("lastError %q", st.Status.LastError)
+	}
+	// It stays terminal instead of replanning the impossible build.
+	e.run(e.state, ns, "s")
+	if again := e.getState("s"); again.Status.Pending != nil || again.Status.Committed != nil {
+		t.Fatalf("terminal failure retried: %+v", again.Status)
+	}
+}
+
+// TestImageBuildTransientErrorKeepsPending: fetch and device errors can
+// recover, so the initial version stays retryable with pending retained.
+func TestImageBuildTransientErrorKeepsPending(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newState("s", func(st *v1.BlipState) { st.Spec.Image = "reg/img:v1"; st.Spec.Replicas = 1 })
+	e.run(e.state, ns, "s")
+	p := e.getState("s").Status.Pending
+	if p == nil {
+		t.Fatal("no pending initial version")
+	}
+	e.report("s", "n1", func(o *v1.NodeObservation) {
+		o.Error = "fetch blip-n1: device-mapper: create ioctl failed: Device or resource busy"
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending == nil {
+		t.Fatalf("transient error was made terminal: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "initial version failed: ") ||
+		!strings.Contains(st.Status.Message, "Device or resource busy") {
+		t.Fatalf("transient message %q", st.Status.Message)
+	}
+	e.hold("s", p.CommitID, "n1")
+	e.run(e.state, ns, "s")
+	if st = e.getState("s"); st.Status.Pending != nil || st.Status.Committed == nil || st.Status.Phase != v1.StateReady {
+		t.Fatalf("retryable initial version did not recover: %+v", st.Status)
+	}
+}
+
 func TestImageStatePendingDropsFailedNodes(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2", "n3")

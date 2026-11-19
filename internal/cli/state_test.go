@@ -56,6 +56,26 @@ func TestPullFailedInitialVersionExits(t *testing.T) {
 	}
 }
 
+// An image-too-large build error is immutable, so the controller clears
+// pending and fails the state. Pull must surface the node error instead of
+// waiting for a retry that can never happen.
+func TestPullFailedInitialVersionSizeExits(t *testing.T) {
+	h := newHarness(t)
+	const msg = "initial version failed: storage: image sha256:ce60 needs 1186988032 bytes, more than the requested 536870912"
+	h.ctrl.set(func(c *fakeController) { c.stateFail = msg })
+	start := time.Now()
+	code, _, errOut := h.run("", "pull", "huge", "registry/dev:v1", "--size", "512Mi")
+	if code != 1 || !strings.Contains(errOut, "needs 1186988032 bytes, more than the requested 536870912") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("pull waited %v for a terminal size failure", elapsed)
+	}
+	if st := h.state("huge"); st.Status.Phase != v1alpha1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("immutable size failure did not end terminal: %+v", st.Status)
+	}
+}
+
 // The same Failed phase with a pending commit is recoverable: pull waits for
 // the retried commit instead of reporting a failure the controller will fix.
 func TestPullWaitsForFailedPendingState(t *testing.T) {
