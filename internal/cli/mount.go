@@ -235,6 +235,9 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 	if r.Spec.Image != "" {
 		return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(root), a.short(root))
 	}
+	if msg := usableStateFailure(r); msg != "" {
+		return fmt.Errorf("state %q failed: %s", a.short(root), msg)
+	}
 	source, err := a.getState(ctx, state)
 	if err != nil {
 		return err
@@ -244,6 +247,12 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 		// desired intent, which would otherwise outlive this command and make
 		// every later Blip on the root wait for a state that is gone.
 		return fmt.Errorf("state %q is being deleted", a.short(state))
+	}
+	if msg := usableStateFailure(source); msg != "" {
+		// A state that can never commit cannot be attached either. Writing
+		// intent for it would poison the root until the mount is removed by
+		// hand.
+		return fmt.Errorf("state %q failed: %s", a.short(state), msg)
 	}
 	var want, demoting, added, moved bool
 	var prevPath string
@@ -1033,6 +1042,13 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		// run --state does. A removal-only command stays legal for cleanup.
 		return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(f.root), a.short(f.root))
 	}
+	if hasAdds {
+		// A root that can never commit cannot run the mount either. Reject
+		// it before any state is created or intent is written.
+		if msg := usableStateFailure(root); msg != "" {
+			return fmt.Errorf("state %q failed: %s", a.short(f.root), msg)
+		}
+	}
 	original := append([]v1alpha1.Mount(nil), root.Spec.Mounts...)
 	removed := make(map[string]bool, len(f.remove))
 	for _, arg := range f.remove {
@@ -1126,6 +1142,9 @@ func (a *app) mountSource(ctx context.Context, name string, created map[string]b
 	if err != nil {
 		return "", err
 	}
+	if msg := usableStateFailure(src); msg != "" {
+		return "", fmt.Errorf("state %q failed: %s", a.short(src.Name), msg)
+	}
 	return src.Name, nil
 }
 
@@ -1162,6 +1181,9 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	}
 	if root.Spec.Image != "" {
 		return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(f.root), a.short(f.root))
+	}
+	if msg := usableStateFailure(root); msg != "" {
+		return fmt.Errorf("state %q failed: %s", a.short(f.root), msg)
 	}
 	if err := validateMountPlan(root, []mountRequest{{state: name, path: mountPath, writable: writable}}, nil, false); err != nil {
 		return err

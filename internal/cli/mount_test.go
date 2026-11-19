@@ -1864,6 +1864,56 @@ func TestMountRejectsImportedBaseRoot(t *testing.T) {
 	}
 }
 
+// TestMountRejectsUnusableStates rejects a failed source or root before any
+// desired intent is written. Such a state can never attach, so an offline
+// success would poison the root until the mount is removed by hand.
+func TestMountRejectsUnusableStates(t *testing.T) {
+	failed := func(name, msg string) *v1alpha1.BlipState {
+		s := state(name)
+		s.Status.Phase, s.Status.Message = v1alpha1.StateFailed, msg
+		return s
+	}
+	t.Run("failed source", func(t *testing.T) {
+		h := newHarness(t, readyState("home"), failed("bad", "image not found"))
+		code, _, errOut := h.run("", "mount", "bad:/x", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `state "bad" failed: image not found`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("failed source written as intent: %+v", mounts)
+		}
+	})
+	t.Run("failed root", func(t *testing.T) {
+		h := newHarness(t, failed("home", "no space left"), readyState("data"))
+		code, _, errOut := h.run("", "mount", "data:/x", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `state "home" failed: no space left`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("failed root written as intent: %+v", mounts)
+		}
+	})
+	t.Run("failed source with committed version is usable", func(t *testing.T) {
+		bad := failed("bad", "an earlier attempt failed")
+		bad.Status.Committed = &v1alpha1.Commit{ID: "0123456789abcdef", Generation: 1}
+		h := newHarness(t, readyState("home"), bad)
+		if code, _, errOut := h.run("", "mount", "bad:/x", "--root", "home"); code != 0 {
+			t.Fatalf("usable state rejected: %d %s", code, errOut)
+		}
+	})
+	t.Run("removal from failed root stays allowed", func(t *testing.T) {
+		root := failed("home", "no space left")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+		h := newHarness(t, root, readyState("data"))
+		if code, _, errOut := h.run("", "mount", "--rm", "data", "--root", "home"); code != 0 {
+			t.Fatalf("removal rejected: %d %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("removal left intent: %+v", mounts)
+		}
+	})
+}
+
 // TestMountNewMountFailureLeavesState ports create's attach-failure coverage:
 // the created state keeps its first commit even when mounting it fails.
 func TestMountNewMountFailureLeavesState(t *testing.T) {
