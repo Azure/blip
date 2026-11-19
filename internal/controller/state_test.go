@@ -1006,6 +1006,38 @@ func TestDrainRepair(t *testing.T) {
 	}
 }
 
+// TestRepairRecordsNodeFetchError surfaces why a placement is stuck
+// replicating the committed version, not only the "replicating to" message.
+func TestRepairRecordsNodeFetchError(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	st := e.readyState("s", "n1", "n2")
+	id := st.Status.Committed.ID
+	e.report("s", "n2", func(o *v1.NodeObservation) {
+		o.Commits = slices.DeleteFunc(o.Commits, func(c string) bool { return c == id })
+		o.Error = "fetch " + id + ": device or resource busy"
+	})
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if !strings.Contains(st.Status.Message, "replicating to n2") {
+		t.Fatalf("repair message %q", st.Status.Message)
+	}
+	if !strings.Contains(st.Status.LastError, "device or resource busy") {
+		t.Fatalf("lastError hid the node repair error: %q", st.Status.LastError)
+	}
+
+	// The error clears once the node catches up.
+	e.report("s", "n2", func(o *v1.NodeObservation) {
+		o.Commits = append(o.Commits, id)
+		o.Error = ""
+	})
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if st.Status.LastError != "" || st.Status.Message != "" {
+		t.Fatalf("resolved repair kept a stale error: %+v", st.Status)
+	}
+}
+
 func TestUnhealthyNodeRepair(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2", "n3")

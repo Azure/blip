@@ -1197,12 +1197,18 @@ func (r *StateReconciler) repair(st *v1.BlipState, cl *cluster) string {
 		s.Placements = append(s.Placements, add...)
 		good = append(good, add...)
 	}
-	var waiting []string
+	var waiting, errs []string
 	for _, n := range good {
 		if !cl.holds(st, n, id) {
 			waiting = append(waiting, n)
+			for _, o := range st.Status.Nodes {
+				if o.Node == n && o.Error != "" && cl.currentObservation(o) {
+					errs = append(errs, fmt.Sprintf("%s: %s", n, o.Error))
+				}
+			}
 		}
 	}
+	s.LastError = strings.Join(errs, "; ")
 	if len(bad) > 0 && len(good) > 0 && len(waiting) == 0 {
 		s.Placements = good
 		return ""
