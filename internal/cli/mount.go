@@ -1038,6 +1038,7 @@ type mountFlags struct {
 	remove   []string
 	create   []string
 	from     string
+	fromSet  bool
 	size     string
 	replicas int32
 }
@@ -1080,6 +1081,7 @@ collect at a path without a colon.`,
   kubectl blip mount repo:/work --root home`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			f.fromSet = cmd.Flags().Changed("from")
 			return a.mount(cmd.Context(), args, f, cmd.Flags().Changed("replicas"))
 		},
 	}
@@ -1132,6 +1134,12 @@ func parseMountSpec(s string) (state, mountPath string, writable *bool, err erro
 func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasSet bool) error {
 	if err := a.mountTarget(&f.root); err != nil {
 		return err
+	}
+	// An explicitly empty source is a mistake, not a request for an empty
+	// state. Reject it as run does, before any state is created or intent is
+	// written, so an unset shell variable cannot silently create a workspace.
+	if f.fromSet && strings.TrimSpace(f.from) == "" {
+		return errors.New("--from must not be empty")
 	}
 	if err := checkNewOnlyFlags(f, replicasSet); err != nil {
 		return err

@@ -1435,6 +1435,53 @@ func TestMountNewRejectsDuplicateArguments(t *testing.T) {
 	}
 }
 
+// TestMountRejectsExplicitEmptyFrom reproduces an explicitly supplied empty
+// --from being ignored: mount only checked f.from != "", so "" selected the
+// empty-state branch and succeeded. As with run, the flag being set means the
+// value is intentional even when blank, so it must be rejected before any
+// state is created or intent is written.
+func TestMountRejectsExplicitEmptyFrom(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		// state is created by the command and must not exist afterwards.
+		create string
+	}{
+		{
+			name:   "new empty",
+			args:   []string{"mount", "--new", "cache:/cache", "--from", "", "--root", "home"},
+			create: "cache",
+		},
+		{
+			name:   "new whitespace",
+			args:   []string{"mount", "--new", "cache:/cache", "--from", "   ", "--root", "home"},
+			create: "cache",
+		},
+		{
+			name: "existing empty",
+			args: []string{"mount", "data:/data", "--from", "", "--root", "home"},
+		},
+		{
+			name: "existing whitespace",
+			args: []string{"mount", "data:/data", "--from", "\t", "--root", "home"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", tc.args...)
+			if code != 1 || !strings.Contains(errOut, "--from must not be empty") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if tc.create != "" && !stateNotFound(t, h, tc.create) {
+				t.Fatalf("empty --from left state %q behind", tc.create)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("empty --from wrote desired intent: %+v", mounts)
+			}
+		})
+	}
+}
+
 func stateNotFound(t *testing.T, h *harness, name string) bool {
 	t.Helper()
 	var s v1alpha1.BlipState
