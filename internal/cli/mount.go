@@ -1054,6 +1054,7 @@ func (a *app) mountTarget(root *string) error {
 
 type mountFlags struct {
 	root     string
+	rootSet  bool
 	remove   []string
 	create   []string
 	from     string
@@ -1101,6 +1102,7 @@ collect at a path without a colon.`,
   kubectl blip mount repo:/work --root home`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			f.rootSet = cmd.Flags().Changed("root")
 			f.fromSet = cmd.Flags().Changed("from")
 			f.sizeSet = cmd.Flags().Changed("size")
 			return a.mount(cmd.Context(), args, f, cmd.Flags().Changed("replicas"))
@@ -1153,6 +1155,12 @@ func parseMountSpec(s string) (state, mountPath string, writable *bool, err erro
 }
 
 func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasSet bool) error {
+	// An explicitly blank root must not fall through to the current blip's
+	// root state: inside a blip that silently targets a different state than
+	// an unset shell variable appears to request.
+	if f.rootSet && strings.TrimSpace(f.root) == "" {
+		return errors.New("--root must not be empty")
+	}
 	if err := a.mountTarget(&f.root); err != nil {
 		return err
 	}

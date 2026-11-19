@@ -1539,6 +1539,62 @@ func TestMountRejectsExplicitEmptySize(t *testing.T) {
 	}
 }
 
+// TestMountRejectsExplicitEmptyRoot reproduces an explicitly blank --root
+// falling through to the current blip's root state. An unset --root has that
+// documented default; a set-but-blank value is a mistake and must not silently
+// target the current root, inside or outside a blip.
+func TestMountRejectsExplicitEmptyRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rootArgs []string
+	}{
+		{"empty", []string{"--root", ""}},
+		{"equals", []string{"--root="}},
+		{"whitespace", []string{"--root", "   "}},
+		{"tab", []string{"--root", "\t"}},
+	} {
+		t.Run("outside "+tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			args := append([]string{"mount"}, tc.rootArgs...)
+			args = append(args, "data:/data")
+			code, _, errOut := h.run("", args...)
+			if code != 1 || !strings.Contains(errOut, "--root must not be empty") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("blank --root wrote desired intent: %+v", mounts)
+			}
+		})
+
+		t.Run("inside "+tc.name, func(t *testing.T) {
+			b := runningBlip("agent")
+			h := newHarness(t, b, readyState("data"))
+			h.self = b.Name
+			args := append([]string{"mount"}, tc.rootArgs...)
+			args = append(args, "data:/data")
+			code, _, errOut := h.run("", args...)
+			if code != 1 || !strings.Contains(errOut, "--root must not be empty") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state(b.Spec.State).Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("blank --root wrote desired intent: %+v", mounts)
+			}
+		})
+	}
+
+	// Leaving --root unset still defaults to the current blip's root state.
+	b := runningBlip("agent")
+	h := newHarness(t, b, readyState("data"))
+	h.self = b.Name
+	if code, _, errOut := h.run("", "mount", "data:/data"); code != 0 {
+		t.Fatalf("unset --root rejected: %d %s", code, errOut)
+	}
+	mounts := h.state(b.Spec.State).Spec.Mounts
+	if len(mounts) != 1 || mounts[0].State != "data" || mounts[0].Path != "/data" {
+		t.Fatalf("unset --root did not use the blip root: %+v", mounts)
+	}
+}
+
 // TestMountRejectsRepeatedStateAcrossNewAndArgs reproduces a state named by
 // both --new and a positional mount (or twice positionally). When the same
 // command also removes a mount, validateMountPlan treats the second reference
