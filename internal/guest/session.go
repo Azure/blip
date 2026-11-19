@@ -441,7 +441,14 @@ func (s *session) endInput() {
 		return
 	}
 	if p.tty != nil {
-		_, _ = p.tty.Write([]byte{4})
+		// In canonical mode the first VEOF (Ctrl-D) delivers a partial line
+		// to the reader but does not end the read: only a VEOF at the start
+		// of an empty line makes read(2) return 0. A piped caller sends its
+		// last line without a newline, so send two: the first flushes the
+		// partial line and the second yields EOF. Interactive Ctrl-D is a
+		// normal stdin byte and does not go through endInput, so typing it
+		// still behaves as before.
+		_, _ = p.tty.Write([]byte{4, 4})
 	} else {
 		_ = p.stdin.Close()
 	}

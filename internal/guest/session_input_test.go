@@ -342,6 +342,61 @@ func firstDifference(a, b []byte) int {
 	return min(len(a), len(b))
 }
 
+// TestTTYEOFEndsPartialLineInput verifies that a piped caller whose input
+// does not end in a newline still ends a terminal session. A single VEOF only
+// delivers the partial line in canonical mode; the second VEOF is what makes
+// read(2) return 0, so commands like `wc -c` no longer hang waiting for EOF.
+func TestTTYEOFEndsPartialLineInput(t *testing.T) {
+	master, slave, err := openPTY()
+	if err != nil {
+		t.Skipf("open PTY: %v", err)
+	}
+	defer master.Close()
+
+	cmd := exec.Command("cat")
+	cmd.Stdin = slave
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slave.Close()
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		slave.Close()
+		t.Skipf("start cat on PTY: %v", err)
+	}
+	// The child owns the slave side; the parent's copy would otherwise keep
+	// the terminal open and hide EOF handling.
+	slave.Close()
+	defer func() { _ = cmd.Process.Kill() }()
+
+	s := &session{proc: &proc{tty: master}, tty: true, out: ring{max: ringSize}}
+	s.inCond = sync.NewCond(&s.inMu)
+	go s.pumpInput()
+	defer s.closeInput()
+
+	if err := s.queueInput([]byte("XYZ")); err != nil {
+		t.Fatal(err)
+	}
+	s.queueEOF()
+
+	copied := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(stdout)
+		copied <- string(b)
+	}()
+	select {
+	case got := <-copied:
+		if got != "XYZ" {
+			t.Fatalf("terminal input = %q, want %q", got, "XYZ")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal input did not reach EOF after piped stdin closed")
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("cat did not exit cleanly after EOF: %v", err)
+	}
+}
+
 // TestQueuedInputPreservesOrder checks that stdin and its end-of-file marker
 // are written in order by the input pump.
 func TestQueuedInputPreservesOrder(t *testing.T) {
