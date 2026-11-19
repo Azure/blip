@@ -237,7 +237,18 @@ one status update. One worker per thread serializes status writes. The model
 is any OpenAI-compatible endpoint selected with `--llm-base-url`; the chat
 front end authenticates users and blipchat reads the identity from
 `X-Forwarded-User`. The chat is stateless: the browser sends its transcript and
-`POST /chat?namespace=NS` names the thread. Chat inspection is read-only:
+`POST /chat?namespace=NS` names the thread (a valid DNS-1123 namespace label;
+the default is `default`).
+
+**Trust boundary:** blipchat has no authentication of its own. It believes
+`X-Forwarded-User` from any caller and authorizes the namespace in the query
+string with its own cluster-wide credentials. It must only be reachable through
+a front end that authenticates users, overwrites `X-Forwarded-User`, and
+restricts which namespaces each user may reach (a NetworkPolicy or an
+authenticating proxy). Do not expose the Service directly. Requests with zero
+or multiple `X-Forwarded-User` headers are rejected.
+
+Chat inspection is read-only:
 running blips accept a small allowlist (`git status|log|diff|show`, `ls`,
 `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `pwd`) and finished blips
 report their last report.

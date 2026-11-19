@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -108,6 +109,10 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	namespace := r.URL.Query().Get("namespace")
 	if namespace == "" {
 		namespace = "default"
+	}
+	if !validNamespace(namespace) {
+		http.Error(w, "invalid namespace", http.StatusBadRequest)
+		return
 	}
 	thread := &v1.BlipThread{}
 	if err := c.Server.Get(ctx, client.ObjectKey{Namespace: namespace, Name: req.Thread}, thread); err != nil {
@@ -426,6 +431,12 @@ func shortUser(user string) string {
 	}
 	sum := sha256.Sum256([]byte(user))
 	return s + "-" + hex.EncodeToString(sum[:4])
+}
+
+// validNamespace reports whether the namespace query parameter is a valid
+// Kubernetes namespace (a DNS-1123 label).
+func validNamespace(ns string) bool {
+	return len(validation.IsDNS1123Label(ns)) == 0
 }
 
 // recentTurns returns up to limit turns with a sequence above since.
