@@ -216,6 +216,37 @@ func TestExecPassesFlagLikeArgsAfterDash(t *testing.T) {
 	}
 }
 
+// pflag accepts an attached value for a boolean shorthand. Without --, the
+// guard must reject that form just like a bare flag because the command would
+// otherwise lose the argument.
+func TestExecRejectsBooleanShorthandValueAfterCommandWithoutDash(t *testing.T) {
+	for _, flag := range []string{"-t=false", "-t=0", "-T=true"} {
+		h := newHarness(t, runningBlip("agent"))
+		code, _, errOut := h.run("", "exec", "agent", "echo", flag)
+		if code != 1 || !strings.Contains(errOut, `flag "`+flag+`"`) || !strings.Contains(errOut, "put -- before the command") {
+			t.Errorf("%s: code %d: %s", flag, code, errOut)
+		}
+		if opens := h.guest.Opens(); len(opens) != 0 {
+			t.Errorf("%s: exec opened a session: %+v", flag, opens)
+		}
+	}
+}
+
+// After --, the same boolean-looking arguments belong to the command.
+func TestExecPassesBooleanShorthandValueAfterDash(t *testing.T) {
+	for _, flag := range []string{"-t=false", "-t=0", "-T=true"} {
+		h := newHarness(t, runningBlip("agent"))
+		h.guest.Run = func(s *fakeguest.Session) wire.Exit {
+			s.Stdout(strings.Join(s.Open.Argv, " "))
+			return wire.Exit{}
+		}
+		code, out, errOut := h.run("", "exec", "agent", "--", "echo", flag)
+		if code != 0 || out != "echo "+flag {
+			t.Errorf("%s: code %d out %q err %q", flag, code, out, errOut)
+		}
+	}
+}
+
 func TestExecSignalExitCode(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"))
 	h.guest.Run = func(s *fakeguest.Session) wire.Exit { return wire.Exit{Signal: "KILL"} }

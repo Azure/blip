@@ -95,6 +95,12 @@ func blipFlag(cmd *cobra.Command, arg string) (bool, bool) {
 			}
 			if f.NoOptDefVal != "" {
 				rest = rest[1:]
+				// A boolean shorthand takes no separate value, but pflag
+				// accepts an attached one ("-t=false"). Treat it as part of
+				// this flag instead of looking up "=" as another shorthand.
+				if strings.HasPrefix(rest, "=") {
+					return true, false
+				}
 				continue
 			}
 			return true, len(rest) == 1
