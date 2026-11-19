@@ -751,7 +751,18 @@ func renderBoard(b *strings.Builder, tasks []v1.ThreadTask, budget int) {
 		}
 		return
 	}
-	// Even the compact board does not fit: keep the newest tasks.
+	// Even the compact board does not fit. The coordinator has no other board
+	// listing tool, so every open (live) task must stay visible: render the
+	// open tasks as short one-line rows, then promote the newest ones back to
+	// full or compact rows with whatever budget remains. Closed tasks are
+	// summarized. Falling back to a newest-only suffix would make older open
+	// work permanently invisible.
+	if text, ok := openBoardLines(tasks, budget); ok {
+		b.WriteString(text)
+		return
+	}
+	// No open tasks (or not even one-line open rows fit): keep the newest
+	// tasks as before.
 	start := len(tasks)
 	used = 0
 	for start > 0 {
@@ -776,6 +787,77 @@ func renderBoard(b *strings.Builder, tasks []v1.ThreadTask, budget int) {
 	for i := start; i < len(tasks); i++ {
 		b.WriteString(compact[i])
 	}
+}
+
+// openBoardLines renders every open task under budget, compactly when needed.
+// It returns false when there is no open work or the one-line rows cannot fit,
+// so the caller can fall back to a newest-only view.
+func openBoardLines(tasks []v1.ThreadTask, budget int) (string, bool) {
+	open := 0
+	for _, t := range tasks {
+		if t.Open {
+			open++
+		}
+	}
+	if open == 0 {
+		return "", false
+	}
+	const compacted = "(task board compacted to fit the prompt budget)\n"
+	closedNotice := ""
+	if closed := len(tasks) - open; closed > 0 {
+		closedNotice = fmt.Sprintf("(%d closed tasks omitted)\n", closed)
+	}
+	fixed := len(compacted) + len(closedNotice)
+	if fixed > budget {
+		return "", false
+	}
+
+	minimal := make([]string, len(tasks))
+	used := 0
+	for _, titleLimit := range []int{80, 40, 20, 8, 0} {
+		used = fixed
+		for i := range tasks {
+			minimal[i] = ""
+			if !tasks[i].Open {
+				continue
+			}
+			minimal[i] = fmt.Sprintf("- %s %s %q\n", tasks[i].ID, openState(tasks[i].Open), limitRunes(tasks[i].Title, titleLimit))
+			used += len(minimal[i])
+		}
+		if used <= budget {
+			break
+		}
+	}
+	if used > budget {
+		return "", false
+	}
+
+	// Spend what is left promoting the newest open tasks: full rows first,
+	// compact rows when a full row does not fit.
+	rows := append([]string(nil), minimal...)
+	remaining := budget - used
+	for i := len(tasks) - 1; i >= 0; i-- {
+		if !tasks[i].Open {
+			continue
+		}
+		if delta := len(taskLine(tasks[i], 0, 0, 0)) - len(rows[i]); delta <= remaining {
+			rows[i] = taskLine(tasks[i], 0, 0, 0)
+			remaining -= delta
+			continue
+		}
+		if delta := len(taskLine(tasks[i], 80, 120, 40)) - len(rows[i]); delta <= remaining {
+			rows[i] = taskLine(tasks[i], 80, 120, 40)
+			remaining -= delta
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(compacted)
+	b.WriteString(closedNotice)
+	for _, row := range rows {
+		b.WriteString(row)
+	}
+	return b.String(), true
 }
 
 // taskLine renders one board row. Non-positive limits keep the full value.

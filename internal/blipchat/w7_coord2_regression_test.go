@@ -2,6 +2,7 @@ package blipchat
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -55,6 +56,35 @@ func TestPromptKeepsLegalWideRuneTurn(t *testing.T) {
 	}
 	if live.Status.ConsumedSeq != 1 {
 		t.Errorf("consumedSeq = %d, want 1", live.Status.ConsumedSeq)
+	}
+}
+
+// When even the compact board does not fit, every open task must still reach
+// the prompt: the coordinator has no other board listing tool.
+func TestBoardPromptShowsAllOpenTasks(t *testing.T) {
+	thread := testThread()
+	addMaxBoard(thread)
+	turn := testTurn("turn-1", "proj")
+	turn.Status.Seq = 1
+	turn.Spec.Text = "please look at the board"
+	prompt, last := boardPrompt(thread, thread.Status.Tasks, []v1.BlipTurn{*turn}, nil, "")
+	if len(prompt) > promptBudget {
+		t.Errorf("prompt = %d bytes, want at most the %d-byte budget", len(prompt), promptBudget)
+	}
+	if last != 1 {
+		t.Errorf("last rendered seq = %d, want the turn", last)
+	}
+	for i := 1; i <= 200; i++ {
+		id := fmt.Sprintf("t%03d", i)
+		if !strings.Contains(prompt, "- "+id+" open") {
+			t.Fatalf("prompt omitted open task %s", id)
+		}
+	}
+	if !strings.Contains(prompt, "task board compacted") {
+		t.Error("prompt did not disclose the compacted board")
+	}
+	if !strings.Contains(prompt, "please look at the board") {
+		t.Error("board crowding removed the turns section")
 	}
 }
 
