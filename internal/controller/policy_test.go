@@ -208,8 +208,7 @@ func blipObj(name, owner string, mutate ...func(spec map[string]any)) map[string
 	return map[string]any{"apiVersion": "blip.dev/v1alpha1", "kind": "Blip", "metadata": meta, "spec": spec}
 }
 
-func stateObj(name, owner, copyFrom string, mutate ...func(map[string]any)) map[string]any {
-	o := blipObj(name, owner)
+func stateObj(name, owner, copyFrom string, mutate ...func(map[string]any)) map[string]any {	o := blipObj(name, owner)
 	o["kind"] = "BlipState"
 	o["spec"] = map[string]any{}
 	if copyFrom != "" {
@@ -219,6 +218,15 @@ func stateObj(name, owner, copyFrom string, mutate ...func(map[string]any)) map[
 		m(o["spec"].(map[string]any))
 	}
 	return o
+}
+
+func threadObj(name, charter string) map[string]any {
+	return map[string]any{
+		"apiVersion": "blip.dev/v1alpha1",
+		"kind":       "BlipThread",
+		"metadata":   map[string]any{"name": name, "namespace": ns},
+		"spec":       map[string]any{"pool": "default", "charter": charter},
+	}
 }
 
 // sessionExec is the exec internal/session opens for a blip session.
@@ -246,6 +254,9 @@ func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map
 	}
 	if strings.HasPrefix(p.resource, "blipturns") {
 		gvk.Kind = "BlipTurn"
+	}
+	if p.resource == "blipthreads" {
+		gvk.Kind = "BlipThread"
 	}
 	var obj, old runtime.Object
 	if p.object != nil {
@@ -347,6 +358,10 @@ func TestVMOwnerPolicy(t *testing.T) {
 		{"own blip update", policyRequest{user: mine, op: admission.Update, resource: "blips", name: o + ".a", object: blipObj(o+".a", o), oldObject: blipObj(o+".a", o)}, true, ""},
 		{"own blip status", policyRequest{user: mine, op: admission.Update, resource: "blips/status", name: o + ".a", object: blipObj(o+".a", o), oldObject: blipObj(o+".a", o)}, false, "may not change status"},
 		{"own state status", policyRequest{user: mine, op: admission.Update, resource: "blipstates/status", name: o + ".s", object: stateObj(o+".s", o, ""), oldObject: stateObj(o+".s", o, "")}, false, "may not change status"},
+		{"restricted creates thread", policyRequest{user: mine, op: admission.Create, resource: "blipthreads", name: "proj", object: threadObj("proj", "mine")}, false, "thread specs"},
+		{"restricted updates thread", policyRequest{user: mine, op: admission.Update, resource: "blipthreads", name: "victim", object: threadObj("victim", "pwned"), oldObject: threadObj("victim", "original")}, false, "thread specs"},
+		{"restricted deletes thread", policyRequest{user: mine, op: admission.Delete, resource: "blipthreads", name: "victim", oldObject: threadObj("victim", "original")}, false, "thread specs"},
+		{"unrestricted updates thread", policyRequest{user: admin, op: admission.Update, resource: "blipthreads", name: "proj", object: threadObj("proj", "new"), oldObject: threadObj("proj", "old")}, true, ""},
 		{"own state", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, o+".base")}, true, ""},
 		{"missing label", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", "")}, false, "must label"},
 		{"wrong label", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", x)}, false, "must label"},

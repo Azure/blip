@@ -11,7 +11,9 @@
 # and delete blips and states named "<owner>.<name>" and labelled
 # blip.dev/owner=<owner> (before and after the change) that reference only
 # such states (or copy/read-only mount shared bases), set no imagePullSecrets,
-# and create blips only in pools of its own service account. Every
+# and create blips only in pools of its own service account. Thread specs are
+# administrator-owned: a restricted VM may read its own thread through the
+# API proxy but may not create, change or delete threads. Every
 # ownerReference it sets must name a Blip of the same owner: fork blips may
 # only be owned by blips of the same owner, and states may only be owned by
 # such blips. A VM pod without an entry (vacant, or unknown) is denied, as is
@@ -32,7 +34,7 @@ spec:
     resourceRules:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
-        resources: [blips, blips/status, blipstates, blipstates/status]
+        resources: [blips, blips/status, blipstates, blipstates/status, blipthreads, blipthreads/status]
         operations: [CREATE, UPDATE, DELETE]
       - apiGroups: [""]
         apiVersions: [v1]
@@ -76,6 +78,14 @@ spec:
     - expression: "!variables.restricted || !has(request.subResource) || request.subResource != 'status'"
       messageExpression: >-
         'owner ' + variables.owner + ' may not change status; only the controller writes it'
+      reason: Forbidden
+    # A thread's spec is administrator-owned and blipchat is the only writer
+    # of its status. A restricted VM token may not create, relabel, rewrite or
+    # delete a thread: its charter, system prompt, pool and base decide what
+    # the project's coordinator runs next.
+    - expression: "variables.owner == '-' || request.resource.resource != 'blipthreads'"
+      messageExpression: >-
+        'thread specs are administrator-owned; VM service account ' + variables.callerSA + ' may not change them'
       reason: Forbidden
     - expression: >-
         !variables.vm || request.operation != 'CONNECT' ||
@@ -181,7 +191,7 @@ spec:
     resourceRules:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
-        resources: [blips, blips/status, blipstates, blipstates/status]
+        resources: [blips, blips/status, blipstates, blipstates/status, blipthreads, blipthreads/status]
         operations: [UPDATE, DELETE]
 ---
 # New objects stay fail-secure: no table means no creation.
@@ -199,7 +209,7 @@ spec:
     resourceRules:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
-        resources: [blips, blips/status, blipstates, blipstates/status]
+        resources: [blips, blips/status, blipstates, blipstates/status, blipthreads, blipthreads/status]
         operations: [CREATE]
 ---
 # Namespaces without blips keep pod exec working for their own workloads.
