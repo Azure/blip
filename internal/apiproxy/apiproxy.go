@@ -316,6 +316,10 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error
 			// Rewrite runs AFTER ReverseProxy's hop-by-hop cleanup. A caller
 			// cannot nominate Authorization in Connection to remove our token.
 			stripIdentity(r.Out.Header)
+			// ReverseProxy clones Trailer before the inbound body reaches
+			// EOF, so the outbound map still has no values when net/http
+			// serializes the request; only the announcement is sent. Keep
+			// stripping names in case trailer forwarding is fixed later.
 			stripIdentity(r.Out.Trailer)
 		},
 		Transport:     roundTripper,
