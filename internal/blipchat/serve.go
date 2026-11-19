@@ -328,7 +328,14 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 func nextWake(st *step, now time.Time) *metav1.Time {
 	var next time.Time
 	if hasOpenTask(st.tasks) {
-		next = now.Add(st.s.Config.Heartbeat)
+		heartbeat := st.s.Config.Heartbeat
+		if st.thread != nil && st.thread.Spec.Heartbeat != nil && st.thread.Spec.Heartbeat.Duration > 0 {
+			heartbeat = st.thread.Spec.Heartbeat.Duration
+		}
+		if heartbeat <= 0 {
+			heartbeat = 30 * time.Minute
+		}
+		next = now.Add(heartbeat)
 	}
 	for _, timer := range st.timers {
 		if timer.At.After(now) && (next.IsZero() || timer.At.Time.Before(next)) {
