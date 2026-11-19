@@ -293,3 +293,120 @@ func TestStreamSignalGraceMaxAbandonsBlockedOutput(t *testing.T) {
 		t.Fatal("guest command was not torn down after detach")
 	}
 }
+
+// blockedStdinConn answers the session open, then blocks every stdin write
+// until it is closed. It models a guest whose stdin transport is full and that
+// is not reading further frames, which is what serialized a forwarded signal
+// behind a blocked stdin write.
+type blockedStdinConn struct {
+	opened    *bytes.Reader
+	mu        sync.Mutex
+	wroteOpen bool
+	blocked   chan struct{}
+	blockOnce sync.Once
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newBlockedStdinConn(opened []byte) *blockedStdinConn {
+	return &blockedStdinConn{
+		opened:  bytes.NewReader(opened),
+		blocked: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (c *blockedStdinConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if c.opened.Len() > 0 {
+		n, err := c.opened.Read(p)
+		c.mu.Unlock()
+		return n, err
+	}
+	c.mu.Unlock()
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *blockedStdinConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	if !c.wroteOpen {
+		c.wroteOpen = true
+		c.mu.Unlock()
+		return len(p), nil
+	}
+	c.mu.Unlock()
+	c.blockOnce.Do(func() { close(c.blocked) })
+	<-c.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (c *blockedStdinConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+// TestStreamSignalIsNotSerializedBehindBlockedStdin is the w7-10 defect 3
+// client regression: when stdin is stuck on a backpressured transport, a
+// SIGTERM must still reach the grace timer and detach at signalGraceMax. It
+// used to wait for the blocked wire write, so the client lived for tens of
+// seconds and the guest command kept draining input after the client went
+// away.
+func TestStreamSignalIsNotSerializedBehindBlockedStdin(t *testing.T) {
+	own := make(chan os.Signal, 16)
+	signal.Notify(own, syscall.SIGTERM)
+	defer signal.Stop(own)
+
+	var ack bytes.Buffer
+	aw := wire.NewConn(&ack)
+	if err := aw.WriteJSON(wire.TOpened, wire.Opened{Session: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	conn := newBlockedStdinConn(ack.Bytes())
+	client := &session.Client{Connect: func(context.Context, string, string) (io.ReadWriteCloser, error) {
+		return conn, nil
+	}}
+	s, err := client.Open(context.Background(), "ns", "pod", wire.Open{Mode: wire.OpenExec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	a := testApp(strings.NewReader(strings.Repeat("x", 1<<20)), io.Discard, io.Discard)
+	a.signalGrace = 200 * time.Millisecond
+	a.signalGraceMax = 400 * time.Millisecond
+	done := make(chan error, 1)
+	go func() { done <- a.stream(context.Background(), s, streamOpts{blip: "test", sendEOF: true}) }()
+
+	select {
+	case <-conn.blocked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stdin write never blocked")
+	}
+
+	start := time.Now()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		select {
+		case err := <-done:
+			var exitErr *ExitError
+			if !errors.As(err, &exitErr) || exitErr.Code != 128+int(syscall.SIGTERM) {
+				t.Fatalf("stream returned %v, want exit 143", err)
+			}
+			if elapsed := time.Since(start); elapsed > 3*time.Second {
+				t.Fatalf("stream took %v with a blocked stdin write, want <= 3s", elapsed)
+			}
+			select {
+			case <-conn.closed:
+			default:
+				t.Fatal("transport was not closed when the stream detached")
+			}
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream stayed blocked behind a backpressured stdin write")
+		}
+	}
+}

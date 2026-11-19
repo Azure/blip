@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -1065,6 +1066,47 @@ func (s *session) terminate() {
 	}()
 }
 
+// watchPeerClose calls gone when the peer closes the stream, even while the
+// session frame loop is blocked waiting for stdin queue space. Polling for a
+// hangup does not consume buffered frames, so it can distinguish a closed
+// transport from data that is merely waiting to be read. Connections without a
+// file descriptor (for example net.Pipe in tests) fall back to the frame loop
+// noticing the close after it is unblocked.
+func watchPeerClose(conn io.Closer, stop <-chan struct{}, gone func()) {
+	sc, ok := conn.(syscall.Conn)
+	if !ok {
+		return
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return
+	}
+	var fd int
+	if err := raw.Control(func(f uintptr) { fd = int(f) }); err != nil {
+		return
+	}
+	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLRDHUP}}
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		pfd[0].Revents = 0
+		n, err := unix.Poll(pfd, 100)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return
+		}
+		if n > 0 && pfd[0].Revents&(unix.POLLRDHUP|unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+			gone()
+			return
+		}
+	}
+}
+
 // serve attaches a client until it disconnects or the session ends. A
 // follower receives retained and live output but is not registered as a
 // reader, so its cursor never pins the replay ring and never backpressures
@@ -1082,12 +1124,31 @@ func (s *session) serve(c *wire.Conn, conn io.Closer, follow bool) {
 	}
 	s.mu.Unlock()
 	s.g.addClients(1)
+	// A stdin frame can block the frame loop when the hard input bound is
+	// full. An exec client may close the transport while that happens (it
+	// detached after its signal grace, or was killed). Watching for the
+	// close independently wakes the loop and stops input so the deferred
+	// detach below runs instead of leaving the command draining an
+	// unwatched upload. A primary session stays attached by design and
+	// keeps its stdin for a later client, so it is not watched.
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	if s.id != wire.PrimarySession {
+		go func() {
+			defer close(watchDone)
+			watchPeerClose(conn, stopWatch, s.closeInput)
+		}()
+	} else {
+		close(watchDone)
+	}
 	// Register the reader before releasing held pumps. pinLocked must see
 	// it, or output produced during the handshake could overflow the replay
 	// ring before write starts draining it. A follower deliberately has no
 	// such pin, so held pumps still release but output may be trimmed.
 	s.releasePumps()
 	defer func() {
+		close(stopWatch)
+		<-watchDone
 		conn.Close()
 		s.mu.Lock()
 		cl.closed = true

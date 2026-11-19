@@ -215,10 +215,26 @@ func detachedSignal(ch <-chan string) (string, bool) {
 // restore runs. Progress restarting the grace keeps a command that is still
 // cleaning up, or output the local writer is still draining, from being
 // reported as an unacknowledged signal.
+//
+// Signal writes run on their own goroutine. A stdin frame blocked on a
+// backpressured transport holds the wire write serialization, and waiting for
+// it here would keep the grace timer from ever starting (w7-10 defect 3).
+// Closing the transport when the grace expires unblocks the pending write.
 func forwardSignals(ctx context.Context, s *session.Session, detached chan<- string, grace, hard time.Duration, abandonStdin *atomic.Bool) {
 	ch := make(chan os.Signal, 4)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(ch)
+	// Buffered so a burst of signals never blocks the grace timer; a single
+	// writer preserves their order on the wire.
+	signals := make(chan string, 4)
+	go func() {
+		for name := range signals {
+			if err := s.Signal(name); err != nil {
+				return
+			}
+		}
+	}()
+	defer close(signals)
 	for {
 		var sig os.Signal
 		select {
@@ -231,9 +247,9 @@ func forwardSignals(ctx context.Context, s *session.Session, detached chan<- str
 		// signal behind a full stdin transport would otherwise be delayed by
 		// the rest of the upload.
 		abandonStdin.Store(true)
-		_ = s.Signal(name)
+		queueSignal(signals, name)
 
-		if !waitSignalGrace(ctx, s, ch, grace, hard) {
+		if !waitSignalGrace(ctx, s, ch, signals, grace, hard) {
 			return
 		}
 		// Publish first: the channel is buffered, and stream only consults
@@ -244,12 +260,22 @@ func forwardSignals(ctx context.Context, s *session.Session, detached chan<- str
 	}
 }
 
+// queueSignal hands a signal to the writer without ever blocking the grace
+// timer behind a stdin frame that is stuck on the transport.
+func queueSignal(signals chan<- string, name string) {
+	select {
+	case signals <- name:
+	default:
+		// The writer is already behind; the grace below decides the outcome.
+	}
+}
+
 // waitSignalGrace waits for the guest to end the session after a signal. It
 // returns false when ctx is done and true when the grace expired without any
 // progress. Immediate signals are still forwarded while waiting, but a
 // repeated signal does not extend the grace by itself. hard caps the total
 // wait even while output is still being delivered to a stalled consumer.
-func waitSignalGrace(ctx context.Context, s *session.Session, ch <-chan os.Signal, grace, hard time.Duration) bool {
+func waitSignalGrace(ctx context.Context, s *session.Session, ch <-chan os.Signal, signals chan<- string, grace, hard time.Duration) bool {
 	deadline := time.Now().Add(grace)
 	hardDeadline := time.Now().Add(hard)
 	progress := s.Progress()
@@ -260,7 +286,7 @@ func waitSignalGrace(ctx context.Context, s *session.Session, ch <-chan os.Signa
 		case <-ctx.Done():
 			return false
 		case more := <-ch:
-			_ = s.Signal(strings.TrimPrefix(unix.SignalName(more.(syscall.Signal)), "SIG"))
+			queueSignal(signals, strings.TrimPrefix(unix.SignalName(more.(syscall.Signal)), "SIG"))
 		case <-tick.C:
 			// Output that the command produced before the signal, or that the
 			// local writer is still draining, proves the session is making
