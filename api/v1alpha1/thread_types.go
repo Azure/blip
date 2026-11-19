@@ -75,6 +75,9 @@ type BlipThreadStatus struct {
 	NextWake *metav1.Time `json:"nextWake,omitempty"`
 	// TokensToday is the token spend in the current day.
 	TokensToday int64 `json:"tokensToday,omitempty"`
+	// TokenDay is the day TokensToday refers to, in YYYY-MM-DD. It resets
+	// the daily budget at midnight UTC.
+	TokenDay string `json:"tokenDay,omitempty"`
 	// Paused stops coordinator steps. Turns still accumulate.
 	Paused *ThreadPause `json:"paused,omitempty"`
 	// Tasks is the coordinator's task board.
@@ -168,7 +171,7 @@ type BlipTurnSpec struct {
 	// Thread is the name of the BlipThread this turn belongs to.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
-	Thread string `json:"thread"`
+	Thread string     `json:"thread"`
 	Author TurnAuthor `json:"author"`
 	// Topic is a free-form dotted label such as blip.report, chat.propose,
 	// or engine.capacity. Nothing in the engine interprets it.

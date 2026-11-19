@@ -17,10 +17,12 @@ spec:
         operations: [CREATE]
   variables:
     - name: blipchat
-      expression: "'system:serviceaccount:' + request.namespace + ':blipchat'"
+      expression: >-
+        request.userInfo.username.startsWith('system:serviceaccount:') &&
+        request.userInfo.username.split(':')[3] == 'blipchat'
   validations:
     - expression: >-
-        request.userInfo.username == variables.blipchat ||
+        variables.blipchat ||
         (request.object.spec.author.kind == 'ServiceAccount' &&
         request.object.spec.author.name == request.userInfo.username)
       messageExpression: >-

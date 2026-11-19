@@ -227,7 +227,11 @@ exec and stop blips; manage tasks and timers), and then writes its turns and
 one status update. One worker per thread serializes status writes. The model
 is any OpenAI-compatible endpoint selected with `--llm-base-url`; the chat
 front end authenticates users and blipchat reads the identity from
-`X-Forwarded-User`.
+`X-Forwarded-User`. The chat is stateless: the browser sends its transcript and
+`POST /chat?namespace=NS` names the thread. Chat inspection is read-only:
+running blips accept a small allowlist (`git status|log|diff|show`, `ls`,
+`cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `pwd`) and finished blips
+report their last report.
 
 ### CLI
 

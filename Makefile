@@ -1,4 +1,4 @@
-BINARIES := blip-controller blip-node blip-runtime blip-guest kubectl-blip
+BINARIES := blip-controller blip-node blip-runtime blipchat blip-guest kubectl-blip
 CONTROLLER_GEN ?= $(shell go env GOPATH)/bin/controller-gen
 
 .PHONY: build generate test test-sim guest images kind-up kind-down

@@ -225,6 +225,11 @@ spec:
                 x-kubernetes-list-map-keys:
                 - id
                 x-kubernetes-list-type: map
+              tokenDay:
+                description: |-
+                  TokenDay is the day TokensToday refers to, in YYYY-MM-DD. It resets
+                  the daily budget at midnight UTC.
+                type: string
               tokensToday:
                 description: TokensToday is the token spend in the current day.
                 format: int64

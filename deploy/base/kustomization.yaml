@@ -7,3 +7,4 @@ resources:
   - vm-owner-policy.yaml
   - turn-policy.yaml
   - node.yaml
+  - blipchat.yaml

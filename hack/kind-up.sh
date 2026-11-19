@@ -119,7 +119,7 @@ make build guest
 hack/build-images.sh
 # shellcheck source=/dev/null
 source build/images.env
-load_images "${CONTROLLER_IMAGE}" "${NODE_IMAGE}" "${RUNTIME_IMAGE}"
+load_images "${CONTROLLER_IMAGE}" "${NODE_IMAGE}" "${RUNTIME_IMAGE}" "${BLIPCHAT_IMAGE}"
 
 # The dev sandbox image (blip-registry:5000/blip/dev:latest inside the cluster),
 # with bin/kubectl-blip from `make build` above.
@@ -141,6 +141,9 @@ images:
   - name: ghcr.io/azure/blip-node
     newName: ${NODE_IMAGE%:*}
     newTag: "${NODE_IMAGE##*:}"
+  - name: ghcr.io/azure/blipchat
+    newName: ${BLIPCHAT_IMAGE%:*}
+    newTag: "${BLIPCHAT_IMAGE##*:}"
 patches:
   - patch: |-
       apiVersion: apps/v1
@@ -165,6 +168,7 @@ k apply -k build/kind
 
 k -n blip-system rollout status deployment/blip-controller --timeout 3m
 k -n blip-system rollout status daemonset/blip-node --timeout 3m
+k -n blip-system rollout status deployment/blipchat --timeout 3m
 
 cat <<EOF
 
