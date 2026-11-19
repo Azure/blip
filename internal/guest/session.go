@@ -31,6 +31,7 @@ type session struct {
 	attached  bool                 // a client has ever attached
 	readers   map[*client]struct{} // clients whose output cursor must be preserved
 	delivered bool                 // a client has received the exit status
+	procDone  bool                 // the process has been reaped (output may still drain)
 	exited    bool
 	status    wire.Exit
 
@@ -47,6 +48,8 @@ type session struct {
 	inDropped bool      // input was discarded because the process is not reading
 	inStalled bool      // no input space was freed for inputStallTimeout
 	inNotice  time.Time // when the stdin-discarded notice was last sent
+	inWrote   bool      // input has reached the process
+	inLast    byte      // last input byte written, for terminal EOF handling
 
 	// Exec sessions hold output pumps until the client is attached (right
 	// after TOpened), so output produced during the open handshake cannot
@@ -75,6 +78,18 @@ const (
 	// detachGrace is how long a detached exec command gets between SIGTERM
 	// and SIGKILL after its last client goes away.
 	detachGrace = 2 * time.Second
+	// ttyEOFSettle lets a program that is switching the terminal to raw
+	// mode (line editors do this at startup) finish before the guest
+	// decides whether a canonical VEOF will be interpreted as EOF or data.
+	ttyEOFSettle = 50 * time.Millisecond
+	// ttyEOFDrain gives the output pump a moment to collect what the
+	// command produced from the final input before a raw terminal is hung
+	// up, which is the only in-band EOF-like event a raw PTY reader sees.
+	ttyEOFDrain = 100 * time.Millisecond
+	// ttyEOFFallback bounds the canonical VEOF wait. If the terminal became
+	// raw after the VEOFs were queued, the program would consume them as
+	// data and keep waiting; hanging up then ends the session instead.
+	ttyEOFFallback = 500 * time.Millisecond
 )
 
 type client struct {
@@ -169,6 +184,9 @@ func (g *Guest) startSessionOpen(id, openID string, s procSpec, base []string, h
 	}
 	go func() {
 		ws := <-p.wait
+		ss.mu.Lock()
+		ss.procDone = true
+		ss.mu.Unlock()
 		// The process can no longer write. Let pumps that were held for a
 		// client drain the rest of the pipe (or PTY) into the replay ring,
 		// so a caller that attaches after the command exited still sees its
@@ -435,6 +453,10 @@ func (s *session) writeInput(b []byte) {
 	} else {
 		_, _ = p.stdin.Write(b)
 	}
+	if len(b) > 0 {
+		s.inWrote = true
+		s.inLast = b[len(b)-1]
+	}
 }
 
 func (s *session) endInput() {
@@ -442,7 +464,15 @@ func (s *session) endInput() {
 	if p == nil {
 		return
 	}
-	if p.tty != nil {
+	if p.tty == nil {
+		_ = p.stdin.Close()
+		return
+	}
+	// A program switching to raw mode does so during startup, often after
+	// the client has already queued its input and EOF. Let that transition
+	// settle before choosing how to signal EOF.
+	time.Sleep(ttyEOFSettle)
+	if canonical, ok := ttyCanonical(p.tty); !ok || canonical {
 		// In canonical mode the first VEOF (Ctrl-D) delivers a partial line
 		// to the reader but does not end the read: only a VEOF at the start
 		// of an empty line makes read(2) return 0. A piped caller sends its
@@ -451,9 +481,91 @@ func (s *session) endInput() {
 		// normal stdin byte and does not go through endInput, so typing it
 		// still behaves as before.
 		_, _ = p.tty.Write([]byte{4, 4})
-	} else {
-		_ = p.stdin.Close()
+		if ok {
+			// If the terminal becomes raw after these bytes were queued,
+			// the program will consume them as data and wait forever. A
+			// bounded check turns that case into a hangup.
+			go s.hangupIfRaw(p.tty)
+		}
+		return
 	}
+	// A raw line editor keeps its own line buffer, so a newline submits a
+	// pending partial line. Once the terminal is canonical again, a VEOF at
+	// the start of the next (empty) line gives the reader a real EOF. This
+	// preserves the partial line instead of discarding it with a hangup.
+	if s.inWrote && s.inLast != '\n' && ttySetCanonical(p.tty) {
+		_, _ = p.tty.Write([]byte{'\n', 4})
+		// A program that restores raw mode before consuming the VEOF would
+		// read it as data; bound that case with a hangup.
+		go s.hangupIfRaw(p.tty)
+		return
+	}
+	// A raw PTY has no in-band EOF: VEOF is ordinary data there. The only
+	// EOF-like event a raw reader can observe is the master going away,
+	// which makes its read fail instead of blocking.
+	if s.inWrote && s.inLast != '\n' {
+		_, _ = p.tty.Write([]byte{'\n'})
+	}
+	if s.inWrote {
+		time.Sleep(ttyEOFDrain)
+	}
+	s.mu.Lock()
+	done := s.procDone
+	s.mu.Unlock()
+	if !done {
+		// p.close runs after the output pumps drain when the process exits.
+		// Closing here would cut that drain short.
+		_ = p.tty.Close()
+	}
+}
+
+// ttyCanonical reports whether the terminal currently uses canonical input.
+// ok is false when the terminal settings cannot be read; callers then keep the
+// historical canonical-VEOF behavior.
+func ttyCanonical(f *os.File) (canonical, ok bool) {
+	var st *unix.Termios
+	err := withFD(f, func(fd int) error {
+		var err error
+		st, err = unix.IoctlGetTermios(fd, unix.TCGETS)
+		return err
+	})
+	if err != nil || st == nil {
+		return true, false
+	}
+	return st.Lflag&unix.ICANON != 0, true
+}
+
+// ttySetCanonical switches a terminal to canonical input so a VEOF is
+// interpreted as end-of-file. It reports whether the setting was applied.
+func ttySetCanonical(f *os.File) bool {
+	err := withFD(f, func(fd int) error {
+		st, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+		if err != nil {
+			return err
+		}
+		st.Lflag |= unix.ICANON
+		return unix.IoctlSetTermios(fd, unix.TCSETS, st)
+	})
+	return err == nil
+}
+
+// hangupIfRaw closes a terminal that turned raw after canonical VEOFs were
+// queued. Those bytes are data in raw mode, so the reader would otherwise wait
+// for input that can no longer arrive.
+func (s *session) hangupIfRaw(f *os.File) {
+	time.Sleep(ttyEOFFallback)
+	if canonical, ok := ttyCanonical(f); ok && canonical {
+		return
+	}
+	s.mu.Lock()
+	done := s.procDone
+	s.mu.Unlock()
+	if done {
+		// The process exited; p.close owns the descriptor and the output
+		// pumps may still be draining it.
+		return
+	}
+	_ = f.Close()
 }
 
 // queueInput appends stdin.

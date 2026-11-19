@@ -397,6 +397,194 @@ func TestTTYEOFEndsPartialLineInput(t *testing.T) {
 	}
 }
 
+// TestTTYRawEOFEndsSessionWithoutVEOFData verifies that piped stdin EOF ends a
+// program which put the terminal into raw mode. A raw-mode reader interprets
+// the canonical VEOF bytes as ordinary data, so it both received 004 004 and
+// waited forever. The guest must end the session without injecting those bytes
+// as input.
+func TestTTYRawEOFEndsSessionWithoutVEOFData(t *testing.T) {
+	master, slave, err := openPTY()
+	if err != nil {
+		t.Skipf("open PTY: %v", err)
+	}
+	defer master.Close()
+
+	cmd := exec.Command("sh", "-c", "stty raw -echo; cat")
+	cmd.Stdin = slave
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slave.Close()
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		slave.Close()
+		t.Skipf("start cat on PTY: %v", err)
+	}
+	slave.Close()
+	defer func() { _ = cmd.Process.Kill() }()
+
+	s := &session{proc: &proc{tty: master}, tty: true, out: ring{max: ringSize}}
+	s.inCond = sync.NewCond(&s.inMu)
+	go s.pumpInput()
+	defer s.closeInput()
+
+	if err := s.queueInput([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The terminal is only known to be raw once cat has returned the partial
+	// line without a newline. Reading that output also proves the data was
+	// delivered before EOF.
+	var (
+		mu  sync.Mutex
+		got bytes.Buffer
+	)
+	eof := make(chan struct{})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := stdout.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				got.Write(buf[:n])
+				mu.Unlock()
+			}
+			if rerr != nil {
+				close(eof)
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		seen := got.Len() >= 3
+		mu.Unlock()
+		if seen {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("raw-mode cat did not receive the piped bytes")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	s.queueEOF()
+
+	select {
+	case <-eof:
+	case <-time.After(5 * time.Second):
+		t.Fatal("raw-mode cat still waits for input after piped stdin closed")
+	}
+	mu.Lock()
+	out := got.Bytes()
+	mu.Unlock()
+	if bytes.Contains(out, []byte{4}) {
+		t.Fatalf("raw-mode reader received VEOF as data: %q", out)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("raw-mode cat did not exit after EOF")
+	}
+}
+
+// TestTTYRawEOFSubmitsPartialLine verifies that a piped final line without a
+// newline is still executed by a raw-mode reader. The guest submits the line
+// the reader is holding and then delivers a canonical VEOF, instead of
+// appending VEOF bytes to the raw line buffer.
+func TestTTYRawEOFSubmitsPartialLine(t *testing.T) {
+	master, slave, err := openPTY()
+	if err != nil {
+		t.Skipf("open PTY: %v", err)
+	}
+	defer master.Close()
+
+	cmd := exec.Command("sh", "-c", "stty raw -echo; echo READY; IFS= read -r x; echo GOT=$x")
+	cmd.Stdin = slave
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slave.Close()
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		slave.Close()
+		t.Skipf("start shell on PTY: %v", err)
+	}
+	slave.Close()
+	defer func() { _ = cmd.Process.Kill() }()
+
+	s := &session{proc: &proc{tty: master}, tty: true, out: ring{max: ringSize}}
+	s.inCond = sync.NewCond(&s.inMu)
+	go s.pumpInput()
+	defer s.closeInput()
+
+	var (
+		mu  sync.Mutex
+		got bytes.Buffer
+	)
+	exited := make(chan struct{})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := stdout.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				got.Write(buf[:n])
+				mu.Unlock()
+			}
+			if rerr != nil {
+				close(exited)
+				return
+			}
+		}
+	}()
+
+	// Queue the partial line only after the shell has set raw mode, so the
+	// test exercises the raw EOF path regardless of startup timing.
+	waitFor := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			mu.Lock()
+			seen := bytes.Contains(got.Bytes(), []byte(want))
+			mu.Unlock()
+			if seen {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("reader did not print %q", want)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitFor("READY")
+
+	if err := s.queueInput([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	s.queueEOF()
+
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("raw-mode read did not finish after piped stdin closed")
+	}
+	mu.Lock()
+	out := got.String()
+	mu.Unlock()
+	if !bytes.Contains([]byte(out), []byte("GOT=abc")) {
+		t.Fatalf("partial line was not executed: %q", out)
+	}
+	if bytes.Contains([]byte(out), []byte{4}) {
+		t.Fatalf("raw-mode reader received VEOF as data: %q", out)
+	}
+}
+
 // TestQueuedInputPreservesOrder checks that stdin and its end-of-file marker
 // are written in order by the input pump.
 func TestQueuedInputPreservesOrder(t *testing.T) {
