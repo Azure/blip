@@ -10,11 +10,9 @@ import (
 // ambiguousCommandFlag returns the first flag-looking token that pflag parsed
 // after the command's own arguments began without an explicit "--". pflag
 // parses interspersed flags, so "run echo -n ns" silently applies -n to blip
-// instead of passing it to echo. commandStartsAt is the number of leading
-// positional arguments that belong to the CLI syntax (0 for run, 1 for exec's
-// blip name). The token is returned only when it is a known blip flag;
-// unknown flags already fail parsing with a clear error.
-func ambiguousCommandFlag(cmd *cobra.Command, argv []string, commandStartsAt int) (string, bool) {
+// instead of passing it to echo. The token is returned only when it is a known
+// blip flag; unknown flags already fail parsing with a clear error.
+func ambiguousCommandFlag(cmd *cobra.Command, argv []string) (string, bool) {
 	i := skipUntilCommand(cmd, argv)
 	positionals := 0
 	for i < len(argv) {
@@ -29,7 +27,7 @@ func ambiguousCommandFlag(cmd *cobra.Command, argv []string, commandStartsAt int
 			i++
 			continue
 		}
-		if positionals > commandStartsAt {
+		if positionals > 0 {
 			return arg, true
 		}
 		i++
@@ -44,8 +42,8 @@ func ambiguousCommandFlag(cmd *cobra.Command, argv []string, commandStartsAt int
 // the command without an explicit "--". Without this pflag silently parses the
 // token as a blip flag, so the command runs with different arguments than the
 // user wrote.
-func (a *app) rejectAmbiguousCommandFlags(cmd *cobra.Command, commandStartsAt int, usage string) error {
-	if arg, ok := ambiguousCommandFlag(cmd, a.args, commandStartsAt); ok {
+func (a *app) rejectAmbiguousCommandFlags(cmd *cobra.Command, usage string) error {
+	if arg, ok := ambiguousCommandFlag(cmd, a.args); ok {
 		return fmt.Errorf("flag %q was parsed by blip after the command began; put -- before the command so it is passed through: %s", arg, usage)
 	}
 	return nil

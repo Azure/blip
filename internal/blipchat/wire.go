@@ -105,10 +105,6 @@ const (
 	recordStart streamRecordType = 4
 	recordEnd   streamRecordType = 5
 	recordGap   streamRecordType = 6
-	// streamRecordHeader is the ring's per-record header size. Offsets are
-	// logical record starts, so the next record begins this far after the
-	// data. It is only used to make test records realistic.
-	streamRecordHeader = 32
 )
 
 // UnmarshalJSON accepts an object shaped {o,g,t,d} and also a four-element

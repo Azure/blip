@@ -56,7 +56,7 @@ func authorize(states []*v1alpha1.BlipState, blips []*v1alpha1.Blip, node string
 		}
 	}
 	for _, b := range blips {
-		if blipFinished(b) || b.Status.Node != node {
+		if v1alpha1.Finished(b) || b.Status.Node != node {
 			continue
 		}
 		for _, m := range b.Status.Mounts {

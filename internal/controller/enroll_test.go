@@ -200,27 +200,6 @@ func TestEnrollRemovesStaleHypervisorLabel(t *testing.T) {
 	}
 }
 
-// TestEnrollWaitsForMigration checks that a legacy pool with no selector does
-// not make the controller drain nodes during an upgrade.
-func TestEnrollWaitsForMigration(t *testing.T) {
-	e := newEnv(t)
-	e.addEnrollableNode("n1", map[string]string{
-		v1.LabelEnrolled:                 "true",
-		v1.LabelHypervisorPrefix + "kvm": "true",
-	}, "kvm")
-	e.create(&v1.BlipPool{ObjectMeta: metav1.ObjectMeta{Name: "default"}})
-
-	e.run(e.enroll, "", "n1")
-
-	n1 := e.getNode("n1")
-	if n1.Labels[v1.LabelEnrolled] != "true" || n1.Labels[v1.LabelHypervisorPrefix+"kvm"] != "true" {
-		t.Errorf("migrating cluster changed enrollment labels: %v", n1.Labels)
-	}
-	if bn := e.getBlipNode("n1"); bn.Spec.Drain {
-		t.Error("migrating cluster drained a node")
-	}
-}
-
 // TestEnrollRemovesLabelsWithoutBlipNode covers a node whose agent already
 // disappeared: the controller still removes the labels it owns.
 func TestEnrollRemovesLabelsWithoutBlipNode(t *testing.T) {

@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -308,6 +308,55 @@ func TestStreamReadStoppedUsesView(t *testing.T) {
 	}
 }
 
+func TestStreamReadTrimmedHistoryEmitsGap(t *testing.T) {
+	f, err := os.OpenFile(ringFile(t), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := stream.NewWriter(f, stream.Offset, stream.MinSize, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Overflow the ring so the oldest records are trimmed.
+	for range 5 {
+		if _, err := w.Append(stream.TypeOut, bytes.Repeat([]byte("x"), stream.MaxRecord)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	rs := newRingStore()
+	rs.views["stream-c1"] = f.Name()
+	m := newStreamManager(rs, nil, self, func(string) string { return t.TempDir() }, nil)
+	s := &v1alpha1.BlipState{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "root", UID: types.UID("uid-root")},
+		Status: v1alpha1.BlipStateStatus{
+			StreamSize: stream.MinSize,
+			Committed:  &v1alpha1.Commit{ID: "c1", Generation: 2},
+			Placements: []string{self},
+		},
+	}
+	scheme, err := Scheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.states = fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
+
+	var got []stream.Record
+	if err := m.Log(context.Background(), "default", "root", 0, false, func(rec stream.Record) error {
+		got = append(got, rec)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 || got[0].Type != stream.TypeGap || got[0].Offset == 0 {
+		t.Fatalf("first record = %+v, want a gap at a trimmed offset", got)
+	}
+}
+
 func TestStreamIdleIgnoresUnstartedWriters(t *testing.T) {
 	rs := newRingStore()
 	rs.files["a1"] = ringFile(t)
@@ -366,20 +415,16 @@ func TestApplyIdleSetsStopReason(t *testing.T) {
 }
 
 func TestStateStreamSize(t *testing.T) {
-	q := func(v int64) *resource.Quantity {
-		x := resource.NewQuantity(v, resource.BinarySI)
-		return x
-	}
 	cases := []struct {
 		name string
 		s    *v1alpha1.BlipState
 		want int64
 	}{
 		{"default", &v1alpha1.BlipState{}, v1alpha1.DefaultStreamSize},
-		{"zero", &v1alpha1.BlipState{Spec: v1alpha1.BlipStateSpec{StreamSize: q(0)}}, v1alpha1.DefaultStreamSize},
-		{"clamp low", &v1alpha1.BlipState{Spec: v1alpha1.BlipStateSpec{StreamSize: q(4096)}}, stream.MinSize},
-		{"clamp high", &v1alpha1.BlipState{Spec: v1alpha1.BlipStateSpec{StreamSize: q(2 << 30)}}, stream.MaxSize},
-		{"align", &v1alpha1.BlipState{Spec: v1alpha1.BlipStateSpec{StreamSize: q(stream.MinSize + 1)}}, stream.MinSize + 4096},
+		{"zero", &v1alpha1.BlipState{Status: v1alpha1.BlipStateStatus{StreamSize: 0}}, v1alpha1.DefaultStreamSize},
+		{"clamp low", &v1alpha1.BlipState{Status: v1alpha1.BlipStateStatus{StreamSize: 4096}}, stream.MinSize},
+		{"clamp high", &v1alpha1.BlipState{Status: v1alpha1.BlipStateStatus{StreamSize: 2 << 30}}, stream.MaxSize},
+		{"align", &v1alpha1.BlipState{Status: v1alpha1.BlipStateStatus{StreamSize: stream.MinSize + 1}}, stream.MinSize + 4096},
 	}
 	for _, tc := range cases {
 		if got := stateStreamSize(tc.s); got != tc.want {

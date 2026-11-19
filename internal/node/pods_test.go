@@ -460,8 +460,8 @@ func TestReadPodDirsNamespaces(t *testing.T) {
 	}
 }
 
-// TestStateConfigPersisted: the state's own ImageConfig wins over the cached
-// live source, and a copy keeps its config after the source is deleted.
+// TestStateConfigPersisted: a state's persisted ImageConfig is returned, and a
+// missing config stays nil.
 func TestStateConfigPersisted(t *testing.T) {
 	v := newView()
 	cfg := &v1alpha1.ImageConfig{Env: []string{"A=1"}, Entrypoint: []string{"/bin/e"}, Cmd: []string{"c"}, WorkingDir: "/w", User: "u"}
@@ -475,25 +475,8 @@ func TestStateConfigPersisted(t *testing.T) {
 	if got := v.stateConfig(img); got == nil || len(got.Env) != 1 || got.Env[0] != "A=1" || got.User != "u" {
 		t.Fatalf("image config = %+v", got)
 	}
-
-	// A copy resolved while the source existed inherits its config.
-	src := state("src")
-	src.Status.ImageConfig = cfg
-	cp := state("cp")
-	cp.Status.CopiedFrom = &v1alpha1.CopySource{StateUID: string(src.UID), CommitID: "c1"}
-	v.states = append(v.states, src, cp)
-	v.index()
-	if got := v.stateConfig(cp); got == nil || got.WorkingDir != "/w" {
-		t.Fatalf("inherited config = %+v", got)
-	}
-
-	// The controller persists the inherited config on the copy; deleting the
-	// source then changes nothing.
-	cp.Status.ImageConfig = cfg
-	v.states = []*v1alpha1.BlipState{cp}
-	v.index()
-	if got := v.stateConfig(cp); got == nil || got.User != "u" || got.Cmd[0] != "c" || got.Entrypoint[0] != "/bin/e" {
-		t.Fatalf("persisted copy config = %+v", got)
+	if got := v.stateConfig(state("plain")); got != nil {
+		t.Fatalf("config without ImageConfig = %+v", got)
 	}
 }
 

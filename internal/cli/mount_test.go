@@ -420,7 +420,10 @@ func TestMountGuestRootAndSharedImport(t *testing.T) {
 	if err := os.WriteFile(a.env.NamespaceFile, []byte(ns), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a.env.Hostname = func() (string, error) { return b.Name, nil }
+	a.env.NameFile = filepath.Join(t.TempDir(), "name")
+	if err := os.WriteFile(a.env.NameFile, []byte(b.Name), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var errOut bytes.Buffer
 	a.env.Err = &errOut
 	ctx := context.Background()

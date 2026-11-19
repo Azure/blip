@@ -78,15 +78,9 @@ func (r *EnrollReconciler) Reconcile(ctx context.Context, rq reconcile.Request) 
 	if node.DeletionTimestamp != nil {
 		return reconcile.Result{}, nil
 	}
-	matched, migrating, err := r.matchesPool(ctx, node)
+	matched, err := r.matchesPool(ctx, node)
 	if err != nil {
 		return reconcile.Result{}, err
-	}
-	if migrating && !matched {
-		// Old pools without a selector cannot express membership. Leave
-		// nodes alone until every pool has been updated; unenrolling here
-		// would drain a working cluster during an upgrade.
-		return reconcile.Result{}, nil
 	}
 	bn := &v1.BlipNode{}
 	if err := r.Get(ctx, client.ObjectKey{Name: node.Name}, bn); err != nil {
@@ -101,14 +95,11 @@ func (r *EnrollReconciler) Reconcile(ctx context.Context, rq reconcile.Request) 
 	return r.unenroll(ctx, node, bn)
 }
 
-// matchesPool reports whether any pool selects node and whether any live pool
-// still has an empty selector (a pre-required-field pool). An empty selector
-// cannot express membership, so while one exists the cluster is migrating and
-// unselected nodes must not be drained.
-func (r *EnrollReconciler) matchesPool(ctx context.Context, node *corev1.Node) (matched, migrating bool, err error) {
+// matchesPool reports whether any pool selects node.
+func (r *EnrollReconciler) matchesPool(ctx context.Context, node *corev1.Node) (bool, error) {
 	var pools v1.BlipPoolList
 	if err := r.List(ctx, &pools); err != nil {
-		return false, false, err
+		return false, err
 	}
 	nodeLabels := labels.Set(node.Labels)
 	for i := range pools.Items {
@@ -116,15 +107,11 @@ func (r *EnrollReconciler) matchesPool(ctx context.Context, node *corev1.Node) (
 		if pool.DeletionTimestamp != nil {
 			continue
 		}
-		if len(pool.Spec.NodeSelector) == 0 {
-			migrating = true
-			continue
-		}
 		if labels.SelectorFromSet(pool.Spec.NodeSelector).Matches(nodeLabels) {
-			matched = true
+			return true, nil
 		}
 	}
-	return matched, migrating, nil
+	return false, nil
 }
 
 // enroll labels a matching node and clears an enrollment drain left by a

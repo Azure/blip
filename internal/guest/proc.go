@@ -111,15 +111,13 @@ func (r *reaper) start(argv0 string, argv []string, attr *os.ProcAttr) (int, <-c
 
 // procSpec describes the primary workload command.
 type procSpec struct {
-	argv []string // empty: login shell
-	env  []string
+	argv []string
 	dir  string
 	user string
 }
 
 // proc is a running workload process and the host side of its stdio.
 type proc struct {
-	pid    int
 	wait   <-chan unix.WaitStatus
 	stdin  *os.File // pipe the guest writes to
 	stdout *os.File // pipe the guest reads from
@@ -267,18 +265,16 @@ func canAccess(fi os.FileInfo, acct *account, owner, group, other os.FileMode) b
 // startProc starts the primary command chrooted in the root filesystem, as
 // the requested user, in the work cgroup. Its stdin and both output streams
 // are pipes owned by the guest.
-func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
+func (g *Guest) startProc(s procSpec, base []string) (*proc, error) {
 	acct, err := lookupAccount(g.root, s.user)
 	if err != nil {
-		return nil, nil, startFail(126, err)
+		return nil, startFail(126, err)
+	}
+	if len(s.argv) == 0 {
+		return nil, startFail(126, errors.New("empty command"))
 	}
 	argv := s.argv
-	argv0 := ""
-	if len(argv) == 0 {
-		argv = []string{"-" + path.Base(acct.shell)}
-		argv0 = acct.shell
-	}
-	env := g.procEnv(acct, s, base)
+	env := g.procEnv(acct, base)
 	// Validation and start failures below are not "command not found": the
 	// command may be fine but the workdir, credentials, or process setup is
 	// wrong, so they use the conventional 126 instead of the old 127.
@@ -299,19 +295,18 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	// the executable were missing. Stat it inside the root, like the chdir
 	// will happen after chroot.
 	if fi, err := statInRoot(g.root, dir); err != nil {
-		return nil, nil, startFail(126, fmt.Errorf("chdir %s: %w", dir, err))
+		return nil, startFail(126, fmt.Errorf("chdir %s: %w", dir, err))
 	} else if !fi.IsDir() {
-		return nil, nil, startFail(126, fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR))
+		return nil, startFail(126, fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR))
 	}
 	if err := checkDirAccess(g.root, dir, acct); err != nil {
-		return nil, nil, startFail(126, err)
+		return nil, startFail(126, err)
 	}
-	// Resolve a bare command after the workdir is known: a relative PATH
-	// entry is relative to the command's working directory, as in execvp.
-	if argv0 == "" {
-		if argv0, err = lookPath(g.root, dir, argv[0], env, acct); err != nil {
-			return nil, nil, err
-		}
+	// Resolve the command after the workdir is known: a relative PATH entry
+	// is relative to the command's working directory, as in execvp.
+	argv0, err := lookPath(g.root, dir, argv[0], env, acct)
+	if err != nil {
+		return nil, err
 	}
 
 	p := &proc{}
@@ -326,13 +321,13 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	}
 	inR, inW, err := os.Pipe()
 	if err != nil {
-		return nil, nil, startFail(126, err)
+		return nil, startFail(126, err)
 	}
 	outR, outW, err := os.Pipe()
 	if err != nil {
 		inR.Close()
 		inW.Close()
-		return nil, nil, startFail(126, err)
+		return nil, startFail(126, err)
 	}
 	errR, errW, err := os.Pipe()
 	if err != nil {
@@ -340,25 +335,25 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 		inW.Close()
 		outR.Close()
 		outW.Close()
-		return nil, nil, startFail(126, err)
+		return nil, startFail(126, err)
 	}
 	p.stdin, p.stdout, p.stderr = inW, outR, errR
 	child = []*os.File{inR, outW, errW}
-	pid, wait, err := g.reaper.start(argv0, argv, &os.ProcAttr{Dir: dir, Env: env, Files: child, Sys: attr})
+	_, wait, err := g.reaper.start(argv0, argv, &os.ProcAttr{Dir: dir, Env: env, Files: child, Sys: attr})
 	for _, f := range child {
 		f.Close()
 	}
 	if err != nil {
 		p.close()
-		return nil, nil, startFail(classifyStart(err), fmt.Errorf("start %s: %w", argv[0], err))
+		return nil, startFail(classifyStart(err), fmt.Errorf("start %s: %w", argv[0], err))
 	}
-	p.pid, p.wait = pid, wait
-	return p, argv, nil
+	p.wait = wait
+	return p, nil
 }
 
 // procEnv supplies the defaults for the primary command, regardless of its
 // user. Explicit workload values take priority.
-func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
+func (g *Guest) procEnv(acct *account, base []string) []string {
 	env := []string{
 		"PATH=" + defaultPath,
 		"HOME=" + acct.home,
@@ -379,7 +374,7 @@ func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
 	// The proxy bypass is applied after every caller-supplied list, so a
 	// workload proxy setting can add names but can never proxy a
 	// guest-local one.
-	return mergeEnv(env, base, s.env, proxyEnv(noProxy, base, s.env))
+	return mergeEnv(env, base, proxyEnv(noProxy, base))
 }
 
 // proxyEnv merges the guest-local names with a workload's NO_PROXY/no_proxy

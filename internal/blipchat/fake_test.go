@@ -271,6 +271,11 @@ func (f *fakeWire) promptIDs() []string {
 	return ids
 }
 
+// streamRecordHeader is the ring's per-record header size. Offsets are logical
+// record starts, so the next record begins this far after the data. It is only
+// used to make test records realistic.
+const streamRecordHeader = 32
+
 type chanReader struct {
 	ctx context.Context
 	ch  <-chan []byte
@@ -306,11 +311,6 @@ func waitFor(t *testing.T, what string, fn func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
-}
-
-func mustJSON(v any) string {
-	b, _ := json.Marshal(v)
-	return string(b)
 }
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

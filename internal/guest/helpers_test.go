@@ -32,12 +32,11 @@ func testRoot(t *testing.T) string {
 func testGuest(t *testing.T) *Guest {
 	t.Helper()
 	return &Guest{
-		root:       testRoot(t),
-		cgroupFD:   -1,
-		reaper:     newReaper(),
-		mounts:     map[string]*mount{},
-		frozen:     map[string]*frozenFS{},
-		stdio:      newStdio(),
-		shutdownCh: make(chan struct{}),
+		root:     testRoot(t),
+		cgroupFD: -1,
+		reaper:   newReaper(),
+		mounts:   map[string]*mount{},
+		frozen:   map[string]*frozenFS{},
+		stdio:    newStdio(),
 	}
 }

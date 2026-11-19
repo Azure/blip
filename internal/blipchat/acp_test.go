@@ -9,10 +9,6 @@ import (
 	"time"
 )
 
-func testAgent(send func(context.Context, []byte, bool) error) *acpAgent {
-	return newACPAgent(send, func(json.RawMessage) {}, func() {}, func(string) {}, "always")
-}
-
 func TestACPFeedFramesSplitLines(t *testing.T) {
 	var mu sync.Mutex
 	var got []json.RawMessage

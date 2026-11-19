@@ -279,7 +279,7 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 		}
 		return os.Rename(staging, absDst)
 	}
-	staging, _, modes, err := stageTree(ctx, src, absDst, info)
+	staging, modes, err := stageTree(ctx, src, absDst, info)
 	if err != nil {
 		return err
 	}
@@ -291,32 +291,31 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 }
 
 // stageTree copies src into a temporary directory used to merge into dst,
-// which must exist and be a directory. It prefers a directory beside dst so
-// mergeTree can swap the result atomically. When the parent is not writable or
-// is on another filesystem (a mount root, for example), staging happens inside
+// which must exist and be a directory. When the parent is writable and on the
+// same filesystem, staging happens beside dst; otherwise it happens inside
 // dst, on the filesystem the merge writes to.
-func stageTree(ctx context.Context, src, dst string, info os.FileInfo) (string, bool, []dirMode, error) {
+func stageTree(ctx context.Context, src, dst string, info os.FileInfo) (string, []dirMode, error) {
 	parent := filepath.Dir(dst)
 	if parent != dst && copyStageDevice(parent, dst) {
 		if staging, err := os.MkdirTemp(parent, collectTempPattern); err == nil {
 			modes, err := copyTreeInto(ctx, src, staging, info)
 			if err != nil {
 				removeTree(staging)
-				return "", false, nil, err
+				return "", nil, err
 			}
-			return staging, true, modes, nil
+			return staging, modes, nil
 		}
 	}
 	staging, err := os.MkdirTemp(dst, collectTempPattern)
 	if err != nil {
-		return "", false, nil, err
+		return "", nil, err
 	}
 	modes, err := copyTreeInto(ctx, src, staging, info)
 	if err != nil {
 		removeTree(staging)
-		return "", false, nil, err
+		return "", nil, err
 	}
-	return staging, false, modes, nil
+	return staging, modes, nil
 }
 
 // copyStageDevice reports whether two paths are on the same filesystem. It is
@@ -341,23 +340,6 @@ func sameDevice(a, b string) bool {
 		return false
 	}
 	return as.Dev == bs.Dev
-}
-
-// cwdInside reports whether the process's working directory is dst or below
-// it, so renaming dst would move the working directory out from under us.
-func cwdInside(dst string) bool {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return false
-	}
-	return cwd == dst || underDir(dst, cwd)
-}
-
-// swapUnsupported reports whether an atomic swap failed because the
-// destination cannot be renamed in its parent, which is normal for a
-// mountpoint or a boundary between filesystems.
-func swapUnsupported(err error) bool {
-	return errors.Is(err, unix.EXDEV) || errors.Is(err, unix.EBUSY)
 }
 
 // dirMode records the source mode a staged directory takes once it is in its

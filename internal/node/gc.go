@@ -108,7 +108,7 @@ func (v *view) keepCommit(c storage.Volume, sealed map[string][]v1alpha1.SealRes
 		return true
 	}
 	for _, b := range v.blips {
-		if blipFinished(b) {
+		if v1alpha1.Finished(b) {
 			continue
 		}
 		for _, m := range b.Status.Mounts {

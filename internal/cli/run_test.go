@@ -259,13 +259,12 @@ func TestRunAndGatherInsideLongNamedBlip(t *testing.T) {
 }
 
 // A Blip whose name exceeds the hostname limit still identifies itself through
-// the guest's name file, even though the hostname stays the VM pod name.
-func TestFindSelfUsesNameFileWhenHostnameDiffers(t *testing.T) {
+// the guest's name file.
+func TestFindSelfUsesNameFile(t *testing.T) {
 	name := "long-" + strings.Repeat("b", 70)
 	h := newHarness(t, runningBlip(name))
 	h.self = name
 	env := h.env(strings.NewReader(""), io.Discard, io.Discard)
-	env.Hostname = func() (string, error) { return "default-kx9pf", nil }
 	a := &app{env: env}
 	if _, err := a.clients(); err != nil {
 		t.Fatal(err)

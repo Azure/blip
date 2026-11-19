@@ -171,9 +171,9 @@ func VsockListenerPath(dir string, port uint32) string {
 
 // EnsurePodDir creates a pod directory with DirMode and tightens it and its
 // namespace parent to DirMode if they already exist with broader permissions.
-// The node agent calls it before writing Desired, so a directory created by
-// an older version (or by kubelet's DirectoryOrCreate) becomes root-only on
-// upgrade. It never widens a mode and never follows a symlink.
+// The node agent calls it before writing Desired, so a directory left at the
+// emptyDir default by kubelet's DirectoryOrCreate becomes root-only. It never
+// widens a mode and never follows a symlink.
 func EnsurePodDir(dir string) error {
 	if err := EnsureDir(dir); err != nil {
 		return err

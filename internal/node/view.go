@@ -361,35 +361,12 @@ func (v *view) fenced(podKey, podUID, attachmentID string) bool {
 	return pod != nil || v.podsGone[podKey]
 }
 
-func blipFinished(b *v1alpha1.Blip) bool {
-	return b.Status.Phase == v1alpha1.BlipSucceeded || b.Status.Phase == v1alpha1.BlipFailed
-}
-
-// stateConfig returns the image config a state was initialized from. It reads
-// the state's persisted ImageConfig first and only falls back to the old
-// live-source traversal for states created before ImageConfig was recorded.
-// Copies whose controller did not record an ImageConfig inherit the source's.
+// stateConfig returns the image config the controller recorded on the state.
 func (v *view) stateConfig(s *v1alpha1.BlipState) *image.Config {
-	for range 8 {
-		if s == nil {
-			return nil
-		}
-		if c := apiImageConfig(s.Status.ImageConfig); c != nil {
-			return c
-		}
-		if s.Status.ImageDigest != "" {
-			id, err := image.DigestOf(s.Status.ImageDigest)
-			if err != nil {
-				return nil
-			}
-			return v.configs[id]
-		}
-		if s.Status.CopiedFrom == nil {
-			return nil
-		}
-		s = v.stateByUID[s.Status.CopiedFrom.StateUID]
+	if s == nil {
+		return nil
 	}
-	return nil
+	return apiImageConfig(s.Status.ImageConfig)
 }
 
 func apiImageConfig(c *v1alpha1.ImageConfig) *image.Config {

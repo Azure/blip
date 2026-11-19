@@ -115,18 +115,14 @@ func (s *Store) runOperationContext(ctx context.Context, steps []deviceEffect, f
 			case s.devices != nil:
 				err = s.devices.Apply(e)
 			default:
-				err = applyDeviceEffectContext(ctx, e)
+				err = applyDeviceEffect(ctx, e)
 			}
 		}
 		m.complete(err)
 	}
 }
 
-func applyDeviceEffect(e deviceEffect) error {
-	return applyDeviceEffectContext(context.Background(), e)
-}
-
-func applyDeviceEffectContext(ctx context.Context, e deviceEffect) error {
+func applyDeviceEffect(ctx context.Context, e deviceEffect) error {
 	id := strconv.FormatUint(uint64(e.Thin), 10)
 	switch e.Kind {
 	case eCreateThin:

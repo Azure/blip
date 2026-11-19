@@ -30,13 +30,11 @@ type Env struct {
 	// ProgressDelay holds progress lines back so fast operations stay
 	// quiet.
 	ProgressDelay time.Duration
-	// NamespaceFile, NameFile and Hostname find the blip the command runs
-	// in. The guest writes its Blip name to NameFile so names longer than a
-	// hostname (64 bytes) still work; Hostname is the fallback for older
-	// guests. Without NamespaceFile the command is never inside a blip.
+	// NamespaceFile and NameFile find the blip the command runs in. The guest
+	// always writes its Blip name to NameFile. Without NamespaceFile the
+	// command is never inside a blip.
 	NamespaceFile string
 	NameFile      string
-	Hostname      func() (string, error)
 	// Args is the raw command line. Commands use it to notice flags that
 	// pflag parsed after a positional argument, where the user meant them
 	// for the command instead.
@@ -76,7 +74,7 @@ func init() {
 // DefaultEnv uses the process's stdio and kubeconfig.
 func DefaultEnv() *Env {
 	return &Env{In: os.Stdin, Out: os.Stdout, Err: os.Stderr, Connect: connect, ProgressDelay: time.Second,
-		NamespaceFile: "/run/blip/namespace", NameFile: "/run/blip/name", Hostname: os.Hostname}
+		NamespaceFile: "/run/blip/namespace", NameFile: "/run/blip/name"}
 }
 
 func connect(f KubeFlags) (*Clients, error) {
@@ -87,9 +85,9 @@ func connect(f KubeFlags) (*Clients, error) {
 	if err != nil {
 		return nil, err
 	}
-	// One `blip run` issues a burst of gets, creates, watches and an exec.
-	// client-go's default 5 QPS throttles the CLI itself, making fast
-	// sandboxes feel slow; the gateway and controller already disable it.
+	// One `blip run` issues a burst of gets, creates and watches. client-go's
+	// default 5 QPS throttles the CLI itself, making fast sandboxes feel
+	// slow, so allow a short burst.
 	cfg.QPS, cfg.Burst = 50, 100
 	ns := f.Namespace
 	if ns == "" {
@@ -131,11 +129,6 @@ type app struct {
 	self   *v1alpha1.Blip
 	owner  string
 	prefix string
-
-	// signalGrace overrides the default grace for tests. signalGraceMax
-	// overrides the hard cap.
-	signalGrace    time.Duration
-	signalGraceMax time.Duration
 }
 
 func (a *app) clients() (*Clients, error) {
@@ -167,12 +160,7 @@ func (a *app) findSelf(ctx context.Context) error {
 		}
 	}
 	if name == "" {
-		if a.env.Hostname == nil {
-			return nil
-		}
-		if name, err = a.env.Hostname(); err != nil {
-			return nil
-		}
+		return nil
 	}
 	var b v1alpha1.Blip
 	err = a.c.Kube.Get(ctx, client.ObjectKey{Namespace: a.c.Namespace, Name: name}, &b)

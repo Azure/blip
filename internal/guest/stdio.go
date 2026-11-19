@@ -12,8 +12,7 @@ import (
 
 const (
 	// stdioBufferMax is the output retained per stream. A node agent that
-	// reconnects asks to resume from the offsets it received last, and this
-	// is the history the guest can serve. Older output is reported as a gap.
+	// reconnects is replayed from the start of this history.
 	stdioBufferMax = 256 << 10
 )
 
@@ -43,17 +42,17 @@ func (b *streamBuf) drop(until uint64) {
 	b.start = until
 }
 
-// since returns the retained bytes from off on. ok is false when off is
-// older than the retained history.
-func (b *streamBuf) since(off uint64) ([]byte, bool) {
+// since returns the retained bytes from off on. An offset older than the
+// retained history returns everything still buffered.
+func (b *streamBuf) since(off uint64) []byte {
 	if off < b.start {
-		return b.data, false
+		return b.data
 	}
 	n := off - b.start
 	if n > uint64(len(b.data)) {
-		return nil, true
+		return nil
 	}
-	return b.data[n:], true
+	return b.data[n:]
 }
 
 func (b *streamBuf) tail(max int) string {
@@ -72,7 +71,7 @@ func (b *streamBuf) tail(max int) string {
 
 // stdio serves the primary command's output and input on the stdio port. One
 // connection is current; a new one replaces it. Output is retained so a
-// reconnecting node agent can resume from the last offsets it received.
+// reconnecting node agent is replayed the history it missed.
 type stdio struct {
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -91,7 +90,6 @@ type stdioConn struct {
 	w      *wire.Conn
 	out    uint64 // next stdout offset to send
 	err    uint64 // next stderr offset to send
-	synced bool   // resume offsets are known; output may flow
 	closed bool
 }
 
@@ -133,7 +131,6 @@ func (s *stdio) attach(f io.ReadWriteCloser) *stdioConn {
 	// Replay everything retained. The agent drops records it already has,
 	// which also covers output produced before its first connection.
 	c.out, c.err = s.out.start, s.err.start
-	c.synced = true
 	s.conn = c
 	exit := s.exit
 	s.mu.Unlock()
@@ -178,7 +175,7 @@ func (s *stdio) append(t wire.Type, p []byte) {
 	for !s.closed && len(b.data)+len(p) > stdioBufferMax {
 		need := uint64(len(b.data) + len(p) - stdioBufferMax)
 		var allowed uint64
-		if s.conn != nil && s.conn.synced && s.conn.cursor(t) > b.start {
+		if s.conn != nil && s.conn.cursor(t) > b.start {
 			allowed = s.conn.cursor(t) - b.start
 		}
 		drop := min(need, allowed)
@@ -204,9 +201,6 @@ func (s *stdio) writeLoop(c *stdioConn) {
 	preferErr := false
 	for {
 		s.mu.Lock()
-		for !c.closed && !c.synced {
-			s.cond.Wait()
-		}
 		if c.closed {
 			s.mu.Unlock()
 			return
@@ -214,8 +208,8 @@ func (s *stdio) writeLoop(c *stdioConn) {
 		var typ wire.Type
 		var off uint64
 		var data []byte
-		out, _ := s.out.since(c.out)
-		errb, _ := s.err.since(c.err)
+		out := s.out.since(c.out)
+		errb := s.err.since(c.err)
 		switch {
 		case preferErr && len(errb) > 0:
 			typ, off, data = wire.TStderr, c.err, errb

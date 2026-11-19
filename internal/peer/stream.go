@@ -26,10 +26,6 @@ type StreamTarget interface {
 	StreamStdin(ctx context.Context, namespace, name string, data []byte, eof bool) error
 }
 
-// StreamGap is the record type the log stream uses to report records trimmed
-// before the reported offset.
-const StreamGap = 255
-
 // streamRecord is one NDJSON line of a log response. Data is base64 so a
 // record can be split on newlines.
 type streamRecord struct {

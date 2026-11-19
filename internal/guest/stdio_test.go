@@ -104,9 +104,6 @@ func TestStdioBackpressureWithoutConnection(t *testing.T) {
 
 	g := &Guest{stdio: s}
 	c, _, _ := stdioConnect(t, g)
-	if err := c.WriteJSON(wire.TStdioResume, wire.StdioResume{}); err != nil {
-		t.Fatal(err)
-	}
 	off, data := readStdioData(t, c, wire.TStdout)
 	if off != 0 || len(data) != stdioBufferMax {
 		t.Fatalf("first frame = %d bytes at %d", len(data), off)
@@ -126,12 +123,11 @@ func TestStdioBackpressureWithoutConnection(t *testing.T) {
 func stdioGuest(t *testing.T) *Guest {
 	t.Helper()
 	return &Guest{
-		root:       t.TempDir(),
-		cgroupFD:   -1,
-		mounts:     map[string]*mount{},
-		frozen:     map[string]*frozenFS{},
-		stdio:      newStdio(),
-		shutdownCh: make(chan struct{}),
+		root:     t.TempDir(),
+		cgroupFD: -1,
+		mounts:   map[string]*mount{},
+		frozen:   map[string]*frozenFS{},
+		stdio:    newStdio(),
 	}
 }
 
@@ -156,16 +152,13 @@ func TestStdioStdinAndEOF(t *testing.T) {
 	defer errW.Close()
 	wait := make(chan unix.WaitStatus, 1)
 
-	g.startProcess = func(procSpec, []string) (*proc, []string, error) {
-		return &proc{stdin: inW, stdout: outR, stderr: errR, wait: wait}, []string{"fake"}, nil
+	g.startProcess = func(procSpec, []string) (*proc, error) {
+		return &proc{stdin: inW, stdout: outR, stderr: errR, wait: wait}, nil
 	}
 	g.claim = &wire.Claim{ID: "root", Command: []string{"fake"}}
 	g.startPrimary()
 
 	c, _, _ := stdioConnect(t, g)
-	if err := c.WriteJSON(wire.TStdioResume, wire.StdioResume{}); err != nil {
-		t.Fatal(err)
-	}
 	if err := c.Write(wire.TStdin, []byte("ping")); err != nil {
 		t.Fatal(err)
 	}
@@ -202,8 +195,8 @@ func TestStdioExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	wait := make(chan unix.WaitStatus, 1)
-	g.startProcess = func(procSpec, []string) (*proc, []string, error) {
-		return &proc{stdin: inW, stdout: outR, stderr: errR, wait: wait}, []string{"fake"}, nil
+	g.startProcess = func(procSpec, []string) (*proc, error) {
+		return &proc{stdin: inW, stdout: outR, stderr: errR, wait: wait}, nil
 	}
 	g.claim = &wire.Claim{ID: "root", Command: []string{"fake"}}
 	g.startPrimary()
@@ -211,9 +204,6 @@ func TestStdioExit(t *testing.T) {
 	c, _, h := stdioConnect(t, g)
 	if h.Exit != nil {
 		t.Fatalf("hello before exit reported %+v", h.Exit)
-	}
-	if err := c.WriteJSON(wire.TStdioResume, wire.StdioResume{}); err != nil {
-		t.Fatal(err)
 	}
 	if _, err := outW.Write([]byte("done\n")); err != nil {
 		t.Fatal(err)
@@ -265,9 +255,6 @@ exited:
 	if h2.Exit == nil || h2.Exit.Code != 3 {
 		t.Fatalf("reconnect hello = %+v", h2)
 	}
-	if err := c2.WriteJSON(wire.TStdioResume, wire.StdioResume{}); err != nil {
-		t.Fatal(err)
-	}
 	if off, data := readStdioData(t, c2, wire.TStdout); off != 0 || string(data) != "done\n" {
 		t.Fatalf("replayed output = %q at %d", data, off)
 	}
@@ -281,8 +268,8 @@ exited:
 // A command that cannot start reports its stderr and conventional 127.
 func TestStdioStartFailure(t *testing.T) {
 	g := stdioGuest(t)
-	g.startProcess = func(procSpec, []string) (*proc, []string, error) {
-		return nil, nil, startFail(127, errors.New("fake: command not found"))
+	g.startProcess = func(procSpec, []string) (*proc, error) {
+		return nil, startFail(127, errors.New("fake: command not found"))
 	}
 	g.claim = &wire.Claim{ID: "root", Command: []string{"fake"}}
 	g.startPrimary()
@@ -290,9 +277,6 @@ func TestStdioStartFailure(t *testing.T) {
 	c, _, h := stdioConnect(t, g)
 	if h.Exit == nil || h.Exit.Code != 127 {
 		t.Fatalf("hello = %+v, want a failed exit", h)
-	}
-	if err := c.WriteJSON(wire.TStdioResume, wire.StdioResume{}); err != nil {
-		t.Fatal(err)
 	}
 	if _, data := readStdioData(t, c, wire.TStderr); !bytes.Contains(data, []byte("command not found")) {
 		t.Fatalf("stderr = %q", data)

@@ -24,8 +24,6 @@ const (
 	HeaderSize int64 = 8 << 10
 	// SlotSize is the size of one header slot.
 	SlotSize int64 = 4 << 10
-	// DefaultSize is the default ring size.
-	DefaultSize int64 = 64 << 20
 	// MinSize and MaxSize bound BlipState.spec.streamSize.
 	MinSize int64 = 1 << 20
 	MaxSize int64 = 1 << 30
@@ -79,9 +77,6 @@ type Record struct {
 	Type RecordType
 	Data []byte
 }
-
-// ErrCorrupt reports a ring whose header or records cannot be read.
-var ErrCorrupt = errors.New("stream: corrupt ring")
 
 // ErrGap is returned by Reader.Read when the requested offset is older than
 // the ring retains. The caller should emit a gap marker and continue from

@@ -65,7 +65,7 @@ func TestWorkdirResolvesDotDotAfterSymlink(t *testing.T) {
 	// not exist when the path is collapsed lexically.
 	g := testGuest(t)
 	g.root = root
-	_, _, err = g.startProc(procSpec{argv: []string{"/bin/sh"}, dir: "/tmp/devlink/../other"}, nil)
+	_, err = g.startProc(procSpec{argv: []string{"/bin/sh"}, dir: "/tmp/devlink/../other"}, nil)
 	if err == nil {
 		t.Fatal("starting a missing executable succeeded")
 	}
@@ -79,7 +79,7 @@ func TestWorkdirResolvesDotDotAfterSymlink(t *testing.T) {
 // outside the root, so "tmp" used to mean the initramfs /tmp.
 func TestStartProcNormalizesRelativeWorkdir(t *testing.T) {
 	g := testGuest(t)
-	_, _, err := g.startProc(procSpec{argv: []string{"/bin/sh"}, dir: "relative/dir"}, nil)
+	_, err := g.startProc(procSpec{argv: []string{"/bin/sh"}, dir: "relative/dir"}, nil)
 	if err == nil {
 		t.Fatal("startProc accepted a missing relative workdir")
 	}
@@ -90,7 +90,7 @@ func TestStartProcNormalizesRelativeWorkdir(t *testing.T) {
 	// ".." is clamped at the root instead of escaping to the guest initramfs.
 	// The temp root has /etc, so validation of "../../etc" must pass and the
 	// failure must come from starting the (missing) executable.
-	_, _, err = g.startProc(procSpec{argv: []string{"/does/not/exist"}, dir: "../../etc"}, nil)
+	_, err = g.startProc(procSpec{argv: []string{"/does/not/exist"}, dir: "../../etc"}, nil)
 	if err == nil {
 		t.Fatal("starting a missing executable unexpectedly succeeded")
 	}
@@ -246,7 +246,7 @@ func TestCheckDirAccessChecksComponentsRemovedByDotDot(t *testing.T) {
 	// failure (126) rather than as a failure of the executable.
 	g := testGuest(t)
 	g.root = root
-	_, _, err = g.startProc(procSpec{
+	_, err = g.startProc(procSpec{
 		argv: []string{"/bin/sh"},
 		dir:  "/tmp/w4/locked/../real",
 		user: strconv.FormatUint(uint64(outsider.uid), 10),
@@ -265,24 +265,22 @@ func TestCheckDirAccessChecksComponentsRemovedByDotDot(t *testing.T) {
 func TestProcEnvNoProxy(t *testing.T) {
 	acct := &account{name: "root", home: "/root", shell: "/bin/sh"}
 	for _, tc := range []struct {
-		name    string
-		g       *Guest
-		base    []string
-		session []string
-		want    [2]string // NO_PROXY, no_proxy
+		name string
+		g    *Guest
+		base []string
+		want [2]string // NO_PROXY, no_proxy
 	}{
-		{"no names", &Guest{}, nil, nil, [2]string{"blip", "blip"}},
-		{"kubernetes", &Guest{kubeNamespace: "sandbox"}, nil, nil, [2]string{"blip,kube-apiserver", "blip,kube-apiserver"}},
-		{"endpoints", &Guest{endpoints: []string{"api.default", "db.default"}}, nil, nil, [2]string{"blip,api.default,db.default", "blip,api.default,db.default"}},
-		{"all", &Guest{kubeNamespace: "sandbox", endpoints: []string{"api.default"}}, nil, nil, [2]string{"blip,kube-apiserver,api.default", "blip,kube-apiserver,api.default"}},
-		{"claim override", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=corp.example"}, nil, [2]string{"blip,kube-apiserver,corp.example", "blip,kube-apiserver,corp.example"}},
-		{"session override", &Guest{kubeNamespace: "sandbox"}, nil, []string{"no_proxy=corp.example"}, [2]string{"blip,kube-apiserver,corp.example", "blip,kube-apiserver,corp.example"}},
-		{"both spellings merge", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=claim.example"}, []string{"no_proxy=session.example"}, [2]string{"blip,kube-apiserver,claim.example,session.example", "blip,kube-apiserver,claim.example,session.example"}},
-		{"duplicates and spaces", &Guest{kubeNamespace: "sandbox", endpoints: []string{"api.default"}}, []string{"NO_PROXY= blip, ,corp.example ,api.default"}, nil, [2]string{"blip,kube-apiserver,api.default,corp.example", "blip,kube-apiserver,api.default,corp.example"}},
-		{"explicit empty keeps guest names", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY="}, []string{"no_proxy="}, [2]string{"blip,kube-apiserver", "blip,kube-apiserver"}},
+		{"no names", &Guest{}, nil, [2]string{"blip", "blip"}},
+		{"kubernetes", &Guest{kubeNamespace: "sandbox"}, nil, [2]string{"blip,kube-apiserver", "blip,kube-apiserver"}},
+		{"endpoints", &Guest{endpoints: []string{"api.default", "db.default"}}, nil, [2]string{"blip,api.default,db.default", "blip,api.default,db.default"}},
+		{"all", &Guest{kubeNamespace: "sandbox", endpoints: []string{"api.default"}}, nil, [2]string{"blip,kube-apiserver,api.default", "blip,kube-apiserver,api.default"}},
+		{"claim override", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=corp.example"}, [2]string{"blip,kube-apiserver,corp.example", "blip,kube-apiserver,corp.example"}},
+		{"both spellings merge", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=claim.example", "no_proxy=extra.example"}, [2]string{"blip,kube-apiserver,claim.example,extra.example", "blip,kube-apiserver,claim.example,extra.example"}},
+		{"duplicates and spaces", &Guest{kubeNamespace: "sandbox", endpoints: []string{"api.default"}}, []string{"NO_PROXY= blip, ,corp.example ,api.default"}, [2]string{"blip,kube-apiserver,api.default,corp.example", "blip,kube-apiserver,api.default,corp.example"}},
+		{"explicit empty keeps guest names", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=", "no_proxy="}, [2]string{"blip,kube-apiserver", "blip,kube-apiserver"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			env := tc.g.procEnv(acct, procSpec{env: tc.session}, tc.base)
+			env := tc.g.procEnv(acct, tc.base)
 			for i, key := range []string{"NO_PROXY", "no_proxy"} {
 				var vals []string
 				for _, entry := range env {

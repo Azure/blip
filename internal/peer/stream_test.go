@@ -84,7 +84,7 @@ func streamRequest(t *testing.T, s *Server, method, target string, body io.Reade
 func TestStreamLogNDJSON(t *testing.T) {
 	target := &fakeStreamTarget{records: []stream.Record{
 		{Offset: 10, Gen: 2, Type: stream.TypeOut, Data: []byte("hi\n")},
-		{Offset: 1, Type: stream.RecordType(StreamGap)},
+		{Offset: 1, Type: stream.TypeGap},
 	}}
 	s, certs := newStreamTestServer(t, target)
 	rec := streamRequest(t, s, http.MethodGet, "/v1/stream/log?namespace=default&name=root&offset=10&follow=true", nil, certs["n1"])
@@ -112,7 +112,7 @@ func TestStreamLogNDJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[1]), &gap); err != nil {
 		t.Fatal(err)
 	}
-	if gap.Type != StreamGap || gap.Offset != 1 || gap.Gen != 0 || gap.Data != "" {
+	if gap.Type != uint8(stream.TypeGap) || gap.Offset != 1 || gap.Gen != 0 || gap.Data != "" {
 		t.Fatalf("gap = %+v", gap)
 	}
 	if target.from != 10 || !target.follow {
@@ -176,7 +176,7 @@ func TestStreamStdinMapsErrors(t *testing.T) {
 func TestClientStreamLog(t *testing.T) {
 	want := []stream.Record{
 		{Offset: 7, Gen: 3, Type: stream.TypeErr, Data: []byte("boom")},
-		{Offset: 20, Type: stream.RecordType(StreamGap)},
+		{Offset: 20, Type: stream.TypeGap},
 	}
 	c := newLifecycleTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/stream/log" {
@@ -203,7 +203,7 @@ func TestClientStreamLog(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].Offset != 7 || got[0].Type != stream.TypeErr || string(got[0].Data) != "boom" || got[1].Type != stream.RecordType(StreamGap) {
+	if len(got) != 2 || got[0].Offset != 7 || got[0].Type != stream.TypeErr || string(got[0].Data) != "boom" || got[1].Type != stream.TypeGap {
 		t.Fatalf("records = %+v", got)
 	}
 }

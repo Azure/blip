@@ -156,31 +156,6 @@ func (r *reporter) stop() {
 	}
 }
 
-// waitRunning waits until the blip is running or has finished and returns the
-// last version it saw.
-func (a *app) waitRunning(ctx context.Context, name string) (*v1alpha1.Blip, error) {
-	r := &reporter{a: a}
-	defer r.stop()
-	var got *v1alpha1.Blip
-	err := a.waitBlip(ctx, name, func(b *v1alpha1.Blip) (bool, error) {
-		if b == nil {
-			return false, fmt.Errorf("blip %q was deleted", name)
-		}
-		got = b
-		switch {
-		case b.Status.Phase == v1alpha1.BlipRunning && b.Status.Pod != "":
-			return true, nil
-		case b.Status.Phase == v1alpha1.BlipSaving || v1alpha1.Finished(b):
-			return true, nil
-		}
-		if b.Status.Message != "" {
-			r.say("waiting for blip %s: %s", name, b.Status.Message)
-		}
-		return false, nil
-	})
-	return got, err
-}
-
 // waitFinished waits until the blip is Succeeded or Failed (saves included).
 func (a *app) waitFinished(ctx context.Context, name string, quiet bool) (*v1alpha1.Blip, error) {
 	r := &reporter{a: a}

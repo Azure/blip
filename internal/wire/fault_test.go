@@ -25,7 +25,7 @@ func (s fragmentedStream) Read(p []byte) (int, error) {
 func TestConnFragmentationAndEveryTruncation(t *testing.T) {
 	var data bytes.Buffer
 	w := NewConn(&data)
-	if err := w.WriteJSON(TStdioResume, StdioResume{Out: 7, Err: 8}); err != nil {
+	if err := w.WriteJSON(TClaim, Claim{ID: "root", Serial: "s1"}); err != nil {
 		t.Fatal(err)
 	}
 	encoded := append([]byte(nil), data.Bytes()...)
@@ -44,8 +44,8 @@ func TestConnFragmentationAndEveryTruncation(t *testing.T) {
 					}
 					continue
 				}
-				var resume StdioResume
-				if err != nil || typ != TStdioResume || Decode(payload, &resume) != nil || resume.Out != 7 || resume.Err != 8 {
+				var claim Claim
+				if err != nil || typ != TClaim || Decode(payload, &claim) != nil || claim.ID != "root" || claim.Serial != "s1" {
 					t.Fatalf("fragmented complete frame: type=%d payload=%q err=%v", typ, payload, err)
 				}
 			}

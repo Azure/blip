@@ -42,11 +42,10 @@ type Guest struct {
 	endpoints     []string
 	proxy         *apiForwarder
 	stdio         *stdio
-	shutdownCh    chan struct{}
 
 	// startProcess replaces startProc in tests, which run outside the guest
 	// and cannot chroot or start a workload. Production leaves it nil.
-	startProcess func(procSpec, []string) (*proc, []string, error)
+	startProcess func(procSpec, []string) (*proc, error)
 	filesystem   *filesystemEffects
 
 	mu       sync.Mutex
@@ -75,14 +74,13 @@ type mount struct {
 
 func newGuest(root, cgroup string) *Guest {
 	g := &Guest{
-		root:       root,
-		cgroup:     cgroup,
-		cgroupFD:   -1,
-		reaper:     newReaper(),
-		mounts:     map[string]*mount{},
-		frozen:     map[string]*frozenFS{},
-		stdio:      newStdio(),
-		shutdownCh: make(chan struct{}),
+		root:     root,
+		cgroup:   cgroup,
+		cgroupFD: -1,
+		reaper:   newReaper(),
+		mounts:   map[string]*mount{},
+		frozen:   map[string]*frozenFS{},
+		stdio:    newStdio(),
 	}
 	if fd, err := unix.Open(cgroup, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0); err == nil {
 		g.cgroupFD = fd
@@ -489,7 +487,7 @@ func (g *Guest) startPrimary() {
 	if g.startProcess != nil {
 		start = g.startProcess
 	}
-	p, _, err := start(procSpec{argv: claim.Command, dir: claim.WorkingDir, user: claim.User}, claim.Env)
+	p, err := start(procSpec{argv: claim.Command, dir: claim.WorkingDir, user: claim.User}, claim.Env)
 	if err != nil {
 		log.Printf("start primary: %v", err)
 		g.failPrimary(err)
@@ -594,9 +592,6 @@ func (g *Guest) shutdown() {
 		return
 	}
 	g.stopping = true
-	if g.shutdownCh != nil {
-		close(g.shutdownCh)
-	}
 	// Frozen filesystems would block the workload's exit and the unmounts.
 	if err := g.thawAll(); err != nil {
 		log.Printf("shutdown: %v", err)

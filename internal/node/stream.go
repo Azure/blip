@@ -38,7 +38,7 @@ const (
 	// never wait on an unresponsive guest forever.
 	streamWriteTimeout = 10 * time.Second
 	// streamGap is the record type the log stream uses for trimmed history.
-	streamGap = stream.RecordType(peer.StreamGap)
+	streamGap = stream.TypeGap
 )
 
 // streamError is a sentinel with the downstream HTTP status it maps to.
@@ -448,10 +448,6 @@ func (m *streamManager) readStopped(ctx context.Context, s *v1alpha1.BlipState, 
 	if c == nil {
 		return ErrStreamNotFound
 	}
-	if s.Status.StreamSize == 0 {
-		// A state created before trajectories existed has no ring.
-		return ErrStreamNotFound
-	}
 	if !slices.Contains(s.Status.Placements, m.node) {
 		if m.peer == nil || len(s.Status.Placements) == 0 {
 			return ErrStreamNotFound
@@ -692,8 +688,7 @@ func (a *streamAttachment) output(typ stream.RecordType, next *uint64, off uint6
 		off = *next
 	} else if off > *next {
 		// The guest trimmed output this agent never saw.
-		g, _ := json.Marshal(wire.StdioGap{Out: off, Err: *next})
-		if _, err := a.writer.Append(stream.TypeGap, g); err != nil {
+		if _, err := a.writer.Append(stream.TypeGap, nil); err != nil {
 			slog.Error("append stream gap", "state", a.key, "err", err)
 		}
 		*next = off
@@ -776,22 +771,12 @@ func (a *streamAttachment) close() error {
 	return errors.Join(errs...)
 }
 
-func jsonBytes(v any) []byte {
-	b, _ := json.Marshal(v)
-	return b
-}
-
 // stateStreamSize returns the ring size for a state, clamped to the bounds the
 // ring supports and aligned to a ring slot.
 func stateStreamSize(s *v1alpha1.BlipState) int64 {
 	size := v1alpha1.DefaultStreamSize
 	if s != nil && s.Status.StreamSize > 0 {
 		size = s.Status.StreamSize
-	} else if s != nil && s.Spec.StreamSize != nil && !s.Spec.StreamSize.IsZero() {
-		size = s.Spec.StreamSize.Value()
-	}
-	if size <= 0 {
-		size = v1alpha1.DefaultStreamSize
 	}
 	const align = int64(stream.SlotSize)
 	if rem := size % align; rem != 0 {

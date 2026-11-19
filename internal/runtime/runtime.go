@@ -392,7 +392,8 @@ func (r *runtime) boot() (*podNet, error) {
 		return nil, err
 	}
 	// The pod directory is mounted only into this privileged (root) container,
-	// so it can be root-only; tighten it from an older release's 0755.
+	// so it can be root-only; tighten a mode left by kubelet's
+	// DirectoryOrCreate.
 	if err := podapi.EnsureDir(r.o.Dir); err != nil {
 		return nil, err
 	}

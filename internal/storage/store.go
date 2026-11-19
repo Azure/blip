@@ -222,11 +222,6 @@ func (s *Store) load() error {
 			if err := json.Unmarshal(v, &r); err != nil {
 				return fmt.Errorf("volume %s: %w", k, err)
 			}
-			if r.FSBytes == 0 {
-				// Records written before the trajectory ring existed used the
-				// whole device as the filesystem.
-				r.FSBytes = r.Size
-			}
 			s.vols[r.ID] = &r
 			return nil
 		})
@@ -1221,19 +1216,13 @@ func randHex(n int) string {
 
 func logf(format string, args ...any) { log.Printf("storage: "+format, args...) }
 
-// fsBytes is the filesystem size of a volume. Older records without FSBytes
-// used the whole device.
-func (r *record) fsBytes() int64 {
-	if r.FSBytes > 0 {
-		return r.FSBytes
-	}
-	return r.Size
-}
+// fsBytes is the filesystem size of a volume.
+func (r *record) fsBytes() int64 { return r.FSBytes }
 
 // VolumeBytes returns the total device size of a volume whose filesystem is
 // fsSize bytes and whose trajectory ring is streamSize bytes. The ring sits at
-// the fixed stream.Offset, after any filesystem. A zero streamSize keeps the
-// old layout: the filesystem fills the device.
+// the fixed stream.Offset, after any filesystem. A zero streamSize means no
+// ring: the filesystem fills the device.
 func VolumeBytes(fsSize, streamSize int64) int64 {
 	fsSize = roundUp(fsSize, blockSize)
 	if streamSize <= 0 {

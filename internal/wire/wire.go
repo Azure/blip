@@ -78,14 +78,12 @@ const (
 	// 27 is reserved for the removed service account token message.
 
 	// Stdio: commands and events for the primary command.
-	TStdin       Type = 42 // host -> guest: raw bytes
-	TStdinEOF    Type = 43 // host -> guest: {}
-	TStdout      Type = 46 // guest -> host: offset + raw bytes
-	TStderr      Type = 47 // guest -> host: offset + raw bytes
-	TExited      Type = 48 // guest -> host: Exit
-	TStdioHello  Type = 50 // guest -> host: StdioHello
-	TStdioResume Type = 51 // host -> guest: StdioResume
-	TStdioGap    Type = 52 // guest -> host: StdioGap
+	TStdin      Type = 42 // host -> guest: raw bytes
+	TStdinEOF   Type = 43 // host -> guest: {}
+	TStdout     Type = 46 // guest -> host: offset + raw bytes
+	TStderr     Type = 47 // guest -> host: offset + raw bytes
+	TExited     Type = 48 // guest -> host: Exit
+	TStdioHello Type = 50 // guest -> host: StdioHello
 )
 
 // ---- control payloads ----
@@ -153,7 +151,7 @@ type Result struct {
 const (
 	// ReasonCompleted marks a primary command that finished on its own.
 	ReasonCompleted = "Completed"
-	// ReasonStopped marks a session ended because the VM is shutting down.
+	// ReasonStopped marks a command ended because the VM is shutting down.
 	ReasonStopped = "Stopped"
 	// ReasonGuestCrashed marks a VM that exited without a shutdown request.
 	ReasonGuestCrashed = "GuestCrashed"
@@ -181,20 +179,6 @@ type ShutdownDone struct {
 type StdioHello struct {
 	// Exit is set when the primary command has already exited.
 	Exit *Exit `json:"exit,omitempty"`
-}
-
-// StdioResume asks the guest to resend output after the given offsets. The
-// guest answers with TStdout/TStderr frames starting there, or with
-// TStdioGap when the requested data is no longer buffered.
-type StdioResume struct {
-	Out uint64 `json:"out"`
-	Err uint64 `json:"err"`
-}
-
-// StdioGap reports the first offsets the guest can still resend.
-type StdioGap struct {
-	Out uint64 `json:"out"`
-	Err uint64 `json:"err"`
 }
 
 // EncodeData encodes a stdout/stderr frame: an 8-byte big-endian offset

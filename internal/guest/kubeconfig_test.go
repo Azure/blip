@@ -122,25 +122,23 @@ func TestKubeMetadataRejectsSymlinks(t *testing.T) {
 	}
 }
 
-func TestPrimaryAndSessionKubeconfigEnvironment(t *testing.T) {
+func TestPrimaryKubeconfigEnvironment(t *testing.T) {
 	for _, user := range []*account{
 		{name: "root", home: "/root", shell: "/bin/sh"},
 		{name: "alice", uid: 1000, gid: 1000, home: "/home/alice", shell: "/bin/bash"},
 	} {
 		for _, tc := range []struct {
-			name          string
-			base, session []string
-			want          string
+			name string
+			base []string
+			want string
 		}{
 			{name: "primary", want: kubeconfigPath},
-			{name: "exec", session: []string{"TERM=xterm"}, want: kubeconfigPath},
 			{name: "claim override", base: []string{"KUBECONFIG=/custom"}, want: "/custom"},
-			{name: "session override", base: []string{"KUBECONFIG=/custom"}, session: []string{"KUBECONFIG=/session"}, want: "/session"},
-			{name: "explicit empty", session: []string{"KUBECONFIG="}, want: ""},
+			{name: "explicit empty", base: []string{"KUBECONFIG="}, want: ""},
 		} {
 			t.Run(user.name+"/"+tc.name, func(t *testing.T) {
 				g := &Guest{kubeNamespace: "sandbox"}
-				env := g.procEnv(user, procSpec{env: tc.session}, tc.base)
+				env := g.procEnv(user, tc.base)
 				var kubeconfigs []string
 				for _, entry := range env {
 					if strings.HasPrefix(entry, "KUBECONFIG=") {
@@ -154,7 +152,7 @@ func TestPrimaryAndSessionKubeconfigEnvironment(t *testing.T) {
 		}
 	}
 	g := &Guest{}
-	for _, entry := range g.procEnv(&account{}, procSpec{}, nil) {
+	for _, entry := range g.procEnv(&account{}, nil) {
 		if strings.HasPrefix(entry, "KUBECONFIG=") {
 			t.Fatalf("disabled API exported %q", entry)
 		}

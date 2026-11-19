@@ -30,8 +30,6 @@ import (
 const (
 	ReasonInvalidSpec   = "InvalidSpec"
 	ReasonPoolNotFound  = "PoolNotFound"
-	ReasonImageResolve  = "ImageResolveFailed"
-	ReasonImageNotFound = "ImageNotFound"
 	ReasonStateNotFound = "StateNotFound"
 	ReasonStateNotReady = "StateNotReady"
 	ReasonStateFailed   = "StateFailed"
@@ -263,8 +261,8 @@ func (r *BlipReconciler) flush(ctx context.Context, b, base *v1.Blip) error {
 	return nil
 }
 
-// cleanup preserves the tail of a finished command, deletes its pod, and
-// removes the finalizer once the Blip is being deleted.
+// cleanup deletes the blip's pod and removes the finalizer once the Blip is
+// being deleted.
 func (r *BlipReconciler) cleanup(ctx context.Context, b *v1.Blip) error {
 	var err error
 	if b.Status.Pod != "" {
