@@ -1001,6 +1001,14 @@ func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
 		}
 		return nil
 	}
+	// Every attachment is resolved. A writable mount still marked Saving was
+	// saved successfully, so show its final ready phase instead of leaving
+	// the finished Blip looking like it is still saving.
+	for i := range b.Status.Mounts {
+		if m := &b.Status.Mounts[i]; m.Writable && m.Phase == v1.MountSaving {
+			m.Phase, m.Message, m.Switching = v1.MountMounted, "", false
+		}
+	}
 	if saveErr != "" {
 		if b.Status.Message != "" && b.Status.Reason != ReasonSaveFailed {
 			saveErr += "\n" + b.Status.Message

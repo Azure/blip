@@ -528,3 +528,32 @@ func TestPendingCommitLostWhenSourceDeleted(t *testing.T) {
 		t.Fatalf("lost save has no failure seal: %+v", st.Status.Seals)
 	}
 }
+
+// TestFinishedBlipClearsSavingMountPhase covers a finished Blip leaving its
+// writable mounts marked Saving after their saves committed.
+func TestFinishedBlipClearsSavingMountPhase(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.readyState("data", "n1")
+	b := e.startBlip("job", "n1", withRoot("home"), e.withMount("data", "/data", true))
+
+	e.updateBlip("job", func(b *v1.Blip) { b.Spec.Stop = true })
+	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSaving, ReasonStopped)
+	if m := mountOf(b, "data"); m == nil || m.Phase != v1.MountSaving {
+		t.Fatalf("mount not saving after fencing: %+v", m)
+	}
+
+	e.saveWriter("home", newID())
+	e.saveWriter("data", newID())
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSucceeded, ReasonStopped)
+	if m := mountOf(b, "data"); m == nil || m.Phase != v1.MountMounted || m.Message != "" || m.Switching {
+		t.Fatalf("finished Blip left mount in saving state: %+v", m)
+	}
+}
