@@ -418,7 +418,7 @@ func copyTreeIntoAt(ctx context.Context, src, dst string, info os.FileInfo, rel 
 	if err := os.Chtimes(dst, info.ModTime(), info.ModTime()); err != nil {
 		return nil, err
 	}
-	return append(modes, dirMode{rel: rel, mode: info.Mode().Perm()}), nil
+	return append(modes, dirMode{rel: rel, mode: info.Mode()}), nil
 }
 
 // applyDirModes sets the source mode on the staged directories at and below
@@ -821,7 +821,9 @@ func copyFile(ctx context.Context, src, dst string, info os.FileInfo) error {
 	if cerr != nil {
 		return cerr
 	}
-	if err := os.Chmod(tmp, info.Mode().Perm()); err != nil {
+	// Reproduce the permission bits and the setuid, setgid, and sticky bits.
+	// os.Chmod ignores the non-mode type bits that may also be set.
+	if err := os.Chmod(tmp, info.Mode()); err != nil {
 		return err
 	}
 	if err := os.Chtimes(tmp, info.ModTime(), info.ModTime()); err != nil {
