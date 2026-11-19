@@ -295,11 +295,14 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 		}
 		st.usage += usage.Total()
 		messages = append(messages, reply)
-		if thread.Spec.DailyTokens > 0 && tokensToday+st.usage >= thread.Spec.DailyTokens {
-			st.paused = budgetPauseReason
-			break
-		}
+		// Crossing the daily budget mid-step must not strand the completion
+		// we already paid for: run its tool calls (including reply) and then
+		// stop before requesting another completion.
+		overBudget := thread.Spec.DailyTokens > 0 && tokensToday+st.usage >= thread.Spec.DailyTokens
 		if len(reply.ToolCalls) == 0 {
+			if overBudget {
+				st.paused = budgetPauseReason
+			}
 			break
 		}
 		for _, call := range reply.ToolCalls {
@@ -308,6 +311,10 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 				result = "error: " + err.Error()
 			}
 			messages = append(messages, Message{Role: "tool", ToolCallID: call.ID, Content: result})
+		}
+		if overBudget {
+			st.paused = budgetPauseReason
+			break
 		}
 		if st.usage >= s.Config.StepTokenLimit {
 			break

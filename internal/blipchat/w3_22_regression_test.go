@@ -107,6 +107,70 @@ func TestBoardPromptTruncatesOldestTurnsNotNewest(t *testing.T) {
 	}
 }
 
+// Crossing the daily budget after a completion was paid for must still run
+// that completion's tool calls, including reply, and consume only input that
+// was shown to the model.
+func TestMidStepBudgetExhaustionRunsPaidToolCalls(t *testing.T) {
+	now := timeNow()
+	thread := testThread()
+	thread.Spec.DailyTokens = 100
+	thread.Status.TokenDay = now.UTC().Format("2006-01-02")
+	thread.Status.TokensToday = 99
+	turn := testTurn("one", "proj")
+	turn.Status.Seq = 1
+	turn.Status.AcceptedTime = &metav1.Time{Time: now.Add(-time.Minute)}
+	thread.Status.Timers = []v1.ThreadTimer{{
+		ID: "t1", At: metav1.NewTime(now.Add(-time.Hour)), Note: "timer-note",
+	}}
+	c := testClient(t, thread, turn)
+	server, requests := llmServerWithRequests(t, Message{Role: "assistant", ToolCalls: []ToolCall{
+		toolCall("reply", `{"inReplyTo":1,"text":"the answer"}`),
+	}})
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	ctx := context.Background()
+	if err := s.step(ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.ConsumedSeq != 1 {
+		t.Errorf("consumedSeq = %d, want the turn whose completion was paid for", updated.Status.ConsumedSeq)
+	}
+	if updated.Status.Paused == nil || updated.Status.Paused.Reason != budgetPauseReason {
+		t.Errorf("paused = %+v, want the budget pause", updated.Status.Paused)
+	}
+	if updated.Status.TokensToday != 114 {
+		t.Errorf("tokensToday = %d, want 99+15", updated.Status.TokensToday)
+	}
+	if len(*requests) != 1 {
+		t.Errorf("made %d LLM requests, want only the completion already paid for", len(*requests))
+	}
+	prompt := requestPrompt(t, (*requests)[0])
+	if !strings.Contains(prompt, "please fix it") || !strings.Contains(prompt, "timer-note") {
+		t.Errorf("step did not show the pending turn and due timer:\n%s", prompt)
+	}
+	var turns v1.BlipTurnList
+	if err := c.List(ctx, &turns, client.InNamespace("ns")); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for i := range turns.Items {
+		turn := &turns.Items[i]
+		if turn.Spec.Author.Kind == v1.TurnAuthorCoordinator && turn.Spec.InReplyTo == 1 && turn.Spec.Text == "the answer" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("paid completion's reply tool call was not delivered: %+v", turns.Items)
+	}
+}
+
 // requestPrompt returns the user message content from a recorded request.
 func requestPrompt(t *testing.T, request map[string]any) string {
 	t.Helper()
