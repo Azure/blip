@@ -12,7 +12,9 @@ spec:
   #     url: https://whoami.example.com
   #     audience: blip-gateway
   # Direct egress is denied unless explicitly allowed. The tokenless
-  # Kubernetes API endpoint is separate from these rules.
+  # Kubernetes API endpoint is separate from these rules. Explicit CIDRs,
+  # including 0.0.0.0/0, do not inherit the default policy's exclusions, so
+  # keep this except list in sync with privateCIDRs in internal/network.
   network:
     egress:
       - to:
@@ -30,6 +32,17 @@ spec:
       - to:
           - ipBlock:
               cidr: 0.0.0.0/0
+              except:
+                - 0.0.0.0/8
+                - 10.0.0.0/8
+                - 100.64.0.0/10
+                - 127.0.0.0/8
+                - 168.63.129.16/32
+                - 169.254.0.0/16
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+                - 224.0.0.0/4
+                - 240.0.0.0/4
         ports:
           - protocol: TCP
             port: 443

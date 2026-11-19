@@ -1,10 +1,15 @@
 package network
 
 import (
+	"os"
+	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
+
+	v1alpha1 "github.com/Azure/blip/api/v1alpha1"
 )
 
 func TestDefaultAllowsInternetAndKubeDNS(t *testing.T) {
@@ -47,5 +52,39 @@ func TestDefaultAllowsInternetAndKubeDNS(t *testing.T) {
 		if got := allows(policy, tt.address, tt.protocol, tt.port); got != tt.allowed {
 			t.Errorf("allows(%s, %s/%d) = %v, want %v", tt.address, tt.protocol, tt.port, got, tt.allowed)
 		}
+	}
+}
+
+// TestExamplePoolsUseDefaultPrivateRanges keeps the kind example pool in sync
+// with the product default policy: an explicit 0.0.0.0/0 rule bypasses
+// Default(), so it must repeat the same LAN and platform exceptions.
+func TestExamplePoolsUseDefaultPrivateRanges(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/kind/pools.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pool v1alpha1.BlipPool
+	if err := yaml.Unmarshal(data, &pool); err != nil {
+		t.Fatal(err)
+	}
+	if pool.Spec.Network == nil {
+		t.Fatal("example pool has no network policy")
+	}
+	var got []string
+	for _, egress := range pool.Spec.Network.Egress {
+		for _, peer := range egress.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
+				got = append(got, peer.IPBlock.Except...)
+			}
+		}
+	}
+	if len(got) == 0 {
+		t.Fatal("example pool allows 0.0.0.0/0 without private-range exceptions")
+	}
+	slices.Sort(got)
+	want := slices.Clone(privateCIDRs)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("example pool exceptions = %v, want the default policy list %v", got, want)
 	}
 }
