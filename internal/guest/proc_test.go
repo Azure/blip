@@ -145,6 +145,55 @@ func TestCheckDirAccessNamesInaccessibleWorkdir(t *testing.T) {
 	}
 }
 
+// A workdir reached through a symlink must be checked along the resolved
+// path. The symlink target can be searchable while its real parent is not, so
+// a lexical walk passed and the child failed with a permission error blamed on
+// the program.
+func TestCheckDirAccessResolvesSymlinkedWorkdir(t *testing.T) {
+	root := testRoot(t)
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	private := filepath.Join(root, "private")
+	if err := os.MkdirAll(filepath.Join(private, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The target is searchable for everyone, but reaching it through
+	// /private is not.
+	if err := os.Chmod(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/private/sub", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no stat ownership information")
+	}
+	outsider := &account{uid: st.Uid + 1, gid: st.Gid + 1, groups: []uint32{st.Gid + 1}}
+
+	// The target itself (what the old lexical check saw) is accessible.
+	target, err := statInRoot(root, "/link")
+	if err != nil || !target.IsDir() {
+		t.Fatalf("symlink target: %v, %v", target, err)
+	}
+	if !canSearchDir(target, outsider) {
+		t.Fatal("test setup: symlink target is not searchable")
+	}
+
+	err = checkDirAccess(root, "/link", outsider)
+	if err == nil {
+		t.Fatal("symlinked workdir through an unsearchable directory was accepted")
+	}
+	if want := "chdir /link: permission denied for uid"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want it to contain %q", err, want)
+	}
+}
+
 // TestProcEnvReservedValuesCannotBeOverridden keeps a caller's exec -e from
 // redirecting the guest-owned report endpoint. The reserved value must appear
 // exactly once and win over both the claim environment and the session's

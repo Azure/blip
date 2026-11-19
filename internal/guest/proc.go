@@ -176,13 +176,20 @@ func workdirInRoot(dir string) string {
 // checkDirAccess verifies that the target account can search every component
 // of dir inside root. Without this, os.StartProcess fails in the child with
 // "fork/exec <program>: permission denied", which makes an inaccessible
-// working directory look like a missing or unexecutable program.
+// working directory look like a missing or unexecutable program. The
+// components come from the resolved path, not the spelling: a symlink can
+// point through a directory the account cannot search even when the target
+// itself is accessible.
 func checkDirAccess(root, dir string, acct *account) error {
 	if acct.uid == 0 {
 		return nil
 	}
+	resolved, err := resolveInRoot(root, dir)
+	if err != nil {
+		return fmt.Errorf("chdir %s: %w", dir, err)
+	}
 	p := "/"
-	for _, part := range strings.Split(strings.TrimPrefix(dir, "/"), "/") {
+	for _, part := range strings.Split(strings.TrimPrefix(resolved, "/"), "/") {
 		if part == "" {
 			continue
 		}
