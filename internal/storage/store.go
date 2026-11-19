@@ -929,6 +929,13 @@ func (s *Store) Activate(id string) (string, error) {
 	}
 	switch r.Kind {
 	case KindWorking:
+		// A ready working volume can lose its device without losing its
+		// record (for example when a snapshot observed the pool between
+		// device creation and the ready phase). Recreate it instead of
+		// handing out a path that does not exist.
+		if err := s.reactivate(r); err != nil {
+			return "", err
+		}
 		return mapperPath(s.plainName(r)), nil
 	case kindExport:
 		return mapperPath(s.topName(r)), nil

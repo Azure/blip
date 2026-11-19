@@ -356,7 +356,16 @@ func (a *Agent) prepare(ctx context.Context, v *view, pr prepare) error {
 	if pr.exists {
 		dev = v.volumes[id].Device
 		if dev == "" {
-			return fmt.Errorf("working volume %s has no active device", id)
+			// The volume is ready but the snapshot did not see its device
+			// (it may have been sampled while the volume was still being
+			// created, or the device may be gone). The store recreates a
+			// missing device; Activate is bounded and idempotent.
+			var err error
+			dev, err = a.store.Activate(id)
+			if err != nil {
+				return fmt.Errorf("reactivate working volume %s: %w", id, err)
+			}
+			slog.Info("reactivated working volume", "id", id, "pod", pr.pod)
 		}
 	} else {
 		req := pr.req

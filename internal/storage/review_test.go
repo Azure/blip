@@ -39,6 +39,27 @@ func TestBusyDeletePreservesWriter(t *testing.T) {
 	}
 }
 
+func TestActivateRecreatesMissingWorkingDevice(t *testing.T) {
+	x := newStorageSimulation(t)
+	r := x.working()
+	plain := x.s.plainName(r)
+	delete(x.dm, plain) // a snapshot can observe the record ready without its device
+	dev, err := x.s.Activate(r.ID)
+	if err != nil {
+		t.Fatalf("Activate = %v", err)
+	}
+	if dev != mapperPath(plain) || x.dm[plain] == nil {
+		t.Fatalf("device not recreated: %q, %v", dev, x.dm[plain])
+	}
+	if got := x.read(plain, 1); got != "base" {
+		t.Fatalf("reactivation lost data: %q", got)
+	}
+	// A second activation is a no-op and still returns the active device.
+	if dev, err := x.s.Activate(r.ID); err != nil || dev != mapperPath(plain) || x.dm[plain] == nil {
+		t.Fatalf("second Activate = %q, %v", dev, err)
+	}
+}
+
 func failDeleteRestoration(s *Store) {
 	writes := 0
 	s.metadataUpdate = func(fn func(*bolt.Tx) error) error {
