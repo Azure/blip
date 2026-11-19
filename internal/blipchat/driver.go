@@ -517,12 +517,12 @@ func (d *driver) endTurn() {
 
 func (d *driver) sendACP(ctx context.Context, data []byte, eof bool) error {
 	var err error
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < 15; attempt++ {
 		err = d.wire.Send(ctx, d.namespace, d.state, data, eof)
 		if err == nil || !errors.Is(err, ErrUnavailable) {
 			return err
 		}
-		sleepCtx(ctx, time.Duration(attempt+1)*200*time.Millisecond)
+		sleepCtx(ctx, time.Duration(min(attempt+1, 5))*200*time.Millisecond)
 	}
 	return err
 }

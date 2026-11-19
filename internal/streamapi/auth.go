@@ -39,12 +39,20 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (user.Info
 }
 
 func (s *Server) user(r *http.Request) (user.Info, error) {
-	if s.proxyAuth {
+	hasCert := r.TLS != nil && len(r.TLS.PeerCertificates) > 0
+	if s.proxyAuth && (s.clientCA == nil || hasCert) {
 		if name := r.Header.Get("X-Remote-User"); name != "" {
+			if hasCert {
+				// A configured CA must verify the proxy certificate before
+				// its identity headers are trusted.
+				if _, err := s.certUser(r.TLS.PeerCertificates); err != nil {
+					return nil, err
+				}
+			}
 			return &user.DefaultInfo{Name: name, Groups: r.Header.Values("X-Remote-Group")}, nil
 		}
 	}
-	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+	if hasCert {
 		return s.certUser(r.TLS.PeerCertificates)
 	}
 	if tok, ok := bearerToken(r); ok {

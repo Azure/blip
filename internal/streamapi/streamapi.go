@@ -96,10 +96,10 @@ type Options struct {
 
 // Server is the stream API HTTP handler.
 type Server struct {
-	backend  Backend
-	client   kubernetes.Interface
-	clientCA *x509.CertPool
-	insecure bool
+	backend   Backend
+	client    kubernetes.Interface
+	clientCA  *x509.CertPool
+	insecure  bool
 	proxyAuth bool
 
 	// Authorizer decides resource access. New sets it to a delegated
@@ -136,17 +136,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !requireMethod(w, r, http.MethodGet) {
 			return
 		}
-		if _, ok := s.authenticate(w, r); !ok {
-			return
-		}
 		writeJSON(w, http.StatusOK, groupList())
 		return
 
 	case len(seg) == 2 && seg[0] == "apis" && seg[1] == GroupName:
 		if !requireMethod(w, r, http.MethodGet) {
-			return
-		}
-		if _, ok := s.authenticate(w, r); !ok {
 			return
 		}
 		writeJSON(w, http.StatusOK, group())

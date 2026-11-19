@@ -40,9 +40,10 @@ func TestUnauthenticated(t *testing.T) {
 	if st := decodeStatus(t, rec); st.Reason != metav1.StatusReasonUnauthorized || st.Code != 401 {
 		t.Fatalf("status: %+v", st)
 	}
-	// Discovery is authenticated too.
+	// Discovery is public: the API server must be able to aggregate the
+	// group before it has a user to impersonate.
 	rec = serve(s, http.MethodGet, "/apis")
-	if rec.Code != http.StatusUnauthorized {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("discovery status %d", rec.Code)
 	}
 }
