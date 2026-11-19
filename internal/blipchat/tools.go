@@ -311,7 +311,7 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 			},
 		},
 	}
-	if err := workspace.Fork(ctx, s.s.Client, &src, state, &workspace.ForkOptions{Owner: &ref}); err != nil {
+	if _, err := workspace.Fork(ctx, s.s.Client, &src, state, &workspace.ForkOptions{Owner: &ref}); err != nil {
 		_ = s.s.Delete(context.WithoutCancel(ctx), b)
 		return "", fmt.Errorf("fork state for %q: %w", name, err)
 	}

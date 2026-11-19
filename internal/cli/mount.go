@@ -927,33 +927,38 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 		st.Spec.Size = &size
 	}
 	a.label(st)
+	var built []*v1alpha1.BlipState
 	if f.from != "" {
 		src, err := a.resolveState(ctx, f.from)
 		if err != nil {
 			return err
 		}
-		if err := workspace.Fork(ctx, c.Kube, src, st, nil); err != nil {
+		created, err := workspace.Fork(ctx, c.Kube, src, st, nil)
+		if err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				return fmt.Errorf("state %q already exists; choose another name", a.short(name))
 			}
 			return err
 		}
+		built = created
 	} else if err := c.Kube.Create(ctx, st); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("state %q already exists; choose another name", a.short(name))
 		}
 		return err
+	} else {
+		built = []*v1alpha1.BlipState{st}
 	}
 	if _, err := a.waitStateCommittedWhilePending(ctx, name); err != nil {
-		a.removeCreatedState(ctx, st)
+		a.removeCreatedStates(ctx, built)
 		return err
 	}
 	if err := a.mountState(ctx, name, f.root, mountPath, &writable); err != nil {
 		// A mount that became desired intent before failing is referenced by
 		// the root, so its state is not an orphan and must stay. Any other
-		// failure leaves the newly created state unused.
+		// failure leaves the newly created states unused.
 		if !a.mountApplied(ctx, f.root, name, mountPath) {
-			a.removeCreatedState(ctx, st)
+			a.removeCreatedStates(ctx, built)
 		}
 		return err
 	}
@@ -973,21 +978,28 @@ func (a *app) mountApplied(ctx context.Context, root, state, mountPath string) b
 	return m != nil && m.Path == mountPath
 }
 
-// removeCreatedState best-effort deletes a state this command created when its
-// mount never became desired intent. Cleanup must not hide the original error.
-func (a *app) removeCreatedState(ctx context.Context, st *v1alpha1.BlipState) {
+// removeCreatedStates best-effort deletes the states this command created when a
+// --new mount never became desired intent. Fork also creates a copy state for
+// every writable mount of the source, so removing only the root would leak those
+// full workspace copies. Cleanup must not hide the original error.
+func (a *app) removeCreatedStates(ctx context.Context, states []*v1alpha1.BlipState) {
 	c, err := a.clients()
 	if err != nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	opts := &client.DeleteOptions{}
-	if st.UID != "" {
-		uid := st.UID
-		opts.Preconditions = &metav1.Preconditions{UID: &uid}
+	// Delete the root first, then the copies: the root is created last, so the
+	// reverse of creation order is the natural teardown order.
+	for i := len(states) - 1; i >= 0; i-- {
+		st := states[i]
+		opts := &client.DeleteOptions{}
+		if st.UID != "" {
+			uid := st.UID
+			opts.Preconditions = &metav1.Preconditions{UID: &uid}
+		}
+		_ = c.Kube.Delete(ctx, st, opts)
 	}
-	_ = c.Kube.Delete(ctx, st, opts)
 }
 
 func (a *app) listMounts(ctx context.Context, root string) error {

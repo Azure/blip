@@ -1212,6 +1212,78 @@ func TestMountNewWaitsThroughRecoverableFailure(t *testing.T) {
 	}
 }
 
+// TestMountNewFromFailureRemovesForkCopies reproduces a failed
+// `mount --new NAME --from SRC` where the new root never becomes usable. Fork
+// creates a copy state for each writable mount of the source before the root;
+// rollback must remove those copies too, not just the destination root.
+func TestMountNewFromFailureRemovesForkCopies(t *testing.T) {
+	src := readyState("src")
+	src.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+	h := newHarness(t, readyState("home"), src, readyState("data"))
+	h.ctrl.set(func(c *fakeController) {
+		c.stateFail = `size 1Gi is smaller than copy source "src" (10Gi)`
+	})
+	code, _, errOut := h.run("", "mount", "--new", "dev:/work:rw", "--from", "src", "--size", "1Gi", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `state "dev" failed: size 1Gi is smaller than copy source "src" (10Gi)`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	var states v1alpha1.BlipStateList
+	if err := h.kube.List(context.Background(), &states); err != nil {
+		t.Fatal(err)
+	}
+	keep := map[string]bool{"home": true, "src": true, "data": true}
+	for _, s := range states.Items {
+		if !keep[s.Name] {
+			t.Fatalf("failed --new leaked state %q (copyFrom %q)", s.Name, s.Spec.CopyFrom)
+		}
+	}
+	if root := h.state("home"); len(root.Spec.Mounts) != 0 {
+		t.Fatalf("failed mount written as desired intent: %+v", root.Spec.Mounts)
+	}
+}
+
+// TestMountNewFromKeepsForkCopiesOnSuccess is the success counterpart: the new
+// root and the copies Fork created for its writable mounts all stay, and the
+// root is mounted at the requested path.
+func TestMountNewFromKeepsForkCopiesOnSuccess(t *testing.T) {
+	src := readyState("src")
+	src.Spec.Mounts = []v1alpha1.Mount{
+		{State: "data", Path: "/data", Writable: true},
+		{State: "tools", Path: "/tools"},
+	}
+	h := newHarness(t, readyState("home"), src, readyState("data"), readyState("tools"))
+	code, out, errOut := h.run("", "mount", "--new", "dev:/work:rw", "--from", "src", "--root", "home")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state dev mounted on root state home at /work (writable)")
+	s := h.state("dev")
+	if s.Spec.CopyFrom != "src" || len(s.Spec.Mounts) != 2 {
+		t.Fatalf("new state %+v", s.Spec)
+	}
+	copyName := s.Spec.Mounts[0].State
+	if copyName == "data" || !s.Spec.Mounts[0].Writable || s.Spec.Mounts[0].Path != "/data" {
+		t.Fatalf("writable mount %+v", s.Spec.Mounts[0])
+	}
+	child := h.state(copyName)
+	if child.Spec.CopyFrom != "data" {
+		t.Fatalf("copy %q copyFrom %q", copyName, child.Spec.CopyFrom)
+	}
+	// Read-only mounts stay references to the existing state.
+	if s.Spec.Mounts[1] != (v1alpha1.Mount{State: "tools", Path: "/tools"}) {
+		t.Fatalf("read-only mount %+v", s.Spec.Mounts[1])
+	}
+	if root := h.state("home"); len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0].State != "dev" {
+		t.Fatalf("root mounts %+v", root.Spec.Mounts)
+	}
+	// The pre-existing source and its mount survive a successful --new.
+	for _, name := range []string{"src", "data", "tools"} {
+		if stateNotFound(t, h, name) {
+			t.Fatalf("pre-existing state %q was deleted", name)
+		}
+	}
+}
+
 func TestMountNewRejectsFailedSource(t *testing.T) {
 	bad := state("bad")
 	bad.Status.Phase, bad.Status.Message = v1alpha1.StateFailed, "image too large"
