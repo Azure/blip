@@ -609,6 +609,27 @@ func TestStopAndDeleteBeforeStart(t *testing.T) {
 // An unknown status phase used to match no reconcile path: it was neither
 // finished nor advanced, so cleanup never ran and the finalizer blocked
 // deletion forever. It must be failed and cleaned up like any terminal Blip.
+func TestUnknownPhaseFailsAndUnblocksDeletion(t *testing.T) {
+	e := newEnv(t)
+	e.newBlip("b", withRoot("home"))
+	e.run(e.blip, ns, "b")
+	b := e.getBlip("b")
+	if len(b.Finalizers) == 0 {
+		t.Fatal("reconcile did not add the finalizer")
+	}
+	b.Status.Phase = "Hacked"
+	e.must(e.c.Status().Update(e.ctx, b))
+	e.run(e.blip, ns, "b")
+	b = e.getBlip("b")
+	expectPhase(t, b, v1.BlipFailed, ReasonInvalidStatus)
+
+	e.must(e.c.Delete(e.ctx, b))
+	e.run(e.blip, ns, "b")
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "b"}, &v1.Blip{}); err == nil {
+		t.Fatal("Blip with an unknown phase was not deleted")
+	}
+}
+
 func TestDeleteRunningBlipWaitsForSave(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")

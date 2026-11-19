@@ -33,6 +33,7 @@ type crdValidation struct {
 type crdSchema struct {
 	Type         string               `json:"type"`
 	Pattern      string               `json:"pattern"`
+	Enum         []string             `json:"enum"`
 	MaxLength    int64                `json:"maxLength"`
 	Minimum      int64                `json:"minimum"`
 	Maximum      int64                `json:"maximum"`
@@ -534,6 +535,32 @@ func TestBlipTurnStatusSeqRules(t *testing.T) {
 
 // TestBlipStatusPhaseAdmission guards that a status writer cannot store a
 // phase no reconcile path understands. Such a phase used to wedge deletion.
+func TestBlipStatusPhaseAdmission(t *testing.T) {
+	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blips.yaml")
+	phase, ok := status.Properties["phase"]
+	if !ok {
+		t.Fatal("generated CRD has no status.phase property")
+	}
+	want := []string{"Pending", "Running", "Saving", "Succeeded", "Failed"}
+	if !slices.Equal(phase.Enum, want) {
+		t.Errorf("status.phase enum = %v, want %v", phase.Enum, want)
+	}
+	validate := admissionValidator(t, "blips")
+	object := func(p string) string {
+		return fmt.Sprintf(`{"spec":{"state":"root","command":["true"]},"status":{"phase":%q}}`, p)
+	}
+	for _, p := range want {
+		if errs := validate(object(p), ""); len(errs) != 0 {
+			t.Errorf("rejected documented phase %q: %v", p, errs.ToAggregate())
+		}
+	}
+	for _, p := range []string{"Hacked", "", "pending", "Stopped"} {
+		if errs := validate(object(p), ""); len(errs) == 0 {
+			t.Errorf("admitted unknown phase %q", p)
+		}
+	}
+}
+
 // TestBlipTurnImmutable guards that a producer cannot rewrite history.
 func TestBlipTurnImmutable(t *testing.T) {
 	data, err := os.ReadFile("../../deploy/crd/blip.dev_blipturns.yaml")

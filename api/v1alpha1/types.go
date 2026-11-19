@@ -595,6 +595,10 @@ type MountStatus struct {
 }
 
 type BlipStatus struct {
+	// Phase is one of the documented Blip phases. An unknown value is
+	// rejected at admission so a status writer cannot leave a Blip in a
+	// phase that no reconcile path can advance or clean up.
+	// +kubebuilder:validation:Enum=Pending;Running;Saving;Succeeded;Failed
 	Phase   string `json:"phase,omitempty"`
 	Reason  string `json:"reason,omitempty"`
 	Message string `json:"message,omitempty"`

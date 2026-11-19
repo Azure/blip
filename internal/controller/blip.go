@@ -48,6 +48,7 @@ const (
 	ReasonRuntimeFailed = "RuntimeFailed"
 	ReasonNetworkFailed = "NetworkFailed"
 	ReasonSaveFailed    = "SaveFailed"
+	ReasonInvalidStatus = "InvalidStatus"
 )
 
 // exitAnnotationGrace lets a pod that reported Succeeded still publish its
@@ -183,6 +184,15 @@ func (r *BlipReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		result, err = r.pending(ctx, b, base)
 	case v1.BlipRunning:
 		result, err = r.running(ctx, b, base)
+	case v1.BlipSaving:
+		// Handled below, after the phase-specific reconcile.
+	default:
+		// An unknown phase (for example one written directly to the status
+		// subresource) is terminal: no reconcile path can advance it, so
+		// cleanup would never run and the finalizer would block deletion
+		// forever. Fail it with a valid phase so the normal finished path
+		// deletes the pod and releases the finalizer.
+		r.finish(b, v1.BlipFailed, ReasonInvalidStatus, fmt.Sprintf("unknown status phase %q", b.Status.Phase))
 	}
 	if err == nil && b.Status.Phase == v1.BlipSaving {
 		err = r.saving(ctx, b)

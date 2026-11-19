@@ -502,6 +502,16 @@ spec:
                 maxLength: 65536
                 type: string
               phase:
+                description: |-
+                  Phase is one of the documented Blip phases. An unknown value is
+                  rejected at admission so a status writer cannot leave a Blip in a
+                  phase that no reconcile path can advance or clean up.
+                enum:
+                - Pending
+                - Running
+                - Saving
+                - Succeeded
+                - Failed
                 type: string
               pod:
                 type: string
