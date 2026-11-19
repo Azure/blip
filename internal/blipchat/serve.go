@@ -1324,7 +1324,14 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 			kept++
 			continue
 		}
-		if t.Status.AcceptedTime == nil || now.Sub(t.Status.AcceptedTime.Time) < turnAge.Duration {
+		// Normal writers stamp AcceptedTime. Legacy, imported, or restored
+		// turns may not have it, but their object creation time still ages
+		// them out; otherwise they would never be pruned.
+		age := t.Status.AcceptedTime
+		if age == nil && !t.CreationTimestamp.IsZero() {
+			age = &t.CreationTimestamp
+		}
+		if age == nil || now.Sub(age.Time) < turnAge.Duration {
 			continue
 		}
 		if err := s.Delete(ctx, t); err != nil && !apierrors.IsNotFound(err) {
@@ -1340,8 +1347,17 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 	}
 	var keptTasks []v1.ThreadTask
 	for _, t := range thread.Status.Tasks {
-		if !t.Open && t.Updated != nil && now.Sub(t.Updated.Time) > taskAge.Duration {
-			continue
+		if !t.Open {
+			updated := t.Updated
+			// A legacy or restored closed task may have no update time. Age it
+			// from the thread incarnation's creation instead; if even that is
+			// unavailable, MaxTasks below is the bound.
+			if updated == nil && !thread.CreationTimestamp.IsZero() {
+				updated = &thread.CreationTimestamp
+			}
+			if updated != nil && now.Sub(updated.Time) > taskAge.Duration {
+				continue
+			}
 		}
 		keptTasks = append(keptTasks, t)
 	}
