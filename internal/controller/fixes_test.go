@@ -589,3 +589,102 @@ func TestFinishedBlipRetainsCommandOutput(t *testing.T) {
 		t.Fatalf("pod not deleted: %v", err)
 	}
 }
+
+// Output beyond the retained bound keeps exactly the newest lines and says
+// that earlier output was truncated. The marker is reserved inside the bound.
+func TestPodOutputKeepsTailWithTruncationMarker(t *testing.T) {
+	e := newEnv(t)
+	const count = 65
+	line := func(i int) string {
+		return fmt.Sprintf("%04d:%s", i, strings.Repeat(string(rune('a'+i%26)), 1018))
+	}
+	var b strings.Builder
+	for i := range count {
+		b.WriteString("blip: " + line(i))
+		b.WriteByte('\n')
+	}
+	e.blip.Config.PodLogs = func(context.Context, string, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(b.String())), nil
+	}
+
+	out, ok := e.blip.podOutput(e.ctx, ns, "pod")
+	if !ok {
+		t.Fatal("podOutput reported no output")
+	}
+	if !strings.HasPrefix(out, outputTruncated) {
+		t.Fatalf("output does not start with the truncation marker: %q", out[:min(len(out), 80)])
+	}
+	if len(out) > maxRetainedOutput {
+		t.Fatalf("output is %d bytes, want at most %d", len(out), maxRetainedOutput)
+	}
+	if !strings.HasSuffix(out, line(count-1)+"\n") {
+		t.Fatalf("output does not end with the final line: %q", out[max(0, len(out)-80):])
+	}
+	body := strings.Split(strings.TrimSuffix(strings.TrimPrefix(out, outputTruncated), "\n"), "\n")
+	if len(body) != count-2 {
+		t.Fatalf("kept %d lines, want %d", len(body), count-2)
+	}
+	if body[0] != line(2) {
+		t.Fatalf("tail starts at %q, want %q", body[0][:5], line(2)[:5])
+	}
+	for i, got := range body {
+		if want := line(i + 2); got != want {
+			t.Fatalf("line %d does not match the command's tail", i+2)
+		}
+	}
+}
+
+// A single line larger than the retained bound still keeps its newest bytes
+// (and the truncation marker) instead of being dropped altogether.
+func TestPodOutputKeepsTailOfOverlongLine(t *testing.T) {
+	e := newEnv(t)
+	body := strings.Repeat("x", 3*maxRetainedOutput)
+	e.blip.Config.PodLogs = func(context.Context, string, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("blip: " + body + "\n")), nil
+	}
+
+	out, ok := e.blip.podOutput(e.ctx, ns, "pod")
+	if !ok || out == "" {
+		t.Fatal("podOutput dropped the only line")
+	}
+	if !strings.HasPrefix(out, outputTruncated) || len(out) > maxRetainedOutput {
+		t.Fatalf("output is %d bytes with marker %t, want at most %d", len(out), strings.HasPrefix(out, outputTruncated), maxRetainedOutput)
+	}
+	if len(out) <= len(outputTruncated) {
+		t.Fatalf("output kept no bytes of the overlong line: %q", out)
+	}
+	if rest := strings.Trim(out[len(outputTruncated):], "x\n"); rest != "" {
+		t.Fatalf("overlong line kept unexpected bytes: %q", rest)
+	}
+}
+
+// Output that fits is returned whole without a truncation marker.
+func TestPodOutputDoesNotMarkOutputThatFits(t *testing.T) {
+	e := newEnv(t)
+	const count = 64 // exactly maxRetainedOutput bytes of 1024-byte lines
+	line := func(i int) string {
+		return fmt.Sprintf("%04d:%s", i, strings.Repeat(string(rune('a'+i%26)), 1018))
+	}
+	var b strings.Builder
+	for i := range count {
+		b.WriteString("blip: " + line(i))
+		b.WriteByte('\n')
+	}
+	e.blip.Config.PodLogs = func(context.Context, string, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(b.String())), nil
+	}
+
+	out, ok := e.blip.podOutput(e.ctx, ns, "pod")
+	if !ok {
+		t.Fatal("podOutput reported no output")
+	}
+	if strings.Contains(out, outputTruncated) {
+		t.Fatalf("output that fits was marked truncated: %q", out[:min(len(out), 80)])
+	}
+	if len(out) != maxRetainedOutput {
+		t.Fatalf("output is %d bytes, want %d", len(out), maxRetainedOutput)
+	}
+	if !strings.HasPrefix(out, line(0)+"\n") || !strings.HasSuffix(out, line(count-1)+"\n") {
+		t.Fatalf("output lost lines that fit: %q", out[:min(len(out), 80)])
+	}
+}

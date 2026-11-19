@@ -262,6 +262,7 @@ func (r *BlipReconciler) podOutput(ctx context.Context, namespace, pod string) (
 	defer rc.Close()
 	var lines []string
 	total := 0
+	truncated := false
 	sc := bufio.NewScanner(rc)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
@@ -274,20 +275,54 @@ func (r *BlipReconciler) podOutput(ctx context.Context, namespace, pod string) (
 		for total > maxRetainedOutput && len(lines) > 1 {
 			total -= len(lines[0]) + 1
 			lines = lines[1:]
+			truncated = true
 		}
 	}
 	if len(lines) == 0 {
 		return "", false
 	}
-	out := strings.Join(lines, "\n") + "\n"
-	if len(out) > maxRetainedOutput {
-		start := len(out) - (maxRetainedOutput - len(outputTruncated))
-		if i := strings.IndexByte(out[start:], '\n'); i >= 0 {
-			start += i + 1
-		}
-		out = outputTruncated + out[start:]
+	return retainTail(lines, truncated), true
+}
+
+// retainTail joins the newest whole lines that fit in maxRetainedOutput. When
+// earlier lines were removed it reserves room for outputTruncated and prefixes
+// it, so a consumer can tell the head is missing. Only a line longer than the
+// bound is split.
+func retainTail(lines []string, truncated bool) string {
+	limit := maxRetainedOutput
+	if truncated {
+		limit -= len(outputTruncated)
 	}
-	return out, true
+	total := 0
+	for _, line := range lines {
+		total += len(line) + 1
+	}
+	start := 0
+	// Always keep the newest line, even when it alone exceeds the bound; the
+	// byte-level cut below preserves its tail rather than losing all output.
+	for total > limit && len(lines)-start > 1 {
+		total -= len(lines[start]) + 1
+		start++
+	}
+	out := strings.Join(lines[start:], "\n")
+	if len(out) > 0 {
+		out += "\n"
+	}
+	if truncated {
+		out = outputTruncated + out
+	}
+	if len(out) > maxRetainedOutput {
+		// A single line exceeded the bound; keep its most recent bytes and
+		// start at a line boundary when one is left.
+		cut := len(out) - (maxRetainedOutput - len(outputTruncated))
+		// Start at the next line boundary when that leaves output behind;
+		// an overlong line's final newline must not discard its whole tail.
+		if i := strings.IndexByte(out[cut:], '\n'); i >= 0 && i+1 < len(out)-cut {
+			cut += i + 1
+		}
+		out = outputTruncated + out[cut:]
+	}
+	return out
 }
 
 // maxRetainedOutput bounds the command output copied from the serial console
