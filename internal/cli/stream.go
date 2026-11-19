@@ -101,7 +101,13 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 
 	exit, err := s.Copy(a.env.Out, a.env.Err, func(m string) { a.progress("blip: %s", m) })
 	if err != nil {
-		return fmt.Errorf("session %s: %w", s.Opened.Session, err)
+		if !a.stopped(ctx, opts.blip) {
+			return fmt.Errorf("session %s: %w", s.Opened.Session, err)
+		}
+		// The VM stopped before the guest could deliver TExited (for example
+		// while the session was backpressured). Report the same result as a
+		// stop that did deliver it.
+		exit = &wire.Exit{Code: 128 + int(unix.SIGTERM), Signal: "TERM", Reason: wire.ReasonStopped}
 	}
 	if exit.Reason == wire.ReasonStopped {
 		a.progress("\rblip %s stopped\r", opts.blip)

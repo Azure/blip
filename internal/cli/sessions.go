@@ -149,6 +149,26 @@ func (a *app) openRetrying(ctx context.Context, name, pod string, o wire.Open, r
 	}
 }
 
+// stopped reports whether a broken session stream ended because the blip was
+// stopped or deleted rather than because its command failed. Shutting the VM
+// down can kill the pod-exec bridge before the guest delivers TExited, so the
+// client has to classify that transport failure from the requested lifecycle.
+func (a *app) stopped(ctx context.Context, name string) bool {
+	if name == "" {
+		return false
+	}
+	// The stream context dies with the transport; the Blip lookup must still
+	// be able to answer.
+	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	b, err := a.getBlip(qctx, name)
+	if err != nil {
+		return false
+	}
+	return b.Spec.Stop || b.DeletionTimestamp != nil ||
+		b.Status.Phase == v1alpha1.BlipSaving || b.Status.Reason == wire.ReasonStopped
+}
+
 // openPrimary attaches to a command blip's main session. The VM can report
 // Running just before its command session is registered, and a very fast
 // command can finish in that window; retry briefly so its replayed output is
