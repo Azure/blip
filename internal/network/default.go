@@ -7,12 +7,16 @@ import (
 	v1alpha1 "github.com/Azure/blip/api/v1alpha1"
 )
 
-// privateCIDRs are loopback, link-local, shared address space, and the private
-// IPv4 ranges. They also cover the cloud metadata endpoint at 169.254.169.254,
-// the Azure WireServer at 168.63.129.16, which looks public but serves host
-// metadata to guests, and the OCI metadata service in 192.0.0.0/24 (for
-// example 192.0.0.192). Multicast and reserved space are excluded too because
-// neither is internet.
+// privateCIDRs are loopback, link-local, shared address space, the private
+// IPv4 ranges, and IANA special-purpose ranges that are not internet. They
+// also cover the cloud metadata endpoint at 169.254.169.254, the Azure
+// WireServer at 168.63.129.16, which looks public but serves host metadata to
+// guests, and the OCI metadata service in 192.0.0.0/24 (for example
+// 192.0.0.192). The benchmarking range 198.18.0.0/15, the TEST-NET
+// documentation ranges 192.0.2.0/24, 198.51.100.0/24 and 203.0.113.0/24, and
+// the 6to4 relay anycast range 192.88.99.0/24 are reserved too, so they are
+// not treated as public internet. Multicast and the remaining reserved space
+// are excluded because neither is internet.
 var privateCIDRs = []string{
 	"0.0.0.0/8",
 	"10.0.0.0/8",
@@ -22,7 +26,12 @@ var privateCIDRs = []string{
 	"169.254.0.0/16",
 	"172.16.0.0/12",
 	"192.0.0.0/24",
+	"192.0.2.0/24",
+	"192.88.99.0/24",
 	"192.168.0.0/16",
+	"198.18.0.0/15",
+	"198.51.100.0/24",
+	"203.0.113.0/24",
 	"224.0.0.0/4",
 	"240.0.0.0/4",
 }
