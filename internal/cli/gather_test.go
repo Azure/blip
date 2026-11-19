@@ -383,9 +383,9 @@ func TestGatherFollowReplaysSerialLogWhenSessionIsGone(t *testing.T) {
 	}
 }
 
-// When the pod is gone there is nothing left to replay; say so instead of
-// silently printing only the status line.
-func TestGatherFollowSaysFinishedOutputIsGone(t *testing.T) {
+// A finished command with no output is not data loss. Do not warn that
+// output is unavailable when the retained stream is empty.
+func TestGatherFollowDoesNotWarnForEmptyOutput(t *testing.T) {
 	withRetainedOutputWait(t, 50*time.Millisecond)
 	b := finishedBlip("gone", v1alpha1.BlipSucceeded, 0)
 	b.Status.Pod = ""
@@ -395,7 +395,9 @@ func TestGatherFollowSaysFinishedOutputIsGone(t *testing.T) {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	mustContain(t, out, "blip/gone Succeeded (exit 0)")
-	mustContain(t, errOut, "output is no longer available")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
 	if !h.gone("gone") {
 		t.Fatal("blip kept")
 	}
@@ -440,9 +442,9 @@ func TestGatherFollowUsesDelayedRetainedOutputAfterEmptyReplay(t *testing.T) {
 	}
 }
 
-// An empty replay with no retained output must warn instead of printing only
-// the summary line.
-func TestGatherFollowWarnsWhenEmptyReplayHasNoOutput(t *testing.T) {
+// An empty replay with an empty retained stream is a command that printed
+// nothing; do not warn.
+func TestGatherFollowDoesNotWarnWhenEmptyReplayHasNoOutput(t *testing.T) {
 	withRetainedOutputWait(t, 50*time.Millisecond)
 	h := newHarness(t, finishedBlip("empty", v1alpha1.BlipSucceeded, 0))
 	code, out, errOut := h.run("", "gather", "empty", "-f")
@@ -450,7 +452,9 @@ func TestGatherFollowWarnsWhenEmptyReplayHasNoOutput(t *testing.T) {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	mustContain(t, out, "blip/empty Succeeded (exit 0)")
-	mustContain(t, errOut, "output is no longer available")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
 }
 
 // The hint must name the object as the API knows it, not the caller-scoped

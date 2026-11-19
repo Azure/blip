@@ -411,7 +411,7 @@ func (a *app) follow(ctx context.Context, name string) {
 	pod := b.Status.Pod
 	if pod == "" {
 		if ending {
-			if !a.printRetained(ctx, name, short) {
+			if !a.printRetained(ctx, name, short) && !a.endedWithoutOutput(ctx, name) {
 				a.progress("%s: output is no longer available (the VM pod is gone)", short)
 			}
 		}
@@ -430,7 +430,9 @@ func (a *app) follow(ctx context.Context, name string) {
 			return
 		}
 		if ending || a.blipEnding(ctx, name) {
-			a.progress("%s: output is no longer available: %v", short, err)
+			if !a.endedWithoutOutput(ctx, name) {
+				a.progress("%s: output is no longer available: %v", short, err)
+			}
 			return
 		}
 		a.progress("%s: could not follow output: %v", short, err)
@@ -443,7 +445,7 @@ func (a *app) follow(ctx context.Context, name string) {
 	out.flush()
 	errw.flush()
 	if !out.wrote && !errw.wrote && (ending || a.blipEnding(ctx, name)) {
-		if !a.replayLogs(ctx, pod, short) && !a.printRetained(ctx, name, short) {
+		if !a.replayLogs(ctx, pod, short) && !a.printRetained(ctx, name, short) && !a.endedWithoutOutput(ctx, name) {
 			a.progress("%s: output is no longer available", short)
 		}
 	}
@@ -455,6 +457,17 @@ func (a *app) follow(ctx context.Context, name string) {
 func (a *app) blipEnding(ctx context.Context, name string) bool {
 	b, err := a.getBlip(ctx, name)
 	return err == nil && (v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving)
+}
+
+// endedWithoutOutput reports that the blip is finished and produced no
+// output. Losing an empty stream is not a failure, so followers should not
+// warn that output is unavailable.
+func (a *app) endedWithoutOutput(ctx context.Context, name string) bool {
+	b, err := a.getBlip(ctx, name)
+	if err != nil {
+		return false
+	}
+	return (v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving) && b.Status.Output == ""
 }
 
 // retainedOutputWait bounds how long gather waits for the controller to
