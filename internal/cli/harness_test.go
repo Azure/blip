@@ -341,6 +341,10 @@ func (c *fakeController) step(b *v1alpha1.Blip) bool {
 			// The unmount failed but the spec was restored: the mount never
 			// left, so it is usable again.
 			m.Phase, m.Message, m.Switching = v1alpha1.MountMounted, "", false
+		case sm != nil && m.Phase == v1alpha1.MountUnmounting && !m.Switching && sm.Path == m.Path && sm.Writable == m.Writable:
+			// The spec was restored while the old mount was still attached:
+			// the real controller revives it instead of unmounting.
+			m.Phase, m.Message = v1alpha1.MountMounted, ""
 		case sm != nil && m.Phase == v1alpha1.MountUnmounting && m.Switching:
 			if c.unmountFail != "" {
 				m.Phase, m.Message = v1alpha1.MountFailed, c.unmountFail

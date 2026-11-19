@@ -400,6 +400,12 @@ func retryableStreamError(err error) bool {
 		"no such host",
 		"unexpected EOF",
 		"i/o timeout",
+		// A blip that was just started has a writer but no attached guest
+		// yet, and a peer hop may not know the node until placement settles.
+		// These clear once the command connects to its stdio.
+		"stream: state has no trajectory",
+		"stream: guest stdio is not connected",
+		"peer: unknown node",
 	} {
 		if strings.Contains(msg, s) {
 			return true

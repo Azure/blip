@@ -17,6 +17,11 @@ cleanup_10() {
 }
 cleanup_register cleanup_10
 
+# blip_printed reports whether a blip's stdout contains an exact line.
+blip_printed() {
+	blip logs "$1" --raw 2>/dev/null | grep -qx "$2"
+}
+
 step "use the shared template"
 ensure_base
 
@@ -60,8 +65,7 @@ data_commit=$(k get blipstate "$P-data" -o jsonpath='{.status.committed.id}')
 config=$(k get blipstate "$P-workspace" -o jsonpath='{.spec.mounts}{.spec.runtime}')
 
 step "run the workspace, then delete the execution; its states remain"
-blip run --name "$P-agent" --state "$P-workspace" -- sleep infinity
-blip run --from "$P-agent" -- sh -ec '
+blip run --name "$P-agent" --state "$P-workspace" -- sh -ec '
   test "$DURABLE_WORKSPACE" = kept
   test "$PWD" = /work
   test "$(id -u):$(id -g)" = 0:0
@@ -69,7 +73,10 @@ blip run --from "$P-agent" -- sh -ec '
   echo rw-kept > /work/kept.txt
   test -x /opt/base/bin/sh
   sync
+  echo agent-checks-passed
+  sleep infinity
 '
+wait_for "$T" "checks in $P-agent" blip_printed "$P-agent" agent-checks-passed
 k delete blip "$P-agent" >/dev/null
 wait_state "$P-workspace"
 wait_state "$P-data"
@@ -80,8 +87,7 @@ test "$(k get blipstate "$P-data" -o jsonpath='{.status.committed.id}')" != "$da
 test "$(k get blipstate "$P-workspace" -o jsonpath='{.spec.mounts}{.spec.runtime}')" = "$config"
 
 step "a differently named execution restores files, topology, and runtime defaults"
-blip run --name "$P-resumed" --state "$P-workspace" -- sleep infinity
-blip run --from "$P-resumed" -- sh -ec '
+blip run --name "$P-resumed" --state "$P-workspace" -- sh -ec '
   test "$(cat /root/kept.txt)" = root-kept
   test "$(cat /work/kept.txt)" = rw-kept
   test "$DURABLE_WORKSPACE" = kept
@@ -90,8 +96,10 @@ blip run --from "$P-resumed" -- sh -ec '
   test -x /opt/base/bin/sh
   awk '\''$2 == "/work" && $4 ~ /(^|,)rw(,|$)/ { found=1 } END { exit !found }'\'' /proc/mounts
   awk '\''$2 == "/opt/base" && $4 ~ /(^|,)ro(,|$)/ { found=1 } END { exit !found }'\'' /proc/mounts
-  echo "root, RW data, RO mount, and runtime defaults restored"
+  echo resumed-checks-passed
+  sleep infinity
 '
+wait_for "$T" "checks in $P-resumed" blip_printed "$P-resumed" resumed-checks-passed
 test "$(blip_field "$P-resumed" '{.spec.state}')" = "$P-workspace"
 test "$(blip_field "$P-resumed" '{.status.mounts[?(@.path=="/work")].state}')" = "$P-data"
 test "$(blip_field "$P-resumed" '{.status.mounts[?(@.path=="/opt/base")].state}')" = "$P-base"
@@ -102,8 +110,7 @@ k delete blip "$P-resumed" >/dev/null
 wait_state "$P-workspace"
 
 step "fork concurrently inside a blip and gather branches, files, and logs"
-blip run --name "$P-collector" --from "$P-base" -- sleep infinity
-blip run --from "$P-collector" -e FORK_MAX="$FORK_MAX" -e W="$P" -- bash -ec '
+blip run --name "$P-collector" --from "$P-base" -e FORK_MAX="$FORK_MAX" -e W="$P" -- bash -ec '
   set -euo pipefail
   git config --global user.email a@example.com
   git config --global user.name a
@@ -148,7 +155,8 @@ blip run --from "$P-collector" -e FORK_MAX="$FORK_MAX" -e W="$P" -- bash -ec '
   git log --oneline --all
   if blip gather "$W-w9" --collect "git:$PWD:w9" 2>/dev/null; then echo "gather of a missing worker succeeded"; exit 1; fi
 '
-k delete blip "$P-collector" >/dev/null
+# gather waits for the script and deletes the collector's state with it.
+blip gather "$P-collector"
 # The workers were deleted by gather, and their owned states go with them.
 for w in w1 w2 slow stopped; do
 	wait_state_gone "$P-$w"

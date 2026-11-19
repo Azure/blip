@@ -462,6 +462,11 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 	if err := os.MkdirAll(vsockDir, 0o770); err != nil { // kubelet fsGroup mode
 		t.Fatal(err)
 	}
+	// MkdirAll is subject to the process umask; kubelet's emptyDir handling
+	// sets the mode explicitly, so model that instead of relying on umask.
+	if err := os.Chmod(vsockDir, 0o770); err != nil {
+		t.Fatal(err)
+	}
 	listener, err := net.Listen("unix", suffix)
 	if err != nil {
 		t.Fatal(err)

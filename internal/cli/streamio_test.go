@@ -5,6 +5,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -224,5 +225,20 @@ func TestGatherFollowReadsRetainedTrajectory(t *testing.T) {
 	mustContain(t, errOut, "fast-err\n", "w1: start", "w1: end")
 	if !h.gone("w1") {
 		t.Fatal("gathered blip was kept")
+	}
+}
+
+func TestRetryableStreamErrorCoversStartup(t *testing.T) {
+	for _, msg := range []string{
+		"peer: unknown node \"\"",
+		`peer: blip-dev-worker /v1/stream/log: 404 Not Found: stream: state has no trajectory`,
+		"stream: guest stdio is not connected",
+	} {
+		if !retryableStreamError(errors.New(msg)) {
+			t.Errorf("retryableStreamError(%q) = false, want true", msg)
+		}
+	}
+	if retryableStreamError(errors.New("blipstreams.stream.blip.dev is forbidden")) {
+		t.Fatal("an authorization error must be terminal")
 	}
 }
