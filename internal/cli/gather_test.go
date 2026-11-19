@@ -713,8 +713,11 @@ func TestGatherFollowReplaysRetainedOutputAfterTruncatedStream(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "cut| LIVE1", "cut| LIVE2", "cut| RETAINED1", "cut| FINAL_MARKER", "blip/cut Succeeded (exit 0)")
-	mustContain(t, errOut, "output stream ended before the command exited", "replayed the retained output")
+	mustContain(t, out, "cut| LIVE1", "cut| LIVE2", "blip/cut Succeeded (exit 0)")
+	mustContain(t, errOut, "cut| RETAINED1", "cut| FINAL_MARKER", "output stream ended before the command exited", "replayed the retained output")
+	if strings.Contains(out, "RETAINED1") {
+		t.Fatalf("retained combined output replayed to stdout: %q", out)
+	}
 	if !h.gone("cut") {
 		t.Fatal("blip kept")
 	}
@@ -772,9 +775,13 @@ func TestGatherFollowReplaysSerialLogWhenSessionIsGone(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "fastlog| FASTOUT", "fastlog| LASTLINE", "blip/fastlog Succeeded (exit 0)")
-	if strings.Contains(out, "boot") || strings.Contains(out, "blip-guest") {
-		t.Fatalf("serial noise leaked into output: %q", out)
+	mustContain(t, out, "blip/fastlog Succeeded (exit 0)")
+	mustContain(t, errOut, "fastlog| FASTOUT", "fastlog| LASTLINE")
+	if strings.Contains(out, "FASTOUT") || strings.Contains(out, "LASTLINE") {
+		t.Fatalf("combined serial output replayed to stdout: %q", out)
+	}
+	if strings.Contains(errOut, "boot") || strings.Contains(errOut, "blip-guest") {
+		t.Fatalf("serial noise leaked into output: %q", errOut)
 	}
 }
 
@@ -813,7 +820,11 @@ func TestGatherFollowWaitsForDelayedStatusOutput(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "lagged| LATEOUT", "blip/lagged Succeeded (exit 0)")
+	mustContain(t, errOut, "lagged| LATEOUT")
+	mustContain(t, out, "blip/lagged Succeeded (exit 0)")
+	if strings.Contains(out, "LATEOUT") {
+		t.Fatalf("retained output replayed to stdout: %q", out)
+	}
 	if strings.Contains(errOut, "output is no longer available") {
 		t.Fatalf("unexpected unavailable message: %q", errOut)
 	}
@@ -858,7 +869,11 @@ func TestGatherFollowUsesDelayedRetainedOutputAfterEmptyReplay(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "empty| RETAINED", "blip/empty Succeeded (exit 0)")
+	mustContain(t, errOut, "empty| RETAINED")
+	mustContain(t, out, "blip/empty Succeeded (exit 0)")
+	if strings.Contains(out, "RETAINED") {
+		t.Fatalf("retained output replayed to stdout: %q", out)
+	}
 	if strings.Contains(errOut, "output is no longer available") {
 		t.Fatalf("unexpected unavailable message: %q", errOut)
 	}
@@ -1014,7 +1029,8 @@ func TestGatherExplicitNameRejectsCaller(t *testing.T) {
 }
 
 // A finished command whose pod is already gone still reports the output the
-// controller retained in status.
+// controller retained in status. status.output combines stdout and stderr, so
+// the replay goes to stderr while the summary stays on stdout.
 func TestGatherFollowUsesRetainedStatusOutput(t *testing.T) {
 	b := finishedBlip("retained", v1alpha1.BlipSucceeded, 0)
 	b.Status.Pod = ""
@@ -1024,7 +1040,11 @@ func TestGatherFollowUsesRetainedStatusOutput(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "retained| FASTOUT", "retained| LASTLINE", "blip/retained Succeeded (exit 0)")
+	mustContain(t, errOut, "retained| FASTOUT", "retained| LASTLINE")
+	mustContain(t, out, "blip/retained Succeeded (exit 0)")
+	if strings.Contains(out, "FASTOUT") || strings.Contains(out, "LASTLINE") {
+		t.Fatalf("retained combined output replayed to stdout: %q", out)
+	}
 	if strings.Contains(errOut, "output is no longer available") {
 		t.Fatalf("unexpected unavailable message: %q", errOut)
 	}

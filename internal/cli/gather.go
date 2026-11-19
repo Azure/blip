@@ -732,7 +732,11 @@ func (a *app) printRetainedFor(ctx context.Context, name, short string, wait tim
 		err := c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: name}, b)
 		switch {
 		case err == nil && b.Status.Output != "":
-			w := &prefixWriter{out: a.env.Out, prefix: short + "|"}
+			// status.output is the combined stdout and stderr tail
+			// recovered from the serial console, so its streams cannot be
+			// split again. Write it to stderr rather than pretend it is
+			// the command's stdout.
+			w := &prefixWriter{out: a.env.Err, prefix: short + "|"}
 			_, _ = w.Write([]byte(b.Status.Output))
 			w.flush()
 			return w.wrote
@@ -752,7 +756,9 @@ func (a *app) printRetainedFor(ctx context.Context, name, short string, wait tim
 
 // replayLogs prints the command output preserved on the VM serial console.
 // The guest prefixes mirrored output with "blip: ", which separates it from
-// kernel and runtime boot messages. It returns whether it printed anything.
+// kernel and runtime boot messages. The mirror combines stdout and stderr
+// without a stream tag, so the output goes to stderr rather than pretending
+// it is the command's stdout. It returns whether it printed anything.
 func (a *app) replayLogs(ctx context.Context, pod, short string) bool {
 	c, err := a.clients()
 	if err != nil || c.Logs == nil {
@@ -763,7 +769,7 @@ func (a *app) replayLogs(ctx context.Context, pod, short string) bool {
 		return false
 	}
 	defer rc.Close()
-	w := &prefixWriter{out: a.env.Out, prefix: short + "|"}
+	w := &prefixWriter{out: a.env.Err, prefix: short + "|"}
 	sc := bufio.NewScanner(rc)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {

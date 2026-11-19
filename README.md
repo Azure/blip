@@ -286,7 +286,10 @@ report their last report.
   vsock protocol.
 - `gather -f` tails a running command's output, and the guest mirrors the
   primary command's output to the VM serial console, so `kubectl logs` shows it
-  too. Output is not retained beyond the 1 MiB replay ring.
+  too. Output is not retained beyond the 1 MiB replay ring. A command that
+  finished before the follower attached is replayed from the combined
+  serial/status tail, whose stdout and stderr cannot be told apart, so that
+  replay is written to stderr.
 - A finished Blip is kept as Succeeded or Failed so its status and exit code
   remain visible, and `gather` reports the command's exit code. The controller
   deletes a Blip `spec.ttlSecondsAfterFinished` after it finishes and
