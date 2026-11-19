@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 "use strict";
 
 // End-to-end smoke test for the Blip Chat UI. The auth shim in front of the

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # shellcheck disable=SC2154
 # Shared helpers for the e2e scenarios. hack/e2e.sh sets the environment and
 # sources this file before any scenario.

@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Local end-to-end profile for the opencode ACP agent.
 #
 # This is a test-only profile: it points opencode at the logical Blip endpoint

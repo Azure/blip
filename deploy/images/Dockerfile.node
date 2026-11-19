@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Built by hack/build-images.sh from binaries prebuilt with `make build`.
 # Nodes convert container images with `mke2fs -d <tarball>`, which needs
 # e2fsprogs >= 1.47.1 (trixie ships 1.47.2) and libarchive, which mke2fs

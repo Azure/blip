@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package simtest provides conformance checks shared by component model tests.
 //
 // The helpers deliberately keep model construction and properties with the

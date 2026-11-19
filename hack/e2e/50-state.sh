@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # shellcheck shell=bash
 # shellcheck disable=SC2154 # $work and the scenario environment come from hack/e2e.sh.
 # Durable state semantics: single-writer serialization, writable mount

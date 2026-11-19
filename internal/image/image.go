@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package image pulls ordinary container images and turns them into ext4
 // filesystems: Pull flattens the linux/GOARCH variant into one tar file and
 // MakeFS writes it to a block device. See the README's implementation outline.

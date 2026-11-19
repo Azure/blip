@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package stream implements the append-only record ring that carries a
 // blip's stdin, stdout, stderr and lifecycle events.
 //

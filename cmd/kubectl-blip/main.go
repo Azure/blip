@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Command kubectl-blip is the Blip kubectl plugin, run as `kubectl blip`.
 package main
 

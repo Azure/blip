@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Allowlist: image builds only need built binaries and guest artifacts.
 *
 !bin/

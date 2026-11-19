@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Local-only authentication shim for the opencode browser E2E test.
 #
 # blipchat rejects API calls without X-Forwarded-User. This nginx pod forwards

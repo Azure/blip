@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Create or update the local kind cluster blip-dev and install Blip on it.
 # Safe to rerun. Touches only the kind cluster blip-dev (always through the
 # explicit context kind-blip-dev), the blip-registry container, and

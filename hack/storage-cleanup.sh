@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Removes kernel objects created by blip storage/nvme/peer tests for the given
 # node names, and nothing else: dm devices named blip-<sha256(node)[:8]>-*,
 # nvmet subsystems nqn.2014-08.dev.blip:<hash>:*, their nvmet port (if left

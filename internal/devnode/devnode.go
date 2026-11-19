@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package devnode creates device nodes below /dev from sysfs device numbers.
 package devnode
 

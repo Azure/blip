@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Download a Debian cloud kernel and matching modules for ARCH, extract them
 # under DEST, and print KVER/KERNEL/MODDIR assignments for hack/guest/build.sh:
 #

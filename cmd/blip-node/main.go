@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Command blip-node is the node agent DaemonSet.
 // +kubebuilder:rbac:groups=blip.dev,resources=blips;blipstates;blippools;blipnodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blip.dev,resources=blipnodes,verbs=create;update

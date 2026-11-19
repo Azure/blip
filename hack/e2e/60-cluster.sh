@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # shellcheck shell=bash
 # shellcheck disable=SC2016
 # Cluster integration: node registration, replicated state placement, warm

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Runs the privileged storage, nvme, and peer tests in disposable privileged
 # containers (they share the host kernel: dm, loop, nvmet, nvme-tcp), then
 # removes every kernel object the run created. Never touches other devices.

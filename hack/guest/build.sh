@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Build the guest kernel and initramfs:
 #   build/guest/vmlinuz       kernel image (KERNEL override; default is the
 #                             host kernel)

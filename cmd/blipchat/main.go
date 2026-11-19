@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Command blipchat is a stateless, team-scoped chat UI for ACP agents running
 // in blips. A chat is a BlipState; each turn runs a Blip whose stdin/stdout is
 // the state's trajectory ring.

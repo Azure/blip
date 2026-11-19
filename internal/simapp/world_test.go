@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package simapp composes public production cores in a deterministic virtual
 // environment. The scenario is an integration workload, not another controller.
 package simapp

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package mountpath holds mount-point rules shared by the command-line
 // preflight and the guest, so a mount the guest cannot create is rejected
 // before it becomes durable intent.

@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # shellcheck shell=bash
 # Disruptive-but-graceful failure coverage: drain a worker that holds a state
 # replica, restart one node agent, and churn a temporary pool at its maxCount.

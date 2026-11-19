@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package diskkey manages the cluster disk key: one dm-crypt key shared by
 // every node, because volumes move between nodes as ciphertext.
 package diskkey

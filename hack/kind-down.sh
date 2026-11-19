@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Delete the kind cluster blip-dev and the host kernel state its blip nodes
 # leave behind. kind nodes share the host kernel, so NVMe/TCP connections,
 # nvmet exports, device-mapper devices and loop devices outlive the node

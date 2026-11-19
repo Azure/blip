@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # shellcheck shell=bash
 # blipchat smoke test: the deployment serves probes, rejects anonymous API
 # calls, and lists team-scoped sessions through a port-forward. Agent turns are

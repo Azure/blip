@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Local end-to-end pool for the opencode ACP browser test.
 #
 # The "unbounded" endpoint is logical: the pool sidecar dials the local

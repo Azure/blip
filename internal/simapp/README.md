@@ -1,3 +1,6 @@
+<!-- Copyright (c) Microsoft Corporation.
+Licensed under the MIT License. -->
+
 # Deterministic cross-component lifecycle
 
 Run with the repository's Go toolchain:

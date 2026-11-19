@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 name: Test
 
 on:
@@ -14,6 +17,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  hygiene:
+    name: repository hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check copyright headers
+        run: python3 hack/headers.py check
+      - name: Check GitHub Actions are SHA-pinned
+        run: python3 hack/actions.py check
   test:
     name: go test (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -29,8 +41,8 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: arm64
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true

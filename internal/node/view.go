@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package node is the blip-node agent: it owns the node's storage, peer trust and
 // export service, prepares disks for VM pods, and reports this node's view of
 // every BlipState. See the README's implementation outline.

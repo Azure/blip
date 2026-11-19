@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # shellcheck shell=bash
 # shellcheck disable=SC2016
 # Endpoint proxy, in-guest Kubernetes access with owner scoping, and the

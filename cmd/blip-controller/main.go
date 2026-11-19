@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Command blip-controller runs the blip control plane: the enrollment, node,
 // pool, state, and blip reconcilers, plus garbage collection of old finished
 // blips.

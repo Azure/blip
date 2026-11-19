@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # shellcheck shell=bash
 # shellcheck disable=SC2016,SC2154
 # Runtime contracts: per-execution overrides, image defaults, trajectory

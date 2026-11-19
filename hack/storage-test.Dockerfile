@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Disposable environment for privileged storage/nvme/peer tests
 # (hack/storage-test.sh). Test binaries are copied in at run time. Matches the
 # node image's e2fsprogs and libarchive (mke2fs -d <tarball>).

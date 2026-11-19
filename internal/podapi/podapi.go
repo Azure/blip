@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package podapi is the contract between the node agent and the in-pod
 // runtime. The node agent writes Desired; the runtime writes Observed. Both
 // live in the pod directory, which is the host path

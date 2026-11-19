@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package apiproxy
 
 // Deterministic simulations for the API proxy's decision core.

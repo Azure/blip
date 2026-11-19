@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package peer provides key-pinned mutual TLS control for authenticated
 // ciphertext NVMe/TCP exports.
 // See the README's implementation outline.

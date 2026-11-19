@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Local kind cluster (hack/kind-up.sh). kind-up.sh applies a generated overlay
 # on top of this one that pins the freshly built, kind-loaded image tags.
 apiVersion: kustomize.config.k8s.io/v1beta1

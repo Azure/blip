@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Command blip-runtime runs one blip VM inside a VM pod.
 //
 //	blip-runtime            supervise Cloud Hypervisor (see the README)

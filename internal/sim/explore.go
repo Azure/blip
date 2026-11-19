@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package sim explores production state machines against explicit models of
 // their environment. It owns no goroutines, wall clocks, or global random state.
 package sim

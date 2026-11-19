@@ -1,3 +1,6 @@
+<!-- Copyright (c) Microsoft Corporation.
+Licensed under the MIT License. -->
+
 # Deterministic simulation
 
 Blip's simulations execute production decision and operation code against

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package storage manages the node's dm-thin pool: image bases, immutable
 // commits, and writable working volumes. Thin devices hold only ciphertext:
 // filesystems are read and written through a dm-crypt mapping above them.

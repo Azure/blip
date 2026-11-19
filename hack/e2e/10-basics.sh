@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # shellcheck shell=bash
 # shellcheck disable=SC2016,SC2154
 # Core lifecycle: pull a base, run and gather a command, keep and resume a

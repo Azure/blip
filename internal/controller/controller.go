@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package controller implements blip-controller: the enrollment, node, pool,
 // state, and blip reconcilers. See the README's implementation outline.
 package controller

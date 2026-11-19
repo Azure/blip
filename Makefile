@@ -1,7 +1,10 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 BINARIES := blip-controller blip-node blip-runtime blipchat blip-guest kubectl-blip
 CONTROLLER_GEN ?= $(shell go env GOPATH)/bin/controller-gen
 
-.PHONY: build generate test test-sim guest images kind-up kind-down
+.PHONY: build generate headers verify-headers verify-actions test test-sim guest images kind-up kind-down
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/ $(addprefix ./cmd/,$(BINARIES))
@@ -9,6 +12,16 @@ build:
 generate:
 	$(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt paths=./api/...
 	$(CONTROLLER_GEN) crd paths=./api/... output:crd:dir=deploy/crd
+	python3 hack/headers.py fix api/v1alpha1/zz_generated.deepcopy.go deploy/crd
+
+headers:
+	python3 hack/headers.py fix
+
+verify-headers:
+	python3 hack/headers.py check
+
+verify-actions:
+	python3 hack/actions.py check
 
 test:
 	go test ./...

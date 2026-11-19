@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Built by hack/build-images.sh from binaries prebuilt with `make build` and
 # guest assets from `make guest`. The script stages the (static) Cloud
 # Hypervisor binary in build/images/. The base suite matches the node image.

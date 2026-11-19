@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Browser end-to-end test for the opencode ACP agent in a Blip.
 #
 # The tracked test harness knows only the logical endpoint named "unbounded".

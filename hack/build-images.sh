@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Build the blip-controller, blip-node, blip-runtime and blipchat images from
 # prebuilt binaries (make build) and guest assets (make guest). Each image is
 # tagged with its content hash, and the references are written to

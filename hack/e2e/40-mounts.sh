@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # shellcheck shell=bash
 # Mounts: durable roots, writable auxiliary mounts and their fork privacy,
 # read-only mounts, --new/--from, removals, rejections, and collecting from a

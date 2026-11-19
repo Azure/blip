@@ -1,3 +1,6 @@
+<!-- Copyright (c) Microsoft Corporation.
+Licensed under the MIT License. -->
+
 # opencode browser E2E
 
 This directory contains a local-only browser test:

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package netpolicy holds the network policy value types shared by the
 // controller, the node agent, and the VM runtime. It deliberately imports
 // nothing from Kubernetes so the runtime binary does not link the API server

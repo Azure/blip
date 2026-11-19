@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package nvme exports block devices over NVMe/TCP through the kernel nvmet
 // target (configfs) and connects to them with the kernel initiator, without
 // nvme-cli. Every configfs name is derived from the node name because kind

@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Local end-to-end image for the opencode ACP profile.
 #
 # Build through hack/e2e/opencode/run.sh, which stages the host's opencode

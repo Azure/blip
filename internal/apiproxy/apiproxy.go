@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package apiproxy serves the pod's Kubernetes API identity and configured
 // HTTPS endpoints over the guest-to-host vsock Unix socket, routing by Host.
 // Service account and endpoint credentials stay in the sidecar; upstreams

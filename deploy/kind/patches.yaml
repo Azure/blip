@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Images are pulled from the plain-HTTP registry container blip-registry on the
 # kind docker network (localhost:5001 from the host).
 apiVersion: apps/v1

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package v1alpha1 contains the blip.dev/v1alpha1 API.
 //
 // Ownership rules (see the README's implementation outline):

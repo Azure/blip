@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Built by hack/build-images.sh from binaries prebuilt with `make build`.
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY bin/blipchat /usr/local/bin/

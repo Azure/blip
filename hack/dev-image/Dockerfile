@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Development sandbox image for the local kind cluster. hack/kind-up.sh builds
 # it and pushes it to the local registry as blip-registry:5000/blip/dev:latest.
 # Build from the repository root after `make build`:

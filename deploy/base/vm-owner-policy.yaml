@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Restricts what a VM's service account token can do. The controller keeps a
 # ConfigMap blip-vm-owners in every namespace with a BlipPool:
 #   sa.<service account>: <pools>  every VM service account, with the

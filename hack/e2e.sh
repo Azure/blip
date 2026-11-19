@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # End-to-end tests against the kind cluster from hack/kind-up.sh. Scenarios
 # live in hack/e2e/ and share the helpers in hack/e2e/lib.sh. Everything runs
 # from the host through the CLI in the default namespace unless a scenario

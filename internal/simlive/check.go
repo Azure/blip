@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package simlive checks eventual reachability of a goal in a bounded, explicit
 // finite-state model. It supports weak fairness of configured action groups,
 // not strong fairness or claims about an unbounded implementation.

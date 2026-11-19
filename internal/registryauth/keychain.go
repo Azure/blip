@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package registryauth builds registry keychains from Kubernetes image pull
 // secrets. Both the controller (to resolve digests and image config) and the
 // node agent (to pull layers) use it, so a private image behaves the same in

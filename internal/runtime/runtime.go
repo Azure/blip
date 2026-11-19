@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package runtime is blip-runtime: it runs Cloud Hypervisor in a VM pod,
 // applies desired.json through the guest control port, and reports
 // observed.json.

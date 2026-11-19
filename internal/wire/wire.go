@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package wire is the framed protocol between the host and the guest init
 // over virtio-vsock. Every message is one frame:
 //

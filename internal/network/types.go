@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package network compiles IPv4 egress policies against a Kubernetes snapshot.
 package network
 

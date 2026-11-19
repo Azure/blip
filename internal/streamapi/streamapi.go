@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package streamapi serves blip trajectories and stdin as an aggregated
 // Kubernetes API. It is a library: the caller supplies a Backend and mounts
 // Handler behind the kube-apiserver's front proxy. The API group is

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package atomicfile replaces files atomically and durably using a temporary
 // file in the destination directory. Success means both the file contents and
 // mode, and the directory entry naming that file, have been synced.

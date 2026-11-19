@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package streamapi
 
 // This file models the aggregated stream API server, not the node's trajectory
