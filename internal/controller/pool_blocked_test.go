@@ -1,11 +1,13 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -126,6 +128,104 @@ func TestPoolBoundsGenericUnschedulableChurn(t *testing.T) {
 	}
 	if len(seen) > 5 {
 		t.Fatalf("%d pods in three minutes, want blockedGrace to bound churn: %v", len(seen), seen)
+	}
+
+	// The shortfall is visible on the pool while a rejected pod is kept.
+	for _, p := range e.pods() {
+		if !unschedulable(&p) {
+			w317MarkUnschedulable(t, e, &p)
+		}
+	}
+	e.run(e.pool, ns, "default")
+	if st := e.getPool("default").Status; st.Reason != poolNoCapacity || st.Vacant != 0 || st.Ready != 0 {
+		t.Fatalf("status %+v, want NoCapacity with no vacant/ready VM", st)
+	}
+}
+
+// TestPoolReportsNoCapacity covers a pool whose only spare is Pending and
+// Unschedulable: status must name the shortage, a Warning must fire once per
+// transition, and both must clear when a schedulable VM exists.
+func TestPoolReportsNoCapacity(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 1, 1)
+	recorder := record.NewFakeRecorder(10)
+	e.pool.Recorder = recorder
+	e.run(e.pool, ns, "default")
+
+	pods := e.pods()
+	if len(pods) != 1 {
+		t.Fatalf("%d pods, want one warm spare", len(pods))
+	}
+	p := pods[0]
+	p.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable,
+		Message: "0/1 nodes are available: 1 Insufficient memory.",
+	}}
+	e.must(e.c.Status().Update(e.ctx, &p))
+
+	e.run(e.pool, ns, "default")
+	st := e.getPool("default").Status
+	if st.Reason != poolNoCapacity {
+		t.Fatalf("reason %q, want %q (status %+v)", st.Reason, poolNoCapacity, st)
+	}
+	if !strings.Contains(st.Message, "Insufficient memory") {
+		t.Errorf("message %q does not explain the scheduler rejection", st.Message)
+	}
+	if st.Vacant != 0 || st.Ready != 0 {
+		t.Errorf("status %+v claims capacity for an unplaceable spare", st)
+	}
+	event := waitForEvent(t, recorder)
+	if !strings.Contains(event, corev1.EventTypeWarning+" "+poolNoCapacity) ||
+		!strings.Contains(event, "Insufficient memory") {
+		t.Errorf("event = %q, want a Warning NoCapacity naming the rejection", event)
+	}
+
+	// Still unschedulable: no flood of Events or pod churn.
+	e.run(e.pool, ns, "default")
+	e.run(e.pool, ns, "default")
+	select {
+	case extra := <-recorder.Events:
+		t.Fatalf("duplicate event %q while the shortage did not change", extra)
+	default:
+	}
+	if n := len(e.pods()); n != 1 {
+		t.Fatalf("%d pods while the spare is kept, want one", n)
+	}
+
+	// The scheduler places the VM: capacity exists, so reason and message clear.
+	cur := e.getPod(p.Name)
+	cur.Spec.NodeName = "n1"
+	cur.Labels[v1.LabelWarm] = "true"
+	e.must(e.c.Update(e.ctx, cur))
+	cur.Status.Phase = corev1.PodRunning
+	cur.Status.Conditions = nil
+	e.must(e.c.Status().Update(e.ctx, cur))
+	e.run(e.pool, ns, "default")
+	st = e.getPool("default").Status
+	if st.Reason != "" || st.Message != "" {
+		t.Fatalf("scheduled pool still reports %q: %q", st.Reason, st.Message)
+	}
+	if st.Ready != 1 || st.Vacant != 1 {
+		t.Fatalf("status %+v, want the placed spare ready and vacant", st)
+	}
+
+	// A later shortage is a new transition and warns again.
+	e.must(e.c.Delete(e.ctx, cur))
+	e.run(e.pool, ns, "default")
+	pods = e.pods()
+	if len(pods) != 1 {
+		t.Fatalf("%d pods after deleting the spare, want a replacement", len(pods))
+	}
+	next := pods[0]
+	w317MarkUnschedulable(t, e, &next)
+	e.run(e.pool, ns, "default")
+	if st := e.getPool("default").Status; st.Reason != poolNoCapacity {
+		t.Fatalf("reason %q after the second shortage, want %q", st.Reason, poolNoCapacity)
+	}
+	event = waitForEvent(t, recorder)
+	if !strings.Contains(event, corev1.EventTypeWarning+" "+poolNoCapacity) {
+		t.Errorf("event = %q, want a second Warning NoCapacity", event)
 	}
 }
 

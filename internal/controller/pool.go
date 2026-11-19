@@ -123,6 +123,11 @@ const (
 	// poolInvalidConfiguration is the BlipPool.status.reason for a spec that
 	// admission accepted but the controller cannot turn into VMs.
 	poolInvalidConfiguration = "InvalidConfiguration"
+
+	// poolNoCapacity is the BlipPool.status.reason for a pool whose VM pod
+	// the scheduler cannot place. Without it the pool claims vacant capacity
+	// while a Blip waits for a VM that can never boot.
+	poolNoCapacity = "NoCapacity"
 )
 
 var (
@@ -166,6 +171,10 @@ type PoolReconciler struct {
 	// rejected and when the pool may replace it. The pod is kept meanwhile,
 	// so the rejection is remembered by name rather than re-derived.
 	rejectedGeneric map[types.NamespacedName]genericRejection
+	// noCapacity records, per pool, that the NoCapacity transition already
+	// published a Warning Event. Repeated passes over an unplaceable pod must
+	// not flood the recorder.
+	noCapacity map[types.NamespacedName]bool
 }
 
 // genericRejection is the state of a generic spare the scheduler rejected.
@@ -266,6 +275,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			delete(r.deleted, rq.NamespacedName)
 			delete(r.blocked, rq.NamespacedName)
 			delete(r.rejectedGeneric, rq.NamespacedName)
+			delete(r.noCapacity, rq.NamespacedName)
 			r.mu.Unlock()
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
@@ -482,6 +492,17 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// maxCount slot and count toward the sizing target, but cannot satisfy a
 	// claim and are not reported as vacant.
 	held := 0
+	// rejected and rejectedMessage describe a pool VM the scheduler cannot
+	// place, so status can say why the warm demand never becomes capacity.
+	rejected := false
+	rejectedMessage := ""
+	// noteRejected records the first scheduler explanation seen this pass.
+	noteRejected := func(p *corev1.Pod) {
+		rejected = true
+		if rejectedMessage == "" {
+			rejectedMessage = unschedulableMessage(p)
+		}
+	}
 	// hot counts the nodes that run a claimed VM of this pool. Warm spares
 	// are placed there first: a fork's data lives on the node its parent
 	// runs on, so a warm VM there starts the fork without booting a VM on
@@ -546,6 +567,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			if p.Annotations[v1.AnnotationPinnedNode] != "" && localWaiters[node] > 0 {
 				// The pod stays for its local waiter, but it is not capacity.
 				total--
+				noteRejected(p)
 				break
 			}
 			// A generic spare has no node to wait for, and its stale avoid
@@ -559,6 +581,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			generic := p.Annotations[v1.AnnotationPinnedNode] == ""
 			if generic && r.keepRejectedGeneric(rq.NamespacedName, p.Name, r.now()) {
 				held++
+				noteRejected(p)
 				break
 			}
 			gone, err := del(p)
@@ -572,6 +595,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 				total--
 			} else if generic {
 				held++
+				noteRejected(p)
 			}
 		case warmingOverdue(p, r.now()):
 			// A spare that never became ready cannot accept a claim. Retire
@@ -758,7 +782,16 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			warm[node]++
 		}
 	}
-	status.Vacant = int32(have)
+	// A held pod is a rejected spare: it holds a slot but is not claimable, so
+	// it must not show up as vacant capacity.
+	status.Vacant = int32(have - held)
+	if rejected {
+		status.Reason = poolNoCapacity
+		status.Message = fmt.Sprintf("pool %s has a VM the scheduler cannot place", pool.Name)
+		if rejectedMessage != "" {
+			status.Message += ": " + rejectedMessage
+		}
+	}
 
 	if status != pool.Status {
 		base := pool.DeepCopy()
@@ -766,6 +799,15 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		if err := r.Status().Patch(ctx, pool, client.MergeFrom(base)); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
+	}
+	if status.Reason == poolNoCapacity {
+		// Publish one Warning per transition, not one per reconcile (the pool
+		// reconciles on every pod and scheduler event).
+		if r.noteNoCapacity(rq.NamespacedName) {
+			r.recordWarning(pool, poolNoCapacity, errors.New(status.Message))
+		}
+	} else {
+		r.clearNoCapacity(rq.NamespacedName)
 	}
 	if deferred > 0 {
 		// The Blip watch usually delivers the locality update first; this
@@ -906,6 +948,41 @@ func (r *PoolReconciler) keepRejectedGeneric(pool types.NamespacedName, pod stri
 		r.rejectedGeneric[pool] = cur
 	}
 	return now.Before(cur.until)
+}
+
+// noteNoCapacity records the NoCapacity transition and reports whether its
+// Warning Event still needs publishing.
+func (r *PoolReconciler) noteNoCapacity(pool types.NamespacedName) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.noCapacity[pool] {
+		return false
+	}
+	if r.noCapacity == nil {
+		r.noCapacity = map[types.NamespacedName]bool{}
+	}
+	r.noCapacity[pool] = true
+	return true
+}
+
+// clearNoCapacity forgets the published NoCapacity Event once a schedulable or
+// ready VM exists, so the next shortage warns again.
+func (r *PoolReconciler) clearNoCapacity(pool types.NamespacedName) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.noCapacity, pool)
+}
+
+// unschedulableMessage returns the scheduler's explanation from a rejected
+// pod, when it has one.
+func unschedulableMessage(p *corev1.Pod) string {
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse &&
+			c.Reason == corev1.PodReasonUnschedulable {
+			return c.Message
+		}
+	}
+	return ""
 }
 
 // countsAsDemand reports whether b is waiting for a VM from this pool. Blips
