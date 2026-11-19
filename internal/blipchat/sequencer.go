@@ -358,25 +358,55 @@ func (s *Sequencer) repairLastSeq(ctx context.Context, turn *v1.BlipTurn) error 
 	return s.raiseLastSeq(ctx, &thread, turn.Status.Seq)
 }
 
-// ensureTurnLabels stamps a turn with the current thread label and
-// incarnation. New turns already carry both; this backfills turns created
-// before the incarnation label existed and rewrites a long thread's old
-// name-derived hash to the reserved thread_ form. Only a turn already known to
+// ensureTurnLabels stamps a turn with the current thread label, incarnation,
+// and owner. New turns already carry them; this backfills turns created before
+// the incarnation label existed, rewrites a long thread's old name-derived
+// hash to the reserved thread_ form, and owns turns created directly through
+// the API so deleting the thread deletes them. Only a turn already known to
 // belong to the current incarnation is passed here.
 func (s *Sequencer) ensureTurnLabels(ctx context.Context, thread *v1.BlipThread, turn *v1.BlipTurn) error {
 	wantThread, wantUID := v1.ThreadLabel(thread.Name), string(thread.UID)
-	if turn.Labels[v1.LabelThread] == wantThread && (wantUID == "" || turn.Labels[v1.LabelThreadUID] == wantUID) {
+	labelsOK := turn.Labels[v1.LabelThread] == wantThread && (wantUID == "" || turn.Labels[v1.LabelThreadUID] == wantUID)
+	owned := wantUID == "" || hasThreadOwnerRef(turn, thread)
+	if labelsOK && owned {
 		return nil
 	}
 	patch := client.MergeFrom(turn.DeepCopy())
-	if turn.Labels == nil {
-		turn.Labels = map[string]string{}
+	if !labelsOK {
+		if turn.Labels == nil {
+			turn.Labels = map[string]string{}
+		}
+		turn.Labels[v1.LabelThread] = wantThread
+		if wantUID != "" {
+			turn.Labels[v1.LabelThreadUID] = wantUID
+		}
 	}
-	turn.Labels[v1.LabelThread] = wantThread
-	if wantUID != "" {
-		turn.Labels[v1.LabelThreadUID] = wantUID
+	if !owned {
+		// No controller or blockOwnerDeletion flag: the sequencer binds the
+		// turn to the thread incarnation for garbage collection without
+		// taking ownership of any other field. Existing references (such as
+		// the controller reference createTurnIn writes) are preserved.
+		turn.OwnerReferences = append(turn.OwnerReferences, metav1.OwnerReference{
+			APIVersion: v1.GroupVersion.String(),
+			Kind:       "BlipThread",
+			Name:       thread.Name,
+			UID:        thread.UID,
+		})
 	}
 	return s.Patch(ctx, turn, patch)
+}
+
+// hasThreadOwnerRef reports whether turn already references this thread as an
+// owner. A reference to any incarnation of the thread is enough: adding a
+// second BlipThread reference would give the turn two owners, and a turn of a
+// previous incarnation must not be adopted or rewritten.
+func hasThreadOwnerRef(turn *v1.BlipTurn, thread *v1.BlipThread) bool {
+	for _, ref := range turn.OwnerReferences {
+		if ref.APIVersion == v1.GroupVersion.String() && ref.Kind == "BlipThread" && ref.Name == thread.Name {
+			return true
+		}
+	}
+	return false
 }
 
 // orphan decides what to do with a turn whose thread does not exist. A turn
