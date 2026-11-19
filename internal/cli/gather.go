@@ -411,6 +411,12 @@ func (a *app) follow(ctx context.Context, name string) {
 	pod := b.Status.Pod
 	if pod == "" {
 		if ending {
+			// A Blip that finished before claiming a VM never ran a
+			// command, so no status.output can ever arrive. Do not wait
+			// out the retained-output poll for it.
+			if b.Status.Output == "" && b.Status.StartTime == nil {
+				return
+			}
 			if !a.printRetained(ctx, name, short) && !a.endedWithoutOutput(ctx, name) {
 				a.progress("%s: output is no longer available (the VM pod is gone)", short)
 			}

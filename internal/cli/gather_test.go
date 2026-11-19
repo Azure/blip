@@ -424,6 +424,33 @@ func TestGatherFollowWaitsForDelayedStatusOutput(t *testing.T) {
 	}
 }
 
+// A Blip can finish before claiming a VM, for example when it is stopped
+// while pending. It never ran a command, so no status.output can arrive and
+// gather -f must not wait out the retained-output poll for it.
+func TestGatherFollowReturnsPromptlyWhenBlipNeverStarted(t *testing.T) {
+	b := finishedBlip("nodop", v1alpha1.BlipFailed, 0)
+	b.Status.Pod = ""
+	b.Status.StartTime = nil
+	b.Status.ExitCode = nil
+	b.Status.Reason = "Stopped"
+	b.Status.Message = "stopped before start"
+	h := newHarness(t, b)
+	start := time.Now()
+	code, out, errOut := h.run("", "gather", "nodop", "-f", "--wait", "2s")
+	elapsed := time.Since(start)
+	if code != 1 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("gather -f took %s for a Blip that never started", elapsed)
+	}
+	mustContain(t, out, "blip/nodop Failed")
+	mustContain(t, errOut, "stopped before start")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}
+
 // If a session attach yields no output and the pod log is unavailable, gather
 // still waits for the retained status output rather than losing it silently.
 func TestGatherFollowUsesDelayedRetainedOutputAfterEmptyReplay(t *testing.T) {
