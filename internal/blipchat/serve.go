@@ -291,6 +291,9 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 	for calls := 0; calls < s.Config.MaxToolCalls; calls++ {
 		reply, usage, err := s.LLM.Chat(ctx, model, messages, toollist)
 		if err != nil {
+			// The completion was paid for even though the step fails, so the
+			// spend must still count against the daily budget.
+			s.chargeUsage(ctx, thread, st.usage)
 			return err
 		}
 		st.usage += usage.Total()
@@ -320,7 +323,11 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 			break
 		}
 	}
-	return s.commit(ctx, st, target, pending, started)
+	if err := s.commit(ctx, st, target, pending, started); err != nil {
+		s.chargeUsage(ctx, thread, st.usage)
+		return err
+	}
+	return nil
 }
 
 // commit writes the step's coordinator turns and then one thread status
@@ -369,6 +376,34 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 		return nil
 	}
 	return fmt.Errorf("thread status update kept conflicting")
+}
+
+// chargeUsage records tokens already spent on a step that will not reach a
+// successful commit, so retries still count against the daily budget. It is
+// best effort: the step's original error is more important than accounting.
+func (s *Server) chargeUsage(ctx context.Context, thread *v1.BlipThread, usage int64) {
+	if usage <= 0 {
+		return
+	}
+	today := timeNow().UTC().Format("2006-01-02")
+	for attempt := 0; attempt < 5; attempt++ {
+		current := &v1.BlipThread{}
+		if err := s.Get(ctx, client.ObjectKeyFromObject(thread), current); err != nil {
+			return
+		}
+		if current.Status.TokenDay != today {
+			current.Status.TokenDay = today
+			current.Status.TokensToday = 0
+		}
+		current.Status.TokensToday += usage
+		if err := s.Status().Update(ctx, current); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return
+		}
+		return
+	}
 }
 
 // nextWake picks the next step time: the heartbeat while tasks are open, or a

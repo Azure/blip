@@ -2,7 +2,10 @@ package blipchat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strconv"
 	"strings"
@@ -250,6 +253,58 @@ func TestDailyBudgetDayBoundaryUsesUTC(t *testing.T) {
 			t.Errorf("tokensToday = %d, want 15 from this step", updated.Status.TokensToday)
 		}
 	})
+}
+
+// Tokens spent on completions that later fail must still be charged, so
+// retries cannot bypass the daily cap.
+func TestFailedStepChargesSpentTokens(t *testing.T) {
+	thread := testThread()
+	thread.Spec.DailyTokens = 1000
+	turn := testTurn("one", "proj")
+	turn.Status.Seq = 1
+	turn.Status.AcceptedTime = &metav1.Time{Time: timeNow().Add(-time.Minute)}
+	c := testClient(t, thread, turn)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests%2 == 0 {
+			http.Error(w, "upstream failed", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": Message{
+				Role:      "assistant",
+				ToolCalls: []ToolCall{toolCall("note", `{"text":"paid"}`)},
+			}}},
+			"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5},
+		})
+	}))
+	defer server.Close()
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	ctx := context.Background()
+	for step := 1; step <= 3; step++ {
+		var current v1.BlipThread
+		if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &current); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.step(ctx, &current); err == nil {
+			t.Fatalf("step %d succeeded, want the upstream error", step)
+		}
+		var updated v1.BlipThread
+		if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if want := int64(step * 15); updated.Status.TokensToday != want {
+			t.Errorf("after failed step %d tokensToday = %d, want %d", step, updated.Status.TokensToday, want)
+		}
+		if updated.Status.TokenDay != timeNow().UTC().Format("2006-01-02") {
+			t.Errorf("after failed step %d tokenDay = %q, want today UTC", step, updated.Status.TokenDay)
+		}
+	}
 }
 
 // requestPrompt returns the user message content from a recorded request.
