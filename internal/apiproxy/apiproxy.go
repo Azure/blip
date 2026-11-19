@@ -185,7 +185,9 @@ type proxyServer struct {
 // and a full close. The underlying Unix socket does distinguish the two:
 // a full close is reported as POLLHUP, a half-close only as POLLRDHUP. The
 // connection lifetime is cancelled immediately on POLLHUP and on Close, so a
-// guest that closes its socket stops an idle watch or stream.
+// guest that closes its socket stops an idle watch or stream. A full close
+// that follows a half-close is invisible to Read (net/http has no reason to
+// read again after EOF), so an independent poll watches for it.
 type connectionLifetimeKey struct{}
 
 func newProxyServer(ctx context.Context, socketPath string, handler http.Handler) (*proxyServer, error) {
@@ -593,7 +595,7 @@ func (l *trackedListener) Accept() (net.Conn, error) {
 		_ = c.Close()
 		return nil, net.ErrClosed
 	}
-	conn := &trackedConn{Conn: c, listener: l}
+	conn := &trackedConn{Conn: c, listener: l, done: make(chan struct{})}
 	l.connections[conn] = struct{}{}
 	return conn, nil
 }
@@ -616,6 +618,9 @@ type trackedConn struct {
 	listener *trackedListener
 	mu       sync.Mutex
 	closed   bool
+	watching bool
+	// done is closed by Close to stop the hangup watcher.
+	done chan struct{}
 	// cancelLifetime ends in-flight upstream requests for this connection.
 	// It is set by ConnContext before the connection starts serving.
 	cancelLifetime context.CancelFunc
@@ -635,12 +640,65 @@ func (c *trackedConn) setLifetimeCancel(cancel context.CancelFunc) {
 // background read; both see EOF for a half-close and for a full close. Only a
 // full close reports POLLHUP on the Unix socket, so it can end the connection
 // lifetime without breaking the wave-4 half-close behaviour.
+//
+// The background read is the last Read net/http performs: after it returns
+// EOF (which is also what a half-close produces) net/http never reads this
+// connection again. A later full close therefore cannot be observed here, so
+// the first EOF starts a watcher that polls for POLLHUP. Any other read error
+// means the connection is already broken, except for the timeout net/http uses
+// to abort a blocked background read, which must be ignored.
 func (c *trackedConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
-	if err != nil && errors.Is(err, io.EOF) && socketHungUp(c.Conn) {
-		c.endLifetime()
+	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return n, err
+		}
+		if errors.Is(err, io.EOF) {
+			c.watchFullClose()
+		} else {
+			c.endLifetime()
+		}
 	}
 	return n, err
+}
+
+// fullClosePollInterval bounds how long an idle watch survives after its guest
+// connection is fully closed. Half-closes are unaffected: they never report
+// POLLHUP, however long they are polled.
+const fullClosePollInterval = 250 * time.Millisecond
+
+// watchFullClose starts one POLLHUP poller per connection. It stops when the
+// connection is closed, when the peer is seen to be fully gone, or after
+// cancelling the lifetime.
+func (c *trackedConn) watchFullClose() {
+	c.mu.Lock()
+	if c.watching || c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.watching = true
+	c.mu.Unlock()
+
+	if socketHungUp(c.Conn) {
+		c.endLifetime()
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(fullClosePollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-c.done:
+				return
+			case <-ticker.C:
+				if socketHungUp(c.Conn) {
+					c.endLifetime()
+					return
+				}
+			}
+		}
+	}()
 }
 
 // socketHungUp reports whether conn has been fully closed by its peer rather
@@ -684,8 +742,12 @@ func (c *trackedConn) CloseWrite() error {
 func (c *trackedConn) Close() error {
 	err := c.Conn.Close()
 	c.mu.Lock()
+	alreadyClosed := c.closed
 	c.closed = true
 	cancel := c.cancelLifetime
+	if !alreadyClosed {
+		close(c.done)
+	}
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()

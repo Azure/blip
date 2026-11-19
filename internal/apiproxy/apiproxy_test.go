@@ -876,6 +876,67 @@ func TestClientCloseCancelsUpstream(t *testing.T) {
 	p.stop(t)
 }
 
+// TestClientHalfCloseThenCloseCancelsUpstream is the shape a real guest
+// disconnect takes: the forwarder half-closes its write side when the
+// workload's request ends, and only later does the guest connection fully
+// close. net/http never reads the connection again after the half-close, so
+// the proxy has to watch for POLLHUP independently of Read.
+func TestClientHalfCloseThenCloseCancelsUpstream(t *testing.T) {
+	upstreamDone := make(chan struct{}, 1)
+	upstream := tlsUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "{\"type\":\"ADDED\"}\n")
+		w.(http.Flusher).Flush()
+		// An idle watch produces no further bytes, so only cancellation can
+		// end this handler before the guard.
+		select {
+		case <-r.Context().Done():
+			upstreamDone <- struct{}{}
+		case <-time.After(20 * time.Second):
+		}
+	})
+	cfg := testConfig(t, upstream)
+	p := startProxy(t, cfg)
+
+	conn, err := net.Dial("unix", cfg.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprintf(conn, "GET /api/v1/pods?watch=true HTTP/1.1\r\nHost: kube-apiserver\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response headers: %v", err)
+	}
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil || line != "{\"type\":\"ADDED\"}\n" {
+		t.Fatalf("first watch event %q: %v", line, err)
+	}
+	// The guest forwarder always half-closes first. The response is still
+	// streaming, so this must not cancel the upstream request.
+	if err := conn.(*net.UnixConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-upstreamDone:
+		t.Fatal("half-close canceled the upstream watch")
+	default:
+	}
+	// Then the guest connection really goes away.
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-upstreamDone:
+	case <-time.After(3 * time.Second):
+		t.Error("upstream watch still running after a full close that followed a half-close")
+	}
+	p.stop(t)
+}
+
 // TestProjectedCARotationAndRemoval checks that a running sidecar follows its
 // projected CA file. The upstream certificate and the CA bundle are rotated
 // together: the new CA must be trusted without a restart, and a CA removed
