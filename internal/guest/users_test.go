@@ -71,6 +71,29 @@ func TestLookPathMatchesExecvp(t *testing.T) {
 	}
 }
 
+// execve("") is ENOENT, so an empty command name is not found (127), not the
+// directory candidate's permission denied (126). PATH must not change that.
+func TestLookPathEmptyNameIsNotFound(t *testing.T) {
+	root := testRoot(t)
+	fi, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no stat ownership information")
+	}
+	acct := &account{uid: st.Uid, gid: st.Gid, groups: []uint32{st.Gid}}
+	for _, env := range [][]string{nil, {"PATH="}, {"PATH=:/usr/bin"}} {
+		// /home exists and is a directory, so the old directory-candidate
+		// path would report 126.
+		_, err := lookPath(root, "/home", "", env, acct)
+		if startExitCode(err) != 127 || !strings.Contains(err.Error(), "command not found") {
+			t.Fatalf("env %v: %v, code %d; want 127 command not found", env, err, startExitCode(err))
+		}
+	}
+}
+
 // A numeric user is matched by value, not by its spelling: 01000 is uid 1000
 // and must get the same name, gid, groups and home as 1000. Out-of-range IDs
 // are rejected before they reach the kernel.
