@@ -608,9 +608,10 @@ func (r *StateReconciler) liveCopyStale(ctx context.Context, st *v1.BlipState, c
 	if w.BlipName == "" {
 		return true, nil
 	}
-	// A live copy needs the writer's pod to freeze. If its Blip finished or
-	// is being deleted, the pod is gone or going; replan from the version the
-	// source saves instead of waiting for a freeze that cannot happen.
+	// A live copy needs the writer's pod to freeze. If its Blip finished,
+	// started saving, or is being deleted, the pod is gone or going; replan
+	// from the version the source saves instead of waiting for a freeze that
+	// cannot happen.
 	srcBlip := &v1.Blip{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: w.BlipName}, srcBlip)
 	if apierrors.IsNotFound(err) {
@@ -619,7 +620,8 @@ func (r *StateReconciler) liveCopyStale(ctx context.Context, st *v1.BlipState, c
 	if err != nil {
 		return false, err
 	}
-	if v1.Finished(srcBlip) || srcBlip.DeletionTimestamp != nil || (w.BlipUID != "" && string(srcBlip.UID) != w.BlipUID) {
+	if v1.Finished(srcBlip) || stopping(srcBlip) || srcBlip.Status.Phase == v1.BlipSaving ||
+		(w.BlipUID != "" && string(srcBlip.UID) != w.BlipUID) {
 		return true, nil
 	}
 	return false, nil
