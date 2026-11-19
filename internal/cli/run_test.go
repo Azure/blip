@@ -293,6 +293,20 @@ func TestRunKeepOwnsForkCopiesByRoot(t *testing.T) {
 	}
 }
 
+func TestRunFromRejectsDanglingReadOnlyMount(t *testing.T) {
+	src := readyState("src")
+	src.Spec.Mounts = []v1alpha1.Mount{{State: "gone", Path: "/ro"}}
+	h := newHarness(t, src)
+	code, _, errOut := h.run("", "run", "--name", "worker", "--from", "src", "--", "true")
+	if code != 1 || !strings.Contains(errOut, `read mount source "gone"`) || !strings.Contains(errOut, "not found") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	var b v1alpha1.Blip
+	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "worker"}, &b); !apierrors.IsNotFound(err) {
+		t.Fatalf("blip kept after rejected fork: %v", err)
+	}
+}
+
 func TestRunLabelsAndNameCollision(t *testing.T) {
 	h := newHarness(t, readyState("base"))
 	if code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--label", "team=a", "--", "true"); code != 0 {

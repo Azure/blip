@@ -64,14 +64,18 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 		if mount.BlipUID != "" {
 			continue
 		}
+		// Every referenced state must still exist, not only the writable
+		// ones. A read-only reference is copied verbatim into the fork, so a
+		// dead reference would produce a workspace that reports success but
+		// cannot start.
+		var src v1alpha1.BlipState
+		if err := c.Get(ctx, client.ObjectKey{Namespace: source.Namespace, Name: mount.State}, &src); err != nil {
+			return nil, fmt.Errorf("read mount source %q: %w", mount.State, err)
+		}
+		if err := CheckSource(&src); err != nil {
+			return nil, err
+		}
 		if mount.Writable {
-			var src v1alpha1.BlipState
-			if err := c.Get(ctx, client.ObjectKey{Namespace: source.Namespace, Name: mount.State}, &src); err != nil {
-				return nil, fmt.Errorf("read mount source %q: %w", mount.State, err)
-			}
-			if err := CheckSource(&src); err != nil {
-				return nil, err
-			}
 			child := &v1alpha1.BlipState{
 				ObjectMeta: metav1.ObjectMeta{Name: childName(root, mount), Namespace: root.Namespace, Labels: maps.Clone(root.Labels)},
 				Spec:       v1alpha1.BlipStateSpec{CopyFrom: mount.State, Replicas: root.Spec.Replicas, NodeSelector: maps.Clone(root.Spec.NodeSelector)},

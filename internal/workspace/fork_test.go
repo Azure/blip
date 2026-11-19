@@ -361,6 +361,57 @@ func TestDurableForkCopiesOwnedByRoot(t *testing.T) {
 	}
 }
 
+// TestForkRejectsDanglingReadOnlyMount verifies that --from validates every
+// mount reference it copies, not only the writable ones it snapshots. A
+// read-only reference to a state that is gone or going away would otherwise
+// produce a fork that reports success but cannot start.
+func TestForkRejectsDanglingReadOnlyMount(t *testing.T) {
+	now := metav1.Now()
+	for _, tc := range []struct {
+		name  string
+		state *v1alpha1.BlipState
+		want  string
+	}{
+		{"missing", nil, "not found"},
+		{"deleting", &v1alpha1.BlipState{
+			ObjectMeta: metav1.ObjectMeta{Name: "ro", Namespace: "ns", DeletionTimestamp: &now, Finalizers: []string{"hold"}},
+		}, "being deleted"},
+		{"failed", &v1alpha1.BlipState{
+			ObjectMeta: metav1.ObjectMeta{Name: "ro", Namespace: "ns"},
+			Status:     v1alpha1.BlipStateStatus{Phase: v1alpha1.StateFailed, Message: "import failed"},
+		}, "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			src := testState("src")
+			src.Spec.Mounts = []v1alpha1.Mount{{State: "ro", Path: "/ro"}}
+			objects := []client.Object{src}
+			if tc.state != nil {
+				objects = append(objects, tc.state)
+			}
+			c := testClient(t, objects...)
+			dest := testState("fork")
+			states, err := Fork(ctx, c, src, dest, nil)
+			if err == nil || !strings.Contains(err.Error(), `"ro"`) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error: %v", err)
+			}
+			if states != nil {
+				t.Fatalf("returned %d states on rejection", len(states))
+			}
+			var list v1alpha1.BlipStateList
+			if err := c.List(ctx, &list); err != nil {
+				t.Fatal(err)
+			}
+			if len(list.Items) != len(objects) {
+				t.Fatalf("rejection created states: %+v", list.Items)
+			}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(dest), &v1alpha1.BlipState{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("destination created: %v", err)
+			}
+		})
+	}
+}
+
 func TestForkOwnerReference(t *testing.T) {
 	ctx := context.Background()
 	src := testState("base")

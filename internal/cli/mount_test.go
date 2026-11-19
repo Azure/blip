@@ -1298,6 +1298,25 @@ func TestMountNewFromKeepsForkCopiesOnSuccess(t *testing.T) {
 	}
 }
 
+// TestMountNewFromRejectsDanglingReadOnlyMount covers the --from path: a
+// read-only reference of the source root is copied verbatim, so it must be
+// validated before any state is created.
+func TestMountNewFromRejectsDanglingReadOnlyMount(t *testing.T) {
+	src := readyState("src")
+	src.Spec.Mounts = []v1alpha1.Mount{{State: "gone", Path: "/ro"}}
+	h := newHarness(t, readyState("home"), src)
+	code, _, errOut := h.run("", "mount", "--new", "dev:/work:rw", "--from", "src", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `read mount source "gone"`) || !strings.Contains(errOut, "not found") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !stateNotFound(t, h, "dev") {
+		t.Fatal("rejected --new left a state behind")
+	}
+	if root := h.state("home"); len(root.Spec.Mounts) != 0 {
+		t.Fatalf("rejected --new wrote desired intent: %+v", root.Spec.Mounts)
+	}
+}
+
 func TestMountNewRejectsFailedSource(t *testing.T) {
 	bad := state("bad")
 	bad.Status.Phase, bad.Status.Message = v1alpha1.StateFailed, "image too large"
