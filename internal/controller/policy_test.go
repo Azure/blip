@@ -532,6 +532,86 @@ func withThreadLabel(o map[string]any, thread string) map[string]any {
 	return o
 }
 
+// withAnnotations adds annotations to an object built by blipObj/stateObj.
+func withAnnotations(o map[string]any, annotations map[string]string) map[string]any {
+	meta := o["metadata"].(map[string]any)
+	existing, _ := meta["annotations"].(map[string]any)
+	if existing == nil {
+		existing = map[string]any{}
+		meta["annotations"] = existing
+	}
+	for k, v := range annotations {
+		existing[k] = v
+	}
+	return o
+}
+
+func withoutAnnotation(o map[string]any, key string) map[string]any {
+	if meta, ok := o["metadata"].(map[string]any); ok {
+		if annotations, ok := meta["annotations"].(map[string]any); ok {
+			delete(annotations, key)
+		}
+	}
+	return o
+}
+
+// A restricted VM may patch its own Blip. The thread incarnation annotations
+// are what the API proxy and blipchat trust to pin a Blip to one thread
+// incarnation, so they must not move after creation: removing the pin lets a
+// stale Blip fall back to the current thread, and rewriting it grants access
+// to a recreated thread's turns. Administrator-owned VMs and non-VM callers
+// (controller, blipchat) stay unrestricted.
+func TestVMOwnerPolicyPinsThreadIncarnationAnnotations(t *testing.T) {
+	v := loadVMOwnerPolicy(t)
+	const owner = "u-0123456789abcdef0123456789abcdef"
+	params := map[string]string{"sa.vm": "default", "default-mine": owner, "default-admin": "-"}
+	mine, admin := vmUser("vm", "default-mine"), vmUser("vm", "default-admin")
+	controller := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blip-controller"}
+	tagged := func(uid string) map[string]any {
+		return withAnnotations(blipObj(owner+".a", owner), map[string]string{
+			v1.AnnotationThread:    "proj",
+			v1.AnnotationThreadUID: uid,
+		})
+	}
+
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		obj   map[string]any
+		old   map[string]any
+		allow bool
+		msg   string
+	}{
+		{"restricted keeps the pin", mine, tagged("thread-1"), tagged("thread-1"), true, ""},
+		{"restricted removes the pin", mine,
+			withoutAnnotation(tagged("thread-1"), v1.AnnotationThreadUID), tagged("thread-1"), false, "incarnation annotation"},
+		{"restricted rewrites the pin", mine, tagged("thread-2"), tagged("thread-1"), false, "incarnation annotation"},
+		{"restricted adds a pin when absent", mine, tagged("thread-1"), blipObj(owner+".a", owner), false, "incarnation annotation"},
+		{"restricted removes the thread name", mine,
+			withoutAnnotation(tagged("thread-1"), v1.AnnotationThread), tagged("thread-1"), false, "incarnation annotation"},
+		{"restricted changes another annotation", mine,
+			withAnnotations(tagged("thread-1"), map[string]string{"note": "new"}),
+			withAnnotations(tagged("thread-1"), map[string]string{"note": "old"}), true, ""},
+		{"admin rewrites the pin", admin, tagged("thread-2"), tagged("thread-1"), true, ""},
+		{"admin removes the pin", admin, withoutAnnotation(tagged("thread-1"), v1.AnnotationThreadUID), tagged("thread-1"), true, ""},
+		{"controller rewrites the pin", controller, tagged("thread-2"), tagged("thread-1"), true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{user: tc.user, op: admission.Update, resource: "blips", name: owner + ".a", object: tc.obj, oldObject: tc.old}
+			allow, msg := req.evaluate(t, v, params)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+
+	// A restricted CREATE must not introduce a pin either: absent stays absent.
+	create := policyRequest{user: mine, op: admission.Create, resource: "blips", name: owner + ".a", object: tagged("thread-1")}
+	if allow, msg := create.evaluate(t, v, params); allow {
+		t.Fatalf("restricted create added an incarnation pin: %s", msg)
+	}
+}
+
 // A restricted VM may attach its Blip only to a thread of its own project.
 // The thread owner is the blip-vm-owners "thread.<name>" entry, so a forged
 // blip.dev/thread label cannot steer blipchat turns into another project.

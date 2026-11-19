@@ -23,7 +23,11 @@
 # such states (or copy/read-only mount shared bases), set no imagePullSecrets,
 # and create blips only in pools of its own service account. Thread specs are
 # administrator-owned: a restricted VM may read its own thread through the
-# API proxy but may not create, change or delete threads. Every new or changed
+# API proxy but may not create, change or delete threads. The thread
+# incarnation annotations on a Blip (blip.dev/thread-uid, blip.dev/thread-name,
+# and blip.dev/thread) are write-once: a restricted owner may neither add,
+# rewrite, nor remove them, because the API proxy and blipchat trust them when
+# pinning reads and writes to a thread incarnation. Every new or changed
 # ownerReference it sets must name an object of the same owner: fork blips may
 # only be owned by blips, and states may be owned by such blips or by another
 # state (a durable fork's hidden children are owned by their root state). An
@@ -123,6 +127,24 @@ spec:
         request.operation == 'UPDATE' && has(oldObject.metadata.labels) &&
         'blip.dev/thread' in oldObject.metadata.labels ?
         string(oldObject.metadata.labels['blip.dev/thread']) : ''
+    # The thread incarnation pin is trusted by the in-guest API proxy and by
+    # blipchat: changing it to the current thread UID grants reads and writes
+    # of that thread's turns, and removing it makes the proxy fall back to the
+    # current incarnation. A restricted VM may patch its own Blip, so these
+    # annotations are write-once and must be identical to oldObject: absent
+    # stays absent, and a value may not be added, changed, or removed.
+    # blip.dev/thread-name is the full-name companion of the blip.dev/thread
+    # label for long thread names; the label itself is pinned below.
+    - name: pinnedAnnotations
+      expression: "['blip.dev/thread-uid', 'blip.dev/thread-name', 'blip.dev/thread']"
+    - name: newAnnotations
+      expression: >-
+        variables.writes && has(object.metadata.annotations) ?
+        object.metadata.annotations : {}
+    - name: oldAnnotations
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.metadata.annotations) ?
+        oldObject.metadata.annotations : {}
     # A child forked from a different-owner or unrestricted Blip inherits the
     # ownerReference its privileged creator set. An UPDATE by the child's own
     # VM leaves that reference untouched, so the prefix rule must exempt
@@ -206,6 +228,20 @@ spec:
         string(variables.data['thread-hash.' + variables.thread]) == variables.owner)))
       messageExpression: >-
         'owner ' + variables.owner + ' may only attach blip.dev/thread labels of its own threads'
+      reason: Forbidden
+    # The incarnation annotation must not move after creation. An unchanged
+    # value stays valid even when the thread is gone (so status/cleanup
+    # patches still work); adding, rewriting, or removing it is a scope
+    # escalation. Controller, blipchat, and administrator-owned VMs are not
+    # restricted and remain unaffected.
+    - expression: >-
+        !variables.restricted || !variables.writes || request.resource.resource != 'blips' ||
+        variables.pinnedAnnotations.all(k,
+          (!(k in variables.newAnnotations) && !(k in variables.oldAnnotations)) ||
+          ((k in variables.newAnnotations) && (k in variables.oldAnnotations) &&
+          variables.newAnnotations[k] == variables.oldAnnotations[k]))
+      messageExpression: >-
+        'owner ' + variables.owner + ' may not add, change, or remove a thread incarnation annotation'
       reason: Forbidden
     - expression: >-
         !variables.restricted || !variables.writes ||
