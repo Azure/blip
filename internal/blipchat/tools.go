@@ -21,6 +21,9 @@ import (
 
 var taskIDPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
+// maxExecTimeout bounds one exec or inspect command.
+const maxExecTimeout = 60 * time.Second
+
 func schema(properties map[string]any, required ...string) map[string]any {
 	out := map[string]any{"type": "object", "properties": properties}
 	if len(required) > 0 {
@@ -177,7 +180,7 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 				argv = append(argv, fmt.Sprint(a))
 			}
 		}
-		timeout := 60 * time.Second
+		timeout := maxExecTimeout
 		if v, ok := args["timeoutSeconds"].(float64); ok {
 			timeout = time.Duration(v) * time.Second
 		}
@@ -329,8 +332,8 @@ func (s *Server) execIn(ctx context.Context, thread *v1.BlipThread, name string,
 	if len(argv) == 0 {
 		return "", fmt.Errorf("argv is required")
 	}
-	if timeout <= 0 || timeout > 60*time.Second {
-		timeout = 60 * time.Second
+	if timeout <= 0 || timeout > maxExecTimeout {
+		timeout = maxExecTimeout
 	}
 	var b v1.Blip
 	if err := s.Get(ctx, client.ObjectKey{Namespace: thread.Namespace, Name: name}, &b); err != nil {

@@ -301,7 +301,7 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	if err := readOnly(argv); err != nil {
 		return "", err
 	}
-	return c.s.execIn(ctx, c.thread, name, argv, 60)
+	return c.s.execIn(ctx, c.thread, name, argv, maxExecTimeout)
 }
 
 // readOnly reports whether argv is safe to run as an inspection command. It
