@@ -269,7 +269,7 @@ func (a *app) gatherOne(ctx context.Context, c *Clients, b *v1alpha1.Blip, f *ga
 	}
 	if f.keep || retained {
 		if retained && !f.keep {
-			a.progress("blip %s kept for inspection; delete it with kubectl delete blip %s", a.short(b.Name), a.short(b.Name))
+			a.progress("blip %s kept for inspection; delete it with kubectl delete blip %s", a.short(b.Name), b.Name)
 		}
 		return errors.Join(errs...)
 	}

@@ -207,3 +207,17 @@ func TestGatherFollowSaysFinishedOutputIsGone(t *testing.T) {
 		t.Fatal("blip kept")
 	}
 }
+
+// The hint must name the object as the API knows it, not the caller-scoped
+// short name, or kubectl delete cannot find it.
+func TestGatherRetentionHintUsesFullName(t *testing.T) {
+	bad := finishedBlip("alice.badfork", v1alpha1.BlipFailed, 1)
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), bad)
+	h.self = "alice.box"
+	code, out, errOut := h.run("", "gather", "badfork")
+	if code != 1 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/badfork Failed")
+	mustContain(t, errOut, "delete it with kubectl delete blip alice.badfork")
+}
