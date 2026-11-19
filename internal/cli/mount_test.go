@@ -1483,6 +1483,62 @@ func TestMountRejectsExplicitEmptyFrom(t *testing.T) {
 	}
 }
 
+// TestMountRejectsExplicitEmptySize reproduces an explicitly supplied blank
+// --size being ignored: mount only checked f.size != "", so "" left the state
+// on the default size and reported success. As with --from, the flag being set
+// means the value is intentional even when blank, so it must be rejected
+// before any state is created or intent is written.
+func TestMountRejectsExplicitEmptySize(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		// state is created by the command and must not exist afterwards.
+		create string
+	}{
+		{
+			name:   "new empty",
+			args:   []string{"mount", "--new", "cache:/cache", "--size", "", "--root", "home"},
+			create: "cache",
+		},
+		{
+			name:   "new whitespace",
+			args:   []string{"mount", "--new", "cache:/cache", "--size", "   ", "--root", "home"},
+			create: "cache",
+		},
+		{
+			name: "existing empty",
+			args: []string{"mount", "data:/data", "--size", "", "--root", "home"},
+		},
+		{
+			name: "existing whitespace",
+			args: []string{"mount", "data:/data", "--size", "\t", "--root", "home"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", tc.args...)
+			if code != 1 || !strings.Contains(errOut, "--size must not be empty") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if tc.create != "" && !stateNotFound(t, h, tc.create) {
+				t.Fatalf("empty --size left state %q behind", tc.create)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("empty --size wrote desired intent: %+v", mounts)
+			}
+		})
+	}
+
+	// Leaving --size unset still creates a state with the default size.
+	h := newHarness(t, readyState("home"))
+	if code, _, errOut := h.run("", "mount", "--new", "cache:/cache", "--root", "home"); code != 0 {
+		t.Fatalf("unset --size rejected: %d %s", code, errOut)
+	}
+	if s := h.state("cache"); s.Spec.Size != nil {
+		t.Fatalf("unset --size set a size: %v", s.Spec.Size)
+	}
+}
+
 func stateNotFound(t *testing.T, h *harness, name string) bool {
 	t.Helper()
 	var s v1alpha1.BlipState

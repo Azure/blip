@@ -1040,6 +1040,7 @@ type mountFlags struct {
 	from     string
 	fromSet  bool
 	size     string
+	sizeSet  bool
 	replicas int32
 }
 
@@ -1082,6 +1083,7 @@ collect at a path without a colon.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			f.fromSet = cmd.Flags().Changed("from")
+			f.sizeSet = cmd.Flags().Changed("size")
 			return a.mount(cmd.Context(), args, f, cmd.Flags().Changed("replicas"))
 		},
 	}
@@ -1140,6 +1142,11 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	// written, so an unset shell variable cannot silently create a workspace.
 	if f.fromSet && strings.TrimSpace(f.from) == "" {
 		return errors.New("--from must not be empty")
+	}
+	// An explicitly blank size is the same mistake as an empty source: an
+	// unset shell variable must not silently fall back to the default size.
+	if f.sizeSet && strings.TrimSpace(f.size) == "" {
+		return errors.New("--size must not be empty")
 	}
 	if err := checkNewOnlyFlags(f, replicasSet); err != nil {
 		return err
