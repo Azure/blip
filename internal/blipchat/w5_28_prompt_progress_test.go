@@ -231,3 +231,44 @@ func TestBoardPromptBoundsMaximalBoard(t *testing.T) {
 		t.Errorf("board crowding removed the turns section:\n%s", prompt)
 	}
 }
+
+// Raising or removing spec.dailyTokens must clear the automatic budget pause;
+// otherwise the thread stays dead until UTC midnight. A manual pause stays.
+func TestMaybeUnpauseClearsWhenBudgetRestored(t *testing.T) {
+	now := timeNow()
+	today := now.UTC().Format("2006-01-02")
+	tests := []struct {
+		name       string
+		reason     string
+		daily      int64
+		tokens     int64
+		wantPaused bool
+	}{
+		{name: "cap raised", reason: budgetPauseReason, daily: 2000, tokens: 1000, wantPaused: false},
+		{name: "cap removed", reason: budgetPauseReason, daily: 0, tokens: 5000, wantPaused: false},
+		{name: "still exhausted", reason: budgetPauseReason, daily: 1000, tokens: 1000, wantPaused: true},
+		{name: "manual pause", reason: "operator hold", daily: 2000, tokens: 1000, wantPaused: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			thread := testThread()
+			thread.Spec.DailyTokens = tt.daily
+			thread.Status.Paused = &v1.ThreadPause{Reason: tt.reason}
+			thread.Status.TokenDay = today
+			thread.Status.TokensToday = tt.tokens
+			c := testClient(t, thread)
+			s := &Server{Client: c}
+			s.maybeUnpause(context.Background(), thread)
+			var updated v1.BlipThread
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(thread), &updated); err != nil {
+				t.Fatal(err)
+			}
+			if got := updated.Status.Paused != nil; got != tt.wantPaused {
+				t.Errorf("paused = %+v, want paused=%v", updated.Status.Paused, tt.wantPaused)
+			}
+			if updated.Status.TokensToday != tt.tokens {
+				t.Errorf("tokensToday = %d, want unchanged %d", updated.Status.TokensToday, tt.tokens)
+			}
+		})
+	}
+}

@@ -183,7 +183,7 @@ func TestDailyBudgetDayBoundaryUsesUTC(t *testing.T) {
 		thread := testThread()
 		thread.Status.Paused = &v1.ThreadPause{Reason: budgetPauseReason}
 		thread.Status.TokenDay = "2026-11-19"
-		thread.Status.TokensToday = 100
+		thread.Status.TokensToday = 1000
 		c := testClient(t, thread)
 		s := &Server{Client: c}
 		s.maybeUnpause(context.Background(), thread)
@@ -194,7 +194,7 @@ func TestDailyBudgetDayBoundaryUsesUTC(t *testing.T) {
 		if updated.Status.Paused == nil {
 			t.Error("maybeUnpause cleared the budget pause before the UTC day ended")
 		}
-		if updated.Status.TokenDay != "2026-11-19" || updated.Status.TokensToday != 100 {
+		if updated.Status.TokenDay != "2026-11-19" || updated.Status.TokensToday != 1000 {
 			t.Errorf("status after pre-UTC-midnight unpause check = day %q tokens %d, want unchanged", updated.Status.TokenDay, updated.Status.TokensToday)
 		}
 	})

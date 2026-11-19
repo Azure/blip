@@ -931,19 +931,39 @@ func openState(open bool) string {
 	return "closed"
 }
 
-// maybeUnpause lets a thread run again on a new day after its budget paused it.
+// budgetAllows reports whether the thread still has daily budget left.
+func budgetAllows(thread *v1.BlipThread) bool {
+	return thread.Spec.DailyTokens == 0 || thread.Status.TokensToday < thread.Spec.DailyTokens
+}
+
+// maybeUnpause lets a thread run again when its automatic budget pause no
+// longer holds: either the UTC day changed, or the cap was raised or removed.
+// A manual pause is never cleared here.
 func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
 	today := timeNow().UTC().Format("2006-01-02")
-	if thread.Status.Paused == nil || thread.Status.Paused.Reason != budgetPauseReason || thread.Status.TokenDay == today {
+	if thread.Status.Paused == nil || thread.Status.Paused.Reason != budgetPauseReason {
+		return
+	}
+	newDay := thread.Status.TokenDay != today
+	if !newDay && !budgetAllows(thread) {
 		return
 	}
 	current := &v1.BlipThread{}
 	if err := s.Get(ctx, client.ObjectKeyFromObject(thread), current); err != nil {
 		return
 	}
+	if current.Status.Paused == nil || current.Status.Paused.Reason != budgetPauseReason {
+		return
+	}
+	newDay = current.Status.TokenDay != today
+	if !newDay && !budgetAllows(current) {
+		return
+	}
 	current.Status.Paused = nil
-	current.Status.TokensToday = 0
-	current.Status.TokenDay = today
+	if newDay {
+		current.Status.TokensToday = 0
+		current.Status.TokenDay = today
+	}
 	if err := s.Status().Update(ctx, current); err != nil {
 		return
 	}
