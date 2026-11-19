@@ -1010,6 +1010,44 @@ func TestMountNewRejectsFailedSource(t *testing.T) {
 	}
 }
 
+// TestMountRejectsGuestReservedAndSymlinkPaths reproduces a mount the CLI
+// accepts offline but the guest cannot create: the path is reserved for the
+// guest itself or lies below a symlink in the image. The mount must be
+// rejected before desired intent is written, or the root cannot start again.
+func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
+	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/lib64/w2", "/bin/w2", "/var/run/w2"} {
+		t.Run(path, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", "mount", "data:"+path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "mount path") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected mount written as desired intent: %+v", mounts)
+			}
+		})
+	}
+
+	// A rejected path must not leave a newly created state behind either.
+	h := newHarness(t, readyState("home"))
+	code, _, errOut := h.run("", "mount", "--new", "reserved:/proc/w2", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, "mount path") {
+		t.Fatalf("--new code %d: %s", code, errOut)
+	}
+	if !stateNotFound(t, h, "reserved") {
+		t.Fatal("rejected --new left state reserved behind")
+	}
+
+	// Prefix-sharing non-overlapping paths stay legal.
+	h = newHarness(t, readyState("home"), readyState("a"), readyState("b"))
+	if code, _, errOut := h.run("", "mount", "a:/data", "--root", "home"); code != 0 {
+		t.Fatalf("legitimate mount rejected: %d %s", code, errOut)
+	}
+	if code, _, errOut := h.run("", "mount", "b:/procdata", "--root", "home"); code != 0 {
+		t.Fatalf("legitimate nested path rejected: %d %s", code, errOut)
+	}
+}
+
 // TestMountNewMountFailureLeavesState ports create's attach-failure coverage:
 // the created state keeps its first commit even when mounting it fails.
 func TestMountNewMountFailureLeavesState(t *testing.T) {

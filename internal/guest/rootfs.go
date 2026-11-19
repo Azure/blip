@@ -8,10 +8,9 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
-)
 
-// reservedPaths are mounted by the guest itself inside the root.
-var reservedPaths = []string{"/proc", "/sys", "/dev", "/run/blip"}
+	"github.com/Azure/blip/internal/mountpath"
+)
 
 // checkMountPath validates a user mount path against the documented rules.
 // existing are the paths of current auxiliary mounts.
@@ -28,7 +27,12 @@ func checkMountPath(p string, existing []string) error {
 	if p == "/" {
 		return errors.New("mount path must not be /")
 	}
-	for _, e := range append(existing, reservedPaths...) {
+	for _, e := range existing {
+		if overlaps(p, e) {
+			return fmt.Errorf("mount path %s overlaps %s", p, e)
+		}
+	}
+	for _, e := range mountpath.Reserved {
 		if overlaps(p, e) {
 			return fmt.Errorf("mount path %s overlaps %s", p, e)
 		}

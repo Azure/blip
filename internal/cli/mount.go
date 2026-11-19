@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/mountpath"
 	"github.com/Azure/blip/internal/workspace"
 )
 
@@ -142,6 +143,9 @@ func mountPathConflict(root string, mounts []v1alpha1.Mount, state, mountPath st
 func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error {
 	mounts := append([]v1alpha1.Mount(nil), root.Spec.Mounts...)
 	for _, req := range requests {
+		if err := mountpath.Validate(req.path); err != nil {
+			return err
+		}
 		if req.state == root.Name {
 			return errors.New("a root state cannot mount itself")
 		}
@@ -163,6 +167,9 @@ func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error 
 func (a *app) mountState(ctx context.Context, state, root, mountPath string, target *bool) error {
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return fmt.Errorf("invalid path %q: must be a clean absolute path other than /", mountPath)
+	}
+	if err := mountpath.Validate(mountPath); err != nil {
+		return err
 	}
 	if state == root {
 		return errors.New("a root state cannot mount itself")
