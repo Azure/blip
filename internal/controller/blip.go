@@ -1052,6 +1052,30 @@ func finishedAt(p *corev1.Pod) time.Time {
 	return time.Time{}
 }
 
+// desiredMounts returns the root state's current mount set. ok is false when
+// the root is gone or deleting, so its topology cannot be used to decide what
+// a finishing Blip should still report.
+func (r *BlipReconciler) desiredMounts(ctx context.Context, b *v1.Blip) (map[string]bool, bool, error) {
+	if b.Spec.State == "" {
+		return nil, false, nil
+	}
+	root := &v1.BlipState{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.State}, root); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if root.DeletionTimestamp != nil {
+		return nil, false, nil
+	}
+	desired := map[string]bool{}
+	for _, m := range v1.DesiredMounts(root, b) {
+		desired[m.State] = true
+	}
+	return desired, true, nil
+}
+
 // saving waits until the root state and every writable mount resolved
 // their attachments, then finishes the Blip.
 func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
@@ -1100,6 +1124,16 @@ func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
 		if m := &b.Status.Mounts[i]; m.Writable && m.Phase == v1.MountSaving {
 			m.Phase, m.Message, m.Switching = v1.MountMounted, "", false
 		}
+	}
+	// A mount removed from desired intent while the Blip was stopping has
+	// been saved above, but it is no longer part of the root's topology: a
+	// finished Blip must not keep reporting it as mounted.
+	if desired, ok, err := r.desiredMounts(ctx, b); err != nil {
+		return err
+	} else if ok {
+		b.Status.Mounts = slices.DeleteFunc(b.Status.Mounts, func(m v1.MountStatus) bool {
+			return m.Phase != v1.MountFailed && !desired[m.State]
+		})
 	}
 	if saveErr != "" {
 		if b.Status.Message != "" && b.Status.Reason != ReasonSaveFailed {

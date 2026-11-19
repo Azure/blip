@@ -562,6 +562,39 @@ func TestFinishedBlipClearsSavingMountPhase(t *testing.T) {
 	}
 }
 
+// TestFinishedBlipDropsRemovedWritableMount covers a mount removed while the
+// Blip is stopping: its save resolves, but the finished Blip must not keep
+// reporting the removed mount as Mounted with an attachment that was sealed.
+func TestFinishedBlipDropsRemovedWritableMount(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.readyState("data", "n1")
+	b := e.startBlip("job", "n1", withRoot("home"), e.withMount("data", "/data", true))
+
+	e.updateBlip("job", func(b *v1.Blip) { b.Spec.Stop = true })
+	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSaving, ReasonStopped)
+	if m := mountOf(b, "data"); m == nil || m.Phase != v1.MountSaving {
+		t.Fatalf("mount not saving after fencing: %+v", m)
+	}
+
+	// The removal lands while the writable mount is still saving.
+	e.updateRoot("job", func(root *v1.BlipState) { root.Spec.Mounts = nil })
+	e.saveWriter("home", newID())
+	e.saveWriter("data", newID())
+	e.run(e.blip, ns, "job")
+
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSucceeded, ReasonStopped)
+	if m := mountOf(b, "data"); m != nil {
+		t.Fatalf("finished Blip keeps a removed mount: %+v", m)
+	}
+}
+
 // TestFinishedBlipRetainsCommandOutput covers gather -f for a command that
 // ended before the client attached: the tail of the guest-mirrored output is
 // saved in status before the pod is deleted.
