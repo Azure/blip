@@ -196,11 +196,21 @@ func writes(s *v1alpha1.BlipState, attachmentID string, pod *corev1.Pod) bool {
 }
 
 // writerLost reports whether a durable disk already given to the VM lost its
-// writer slot.
+// writer slot. A controller-driven replacement can move the slot to another
+// attachment of the same Blip and pod before the node has rewritten
+// desired.json. That is not a lost writer: no other VM can write the state,
+// and the controller is detaching or reusing the old attachment deliberately.
 func writerLost(v *view, pod *corev1.Pod, b *v1alpha1.Blip, prev podapi.Desired) bool {
 	lost := func(stateName, id string) bool {
 		s := v.stateByName[b.Namespace+"/"+stateName]
-		return s == nil || !writes(s, id, pod)
+		if s == nil {
+			return true
+		}
+		if writes(s, id, pod) {
+			return false
+		}
+		w := s.Status.Writer
+		return w == nil || w.BlipUID != string(b.UID) || w.PodUID == "" || w.PodUID != string(pod.UID)
 	}
 	if lost(b.Spec.State, prev.Claim.Root.ID) {
 		return true

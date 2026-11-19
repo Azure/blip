@@ -349,6 +349,57 @@ func TestMounts(t *testing.T) {
 	}
 }
 
+// TestWriterLostToleratesSameBlipReplacement covers w7-06: replacing a
+// writable mount can move the state's writer slot to the replacement
+// attachment before the node rewrites desired.json. The old attachment is
+// then no longer the writer, but the same Blip and pod still hold the state,
+// so the VM must keep running for the controller's detach/attach. Only a lost
+// slot, or one taken by another Blip or pod, fences the VM.
+func TestWriterLostToleratesSameBlipReplacement(t *testing.T) {
+	const (
+		blipUID = "blipuid-b"
+		podUID  = "poduid-p"
+	)
+	setup := func(w *v1alpha1.Writer) *view {
+		v := newView()
+		b, s, d := stateRoot(v)
+		s.Status.Writer.PodUID = podUID
+		d.observed.Phase = podapi.PhaseRunning
+		readyDev(v, d, storage.Volume{ID: "r1", StateUID: string(s.UID)}, 7)
+		data := state("data")
+		data.Status.Committed = &v1alpha1.Commit{ID: "d1", Generation: 1}
+		data.Status.Writer = w
+		v.states = append(v.states, data)
+		old := disk("m1", false)
+		old.State, old.Path = "data", "/old"
+		d.desired = &podapi.Desired{Claim: claimFor(b, disk("r1", false), nil, nil), Mounts: []podapi.Disk{old}}
+		if string(b.UID) != blipUID {
+			t.Fatalf("test blip UID = %q", b.UID)
+		}
+		return v
+	}
+	writer := func(id, blip, pod string) *v1alpha1.Writer {
+		return &v1alpha1.Writer{AttachmentID: id, BlipUID: blip, PodUID: pod, PodName: "p", Node: self, BaseCommit: "d1"}
+	}
+	stopped := func(v *view) bool { return compute(v).desired[pkey("p")].Stop }
+
+	// The controller acquired a replacement attachment for the same mount.
+	if stopped(setup(writer("m2", blipUID, podUID))) {
+		t.Fatal("same-blip replacement attachment was treated as a lost writer")
+	}
+	// The writer slot disappeared (or was never claimed): fence as before.
+	if !stopped(setup(nil)) {
+		t.Fatal("missing writer did not stop the VM")
+	}
+	// Another Blip or another pod owns the state now: fence as before.
+	if !stopped(setup(writer("m2", "other-blip", podUID))) {
+		t.Fatal("writer taken by another Blip did not stop the VM")
+	}
+	if !stopped(setup(writer("m2", blipUID, "poduid-other"))) {
+		t.Fatal("writer taken by another pod did not stop the VM")
+	}
+}
+
 // TestSamePodNameDifferentNamespaces proves identically named pods in two
 // namespaces get separate plans, pod directories, and device nodes.
 func TestSamePodNameDifferentNamespaces(t *testing.T) {
