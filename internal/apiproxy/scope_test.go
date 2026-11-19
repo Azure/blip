@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
@@ -829,6 +831,89 @@ func TestOwnerScopeWatchStreams(t *testing.T) {
 	p.stop(t)
 	if _, err := reader.ReadByte(); err == nil {
 		t.Fatal("watch stream stayed open after shutdown")
+	}
+}
+
+// A blipthreads watch is scoped by name, and a recreated thread keeps its
+// name. The stream must keep delivering the incarnation the guest was created
+// for and drop the replacement object, including its new UID and spec.
+func TestOwnerScopeThreadWatchPinsIncarnation(t *testing.T) {
+	kube := scopedFixture()
+	oldEvent := `{"type":"ADDED","object":{"metadata":{"name":"alice-proj","uid":"thread-alice"},"spec":{"charter":"OLD_CHARTER"}}}`
+	newEvent := `{"type":"ADDED","object":{"metadata":{"name":"alice-proj","uid":"thread-recreated"},"spec":{"charter":"NEW_INC_SECRET"}}}`
+	bookmark := `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"9"}}}`
+	upstream := tlsUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("watch") != "true" {
+			kube.ServeHTTP(w, r)
+			return
+		}
+		kube.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		flush := w.(http.Flusher)
+		// Split the first line across writes: the filter must buffer it until
+		// the newline arrives rather than forward a partial JSON object.
+		half := len(oldEvent) / 2
+		_, _ = io.WriteString(w, oldEvent[:half])
+		flush.Flush()
+		time.Sleep(10 * time.Millisecond)
+		_, _ = io.WriteString(w, oldEvent[half:]+"\n")
+		flush.Flush()
+		_, _ = io.WriteString(w, newEvent+"\n")
+		flush.Flush()
+		_, _ = io.WriteString(w, bookmark+"\n")
+		flush.Flush()
+		<-r.Context().Done()
+	})
+	cfg := testConfig(t, upstream)
+	cfg.PodName, cfg.PodNamespace = "proj-vm", scopeNamespace
+	p := startProxy(t, cfg)
+
+	resp, err := p.client.Get("http://kube-apiserver/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads?watch=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	var got []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read watch: %v (got %q)", err, strings.Join(got, ""))
+		}
+		got = append(got, line)
+		if strings.Contains(line, "BOOKMARK") {
+			break
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("guest events = %q, want the old incarnation and the bookmark", got)
+	}
+	if !strings.Contains(got[0], `"uid":"thread-alice"`) || !strings.Contains(got[0], "OLD_CHARTER") {
+		t.Fatalf("first event = %q", got[0])
+	}
+	stream := strings.Join(got, "")
+	if strings.Contains(stream, "thread-recreated") || strings.Contains(stream, "NEW_INC_SECRET") {
+		t.Fatalf("recreated thread leaked: %q", got)
+	}
+}
+
+func TestThreadWatchWriterBuffersPartialLines(t *testing.T) {
+	line := `{"type":"ADDED","object":{"metadata":{"uid":"thread-alice"}}}`
+	recreated := `{"type":"ADDED","object":{"metadata":{"uid":"thread-recreated"}}}`
+	rec := httptest.NewRecorder()
+	w := &threadWatchWriter{ResponseWriter: rec, uid: "thread-alice"}
+	half := len(line) / 2
+	if n, err := w.Write([]byte(line[:half])); err != nil || n != half {
+		t.Fatalf("write partial: n=%d err=%v", n, err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("partial line forwarded: %q", rec.Body.String())
+	}
+	if _, err := w.Write([]byte(line[half:] + "\n" + recreated + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Body.String(); got != line+"\n" {
+		t.Fatalf("filtered stream = %q, want %q", got, line+"\n")
 	}
 }
 

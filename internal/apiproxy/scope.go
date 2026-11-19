@@ -1,6 +1,7 @@
 package apiproxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -65,6 +66,9 @@ type scopeRequest struct {
 	name        string // empty for a list or watch
 	subresource string
 	list        bool
+	// watch marks a legacy /watch/ collection path, whose query does not
+	// carry watch=true. A normal list becomes a watch with ?watch=true.
+	watch bool
 }
 
 type scopeAction int
@@ -178,7 +182,15 @@ func (s *ownerScope) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		s.next.ServeHTTP(w, next)
+		// A blipthreads watch is scoped by metadata.name, which survives a
+		// delete/recreate. Filter the stream by incarnation as well so a
+		// guest created for the previous thread never receives the recreated
+		// object's UID, spec, or status.
+		var out http.ResponseWriter = w
+		if req.resource == "blipthreads" && id.threadUID != "" && isWatch(r, req) {
+			out = &threadWatchWriter{ResponseWriter: w, uid: id.threadUID}
+		}
+		s.next.ServeHTTP(out, next)
 		return
 	}
 	allowed, status, err := s.allowed(r.Context(), id, req)
@@ -359,6 +371,76 @@ func scopedList(r *http.Request, id identity, resource string) (*http.Request, b
 	}
 }
 
+// isWatch reports whether a scoped collection request is a watch: either the
+// modern ?watch=true form or a legacy /watch/ collection path.
+func isWatch(r *http.Request, req scopeRequest) bool {
+	return req.watch || strings.EqualFold(r.URL.Query().Get("watch"), "true")
+}
+
+// threadWatchWriter forwards only blipthreads watch events for the thread
+// incarnation the guest was created for. A watch is scoped by metadata.name,
+// and a deleted and recreated thread keeps that name, so without this check
+// the replacement object (new UID, charter, systemPrompt, status) would reach
+// the previous incarnation's guest. BOOKMARK and ERROR events carry no
+// object scope and pass through.
+//
+// Events are newline-delimited JSON. A line split across writes is buffered
+// until its newline arrives; Flush only pushes the already-forwarded lines so
+// watches keep streaming.
+type threadWatchWriter struct {
+	http.ResponseWriter
+	uid     string
+	pending []byte
+}
+
+func (w *threadWatchWriter) Write(p []byte) (int, error) {
+	w.pending = append(w.pending, p...)
+	for {
+		i := bytes.IndexByte(w.pending, '\n')
+		if i < 0 {
+			break
+		}
+		line := w.pending[:i+1]
+		w.pending = w.pending[i+1:]
+		if !keepThreadWatchEvent(line, w.uid) {
+			continue
+		}
+		if _, err := w.ResponseWriter.Write(line); err != nil {
+			return 0, err
+		}
+	}
+	return len(p), nil
+}
+
+func (w *threadWatchWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// keepThreadWatchEvent decides whether one watch event belongs to uid. An
+// unparseable line is dropped: a thread watch must fail closed rather than
+// forward an object whose incarnation cannot be checked.
+func keepThreadWatchEvent(line []byte, uid string) bool {
+	var event struct {
+		Type   string `json:"type"`
+		Object struct {
+			Metadata struct {
+				UID string `json:"uid"`
+			} `json:"metadata"`
+		} `json:"object"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(line), &event); err != nil {
+		return false
+	}
+	switch event.Type {
+	case "BOOKMARK", "ERROR":
+		return true
+	default:
+		return event.Object.Metadata.UID == uid
+	}
+}
+
 // objectMeta is the small part of an object the scope may inspect.
 type objectMeta struct {
 	Metadata struct {
@@ -495,7 +577,9 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		// naming a scoped resource is denied rather than forwarded unscoped.
 		if len(seg) > 2 && seg[2] == "watch" {
 			if len(seg) == 6 && seg[3] == "namespaces" && scopedResource(seg[5]) {
-				return namespaced(5)
+				req, action := namespaced(5)
+				req.watch = true
+				return req, action
 			}
 			if namesScopedResource(seg[3:]) {
 				return scopeRequest{}, scopedDeny
@@ -517,7 +601,9 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		// the list. Unknown watch shapes naming a scoped resource are denied.
 		if len(seg) > 3 && seg[3] == "watch" {
 			if len(seg) == 7 && seg[4] == "namespaces" && scopedResource(seg[6]) {
-				return namespaced(6)
+				req, action := namespaced(6)
+				req.watch = true
+				return req, action
 			}
 			if namesScopedResource(seg[4:]) {
 				return scopeRequest{}, scopedDeny
