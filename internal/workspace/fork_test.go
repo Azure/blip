@@ -141,6 +141,20 @@ func TestForkRollbackPreservesExistingStates(t *testing.T) {
 	}
 }
 
+func TestCheckSourceAllowsFailedPending(t *testing.T) {
+	src := testState("src")
+	src.Status.Phase = v1alpha1.StateFailed
+	src.Status.Message = "initial version failed: fetch: device busy"
+	src.Status.Pending = &v1alpha1.PendingCommit{CommitID: "c1", Generation: 1, SourceNode: "n1"}
+	if err := CheckSource(src); err != nil {
+		t.Fatalf("failed-but-pending source rejected: %v", err)
+	}
+	src.Status.Pending = nil
+	if err := CheckSource(src); err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Fatalf("terminally failed source accepted: %v", err)
+	}
+}
+
 func TestForkPreflightAndReplacementSafety(t *testing.T) {
 	ctx := context.Background()
 	src, dest := testState("source"), testState("worker")

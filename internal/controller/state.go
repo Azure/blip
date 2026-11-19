@@ -508,7 +508,10 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 				// source's finalizer on a build that cannot succeed.
 				s.Phase = v1.StateFailed
 				return fmt.Sprintf("copy source %q is being deleted", src.Name), false, nil
-			case src.Status.Committed == nil && src.Status.Phase == v1.StateFailed:
+			case src.Status.Committed == nil && src.Status.Phase == v1.StateFailed && src.Status.Pending == nil:
+				// A failed import can still commit a pending version, and
+				// workspace.CheckSource accepts exactly that source. Only a
+				// source with no pending commit is terminally failed.
 				s.Phase = v1.StateFailed
 				return fmt.Sprintf("copy source %q failed: %s", src.Name, copySourceFailure(src)), false, nil
 			case src.Status.Committed == nil:
