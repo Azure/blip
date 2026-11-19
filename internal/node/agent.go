@@ -55,7 +55,7 @@ const (
 	imageConcurrency = 2
 	// sealConcurrency bounds concurrent state saves. Each one syncs a whole
 	// filesystem and snapshots a device; unbounded saves starve each other
-	// and every reconnecting SSH command waits for the backlog.
+	// and every reconnecting command session waits for the backlog.
 	sealConcurrency = 4
 )
 

@@ -37,14 +37,13 @@ var (
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
-	only := flag.String("run", "", "run only this scenario (main, idle, command)")
+	only := flag.String("run", "", "run only this scenario (main, command)")
 	flag.Parse()
 	scenarios := []struct {
 		name string
 		fn   func()
 	}{
 		{"main", scenarioMain},
-		{"idle", scenarioIdle},
 		{"command", scenarioCommand},
 	}
 	for _, s := range scenarios {
@@ -526,13 +525,7 @@ func scenarioMain() {
 	p.wait("allow-echo policy applied", 5*time.Second, func(o podapi.Observed) bool { return o.NetworkRevision == policy.Revision && o.NetworkError == "" })
 	r = run(p, wire.Open{Argv: []string{"bash", "-c", "exec 3<>/dev/tcp/10.99.0.1/18080; echo from-guest >&3; cat <&3"}}, "")
 	check(r.stdout == "echo:from-guest\n", "explicitly allowed guest TCP egress over routed TAP: %q", r.stdout)
-	s, err := open(p, wire.Open{Mode: wire.OpenDial, Host: "10.99.0.1", Port: 18080})
-	must(err, "dial")
-	must(writeStdin(s, "via-dial\n"), "dial write")
-	r = s.collect(5*time.Second, nil)
-	s.Close()
-	check(r.stdout == "echo:via-dial\n" && r.exit != nil, "dial relay: %q exit=%v", r.stdout, r.exit != nil)
-	s, err = open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"bash", "-c", `exec 3<>/dev/tcp/10.99.0.1/18080
+	s, err := open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"bash", "-c", `exec 3<>/dev/tcp/10.99.0.1/18080
 echo live-before >&3
 IFS= read -r line <&3; echo "$line"
 read -r trigger
@@ -568,23 +561,13 @@ echo revoked`}})
 	check(r.exit != nil && r.exit.Code == 4, "pty shell exit code 4")
 	s.Close()
 
-	// Detach and rejoin with replay.
+	// Disconnect and rejoin the session with replay.
 	s, err = open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"sh", "-c", "for i in 1 2 3; do echo line$i; sleep 0.3; done; sleep 1; echo done"}})
 	must(err, "replay exec")
 	id := s.opened.Session
 	r = s.collect(5*time.Second, func(out string) bool { return strings.Contains(out, "line1") })
 	s.Close()
 	time.Sleep(500 * time.Millisecond)
-	ls, err := open(p, wire.Open{Mode: wire.OpenList})
-	must(err, "list")
-	found := false
-	for _, si := range ls.opened.Sessions {
-		if si.ID == id && !si.Exited && si.Clients == 0 {
-			found = true
-		}
-	}
-	ls.Close()
-	check(found, "list shows detached running session %s", id)
 	s, err = open(p, wire.Open{Mode: wire.OpenAttach, Session: id})
 	must(err, "attach")
 	r = s.collect(10*time.Second, nil)
@@ -744,31 +727,6 @@ echo revoked`}})
 	check(fsCat(rootImg, "/root/marker") == "root-data\n", "root data persisted")
 	out, _ = exec.Command("ip", "netns", "exec", netns, "ip", "link", "show").CombinedOutput()
 	check(!strings.Contains(string(out), "blip-tap0"), "TAP removed after exit")
-}
-
-func scenarioIdle() {
-	rootImg := freshRoot("idle")
-	p := startPod("idle", false)
-	p.wait("Warm", 30*time.Second, func(o podapi.Observed) bool { return o.Phase == podapi.PhaseWarm })
-	rootID := newID(10)
-	p.setDesired(podapi.Desired{Claim: &podapi.Claim{
-		BlipName: "idle", Root: podapi.Disk{ID: rootID, Serial: rootID, Device: rootImg}, IdleTimeoutSeconds: 3,
-	}})
-	p.wait("Running", 30*time.Second, func(o podapi.Observed) bool { return o.Phase == podapi.PhaseRunning })
-	s, err := open(p, wire.Open{Mode: wire.OpenExec, Argv: []string{"sh", "-c", "echo idle-data > /root/idle; sleep 4"}})
-	must(err, "exec")
-	t := time.Now()
-	s.collect(10*time.Second, nil)
-	s.Close()
-	// Detached background work keeps the blip alive.
-	sh(p, "setsid sleep 3 >/dev/null 2>&1 < /dev/null &")
-	o := p.wait("Exited", 30*time.Second, func(o podapi.Observed) bool { return o.Phase == podapi.PhaseExited })
-	idle := time.Since(t)
-	check(o.Exit != nil && o.Exit.Reason == wire.ReasonIdle, "idle exit %+v", o.Exit)
-	check(idle > 9*time.Second, "idle waited for session (4s), background work (3s) and timeout (3s): %v", idle.Round(time.Millisecond))
-	p.waitExit(10 * time.Second)
-	fsClean(rootImg)
-	check(fsCat(rootImg, "/root/idle") == "idle-data\n", "idle blip data persisted")
 }
 
 func scenarioCommand() {

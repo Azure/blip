@@ -15,7 +15,7 @@ import (
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
 
-const scopeNamespace = "blip-ssh"
+const scopeNamespace = "blip-sandbox"
 
 // fakeObject is the small object shape the fake API server serves.
 type fakeObject struct {
@@ -191,7 +191,7 @@ func scopedFixture() *fakeKube {
 	kube.blips["admin.a"] = fakeObject{Name: "admin.a", UID: "uid-admin", Secret: "admin-secret"}
 	kube.states["alice.home"] = fakeObject{Name: "alice.home", UID: "state-alice", Labels: map[string]string{v1.LabelOwner: "alice"}}
 	kube.states["bob.home"] = fakeObject{Name: "bob.home", UID: "state-bob", Labels: map[string]string{v1.LabelOwner: "bob"}}
-	kube.states["gateway-base"] = fakeObject{Name: "gateway-base", UID: "state-base"}
+	kube.states["shared-base"] = fakeObject{Name: "shared-base", UID: "state-base"}
 	return kube
 }
 
@@ -249,48 +249,48 @@ func TestOwnerScopeHidesOtherOwners(t *testing.T) {
 	kube := scopedFixture()
 	p := startScoped(t, kube, "alice-vm")
 
-	if status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips/bob.b"); status != http.StatusNotFound {
+	if status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips/bob.b"); status != http.StatusNotFound {
 		t.Fatalf("other owner's Blip status = %d, body %q", status, body)
 	} else if strings.Contains(body, "super-secret") {
 		t.Fatalf("other owner's secret leaked: %q", body)
 	}
-	status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips")
+	status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips")
 	if status != http.StatusOK || !strings.Contains(body, "alice.a") {
 		t.Fatalf("own Blip list status = %d, body %q", status, body)
 	}
 	if strings.Contains(body, "bob.b") || strings.Contains(body, "super-secret") {
 		t.Fatalf("Blip list leaked another owner: %q", body)
 	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips/admin.a"); status != http.StatusNotFound {
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips/admin.a"); status != http.StatusNotFound {
 		t.Fatalf("administrator Blip status = %d, want private", status)
 	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blipstates/bob.home"); status != http.StatusNotFound {
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipstates/bob.home"); status != http.StatusNotFound {
 		t.Fatalf("other owner's state status = %d", status)
 	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blipstates/alice.home"); status != http.StatusOK {
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipstates/alice.home"); status != http.StatusOK {
 		t.Fatalf("own state status = %d", status)
 	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blipstates/gateway-base"); status != http.StatusOK {
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipstates/shared-base"); status != http.StatusOK {
 		t.Fatalf("shared base status = %d", status)
 	}
-	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-ssh/pods/bob-vm"); status != http.StatusNotFound {
+	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods/bob-vm"); status != http.StatusNotFound {
 		t.Fatalf("other owner's pod status = %d", status)
 	}
-	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-ssh/pods/warm-vm"); status != http.StatusNotFound {
+	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods/warm-vm"); status != http.StatusNotFound {
 		t.Fatalf("warm pod status = %d", status)
 	}
-	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-ssh/pods/alice-vm"); status != http.StatusOK {
+	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods/alice-vm"); status != http.StatusOK {
 		t.Fatalf("own pod status = %d", status)
 	}
 
-	status, body = proxyGet(t, p, "/api/v1/namespaces/blip-ssh/pods")
+	status, body = proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods")
 	if status != http.StatusOK || !strings.Contains(body, "alice-vm") {
 		t.Fatalf("own pod list status = %d, body %q", status, body)
 	}
 	if strings.Contains(body, "bob-vm") || strings.Contains(body, "warm-vm") {
 		t.Fatalf("pod list leaked other pods: %q", body)
 	}
-	status, body = proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blipstates")
+	status, body = proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipstates")
 	if status != http.StatusOK || !strings.Contains(body, "alice.home") || strings.Contains(body, "bob.home") {
 		t.Fatalf("state list status = %d, body %q", status, body)
 	}
@@ -300,19 +300,19 @@ func TestOwnerScopeSelectorAndPaths(t *testing.T) {
 	kube := scopedFixture()
 	p := startScoped(t, kube, "alice-vm")
 
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips?labelSelector=app%3Ddemo"); status != http.StatusOK {
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips?labelSelector=app%3Ddemo"); status != http.StatusOK {
 		t.Fatalf("list status = %d", status)
 	}
-	query := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips")
+	query := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips")
 	if got := query.Get("labelSelector"); got != "app=demo,blip.dev/owner=alice" {
 		t.Fatalf("merged selector = %q", got)
 	}
 
 	// Watches keep streaming and all other query parameters.
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips?watch=true&labelSelector=app%3Ddemo&resourceVersion=7&allowWatchBookmarks=true"); status != http.StatusOK {
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips?watch=true&labelSelector=app%3Ddemo&resourceVersion=7&allowWatchBookmarks=true"); status != http.StatusOK {
 		t.Fatalf("watch status = %d", status)
 	}
-	query = kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips")
+	query = kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips")
 	if query.Get("watch") != "true" || query.Get("resourceVersion") != "7" || query.Get("allowWatchBookmarks") != "true" ||
 		query.Get("labelSelector") != "app=demo,blip.dev/owner=alice" {
 		t.Fatalf("watch parameters changed: %v", query)
@@ -326,7 +326,7 @@ func TestOwnerScopeSelectorAndPaths(t *testing.T) {
 	}
 
 	// exec is checked against the parent pod and forwarded byte-for-byte.
-	exec := "/api/v1/namespaces/blip-ssh/pods/alice-vm/exec?command=sh&command=-c&stdin=true"
+	exec := "/api/v1/namespaces/blip-sandbox/pods/alice-vm/exec?command=sh&command=-c&stdin=true"
 	if status, _ := proxyGet(t, p, exec); status != http.StatusOK {
 		t.Fatalf("own exec status = %d", status)
 	}
@@ -339,10 +339,10 @@ func TestOwnerScopeSelectorAndPaths(t *testing.T) {
 	if !seen {
 		t.Fatalf("exec request was rewritten: %v", kube.recorded())
 	}
-	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-ssh/pods/bob-vm/exec?command=sh"); status != http.StatusNotFound {
+	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods/bob-vm/exec?command=sh"); status != http.StatusNotFound {
 		t.Fatalf("other owner's exec status = %d", status)
 	}
-	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-ssh/pods/alice-vm/log?tailLines=10"); status != http.StatusOK {
+	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods/alice-vm/log?tailLines=10"); status != http.StatusOK {
 		t.Fatalf("own log status = %d", status)
 	}
 
@@ -357,10 +357,10 @@ func TestOwnerScopeSelectorAndPaths(t *testing.T) {
 			t.Errorf("%s status = %d, want 403", path, status)
 		}
 	}
-	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-ssh/pods/alice-vm/exec/extra"); status != http.StatusForbidden {
+	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods/alice-vm/exec/extra"); status != http.StatusForbidden {
 		t.Errorf("ambiguous path status = %d", status)
 	}
-	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-ssh/pods/alice-vm%2Fbob-vm"); status != http.StatusBadRequest {
+	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods/alice-vm%2Fbob-vm"); status != http.StatusBadRequest {
 		t.Errorf("encoded slash status = %d", status)
 	}
 	for _, path := range pathsFor(kube) {
@@ -371,7 +371,7 @@ func TestOwnerScopeSelectorAndPaths(t *testing.T) {
 
 	// Writes are not read-scoped: they keep their exact query for RBAC and the
 	// owner admission policy to decide.
-	request, err := http.NewRequest(http.MethodPost, "http://guest/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips", strings.NewReader("{}"))
+	request, err := http.NewRequest(http.MethodPost, "http://guest/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips", strings.NewReader("{}"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +383,7 @@ func TestOwnerScopeSelectorAndPaths(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("write status = %d", response.StatusCode)
 	}
-	if got := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips").Get("labelSelector"); got != "" {
+	if got := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips").Get("labelSelector"); got != "" {
 		t.Fatalf("write was given a label selector: %q", got)
 	}
 }
@@ -405,7 +405,7 @@ func TestOwnerScopeWatchStreams(t *testing.T) {
 	cfg.PodName, cfg.PodNamespace = "alice-vm", scopeNamespace
 	p := startProxy(t, cfg)
 
-	resp, err := p.client.Get("http://guest/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips?watch=true")
+	resp, err := p.client.Get("http://guest/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips?watch=true")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +415,7 @@ func TestOwnerScopeWatchStreams(t *testing.T) {
 	if err != nil || line != "{\"type\":\"ADDED\"}\n" {
 		t.Fatalf("first watch event: %q, %v", line, err)
 	}
-	if got := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips").Get("labelSelector"); got != "blip.dev/owner=alice" {
+	if got := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips").Get("labelSelector"); got != "blip.dev/owner=alice" {
 		t.Fatalf("watch selector = %q", got)
 	}
 	p.stop(t)
@@ -436,21 +436,21 @@ func TestOwnerScopeAdminIsUnrestricted(t *testing.T) {
 	kube.pods["warm-vm"] = fakeObject{Name: "warm-vm", UID: "pod-warm"}
 	p := startScoped(t, kube, "admin-vm")
 
-	status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips/bob.b")
+	status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips/bob.b")
 	if status != http.StatusOK || !strings.Contains(body, "bob-secret") {
 		t.Fatalf("admin GET status = %d, body %q", status, body)
 	}
-	status, body = proxyGet(t, p, "/api/v1/namespaces/blip-ssh/pods")
+	status, body = proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods")
 	if status != http.StatusOK || !strings.Contains(body, "warm-vm") {
 		t.Fatalf("admin pod list status = %d, body %q", status, body)
 	}
-	if status, body = proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips"); status != http.StatusOK ||
+	if status, body = proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips"); status != http.StatusOK ||
 		!strings.Contains(body, "admin.a") || !strings.Contains(body, "bob.b") {
 		t.Fatalf("admin list status = %d, body %q", status, body)
 	}
 	for _, uri := range kube.recorded() {
 		parsed, err := url.ParseRequestURI(uri)
-		if err == nil && parsed.Path == "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips" && parsed.Query().Get("labelSelector") != "" {
+		if err == nil && parsed.Path == "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips" && parsed.Query().Get("labelSelector") != "" {
 			t.Fatalf("admin list was scoped: %q", uri)
 		}
 	}
@@ -467,9 +467,9 @@ func TestOwnerScopeVacantPodDenies(t *testing.T) {
 	p := startScoped(t, kube, "warm-vm")
 
 	for _, path := range []string{
-		"/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips",
-		"/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips/alice.a",
-		"/api/v1/namespaces/blip-ssh/pods",
+		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips",
+		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips/alice.a",
+		"/api/v1/namespaces/blip-sandbox/pods",
 	} {
 		if status, _ := proxyGet(t, p, path); status != http.StatusForbidden {
 			t.Errorf("vacant pod %s status = %d, want 403", path, status)
@@ -490,7 +490,7 @@ func TestOwnerScopeRejectsStaleBlipBinding(t *testing.T) {
 	}
 	kube.blips["alice.a"] = fakeObject{Name: "alice.a", UID: "uid-new", Labels: map[string]string{v1.LabelOwner: "alice"}}
 	p := startScoped(t, kube, "alice-vm")
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-ssh/blips"); status != http.StatusForbidden {
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips"); status != http.StatusForbidden {
 		t.Fatalf("stale pod/Blip binding status = %d, want 403", status)
 	}
 }

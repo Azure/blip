@@ -9,6 +9,7 @@ kind: ClusterRole
 metadata:
   name: blip-controller
 rules:
+  # Includes delete on blips for the terminated-blip garbage collector.
   - apiGroups: [blip.dev]
     resources: ["*"]
     verbs: ["*"]

@@ -1,5 +1,6 @@
 // Command blip-controller runs the blip control plane: the enrollment, node,
-// pool, state, and blip reconcilers.
+// pool, state, and blip reconcilers, plus garbage collection of old finished
+// blips.
 package main
 
 import (
@@ -27,6 +28,7 @@ import (
 )
 
 // +kubebuilder:rbac:groups=blip.dev,resources=blips;blipstates;blippools;blipnodes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=blip.dev,resources=blips,verbs=delete
 // +kubebuilder:rbac:groups=blip.dev,resources=blips/status;blipstates/status;blippools/status;blipnodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=blip.dev,resources=blips/finalizers;blipstates/finalizers;blippools/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
@@ -39,22 +41,24 @@ import (
 func main() {
 	var runtimeImage, insecure, namespace string
 	var leaderElect bool
+	var gcThreshold int
 	flag.StringVar(&namespace, "namespace", os.Getenv("POD_NAMESPACE"), "namespace of the controller and the disk key secret")
 	flag.StringVar(&runtimeImage, "runtime-image", "", "image of the VM pod's vm container (blip-runtime)")
 	flag.StringVar(&insecure, "insecure-registry", "", "comma-separated registry hosts reached over plain HTTP")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
+	flag.IntVar(&gcThreshold, "terminated-blip-gc-threshold", controller.DefaultTerminatedBlipGCThreshold, "delete the oldest finished blips beyond this many (0 disables)")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	if err := run(runtimeImage, insecure, namespace, leaderElect); err != nil {
+	if err := run(runtimeImage, insecure, namespace, leaderElect, gcThreshold); err != nil {
 		fmt.Fprintln(os.Stderr, "blip-controller:", err)
 		os.Exit(1)
 	}
 }
 
-func run(runtimeImage, insecure, namespace string, leaderElect bool) error {
+func run(runtimeImage, insecure, namespace string, leaderElect bool, gcThreshold int) error {
 	if runtimeImage == "" || namespace == "" {
 		return fmt.Errorf("--runtime-image and --namespace are required")
 	}
@@ -111,6 +115,11 @@ func run(runtimeImage, insecure, namespace string, leaderElect bool) error {
 		Registry:     controller.RemoteRegistry{Insecure: registries, Reader: mgr.GetAPIReader()},
 	}
 	if err := controller.Setup(ctx, mgr, cfg); err != nil {
+		return err
+	}
+	// Use the direct client: listing and deleting finished blips should not
+	// depend on the manager's cache.
+	if err := mgr.Add(controller.NewTerminatedBlipGC(direct, gcThreshold)); err != nil {
 		return err
 	}
 	return mgr.Start(ctx)

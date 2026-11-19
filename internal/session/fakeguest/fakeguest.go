@@ -17,8 +17,6 @@ type Guest struct {
 	// Run handles exec and attach sessions and returns the exit status.
 	// The default exits 0 immediately.
 	Run func(s *Session) wire.Exit
-	// Sessions is returned for list requests.
-	Sessions []wire.SessionInfo
 	// OpenError, if set, rejects exec and attach requests.
 	OpenError string
 
@@ -95,26 +93,6 @@ func (g *Guest) serve(pod string, c net.Conn) {
 		return
 	}
 	n := g.record(Request{Pod: pod, Open: o})
-	switch o.Mode {
-	case wire.OpenList:
-		conn.WriteJSON(wire.TOpened, wire.Opened{Sessions: g.Sessions})
-		return
-	case wire.OpenDial:
-		conn.WriteJSON(wire.TOpened, wire.Opened{Session: "dial"})
-		for {
-			t, p, err := conn.Read()
-			if err != nil {
-				return
-			}
-			switch t {
-			case wire.TStdin:
-				conn.Write(wire.TStdout, p)
-			case wire.TStdinEOF:
-				conn.WriteJSON(wire.TExited, wire.Exit{})
-				return
-			}
-		}
-	}
 	if g.OpenError != "" {
 		conn.WriteJSON(wire.TOpened, wire.Opened{Error: g.OpenError})
 		return

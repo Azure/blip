@@ -73,7 +73,7 @@ type Claim struct {
 	BlipName string `json:"blipName"`
 	BlipUID  string `json:"blipUID"`
 	Root     Disk   `json:"root"`
-	// Command is the primary command; empty means interactive.
+	// Command is the required primary command.
 	Command    []string `json:"command,omitempty"`
 	TTY        bool     `json:"tty,omitempty"`
 	Env        []string `json:"env,omitempty"` // KEY=VALUE, image env first
@@ -82,8 +82,6 @@ type Claim struct {
 	// WaitForClient holds the command's output until a client attaches, so a
 	// fast command cannot outrun a caller that is about to connect.
 	WaitForClient bool `json:"waitForClient,omitempty"`
-	// IdleTimeoutSeconds applies when Command is empty.
-	IdleTimeoutSeconds int64 `json:"idleTimeoutSeconds,omitempty"`
 }
 
 // Disk is a block device for the VM. Device is a path inside the vm
@@ -134,8 +132,7 @@ type Observed struct {
 	Mounts []DiskStatus `json:"mounts,omitempty"`
 	// Sessions is the number of attached sessions.
 	Sessions int `json:"sessions,omitempty"`
-	// Exit is set when the primary command exited (command blips) or the
-	// guest stopped (interactive blips).
+	// Exit is set when the primary command exited or the guest stopped.
 	Exit *Exit `json:"exit,omitempty"`
 	// Error describes a fatal runtime or guest failure.
 	Error string `json:"error,omitempty"`

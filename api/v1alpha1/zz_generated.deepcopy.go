@@ -299,11 +299,6 @@ func (in *BlipSpec) DeepCopyInto(out *BlipSpec) {
 		*out = make([]EnvVar, len(*in))
 		copy(*out, *in)
 	}
-	if in.IdleTimeout != nil {
-		in, out := &in.IdleTimeout, &out.IdleTimeout
-		*out = new(metav1.Duration)
-		**out = **in
-	}
 	if in.Network != nil {
 		in, out := &in.Network, &out.Network
 		*out = new(NetworkPolicy)
@@ -860,11 +855,6 @@ func (in *RuntimeDefaults) DeepCopyInto(out *RuntimeDefaults) {
 		in, out := &in.Env, &out.Env
 		*out = make([]EnvVar, len(*in))
 		copy(*out, *in)
-	}
-	if in.IdleTimeout != nil {
-		in, out := &in.IdleTimeout, &out.IdleTimeout
-		*out = new(metav1.Duration)
-		**out = **in
 	}
 	if in.Network != nil {
 		in, out := &in.Network, &out.Network

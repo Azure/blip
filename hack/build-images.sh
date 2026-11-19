@@ -9,7 +9,7 @@ REPO="${IMAGE_REPO:-ghcr.io/azure}"
 CH="${CLOUD_HYPERVISOR:-/usr/local/bin/cloud-hypervisor}"
 cd "${ROOT}"
 
-for f in bin/blip-controller bin/blip-gateway bin/blip-node bin/blip-runtime \
+for f in bin/blip-controller bin/blip-node bin/blip-runtime \
   build/guest/vmlinuz build/guest/initramfs.gz "${CH}"; do
   [[ -f "${f}" ]] || { echo "missing ${f} (run make build guest)" >&2; exit 1; }
 done

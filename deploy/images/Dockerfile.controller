@@ -1,4 +1,4 @@
 # Built by hack/build-images.sh from binaries prebuilt with `make build`.
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY bin/blip-controller bin/blip-gateway /usr/local/bin/
+COPY bin/blip-controller /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/blip-controller"]

@@ -218,10 +218,10 @@ func NewCommand(env *Env) *cobra.Command {
 		Short:       "Run fast VM sandboxes with durable state on Kubernetes",
 		Long: `Run fast VM sandboxes with durable state on Kubernetes.
 
-These commands cover what kubectl cannot do: sessions inside a blip,
-mounts on a running blip, waits that report its result, collecting files
-and commits from a blip's state, and creating states without YAML. Use
-kubectl for everything else:
+These commands cover what kubectl cannot do: creating and running blips,
+exec in a running blip, mounts on a running blip, waits that report its
+result, collecting files and commits from a blip's state, and creating states
+without YAML. Use kubectl for everything else:
   kubectl get blips,blipstates
   kubectl apply -f state.yaml  # advanced state fields
   kubectl patch blip NAME --type=merge -p '{"spec":{"stop":true}}'
@@ -238,8 +238,8 @@ kubectl for everything else:
 	pf.StringVar(&a.flags.Context, "context", "", "kubeconfig context to use")
 	pf.StringVarP(&a.flags.Namespace, "namespace", "n", "", "namespace (default from kubeconfig)")
 	root.AddCommand(
-		a.createCommand(), a.pullCommand(), a.runCommand(), a.collectCommand(), a.execCommand(), a.attachCommand(),
-		a.sessionsCommand(), a.mountCommand(), a.unmountCommand(), a.waitCommand(),
+		a.createCommand(), a.pullCommand(), a.runCommand(), a.collectCommand(), a.execCommand(),
+		a.mountCommand(), a.unmountCommand(), a.waitCommand(),
 	)
 	return root
 }
@@ -249,7 +249,7 @@ func Main(ctx context.Context, env *Env, args []string) int {
 	cmd := NewCommand(env)
 	cmd.SetArgs(args)
 	err := cmd.ExecuteContext(ctx)
-	if err == nil || errors.Is(err, errDetached) {
+	if err == nil {
 		return 0
 	}
 	var exit *ExitError

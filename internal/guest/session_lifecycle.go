@@ -35,7 +35,7 @@ func (r *openRecord) complete() bool {
 	return true
 }
 
-// sessionRetention decides which resources an exit/detach can release. An
+// sessionRetention decides which resources an exit/client close can release. An
 // unattached caller may still hold the session pointer returned by openExec,
 // so even an unlisted session keeps its replay until that caller has attached.
 func sessionRetention(primary, exited, attached bool, clients int) (clearReplay, remove bool) {

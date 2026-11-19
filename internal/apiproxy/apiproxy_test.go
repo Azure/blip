@@ -148,14 +148,14 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "443")
 	t.Setenv("POD_NAME", "vm-0")
-	t.Setenv("POD_NAMESPACE", "blip-ssh")
+	t.Setenv("POD_NAMESPACE", "blip-sandbox")
 	cfg, err := ConfigFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.APIAddress != "10.96.0.1:443" || cfg.SocketPath != "/run/blip/vsock/vsock.sock_1026" ||
 		cfg.TokenFile != serviceAccountDir+"/token" || cfg.CAFile != serviceAccountDir+"/ca.crt" ||
-		cfg.PodName != "vm-0" || cfg.PodNamespace != "blip-ssh" {
+		cfg.PodName != "vm-0" || cfg.PodNamespace != "blip-sandbox" {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 	// The trusted identity is all-or-nothing.
@@ -164,7 +164,7 @@ func TestConfigFromEnv(t *testing.T) {
 		t.Fatal("accepted a partial pod identity")
 	}
 	t.Setenv("POD_NAME", "")
-	t.Setenv("POD_NAMESPACE", "blip-ssh")
+	t.Setenv("POD_NAMESPACE", "blip-sandbox")
 	if _, err := ConfigFromEnv(); err == nil {
 		t.Fatal("accepted a partial pod identity")
 	}

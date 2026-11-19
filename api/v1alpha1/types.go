@@ -460,23 +460,19 @@ type RuntimeDefaults struct {
 	Env        []EnvVar `json:"env,omitempty"`
 	WorkingDir string   `json:"workingDir,omitempty"`
 	User       string   `json:"user,omitempty"`
-	// IdleTimeout applies to interactive blips. Default 30s.
-	// +kubebuilder:validation:Type=string
-	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`
-	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
 	// Network narrows the pool's egress policy. Omitted inherits the pool;
 	// explicitly empty denies all.
 	Network *NetworkPolicy `json:"network,omitempty"`
 }
 
-// BlipSpec is one VM lifetime: either one command, or an interactive
-// sandbox that lives while sessions or processes are active.
+// BlipSpec is one VM lifetime: one command that runs as the primary session.
+// The blip ends when the command exits.
 //
-// +kubebuilder:validation:XValidation:rule="has(self.command) == has(oldSelf.command)",message="command is immutable"
+// +kubebuilder:validation:XValidation:rule="self.command == oldSelf.command",message="command is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env == oldSelf.env)",message="env is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.workingDir) == has(oldSelf.workingDir)) && (!has(self.workingDir) || self.workingDir == oldSelf.workingDir)",message="workingDir is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user == oldSelf.user)",message="user is immutable"
-// +kubebuilder:validation:XValidation:rule="(has(self.tty) && self.tty) == (has(oldSelf.tty) && oldSelf.tty) && (has(self.idleTimeout) == has(oldSelf.idleTimeout)) && (!has(self.idleTimeout) || self.idleTimeout == oldSelf.idleTimeout)",message="tty and idleTimeout are immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.tty) && self.tty) == (has(oldSelf.tty) && oldSelf.tty)",message="tty is immutable"
 type BlipSpec struct {
 	// Pool names a BlipPool in the blip's namespace.
 	// +kubebuilder:default=default
@@ -490,10 +486,8 @@ type BlipSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="state is immutable"
 	State string `json:"state"`
 	// Command runs as the primary session. The blip ends when it exits.
-	// Without a command the blip is an interactive sandbox that stops after
-	// IdleTimeout without sessions or running processes.
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="command is immutable"
-	Command []string `json:"command,omitempty"`
+	// +kubebuilder:validation:MinItems=1
+	Command []string `json:"command"`
 	Env     []EnvVar `json:"env,omitempty"`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="workingDir is immutable"
 	WorkingDir string `json:"workingDir,omitempty"`
@@ -501,10 +495,6 @@ type BlipSpec struct {
 	User string `json:"user,omitempty"`
 	// TTY gives the primary command a terminal.
 	TTY bool `json:"tty,omitempty"`
-	// IdleTimeout applies to interactive blips. Default 30s.
-	// +kubebuilder:validation:Type=string
-	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`
-	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
 	// Stop asks the blip to shut down gracefully and save.
 	Stop bool `json:"stop,omitempty"`
 	// Network narrows the pool's egress policy. Omitted inherits the root
@@ -517,7 +507,7 @@ const (
 	BlipPending   = "Pending"   // waiting for a VM or for states
 	BlipRunning   = "Running"   // the VM is claimed and running
 	BlipSaving    = "Saving"    // the VM stopped; writable states are saving
-	BlipSucceeded = "Succeeded" // command exited 0 (or sandbox stopped) and all saves committed
+	BlipSucceeded = "Succeeded" // command exited 0 and all saves committed
 	BlipFailed    = "Failed"
 )
 

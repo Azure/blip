@@ -117,23 +117,3 @@ func TestDisconnectBeforeExit(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
-
-func TestDialStream(t *testing.T) {
-	g := &fakeguest.Guest{}
-	c := &session.Client{Connect: g.Connect}
-	st, err := c.Dial(context.Background(), "ns", "p", "localhost", 8080)
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		st.Write([]byte("hello"))
-		st.CloseWrite()
-	}()
-	b, err := io.ReadAll(st)
-	if err != nil || string(b) != "hello" {
-		t.Fatalf("read %q err=%v", b, err)
-	}
-	if o := g.Opens()[0].Open; o.Mode != wire.OpenDial || o.Host != "localhost" || o.Port != 8080 {
-		t.Fatalf("open = %+v", o)
-	}
-}

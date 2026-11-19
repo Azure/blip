@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/session/fakeguest"
 	"github.com/Azure/blip/internal/wire"
@@ -27,11 +26,12 @@ func shortenOpenRetry(t *testing.T, window, first time.Duration) {
 	})
 }
 
-func TestAttachRetriesTransientVMErrors(t *testing.T) {
+func TestRunRetriesTransientVMErrors(t *testing.T) {
 	shortenOpenRetry(t, 2*time.Second, time.Millisecond)
-	h := newHarness(t, runningBlip("agent"))
+	h := newHarness(t, state("workspace"))
 	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
 		s.Stdout("replay")
+		h.ctrl.set(func(c *fakeController) { c.exited["agent"] = 0 })
 		return wire.Exit{}
 	}
 	base := h.guest.Connect
@@ -45,7 +45,7 @@ func TestAttachRetriesTransientVMErrors(t *testing.T) {
 		return base(ctx, namespace, pod)
 	}
 
-	code, out, errOut := h.run("", "attach", "agent")
+	code, out, errOut := h.run("", "run", "agent", "--state", "workspace", "--", "true")
 	if code != 0 || out != "replay" {
 		t.Fatalf("code %d out %q err %q", code, out, errOut)
 	}
@@ -57,24 +57,13 @@ func TestAttachRetriesTransientVMErrors(t *testing.T) {
 	}
 }
 
-func TestAttachOnFinishedBlipNamesTheReason(t *testing.T) {
-	b := runningBlip("agent")
-	b.Status.Phase, b.Status.Pod = v1alpha1.BlipFailed, ""
-	b.Status.Reason, b.Status.Message = "Stopped", "stopped before start"
-	h := newHarness(t, b)
-
-	code, _, errOut := h.run("", "attach", "agent")
-	if code != 1 || !strings.Contains(errOut, `blip "agent" has finished (Failed: Stopped)`) {
-		t.Fatalf("code %d err %q", code, errOut)
-	}
-	if opens := h.guest.Opens(); len(opens) != 0 {
-		t.Fatalf("attach opened a session on a finished blip: %+v", opens)
-	}
-}
-
 func TestAttachRetryGivesUpWithLastError(t *testing.T) {
 	shortenOpenRetry(t, 40*time.Millisecond, 5*time.Millisecond)
-	h := newHarness(t, runningBlip("agent"))
+	h := newHarness(t, state("workspace"))
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		h.ctrl.set(func(c *fakeController) { c.exited["agent"] = 0 })
+	}()
 	var mu sync.Mutex
 	var attempts atomic.Int32
 	last := ""
@@ -86,9 +75,9 @@ func TestAttachRetryGivesUpWithLastError(t *testing.T) {
 	}
 
 	start := time.Now()
-	code, _, errOut := h.run("", "attach", "agent")
+	code, _, errOut := h.run("", "run", "agent", "--state", "workspace", "--", "true")
 	elapsed := time.Since(start)
-	if code != 1 {
+	if code != 0 {
 		t.Fatalf("code %d err %q", code, errOut)
 	}
 	mu.Lock()
@@ -125,41 +114,6 @@ func TestExecIsNeverRetried(t *testing.T) {
 	}
 	if opens := h.guest.Opens(); len(opens) != 0 {
 		t.Fatalf("exec opened a session despite the failure: %+v", opens)
-	}
-}
-
-// TestSessionsRetriesTeardownAndExplainsStopping covers list opens during a
-// VM teardown: a transient 137 is retried, and one that persists becomes a
-// clear "is stopping" error instead of a raw pod exec failure.
-func TestSessionsRetriesTeardownAndExplainsStopping(t *testing.T) {
-	shortenOpenRetry(t, 40*time.Millisecond, 5*time.Millisecond)
-	h := newHarness(t, runningBlip("agent"))
-	h.guest.Sessions = []wire.SessionInfo{{ID: "main", Argv: []string{"make"}}}
-	base := h.guest.Connect
-	var calls atomic.Int32
-	h.connect = func(ctx context.Context, namespace, pod string) (io.ReadWriteCloser, error) {
-		if calls.Add(1) == 1 {
-			return nil, errors.New(`pod pod-agent exec: command terminated with exit code 137`)
-		}
-		return base(ctx, namespace, pod)
-	}
-	if code, out, errOut := h.run("", "sessions", "agent"); code != 0 || !strings.Contains(out, "main") {
-		t.Fatalf("code %d out %q err %q", code, out, errOut)
-	}
-
-	// The same failure every time: after the bounded retry the user gets a
-	// stopping explanation, and the underlying error is still visible.
-	calls.Store(0)
-	h.connect = func(context.Context, string, string) (io.ReadWriteCloser, error) {
-		calls.Add(1)
-		return nil, errors.New(`pod pod-agent exec: command terminated with exit code 137`)
-	}
-	code, _, errOut := h.run("", "sessions", "agent")
-	if code != 1 || !strings.Contains(errOut, `blip "agent" is stopping`) || !strings.Contains(errOut, "exit code 137") {
-		t.Fatalf("code %d err %q", code, errOut)
-	}
-	if calls.Load() < 2 {
-		t.Fatalf("sessions did not retry: %d calls", calls.Load())
 	}
 }
 

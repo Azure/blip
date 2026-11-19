@@ -6,4 +6,3 @@ resources:
   - controller.yaml
   - vm-owner-policy.yaml
   - node.yaml
-  - gateway.yaml

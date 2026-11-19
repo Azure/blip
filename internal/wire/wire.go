@@ -7,7 +7,7 @@
 // one JSON object. There are two guest ports:
 //
 //   - ControlPort: the in-pod runtime only (claim, mounts, shutdown).
-//   - SessionPort: interactive and command sessions, and TCP dials.
+//   - SessionPort: command and exec sessions.
 //
 // APIPort is a host listener for credential-free Kubernetes API streams from
 // the guest. The runtime authenticates those requests on the host side.
@@ -53,7 +53,7 @@ const (
 	TMountResult   Type = 3 // Result
 	TUnmountResult Type = 4 // Result
 	TStatus        Type = 5 // Status
-	TExit          Type = 6 // Exit: primary exited or idle; guest is shutting down
+	TExit          Type = 6 // Exit: primary command exited; guest is shutting down
 	TShutdownDone  Type = 7 // ShutdownDone: sent right before power off
 	TFreezeResult  Type = 8 // FreezeResult: answers Freeze and Thaw, or reports a timed-out thaw
 
@@ -104,8 +104,6 @@ type Claim struct {
 	// client attaches. Without it the pumps start immediately, so a fast
 	// command can overflow the replay ring before the caller connects.
 	WaitForClient bool `json:"waitForClient,omitempty"`
-	// IdleTimeoutSeconds applies when Command is empty.
-	IdleTimeoutSeconds int64 `json:"idleTimeoutSeconds,omitempty"`
 	// Mounts are mounted before Command starts. The guest answers each with
 	// a TMountResult; if one fails, Command does not run.
 	Mounts []Mount `json:"mounts,omitempty"`
@@ -155,8 +153,6 @@ type Status struct {
 const (
 	// ReasonCompleted marks a primary command that finished on its own.
 	ReasonCompleted = "Completed"
-	// ReasonIdle marks an interactive VM shut down for inactivity.
-	ReasonIdle = "Idle"
 	// ReasonStopped marks a session ended because the VM is shutting down.
 	ReasonStopped = "Stopped"
 	// ReasonGuestCrashed marks a VM that exited without a shutdown request.
@@ -184,11 +180,6 @@ const (
 	OpenExec = "exec"
 	// OpenAttach joins an existing session (Session empty = primary).
 	OpenAttach = "attach"
-	// OpenDial connects to Host:Port from inside the guest; afterwards
-	// TStdin/TStdout carry the TCP stream and TStdinEOF half-closes.
-	OpenDial = "dial"
-	// OpenList returns the session list in Opened.Sessions and closes.
-	OpenList = "list"
 )
 
 // PrimarySession is the ID of the claim's primary command session.
@@ -204,8 +195,6 @@ type Open struct {
 	TTY        bool     `json:"tty,omitempty"`
 	Rows       uint16   `json:"rows,omitempty"`
 	Cols       uint16   `json:"cols,omitempty"`
-	Host       string   `json:"host,omitempty"`
-	Port       int      `json:"port,omitempty"`
 	// OpenID identifies one logical exec/attach attempt. A client that
 	// retries after a transport failure reuses it so the guest can attach to
 	// a session it may already have started instead of running the command
@@ -214,18 +203,9 @@ type Open struct {
 }
 
 type Opened struct {
-	Session  string        `json:"session,omitempty"`
-	TTY      bool          `json:"tty,omitempty"`
-	Error    string        `json:"error,omitempty"`
-	Sessions []SessionInfo `json:"sessions,omitempty"`
-}
-
-type SessionInfo struct {
-	ID      string   `json:"id"`
-	Argv    []string `json:"argv"`
-	TTY     bool     `json:"tty"`
-	Clients int      `json:"clients"`
-	Exited  bool     `json:"exited"`
+	Session string `json:"session,omitempty"`
+	TTY     bool   `json:"tty,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 type Resize struct {

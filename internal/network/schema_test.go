@@ -108,7 +108,7 @@ func TestNetworkAdmissionAndLiveUpdates(t *testing.T) {
 			}
 			cel := celvalidation.NewValidator(structural, true, celconfig.PerCallLimit)
 			object := func(network string) map[string]interface{} {
-				base := `{"spec":{"state":"root","pool":"default"}}`
+				base := `{"spec":{"state":"root","pool":"default","command":["true"]}}`
 				if name == "blippools" {
 					base = `{"spec":{"nodeSelector":{"role":"worker"}}}`
 				}

@@ -228,8 +228,6 @@ func (r *BlipReconciler) cleanup(ctx context.Context, b *v1.Blip) error {
 	return nil
 }
 
-func interactive(b *v1.Blip) bool { return len(b.Spec.Command) == 0 }
-
 func stopping(b *v1.Blip) bool { return b.Spec.Stop || b.DeletionTimestamp != nil }
 
 func wait(b *v1.Blip, reason, msg string) {
@@ -285,11 +283,7 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		return finish(v1.BlipFailed, reason, msg)
 	}
 	if stopping(b) {
-		phase := v1.BlipFailed
-		if interactive(b) {
-			phase = v1.BlipSucceeded
-		}
-		return finish(phase, ReasonStopped, "stopped before start")
+		return finish(v1.BlipFailed, ReasonStopped, "stopped before start")
 	}
 	if b.Spec.State == "" {
 		return fail(ReasonInvalidSpec, "state is required")
@@ -713,7 +707,7 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 		}
 		if r.now().Sub(b.Status.StartTime.Time) > startTimeout {
 			reason = ReasonStartTimeout
-			msg = "timed out starting sandbox"
+			msg = "timed out starting the VM"
 			if prepareErr != "" {
 				reason = ReasonPrepareFailed
 				msg += ": " + prepareErr
@@ -749,7 +743,7 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Res
 		r.now().Sub(b.Status.StartTime.Time) > startTimeout {
 		// A VM that never reported an observation has no state to save, so
 		// stopping or deleting it must not wait for one either.
-		r.finish(b, v1.BlipFailed, ReasonStartTimeout, "timed out starting sandbox: the VM never reported its state")
+		r.finish(b, v1.BlipFailed, ReasonStartTimeout, "timed out starting the VM: the VM never reported its state")
 		return reconcile.Result{}, nil
 	}
 	if err := r.ensureWriterPods(ctx, b); err != nil {

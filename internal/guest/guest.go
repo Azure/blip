@@ -52,20 +52,19 @@ type Guest struct {
 	startProcess func(procSpec, []string) (*proc, []string, error)
 	filesystem   *filesystemEffects
 
-	mu         sync.Mutex
-	ctl        *controlConn
-	ctlFile    io.ReadWriteCloser
-	ctlGone    chan struct{} // closed when ctl disconnects
-	claim      *wire.Claim
-	rootDev    string
-	mounts     map[string]*mount // auxiliary mounts by ID
-	sessions   map[string]*session
-	openIDs    map[string]*openRecord // exec opens by client OpenID
-	openOrder  []string               // completed OpenIDs, oldest first
-	clients    int
-	lastActive time.Time // last client attach or session start; resets idle
-	exit       *wire.Exit
-	stopping   bool
+	mu        sync.Mutex
+	ctl       *controlConn
+	ctlFile   io.ReadWriteCloser
+	ctlGone   chan struct{} // closed when ctl disconnects
+	claim     *wire.Claim
+	rootDev   string
+	mounts    map[string]*mount // auxiliary mounts by ID
+	sessions  map[string]*session
+	openIDs   map[string]*openRecord // exec opens by client OpenID
+	openOrder []string               // completed OpenIDs, oldest first
+	clients   int
+	exit      *wire.Exit
+	stopping  bool
 
 	// fmu guards frozen. It is taken after mu, never before, and nothing
 	// that can block on a frozen filesystem runs under it, so the
@@ -147,7 +146,6 @@ func Main() {
 		powerOff()
 	}
 	go g.accept(sess, g.serveSession)
-	go g.idleLoop()
 	log.Printf("ready")
 	g.accept(ctl, g.serveControl)
 	powerOff()
@@ -293,25 +291,9 @@ func (g *Guest) send(t wire.Type, v any) {
 func (g *Guest) addClients(n int) {
 	g.mu.Lock()
 	g.clients += n
-	g.lastActive = time.Now()
 	st := wire.Status{Sessions: g.clients}
 	g.mu.Unlock()
 	g.send(wire.TStatus, st)
-}
-
-func (g *Guest) sessionList() []wire.SessionInfo {
-	g.mu.Lock()
-	ss := make([]*session, 0, len(g.sessions))
-	for _, s := range g.sessions {
-		ss = append(ss, s)
-	}
-	g.mu.Unlock()
-	out := make([]wire.SessionInfo, 0, len(ss))
-	for _, s := range ss {
-		out = append(out, s.info())
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
 }
 
 func (g *Guest) doClaim(m wire.Claim) error {
@@ -460,7 +442,7 @@ func (g *Guest) startPrimary() {
 	claim := g.claim
 	_, started := g.sessions[wire.PrimarySession]
 	g.mu.Unlock()
-	if claim == nil || len(claim.Command) == 0 || started {
+	if claim == nil || started {
 		return
 	}
 	spec := procSpec{argv: claim.Command, dir: claim.WorkingDir, user: claim.User, tty: claim.TTY}
@@ -484,7 +466,7 @@ func (g *Guest) failPrimary(err error) {
 	claim := g.claim
 	_, started := g.sessions[wire.PrimarySession]
 	g.mu.Unlock()
-	if claim == nil || len(claim.Command) == 0 || started {
+	if claim == nil || started {
 		log.Printf("claim: %v", err)
 		return
 	}
@@ -497,7 +479,6 @@ func (g *Guest) sessionExited(s *session) {
 		return
 	}
 	g.mu.Lock()
-	g.lastActive = time.Now()
 	if g.stopping || g.exit != nil {
 		g.mu.Unlock()
 		return
@@ -527,43 +508,9 @@ func (g *Guest) sessionExited(s *session) {
 			// hold the VM open.
 			s.waitDelivered(exitAttachTimeout, exitDeliveryTimeout)
 		}
-		// No client is attached and none is expected: shut down now instead
-		// of paying the old fixed 30s linger (detached runs and blip wait).
+		// No client is attached and none is expected: shut down now.
 		g.shutdown()
 	}()
-}
-
-// idleLoop ends an interactive blip when nothing is attached and the work
-// cgroup is empty for the claim's idle timeout.
-func (g *Guest) idleLoop() {
-	for range time.Tick(time.Second) {
-		g.mu.Lock()
-		c := g.claim
-		idle := c != nil && len(c.Command) == 0 && c.IdleTimeoutSeconds > 0 &&
-			g.clients == 0 && !g.stopping && g.exit == nil && cgroupEmpty(g.cgroup)
-		now := time.Now()
-		if !idle {
-			// Also refresh while busy: a command that starts and ends
-			// between ticks still resets the idle clock.
-			g.lastActive = now
-			g.mu.Unlock()
-			continue
-		}
-		if g.lastActive.IsZero() {
-			g.lastActive = now
-		}
-		if now.Sub(g.lastActive) < time.Duration(c.IdleTimeoutSeconds)*time.Second {
-			g.mu.Unlock()
-			continue
-		}
-		g.exit = &wire.Exit{Reason: wire.ReasonIdle}
-		ex := *g.exit
-		g.mu.Unlock()
-		log.Printf("idle for %ds; shutting down", c.IdleTimeoutSeconds)
-		g.send(wire.TExit, ex)
-		g.shutdown()
-		return
-	}
 }
 
 func cgroupEmpty(cg string) bool {

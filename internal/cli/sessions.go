@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -75,9 +74,9 @@ func (a *app) open(ctx context.Context, pod string, o wire.Open) (*session.Sessi
 	return c.Sessions.Open(ctx, c.Namespace, pod, o)
 }
 
-// Attach and list opens are idempotent, so a VM that is still starting or
-// already shutting down can be retried. Exec must never use these: without a
-// stable OpenID a retry could start the command twice.
+// Attach opens are idempotent, so a VM that is still starting or already
+// shutting down can be retried. Exec must never use these: without a stable
+// OpenID a retry could start the command twice.
 var (
 	openRetryWindow = 10 * time.Second
 	openRetryFirst  = 50 * time.Millisecond
@@ -118,10 +117,10 @@ func openRetryable(err error, retryNoSession bool) bool {
 }
 
 // openRetrying opens a session, retrying transient startup/teardown failures
-// for a bounded time. Only attach and list opens may use it. With
-// retryNoSession it also covers the gap between a blip reporting Running and
-// its command session registering; a session that never appears still ends
-// with the guest's "no session" error.
+// for a bounded time. Only attach opens may use it. With retryNoSession it
+// also covers the gap between a blip reporting Running and its command session
+// registering; a session that never appears still ends with the guest's
+// "no session" error.
 func (a *app) openRetrying(ctx context.Context, name, pod string, o wire.Open, retryNoSession bool) (*session.Session, error) {
 	deadline := time.Now().Add(openRetryWindow)
 	delay := openRetryFirst
@@ -222,69 +221,4 @@ open a login shell, with a terminal when the local side has one.`,
 	}
 	f.add(cmd)
 	return cmd
-}
-
-func (a *app) attachCommand() *cobra.Command {
-	var id string
-	cmd := &cobra.Command{
-		Use:   "attach NAME",
-		Short: "Join a session (default: the main command); Ctrl-] detaches",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := a.scope(&args[0]); err != nil {
-				return err
-			}
-			pod, err := a.runningPod(cmd.Context(), args[0])
-			if err != nil {
-				return err
-			}
-			s, err := a.openRetrying(cmd.Context(), args[0], pod, wire.Open{Mode: wire.OpenAttach, Session: id}, id == "" || id == wire.PrimarySession)
-			if err != nil {
-				return err
-			}
-			return a.stream(cmd.Context(), s, streamOpts{blip: args[0]})
-		},
-	}
-	cmd.Flags().StringVar(&id, "session", "", "session ID (default main)")
-	return cmd
-}
-
-func (a *app) sessionsCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "sessions NAME",
-		Short: "List the sessions of a running blip",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := a.scope(&args[0]); err != nil {
-				return err
-			}
-			pod, err := a.runningPod(cmd.Context(), args[0])
-			if err != nil {
-				return err
-			}
-			s, err := a.openRetrying(cmd.Context(), args[0], pod, wire.Open{Mode: wire.OpenList}, false)
-			if err != nil {
-				if strings.Contains(err.Error(), "exit code 137") {
-					return fmt.Errorf("blip %q is stopping (the VM is shutting down): %w", a.short(args[0]), err)
-				}
-				return err
-			}
-			list := s.Opened.Sessions
-			s.Close()
-			w := tabwriter.NewWriter(a.env.Out, 0, 4, 3, ' ', 0)
-			fmt.Fprintln(w, "ID\tSTATUS\tTTY\tCLIENTS\tCOMMAND")
-			for _, s := range list {
-				status := "Running"
-				if s.Exited {
-					status = "Exited"
-				}
-				argv := strings.Join(s.Argv, " ")
-				if argv == "" {
-					argv = "(login shell)"
-				}
-				fmt.Fprintf(w, "%s\t%s\t%t\t%d\t%s\n", s.ID, status, s.TTY, s.Clients, argv)
-			}
-			return w.Flush()
-		},
-	}
 }

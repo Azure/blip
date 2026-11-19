@@ -19,6 +19,7 @@ func TestRunForkOutsideGuestSnapshotsWorkspace(t *testing.T) {
 	base.Spec.Runtime = &v1alpha1.RuntimeDefaults{User: "dev", WorkingDir: "/work", Env: []v1alpha1.EnvVar{{Name: "A", Value: "base"}}}
 	base.Spec.Mounts = []v1alpha1.Mount{{State: "repo", Path: "/work", Writable: true}, {State: "tools", Path: "/tools"}, {State: "temporary", Path: "/tmp/collect", BlipUID: "previous"}}
 	h := newHarness(t, base, readyState("repo"), readyState("tools"))
+	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
 	var creates []string
 	h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 		if b, ok := obj.(*v1alpha1.Blip); ok {
@@ -32,7 +33,7 @@ func TestRunForkOutsideGuestSnapshotsWorkspace(t *testing.T) {
 		}
 		return c.Create(ctx, obj, opts...)
 	}})
-	code, _, errOut := h.run("", "run", "worker", "--fork", "base", "--env", "A=execution", "--user", "root", "--workdir", "/override", "-d")
+	code, _, errOut := h.run("", "run", "worker", "--fork", "base", "--env", "A=execution", "--user", "root", "--workdir", "/override", "--", "true")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
@@ -61,7 +62,7 @@ func TestRunImportedBaseRequiresFork(t *testing.T) {
 	base := readyState("base")
 	base.Spec.Image = "registry/base:v1"
 	h := newHarness(t, base)
-	code, _, errOut := h.run("", "run", "worker", "--state", "base", "-d")
+	code, _, errOut := h.run("", "run", "worker", "--state", "base", "--", "true")
 	if code != 1 || !strings.Contains(errOut, "use --fork base") {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
@@ -79,7 +80,7 @@ func TestRunForkKeepsWorkspaceOnExecutionCreateFailure(t *testing.T) {
 		}
 		return c.Create(ctx, obj, opts...)
 	}})
-	code, _, errOut := h.run("", "run", "worker", "--fork", "base", "-d")
+	code, _, errOut := h.run("", "run", "worker", "--fork", "base", "--", "true")
 	if code != 1 || !strings.Contains(errOut, "execution denied") {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
@@ -101,7 +102,8 @@ func TestOwnedForkSourceResolution(t *testing.T) {
 			}
 			h := newHarness(t, objects...)
 			h.self = "alice.box"
-			code, _, errOut := h.run("", "run", "worker", "--fork", "base", "-d")
+			h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
+			code, _, errOut := h.run("", "run", "worker", "--fork", "base", "--", "true")
 			if code != 0 {
 				t.Fatalf("code %d: %s", code, errOut)
 			}

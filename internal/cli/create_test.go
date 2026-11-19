@@ -26,7 +26,7 @@ func TestCreateStateDetached(t *testing.T) {
 
 func TestCreateStateSettings(t *testing.T) {
 	h := newHarness(t, readyState("repo"), readyState("ref"))
-	code, out, errOut := h.run("", "create", "blipstate", "dev", "--size", "20Gi", "--mount", "repo:/work:rw", "--mount", "ref:/ref", "--env", "EDITOR=vim", "--workdir", "/work", "--user", "dev", "--idle-timeout", "10m", "-d")
+	code, out, errOut := h.run("", "create", "blipstate", "dev", "--size", "20Gi", "--mount", "repo:/work:rw", "--mount", "ref:/ref", "--env", "EDITOR=vim", "--workdir", "/work", "--user", "dev", "-d")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
@@ -35,7 +35,7 @@ func TestCreateStateSettings(t *testing.T) {
 	if s.Spec.Image != "" || s.Spec.Size == nil || s.Spec.Size.String() != "20Gi" || s.Spec.Replicas != 0 {
 		t.Fatalf("unexpected spec %+v", s.Spec)
 	}
-	if rt := s.Spec.Runtime; rt == nil || rt.User != "dev" || rt.WorkingDir != "/work" || len(rt.Env) != 1 || rt.Env[0].Value != "vim" || rt.IdleTimeout == nil || rt.IdleTimeout.Duration.String() != "10m0s" {
+	if rt := s.Spec.Runtime; rt == nil || rt.User != "dev" || rt.WorkingDir != "/work" || len(rt.Env) != 1 || rt.Env[0].Value != "vim" {
 		t.Fatalf("runtime %+v", rt)
 	}
 	if mounts := s.Spec.Mounts; len(mounts) != 2 || mounts[0].State != "repo" || !mounts[0].Writable || mounts[1].State != "ref" || mounts[1].Writable {
@@ -232,7 +232,6 @@ func TestCreateStateRejectsBadFlags(t *testing.T) {
 		{"two self mounts", []string{"create", "state", "x", "--mount", "/a", "--mount", "/b"}, "only once"},
 		{"detach with self mount", []string{"create", "state", "x", "-d", "--mount", "/a"}, "cannot be combined"},
 		{"self mount outside blip", []string{"create", "state", "x", "--mount", "/a"}, "not running inside one"},
-		{"negative idle", []string{"create", "state", "x", "--idle-timeout=-1s"}, "must not be negative"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			code, _, errOut := h.run("", tc.args...)

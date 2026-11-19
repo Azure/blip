@@ -6,9 +6,9 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -33,6 +33,8 @@ type crdSchema struct {
 	Type         string               `json:"type"`
 	Pattern      string               `json:"pattern"`
 	MaxLength    int64                `json:"maxLength"`
+	MinItems     int64                `json:"minItems"`
+	Required     []string             `json:"required"`
 	Properties   map[string]crdSchema `json:"properties"`
 	Items        *crdSchema           `json:"items"`
 	XValidations []crdValidation      `json:"x-kubernetes-validations"`
@@ -87,41 +89,31 @@ func ruleFor(t *testing.T, rules []crdValidation, message string) string {
 	return ""
 }
 
-// TestIdleTimeoutCRDPattern guards the admission pattern for
-// Blip.spec.idleTimeout. Without it, values that cannot be decoded into a
-// metav1.Duration are admitted and break the controller's shared Blip
-// informer cluster-wide.
-func TestIdleTimeoutCRDPattern(t *testing.T) {
+// TestBlipCommandRequired guards that every Blip runs exactly one non-empty
+// command: the CRD requires spec.command and rejects an empty list.
+func TestBlipCommandRequired(t *testing.T) {
 	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blips.yaml")
-	idleTimeout, ok := spec.Properties["idleTimeout"]
+	if !slices.Contains(spec.Required, "command") {
+		t.Error("Blip schema does not require spec.command")
+	}
+	command, ok := spec.Properties["command"]
 	if !ok {
-		t.Fatal("generated CRD has no spec.idleTimeout property")
+		t.Fatal("generated CRD has no spec.command property")
 	}
-	pattern := idleTimeout.Pattern
-	if pattern == "" {
-		t.Fatal("generated CRD has no spec.idleTimeout.pattern; malformed durations would be admitted")
+	if command.MinItems != 1 {
+		t.Errorf("spec.command minItems %d, want 1", command.MinItems)
 	}
-
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		t.Fatalf("compile spec.idleTimeout.pattern %q: %v", pattern, err)
-	}
-
-	accept := []string{"30s", "1m30s", "0s", "1.5s", "500ms", "1us"}
-	for _, value := range accept {
-		if !re.MatchString(value) {
-			t.Errorf("pattern %q rejects valid duration %q", pattern, value)
-		}
-		if _, err := time.ParseDuration(value); err != nil {
-			t.Errorf("test case %q is not a valid Go duration: %v", value, err)
+	validate := admissionValidator(t, "blips")
+	for _, object := range []string{
+		`{"spec":{"state":"root"}}`,
+		`{"spec":{"state":"root","command":[]}}`,
+	} {
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted blip without a command: %s", object)
 		}
 	}
-
-	reject := []string{"bogus", "-5s", "1d", ""}
-	for _, value := range reject {
-		if re.MatchString(value) {
-			t.Errorf("pattern %q accepts invalid duration %q", pattern, value)
-		}
+	if errs := validate(`{"spec":{"state":"root","command":["true"]}}`, ""); len(errs) != 0 {
+		t.Fatal(errs.ToAggregate())
 	}
 }
 
@@ -140,11 +132,11 @@ func TestBlipRootRequired(t *testing.T) {
 			t.Errorf("admitted execution without a root: %s", object)
 		}
 	}
-	root := `{"spec":{"state":"root"}}`
+	root := `{"spec":{"state":"root","command":["true"]}}`
 	if errs := validate(root, ""); len(errs) != 0 {
 		t.Fatal(errs.ToAggregate())
 	}
-	if errs := validate(`{"spec":{"state":"other"}}`, root); len(errs) == 0 {
+	if errs := validate(`{"spec":{"state":"other","command":["true"]}}`, root); len(errs) == 0 {
 		t.Fatal("admitted root replacement")
 	}
 }
@@ -408,8 +400,8 @@ func TestStateProvisioningImmutableAndRuntimeMutable(t *testing.T) {
 	}
 	objects := []string{
 		`{"spec":{"copyFrom":"source"}}`,
-		`{"spec":{"copyFrom":"source","mounts":[{"state":"data","path":"/data","blipUID":"execution-uid"}],"runtime":{"env":[{"name":"A","value":"1"}],"workingDir":"/work","user":"1000","idleTimeout":"1m","network":{}}}}`,
-		`{"spec":{"copyFrom":"source","mounts":[{"state":"data","path":"/updated","writable":true}],"runtime":{"env":[{"name":"A","value":"2"}],"workingDir":"/next","user":"1001","idleTimeout":"0s","network":{"egress":[{}]}}}}`,
+		`{"spec":{"copyFrom":"source","mounts":[{"state":"data","path":"/data","blipUID":"execution-uid"}],"runtime":{"env":[{"name":"A","value":"1"}],"workingDir":"/work","user":"1000","network":{}}}}`,
+		`{"spec":{"copyFrom":"source","mounts":[{"state":"data","path":"/updated","writable":true}],"runtime":{"env":[{"name":"A","value":"2"}],"workingDir":"/next","user":"1001","network":{"egress":[{}]}}}}`,
 	}
 	for _, before := range objects {
 		for _, after := range objects {
@@ -417,9 +409,6 @@ func TestStateProvisioningImmutableAndRuntimeMutable(t *testing.T) {
 				t.Errorf("runtime/mount update rejected: %v", errs.ToAggregate())
 			}
 		}
-	}
-	if errs := validate(`{"spec":{"runtime":{"idleTimeout":"bogus"}}}`, ""); len(errs) == 0 {
-		t.Fatal("admitted malformed runtime idle timeout")
 	}
 }
 

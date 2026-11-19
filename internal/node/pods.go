@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"path"
 	"slices"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -14,8 +13,6 @@ import (
 	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/storage"
 )
-
-const defaultIdleTimeoutSeconds = 30
 
 func planPods(v *view, p *plan) {
 	for _, key := range sortedKeys(v.pods) {
@@ -234,7 +231,6 @@ func claimFor(b *v1alpha1.Blip, root podapi.Disk, cfg *image.Config, defaults *v
 		c.WorkingDir = cfg.WorkingDir
 		c.User = cfg.User
 	}
-	idleTimeout := b.Spec.IdleTimeout
 	if defaults != nil {
 		for _, e := range defaults.Env {
 			c.Env = append(c.Env, e.Name+"="+e.Value)
@@ -244,9 +240,6 @@ func claimFor(b *v1alpha1.Blip, root podapi.Disk, cfg *image.Config, defaults *v
 		}
 		if defaults.User != "" {
 			c.User = defaults.User
-		}
-		if idleTimeout == nil {
-			idleTimeout = defaults.IdleTimeout
 		}
 	}
 	if b.Spec.WorkingDir != "" {
@@ -258,24 +251,7 @@ func claimFor(b *v1alpha1.Blip, root podapi.Disk, cfg *image.Config, defaults *v
 	for _, e := range b.Spec.Env {
 		c.Env = append(c.Env, e.Name+"="+e.Value)
 	}
-	if len(c.Command) == 0 {
-		c.IdleTimeoutSeconds = defaultIdleTimeoutSeconds
-		if idleTimeout != nil {
-			c.IdleTimeoutSeconds = idleTimeoutSeconds(idleTimeout.Duration)
-		}
-	}
 	return c
-}
-
-// idleTimeoutSeconds converts an idle timeout into whole seconds for the
-// guest. An explicit zero keeps its meaning of disabling idle shutdown, but a
-// positive sub-second value rounds up instead of truncating to zero, which
-// the guest would treat as disabled.
-func idleTimeoutSeconds(d time.Duration) int64 {
-	if d <= 0 {
-		return 0
-	}
-	return int64((d + time.Second - 1) / time.Second)
 }
 
 // attach describes a working volume a pod needs.

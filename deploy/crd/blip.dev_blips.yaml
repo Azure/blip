@@ -56,20 +56,16 @@ spec:
             type: object
           spec:
             description: |-
-              BlipSpec is one VM lifetime: either one command, or an interactive
-              sandbox that lives while sessions or processes are active.
+              BlipSpec is one VM lifetime: one command that runs as the primary session.
+              The blip ends when the command exits.
             properties:
               command:
-                description: |-
-                  Command runs as the primary session. The blip ends when it exits.
-                  Without a command the blip is an interactive sandbox that stops after
-                  IdleTimeout without sessions or running processes.
+                description: Command runs as the primary session. The blip ends when
+                  it exits.
                 items:
                   type: string
+                minItems: 1
                 type: array
-                x-kubernetes-validations:
-                - message: command is immutable
-                  rule: self == oldSelf
               env:
                 items:
                   properties:
@@ -81,10 +77,6 @@ spec:
                   - name
                   type: object
                 type: array
-              idleTimeout:
-                description: IdleTimeout applies to interactive blips. Default 30s.
-                pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
-                type: string
               network:
                 description: |-
                   Network narrows the pool's egress policy. Omitted inherits the root
@@ -367,11 +359,12 @@ spec:
                 - message: workingDir is immutable
                   rule: self == oldSelf
             required:
+            - command
             - state
             type: object
             x-kubernetes-validations:
             - message: command is immutable
-              rule: has(self.command) == has(oldSelf.command)
+              rule: self.command == oldSelf.command
             - message: env is immutable
               rule: (has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env
                 == oldSelf.env)
@@ -381,10 +374,8 @@ spec:
             - message: user is immutable
               rule: (has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user
                 == oldSelf.user)
-            - message: tty and idleTimeout are immutable
+            - message: tty is immutable
               rule: (has(self.tty) && self.tty) == (has(oldSelf.tty) && oldSelf.tty)
-                && (has(self.idleTimeout) == has(oldSelf.idleTimeout)) && (!has(self.idleTimeout)
-                || self.idleTimeout == oldSelf.idleTimeout)
           status:
             properties:
               exitCode:

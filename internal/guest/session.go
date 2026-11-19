@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"net"
 	"os"
 	"strconv"
 	"sync"
@@ -57,7 +56,7 @@ type session struct {
 }
 
 // maxPendingInput bounds stdin queued for a process that is not reading it.
-// The SSH channel window is smaller, so this leaves room for a control frame
+// A client write burst is smaller, so this leaves room for a control frame
 // (resize or signal) behind a burst of input without buffering without limit.
 const maxPendingInput = 8 << 20
 
@@ -138,7 +137,6 @@ func (g *Guest) startSessionOpen(id, openID string, s procSpec, base []string, h
 	}
 	g.mu.Lock()
 	g.sessions[id] = ss
-	g.lastActive = time.Now()
 	g.mu.Unlock()
 	go ss.pumpInput()
 	var pumps sync.WaitGroup
@@ -436,15 +434,15 @@ func (s *session) endInput() {
 //
 // A terminal session's input is best-effort: if the process stops reading,
 // maxPendingInput is queued and further stdin is dropped rather than closing
-// the client. An SSH client may keep writing (for example a redirected
+// the client. A terminal client may keep writing (for example a redirected
 // /dev/zero) while the user presses Ctrl-C, and the signal has to reach the
-// process instead of failing on a dead session. An interactive client never
-// sends megabytes without the process reading them.
+// process instead of failing on a dead session. A person typing never sends
+// megabytes without the process reading them.
 //
-// A non-terminal session is a byte stream, not a person typing: sftp, scp and
-// git upload data through it. Dropping a frame would corrupt the stream, so
-// wait for the input pump to make space instead. The wait propagates through
-// the client's SSH window as normal backpressure. If the full queue makes no
+// A non-terminal session is a byte stream, not a person typing: commands
+// upload data through it. Dropping a frame would corrupt the stream, so wait
+// for the input pump to make space instead. The wait propagates through the
+// client's transport as normal backpressure. If the full queue makes no
 // progress for inputStallTimeout, the process is not reading: further input
 // is dropped (with one throttled notice) so the frame loop can still deliver
 // SIGINT/SIGTERM instead of hanging behind the unread bytes.
@@ -624,10 +622,19 @@ func (s *session) waitDelivered(unattached, attached time.Duration) {
 	}
 }
 
-func (s *session) info() wire.SessionInfo {
+// sessionInfo is a consistent snapshot of a session for tests and diagnostics.
+type sessionInfo struct {
+	ID      string
+	Argv    []string
+	TTY     bool
+	Clients int
+	Exited  bool
+}
+
+func (s *session) info() sessionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return wire.SessionInfo{ID: s.id, Argv: s.argv, TTY: s.tty, Clients: s.clients, Exited: s.exited}
+	return sessionInfo{ID: s.id, Argv: s.argv, TTY: s.tty, Clients: s.clients, Exited: s.exited}
 }
 
 // serve attaches a client until it disconnects or the session ends.
@@ -793,9 +800,6 @@ func (g *Guest) serveSession(f io.ReadWriteCloser) {
 		return
 	}
 	switch o.Mode {
-	case wire.OpenList:
-		_ = c.WriteJSON(wire.TOpened, wire.Opened{Sessions: g.sessionList()})
-		f.Close()
 	case wire.OpenAttach:
 		id := o.Session
 		if id == "" {
@@ -828,8 +832,6 @@ func (g *Guest) serveSession(f io.ReadWriteCloser) {
 			return
 		}
 		s.serve(c, f)
-	case wire.OpenDial:
-		g.dial(c, f, o)
 	default:
 		reject(c, f, errors.New("unknown mode "+strconv.Quote(o.Mode)))
 	}
@@ -853,59 +855,6 @@ func execProcSpec(claim *wire.Claim, o wire.Open) procSpec {
 func reject(c *wire.Conn, f io.Closer, err error) {
 	_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error()})
 	f.Close()
-}
-
-// dial relays a TCP connection opened from inside the guest. When the remote
-// side closes, the guest sends Exited and closes the stream.
-func (g *Guest) dial(c *wire.Conn, f io.ReadWriteCloser, o wire.Open) {
-	g.mu.Lock()
-	stopping := g.stopping
-	g.mu.Unlock()
-	if stopping {
-		reject(c, f, errors.New("blip is stopping"))
-		return
-	}
-	tc, err := net.DialTimeout("tcp", net.JoinHostPort(o.Host, strconv.Itoa(o.Port)), 10*time.Second)
-	if err != nil {
-		reject(c, f, err)
-		return
-	}
-	defer tc.Close()
-	defer f.Close()
-	if c.WriteJSON(wire.TOpened, wire.Opened{}) != nil {
-		return
-	}
-	g.addClients(1)
-	defer g.addClients(-1)
-	go func() {
-		defer tc.Close()
-		defer f.Close()
-		buf := make([]byte, 32<<10)
-		for {
-			n, err := tc.Read(buf)
-			if n > 0 && c.Write(wire.TStdout, buf[:n]) != nil {
-				return
-			}
-			if err != nil {
-				_ = c.WriteJSON(wire.TExited, wire.Exit{})
-				return
-			}
-		}
-	}()
-	for {
-		t, payload, err := c.Read()
-		if err != nil {
-			return
-		}
-		switch t {
-		case wire.TStdin:
-			if _, err := tc.Write(payload); err != nil {
-				return
-			}
-		case wire.TStdinEOF:
-			_ = tc.(*net.TCPConn).CloseWrite()
-		}
-	}
 }
 
 func (s *session) tail(max int) string {

@@ -20,8 +20,8 @@ var ErrUnreachable = errors.New("the VM is not reachable; it may have stopped or
 
 // Connector opens a byte stream to the guest session port of a VM pod. The
 // stream lives until it is closed or ctx is done. Callers that must still
-// signal a guest after their own request is gone (the SSH gateway's hangup
-// path) have to pass a context that outlives that request.
+// signal a guest after their own request is gone have to pass a context that
+// outlives that request.
 type Connector func(ctx context.Context, namespace, pod string) (io.ReadWriteCloser, error)
 
 // Client opens guest sessions.
@@ -73,15 +73,6 @@ func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (
 	return s, nil
 }
 
-// Dial connects to host:port from inside the guest.
-func (c *Client) Dial(ctx context.Context, namespace, pod, host string, port int) (*Stream, error) {
-	s, err := c.Open(ctx, namespace, pod, wire.Open{Mode: wire.OpenDial, Host: host, Port: port})
-	if err != nil {
-		return nil, err
-	}
-	return &Stream{s: s}, nil
-}
-
 // Session is one open guest session. Send methods are safe for concurrent
 // use; Recv and Copy must be called from one goroutine.
 type Session struct {
@@ -127,7 +118,7 @@ func (s *Session) Signal(name string) error {
 	return s.conn.WriteJSON(wire.TSignal, wire.Signal{Name: name})
 }
 
-// Close disconnects. The guest keeps the session running (detach).
+// Close disconnects. The guest keeps the session running.
 func (s *Session) Close() error {
 	var err error
 	s.once.Do(func() { err = s.rwc.Close() })
@@ -192,41 +183,3 @@ func (s *Session) Copy(stdout, stderr io.Writer, notice func(string)) (*wire.Exi
 		}
 	}
 }
-
-// Stream is a TCP connection dialed inside the guest.
-type Stream struct {
-	s   *Session
-	buf []byte
-	eof bool
-}
-
-func (st *Stream) Read(p []byte) (int, error) {
-	for len(st.buf) == 0 {
-		if st.eof {
-			return 0, io.EOF
-		}
-		f, err := st.s.Recv()
-		if err != nil {
-			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return 0, io.EOF
-			}
-			return 0, err
-		}
-		switch f.Type {
-		case wire.TStdout:
-			st.buf = f.Data
-		case wire.TExited:
-			st.eof = true
-		}
-	}
-	n := copy(p, st.buf)
-	st.buf = st.buf[n:]
-	return n, nil
-}
-
-func (st *Stream) Write(p []byte) (int, error) { return st.s.Write(p) }
-
-// CloseWrite half-closes the connection.
-func (st *Stream) CloseWrite() error { return st.s.CloseStdin() }
-
-func (st *Stream) Close() error { return st.s.Close() }

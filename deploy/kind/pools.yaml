@@ -41,36 +41,3 @@ spec:
   #   caConfigMap: gateway-ca
   #   audience: blip-gateway
   #   loopbackPort: 8002
----
-apiVersion: blip.dev/v1alpha1
-kind: BlipPool
-metadata:
-  name: default
-  namespace: blip-ssh
-spec:
-  serviceAccountName: blip-sandbox
-  network:
-    egress:
-      - to:
-          - namespaceSelector:
-              matchLabels:
-                kubernetes.io/metadata.name: kube-system
-            serviceSelector:
-              matchLabels:
-                k8s-app: kube-dns
-        ports:
-          - protocol: UDP
-            port: 53
-          - protocol: TCP
-            port: 53
-      - to:
-          - ipBlock:
-              cidr: 0.0.0.0/0
-        ports:
-          - protocol: TCP
-            port: 443
-  cpus: 1
-  memory: 1Gi
-  warmCount: 2
-  nodeSelector:
-    blip.dev/node-pool: default

@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -18,11 +16,6 @@ import (
 	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/wire"
 )
-
-const detachKey = 0x1d // Ctrl-]
-
-// errDetached means the user detached; the command succeeds.
-var errDetached = errors.New("detached")
 
 // terminal returns stdin as a terminal file, or nil.
 func (a *app) terminal() *os.File {
@@ -60,8 +53,8 @@ type streamOpts struct {
 	sendEOF bool
 }
 
-// stream connects the local terminal or stdio to s until the session exits
-// or the user detaches. It returns an ExitError for nonzero exits.
+// stream connects the local terminal or stdio to s until the session exits.
+// It returns an ExitError for nonzero exits.
 func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) error {
 	defer s.Close()
 	ctx, cancel := context.WithCancel(ctx)
@@ -83,22 +76,12 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 		go forwardSignals(ctx, s)
 	}
 
-	var detached atomic.Bool
 	go func() {
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := a.env.In.Read(buf)
-			p := buf[:n]
-			if tty && f != nil {
-				if i := bytes.IndexByte(p, detachKey); i >= 0 {
-					s.Write(p[:i])
-					detached.Store(true)
-					s.Close()
-					return
-				}
-			}
-			if len(p) > 0 {
-				if _, err := s.Write(p); err != nil {
+			if n > 0 {
+				if _, werr := s.Write(buf[:n]); werr != nil {
 					return
 				}
 			}
@@ -112,10 +95,6 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 	}()
 
 	exit, err := s.Copy(a.env.Out, a.env.Err, func(m string) { a.progress("blip: %s", m) })
-	if detached.Load() {
-		a.progress("\r\ndetached from session %s (reattach: kubectl blip attach %s --session %s)\r", s.Opened.Session, opts.blip, s.Opened.Session)
-		return errDetached
-	}
 	if err != nil {
 		return fmt.Errorf("session %s: %w", s.Opened.Session, err)
 	}

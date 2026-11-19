@@ -3,8 +3,8 @@
 > NOTE: this project is in active development, not ready for serious use
 
 Blip runs workloads in VMs backed by durable **BlipStates**. A **Blip** is one
-execution; deleting it saves and releases its writable filesystems. States remain
-until you explicitly delete them.
+execution of one required command; deleting it saves and releases its writable
+filesystems. States remain until you explicitly delete them.
 
 ## Pull, fork, and reuse
 
@@ -54,7 +54,6 @@ spec:
         value: demo
     workingDir: /work
     user: "0:0"
-    idleTimeout: 10m
     network: {} # Deny outbound traffic; omit to inherit the pool policy.
 ```
 
@@ -77,13 +76,14 @@ Pod as node-local, replicated, encrypted block storage.
 ### API (`blip.dev/v1alpha1`)
 
 - **`BlipPool`** — VM shape (CPUs, memory), `warmCount`/`maxCount`, node selector,
-  service account, egress policy, and optional gateway sidecar.
+  service account, egress policy, and an optional fixed-upstream HTTPS gateway
+  proxy sidecar. This gateway is a network proxy, not a login service.
 - **`BlipState`** — one durable ext4 filesystem. Provisioning is immutable:
   `image` (OCI image converted to ext4), `copyFrom`, `size`, `replicas` (default
   3), `nodeSelector`. `mounts` and `runtime` persist across executions.
   Image states are read-only templates held by every eligible node.
-- **`Blip`** — one VM lifetime: root `state`, command, env, workdir, user, TTY,
-  idle timeout, `stop` flag, and per-execution network narrowing.
+- **`Blip`** — one VM lifetime: root `state`, one required command, env, workdir,
+  user, TTY, `stop` flag, and per-execution network narrowing.
 - **`BlipNode`** — cluster-scoped node inventory: endpoint, hypervisors,
   incarnation, heartbeat, drain and safe-to-remove state.
 
@@ -148,47 +148,44 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 - Writes complete `desired.json`/`observed.json` snapshots and reconciles guest
   claims, mounts, freeze requests, and shutdown.
 - The `api-proxy` native sidecar holds the projected service-account token (and
-  optional gateway token) and proxies the guest's loopback ports 8001
-  (Kubernetes API) and 8002 (gateway) over vsock to HTTPS upstreams. It strips
-  caller identity headers and scopes reads to the Blip's owner.
+  the pool gateway's optional token) and proxies the guest's loopback ports 8001
+  (Kubernetes API) and 8002 (the pool's HTTPS gateway proxy) over vsock to
+  HTTPS upstreams. It strips caller identity headers and scopes reads to the
+  Blip's owner.
 
 ### Guest (`blip-guest`)
 
 - PID 1 in the initramfs: reads its config disk, mounts pseudo-filesystems, loads
   modules, configures `eth0` over rtnetlink, and serves the framed vsock
   protocol on port 1024 (control) and 1025 (sessions), with loopback relays to
-  the API and gateway proxies.
+  the API proxy and the pool gateway proxy.
 - Claims the root ext4 filesystem, chroots into it, resolves users/groups from
   the image's `/etc/passwd` and `/etc/group`, runs processes in a cgroup, and
-  supports PTYs, multiple sessions, signals, window resize, and detach without
-  killing the process. Each session keeps a 1 MiB output replay ring.
-- Uses `FIFREEZE`/`FITHAW` with a 90s auto-thaw for live snapshots and stops
-  interactive sandboxes after the idle timeout with no clients or processes.
+  supports PTYs, multiple command sessions, signals, and window resize. Each
+  session keeps a 1 MiB output replay ring.
+- Uses `FIFREEZE`/`FITHAW` with a 90s auto-thaw for live snapshots.
 - Writes `/run/blip/kubeconfig` pointing at the loopback API proxy; the proxy
   injects the real token, so no credential enters the workload filesystem.
 
-### Gateway and CLI
+### CLI
 
-- `blip-gateway` serves SSH on 2222 with public keys or CA-signed user
-  certificates. The key determines the owner and the SSH user name selects a
-  sandbox within it; resources are named `owner.name`. The gateway starts each
-  sandbox from the configured base state and creates its Blip on demand.
-  Interactive shells without a command enter a Bubble Tea menu for listing,
-  creating, connecting to, and deleting root sandboxes that start from the
-  gateway's configured base. `direct-tcpip` forwarding is supported;
-  remote forwarding is not. An mTLS certificate API on 8443 (behind Envoy)
-  issues short-lived user certificates from a trusted identity header.
-- `kubectl-blip` provides `run`, `exec`, `attach`, `sessions`, `wait`, `pull`,
-  `create blipstate`, `mount`, `unmount`, and `collect`. It reaches a VM through
-  Kubernetes pod exec (`blip-runtime bridge 1025`, WebSocket with SPDY
-  fallback), then the framed vsock protocol; guest exit codes propagate and
-  Ctrl-] detaches.
-- `blip-controller` and `blip-gateway` share one image; the node agent, VM
-  runtime, and dev sandbox are separate images.
+- Every Blip runs one required command. `kubectl-blip run NAME -- CMD [ARG...]`
+  creates the Blip, streams the command's output, and exits with its exit code.
+  `--fork SOURCE_STATE` copies a workspace and `--state WORKSPACE` reuses one.
+  `exec` runs additional commands in a running Blip; `wait`, `pull`,
+  `create blipstate`, `mount`, `unmount`, and `collect` cover the rest. It
+  reaches a VM through Kubernetes pod exec (`blip-runtime bridge 1025`,
+  WebSocket with SPDY fallback), then the framed vsock protocol.
+- A finished Blip is kept as Succeeded or Failed so its status and exit code
+  remain visible. The controller garbage-collects old finished Blips past a
+  count threshold (1000 by default), oldest `status.finishTime` first; states
+  remain until you delete them.
+- `blip-controller` is its own image; the node agent, VM runtime, and dev
+  sandbox are separate images.
 
 ## Local development
 
 `hack/kind-up.sh` builds and installs a local kind cluster and prints connection
-examples. `hack/e2e.sh` exercises durable workspace reuse, forks, collection, and
-SSH-user isolation against that cluster. Tear it down with `hack/kind-down.sh`
+examples. `hack/e2e.sh` exercises durable workspace reuse, forks, collection,
+and command exit codes against that cluster. Tear it down with `hack/kind-down.sh`
 (`--purge` also discards local storage).

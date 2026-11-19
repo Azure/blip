@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"path"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,8 +22,6 @@ type createStateFlags struct {
 	detach        bool
 	mounts, env   []string
 	workdir, user string
-	idle          time.Duration
-	idleSet       bool
 }
 
 func (a *app) createCommand() *cobra.Command {
@@ -59,7 +56,6 @@ be combined with --detach.`,
   blip create blipstate scratch -d`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			f.idleSet = cmd.Flags().Changed("idle-timeout")
 			return a.createState(cmd.Context(), args[0], f, cmd.Flags().Changed("replicas"))
 		},
 	}
@@ -72,7 +68,6 @@ be combined with --detach.`,
 	fl.StringArrayVarP(&f.env, "env", "e", nil, "default environment variable KEY=VALUE (repeatable)")
 	fl.StringVarP(&f.workdir, "workdir", "w", "", "default working directory")
 	fl.StringVarP(&f.user, "user", "u", "", "default user name or uid")
-	fl.DurationVar(&f.idle, "idle-timeout", 0, "default interactive idle timeout")
 	return cmd
 }
 
@@ -158,14 +153,11 @@ func stateFromFlags(name, namespace string, f *createStateFlags, mounts []v1alph
 }
 
 func applyStateSettings(st *v1alpha1.BlipState, f *createStateFlags, mounts []v1alpha1.Mount) error {
-	if f.idle < 0 {
-		return errors.New("--idle-timeout must not be negative")
-	}
 	env, err := parseEnv(f.env)
 	if err != nil {
 		return err
 	}
-	if len(env) > 0 || f.workdir != "" || f.user != "" || f.idleSet || f.idle > 0 {
+	if len(env) > 0 || f.workdir != "" || f.user != "" {
 		if st.Spec.Runtime == nil {
 			st.Spec.Runtime = &v1alpha1.RuntimeDefaults{}
 		}
@@ -187,9 +179,6 @@ func applyStateSettings(st *v1alpha1.BlipState, f *createStateFlags, mounts []v1
 		}
 		if f.user != "" {
 			rt.User = f.user
-		}
-		if f.idleSet || f.idle > 0 {
-			rt.IdleTimeout = &metav1.Duration{Duration: f.idle}
 		}
 	}
 	for _, m := range mounts {

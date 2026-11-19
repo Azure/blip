@@ -18,7 +18,7 @@ cd "${ROOT}"
 # Non-login shells often omit the Go, snap, and sbin tool locations.
 PATH="${PATH}:/usr/local/go/bin:${HOME}/go/bin:/snap/bin:/usr/sbin:/sbin"
 export PATH
-for tool in docker kind kubectl go make openssl modinfo; do
+for tool in docker kind kubectl go make modinfo; do
   command -v "${tool}" >/dev/null || { echo "missing tool: ${tool}" >&2; exit 1; }
 done
 
@@ -156,34 +156,6 @@ patches:
                 env:
                   - name: RUNTIME_IMAGE
                     value: ${RUNTIME_IMAGE}
-  # deploy/kind replaces the gateway args, so repeat the TLS flags required by
-  # the certificate API (the generated secret is created below).
-  - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: blip-gateway
-        namespace: blip-ssh
-      spec:
-        template:
-          spec:
-            containers:
-              - name: gateway
-                args:
-                  - --namespace=blip-ssh
-                  - --base-state=gateway-base
-                  - --identity-header=X-Forwarded-User
-                  - --tls-cert=/etc/blip/tls/tls.crt
-                  - --tls-key=/etc/blip/tls/tls.key
-                  - --tls-client-ca=/etc/blip/tls/client-ca.crt
-  - patch: |-
-      apiVersion: blip.dev/v1alpha1
-      kind: BlipState
-      metadata:
-        name: gateway-base
-        namespace: blip-ssh
-      spec:
-        image: ${REGISTRY}:5000/blip/dev:latest
 EOF
 
 k apply -k deploy/crd
@@ -191,29 +163,9 @@ k apply -k deploy/crd
 k wait --for condition=Established --timeout 60s $(k get -k deploy/crd -o name)
 k apply -k build/kind
 
-# The gateway certificate API is TLS and requires a client certificate. The
-# kind overlay has no Envoy, but the gateway still mounts Secret
-# blip-gateway-tls, so create a throwaway pair for local use.
-if ! k -n blip-ssh get secret blip-gateway-tls >/dev/null 2>&1; then
-  tlsdir="$(mktemp -d "${TMPDIR:-/tmp}/blip-gateway-tls.XXXXXX")"
-  trap 'rm -rf "${tlsdir}"' EXIT
-  openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=blip-gateway' \
-    -keyout "${tlsdir}/tls.key" -out "${tlsdir}/tls.crt" >/dev/null 2>&1
-  openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=blip-gateway-client-ca' \
-    -keyout "${tlsdir}/client-ca.key" -out "${tlsdir}/client-ca.crt" >/dev/null 2>&1
-  k -n blip-ssh create secret generic blip-gateway-tls \
-    --from-file=tls.crt="${tlsdir}/tls.crt" \
-    --from-file=tls.key="${tlsdir}/tls.key" \
-    --from-file=client-ca.crt="${tlsdir}/client-ca.crt" >/dev/null
-  rm -rf "${tlsdir}"
-  trap - EXIT
-fi
-
 k -n blip-system rollout status deployment/blip-controller --timeout 3m
 k -n blip-system rollout status daemonset/blip-node --timeout 3m
-k -n blip-ssh rollout status deployment/blip-gateway --timeout 3m
 
-ip="$(docker container inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' "${WORKERS[0]}")"
 cat <<EOF
 
 blip-dev is ready. Always pass the context explicitly:
@@ -227,13 +179,6 @@ blip-dev is ready. Always pass the context explicitly:
 
 Root BlipState.spec.mounts and spec.runtime hold durable workspace configuration.
 Delete BlipStates explicitly when their data is no longer needed.
-
-SSH gateway (NodePort 30022 on every node). Add your key, then connect;
-the user name picks the sandbox:
-
-  kubectl --context ${CTX} -n blip-ssh patch configmap blip-ssh-users --type merge \\
-    -p "{\\"data\\":{\\"\$USER\\":\\"\$(cat ~/.ssh/id_ed25519.pub)\\"}}"
-  ssh -p 30022 default@${ip}
 
 Tear down with hack/kind-down.sh [--purge].
 EOF

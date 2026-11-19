@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Azure/blip/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,7 +40,7 @@ func TestForkWorkspaceSnapshot(t *testing.T) {
 	src.Spec.Image = "registry/base:v1"
 	src.Spec.Runtime = &v1alpha1.RuntimeDefaults{
 		Env: []v1alpha1.EnvVar{{Name: "A", Value: "original"}}, WorkingDir: "/work", User: "dev",
-		IdleTimeout: &metav1.Duration{Duration: time.Minute}, Network: &v1alpha1.NetworkPolicy{},
+		Network: &v1alpha1.NetworkPolicy{},
 	}
 	src.Spec.Mounts = []v1alpha1.Mount{
 		{State: "repo", Path: "/work", Writable: true},
@@ -85,9 +84,8 @@ func TestForkWorkspaceSnapshot(t *testing.T) {
 		t.Fatal("read-only reference changed")
 	}
 	src.Spec.Runtime.Env[0].Value = "changed"
-	src.Spec.Runtime.IdleTimeout.Duration = time.Hour
 	src.Spec.Mounts[0].Path = "/changed"
-	if dest.Spec.Runtime.Env[0].Value != "original" || dest.Spec.Runtime.IdleTimeout.Duration != time.Minute || dest.Spec.Mounts[0].Path != "/work" {
+	if dest.Spec.Runtime.Env[0].Value != "original" || dest.Spec.Mounts[0].Path != "/work" {
 		t.Fatal("fork aliases source configuration")
 	}
 	if err := c.Delete(ctx, src); err != nil {

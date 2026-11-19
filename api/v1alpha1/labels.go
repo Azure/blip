@@ -24,8 +24,8 @@ const (
 
 	// AnnotationWaitForClient on a Blip asks the guest to hold the primary
 	// command's output until a client attaches. `kubectl blip run` sets it
-	// when it will attach; a detached run leaves it unset so the command
-	// starts itself.
+	// because it always attaches; a Blip created directly through the API may
+	// omit it, and then the command starts itself.
 	AnnotationWaitForClient = "blip.dev/wait-for-client"
 
 	Finalizer = "blip.dev/finalizer"

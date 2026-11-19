@@ -120,8 +120,8 @@ func TestRing(t *testing.T) {
 }
 
 // Frames a client has not received yet must survive ring pressure. Without
-// this, a command producing output faster than an SSH download could deliver
-// a silently truncated stream.
+// this, a command producing output faster than a client could receive would
+// deliver a silently truncated stream.
 func TestRingPinned(t *testing.T) {
 	r := ring{max: 10}
 	r.addPinned(wire.TStdout, []byte("aaaa"), 0)
@@ -189,7 +189,7 @@ func TestHostsFile(t *testing.T) {
 }
 
 // A finished command must leave the session list; a long-lived blip runs one
-// session per SSH command and would otherwise grow without bound.
+// session per exec and would otherwise grow without bound.
 func TestFinishedSessionIsForgotten(t *testing.T) {
 	g := &Guest{sessions: map[string]*session{}}
 	s := &session{g: g, id: "exec-1", out: ring{max: ringSize}}

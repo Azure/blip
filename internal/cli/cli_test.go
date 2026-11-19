@@ -13,15 +13,15 @@ import (
 	"github.com/Azure/blip/internal/wire"
 )
 
-func TestRunDetachedCreatesBlipFromFlags(t *testing.T) {
+func TestRunCreatesBlipFromFlags(t *testing.T) {
 	h := newHarness(t, state("workspace"))
-	code, out, errOut := h.run("", "run", "worker-1", "--state", "workspace", "-d",
-		"-w", "/work/repo", "-e", "A=B", "-u", "dev", "--pool", "big", "--idle-timeout", "5m",
+	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
+	code, _, errOut := h.run("", "run", "worker-1", "--state", "workspace",
+		"-w", "/work/repo", "-e", "A=B", "-u", "dev", "--pool", "big",
 		"--", "sh", "-lc", "make test")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "blip/worker-1 created")
 	b := h.blip("worker-1")
 	s := b.Spec
 	if s.State != "workspace" || s.Pool != "big" || s.WorkingDir != "/work/repo" || s.User != "dev" || s.TTY {
@@ -30,11 +30,16 @@ func TestRunDetachedCreatesBlipFromFlags(t *testing.T) {
 	if strings.Join(s.Command, "|") != "sh|-lc|make test" || len(s.Env) != 1 || s.Env[0] != (v1alpha1.EnvVar{Name: "A", Value: "B"}) {
 		t.Fatalf("command/env = %v %v", s.Command, s.Env)
 	}
-	if s.IdleTimeout == nil || s.IdleTimeout.Duration != 5*time.Minute {
-		t.Fatalf("idle = %v", s.IdleTimeout)
+	if b.Annotations[v1alpha1.AnnotationWaitForClient] != "true" {
+		t.Fatalf("run does not wait for the client: %v", b.Annotations)
 	}
-	if _, ok := b.Annotations[v1alpha1.AnnotationWaitForClient]; ok {
-		t.Fatalf("detached run waits for a client: %v", b.Annotations)
+}
+
+func TestRunRequiresCommand(t *testing.T) {
+	h := newHarness(t)
+	code, _, errOut := h.run("", "run", "x")
+	if code != 1 || !strings.Contains(errOut, "a command is required") {
+		t.Fatalf("code %d err %q", code, errOut)
 	}
 }
 
@@ -44,11 +49,12 @@ func TestRunRejectsBadFlags(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"run", "x", "-d"}, "exactly one of --state"},
-		{[]string{"run", "x", "--fork", "base", "--state", "s", "-d"}, "exactly one of --state"},
-		{[]string{"run", "x", "--image", "i", "-d"}, "unknown flag: --image"},
-		{[]string{"run", "x", "--state", "s", "--mount", "s:/w", "-d"}, "unknown flag: --mount"},
-		{[]string{"run", "x", "--state", "s", "--idle-timeout=-5s", "-d"}, "must not be negative"},
+		{[]string{"run", "x", "--", "true"}, "exactly one of --state"},
+		{[]string{"run", "x", "--fork", "base", "--state", "s", "--", "true"}, "exactly one of --state"},
+		{[]string{"run", "x", "--image", "i", "--", "true"}, "unknown flag: --image"},
+		{[]string{"run", "x", "--state", "s", "--mount", "s:/w", "--", "true"}, "unknown flag: --mount"},
+		{[]string{"run", "x", "--state", "s", "--detach", "--", "true"}, "unknown flag: --detach"},
+		{[]string{"run", "x", "--state", "s", "--idle-timeout", "5m", "--", "true"}, "unknown flag: --idle-timeout"},
 	} {
 		code, _, errOut := h.run("", tc.args...)
 		if code != 1 || !strings.Contains(errOut, tc.want) {
@@ -79,22 +85,6 @@ func TestRunAttachesToCommandAndExitsWithItsCode(t *testing.T) {
 	}
 	if b := h.blip("job"); b.Annotations[v1alpha1.AnnotationWaitForClient] != "true" {
 		t.Fatalf("attached run does not wait for the client: %v", b.Annotations)
-	}
-}
-
-func TestRunWithoutCommandOpensShell(t *testing.T) {
-	h := newHarness(t, state("home"))
-	h.guest.Run = func(s *fakeguest.Session) wire.Exit { return wire.Exit{Code: 0} }
-	code, _, errOut := h.run("", "run", "sbx", "--state", "home")
-	if code != 0 {
-		t.Fatalf("code %d: %s", code, errOut)
-	}
-	o := h.guest.Opens()[0].Open
-	if o.Mode != wire.OpenExec || len(o.Argv) != 0 || o.TTY {
-		t.Fatalf("open = %+v", o)
-	}
-	if b := h.blip("sbx"); b.Spec.State != "home" || len(b.Spec.Command) != 0 {
-		t.Fatalf("spec = %+v", b.Spec)
 	}
 }
 
@@ -153,21 +143,6 @@ func TestExecOnFinishedOrMissingBlipIsFriendly(t *testing.T) {
 	if code != 1 || !strings.Contains(errOut, `blip "missing" not found`) {
 		t.Fatalf("code %d err %q", code, errOut)
 	}
-}
-
-func TestAttachAndSessions(t *testing.T) {
-	h := newHarness(t, runningBlip("agent"))
-	h.guest.Sessions = []wire.SessionInfo{{ID: "main", Argv: []string{"make"}, Clients: 1}, {ID: "s2", TTY: true, Exited: true}}
-	h.guest.Run = func(s *fakeguest.Session) wire.Exit { s.Stdout("replay"); return wire.Exit{} }
-	code, out, _ := h.run("", "attach", "agent", "--session", "s2")
-	if code != 0 || out != "replay" || h.guest.Opens()[0].Open.Session != "s2" {
-		t.Fatalf("code %d out %q", code, out)
-	}
-	code, out, _ = h.run("", "sessions", "agent")
-	if code != 0 {
-		t.Fatal(code)
-	}
-	mustContain(t, out, "ID", "main", "Running", "make", "s2", "Exited", "(login shell)")
 }
 
 func TestWaitFailsIfAnyFailed(t *testing.T) {
@@ -435,7 +410,7 @@ func TestGitWorkflow(t *testing.T) {
 		{args: []string{"exec", "agent", "--", "sh", "-lc", "git clone https://example.com/repo /work/repo"}},
 		{args: []string{"unmount", "repo", "agent-root"}},
 		{apply: worker},
-		{args: []string{"run", "worker-1", "--state", "worker-1", "-d", "-w", "/work/repo", "--", "sh", "-lc", "make fix"}},
+		{args: []string{"run", "worker-1", "--state", "worker-1", "-w", "/work/repo", "--", "sh", "-lc", "make fix"}},
 		{args: []string{"wait", "worker-1"}},
 	}
 	for _, s := range steps {

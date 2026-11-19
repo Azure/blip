@@ -532,7 +532,7 @@ func (m *Machine) Reconcile(now time.Time) []Effect {
 		effects = append(effects, m.send(wire.TClaim, wire.Claim{
 			ID: c.Root.ID, Serial: diskSerial(c.Root), Hostname: c.BlipName,
 			Command: append([]string(nil), c.Command...), TTY: c.TTY, Env: append([]string(nil), c.Env...), WorkingDir: c.WorkingDir,
-			User: c.User, WaitForClient: c.WaitForClient, IdleTimeoutSeconds: c.IdleTimeoutSeconds, Mounts: mounts,
+			User: c.User, WaitForClient: c.WaitForClient, Mounts: mounts,
 		}))
 		m.claimWaiting, m.claimSince = true, now
 		return effects

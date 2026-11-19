@@ -101,15 +101,6 @@ func TestSessionLostOpenAckFaults(t *testing.T) {
 				if retry.Opened.Session != s.id || len(*waits) != 1 || s.clients != 1 {
 					t.Fatalf("retry duplicated or leaked session: id=%s starts=%d clients=%d", retry.Opened.Session, len(*waits), s.clients)
 				}
-				listSession, err := c.Open(context.Background(), "ns", "pod", wire.Open{Mode: wire.OpenList})
-				if err != nil {
-					t.Fatal(err)
-				}
-				list := listSession.Opened.Sessions
-				listSession.Close()
-				if len(list) != 1 || list[0].ID != s.id || list[0].Clients != 1 {
-					t.Fatalf("list after reconnect: %+v %v", list, err)
-				}
 				(*waits)[0] <- unix.WaitStatus(7 << 8)
 				var out bytes.Buffer
 				exit, err := retry.Copy(&out, io.Discard, nil)

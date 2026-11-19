@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -18,18 +17,12 @@ import (
 type runFlags struct {
 	execFlags
 	state, pool, fork string
-	detach            bool
-	idle              time.Duration
-	idleSet           bool
 }
 
 // blipFromFlags builds the Blip that `kubectl blip run` creates.
 func blipFromFlags(name, namespace string, f *runFlags, command []string) (*v1alpha1.Blip, error) {
 	if (f.fork == "") == (f.state == "") {
 		return nil, errors.New("set exactly one of --state (existing workspace) and --fork (copy a workspace)")
-	}
-	if f.idle < 0 {
-		return nil, errors.New("--idle-timeout must not be negative")
 	}
 	env, err := parseEnv(f.env)
 	if err != nil {
@@ -44,25 +37,19 @@ func blipFromFlags(name, namespace string, f *runFlags, command []string) (*v1al
 			Env:        env,
 			WorkingDir: f.workdir,
 			User:       f.user,
-			TTY:        len(command) > 0 && f.tty && !f.noTTY,
+			TTY:        f.tty && !f.noTTY,
 		},
 	}
 	if f.fork != "" {
 		b.Spec.State = name
 	}
-	if f.idleSet || f.idle > 0 {
-		b.Spec.IdleTimeout = &metav1.Duration{Duration: f.idle}
+	// The CLI always attaches, so tell the guest to hold the primary
+	// command's output until the caller connects. Otherwise a fast command
+	// could outrun the caller and overflow the replay ring.
+	if b.Annotations == nil {
+		b.Annotations = map[string]string{}
 	}
-	if !f.detach {
-		// The CLI is about to attach. Tell the guest to hold the primary
-		// command's output so a fast command cannot outrun the caller and
-		// overflow the replay ring. A detached run must not wait for a client
-		// that will never come.
-		if b.Annotations == nil {
-			b.Annotations = map[string]string{}
-		}
-		b.Annotations[v1alpha1.AnnotationWaitForClient] = "true"
-	}
+	b.Annotations[v1alpha1.AnnotationWaitForClient] = "true"
 	return b, nil
 }
 
@@ -77,18 +64,16 @@ func envStrings(env []v1alpha1.EnvVar) []string {
 func (a *app) runCommand() *cobra.Command {
 	f := &runFlags{}
 	cmd := &cobra.Command{
-		Use:   "run NAME [flags] [-- CMD [ARG...]]",
-		Short: "Create a blip and attach to it",
-		Long: `Create a blip. With a command, wait for it to run, stream its output,
-and exit with its exit code. Without a command, the blip is an interactive
-sandbox and you get a login shell. With -d, return right after creating it.`,
+		Use:   "run NAME [flags] -- CMD [ARG...]",
+		Short: "Create a blip that runs a command and attach to it",
+		Long: `Create a blip that runs one command, stream its output, and exit with
+its exit code.`,
 		Example: `  kubectl blip pull base ghcr.io/me/dev:latest
   kubectl blip run job1 --fork base -w /work -- make test
-  kubectl blip run dev --state dev-home -d --idle-timeout 30m
+  kubectl blip run dev --state dev-home -- bash
   blip run w1 --fork dev-home -- sh -c "git switch -c w1 && make fix && git commit -qam w1"`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			f.idleSet = cmd.Flags().Changed("idle-timeout")
 			return a.run(cmd.Context(), args[0], args[1:], f)
 		},
 	}
@@ -97,8 +82,6 @@ sandbox and you get a login shell. With -d, return right after creating it.`,
 	fl.StringVar(&f.state, "state", "", "existing writable workspace")
 	fl.StringVar(&f.pool, "pool", "", "VM pool (default \"default\")")
 	fl.StringVar(&f.fork, "fork", "", "copy SOURCE_STATE into a new workspace named NAME (inside a blip, / means its root)")
-	fl.BoolVarP(&f.detach, "detach", "d", false, "do not wait or attach")
-	fl.DurationVar(&f.idle, "idle-timeout", 0, "stop an interactive blip after this long with no sessions or processes (default 30s)")
 	return cmd
 }
 
@@ -121,6 +104,9 @@ func (a *app) preflight(ctx context.Context, kube client.Client, b *v1alpha1.Bli
 func (a *app) run(ctx context.Context, name string, command []string, f *runFlags) error {
 	if err := a.scope(&name); err != nil {
 		return err
+	}
+	if len(command) == 0 {
+		return errors.New("a command is required: kubectl blip run NAME -- CMD [ARG...]")
 	}
 	c, _ := a.clients()
 	b, err := blipFromFlags(name, c.Namespace, f, command)
@@ -194,19 +180,9 @@ func (a *app) run(ctx context.Context, name string, command []string, f *runFlag
 		}
 		return err
 	}
-	if f.detach {
-		fmt.Fprintf(a.env.Out, "blip/%s created\n", a.short(name))
-		return nil
-	}
 	b, err = a.waitRunning(ctx, name)
 	if err != nil {
 		return err
-	}
-	if len(command) == 0 {
-		if b.Status.Phase != v1alpha1.BlipRunning {
-			return fmt.Errorf("blip %q stopped before it was ready (%s)", name, describe(b))
-		}
-		return a.execSession(ctx, name, b.Status.Pod, nil, &execFlags{}, a.shellTTY(&f.execFlags))
 	}
 
 	var sessErr error
@@ -216,9 +192,6 @@ func (a *app) run(ctx context.Context, name string, command []string, f *runFlag
 			sessErr = a.stream(ctx, s, streamOpts{blip: name, sendEOF: true})
 		} else {
 			a.progress("blip %s: could not attach to the command: %v", name, err)
-		}
-		if errors.Is(sessErr, errDetached) {
-			return sessErr
 		}
 	}
 	fin, err := a.waitFinished(ctx, name, false)

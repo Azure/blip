@@ -56,7 +56,7 @@ func TestWarmLabelAndObservedAnnotation(t *testing.T) {
 
 func durableBlip(v *view) (*v1alpha1.Blip, *podDir) {
 	b, s, d := stateRoot(v)
-	b.Spec.Command = nil
+	b.Spec.Command = []string{"true"}
 	b.Spec.Env = []v1alpha1.EnvVar{{Name: "A", Value: "1"}}
 	s.Status.Writer.PodUID = "poduid-p"
 	s.Status.ImageConfig = &v1alpha1.ImageConfig{Env: []string{"PATH=/bin"}, WorkingDir: "/w"}
@@ -85,7 +85,7 @@ func TestDurableRootClaim(t *testing.T) {
 	}
 	c := p.desired[pkey("p")].Claim
 	if c == nil || c.Root.Device != "/run/blip/dev/r1" || c.Root.Serial != "r1" || c.WorkingDir != "/w" ||
-		len(c.Env) != 2 || c.Env[0] != "PATH=/bin" || c.Env[1] != "A=1" || c.IdleTimeoutSeconds != 30 {
+		len(c.Env) != 2 || c.Env[0] != "PATH=/bin" || c.Env[1] != "A=1" {
 		t.Fatalf("claim = %+v", c)
 	}
 
@@ -114,41 +114,6 @@ func TestClaimCarriesWaitForClient(t *testing.T) {
 	}
 }
 
-func TestIdleTimeoutOverride(t *testing.T) {
-	for _, tt := range []struct {
-		d    time.Duration
-		want int64
-	}{
-		{45 * time.Second, 45},
-		{500 * time.Millisecond, 1},
-	} {
-		v := newView()
-		b, d := durableBlip(v)
-		b.Spec.IdleTimeout = &metav1.Duration{Duration: tt.d}
-		readyDev(v, d, storage.Volume{ID: "r1", StateUID: "uid-root"}, 7)
-		p := compute(v)
-		if c := p.desired[pkey("p")].Claim; c == nil || c.IdleTimeoutSeconds != tt.want {
-			t.Fatalf("claim with idle timeout %v = %+v, want %ds", tt.d, c, tt.want)
-		}
-	}
-}
-
-func TestIdleTimeoutSeconds(t *testing.T) {
-	for _, tt := range []struct {
-		d    time.Duration
-		want int64
-	}{
-		{0, 0},
-		{500 * time.Millisecond, 1},
-		{1500 * time.Millisecond, 2},
-		{30 * time.Second, 30},
-	} {
-		if got := idleTimeoutSeconds(tt.d); got != tt.want {
-			t.Errorf("idleTimeoutSeconds(%v) = %d, want %d", tt.d, got, tt.want)
-		}
-	}
-}
-
 func TestRuntimeDefaultsPrecedence(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -157,43 +122,24 @@ func TestRuntimeDefaultsPrecedence(t *testing.T) {
 		env      []string
 		dir      string
 		user     string
-		idle     int64
 	}{
 		{
-			name: "image metadata", env: []string{"PATH=/bin", "A=image"}, dir: "/image", user: "image-user", idle: 30,
+			name: "image metadata", env: []string{"PATH=/bin", "A=image"}, dir: "/image", user: "image-user",
 		},
 		{
 			name: "state defaults",
 			defaults: &v1alpha1.RuntimeDefaults{
 				Env: []v1alpha1.EnvVar{{Name: "A", Value: "state"}}, WorkingDir: "/state", User: "state-user",
-				IdleTimeout: &metav1.Duration{Duration: time.Minute},
 			},
-			env: []string{"PATH=/bin", "A=image", "A=state"}, dir: "/state", user: "state-user", idle: 60,
+			env: []string{"PATH=/bin", "A=image", "A=state"}, dir: "/state", user: "state-user",
 		},
 		{
-			name: "subsecond state default rounds up",
-			defaults: &v1alpha1.RuntimeDefaults{
-				IdleTimeout: &metav1.Duration{Duration: 500 * time.Millisecond},
-			},
-			env: []string{"PATH=/bin", "A=image"}, dir: "/image", user: "image-user", idle: 1,
-		},
-		{
-			name: "subsecond execution override wins and rounds up",
-			defaults: &v1alpha1.RuntimeDefaults{
-				IdleTimeout: &metav1.Duration{Duration: time.Minute},
-			},
-			override: v1alpha1.BlipSpec{IdleTimeout: &metav1.Duration{Duration: 500 * time.Millisecond}},
-			env:      []string{"PATH=/bin", "A=image"}, dir: "/image", user: "image-user", idle: 1,
-		},
-		{
-			name: "execution overrides including zero timeout and empty env",
+			name: "execution overrides including empty env",
 			defaults: &v1alpha1.RuntimeDefaults{
 				Env: []v1alpha1.EnvVar{{Name: "A", Value: "state"}}, WorkingDir: "/state", User: "state-user",
-				IdleTimeout: &metav1.Duration{Duration: time.Minute},
 			},
 			override: v1alpha1.BlipSpec{
 				Env: []v1alpha1.EnvVar{{Name: "A"}}, WorkingDir: "/execution", User: "execution-user",
-				IdleTimeout: &metav1.Duration{},
 			},
 			env: []string{"PATH=/bin", "A=image", "A=state", "A="}, dir: "/execution", user: "execution-user",
 		},
@@ -202,15 +148,7 @@ func TestRuntimeDefaultsPrecedence(t *testing.T) {
 			defaults: &v1alpha1.RuntimeDefaults{
 				Env: []v1alpha1.EnvVar{{Name: "NEW", Value: "value"}}, User: "state-user",
 			},
-			env: []string{"PATH=/bin", "A=image", "NEW=value"}, dir: "/image", user: "state-user", idle: 30,
-		},
-		{
-			name: "primary command ignores idle timeout",
-			defaults: &v1alpha1.RuntimeDefaults{
-				IdleTimeout: &metav1.Duration{Duration: time.Minute},
-			},
-			override: v1alpha1.BlipSpec{Command: []string{"true"}},
-			env:      []string{"PATH=/bin", "A=image"}, dir: "/image", user: "image-user",
+			env: []string{"PATH=/bin", "A=image", "NEW=value"}, dir: "/image", user: "state-user",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -228,7 +166,7 @@ func TestRuntimeDefaultsPrecedence(t *testing.T) {
 			c := compute(v).desired[pkey("p")].Claim
 			// Env entries are ordered image -> state -> execution. The guest
 			// applies later entries last, including explicitly empty values.
-			if c == nil || !slices.Equal(c.Env, tc.env) || c.WorkingDir != tc.dir || c.User != tc.user || c.IdleTimeoutSeconds != tc.idle {
+			if c == nil || !slices.Equal(c.Env, tc.env) || c.WorkingDir != tc.dir || c.User != tc.user {
 				t.Fatalf("resolved claim = %+v", c)
 			}
 			if !slices.Equal(c.Command, tc.override.Command) {
@@ -244,7 +182,6 @@ func TestRuntimeStartupDefaultsResolvedOnce(t *testing.T) {
 	s := v.states[0]
 	s.Spec.Runtime = &v1alpha1.RuntimeDefaults{
 		Env: []v1alpha1.EnvVar{{Name: "B", Value: "initial"}}, WorkingDir: "/initial", User: "initial-user",
-		IdleTimeout: &metav1.Duration{Duration: time.Minute},
 	}
 	readyDev(v, d, storage.Volume{ID: "r1", StateUID: string(s.UID)}, 7)
 	initial := compute(v).desired[pkey("p")]
@@ -256,7 +193,6 @@ func TestRuntimeStartupDefaultsResolvedOnce(t *testing.T) {
 	s.Spec.Runtime.Env[0].Value = "updated"
 	s.Spec.Runtime.WorkingDir = "/updated"
 	s.Spec.Runtime.User = "updated-user"
-	s.Spec.Runtime.IdleTimeout.Duration = 2 * time.Minute
 	s.Status.ImageConfig.Env[0] = "PATH=/updated"
 	if p := compute(v); len(p.desired) != 0 {
 		t.Fatalf("startup defaults changed an existing claim: %+v", p.desired)

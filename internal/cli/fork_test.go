@@ -29,17 +29,16 @@ func ownedBlip(name, root string, mounts ...v1alpha1.Mount) *v1alpha1.Blip {
 func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	h := newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.repo"))
 	h.self = "alice.box"
-	code, out, errOut := h.run("", "run", "w1", "--state", "repo", "-d", "--", "true")
+	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
+	code, _, errOut := h.run("", "run", "w1", "--state", "repo", "--", "true")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "blip/w1 created")
 	b := h.blip("alice.w1")
 	if b.Labels[v1alpha1.LabelOwner] != "alice" || b.Spec.State != "alice.repo" {
 		t.Fatalf("labels %v spec %+v", b.Labels, b.Spec)
 	}
-	h.ctrl.set(func(c *fakeController) { c.exited["alice.w1"] = 0 })
-	code, out, _ = h.run("", "wait", "alice.w1")
+	code, out, _ := h.run("", "wait", "alice.w1")
 	if code != 0 || !strings.HasPrefix(out, "blip/w1 Succeeded") {
 		t.Fatalf("code %d out %q", code, out)
 	}
@@ -47,7 +46,8 @@ func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	// The separator is always ".", whatever the caller's own name.
 	h2 := newHarness(t, ownedBlip("alice-box", "alice.home"))
 	h2.self = "alice-box"
-	if code, _, errOut := h2.run("", "run", "w1", "--fork", "home", "-d"); code != 0 {
+	h2.ctrl.set(func(c *fakeController) { c.autoFinish = true })
+	if code, _, errOut := h2.run("", "run", "w1", "--fork", "home", "--", "true"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	h2.blip("alice.w1")
@@ -55,7 +55,8 @@ func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	// Without an owner, names are not scoped.
 	h3 := newHarness(t, runningBlip("agent"))
 	h3.self = "agent"
-	if code, _, errOut := h3.run("", "run", "w1", "--fork", "agent-root", "-d"); code != 0 {
+	h3.ctrl.set(func(c *fakeController) { c.autoFinish = true })
+	if code, _, errOut := h3.run("", "run", "w1", "--fork", "agent-root", "--", "true"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	if b := h3.blip("w1"); b.Labels[v1alpha1.LabelOwner] != "" {
@@ -70,11 +71,11 @@ func TestForkRoot(t *testing.T) {
 	home.Spec.Runtime = &v1alpha1.RuntimeDefaults{User: "workspace-user", WorkingDir: "/work"}
 	h := newHarness(t, self, home)
 	h.self = "alice.box"
-	code, out, errOut := h.run("", "run", "w1", "--fork", "/", "-d", "--", "sh", "-c", "make")
+	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
+	code, _, errOut := h.run("", "run", "w1", "--fork", "/", "--", "sh", "-c", "make")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "blip/w1 created")
 	b := h.blip("alice.w1")
 	if b.Spec.State != "alice.w1" || b.Spec.Pool != "big" || b.Spec.User != "" || b.Spec.WorkingDir != "" {
 		t.Fatalf("spec = %+v", b.Spec)
@@ -92,7 +93,7 @@ func TestForkCreatesNothingOnStateFailure(t *testing.T) {
 	// An existing state of the worker's name is not reused.
 	h := newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.home"), readyState("alice.w1"))
 	h.self = "alice.box"
-	code, _, errOut := h.run("", "run", "w1", "--fork", "/", "-d")
+	code, _, errOut := h.run("", "run", "w1", "--fork", "/", "--", "true")
 	if code != 1 || !strings.Contains(errOut, `workspace "w1" already exists`) {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
@@ -110,7 +111,7 @@ func TestForkCreatesNothingOnStateFailure(t *testing.T) {
 		}
 		return c.Create(ctx, obj, opts...)
 	}})
-	code, _, errOut = h.run("", "run", "w1", "--fork", "/", "-d")
+	code, _, errOut = h.run("", "run", "w1", "--fork", "/", "--", "true")
 	if code != 1 || !strings.Contains(errOut, "denied") {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
@@ -126,10 +127,10 @@ func TestForkRejections(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"", []string{"run", "x", "--fork", "/", "-d"}, "--fork / only works inside a blip"},
-		{"alice.box", []string{"run", "x", "--fork", "/", "--state", "s", "-d"}, "exactly one of --state"},
-		{"alice.box", []string{"run", "x", "--fork", "/", "--image", "i", "-d"}, "unknown flag: --image"},
-		{"alice.box", []string{"run", "x", "--fork", "missing", "-d"}, `state "missing" not found`},
+		{"", []string{"run", "x", "--fork", "/", "--", "true"}, "--fork / only works inside a blip"},
+		{"alice.box", []string{"run", "x", "--fork", "/", "--state", "s", "--", "true"}, "exactly one of --state"},
+		{"alice.box", []string{"run", "x", "--fork", "/", "--image", "i", "--", "true"}, "unknown flag: --image"},
+		{"alice.box", []string{"run", "x", "--fork", "missing", "--", "true"}, `state "missing" not found`},
 	} {
 		h.self = tc.self
 		code, _, errOut := h.run("", tc.args...)
