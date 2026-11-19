@@ -196,3 +196,67 @@ func TestPrunedTasksStayPrunedAfterSameTickStep(t *testing.T) {
 		t.Errorf("step prompt still showed the pruned task:\n%s", content)
 	}
 }
+
+// set_timer with an already-past time must not strand the timer: it wakes the
+// thread on the next tick, and that step delivers the note.
+func TestPastTimerWakesImmediatelyAndDeliversNote(t *testing.T) {
+	thread := testThread()
+	server, requests := llmServerWithRequests(t,
+		Message{Role: "assistant", ToolCalls: []ToolCall{
+			toolCall("set_timer", fmt.Sprintf(`{"at":%q,"note":"retry deploy"}`, timeNow().Add(-time.Hour).Format(time.RFC3339))),
+		}},
+		Message{Role: "assistant", Content: "timer set"},
+		Message{Role: "assistant", Content: "noted"},
+	)
+	c := testClient(t, thread)
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	ctx := context.Background()
+	if err := s.step(ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Status.Timers) != 1 {
+		t.Fatalf("timers after set_timer = %+v, want the past timer retained", updated.Status.Timers)
+	}
+	if updated.Status.NextWake == nil {
+		t.Fatalf("past timer stored but nextWake is nil")
+	}
+	if updated.Status.NextWake.After(timeNow()) {
+		t.Errorf("nextWake = %s, want now or earlier", updated.Status.NextWake)
+	}
+	if !s.shouldStep(ctx, &updated) {
+		t.Fatal("a due timer did not make the thread step")
+	}
+	if err := s.step(ctx, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Status.Timers) != 0 {
+		t.Errorf("timers after the wake step = %+v, want none", updated.Status.Timers)
+	}
+	if len(*requests) < 2 {
+		t.Fatalf("got %d LLM requests, want at least 2", len(*requests))
+	}
+	last := (*requests)[len(*requests)-1]
+	messages, ok := last["messages"].([]any)
+	if !ok || len(messages) < 2 {
+		t.Fatalf("second step request messages = %#v", last["messages"])
+	}
+	user, ok := messages[1].(map[string]any)
+	if !ok {
+		t.Fatalf("user message = %#v", messages[1])
+	}
+	content, _ := user["content"].(string)
+	if !strings.Contains(content, "retry deploy") {
+		t.Errorf("due timer note was not delivered:\n%s", content)
+	}
+}

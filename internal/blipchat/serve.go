@@ -139,6 +139,13 @@ func (s *Server) shouldStep(ctx context.Context, thread *v1.BlipThread) bool {
 	if wake := thread.Status.NextWake; wake != nil && !now.Before(wake.Time) {
 		return true
 	}
+	// A stored timer that is already due is a pending wake even if an older
+	// version of status did not record it in NextWake.
+	for _, timer := range thread.Status.Timers {
+		if !timer.At.After(now) {
+			return true
+		}
+	}
 	turns, err := s.pendingTurns(ctx, thread)
 	if err != nil {
 		s.Log.Error(err, "list pending turns", "thread", thread.Namespace+"/"+thread.Name)
@@ -354,8 +361,14 @@ func nextWake(st *step, now time.Time) *metav1.Time {
 		next = now.Add(heartbeat)
 	}
 	for _, timer := range st.timers {
-		if timer.At.After(now) && (next.IsZero() || timer.At.Time.Before(next)) {
-			next = timer.At.Time
+		at := timer.At.Time
+		if !timer.At.After(now) {
+			// A timer set for the past is due now; wake on the next tick so
+			// its note is not stranded.
+			at = now
+		}
+		if next.IsZero() || at.Before(next) {
+			next = at
 		}
 	}
 	if next.IsZero() {
