@@ -9,10 +9,24 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
+)
+
+const (
+	// maxChatBody is the total request size; the same bound is advertised by
+	// the 413-style error from http.MaxBytesReader.
+	maxChatBody = 1 << 20
+	// maxMessageRunes matches the per-history-entry bound below. It keeps a
+	// single prompt from dwarfing the thread's context.
+	maxMessageRunes = 8000
+	// maxHistoryMessages and maxHistoryRunes bound the transcript the browser
+	// may replay. The body limit alone still allows hundreds of 8k messages.
+	maxHistoryMessages = 40
+	maxHistoryRunes    = 32000
 )
 
 // Chat is the engineer-facing conversation about a thread. The server keeps no
@@ -54,12 +68,28 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req chatRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(&req); err != nil {
 		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	if req.Thread == "" || req.Message == "" {
 		http.Error(w, "thread and message are required", http.StatusBadRequest)
+		return
+	}
+	if n := utf8.RuneCountInString(req.Message); n > maxMessageRunes {
+		http.Error(w, fmt.Sprintf("message is too long: %d characters, limit %d", n, maxMessageRunes), http.StatusBadRequest)
+		return
+	}
+	if len(req.History) > maxHistoryMessages {
+		http.Error(w, fmt.Sprintf("too many history messages: %d, limit %d", len(req.History), maxHistoryMessages), http.StatusBadRequest)
+		return
+	}
+	historyRunes := 0
+	for _, h := range req.History {
+		historyRunes += utf8.RuneCountInString(h.Content)
+	}
+	if historyRunes > maxHistoryRunes {
+		http.Error(w, fmt.Sprintf("history is too long: %d characters, limit %d", historyRunes, maxHistoryRunes), http.StatusBadRequest)
 		return
 	}
 	ctx := r.Context()
