@@ -55,7 +55,9 @@ spec:
               base:
                 description: |-
                   Base is the BlipState new task blips fork from, when the coordinator
-                  does not choose another one.
+                  does not choose another one. Empty selects the coordinator's default.
+                maxLength: 253
+                pattern: ^$|^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string
               charter:
                 description: |-
@@ -94,7 +96,9 @@ spec:
                 type: string
               pool:
                 description: Pool is the BlipPool tasks run in.
+                maxLength: 253
                 minLength: 1
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string
               retention:
                 description: Retention bounds the history blipchat keeps for this

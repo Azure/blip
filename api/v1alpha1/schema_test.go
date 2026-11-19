@@ -767,3 +767,44 @@ func TestBlipTurnStatusSeqCannotBeCleared(t *testing.T) {
 		t.Errorf("rejected an unsequenced turn: %v", errs.ToAggregate())
 	}
 }
+
+// TestReferenceNamesValidated guards that pool and base references look like
+// Kubernetes object names. Names with '/', spaces, or underscores can never
+// exist, so failing at admission avoids a pending Blip or a later coordinator
+// step failure. Empty base retains its documented default semantics.
+func TestReferenceNamesValidated(t *testing.T) {
+	blip := admissionValidator(t, "blips")
+	for _, pool := range []string{"Bad/Pool", "Bad Pool", "Bad_Pool", ""} {
+		object := fmt.Sprintf(`{"spec":{"pool":%q,"state":"root","command":["true"]}}`, pool)
+		if errs := blip(object, ""); len(errs) == 0 {
+			t.Errorf("admitted blip pool %q", pool)
+		}
+	}
+	for _, pool := range []string{"default", "pool-1", "pool.one"} {
+		object := fmt.Sprintf(`{"spec":{"pool":%q,"state":"root","command":["true"]}}`, pool)
+		if errs := blip(object, ""); len(errs) != 0 {
+			t.Errorf("rejected valid blip pool %q: %v", pool, errs.ToAggregate())
+		}
+	}
+
+	thread := admissionValidator(t, "blipthreads")
+	for _, spec := range []string{
+		`{"pool":"Bad/Pool"}`,
+		`{"pool":"Bad Pool"}`,
+		`{"pool":"p","base":"Bad_State"}`,
+		`{"pool":"p","base":"Bad/State"}`,
+	} {
+		if errs := thread(`{"spec":`+spec+`}`, ""); len(errs) == 0 {
+			t.Errorf("admitted thread spec %s", spec)
+		}
+	}
+	for _, spec := range []string{
+		`{"pool":"default"}`,
+		`{"pool":"pool-1","base":""}`,
+		`{"pool":"pool.one","base":"project.base"}`,
+	} {
+		if errs := thread(`{"spec":`+spec+`}`, ""); len(errs) != 0 {
+			t.Errorf("rejected valid thread spec %s: %v", spec, errs.ToAggregate())
+		}
+	}
+}

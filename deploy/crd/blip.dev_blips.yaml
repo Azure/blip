@@ -336,6 +336,9 @@ spec:
               pool:
                 default: default
                 description: Pool names a BlipPool in the blip's namespace.
+                maxLength: 253
+                minLength: 1
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string
                 x-kubernetes-validations:
                 - message: pool is immutable

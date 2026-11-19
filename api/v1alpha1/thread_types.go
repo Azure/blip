@@ -25,9 +25,13 @@ type BlipThreadSpec struct {
 	SystemPrompt string `json:"systemPrompt,omitempty"`
 	// Pool is the BlipPool tasks run in.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	Pool string `json:"pool"`
 	// Base is the BlipState new task blips fork from, when the coordinator
-	// does not choose another one.
+	// does not choose another one. Empty selects the coordinator's default.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	Base string `json:"base,omitempty"`
 	// MaxRunning caps concurrently running blips labelled with this thread.
 	// +kubebuilder:validation:Minimum=1

@@ -490,6 +490,9 @@ type RuntimeDefaults struct {
 type BlipSpec struct {
 	// Pool names a BlipPool in the blip's namespace.
 	// +kubebuilder:default=default
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="pool is immutable"
 	Pool string `json:"pool,omitempty"`
 	// State gives the blip a durable root filesystem. A new version is
