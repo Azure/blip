@@ -84,8 +84,10 @@ spec:
       expression: "'bases' in variables.data ? string(variables.data['bases']).split(' ') : []"
     # A blip.dev/thread label decides which project's history a Blip's reports
     # are appended to. The label is self-asserted by the VM, so a restricted
-    # owner may only set it to a thread it owns: the "thread.<name>" table
-    # records the owner hash of every thread.
+    # owner may only set it to a thread it owns: the "thread.<label>" table
+    # records the owner hash of every thread. Label values are ThreadLabel(name),
+    # which is hashed when the name is too long for a label; the table records
+    # the owner under that value as well as under the raw thread name.
     - name: thread
       expression: >-
         (request.operation == 'CREATE' || request.operation == 'UPDATE') &&

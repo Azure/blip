@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"maps"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -397,5 +398,38 @@ func TestVMOwnersThreadOwners(t *testing.T) {
 	e.must(syncVMOwners(e.ctx, e.c, ns))
 	if got, ok := e.owners()["thread.proj"]; ok {
 		t.Fatalf("deleted thread left owner key %q", got)
+	}
+}
+
+// A long thread name cannot be a label value, so blip.dev/thread carries
+// ThreadLabel(name). The table must publish that key too; otherwise a
+// restricted VM cannot attach its Blip to its own long-named thread.
+func TestVMOwnersThreadOwnersLongName(t *testing.T) {
+	e := newEnv(t)
+	e.newPool("default", 0, 0)
+	long := strings.Repeat("thread-", 12)
+	if len(long) <= 63 {
+		t.Fatalf("test thread name %q is not long", long)
+	}
+	thread := &v1.BlipThread{
+		ObjectMeta: metav1.ObjectMeta{Name: long, Namespace: ns},
+		Spec:       v1.BlipThreadSpec{Pool: "default"},
+	}
+	e.create(thread)
+	e.must(syncVMOwners(e.ctx, e.c, ns))
+	owner := v1.ThreadOwner(ns, long)
+	for _, name := range []string{long, v1.ThreadLabel(long)} {
+		if got := e.owners()["thread."+name]; got != owner {
+			t.Errorf("thread owner key %q = %q, want %q", "thread."+name, got, owner)
+		}
+	}
+	if err := e.c.Delete(e.ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	e.must(syncVMOwners(e.ctx, e.c, ns))
+	for _, name := range []string{long, v1.ThreadLabel(long)} {
+		if got, ok := e.owners()["thread."+name]; ok {
+			t.Errorf("deleted thread left owner key %q = %q", "thread."+name, got)
+		}
 	}
 }

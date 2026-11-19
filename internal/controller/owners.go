@@ -20,9 +20,10 @@ import (
 // "sa.<service account>" for every VM service account, with the sorted,
 // space-separated names of the pools using it, and "<pod>" with the owner of
 // each claimed VM pod ("-" for an unrestricted Blip). "thread.<name>" maps a
-// thread to the owner hash of its project, so the turn policy can bind turns
-// to a producer's own thread. "bases" lists the ownerless imported states
-// available for shared read-only use and copying.
+// thread to the owner hash of its project for turn producers, and
+// "thread.<ThreadLabel(name)>" does the same for the blip.dev/thread label
+// (which is hashed for long names). "bases" lists the ownerless imported
+// states available for shared read-only use and copying.
 const VMOwnersConfigMap = "blip-vm-owners"
 
 const (
@@ -211,13 +212,18 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 		want[ownersBasesKey] = strings.Join(bases, " ")
 	}
 	// Thread ownership lets the turn policy bind a pod-bound producer to its
-	// own project without trusting labels on the turn.
+	// own project without trusting labels on the turn. Keys use both the raw
+	// thread name (spec.thread on a turn) and ThreadLabel(name) (the
+	// blip.dev/thread label, which is hashed for names over 63 characters).
 	var threads v1.BlipThreadList
 	if err := c.List(ctx, &threads, client.InNamespace(ns)); err != nil {
 		return err
 	}
 	for i := range threads.Items {
-		want[ownersThreadPrefix+threads.Items[i].Name] = v1.ThreadOwner(ns, threads.Items[i].Name)
+		name := threads.Items[i].Name
+		owner := v1.ThreadOwner(ns, name)
+		want[ownersThreadPrefix+name] = owner
+		want[ownersThreadPrefix+v1.ThreadLabel(name)] = owner
 	}
 	exists := map[string]bool{}
 	for i := range pods.Items {
