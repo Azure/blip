@@ -110,12 +110,28 @@ func (s *Sequencer) sequenceThread(ctx context.Context, thread *v1.BlipThread) e
 		return err
 	}
 	pending := make([]v1.BlipTurn, 0, len(turns.Items))
+	var maxSeq int64
 	for i := range turns.Items {
 		t := &turns.Items[i]
-		if t.Status.Seq != 0 || t.DeletionTimestamp != nil || !turnBelongsToThread(t, thread) {
+		if t.DeletionTimestamp != nil || !turnBelongsToThread(t, thread) {
+			continue
+		}
+		if t.Status.Seq > maxSeq {
+			maxSeq = t.Status.Seq
+		}
+		if t.Status.Seq != 0 {
 			continue
 		}
 		pending = append(pending, *t)
+	}
+	// A counter write can be lost after a turn was already numbered (the
+	// pre-CAS writer order, or an interrupted upgrade). Raise lastSeq to the
+	// highest sealed sequence before reserving anything, so a new turn never
+	// reuses or undercuts a number already recorded on this thread's turns.
+	if maxSeq > thread.Status.LastSeq {
+		if err := s.raiseLastSeq(ctx, thread, maxSeq); err != nil {
+			return err
+		}
 	}
 	sort.SliceStable(pending, func(i, j int) bool {
 		a, b := &pending[i], &pending[j]
