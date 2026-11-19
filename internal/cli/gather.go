@@ -599,7 +599,7 @@ func (a *app) follow(ctx context.Context, name string) {
 		// the pod can disappear between the wait and this attach.
 		ending = ending || a.blipEnding(ctx, name)
 		if ending {
-			if a.replayFinished(ctx, name, short, pod, 3*time.Second, true) {
+			if a.replayFinished(ctx, name, short, pod, attachFailWait, true) {
 				return
 			}
 		} else if a.replayLogs(ctx, pod, short) {
@@ -608,7 +608,7 @@ func (a *app) follow(ctx context.Context, name string) {
 		if ctx.Err() != nil {
 			return
 		}
-		if !ending && a.printRetainedFor(ctx, name, short, 3*time.Second) {
+		if !ending && a.printRetainedFor(ctx, name, short, attachFailWait) {
 			return
 		}
 		if ctx.Err() != nil {
@@ -657,6 +657,11 @@ func (a *app) follow(ctx context.Context, name string) {
 // writes the output before it deletes the VM pod, so this only covers client
 // staleness.
 var truncatedOutputWait = 3 * time.Second
+
+// attachFailWait bounds how long a follower waits for retained output after a
+// failed attach before deciding that the Blip is still running or that its
+// output is gone.
+var attachFailWait = 3 * time.Second
 
 // replayTruncatedOutput reports that a followed stream ended before the
 // command's exit status arrived and, when the blip is finishing, prints the

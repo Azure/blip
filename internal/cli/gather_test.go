@@ -48,6 +48,14 @@ func withTruncatedOutputWait(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { truncatedOutputWait = old })
 }
 
+// withAttachFailWait shortens the wait after a failed follower attach.
+func withAttachFailWait(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := attachFailWait
+	attachFailWait = d
+	t.Cleanup(func() { attachFailWait = old })
+}
+
 // setOutput writes status.output directly, like the controller does.
 func (h *harness) setOutput(name, output string) {
 	h.t.Helper()
@@ -898,6 +906,56 @@ func TestGatherFollowWarnsWhenBothRetainedSourcesAreTruncated(t *testing.T) {
 	if got := strings.Count(errOut, "fast| 300"); got != 1 {
 		t.Fatalf("replayed the final line %d times, want once: %s", got, errOut)
 	}
+}
+
+// A command that exits between waitRunning and the attach makes the attach
+// fail with a container-stopped error. If the controller then reports a
+// finished, empty-output Blip, losing that empty stream is not a failure:
+// gather must not print "could not follow output" for a Succeeded Blip.
+func TestGatherFollowSuppressesAttachErrorForFinishedEmptyBlip(t *testing.T) {
+	withAttachFailWait(t, 200*time.Millisecond)
+	h := newHarness(t, runningBlip("quiet"))
+	h.ctrl.set(func(c *fakeController) { c.paused = true })
+	h.guest.OpenError = "cannot exec in a stopped state"
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		var b v1alpha1.Blip
+		if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "quiet"}, &b); err != nil {
+			return
+		}
+		code := int32(0)
+		b.Status.Phase = v1alpha1.BlipSucceeded
+		b.Status.ExitCode = &code
+		b.Status.FinishTime = &metav1.Time{Time: time.Now()}
+		_ = h.kube.Status().Update(context.Background(), &b)
+	}()
+
+	code, out, errOut := h.run("", "gather", "quiet", "-f", "--wait", "5s")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/quiet Succeeded (exit 0)")
+	if strings.Contains(errOut, "could not follow output") {
+		t.Fatalf("reported an attach failure for a successful silent Blip: %q", errOut)
+	}
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("reported unavailable output for an empty stream: %q", errOut)
+	}
+}
+
+// The same attach failure while the Blip is still running is real: gather -f
+// must keep warning that it could not follow a running command.
+func TestGatherFollowWarnsOnAttachErrorForRunningBlip(t *testing.T) {
+	withAttachFailWait(t, 100*time.Millisecond)
+	h := newHarness(t, runningBlip("still-running"))
+	h.ctrl.set(func(c *fakeController) { c.paused = true })
+	h.guest.OpenError = "no running task found"
+
+	code, _, errOut := h.run("", "gather", "still-running", "-f", "--wait", "400ms")
+	if code != 1 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, errOut, "could not follow output", "no running task found")
 }
 
 // A finished command with no output is not data loss. Do not warn that
