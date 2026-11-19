@@ -176,6 +176,7 @@ type BlipStateSpec struct {
 	// active writer's disk. Later source changes or
 	// deletion do not affect it.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=253
 	CopyFrom string `json:"copyFrom,omitempty"`
 	// Size is the filesystem size. Defaults to the source state's size for
 	// copies and to 10Gi otherwise. An image state fails if the converted
@@ -454,6 +455,7 @@ type NetworkPort struct {
 type Mount struct {
 	// State names a BlipState in the blip's namespace.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=253
 	State string `json:"state"`
 	// Path is an absolute path inside the guest root. It must be clean: no
 	// trailing slash, repeated slash, or . and .. segments. It must also be
@@ -517,6 +519,7 @@ type BlipSpec struct {
 	// saved when the blip stops. Mounts and runtime defaults come from this
 	// state in the blip's namespace.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="state is immutable"
 	State string `json:"state"`

@@ -348,6 +348,7 @@ spec:
                   State gives the blip a durable root filesystem. A new version is
                   saved when the blip stops. Mounts and runtime defaults come from this
                   state in the blip's namespace.
+                maxLength: 253
                 minLength: 1
                 pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string

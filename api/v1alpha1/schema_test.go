@@ -950,6 +950,52 @@ func TestReferenceNamesValidated(t *testing.T) {
 // TestStateReferenceNameLimits guards that a reference to a BlipState is no
 // longer than a Kubernetes object name. A too-long reference can never name an
 // object and used to leave the Blip pending until its start timeout.
+func TestStateReferenceNameLimits(t *testing.T) {
+	blip := admissionValidator(t, "blips")
+	state := admissionValidator(t, "blipstates")
+	name := func(n int) string { return strings.Repeat("s", n) }
+	for _, n := range []int{253, 254, 300} {
+		object := fmt.Sprintf(`{"spec":{"state":%q,"command":["true"]}}`, name(n))
+		errs := blip(object, "")
+		if n == 253 && len(errs) != 0 {
+			t.Errorf("rejected %d-character Blip.spec.state: %v", n, errs.ToAggregate())
+		}
+		if n != 253 && len(errs) == 0 {
+			t.Errorf("admitted %d-character Blip.spec.state", n)
+		}
+	}
+	for _, n := range []int{253, 254, 300} {
+		copyFrom := fmt.Sprintf(`{"spec":{"copyFrom":%q}}`, name(n))
+		errs := state(copyFrom, "")
+		if n == 253 && len(errs) != 0 {
+			t.Errorf("rejected %d-character copyFrom: %v", n, errs.ToAggregate())
+		}
+		if n != 253 && len(errs) == 0 {
+			t.Errorf("admitted %d-character copyFrom", n)
+		}
+		mount := fmt.Sprintf(`{"spec":{"mounts":[{"state":%q,"path":"/m"}]}}`, name(n))
+		errs = state(mount, "")
+		if n == 253 && len(errs) != 0 {
+			t.Errorf("rejected %d-character mount state: %v", n, errs.ToAggregate())
+		}
+		if n != 253 && len(errs) == 0 {
+			t.Errorf("admitted %d-character mount state", n)
+		}
+	}
+
+	blipSpec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blips.yaml")
+	if got := blipSpec.Properties["state"].MaxLength; got != 253 {
+		t.Errorf("Blip.spec.state maxLength = %d, want 253", got)
+	}
+	stateSpec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipstates.yaml")
+	if got := stateSpec.Properties["copyFrom"].MaxLength; got != 253 {
+		t.Errorf("BlipState.spec.copyFrom maxLength = %d, want 253", got)
+	}
+	if got := stateSpec.Properties["mounts"].Items.Properties["state"].MaxLength; got != 253 {
+		t.Errorf("BlipState.spec.mounts[].state maxLength = %d, want 253", got)
+	}
+}
+
 // TestBlipPoolServiceAccountNameFitsOwnerTable guards the same limit on the
 // "sa.<name>" key. The field has no DNS pattern, so without a cap a 251-byte
 // name was accepted and wedged the owner table.

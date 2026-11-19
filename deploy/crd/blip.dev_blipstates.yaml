@@ -65,6 +65,7 @@ spec:
                   source when created: its committed version, or a live snapshot of an
                   active writer's disk. Later source changes or
                   deletion do not affect it.
+                maxLength: 253
                 pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string
               image:
@@ -148,6 +149,7 @@ spec:
                           + ''/''))'
                     state:
                       description: State names a BlipState in the blip's namespace.
+                      maxLength: 253
                       pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                       type: string
                     writable:
