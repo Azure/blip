@@ -850,6 +850,39 @@ func TestMountValidationErrors(t *testing.T) {
 	}
 }
 
+// TestMountRequiresNewForStateSettings reproduces --size, --replicas and
+// --from being accepted and silently discarded on a mount that creates no
+// state. They only configure --new, so using them without it is a usage error.
+func TestMountRequiresNewForStateSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		flag string
+	}{
+		{"size", []string{"mount", "data:/data", "--size", "1Gi", "--root", "home"}, "--size"},
+		{"replicas", []string{"mount", "data:/data", "--replicas", "2", "--root", "home"}, "--replicas"},
+		{"from", []string{"mount", "data:/data", "--from", "base", "--root", "home"}, "--from"},
+		{"list", []string{"mount", "--size", "1Gi", "--root", "home"}, "--size"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"), readyState("base"))
+			code, _, errOut := h.run("", tc.args...)
+			if code != 1 || !strings.Contains(errOut, tc.flag) || !strings.Contains(errOut, "--new") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("discarded flags still changed mounts: %+v", mounts)
+			}
+		})
+	}
+
+	// The same flags remain valid with --new.
+	h := newHarness(t, readyState("home"), readyState("base"))
+	if code, _, errOut := h.run("", "mount", "--new", "dev:/work", "--from", "base", "--size", "1Gi", "--replicas", "2", "--root", "home"); code != 0 {
+		t.Fatalf("--new with state settings rejected: %d %s", code, errOut)
+	}
+}
+
 // TestMountNewFromWithReplicasAndOwner ports the old create from-owned-state
 // coverage: --from and --replicas still configure the new state, and a guest's
 // owner label follows it into the cluster.

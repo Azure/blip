@@ -662,6 +662,9 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	if err := a.mountTarget(&f.root); err != nil {
 		return err
 	}
+	if err := checkNewOnlyFlags(f, replicasSet); err != nil {
+		return err
+	}
 	if len(args) == 0 && len(f.remove) == 0 && len(f.create) == 0 {
 		return a.listMounts(ctx, f.root)
 	}
@@ -723,6 +726,29 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		}
 	}
 	return nil
+}
+
+// checkNewOnlyFlags rejects state settings that have no state to apply to.
+// Silently discarding them would report success for a size, replica count, or
+// copy source that was never used.
+func checkNewOnlyFlags(f *mountFlags, replicasSet bool) error {
+	if len(f.create) > 0 {
+		return nil
+	}
+	var used []string
+	if f.from != "" {
+		used = append(used, "--from")
+	}
+	if f.size != "" {
+		used = append(used, "--size")
+	}
+	if replicasSet {
+		used = append(used, "--replicas")
+	}
+	if len(used) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s can only be used with --new", strings.Join(used, ", "))
 }
 
 // prepareNewMounts parses and scopes every --new request before any state is
