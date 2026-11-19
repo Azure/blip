@@ -27,6 +27,35 @@ var ErrImageNotFound = errors.New("not found")
 // cannot fix it.
 var ErrInvalidImage = errors.New("invalid image reference")
 
+// terminalImageError reports whether an image resolution error is permanent.
+// Image references are immutable on a state, so a missing image or an
+// unparsable reference can never recover by retrying. Other registry errors
+// remain transient.
+func terminalImageError(err error) bool {
+	return errors.Is(err, ErrImageNotFound) ||
+		errors.Is(err, ErrInvalidImage)
+}
+
+// notFound reports whether err is a permanent registry lookup failure. A 404
+// or an unknown manifest/name/blob is content-addressed: retrying the same
+// reference cannot succeed. Temporary errors are never terminal.
+func notFound(err error) bool {
+	var terr *transport.Error
+	if !errors.As(err, &terr) || terr.Temporary() {
+		return false
+	}
+	if terr.StatusCode == http.StatusNotFound {
+		return true
+	}
+	for _, d := range terr.Errors {
+		switch d.Code {
+		case transport.ManifestUnknownErrorCode, transport.NameUnknownErrorCode, transport.BlobUnknownErrorCode:
+			return true
+		}
+	}
+	return false
+}
+
 // Registry resolves container image references.
 type Registry interface {
 	// Digest returns the pinned reference repo@sha256:... for ref. For a
@@ -90,16 +119,12 @@ func (r RemoteRegistry) digest(ctx context.Context, ref string, kc authn.Keychai
 	if err != nil {
 		return "", err
 	}
-	if d, ok := parsed.(name.Digest); ok {
-		return d.String(), nil
-	}
 	opts := r.options(ctx, kc)
 	desc, err := remote.Head(parsed, opts...)
 	if err != nil {
 		full, gerr := remote.Get(parsed, opts...)
 		if gerr != nil {
-			var terr *transport.Error
-			if errors.As(gerr, &terr) && terr.StatusCode == http.StatusNotFound {
+			if notFound(gerr) {
 				return "", fmt.Errorf("image %s: %w", ref, ErrImageNotFound)
 			}
 			return "", gerr
@@ -125,10 +150,16 @@ func (r RemoteRegistry) imageConfig(ctx context.Context, ref string, kc authn.Ke
 	opts := append(r.options(ctx, kc), remote.WithPlatform(ociv1.Platform{OS: "linux", Architecture: runtime.GOARCH}))
 	img, err := remote.Image(parsed, opts...)
 	if err != nil {
+		if notFound(err) {
+			return nil, fmt.Errorf("image config %s: %v: %w", ref, err, ErrImageNotFound)
+		}
 		return nil, fmt.Errorf("image config %s: %w", ref, err)
 	}
 	cf, err := img.ConfigFile()
 	if err != nil {
+		if notFound(err) {
+			return nil, fmt.Errorf("image config %s: %v: %w", ref, err, ErrImageNotFound)
+		}
 		return nil, fmt.Errorf("image config %s: %w", ref, err)
 	}
 	c := cf.Config

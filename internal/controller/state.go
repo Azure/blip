@@ -442,7 +442,7 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 	case st.Spec.Image != "":
 		if s.ImageDigest == "" {
 			d, err := r.Registry.Digest(ctx, st.Spec.Image, st.Namespace, st.Spec.ImagePullSecrets)
-			if errors.Is(err, ErrImageNotFound) || errors.Is(err, ErrInvalidImage) {
+			if terminalImageError(err) {
 				s.Phase = v1.StateFailed
 				return err.Error(), false, nil
 			}
@@ -453,6 +453,10 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 		}
 		if s.ImageConfig == nil {
 			cfg, err := r.Registry.ImageConfig(ctx, s.ImageDigest, st.Namespace, st.Spec.ImagePullSecrets)
+			if terminalImageError(err) {
+				s.Phase = v1.StateFailed
+				return err.Error(), false, nil
+			}
 			if err != nil {
 				return fmt.Sprintf("resolve image config %s: %v", st.Spec.Image, err), true, nil
 			}

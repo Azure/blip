@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -90,6 +92,37 @@ func TestStateInitialization(t *testing.T) {
 				t.Fatalf("status %+v", st.Status)
 			}
 		})
+	}
+}
+
+// imageConfigNotFound resolves any digest reference but reports its image
+// config as missing, like a syntactically valid digest that the registry does
+// not have.
+type imageConfigNotFound struct{}
+
+func (imageConfigNotFound) Digest(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (string, error) {
+	return ref, nil
+}
+
+func (imageConfigNotFound) ImageConfig(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (*v1.ImageConfig, error) {
+	return nil, fmt.Errorf("image config %s: %w", ref, ErrImageNotFound)
+}
+
+func TestStateMissingDigestFails(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.state.Registry = imageConfigNotFound{}
+	ref := "reg/img@sha256:" + strings.Repeat("1", 64)
+	e.newState("s", func(st *v1.BlipState) {
+		st.Spec.Image, st.Spec.Replicas = ref, 0
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("missing digest not terminal: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "not found") {
+		t.Fatalf("message %q does not explain the missing digest", st.Status.Message)
 	}
 }
 

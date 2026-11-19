@@ -59,6 +59,13 @@ func TestRemoteRegistry(t *testing.T) {
 	if _, err := r.Digest(ctx, repo.Tag("missing").String(), "", nil); !errors.Is(err, ErrImageNotFound) {
 		t.Errorf("missing tag: %v", err)
 	}
+	missingDigest := repo.Digest("sha256:" + strings.Repeat("1", 64)).String()
+	if _, err := r.Digest(ctx, missingDigest, "", nil); !errors.Is(err, ErrImageNotFound) {
+		t.Errorf("missing digest: %v", err)
+	}
+	if _, err := r.ImageConfig(ctx, missingDigest, "", nil); !errors.Is(err, ErrImageNotFound) {
+		t.Errorf("missing digest config: %v", err)
+	}
 	_, parseErr := name.ParseReference("bad image!!")
 	if _, err := r.Digest(ctx, "bad image!!", "", nil); !errors.Is(err, ErrInvalidImage) {
 		t.Errorf("invalid reference not classified: %v", err)
