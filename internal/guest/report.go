@@ -29,6 +29,17 @@ const (
 // into one observation. It is a variable so tests can shorten it.
 var reportInterval = 10 * time.Second
 
+// reportReadTimeout bounds how long a client may take to send a request,
+// including its body. A stalled POST must not pin an init descriptor.
+var reportReadTimeout = 10 * time.Second
+
+// reportIdleTimeout bounds how long an idle keep-alive connection stays open.
+var reportIdleTimeout = 30 * time.Second
+
+// reportWriteGrace is added to the pacing interval to give a legitimate
+// report that is waiting its turn time to write its response.
+const reportWriteGrace = 10 * time.Second
+
 // reporter tracks the sequence and pacing of reports. Its lock is never held
 // while taking Guest.mu.
 type reporter struct {
@@ -206,8 +217,13 @@ func (g *Guest) startReportServer(address string) (net.Addr, error) {
 	}
 	server := &http.Server{
 		Handler:           http.HandlerFunc(g.serveReport),
-		ReadHeaderTimeout: 10 * time.Second,
-		ErrorLog:          log.New(io.Discard, "", 0),
+		ReadHeaderTimeout: reportReadTimeout,
+		ReadTimeout:       reportReadTimeout,
+		// The write deadline starts before the body is read and covers the
+		// pacing wait, so it must span a full report interval.
+		WriteTimeout: reportReadTimeout + reportInterval + reportWriteGrace,
+		IdleTimeout:  reportIdleTimeout,
+		ErrorLog:     log.New(io.Discard, "", 0),
 	}
 	g.mu.Lock()
 	g.reportServer = server

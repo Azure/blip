@@ -1,7 +1,10 @@
 package guest
 
 import (
+	"bufio"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -135,6 +138,89 @@ func TestReportEndpointStatusOnReportPath(t *testing.T) {
 	}
 	if rec := postReport(g, strings.Repeat("x", podapi.MaxReportBytes+1)); rec.Code != 413 {
 		t.Errorf("oversized body = %d, want 413", rec.Code)
+	}
+}
+
+// A stalled request body must be released in bounded time: otherwise a
+// workload can pin one init descriptor per half-sent POST.
+func TestReportEndpointClosesStalledBody(t *testing.T) {
+	g := reportGuest(t)
+	oldRead, oldIdle := reportReadTimeout, reportIdleTimeout
+	reportReadTimeout, reportIdleTimeout = 100*time.Millisecond, 100*time.Millisecond
+	t.Cleanup(func() { reportReadTimeout, reportIdleTimeout = oldRead, oldIdle })
+
+	addr, err := g.startReportServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.stopReporter()
+
+	conn, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Complete headers, then stop without sending the declared body.
+	if _, err := io.WriteString(conn, "POST /report HTTP/1.1\r\nHost: blip\r\nContent-Length: 1024\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(conn); err != nil {
+		t.Fatalf("stalled body connection was not closed: %v", err)
+	}
+	if got := g.lastReport(); got != nil {
+		t.Fatalf("report from a stalled body was accepted: %+v", got)
+	}
+}
+
+// An idle keep-alive connection must also be released in bounded time.
+func TestReportEndpointClosesIdleConnection(t *testing.T) {
+	g := reportGuest(t)
+	oldIdle := reportIdleTimeout
+	reportIdleTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { reportIdleTimeout = oldIdle })
+
+	addr, err := g.startReportServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.stopReporter()
+
+	conn, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	body := "building"
+	req := fmt.Sprintf("POST /report HTTP/1.1\r\nHost: blip\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(conn)
+	reqObj, err := http.ReadRequest(bufio.NewReader(strings.NewReader(req)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(br, reqObj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("report = %d", resp.StatusCode)
+	}
+	// The connection is now idle. The server must close it within the idle
+	// timeout instead of keeping the descriptor until the client leaves.
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := br.ReadByte(); err != io.EOF {
+		t.Fatalf("idle connection stayed open: %v", err)
 	}
 }
 
