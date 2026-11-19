@@ -346,6 +346,10 @@ type BlipStateStatus struct {
 	// Placements are the nodes that hold (or are being given) the
 	// committed version.
 	Placements []string `json:"placements,omitempty"`
+	// UnplaceableSince is when a copy first found no node matching its
+	// immutable nodeSelector. It bounds how long such a copy may pin its
+	// source's finalizer before failing terminally.
+	UnplaceableSince *metav1.Time `json:"unplaceableSince,omitempty"`
 	// +listType=map
 	// +listMapKey=node
 	Nodes []NodeObservation `json:"nodes,omitempty"`

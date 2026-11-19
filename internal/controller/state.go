@@ -576,8 +576,25 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 		}
 	}
 	if len(nodes) == 0 {
-		return "no healthy node can hold the state", false, nil
+		if st.Spec.CopyFrom == "" {
+			return "no healthy node can hold the state", false, nil
+		}
+		// A copy pins its source until it commits. When no node matches its
+		// immutable selector it can never make progress, so bound the wait
+		// and fail terminally; otherwise the source finalizer waits forever.
+		if s.UnplaceableSince == nil {
+			now := metav1.NewTime(cl.now)
+			s.UnplaceableSince = &now
+			return fmt.Sprintf("no eligible node can hold copy source %q; retrying", st.Spec.CopyFrom), true, nil
+		}
+		if cl.now.Sub(s.UnplaceableSince.Time) < pendingTimeout {
+			return fmt.Sprintf("no eligible node can hold copy source %q; retrying", st.Spec.CopyFrom), true, nil
+		}
+		s.Phase = v1.StateFailed
+		s.UnplaceableSince = nil
+		return fmt.Sprintf("no eligible node can hold copy source %q: its nodeSelector matches no node after %s", st.Spec.CopyFrom, pendingTimeout), false, nil
 	}
+	s.UnplaceableSince = nil
 	if s.SizeBytes > 0 {
 		for _, n := range nodes {
 			if free := cl.nodes[n].Status.FreeBytes; free < s.SizeBytes {

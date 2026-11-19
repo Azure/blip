@@ -694,6 +694,13 @@ spec:
               sizeBytes:
                 format: int64
                 type: integer
+              unplaceableSince:
+                description: |-
+                  UnplaceableSince is when a copy first found no node matching its
+                  immutable nodeSelector. It bounds how long such a copy may pin its
+                  source's finalizer before failing terminally.
+                format: date-time
+                type: string
               writer:
                 description: Writer is the single writable attachment of a state.
                 properties:
