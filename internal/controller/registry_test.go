@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/registry"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 )
 
 func TestRemoteRegistry(t *testing.T) {
@@ -81,5 +83,29 @@ func TestRemoteRegistry(t *testing.T) {
 	ref, _ = insecure.parse("registry.example:5000/blip/base:v1")
 	if ref.Context().Scheme() != "https" {
 		t.Errorf("secure registry scheme %s", ref.Context().Scheme())
+	}
+}
+
+// TestNotFoundClassification keeps transient registry errors retryable while
+// permanent not-found responses become terminal.
+func TestNotFoundClassification(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"404", &transport.Error{StatusCode: http.StatusNotFound}, true},
+		{"manifest unknown", &transport.Error{StatusCode: http.StatusInternalServerError,
+			Errors: []transport.Diagnostic{{Code: transport.ManifestUnknownErrorCode}}}, true},
+		{"name unknown", &transport.Error{StatusCode: http.StatusNotFound,
+			Errors: []transport.Diagnostic{{Code: transport.NameUnknownErrorCode}}}, true},
+		{"unavailable", &transport.Error{StatusCode: http.StatusServiceUnavailable}, false},
+		{"too many requests", &transport.Error{StatusCode: http.StatusTooManyRequests,
+			Errors: []transport.Diagnostic{{Code: transport.TooManyRequestsErrorCode}}}, false},
+		{"generic", errors.New("connection reset"), false},
+	} {
+		if got := notFound(tt.err); got != tt.want {
+			t.Errorf("%s: notFound = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }

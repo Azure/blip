@@ -126,6 +126,60 @@ func TestStateMissingDigestFails(t *testing.T) {
 	}
 }
 
+func TestStateUnusablePullSecretFails(t *testing.T) {
+	tests := []struct {
+		name   string
+		secret *corev1.Secret
+		ref    string
+		want   string
+	}{
+		{name: "missing", ref: "missing", want: `image pull secret ns/missing`},
+		{
+			name: "wrong type",
+			ref:  "opaque",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "opaque"},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"foo": []byte("bar")},
+			},
+			want: "type Opaque has no .dockerconfigjson",
+		},
+		{
+			name: "bad dockerconfigjson",
+			ref:  "bad",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "bad"},
+				Type:       corev1.SecretTypeDockerConfigJson,
+				Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{`)},
+			},
+			want: "invalid .dockerconfigjson",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.addNodes("n1", "n2")
+			e.state.Registry = RemoteRegistry{Reader: e.c}
+			if tt.secret != nil {
+				e.create(tt.secret)
+			}
+			e.newState("s", func(st *v1.BlipState) {
+				st.Spec.Image = "reg/img:v1"
+				st.Spec.Replicas = 0
+				st.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: tt.ref}}
+			})
+			e.run(e.state, ns, "s")
+			st := e.getState("s")
+			if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+				t.Fatalf("unusable pull secret not terminal: %+v", st.Status)
+			}
+			if !strings.Contains(st.Status.Message, tt.want) {
+				t.Fatalf("message %q does not contain %q", st.Status.Message, tt.want)
+			}
+		})
+	}
+}
+
 func TestStateCopyFromSelfFails(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")

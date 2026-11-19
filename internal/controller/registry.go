@@ -28,12 +28,13 @@ var ErrImageNotFound = errors.New("not found")
 var ErrInvalidImage = errors.New("invalid image reference")
 
 // terminalImageError reports whether an image resolution error is permanent.
-// Image references are immutable on a state, so a missing image or an
-// unparsable reference can never recover by retrying. Other registry errors
-// remain transient.
+// Image references and imagePullSecrets are immutable on a state, so a
+// missing image, an unparsable reference, or an unusable pull secret can
+// never recover by retrying. Other registry errors remain transient.
 func terminalImageError(err error) bool {
 	return errors.Is(err, ErrImageNotFound) ||
-		errors.Is(err, ErrInvalidImage)
+		errors.Is(err, ErrInvalidImage) ||
+		errors.Is(err, registryauth.ErrUnusableSecret)
 }
 
 // notFound reports whether err is a permanent registry lookup failure. A 404
@@ -101,7 +102,7 @@ func (r RemoteRegistry) keychain(ctx context.Context, namespace string, secrets 
 		return authn.DefaultKeychain, nil
 	}
 	if r.Reader == nil {
-		return nil, fmt.Errorf("image pull secrets %s: no secret reader configured", namespace)
+		return nil, registryauth.UnusableSecret(fmt.Errorf("image pull secrets %s: no secret reader configured", namespace))
 	}
 	return registryauth.Keychain(ctx, r.Reader, registryauth.RefList(namespace, secrets))
 }
