@@ -1193,6 +1193,7 @@ func TestBrokenSidecarIsNotReadyOrClaimable(t *testing.T) {
 	if len(pods) != 1 {
 		t.Fatalf("pods = %d, want 1", len(pods))
 	}
+	broken := pods[0]
 	p := pods[0]
 	p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady"}}
 	e.must(e.c.Status().Update(e.ctx, &p))
@@ -1207,5 +1208,65 @@ func TestBrokenSidecarIsNotReadyOrClaimable(t *testing.T) {
 	b := e.getBlip("b")
 	if b.Status.Pod != "" || b.Status.Phase != v1.BlipPending {
 		t.Fatalf("blip claimed a pod with a broken sidecar: phase %s pod %q", b.Status.Phase, b.Status.Pod)
+	}
+
+	// The unready spare cannot satisfy the waiting Blip, so it must not
+	// suppress the replacement the uncapped pool can boot.
+	e.run(e.pool, ns, "default")
+	pods = e.pods()
+	if len(pods) != 2 {
+		t.Fatalf("%d pods, want the broken spare and a replacement: %+v", len(pods), pods)
+	}
+	if pool := e.getPool("default"); pool.Status.Ready != 0 || pool.Status.Vacant != 2 {
+		t.Fatalf("pool status = %+v, want ready 0 vacant 2", pool.Status)
+	}
+
+	e.warmOn("n1")
+	for _, p := range e.pods() {
+		if p.Name != broken.Name && isVacant(&p) {
+			e.observe(p.Name, podapi.Observed{Phase: podapi.PhaseWarm})
+		}
+	}
+	e.run(e.blip, ns, "b")
+	b = e.getBlip("b")
+	if b.Status.Pod == "" || b.Status.Pod == broken.Name {
+		t.Fatalf("blip did not claim the replacement: pod %q", b.Status.Pod)
+	}
+	expectPhase(t, b, v1.BlipPending, ReasonStarting)
+}
+
+// TestPoolRetiresPermanentlyNotReadySpare covers a spare that never becomes
+// ready in a capped pool: it consumed the only maxCount slot, so a waiting
+// Blip starved until pendingTimeout. After the warming budget the pool must
+// retire it and boot a replacement.
+func TestPoolRetiresPermanentlyNotReadySpare(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.newPool("default", 1, 1)
+	e.run(e.pool, ns, "default")
+	e.warmOn("n1")
+	pods := e.pods()
+	if len(pods) != 1 {
+		t.Fatalf("%d pods, want one spare", len(pods))
+	}
+	stale := pods[0]
+	p := pods[0]
+	p.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady",
+		LastTransitionTime: metav1.NewTime(e.now.Add(-warmTimeout - time.Minute)),
+	}}
+	e.must(e.c.Status().Update(e.ctx, &p))
+
+	e.run(e.pool, ns, "default")
+	pods = e.pods()
+	if len(pods) != 1 {
+		t.Fatalf("%d pods, want one replacement within maxCount=1: %+v", len(pods), pods)
+	}
+	if pods[0].Name == stale.Name || !isVacant(&pods[0]) {
+		t.Fatalf("stale not-ready spare still holds the slot: %+v", pods[0])
+	}
+	e.run(e.pool, ns, "default")
+	if n := len(e.pods()); n != 1 {
+		t.Fatalf("%d pods after the replacement, want no churn", n)
 	}
 }

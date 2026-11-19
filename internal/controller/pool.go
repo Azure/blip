@@ -68,6 +68,12 @@ const expectTimeout = time.Minute
 // recreate another unschedulable one there.
 const blockedGrace = time.Minute
 
+// warmTimeout bounds how long a spare may stay unready before the pool retires
+// it. A pod that never becomes ready (image pull failure, VM boot failure, or
+// a crash-looping sidecar) cannot accept a claim, so keeping it would consume
+// warmCount/maxCount and suppress the replacement that waiting demand needs.
+const warmTimeout = 5 * time.Minute
+
 const (
 	// Bump when pod topology changes without a pool spec change, so warm
 	// pods cannot retain the old credential or socket layout.
@@ -410,9 +416,9 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			}
 		case p.DeletionTimestamp != nil || deleted[p.Name]:
 			// Its replacement is already accounted for; do not let a pod
-			// leaving an unusable node (or a node the scheduler rejected)
-			// hold maxCount capacity either.
-			if unusable || unschedulable(p) {
+			// leaving an unusable node, a node the scheduler rejected, or
+			// one that never became ready hold maxCount capacity either.
+			if unusable || !ready(p) {
 				total--
 			}
 		case podTerminated(p) || unusable || p.Annotations[v1.AnnotationTemplateHash] != hash:
@@ -436,6 +442,14 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 				if err := del(p); err != nil {
 					return reconcile.Result{}, err
 				}
+			}
+		case warmingOverdue(p, r.now()):
+			// A spare that never became ready cannot accept a claim. Retire
+			// it so a replacement boots instead of it holding a slot and
+			// covering waiting demand until pendingTimeout.
+			total--
+			if err := del(p); err != nil {
+				return reconcile.Result{}, err
 			}
 		default:
 			vacant = append(vacant, p)
@@ -472,6 +486,10 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	if maxCount > 0 {
 		target = min(target, maxCount)
 	}
+	// Only ready vacant pods can satisfy a waiting Blip. A booting or broken
+	// spare must not stand in for demand and suppress the replacement that the
+	// waiting Blip needs.
+	claimable := int(status.Ready)
 	have := len(vacant) + created
 	log.FromContext(ctx).V(1).Info("pool sizing", "demand", demand, "deferred", deferred, "claimed", len(claimed), "pinned", pinned, "vacant", len(vacant), "created", created, "target", target, "have", have, "total", total, "blocked", blocked)
 	room := func() bool { return maxCount <= 0 || total < maxCount }
@@ -502,11 +520,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		warm[n] += c
 	}
 	if want := target - have; want > 0 {
-		// If every waiting Blip can claim an existing warm VM, do not boot
-		// replacements yet. The claim tells us which node is hot, and a
+		// If every waiting Blip can claim an existing ready warm VM, do not
+		// boot replacements yet. The claim tells us which node is hot, and a
 		// spare booted now would land on an arbitrary node and be moved
 		// again. The claim wakes the pool, which then boots the replacement.
-		if demand > 0 && len(vacant) >= demand {
+		if demand > 0 && claimable >= demand {
 			want = 0
 		}
 		for ; want > 0; want-- {
@@ -621,6 +639,26 @@ func ready(p *corev1.Pod) bool {
 	// A pod that the kubelet has not yet described keeps the previous
 	// behavior; phase and warm already say it booted.
 	return true
+}
+
+// warmingOverdue reports whether a spare has been unready for longer than
+// warmTimeout. A Ready=False transition time bounds the wait from when the pod
+// stopped being usable; a pod that never reported Readiness is measured from
+// its creation. Pods without a usable timestamp are never retired, so a fake
+// or unscheduled pod is not deleted immediately.
+func warmingOverdue(p *corev1.Pod, now time.Time) bool {
+	if ready(p) || podTerminated(p) || p.DeletionTimestamp != nil {
+		return false
+	}
+	since := p.CreationTimestamp.Time
+	for _, condition := range p.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status != corev1.ConditionTrue &&
+			!condition.LastTransitionTime.IsZero() {
+			since = condition.LastTransitionTime.Time
+			break
+		}
+	}
+	return !since.IsZero() && now.Sub(since) > warmTimeout
 }
 
 // pickWarmNode picks the node where a warm spare is most useful: a node
