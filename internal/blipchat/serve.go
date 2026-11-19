@@ -817,7 +817,12 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 	kept := 0
 	for i := len(turns) - 1; i >= 0; i-- {
 		t := &turns[i]
-		if t.Status.Seq > thread.Status.ConsumedSeq || kept < keepTurns {
+		// A sequence above consumedSeq only marks pending *input*.
+		// pendingTurns excludes coordinator output, so a timer-driven note
+		// or reply above consumedSeq must still age out; otherwise a thread
+		// whose steps emit notes keeps every one of them forever.
+		pending := t.Status.Seq > thread.Status.ConsumedSeq && t.Spec.Author.Kind != v1.TurnAuthorCoordinator
+		if pending || kept < keepTurns {
 			kept++
 			continue
 		}

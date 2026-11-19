@@ -17,6 +17,47 @@ import (
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
 
+// Coordinator notes and replies are never pending input (pendingTurns
+// excludes them), so retention must be able to age them out even though their
+// sequence is above consumedSeq.
+func TestPruneBoundsOldCoordinatorTurns(t *testing.T) {
+	old := metav1.NewTime(timeNow().Add(-48 * time.Hour))
+	fresh := metav1.NewTime(timeNow())
+	thread := testThread()
+	thread.Spec.Retention.Turns = &metav1.Duration{Duration: time.Hour}
+	thread.Spec.Retention.KeepTurns = 1
+	thread.Status.ConsumedSeq = 5
+	objs := []client.Object{thread}
+	user := testTurn("user-old", "proj")
+	user.Status = v1.BlipTurnStatus{Seq: 1, AcceptedTime: &old}
+	objs = append(objs, user)
+	// The shape produced by successive timer-driven steps: coordinator turns
+	// created after the last user turn, all above consumedSeq.
+	for i := 0; i < 100; i++ {
+		turn := testTurn(fmt.Sprintf("coord-%03d", i), "proj")
+		turn.Spec.Author = v1.TurnAuthor{Kind: v1.TurnAuthorCoordinator, Name: "proj"}
+		turn.Status = v1.BlipTurnStatus{Seq: int64(6 + i), AcceptedTime: &old}
+		objs = append(objs, turn)
+	}
+	pending := testTurn("pending", "proj")
+	pending.Status = v1.BlipTurnStatus{Seq: 106, AcceptedTime: &fresh}
+	objs = append(objs, pending)
+
+	c := testClient(t, objs...)
+	s := &Server{Client: c}
+	ctx := context.Background()
+	if err := s.prune(ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	var turns v1.BlipTurnList
+	if err := c.List(ctx, &turns, client.InNamespace("ns")); err != nil {
+		t.Fatal(err)
+	}
+	if got := names(turns.Items); len(got) != 1 || got[0] != "pending" {
+		t.Errorf("turns after prune = %v, want only the pending user turn", got)
+	}
+}
+
 // cleanAttributes must select the same subset of oversized attribute maps on
 // every call: a random subset makes an idempotent turn re-create itself.
 // A prompt that cannot fit every turn must not advance consumedSeq past a
