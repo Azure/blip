@@ -288,11 +288,22 @@ func testNetworkNamespace(t *testing.T) {
 		denied(c)
 	}
 	checkSidecar(request.Address, p.podIP)
-	// An intentionally permitted inbound connection can still return traffic
-	// under default-deny egress; new guest-initiated flows remain denied.
+	// A denied peer cannot open an inbound connection, so the guest can never
+	// be made to reply to it. Only a peer the egress policy allows may
+	// establish inbound traffic and receive the return path.
 	vm.must(t, nsCommand{Op: "listen", Network: "tcp", Address: cfg.IP + ":8088"})
-	if got := wan.must(t, nsCommand{Op: "exchange", Network: "tcp", Address: p.podIP + ":8088"}); !strings.HasSuffix(got, "|hello\n") {
-		t.Fatalf("inbound DNAT/return failed: %q", got)
+	inbound := nsCommand{Op: "exchange", Network: "tcp", Address: p.podIP + ":8088"}
+	if r := wan.call(t, inbound); r.Error == "" {
+		t.Fatalf("denied peer opened an inbound DNAT connection: %q", r.Data)
+	}
+	inboundPolicy := &netpolicy.Policy{Revision: "inbound", Layers: [][]netpolicy.Rule{
+		{{CIDR: "192.0.2.0/24", Protocol: "TCP"}},
+	}}
+	if _, err := p.apply(inboundPolicy, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := wan.must(t, inbound); !strings.HasSuffix(got, "|hello\n") {
+		t.Fatalf("allowed inbound DNAT/return failed: %q", got)
 	}
 	if _, err := p.apply(&netpolicy.Policy{Revision: "invalid", Layers: [][]netpolicy.Rule{{{CIDR: "not-an-address"}}}}, true); err == nil {
 		t.Fatal("invalid policy accepted")

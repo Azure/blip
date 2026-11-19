@@ -177,6 +177,94 @@ func TestPolicyDropsNewInboundICMPEcho(t *testing.T) {
 	}
 }
 
+// TestPolicyInboundTrafficRequiresAllowedPeer guards the remaining
+// TCP/UDP reflection bypass: the to_guest DNAT accept delivered a new
+// connection from any source, and the guest's kernel RST/SYN-ACK or an
+// application UDP reply then matched the from_guest DNAT accept before the
+// egress chain. Both the new inbound connection and its return path now
+// check the peer against every policy layer.
+func TestPolicyInboundTrafficRequiresAllowedPeer(t *testing.T) {
+	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
+		{{CIDR: "198.51.100.0/24"}},
+		{{CIDR: "0.0.0.0/0", Except: []string{"10.0.0.0/8"}, Protocol: "TCP", Port: 443}},
+	}}
+	script, err := testPodNet(nil).policyScript(policy, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toGuest := scriptChain(t, script, "to_guest")
+	inbound := "ct direction original ct status dnat ct original ip daddr 192.0.2.2 meta l4proto != icmp"
+	for _, jump := range []string{"jump inbound_0", "jump inbound_1"} {
+		if !strings.Contains(toGuest, inbound+" "+jump) {
+			t.Errorf("to_guest does not check the peer before accepting: missing %q\n%s", jump, toGuest)
+		}
+	}
+	if accept := strings.Index(toGuest, inbound+" counter accept"); accept < 0 ||
+		accept < strings.Index(toGuest, inbound+" jump inbound_1") {
+		t.Errorf("to_guest accepts a new inbound connection before the last peer layer:\n%s", toGuest)
+	}
+	// Inbound checks ignore ports: the source port of a new connection is
+	// ephemeral. They still honor the address exception and protocol.
+	first := scriptChain(t, script, "inbound_0")
+	if !strings.Contains(first, "ip saddr 198.51.100.0/24 counter return") {
+		t.Errorf("inbound_0 does not allow the first layer's peer:\n%s", first)
+	}
+	second := scriptChain(t, script, "inbound_1")
+	want := "ip saddr 0.0.0.0/0 ip saddr != 10.0.0.0/8 meta l4proto tcp counter return"
+	if !strings.Contains(second, want) {
+		t.Errorf("inbound_1 lacks %q:\n%s", want, second)
+	}
+	if strings.Contains(first+second, "dport") || strings.Contains(first+second, "sport") {
+		t.Errorf("inbound peer check uses a port:\n%s\n%s", first, second)
+	}
+	// The reply path checks the reply's destination (the original peer) with
+	// the same layers, so narrowing a policy stops established reflections.
+	fromGuest := scriptChain(t, script, "from_guest")
+	reply := "ct direction reply ct status dnat ct original ip daddr 192.0.2.2 ct state established meta l4proto != icmp"
+	for _, jump := range []string{"jump inbound_reply_0", "jump inbound_reply_1"} {
+		if !strings.Contains(fromGuest, reply+" "+jump) {
+			t.Errorf("from_guest does not check the reply peer: missing %q\n%s", jump, fromGuest)
+		}
+	}
+	if accept := strings.Index(fromGuest, reply+" counter accept"); accept < 0 ||
+		accept < strings.Index(fromGuest, reply+" jump inbound_reply_1") {
+		t.Errorf("from_guest returns to any peer before the last layer:\n%s", fromGuest)
+	}
+	replyChain := scriptChain(t, script, "inbound_reply_0")
+	if !strings.Contains(replyChain, "ip daddr 198.51.100.0/24 counter return") {
+		t.Errorf("inbound_reply_0 does not allow the peer:\n%s", replyChain)
+	}
+
+	// An empty layer is default deny: the peer chain drops, so the accept
+	// after the jump is unreachable and no DNAT reply is returned.
+	closed, err := testPodNet(nil).policyScript(&netpolicy.Policy{Revision: "deny", Layers: [][]netpolicy.Rule{{}}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := scriptChain(t, closed, "inbound_0"); !strings.Contains(body, "counter drop") ||
+		strings.Contains(body, "counter return") {
+		t.Errorf("empty layer does not deny inbound peers:\n%s", body)
+	}
+	for _, chain := range []string{"to_guest", "from_guest"} {
+		if body := scriptChain(t, closed, chain); !strings.Contains(body, "ct status dnat") {
+			t.Errorf("%s lost its DNAT gate:\n%s", chain, body)
+		}
+	}
+	// A policy with no layers has no peer set, so nothing inbound is accepted.
+	empty, err := testPodNet(nil).policyScript(&netpolicy.Policy{Revision: "deny"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, chain := range []string{"to_guest", "from_guest"} {
+		if body := scriptChain(t, empty, chain); strings.Contains(body, "ct status dnat") {
+			t.Errorf("%s accepts inbound traffic without a policy layer:\n%s", chain, body)
+		}
+	}
+	if strings.Contains(empty, "inbound_") {
+		t.Errorf("peer chains generated without policy layers:\n%s", empty)
+	}
+}
+
 func TestApplyInvalidPolicyRevokesAndNftFailureDisablesTap(t *testing.T) {
 	var calls []string
 	nftFails, ipFails := false, false
