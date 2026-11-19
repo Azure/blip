@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1211,4 +1212,19 @@ func randHex(n int) string {
 
 func logf(format string, args ...any) { log.Printf("storage: "+format, args...) }
 
-func roundUp(n, to int64) int64 { return (n + to - 1) / to * to }
+// roundUp rounds n up to a multiple of to. It saturates at the largest
+// representable block-aligned value instead of overflowing to a negative
+// length; callers that accept user sizes reject those values beforehand.
+func roundUp(n, to int64) int64 {
+	if n <= 0 || to <= 0 {
+		return n
+	}
+	q := n / to
+	if n%to != 0 {
+		q++
+	}
+	if q > math.MaxInt64/to {
+		return (math.MaxInt64 / to) * to
+	}
+	return q * to
+}

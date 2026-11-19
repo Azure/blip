@@ -1018,6 +1018,8 @@ func TestMountValidationErrors(t *testing.T) {
 		{"self mount", []string{"mount", "home:/data", "--root", "home"}, "a root state cannot mount itself"},
 		{"bad size", []string{"mount", "--new", "x:/data", "--size", "nope", "--root", "home"}, "invalid --size"},
 		{"zero size", []string{"mount", "--new", "x:/data", "--size", "0", "--root", "home"}, "must be positive"},
+		{"huge size", []string{"mount", "--new", "x:/data", "--size", "10Ei", "--root", "home"}, "too large"},
+		{"max int64 size", []string{"mount", "--new", "x:/data", "--size", "9223372036854775807", "--root", "home"}, "too large"},
 		{"missing source", []string{"mount", "--new", "x:/data", "--from", "missing", "--root", "home"}, `state "missing" not found`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1196,19 +1198,31 @@ func TestMountNewSurfacesStateFailure(t *testing.T) {
 	}
 }
 
-func TestMountNewWaitsThroughRecoverableFailure(t *testing.T) {
+// TestMountNewFailsTerminalInitialVersion: a Failed initial version can retain
+// a pending commit while the controller keeps retrying. Mount must not wait
+// forever for such a state, and must roll back the state it created.
+func TestMountNewFailsTerminalInitialVersion(t *testing.T) {
 	h := newHarness(t, readyState("home"))
 	h.ctrl.set(func(c *fakeController) {
 		c.stateFail = "initial version failed: retrying"
 		c.stateFailPending = true
+		c.stateFailStuck = true
 	})
-	code, out, errOut := h.run("", "mount", "--new", "flaky:/data", "--root", "home")
-	if code != 0 {
+	start := time.Now()
+	code, _, errOut := h.run("", "mount", "--new", "stuck:/data", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `state "stuck" failed: initial version failed: retrying`) {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "state flaky mounted on root state home at /data")
-	if s := h.state("flaky"); s.Status.Committed == nil {
-		t.Fatal("state has no first commit")
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("mount waited %v for a terminal failure", elapsed)
+	}
+	if root := h.state("home"); len(root.Spec.Mounts) != 0 {
+		t.Fatalf("failed state mounted: %+v", root.Spec.Mounts)
+	}
+	var st v1alpha1.BlipState
+	err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "stuck"}, &st)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("failed mount left its state behind: %v", err)
 	}
 }
 

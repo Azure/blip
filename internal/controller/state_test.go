@@ -44,6 +44,8 @@ func TestStateInitialization(t *testing.T) {
 	size20G := resource.MustParse("20Gi")
 	zeroSize := resource.MustParse("0")
 	negativeSize := resource.MustParse("-1Gi")
+	hugeSize := resource.MustParse("10Ei")
+	maxInt64Size := resource.MustParse("9223372036854775807")
 	tests := []struct {
 		name    string
 		spec    v1.BlipStateSpec
@@ -56,6 +58,8 @@ func TestStateInitialization(t *testing.T) {
 		{name: "empty size", spec: v1.BlipStateSpec{Replicas: 2, Size: &size20G}, size: 20 << 30},
 		{name: "zero size", spec: v1.BlipStateSpec{Replicas: 2, Size: &zeroSize}, message: "size 0 must be greater than 0", phase: v1.StateFailed},
 		{name: "negative size", spec: v1.BlipStateSpec{Replicas: 2, Size: &negativeSize}, message: "size -1Gi must be greater than 0", phase: v1.StateFailed},
+		{name: "huge size", spec: v1.BlipStateSpec{Replicas: 2, Size: &hugeSize}, message: "too large", phase: v1.StateFailed},
+		{name: "max int64 size", spec: v1.BlipStateSpec{Replicas: 2, Size: &maxInt64Size}, message: "too large", phase: v1.StateFailed},
 		{name: "image", spec: v1.BlipStateSpec{Image: "reg/img:v1"}, size: 10 << 30, nodes: 2},
 		{name: "image size", spec: v1.BlipStateSpec{Image: "reg/img:v1", Size: &size20G}, size: 20 << 30, nodes: 2},
 		{name: "missing image", spec: v1.BlipStateSpec{Image: "reg/nope:v1"}, message: "image reg/nope:v1: not found", phase: v1.StateFailed},

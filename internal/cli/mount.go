@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -917,14 +916,11 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 		st.Spec.Replicas = f.replicas
 	}
 	if f.size != "" {
-		size, err := resource.ParseQuantity(f.size)
+		size, err := parseSizeFlag(f.size)
 		if err != nil {
-			return fmt.Errorf("invalid --size %q: %w", f.size, err)
+			return err
 		}
-		if size.Sign() <= 0 {
-			return fmt.Errorf("invalid --size %q: must be positive", f.size)
-		}
-		st.Spec.Size = &size
+		st.Spec.Size = size
 	}
 	a.label(st)
 	var built []*v1alpha1.BlipState
@@ -949,7 +945,7 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	} else {
 		built = []*v1alpha1.BlipState{st}
 	}
-	if _, err := a.waitStateCommittedWhilePending(ctx, name); err != nil {
+	if _, err := a.waitStateCommitted(ctx, name); err != nil {
 		a.removeCreatedStates(ctx, built)
 		return err
 	}
