@@ -147,31 +147,64 @@ func checkDestParents(dst string) error {
 	return nil
 }
 
+const collectTempPattern = ".blip-tmp-*"
+
+// copyTree builds the tree in a temporary directory and only then moves it
+// into place. A failed or interrupted copy therefore leaves an existing
+// destination as it was; a new destination appears only when it is complete.
 func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	created := false
+	exists := false
 	if di, err := os.Lstat(dst); err == nil {
 		if !di.IsDir() {
 			return fmt.Errorf("cannot copy directory %s onto %s: not a directory", src, dst)
 		}
+		exists = true
 	} else if !os.IsNotExist(err) {
 		return err
-	} else {
-		// Create the directory writable so its children can be written even
-		// when the source directory is read-only. The source mode is applied
-		// after the tree is populated.
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	}
+	// Reject type conflicts before copying anything, so a merge cannot fail
+	// halfway through after replacing other children.
+	if exists {
+		if err := checkMergeTypes(src, dst); err != nil {
 			return err
 		}
-		if err := os.Mkdir(dst, 0o700); err != nil {
-			if !os.IsExist(err) {
-				return err
-			}
-		} else {
-			created = true
+	}
+	parent := filepath.Dir(dst)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	staging, err := os.MkdirTemp(parent, collectTempPattern)
+	if err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			os.RemoveAll(staging)
 		}
+	}()
+	if err := copyTreeInto(ctx, src, staging, info); err != nil {
+		return err
+	}
+	if !exists {
+		if err := os.Rename(staging, dst); err != nil {
+			return err
+		}
+		keep = true
+		return nil
+	}
+	return mergeTree(ctx, staging, dst)
+}
+
+// copyTreeInto copies a source tree into an empty, writable directory. The
+// destination takes the source's mode and mtime; callers that merge into an
+// existing directory preserve that directory's own metadata instead.
+func copyTreeInto(ctx context.Context, src, dst string, info os.FileInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	entries, err := os.ReadDir(src)
 	if err != nil {
@@ -188,7 +221,10 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 			return err
 		}
 		if ei.IsDir() {
-			if err := copyTree(ctx, s, d, ei); err != nil {
+			if err := os.Mkdir(d, 0o700); err != nil {
+				return err
+			}
+			if err := copyTreeInto(ctx, s, d, ei); err != nil {
 				return err
 			}
 			continue
@@ -197,15 +233,85 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 			return err
 		}
 	}
-	// An existing destination directory belongs to the caller: keep its
-	// mode and mtime. Only a directory created here takes the source's.
-	if !created {
-		return nil
-	}
 	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
 		return err
 	}
 	return os.Chtimes(dst, info.ModTime(), info.ModTime())
+}
+
+// checkMergeTypes rejects a merge whose existing destination has a directory
+// where the source has another kind of entry, or the reverse.
+func checkMergeTypes(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		s := filepath.Join(src, e.Name())
+		d := filepath.Join(dst, e.Name())
+		si, err := os.Lstat(s)
+		if err != nil {
+			return err
+		}
+		di, err := os.Lstat(d)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if si.IsDir() {
+			if !di.IsDir() {
+				return fmt.Errorf("cannot copy directory %s onto %s: not a directory", s, d)
+			}
+			if err := checkMergeTypes(s, d); err != nil {
+				return err
+			}
+			continue
+		}
+		if di.IsDir() {
+			return fmt.Errorf("cannot copy file %s onto directory %s", s, d)
+		}
+	}
+	return nil
+}
+
+// mergeTree moves a complete staged tree into an existing destination. Files
+// and symlinks are renamed into place atomically; only directory metadata of
+// directories the caller already had is left untouched.
+func mergeTree(ctx context.Context, staged, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(staged)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s := filepath.Join(staged, e.Name())
+		d := filepath.Join(dst, e.Name())
+		si, err := os.Lstat(s)
+		if err != nil {
+			return err
+		}
+		di, err := os.Lstat(d)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if si.IsDir() && err == nil && di.IsDir() {
+			if err := mergeTree(ctx, s, d); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.Rename(s, d); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // copyEntry copies a regular file or a symlink. It never follows a source
@@ -238,35 +344,50 @@ func copyFile(ctx context.Context, src, dst string, info os.FileInfo) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
-	}
-	// Replace a symlink at dst rather than writing through it.
-	if di, err := os.Lstat(dst); err == nil && di.Mode()&os.ModeSymlink != 0 {
-		if err := os.Remove(dst); err != nil {
-			return err
-		}
 	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+	// Write beside the destination and rename into place. A symlink at dst is
+	// replaced by the rename, not written through.
+	out, err := os.CreateTemp(dir, collectTempPattern)
 	if err != nil {
 		return err
 	}
+	tmp := out.Name()
+	done := false
+	defer func() {
+		if !done {
+			out.Close()
+			os.Remove(tmp)
+		}
+	}()
 	_, cerr := io.Copy(out, ctxReader{ctx: ctx, r: in})
+	if cerr == nil {
+		cerr = out.Sync()
+	}
 	if err := out.Close(); err != nil && cerr == nil {
 		cerr = err
 	}
 	if cerr != nil {
 		return cerr
 	}
-	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
+	if err := os.Chmod(tmp, info.Mode().Perm()); err != nil {
 		return err
 	}
-	return os.Chtimes(dst, info.ModTime(), info.ModTime())
+	if err := os.Chtimes(tmp, info.ModTime(), info.ModTime()); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return err
+	}
+	done = true
+	return nil
 }
 
 // ctxReader stops a copy when its context is canceled.

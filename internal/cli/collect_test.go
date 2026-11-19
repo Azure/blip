@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"golang.org/x/sys/unix"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
@@ -374,6 +375,120 @@ func TestCopyPathCanceled(t *testing.T) {
 	// A copy in progress stops at the next chunk.
 	if _, err := io.ReadAll(ctxReader{ctx: ctx, r: strings.NewReader("data")}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("reader err = %v", err)
+	}
+}
+
+// A copy interrupted halfway must leave an existing destination untouched.
+func TestCopyFileAtomicOnCancel(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "big")
+	data := make([]byte, 128<<20)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "dst")
+	if err := os.WriteFile(dst, []byte("GOOD"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- copyPath(ctx, src, dst) }()
+
+	// Wait until the copy has started writing. With an atomic copy that is
+	// the temporary file next to the destination.
+	grown := func() bool {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return false
+		}
+		for _, e := range entries {
+			if e.Name() == "big" {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			if e.Name() != "dst" || info.Size() > int64(len("GOOD")) {
+				if info.Size() > 0 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for !grown() {
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("copy never started writing")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("copy err = %v, want context.Canceled", err)
+	}
+	if got := readFile(t, dst); got != "GOOD" {
+		t.Fatalf("destination changed to %d bytes after an interrupted copy", len(got))
+	}
+	assertNoTempFiles(t, dir)
+}
+
+// A directory copy that fails on a later child must not have replaced an
+// earlier child of an existing destination.
+func TestCopyTreeAtomicOnFailure(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	dst := filepath.Join(base, "dst")
+	for _, d := range []string{src, dst} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("NEW"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "a.txt"), []byte("OLD"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "b.txt"), []byte("B-OLD"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A special file fails after a.txt was copied. ReadDir sorts names, so
+	// a.txt comes first.
+	if err := unix.Mkfifo(filepath.Join(src, "z.fifo"), 0o644); err != nil {
+		t.Skipf("cannot create a fifo: %v", err)
+	}
+	err := copyPath(context.Background(), src, dst)
+	if err == nil || !strings.Contains(err.Error(), "special file") {
+		t.Fatalf("err = %v, want a special file error", err)
+	}
+	if got := readFile(t, filepath.Join(dst, "a.txt")); got != "OLD" {
+		t.Fatalf("earlier child was replaced after a later one failed: %q", got)
+	}
+	if got := readFile(t, filepath.Join(dst, "b.txt")); got != "B-OLD" {
+		t.Fatalf("destination child changed: %q", got)
+	}
+	assertNoTempFiles(t, base)
+}
+
+// assertNoTempFiles rejects staging paths left behind by a failed copy.
+func assertNoTempFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "blip-tmp") {
+			t.Fatalf("temporary path %q was not cleaned up", filepath.Join(dir, e.Name()))
+		}
 	}
 }
 
