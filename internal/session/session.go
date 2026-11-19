@@ -5,9 +5,12 @@ package session
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"unicode/utf8"
@@ -232,16 +235,26 @@ func (s *Session) Recv() (Frame, error) {
 // ErrDisconnected means the stream ended before the session exited.
 var ErrDisconnected = errors.New("connection to the session was lost")
 
-// outputReadAhead bounds output that the client has received from the guest
-// but not yet written to the caller. Reading the transport while a local
-// stdout consumer is stalled keeps the transport from going idle (some
-// transports tear an idle exec stream down after a few seconds) and lets the
-// client retain output the command already produced. Beyond this bound the
-// transport is backpressured exactly as before, so memory stays bounded.
+// outputReadAhead bounds output that the client keeps in memory after it has
+// been received from the guest but not yet written to the caller. Reading the
+// transport while a local stdout consumer is stalled keeps the transport from
+// going idle (some transports tear an idle exec stream down after a few
+// seconds). Beyond this bound complete frames are spooled to a temporary file
+// instead of stopping the reader, so a long stall cannot make the transport
+// time out and lose the tail of output the command already produced.
 const outputReadAhead = 8 << 20
 
+// outputSpoolMax bounds the temporary file used for output that does not fit
+// in memory. Exceeding it is reported as an error, never as a successful exit:
+// a caller must not mistake a truncated stream for the command's result.
+var outputSpoolMax int64 = 512 << 20
+
+// outputSpoolDir overrides the directory used for spool files. Tests set it to
+// a private directory; an empty value uses os.TempDir.
+var outputSpoolDir string
+
 // outputQueue decouples the transport reader from the caller's writer. Only
-// the reader goroutine calls put and only Copy calls get.
+// the reader goroutine calls put and only the Copy consumer calls get.
 type outputQueue struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -250,6 +263,15 @@ type outputQueue struct {
 	max    int
 	done   bool
 	err    error
+
+	// Frames that do not fit in memory are written in order to one temporary
+	// file. spoolWrite is the committed end of the file, spoolRead the next
+	// record to deliver, and spoolBytes the unread amount (for the bound).
+	spool      *os.File
+	spoolPath  string
+	spoolRead  int64
+	spoolWrite int64
+	spoolBytes int64
 }
 
 func newOutputQueue(max int) *outputQueue {
@@ -265,22 +287,90 @@ func frameBytes(f Frame) int {
 	return 0
 }
 
-// put appends one frame, waiting while the writer is behind. It reports false
-// when the queue was stopped because the writer failed.
+// put appends one frame. It never waits for the local consumer: output that
+// does not fit in memory is spooled to disk. It reports false when the queue
+// was stopped or the spool failed; the failure is returned by get.
 func (q *outputQueue) put(f Frame) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	n := frameBytes(f)
-	for !q.done && q.bytes+n > q.max && len(q.frames) > 0 {
-		q.cond.Wait()
-	}
 	if q.done {
 		return false
 	}
-	q.frames = append(q.frames, f)
-	q.bytes += n
+	n := frameBytes(f)
+	if q.spool == nil && q.bytes+n <= q.max {
+		q.frames = append(q.frames, f)
+		q.bytes += n
+		q.cond.Signal()
+		return true
+	}
+	if err := q.spoolLocked(f); err != nil {
+		q.done = true
+		q.err = err
+		q.cond.Broadcast()
+		return false
+	}
 	q.cond.Signal()
 	return true
+}
+
+// spoolLocked appends one frame to the temporary file. The caller holds q.mu.
+func (q *outputQueue) spoolLocked(f Frame) error {
+	if q.spool == nil {
+		dir := outputSpoolDir
+		file, err := os.CreateTemp(dir, "blip-output-*")
+		if err != nil {
+			return fmt.Errorf("session output exceeded memory and could not be spooled: %w", err)
+		}
+		q.spool = file
+		q.spoolPath = file.Name()
+	}
+	rec, err := encodeSpoolFrame(f)
+	if err != nil {
+		return err
+	}
+	if q.spoolBytes+int64(len(rec)) > outputSpoolMax {
+		return fmt.Errorf("session output exceeded the %d-byte spool limit while the local consumer was stalled", outputSpoolMax)
+	}
+	if _, err := q.spool.WriteAt(rec, q.spoolWrite); err != nil {
+		return fmt.Errorf("spool session output: %w", err)
+	}
+	q.spoolWrite += int64(len(rec))
+	q.spoolBytes += int64(len(rec))
+	return nil
+}
+
+func (q *outputQueue) spoolHasDataLocked() bool {
+	return q.spool != nil && q.spoolRead < q.spoolWrite
+}
+
+// readSpoolLocked reads the next record. The caller holds q.mu.
+func (q *outputQueue) readSpoolLocked() (Frame, error) {
+	var hdr [5]byte
+	if _, err := q.spool.ReadAt(hdr[:], q.spoolRead); err != nil {
+		return Frame{}, fmt.Errorf("read spooled session output: %w", err)
+	}
+	n := binary.BigEndian.Uint32(hdr[1:])
+	if n > wire.MaxFrame {
+		return Frame{}, fmt.Errorf("read spooled session output: frame too large: %d", n)
+	}
+	payload := make([]byte, n)
+	if _, err := q.spool.ReadAt(payload, q.spoolRead+5); err != nil {
+		return Frame{}, fmt.Errorf("read spooled session output: %w", err)
+	}
+	q.spoolRead += int64(5 + n)
+	q.spoolBytes -= int64(5 + n)
+	f, err := decodeSpoolFrame(wire.Type(hdr[0]), payload)
+	if err != nil {
+		return Frame{}, err
+	}
+	if q.spoolRead == q.spoolWrite && len(q.frames) == 0 {
+		// Keep the file for reuse but release its space.
+		if err := q.spool.Truncate(0); err != nil {
+			return Frame{}, fmt.Errorf("truncate session output spool: %w", err)
+		}
+		q.spoolRead, q.spoolWrite, q.spoolBytes = 0, 0, 0
+	}
+	return f, nil
 }
 
 // get removes the next frame. It returns the reader's error once every
@@ -289,7 +379,7 @@ func (q *outputQueue) put(f Frame) bool {
 func (q *outputQueue) get() (Frame, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for len(q.frames) == 0 && !q.done {
+	for len(q.frames) == 0 && !q.spoolHasDataLocked() && !q.done {
 		q.cond.Wait()
 	}
 	if len(q.frames) > 0 {
@@ -298,6 +388,9 @@ func (q *outputQueue) get() (Frame, error) {
 		q.bytes -= frameBytes(f)
 		q.cond.Broadcast()
 		return f, nil
+	}
+	if q.spoolHasDataLocked() {
+		return q.readSpoolLocked()
 	}
 	if q.err != nil {
 		return Frame{}, q.err
@@ -314,9 +407,9 @@ func (q *outputQueue) finish(err error) {
 	q.mu.Unlock()
 }
 
-// stop abandons the queue because the caller's writer failed. It returns the
-// number of data frames that were queued but never written, so pending-output
-// accounting is released.
+// stop abandons the queue because the caller's writer failed or the transport
+// was closed. It returns the number of data frames that were still in memory,
+// so the caller can release pending-output accounting.
 func (q *outputQueue) stop() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -330,8 +423,89 @@ func (q *outputQueue) stop() int {
 	q.bytes = 0
 	q.done = true
 	q.err = io.EOF
+	q.closeSpoolLocked()
 	q.cond.Broadcast()
 	return n
+}
+
+// cleanup releases the spool. It is safe to call while the reader is still
+// running: put sees done and stops without touching the closed file.
+func (q *outputQueue) cleanup() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.done = true
+	q.frames = nil
+	q.bytes = 0
+	q.closeSpoolLocked()
+	q.cond.Broadcast()
+}
+
+func (q *outputQueue) closeSpoolLocked() {
+	if q.spool == nil {
+		return
+	}
+	name := q.spoolPath
+	_ = q.spool.Close()
+	q.spool = nil
+	q.spoolPath = ""
+	q.spoolRead, q.spoolWrite, q.spoolBytes = 0, 0, 0
+	if name != "" {
+		_ = os.Remove(name)
+	}
+}
+
+// Spool records are [1 byte type][4 byte big-endian length][payload]. Data
+// frames carry their bytes; control frames carry JSON so the queue can spool
+// them without reordering output.
+func encodeSpoolFrame(f Frame) ([]byte, error) {
+	var payload []byte
+	switch f.Type {
+	case wire.TStdout, wire.TStderr:
+		payload = f.Data
+	case wire.TNotice:
+		b, err := json.Marshal(wire.Notice{Message: f.Notice})
+		if err != nil {
+			return nil, err
+		}
+		payload = b
+	case wire.TExited:
+		if f.Exit == nil {
+			return nil, errors.New("spool an exit frame without a status")
+		}
+		b, err := json.Marshal(*f.Exit)
+		if err != nil {
+			return nil, err
+		}
+		payload = b
+	default:
+		return nil, fmt.Errorf("cannot spool session frame type %d", f.Type)
+	}
+	rec := make([]byte, 5+len(payload))
+	rec[0] = byte(f.Type)
+	binary.BigEndian.PutUint32(rec[1:], uint32(len(payload)))
+	copy(rec[5:], payload)
+	return rec, nil
+}
+
+func decodeSpoolFrame(t wire.Type, payload []byte) (Frame, error) {
+	switch t {
+	case wire.TStdout, wire.TStderr:
+		return Frame{Type: t, Data: payload}, nil
+	case wire.TNotice:
+		var n wire.Notice
+		if err := json.Unmarshal(payload, &n); err != nil {
+			return Frame{}, fmt.Errorf("decode spooled notice: %w", err)
+		}
+		return Frame{Type: t, Notice: n.Message}, nil
+	case wire.TExited:
+		var e wire.Exit
+		if err := json.Unmarshal(payload, &e); err != nil {
+			return Frame{}, fmt.Errorf("decode spooled exit: %w", err)
+		}
+		return Frame{Type: t, Exit: &e}, nil
+	default:
+		return Frame{}, fmt.Errorf("cannot decode spooled session frame type %d", t)
+	}
 }
 
 // Copy writes output until the session exits and returns its exit status.
@@ -346,6 +520,7 @@ func (q *outputQueue) stop() int {
 // silently reporting success.
 func (s *Session) Copy(stdout, stderr io.Writer, notice func(string)) (*wire.Exit, error) {
 	q := newOutputQueue(outputReadAhead)
+	defer q.cleanup()
 	go func() {
 		for {
 			f, err := s.Recv()
