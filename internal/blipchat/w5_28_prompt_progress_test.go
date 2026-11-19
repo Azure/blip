@@ -188,3 +188,46 @@ func TestUnrenderableBacklogDefersWithoutLLM(t *testing.T) {
 		t.Error("deferred thread did not wake after the backoff")
 	}
 }
+
+// A maximal, legal task board alone used to be ~935 KB, pushing the turn
+// budget negative. The board must be bounded and disclose its truncation
+// while keeping the newest tasks and the turns section.
+func TestBoardPromptBoundsMaximalBoard(t *testing.T) {
+	tasks := make([]v1.ThreadTask, 0, 200)
+	for i := 1; i <= 200; i++ {
+		attrs := make(map[string]string, 16)
+		for a := 0; a < 16; a++ {
+			attrs[fmt.Sprintf("attr%02d", a)] = strings.Repeat(string(rune('a'+a)), 256)
+		}
+		tasks = append(tasks, v1.ThreadTask{
+			ID:         fmt.Sprintf("t%03d", i),
+			Title:      fmt.Sprintf("TASK%03d %s", i, strings.Repeat("title", 20)),
+			Open:       i%2 == 0,
+			Attributes: attrs,
+			Note:       strings.Repeat("note", 64),
+		})
+	}
+	thread := testThread()
+	turn := testTurn("turn-1", "proj")
+	turn.Status.Seq = 1
+	turn.Spec.Text = "please look at the board"
+	prompt, last := boardPrompt(thread, tasks, []v1.BlipTurn{*turn}, nil, "")
+	if len(prompt) > promptBudget {
+		t.Errorf("prompt = %d bytes, want at most the %d-byte budget", len(prompt), promptBudget)
+	}
+	if last != 1 {
+		t.Errorf("last rendered seq = %d, want the turn", last)
+	}
+	if !strings.Contains(prompt, "TASK200") {
+		t.Errorf("prompt omitted the newest task:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "TASK001") {
+		t.Errorf("prompt kept the oldest task instead of bounding the board:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "older tasks omitted") && !strings.Contains(prompt, "task board compacted") {
+		t.Errorf("prompt did not disclose the truncation:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "please look at the board") {
+		t.Errorf("board crowding removed the turns section:\n%s", prompt)
+	}
+}

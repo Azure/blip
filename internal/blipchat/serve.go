@@ -577,27 +577,7 @@ func systemPrompt(thread *v1.BlipThread) string {
 func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTurn, timers []v1.ThreadTimer, summary string) (string, int64) {
 	var b strings.Builder
 	b.WriteString("Task board:\n")
-	if len(tasks) == 0 {
-		b.WriteString("(empty)\n")
-	}
-	for _, t := range tasks {
-		fmt.Fprintf(&b, "- %s %s %q", t.ID, openState(t.Open), t.Title)
-		if len(t.Blips) > 0 {
-			fmt.Fprintf(&b, " blips=%s", strings.Join(t.Blips, ","))
-		}
-		if t.Note != "" {
-			fmt.Fprintf(&b, " note=%q", t.Note)
-		}
-		keys := make([]string, 0, len(t.Attributes))
-		for k := range t.Attributes {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Fprintf(&b, " %s=%q", k, t.Attributes[k])
-		}
-		b.WriteString("\n")
-	}
+	renderBoard(&b, tasks, boardBudget)
 	if summary != "" {
 		fmt.Fprintf(&b, "\nSummary of earlier history:\n%s\n", summary)
 	}
@@ -615,6 +595,96 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 
 	last := boardTurns(&b, turns, promptBudget-b.Len())
 	return b.String(), last
+}
+
+// renderBoard writes the task board under budget. A full board can be far
+// larger than a whole prompt, so it is compacted and then truncated to the
+// newest tasks, with a notice, instead of crowding out the turns.
+func renderBoard(b *strings.Builder, tasks []v1.ThreadTask, budget int) {
+	if len(tasks) == 0 {
+		b.WriteString("(empty)\n")
+		return
+	}
+	full := make([]string, len(tasks))
+	used := 0
+	for i := range tasks {
+		full[i] = taskLine(tasks[i], 0, 0, 0)
+		used += len(full[i])
+	}
+	if used <= budget {
+		for _, line := range full {
+			b.WriteString(line)
+		}
+		return
+	}
+	compact := make([]string, len(tasks))
+	used = 0
+	for i := range tasks {
+		compact[i] = taskLine(tasks[i], 80, 120, 40)
+		used += len(compact[i])
+	}
+	const compacted = "(task board compacted to fit the prompt budget)\n"
+	if used+len(compacted) <= budget {
+		b.WriteString(compacted)
+		for _, line := range compact {
+			b.WriteString(line)
+		}
+		return
+	}
+	// Even the compact board does not fit: keep the newest tasks.
+	start := len(tasks)
+	used = 0
+	for start > 0 {
+		i := start - 1
+		notice := 0
+		if i > 0 {
+			notice = len(fmt.Sprintf("(%d older tasks omitted)\n", i))
+		}
+		if used+len(compact[i])+notice > budget {
+			break
+		}
+		used += len(compact[i])
+		start = i
+	}
+	if start == len(tasks) {
+		// Always show the newest task, even when one row alone is over.
+		start = len(tasks) - 1
+	}
+	if start > 0 {
+		fmt.Fprintf(b, "(%d older tasks omitted)\n", start)
+	}
+	for i := start; i < len(tasks); i++ {
+		b.WriteString(compact[i])
+	}
+}
+
+// taskLine renders one board row. Non-positive limits keep the full value.
+func taskLine(t v1.ThreadTask, titleLimit, noteLimit, attrLimit int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "- %s %s %q", t.ID, openState(t.Open), limitRunes(t.Title, titleLimit))
+	if len(t.Blips) > 0 {
+		fmt.Fprintf(&b, " blips=%s", strings.Join(t.Blips, ","))
+	}
+	if t.Note != "" {
+		fmt.Fprintf(&b, " note=%q", limitRunes(t.Note, noteLimit))
+	}
+	keys := make([]string, 0, len(t.Attributes))
+	for k := range t.Attributes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, " %s=%q", k, limitRunes(t.Attributes[k], attrLimit))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+func limitRunes(s string, n int) string {
+	if n <= 0 {
+		return s
+	}
+	return truncateRunes(s, n)
 }
 
 // summarizeTurn renders a compact one-line form of a turn. It keeps the
