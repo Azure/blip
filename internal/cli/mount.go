@@ -492,8 +492,18 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 	// will advance the committed generation.
 	demoted := false
 	return a.waitBlip(ctx, writer.Name, func(b *v1alpha1.Blip) (bool, error) {
-		if b == nil || b.UID != writer.UID || b.Spec.State != writer.Spec.State || v1alpha1.Finished(b) ||
-			b.Spec.Stop || b.DeletionTimestamp != nil || b.Status.Phase == v1alpha1.BlipSaving {
+		if b == nil || b.UID != writer.UID || b.Spec.State != writer.Spec.State {
+			return false, fmt.Errorf("blip %q stopped before the mount completed; desired mount remains on root state %q", writer.Name, writer.Spec.State)
+		}
+		// A terminating or missing source never gets an attachment. The
+		// controller reports it as a wait on the Blip, so waiting for a
+		// status entry would poll forever and leave the root poisoned. A
+		// deleted writable source also stops the Blip, so this must run
+		// before the generic stop check to keep the rollback cause.
+		if gone := mountStateGone(b.Status.Message, state); gone != "" {
+			return false, &mountStateGoneError{msg: fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, gone)}
+		}
+		if v1alpha1.Finished(b) || b.Spec.Stop || b.DeletionTimestamp != nil || b.Status.Phase == v1alpha1.BlipSaving {
 			return false, fmt.Errorf("blip %q stopped before the mount completed; desired mount remains on root state %q", writer.Name, writer.Spec.State)
 		}
 		root, err := a.getState(ctx, writer.Spec.State)
@@ -508,12 +518,6 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			return false, fmt.Errorf("mount of state %q changed concurrently", state)
 		}
 		m := findMount(b.Status.Mounts, state)
-		// A terminating or missing source never gets an attachment. The
-		// controller reports it as a wait on the Blip, so waiting for a
-		// status entry would poll forever and leave the root poisoned.
-		if gone := mountStateGone(b.Status.Message, state); gone != "" {
-			return false, &mountStateGoneError{msg: fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, gone)}
-		}
 		if m == nil || m.Path != mountPath {
 			// A writable mount can be rejected before any status entry
 			// exists: the controller leaves the reason on the Blip. Report

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -287,6 +288,35 @@ func TestMountGoneStateWhileWaitingRollsBackAndRetries(t *testing.T) {
 				t.Fatalf("retry did not restore mount: %+v", s.Spec.Mounts)
 			}
 		})
+	}
+}
+
+// TestWaitMountDeletionCauseBeatsStopped covers a writable mount whose source
+// is deleted during the wait. The controller stops the writer with a
+// StateNotFound message before the CLI sees a stopped Blip, so the deletion
+// check must win over the generic "stopped" error; mountState then rolls back
+// only the intent this command added.
+func TestWaitMountDeletionCauseBeatsStopped(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	// The controller stops the writer and records why before the stopped
+	// Blip is visible to the CLI. The deletion cause must win over the
+	// generic stop error so waitMount returns a rollback-able error.
+	b.Spec.Stop = true
+	b.Status.Reason = "StateNotFound"
+	b.Status.Message = `mount state "data" is being deleted; stopping before the workspace is removed`
+	a := mountTestApp(t, b, root, readyState("data"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := a.waitMount(ctx, b, "data", "/data", true, 0, "")
+	if err == nil || !strings.Contains(err.Error(), "is being deleted") {
+		t.Fatalf("waitMount returned %v, want the deletion cause", err)
+	}
+	var gone *mountStateGoneError
+	if !errors.As(err, &gone) {
+		t.Fatalf("waitMount returned %T, want a rollback-able deletion error", err)
 	}
 }
 
