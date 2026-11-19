@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 
@@ -152,9 +153,18 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// of an EOF after a tool already committed work.
 	ctx, cancel := context.WithTimeout(r.Context(), c.Server.Config.chatTimeout())
 	defer cancel()
-	namespace := r.URL.Query().Get("namespace")
-	if namespace == "" {
-		namespace = "default"
+	namespace := "default"
+	if rawQuery := r.URL.RawQuery; rawQuery != "" {
+		query, err := url.ParseQuery(rawQuery)
+		if values, ok := query["namespace"]; ok {
+			namespace = values[0]
+		} else if err != nil && rawQueryHasParam(rawQuery, "namespace") {
+			// ParseQuery drops a pair whose value does not unescape, so a
+			// malformed namespace such as ?namespace=%zz would otherwise
+			// look absent and silently query the default namespace.
+			http.Error(w, "invalid namespace", http.StatusBadRequest)
+			return
+		}
 	}
 	if !validNamespace(namespace) {
 		http.Error(w, "invalid namespace", http.StatusBadRequest)
@@ -578,6 +588,20 @@ func shortUser(user string) string {
 	}
 	sum := sha256.Sum256([]byte(user))
 	return s + "-" + hex.EncodeToString(sum[:4])
+}
+
+// rawQueryHasParam reports whether rawQuery names param, including a pair
+// whose value failed to unescape and was therefore dropped by url.ParseQuery.
+func rawQueryHasParam(rawQuery, param string) bool {
+	for rawQuery != "" {
+		var pair string
+		pair, rawQuery, _ = strings.Cut(rawQuery, "&")
+		key, _, _ := strings.Cut(pair, "=")
+		if key == param {
+			return true
+		}
+	}
+	return false
 }
 
 // validNamespace reports whether the namespace query parameter is a valid
