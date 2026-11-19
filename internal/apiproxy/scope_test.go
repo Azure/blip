@@ -529,6 +529,41 @@ func TestOwnerScopeNamespacedWatchPaths(t *testing.T) {
 	}
 }
 
+// A long thread name is hashed into the thread label. The proxy must recover
+// the full name from the annotation so its owner binding and turn selector
+// still work.
+func TestOwnerScopeHashedThreadLabel(t *testing.T) {
+	kube := scopedFixture()
+	thread := "alice-" + strings.Repeat("x", 70)
+	owner := v1.ThreadOwner(scopeNamespace, thread)
+	kube.pods["long-vm"] = fakeObject{
+		Name: "long-vm", UID: "pod-long",
+		Labels:      map[string]string{v1.LabelOwner: owner, v1.LabelBlipUID: "uid-long"},
+		Annotations: map[string]string{v1.AnnotationBlip: "long.a"},
+	}
+	kube.blips["long.a"] = fakeObject{
+		Name: "long.a", UID: "uid-long",
+		Labels:      map[string]string{v1.LabelOwner: owner, v1.LabelThread: v1.ThreadLabel(thread)},
+		Annotations: map[string]string{v1.AnnotationThread: thread},
+	}
+	kube.threads[thread] = fakeObject{Name: thread, UID: "thread-long"}
+	kube.turns["long-turn"] = fakeObject{
+		Name: "long-turn", UID: "turn-long", Thread: thread,
+		Labels: map[string]string{v1.LabelThread: v1.ThreadLabel(thread), v1.LabelOwner: owner},
+	}
+	p := startScoped(t, kube, "long-vm")
+	if status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads/"+thread); status != http.StatusOK {
+		t.Fatalf("long thread status = %d, body %q", status, body)
+	}
+	status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns")
+	if status != http.StatusOK || !strings.Contains(body, "long-turn") {
+		t.Fatalf("long turn list status = %d, body %q", status, body)
+	}
+	if got := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns").Get("labelSelector"); got != v1.LabelThread+"="+v1.ThreadLabel(thread) {
+		t.Fatalf("long turn list label selector = %q", got)
+	}
+}
+
 // A VM whose Blip carries another project's thread name (or no thread at all)
 // gets no access to thread history. The thread label alone is not trusted:
 // its derived owner must match the Blip's owner label.

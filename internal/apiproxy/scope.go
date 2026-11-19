@@ -232,7 +232,10 @@ func (s *ownerScope) identity(ctx context.Context) (identity, error) {
 	// The Blip's thread label is self-asserted (a guest may patch its own
 	// Blip), so only trust it when the thread's derived owner equals the
 	// Blip's owner. Otherwise the caller has no thread scope at all.
-	thread := blip.Metadata.Labels[v1.LabelThread]
+	thread := blip.Metadata.Annotations[v1.AnnotationThread]
+	if thread == "" {
+		thread = blip.Metadata.Labels[v1.LabelThread]
+	}
 	if thread == "" || owner == adminOwner || v1.ThreadOwner(s.namespace, thread) != owner {
 		thread = ""
 	}
@@ -307,7 +310,7 @@ func scopedList(r *http.Request, id identity, resource string) (*http.Request, b
 		if id.thread == "" {
 			return nil, false
 		}
-		return withLabelSelector(r, v1.LabelThread, id.thread), true
+		return withLabelSelector(r, v1.LabelThread, v1.ThreadLabel(id.thread)), true
 	default:
 		return withOwnerSelector(r, id.owner), true
 	}

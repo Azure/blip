@@ -32,7 +32,10 @@ func (w *Watcher) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 	if err := w.Get(ctx, req.NamespacedName, &b); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	thread := b.Labels[v1.LabelThread]
+	thread := b.Annotations[v1.AnnotationThread]
+	if thread == "" {
+		thread = b.Labels[v1.LabelThread]
+	}
 	if thread == "" {
 		return ctrl.Result{}, nil
 	}

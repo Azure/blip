@@ -256,7 +256,7 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 		return "", fmt.Errorf("task %q is closed", taskID)
 	}
 	var running v1.BlipList
-	if err := s.s.List(ctx, &running, client.InNamespace(s.thread.Namespace), client.MatchingLabels{v1.LabelThread: s.thread.Name}); err != nil {
+	if err := s.s.List(ctx, &running, client.InNamespace(s.thread.Namespace), client.MatchingLabels{v1.LabelThread: v1.ThreadLabel(s.thread.Name)}); err != nil {
 		return "", err
 	}
 	active := 0
@@ -290,7 +290,10 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: s.thread.Namespace,
-			Labels:    map[string]string{v1.LabelOwner: owner, v1.LabelThread: s.thread.Name, v1.LabelTask: taskID},
+			Labels:    map[string]string{v1.LabelOwner: owner, v1.LabelThread: v1.ThreadLabel(s.thread.Name), v1.LabelTask: taskID},
+			Annotations: map[string]string{
+				v1.AnnotationThread: s.thread.Name,
+			},
 		},
 		Spec: v1.BlipSpec{Pool: s.thread.Spec.Pool, State: name, Command: command},
 	}
@@ -302,7 +305,10 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: s.thread.Namespace,
-			Labels:    map[string]string{v1.LabelOwner: owner, v1.LabelThread: s.thread.Name, v1.LabelTask: taskID},
+			Labels:    map[string]string{v1.LabelOwner: owner, v1.LabelThread: v1.ThreadLabel(s.thread.Name), v1.LabelTask: taskID},
+			Annotations: map[string]string{
+				v1.AnnotationThread: s.thread.Name,
+			},
 		},
 	}
 	if err := workspace.Fork(ctx, s.s.Client, &src, state, &workspace.ForkOptions{Owner: &ref}); err != nil {
@@ -323,7 +329,7 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 func belongsToThread(b *v1.Blip, thread *v1.BlipThread) bool {
 	owner := Owner(&ThreadKey{Namespace: thread.Namespace, Name: thread.Name})
 	return b.Namespace == thread.Namespace &&
-		b.Labels[v1.LabelThread] == thread.Name &&
+		b.Labels[v1.LabelThread] == v1.ThreadLabel(thread.Name) &&
 		b.Labels[v1.LabelOwner] == owner
 }
 
@@ -391,7 +397,7 @@ func tailWords(b *bytes.Buffer, n int) string {
 // blipList renders blips of this thread for the chat and coordinator prompts.
 func (s *Server) blipList(ctx context.Context, thread *v1.BlipThread) (string, error) {
 	var blips v1.BlipList
-	if err := s.List(ctx, &blips, client.InNamespace(thread.Namespace), client.MatchingLabels{v1.LabelThread: thread.Name}); err != nil {
+	if err := s.List(ctx, &blips, client.InNamespace(thread.Namespace), client.MatchingLabels{v1.LabelThread: v1.ThreadLabel(thread.Name)}); err != nil {
 		return "", err
 	}
 	sort.Slice(blips.Items, func(i, j int) bool { return blips.Items[i].Name < blips.Items[j].Name })

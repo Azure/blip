@@ -20,8 +20,13 @@ const (
 	// blip it runs in. Label values are limited to 63 characters, so a long
 	// short name is hashed; AnnotationParent keeps the full name.
 	LabelParent = "blip.dev/parent"
-	// LabelThread marks blips and other objects owned by a BlipThread.
+	// LabelThread marks blips and other objects owned by a BlipThread. Its
+	// value is ThreadLabel(name), because Kubernetes labels are at most 63
+	// characters but BlipThread names may be longer.
 	LabelThread = "blip.dev/thread"
+	// AnnotationThread carries the full BlipThread name when LabelThread is
+	// hashed for a long name.
+	AnnotationThread = "blip.dev/thread-name"
 	// LabelTask marks a blip as work for one ThreadTask.
 	LabelTask = "blip.dev/task"
 
@@ -60,6 +65,18 @@ func ParentLabel(name string) string {
 	}
 	sum := sha256.Sum256([]byte(name))
 	return "sha256-" + hex.EncodeToString(sum[:])[:56]
+}
+
+// ThreadLabel is the LabelThread value for a BlipThread name. Kubernetes label
+// values are at most 63 characters: names that fit are used as-is so existing
+// selectors keep working, and longer names become a stable 63-character hash.
+// AnnotationThread always carries the full name.
+func ThreadLabel(name string) string {
+	if len(name) <= 63 {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	return "thread-" + hex.EncodeToString(sum[:])[:56]
 }
 
 // ThreadOwner is the blip.dev/owner label of the blips and states a
