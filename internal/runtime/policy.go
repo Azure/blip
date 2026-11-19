@@ -9,9 +9,10 @@ import (
 	"github.com/Azure/blip/internal/netpolicy"
 )
 
-// addrMatch renders the address and protocol part of a rule. Ports are
-// omitted so a peer check can ignore the ephemeral source port of an inbound
-// connection.
+// addrMatch renders the address, exceptions, and protocol part of a rule. It
+// deliberately omits ports: a reply to a connection may use an ephemeral
+// source port, so a peer check cannot match the rule's destination port on
+// that packet.
 func addrMatch(r netpolicy.Rule, addr string) string {
 	cidr := r.CIDRPrefix()
 	match := "ip " + addr + " " + cidr.String()
@@ -27,6 +28,20 @@ func addrMatch(r netpolicy.Rule, addr string) string {
 	return match
 }
 
+// portMatch renders the rule's port or range, for either the destination port
+// of egress traffic or the destination port of a new inbound connection.
+func portMatch(r netpolicy.Rule, port string) string {
+	if r.Port == 0 {
+		return ""
+	}
+	proto := strings.ToLower(r.Protocol)
+	match := " " + proto + " " + port + " " + strconv.Itoa(int(r.Port))
+	if r.EndPort > r.Port {
+		match += "-" + strconv.Itoa(int(r.EndPort))
+	}
+	return match
+}
+
 // ruleMatch renders one rule. The rule must already have passed
 // netpolicy.Rule.Validate; only parsed addresses, numeric ports, and a fixed
 // protocol vocabulary enter nft syntax.
@@ -35,15 +50,16 @@ func ruleMatch(r netpolicy.Rule, reverse bool) string {
 	if reverse {
 		addr, port = "saddr", "sport"
 	}
-	match := addrMatch(r, addr)
-	if r.Port != 0 {
-		proto := strings.ToLower(r.Protocol)
-		match += " " + proto + " " + port + " " + strconv.Itoa(int(r.Port))
-		if r.EndPort > r.Port {
-			match += "-" + strconv.Itoa(int(r.EndPort))
-		}
-	}
-	return match
+	return addrMatch(r, addr) + portMatch(r, port)
+}
+
+// inboundMatch admits a new inbound connection only from the rule's peer and
+// only to the rule's protocol and destination port. The egress port names the
+// remote service, but it is the closest match an egress-only policy can give
+// for a connection arriving from that peer; it must not turn an allow for one
+// remote port into an allow for every guest port.
+func inboundMatch(r netpolicy.Rule) string {
+	return addrMatch(r, "saddr") + portMatch(r, "dport")
 }
 
 func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, error) {
@@ -79,23 +95,31 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 		b.WriteString(" }\n")
 	}
 	// A new inbound connection may reach the guest only when its peer is an
-	// allowed destination in every layer. Ports are intentionally ignored:
-	// the source port of an inbound connection is ephemeral, so a policy's
-	// destination port cannot describe it. The same peer set checks replies
-	// to an inbound connection, so narrowing a policy also stops an
-	// established flow from carrying replies to a now-denied peer.
+	// explicitly named destination in every layer and the connection targets
+	// the rule's protocol and port. A wildcard rule (0.0.0.0/0, with or
+	// without private exceptions) names no peer and is an egress allowance,
+	// not an ingress policy, so it admits no new inbound connections.
+	// Replies to an allowed egress flow and related ICMP errors stay broadly
+	// allowed through the reply chains below. Replies to an inbound
+	// connection check the peer address only, because that peer's source
+	// port is ephemeral. The same peer set checks replies to an inbound
+	// connection, so narrowing a policy also stops an established flow from
+	// carrying replies to a now-denied peer.
 	if policy != nil && len(policy.Layers) > 0 {
 		for i, layer := range policy.Layers {
-			for _, check := range []struct{ chain, addr string }{
-				{"inbound", "saddr"},
-				{"inbound_reply", "daddr"},
-			} {
-				fmt.Fprintf(&b, " chain %s_%d {\n", check.chain, i)
-				for _, rule := range layer {
-					fmt.Fprintf(&b, "  %s counter return\n", addrMatch(rule, check.addr))
+			fmt.Fprintf(&b, " chain inbound_%d {\n", i)
+			for _, rule := range layer {
+				if rule.CIDRPrefix().Bits() == 0 {
+					continue
 				}
-				b.WriteString("  counter drop\n }\n")
+				fmt.Fprintf(&b, "  %s counter return\n", inboundMatch(rule))
 			}
+			b.WriteString("  counter drop\n }\n")
+			fmt.Fprintf(&b, " chain inbound_reply_%d {\n", i)
+			for _, rule := range layer {
+				fmt.Fprintf(&b, "  %s counter return\n", addrMatch(rule, "daddr"))
+			}
+			b.WriteString("  counter drop\n }\n")
 		}
 	}
 	iface, tap := strconv.Quote(p.iface), strconv.Quote(tapName)

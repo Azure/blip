@@ -199,7 +199,11 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
   chosen to avoid existing pod, CNI, and DNS routes, with NAT to the pod IP. A
   default-drop nftables gate applies the compiled egress policy: layers are
   ANDed, rules within a layer are ORed. The default pool policy allows public
-  internet plus cluster DNS and denies private/LAN ranges and metadata.
+  internet plus cluster DNS and denies private/LAN ranges and metadata. New
+  inbound connections are admitted only from an explicitly named egress peer,
+  matched on the rule's protocol and destination port; a broad `0.0.0.0/0`
+  egress rule grants no new inbound connections. Replies to allowed flows and
+  related ICMP errors (including PMTUD) remain allowed.
 - Writes complete `desired.json`/`observed.json` snapshots and reconciles guest
   claims, mounts, freeze requests, and shutdown.
 - The `api-proxy` native sidecar holds projected service-account tokens and

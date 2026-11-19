@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Azure/blip/internal/netpolicy"
+	"github.com/Azure/blip/internal/network"
 )
 
 func testPodNet(run commandRunner) *podNet {
@@ -203,19 +204,20 @@ func TestPolicyInboundTrafficRequiresAllowedPeer(t *testing.T) {
 		accept < strings.Index(toGuest, inbound+" jump inbound_1") {
 		t.Errorf("to_guest accepts a new inbound connection before the last peer layer:\n%s", toGuest)
 	}
-	// Inbound checks ignore ports: the source port of a new connection is
-	// ephemeral. They still honor the address exception and protocol.
+	// Inbound checks match the peer and the rule's destination port, but a
+	// wildcard (0.0.0.0/0) rule names no peer and therefore grants no new
+	// inbound connection. The rule still admits replies to the guest's own
+	// egress, which carries an ephemeral source port.
 	first := scriptChain(t, script, "inbound_0")
 	if !strings.Contains(first, "ip saddr 198.51.100.0/24 counter return") {
 		t.Errorf("inbound_0 does not allow the first layer's peer:\n%s", first)
 	}
 	second := scriptChain(t, script, "inbound_1")
-	want := "ip saddr 0.0.0.0/0 ip saddr != 10.0.0.0/8 meta l4proto tcp counter return"
-	if !strings.Contains(second, want) {
-		t.Errorf("inbound_1 lacks %q:\n%s", want, second)
+	if strings.Contains(second, "counter return") {
+		t.Errorf("wildcard public egress rule granted new inbound connections:\n%s", second)
 	}
-	if strings.Contains(first+second, "dport") || strings.Contains(first+second, "sport") {
-		t.Errorf("inbound peer check uses a port:\n%s\n%s", first, second)
+	if !strings.Contains(second, "counter drop") {
+		t.Errorf("inbound_1 does not deny unmatched peers:\n%s", second)
 	}
 	// The reply path checks the reply's destination (the original peer) with
 	// the same layers, so narrowing a policy stops established reflections.
@@ -233,6 +235,17 @@ func TestPolicyInboundTrafficRequiresAllowedPeer(t *testing.T) {
 	replyChain := scriptChain(t, script, "inbound_reply_0")
 	if !strings.Contains(replyChain, "ip daddr 198.51.100.0/24 counter return") {
 		t.Errorf("inbound_reply_0 does not allow the peer:\n%s", replyChain)
+	}
+	// Replies to an inbound connection have an ephemeral destination port, so
+	// they keep the broad peer and protocol check, including the wildcard
+	// rule that no longer admits a new inbound connection.
+	replyWildcard := scriptChain(t, script, "inbound_reply_1")
+	wantReply := "ip daddr 0.0.0.0/0 ip daddr != 10.0.0.0/8 meta l4proto tcp counter return"
+	if !strings.Contains(replyWildcard, wantReply) {
+		t.Errorf("inbound_reply_1 lacks %q:\n%s", wantReply, replyWildcard)
+	}
+	if strings.Contains(first+second+replyWildcard, "dport") || strings.Contains(first+second+replyWildcard, "sport") {
+		t.Errorf("address-only inbound peer check uses a port:\n%s\n%s\n%s", first, second, replyWildcard)
 	}
 
 	// An empty layer is default deny: the peer chain drops, so the accept
@@ -262,6 +275,80 @@ func TestPolicyInboundTrafficRequiresAllowedPeer(t *testing.T) {
 	}
 	if strings.Contains(empty, "inbound_") {
 		t.Errorf("peer chains generated without policy layers:\n%s", empty)
+	}
+}
+
+// TestPolicyInboundMatchesRuleProtocolAndPort pins the ingress half of the
+// egress peer gate: an allow for one remote port must not open every guest
+// port to that peer. New inbound connections match the peer address, the
+// protocol, and the rule's destination port (or range). A rule without ports
+// still describes any port, and a wildcard rule still describes no peer, so it
+// grants no new inbound connection at all.
+func TestPolicyInboundMatchesRuleProtocolAndPort(t *testing.T) {
+	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{{
+		{CIDR: "10.0.0.0/8", Protocol: "TCP", Port: 4444},
+		{CIDR: "10.1.0.0/16", Protocol: "UDP", Port: 53, EndPort: 54},
+		{CIDR: "192.0.2.0/24", Protocol: "TCP"},
+	}}}
+	script, err := testPodNet(nil).policyScript(policy, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbound := scriptChain(t, script, "inbound_0")
+	for _, want := range []string{
+		"ip saddr 10.0.0.0/8 meta l4proto tcp tcp dport 4444 counter return",
+		"ip saddr 10.1.0.0/16 meta l4proto udp udp dport 53-54 counter return",
+		"ip saddr 192.0.2.0/24 meta l4proto tcp counter return",
+	} {
+		if !strings.Contains(inbound, want) {
+			t.Errorf("inbound_0 lacks %q:\n%s", want, inbound)
+		}
+	}
+	if strings.Contains(inbound, "ip saddr 10.0.0.0/8 meta l4proto tcp counter return") {
+		t.Errorf("port-scoped rule admits every guest TCP port:\n%s", inbound)
+	}
+
+	// A wildcard public allow (with private exceptions) is an egress rule,
+	// not an ingress allowlist. Its peers are still checked for replies.
+	wildcard := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{{
+		{CIDR: "0.0.0.0/0", Except: []string{"10.0.0.0/8"}, Protocol: "TCP", Port: 443},
+	}}}
+	script, err = testPodNet(nil).policyScript(wildcard, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := scriptChain(t, script, "inbound_0"); strings.Contains(body, "counter return") {
+		t.Errorf("wildcard public rule grants a new inbound connection:\n%s", body)
+	}
+	if body := scriptChain(t, script, "inbound_reply_0"); !strings.Contains(body, "counter return") {
+		t.Errorf("wildcard public rule no longer admits replies to allowed egress:\n%s", body)
+	}
+}
+
+// TestPolicyDefaultPublicEgressGrantsNoNewInbound is the default-policy
+// regression: its public wildcard is the most common egress allow, but it must
+// not turn every public address into an ingress peer. Private and DNS rules
+// that name a peer still admit their matching inbound traffic.
+func TestPolicyDefaultPublicEgressGrantsNoNewInbound(t *testing.T) {
+	policy, err := network.Compile("apps", network.Default(), nil, network.Destinations{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := testPodNet(nil).policyScript(&policy, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbound := scriptChain(t, script, "inbound_0")
+	if strings.Contains(inbound, "0.0.0.0/0") {
+		t.Errorf("default public egress wildcard grants new inbound connections:\n%s", inbound)
+	}
+	if !strings.Contains(inbound, "ip saddr 169.254.10.10/32") {
+		t.Errorf("default inbound chain is missing its named DNS peers:\n%s", inbound)
+	}
+	// Replies to the guest's own public egress still use the wildcard.
+	reply := scriptChain(t, script, "inbound_reply_0")
+	if !strings.Contains(reply, "ip daddr 0.0.0.0/0") {
+		t.Errorf("default public egress no longer admits replies:\n%s", reply)
 	}
 }
 
