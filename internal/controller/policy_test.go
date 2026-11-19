@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -675,5 +676,48 @@ func TestTurnOwnerPolicy(t *testing.T) {
 				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
 			}
 		})
+	}
+}
+
+// The policy rules and every binding that covers them must agree. A resource
+// present in the policy but missing from the binding is silently unrestricted,
+// and a CONNECT subresource present in only one place is a hole.
+func TestVMOwnerPolicyBindingCoverage(t *testing.T) {
+	policies, bindings := readPolicyDocs(t, "../../deploy/base/vm-owner-policy.yaml")
+	policy := findPolicy(t, policies, "blip-vm-owner")
+	hasResource := func(rules []admissionv1.NamedRuleWithOperations, resource string, op admissionv1.OperationType) bool {
+		for _, r := range rules {
+			if !slices.Contains(r.Operations, op) {
+				continue
+			}
+			if slices.Contains(r.Resources, resource) {
+				return true
+			}
+		}
+		return false
+	}
+	has := func(rules []admissionv1.NamedRuleWithOperations, resource string) bool {
+		return hasResource(rules, resource, admissionv1.Create) ||
+			hasResource(rules, resource, admissionv1.Update)
+	}
+	for _, resource := range []string{"blipthreads", "blipthreads/status"} {
+		if !has(policy.Spec.MatchConstraints.ResourceRules, resource) {
+			t.Errorf("policy does not cover %s", resource)
+		}
+	}
+	if !hasResource(policy.Spec.MatchConstraints.ResourceRules, "pods/proxy", admissionv1.Connect) {
+		t.Error("policy does not cover pods/proxy CONNECT")
+	}
+	for _, b := range bindings {
+		if b.Spec.MatchResources == nil {
+			continue
+		}
+		rules := b.Spec.MatchResources.ResourceRules
+		if has(rules, "pods/exec") && !hasResource(rules, "pods/proxy", admissionv1.Connect) {
+			t.Errorf("binding %s covers exec but not proxy", b.Name)
+		}
+		if (has(rules, "blips") || has(rules, "blipstates")) && !has(rules, "blipthreads") {
+			t.Errorf("binding %s covers blips/states but not threads", b.Name)
+		}
 	}
 }
