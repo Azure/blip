@@ -518,6 +518,13 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	if claimed != nil && lostClaim(claimed) {
+		// A graceful pod deletion leaves the object Terminating for its
+		// grace period. The guest never accepted the claim, so this is the
+		// same lost claim as a pod that vanished: forget it and use the rest
+		// of this pass to claim a replacement.
+		claimed = nil
+	}
 	if claimed == nil {
 		if err := r.forgetLostClaim(ctx, b); err != nil {
 			return reconcile.Result{}, err
@@ -863,7 +870,7 @@ func (r *BlipReconciler) forgetLostClaim(ctx context.Context, b *v1.Blip) error 
 	pod := &corev1.Pod{}
 	err := r.Live.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.Pod}, pod)
 	switch {
-	case err == nil && string(pod.UID) == b.Status.PodUID:
+	case err == nil && string(pod.UID) == b.Status.PodUID && !lostClaim(pod):
 		// Still a live claim; keep its pod and start time.
 		return nil
 	case err != nil && !apierrors.IsNotFound(err):
@@ -874,6 +881,23 @@ func (r *BlipReconciler) forgetLostClaim(ctx context.Context, b *v1.Blip) error 
 	b.Status.Node = ""
 	b.Status.StartTime = nil
 	return nil
+}
+
+// claimAccepted reports whether the guest accepted the claim or already
+// produced an exit. Merely being scheduled, prepared, or deleted is not a
+// start: only the node's observation proves that the guest has the disks.
+func claimAccepted(pod *corev1.Pod) bool {
+	obs := observed(pod)
+	return obs.ClaimID != "" || obs.Exit != nil || obs.Phase == podapi.PhaseExited ||
+		pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+}
+
+// lostClaim reports whether a claimed pod is terminating before its guest
+// accepted the claim. A graceful delete keeps the pod listed with a
+// DeletionTimestamp for the termination grace period, but that claim can never
+// start this Blip and must not be mistaken for a running guest.
+func lostClaim(pod *corev1.Pod) bool {
+	return pod.DeletionTimestamp != nil && !claimAccepted(pod)
 }
 
 // observed decodes the node's observation annotation, if present.
@@ -1030,11 +1054,10 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 		return err
 	}
 	// Running means the guest accepted the claim; until then the node is
-	// still preparing disks.
+	// still preparing disks. A pod that is only Terminating was filtered out
+	// by pending unless the guest already accepted it.
 	obs := observed(pod)
-	started := obs.ClaimID != "" || obs.Exit != nil || obs.Phase == podapi.PhaseExited ||
-		pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded ||
-		pod.DeletionTimestamp != nil || stopping(b)
+	started := claimAccepted(pod) || stopping(b)
 	if !started {
 		prepareErr := pod.Annotations[v1.AnnotationPrepareError]
 		msg := "preparing the root disk on " + pod.Spec.NodeName
