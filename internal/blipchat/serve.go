@@ -24,6 +24,8 @@ const (
 	stepInterval = 2 * time.Second
 	// turnField indexes BlipTurns by spec.thread.
 	turnField = "spec.thread"
+	// budgetPauseReason is the only pause blipchat clears automatically.
+	budgetPauseReason = "daily token budget exhausted"
 )
 
 var timeNow = time.Now
@@ -225,6 +227,18 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 		timers:  append([]v1.ThreadTimer{}, thread.Status.Timers...),
 		summary: thread.Status.Summary,
 	}
+	// Check the budget before draining timers or turns: an exhausted step does
+	// not process this input, so it must stay pending.
+	started := timeNow()
+	tokensToday := thread.Status.TokensToday
+	if thread.Status.TokenDay != started.Format("2006-01-02") {
+		tokensToday = 0
+	}
+	if thread.Spec.DailyTokens > 0 && tokensToday >= thread.Spec.DailyTokens {
+		st.paused = budgetPauseReason
+		return s.commit(ctx, st, thread.Status.ConsumedSeq, pending, started)
+	}
+
 	// Consume due timers: their notes are part of this step's input.
 	var dueTimers []v1.ThreadTimer
 	kept := st.timers[:0]
@@ -244,15 +258,6 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 	if model == "" {
 		return fmt.Errorf("no model: set spec.model or --model")
 	}
-	started := timeNow()
-	tokensToday := thread.Status.TokensToday
-	if thread.Status.TokenDay != started.Format("2006-01-02") {
-		tokensToday = 0
-	}
-	if thread.Spec.DailyTokens > 0 && tokensToday >= thread.Spec.DailyTokens {
-		st.paused = "daily token budget exhausted"
-		return s.commit(ctx, st, target, pending, started)
-	}
 
 	messages := []Message{
 		{Role: "system", Content: systemPrompt(thread)},
@@ -267,7 +272,7 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 		st.usage += usage.Total()
 		messages = append(messages, reply)
 		if thread.Spec.DailyTokens > 0 && tokensToday+st.usage >= thread.Spec.DailyTokens {
-			st.paused = "daily token budget exhausted"
+			st.paused = budgetPauseReason
 			break
 		}
 		if len(reply.ToolCalls) == 0 {
