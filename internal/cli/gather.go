@@ -25,12 +25,13 @@ import (
 )
 
 type gatherFlags struct {
-	selector string
-	collect  []string
-	any      bool
-	wait     time.Duration
-	follow   bool
-	keep     bool
+	selector    string
+	selectorSet bool
+	collect     []string
+	any         bool
+	wait        time.Duration
+	follow      bool
+	keep        bool
 }
 
 func (a *app) gatherCommand() *cobra.Command {
@@ -66,6 +67,7 @@ blips are deleted with their workspaces.`,
   blip gather -l app=nightly --wait 10m`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			f.selectorSet = cmd.Flags().Changed("selector")
 			return a.gather(cmd.Context(), args, f)
 		},
 	}
@@ -96,6 +98,12 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 	if len(names) == 0 && selector == "" {
 		if a.self == nil {
 			return errors.New("gather needs blip names or --selector outside a blip")
+		}
+		// An explicitly empty selector is a mistake, not a request for the
+		// default set: inside a blip the default is every fork of the
+		// caller, which gather would delete.
+		if f.selectorSet {
+			return errors.New("--selector must not be empty")
 		}
 		selector = v1alpha1.LabelParent + "=" + v1alpha1.ParentLabel(a.short(a.self.Name))
 	}
