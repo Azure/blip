@@ -6,8 +6,10 @@ import (
 	"strconv"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -27,6 +29,13 @@ func (w *Watcher) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 	}
 	thread := b.Labels[v1.LabelThread]
 	if thread == "" {
+		return ctrl.Result{}, nil
+	}
+	owned, err := w.threadOwnedBy(ctx, &b, thread)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !owned {
 		return ctrl.Result{}, nil
 	}
 	task := b.Labels[v1.LabelTask]
@@ -74,6 +83,29 @@ func (w *Watcher) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// threadOwnedBy reports whether thread exists and belongs to the Blip's
+// owner. The thread label is self-asserted: a restricted VM may patch its own
+// Blip, so appending its reports to that thread's history also requires the
+// derived thread owner to match blip.dev/owner. A foreign, unknown, or
+// ownerless label is ignored rather than allowed to inject turns into another
+// project.
+func (w *Watcher) threadOwnedBy(ctx context.Context, b *v1.Blip, thread string) (bool, error) {
+	owner := b.Labels[v1.LabelOwner]
+	if owner == "" || owner != v1.ThreadOwner(b.Namespace, thread) {
+		log.FromContext(ctx).Info("ignoring blip report for a thread of another owner", "blip", b.Name, "thread", thread)
+		return false, nil
+	}
+	var t v1.BlipThread
+	if err := w.Get(ctx, client.ObjectKey{Namespace: b.Namespace, Name: thread}, &t); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.FromContext(ctx).Info("ignoring blip report for a missing thread", "blip", b.Name, "thread", thread)
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // SetupWithManager registers the watcher for blips labelled with a thread.

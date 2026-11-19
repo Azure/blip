@@ -398,6 +398,14 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 	scopedResource := func(s string) bool {
 		return s == "pods" || s == "blips" || s == "blipstates" || s == "blipthreads" || s == "blipturns"
 	}
+	namesScopedResource := func(parts []string) bool {
+		for _, s := range parts {
+			if scopedResource(s) {
+				return true
+			}
+		}
+		return false
+	}
 	namespaced := func(base int) (scopeRequest, scopeAction) {
 		// seg[base] is the resource, seg[base-1] the namespace.
 		res := seg[base]
@@ -421,6 +429,19 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		if len(seg) >= 5 && seg[2] == "namespaces" && scopedResource(seg[4]) {
 			return namespaced(4)
 		}
+		// Legacy namespaced watches, /api/v1/watch/namespaces/{ns}/{res},
+		// are reads of the same collection and must be scoped like the list.
+		// Only the collection shape is a real route; any other watch shape
+		// naming a scoped resource is denied rather than forwarded unscoped.
+		if len(seg) > 2 && seg[2] == "watch" {
+			if len(seg) == 6 && seg[3] == "namespaces" && scopedResource(seg[5]) {
+				return namespaced(5)
+			}
+			if namesScopedResource(seg[3:]) {
+				return scopeRequest{}, scopedDeny
+			}
+			return scopeRequest{}, passThrough
+		}
 		// /api/v1/pods (all namespaces) or another shape naming pods.
 		if len(seg) >= 3 && seg[2] == "pods" {
 			return scopeRequest{}, scopedDeny
@@ -431,8 +452,19 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		if len(seg) >= 6 && seg[3] == "namespaces" && scopedResource(seg[5]) {
 			return namespaced(5)
 		}
+		// Legacy namespaced watches,
+		// /apis/blip.dev/v1alpha1/watch/namespaces/{ns}/{res}, are scoped like
+		// the list. Unknown watch shapes naming a scoped resource are denied.
+		if len(seg) > 3 && seg[3] == "watch" {
+			if len(seg) == 7 && seg[4] == "namespaces" && scopedResource(seg[6]) {
+				return namespaced(6)
+			}
+			if namesScopedResource(seg[4:]) {
+				return scopeRequest{}, scopedDeny
+			}
+		}
 		// /apis/blip.dev/v1alpha1/blips (all namespaces) or another shape.
-		if len(seg) >= 4 && (scopedResource(seg[3]) || seg[3] == "watch" && len(seg) >= 5 && scopedResource(seg[4])) {
+		if len(seg) >= 4 && scopedResource(seg[3]) {
 			return scopeRequest{}, scopedDeny
 		}
 	}

@@ -82,6 +82,20 @@ spec:
         string(variables.data['sa.' + variables.callerSA]).split(' ') : []
     - name: bases
       expression: "'bases' in variables.data ? string(variables.data['bases']).split(' ') : []"
+    # A blip.dev/thread label decides which project's history a Blip's reports
+    # are appended to. The label is self-asserted by the VM, so a restricted
+    # owner may only set it to a thread it owns: the "thread.<name>" table
+    # records the owner hash of every thread.
+    - name: thread
+      expression: >-
+        (request.operation == 'CREATE' || request.operation == 'UPDATE') &&
+        has(object.metadata.labels) && 'blip.dev/thread' in object.metadata.labels ?
+        string(object.metadata.labels['blip.dev/thread']) : ''
+    - name: oldThread
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.metadata.labels) &&
+        'blip.dev/thread' in oldObject.metadata.labels ?
+        string(oldObject.metadata.labels['blip.dev/thread']) : ''
   validations:
     - expression: "!variables.vm || variables.owner != ''"
       messageExpression: >-
@@ -141,6 +155,17 @@ spec:
         object.metadata.labels['blip.dev/owner'] == variables.owner)
       messageExpression: >-
         'owner ' + variables.owner + ' must label its objects blip.dev/owner=' + variables.owner
+      reason: Forbidden
+    # An attacker must not steer its reports into another project's thread by
+    # relabelling its own Blip. The label may only name a thread of the same
+    # owner, and an unchanged label stays valid when the thread is gone.
+    - expression: >-
+        !variables.restricted || !variables.writes || request.resource.resource != 'blips' ||
+        variables.thread == variables.oldThread ||
+        (variables.thread != '' && ('thread.' + variables.thread) in variables.data &&
+        string(variables.data['thread.' + variables.thread]) == variables.owner)
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only attach blip.dev/thread labels of its own threads'
       reason: Forbidden
     - expression: >-
         !variables.restricted || !variables.writes ||

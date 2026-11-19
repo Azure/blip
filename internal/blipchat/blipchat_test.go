@@ -503,7 +503,7 @@ func TestWatcherTurnsReportsIntoMessages(t *testing.T) {
 	b := &v1.Blip{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "blip-a", Namespace: "ns", UID: types.UID("uid-a"),
-			Labels: map[string]string{v1.LabelThread: "proj", v1.LabelTask: "t1"},
+			Labels: map[string]string{v1.LabelThread: "proj", v1.LabelTask: "t1", v1.LabelOwner: Owner(&ThreadKey{Namespace: "ns", Name: "proj"})},
 		},
 		Spec:   v1.BlipSpec{Pool: "default", State: "s", Command: []string{"true"}},
 		Status: v1.BlipStatus{Phase: v1.BlipRunning, Report: &v1.BlipReport{Seq: 2, Text: `{"outcome":"success","summary":"tests pass"}`}},
@@ -861,7 +861,7 @@ func TestReportReachesCoordinator(t *testing.T) {
 	b := &v1.Blip{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "blip-a", Namespace: "ns", UID: types.UID("uid-a"),
-			Labels: map[string]string{v1.LabelThread: "proj", v1.LabelTask: "t1"},
+			Labels: map[string]string{v1.LabelThread: "proj", v1.LabelTask: "t1", v1.LabelOwner: Owner(&ThreadKey{Namespace: "ns", Name: "proj"})},
 		},
 		Spec:   v1.BlipSpec{Pool: "default", State: "s", Command: []string{"true"}},
 		Status: v1.BlipStatus{Phase: v1.BlipRunning, Report: &v1.BlipReport{Seq: 1, Text: `{"outcome":"success","summary":"done"}`}},
@@ -897,6 +897,61 @@ func TestReportReachesCoordinator(t *testing.T) {
 	}
 	if thread.Status.ConsumedSeq != 1 {
 		t.Errorf("consumedSeq = %d, want 1", thread.Status.ConsumedSeq)
+	}
+}
+
+// A blip may only report into a thread its owner owns. A restricted VM can
+// relabel its own Blip with another project's blip.dev/thread, so the watcher
+// must verify the thread exists and its derived owner matches the Blip owner
+// before appending attacker-controlled text to the victim's history.
+func TestWatcherIgnoresForeignThreadLabel(t *testing.T) {
+	project := Owner(&ThreadKey{Namespace: "ns", Name: "proj"})
+	victimThread := &v1.BlipThread{ObjectMeta: metav1.ObjectMeta{Name: "victim", Namespace: "ns"}}
+	report := func(labels map[string]string) *v1.Blip {
+		return &v1.Blip{
+			ObjectMeta: metav1.ObjectMeta{Name: "blip-a", Namespace: "ns", UID: types.UID("uid-a"), Labels: labels},
+			Status: v1.BlipStatus{
+				Phase:  v1.BlipSucceeded,
+				Report: &v1.BlipReport{Seq: 1, Text: "CROSS-PROJECT-INJECTION"},
+			},
+		}
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "blip-a"}}
+
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+	}{
+		{"foreign thread label", map[string]string{v1.LabelThread: "victim", v1.LabelOwner: project}},
+		{"missing thread", map[string]string{v1.LabelThread: "missing", v1.LabelOwner: project}},
+		{"missing owner label", map[string]string{v1.LabelThread: "proj"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testClient(t, testThread(), victimThread, report(tc.labels))
+			if _, err := (&Watcher{Client: c}).Reconcile(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			var turns v1.BlipTurnList
+			if err := c.List(context.Background(), &turns, client.InNamespace("ns")); err != nil {
+				t.Fatal(err)
+			}
+			if len(turns.Items) != 0 {
+				t.Fatalf("created turns outside the blip's thread: %v", names(turns.Items))
+			}
+		})
+	}
+
+	// Same-owner reporting still becomes turns.
+	labels := map[string]string{v1.LabelThread: "proj", v1.LabelOwner: project}
+	c := testClient(t, testThread(), victimThread, report(labels))
+	if _, err := (&Watcher{Client: c}).Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"blip-uid-a-r1", "blip-uid-a-fin"} {
+		var turn v1.BlipTurn
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: name}, &turn); err != nil {
+			t.Errorf("same-owner turn %s: %v", name, err)
+		}
 	}
 }
 

@@ -87,9 +87,16 @@ func (f *fakeKube) recorded() []string {
 	return append([]string(nil), f.requests...)
 }
 
-// resourceFromPath extracts a namespaced pods/blips/blipstates request.
+// resourceFromPath extracts a namespaced pods/blips/blipstates request. The
+// legacy watch routes prefix the namespaced collection with "watch"; strip it
+// so a watch is served like the corresponding list.
 func resourceFromPath(namespace, path string) (resource, name string, list bool) {
 	seg := strings.Split(strings.Trim(path, "/"), "/")
+	if len(seg) > 2 && seg[0] == "api" && seg[2] == "watch" {
+		seg = append(seg[:2], seg[3:]...)
+	} else if len(seg) > 3 && seg[0] == "apis" && seg[3] == "watch" {
+		seg = append(seg[:3], seg[4:]...)
+	}
 	if len(seg) >= 2 && seg[0] == "api" && len(seg) >= 5 && seg[2] == "namespaces" && seg[3] == namespace && seg[4] == "pods" {
 		if len(seg) == 5 {
 			return "pods", "", true
@@ -420,6 +427,101 @@ func TestOwnerScopeScopesThreadsAndTurns(t *testing.T) {
 		"/apis/blip.dev/v1alpha1/blipturns",
 		"/apis/blip.dev/v1alpha1/watch/blipthreads",
 		"/apis/blip.dev/v1alpha1/watch/blipturns",
+	} {
+		if status, _ := proxyGet(t, p, path); status != http.StatusForbidden {
+			t.Errorf("%s status = %d, want 403", path, status)
+		}
+	}
+}
+
+// TestOwnerScopeNamespacedWatchPaths is the regression test for the legacy
+// namespaced watch routes. They must be scoped exactly like the corresponding
+// list; forwarding them unscoped leaked every owner's objects in the namespace.
+func TestOwnerScopeNamespacedWatchPaths(t *testing.T) {
+	kube := scopedFixture()
+	owner := v1.ThreadOwner(scopeNamespace, "alice-proj")
+	p := startScoped(t, kube, "proj-vm")
+
+	for _, tc := range []struct {
+		name     string
+		path     string
+		query    string
+		selector string
+		want     []string
+		not      []string
+	}{
+		{
+			name: "pods", path: "/api/v1/watch/namespaces/blip-sandbox/pods",
+			query: "labelSelector", selector: v1.LabelOwner + "=" + owner,
+			want: []string{"proj-vm"}, not: []string{"alice-vm", "bob-vm", "warm-vm"},
+		},
+		{
+			name: "blips", path: "/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blips",
+			query: "labelSelector", selector: v1.LabelOwner + "=" + owner,
+			want: []string{"proj.a"}, not: []string{"alice.a", "bob.b", "admin.a"},
+		},
+		{
+			name: "blipstates", path: "/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blipstates",
+			query: "labelSelector", selector: v1.LabelOwner + "=" + owner,
+			not: []string{"alice.home", "bob.home", "shared-base", "legacy-copy"},
+		},
+		{
+			name: "blipthreads", path: "/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blipthreads",
+			query: "fieldSelector", selector: "metadata.name=alice-proj",
+			want: []string{"alice-proj"}, not: []string{"bob-proj", "admin-proj"},
+		},
+		{
+			name: "blipturns", path: "/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blipturns",
+			query: "labelSelector", selector: v1.LabelThread + "=alice-proj",
+			want: []string{"alice-turn"}, not: []string{"bob-turn", "admin-turn", "unlabelled-alice-turn"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, body := proxyGet(t, p, tc.path+"?watch=true")
+			if status != http.StatusOK {
+				t.Fatalf("%s status = %d, body %q", tc.path, status, body)
+			}
+			if got := kube.lastQuery(t, tc.path).Get(tc.query); got != tc.selector {
+				t.Errorf("%s %s = %q, want %q", tc.path, tc.query, got, tc.selector)
+			}
+			for _, name := range tc.want {
+				if !strings.Contains(body, name) {
+					t.Errorf("%s watch missing %q: %s", tc.path, name, body)
+				}
+			}
+			for _, name := range tc.not {
+				if strings.Contains(body, name) {
+					t.Errorf("%s watch leaked %q: %s", tc.path, name, body)
+				}
+			}
+		})
+	}
+
+	// The latent core-API pod watch is scoped to a user-owned VM as well.
+	p = startScoped(t, kube, "alice-vm")
+	status, body := proxyGet(t, p, "/api/v1/watch/namespaces/blip-sandbox/pods?watch=true")
+	if status != http.StatusOK {
+		t.Fatalf("alice pod watch status = %d, body %q", status, body)
+	}
+	if got := kube.lastQuery(t, "/api/v1/watch/namespaces/blip-sandbox/pods").Get("labelSelector"); got != v1.LabelOwner+"=alice" {
+		t.Errorf("alice pod watch selector = %q", got)
+	}
+	if !strings.Contains(body, "alice-vm") || strings.Contains(body, "bob-vm") || strings.Contains(body, "warm-vm") {
+		t.Errorf("alice pod watch leaked pods: %s", body)
+	}
+
+	// Unknown watch shapes naming a scoped resource, and other namespaces,
+	// are denied rather than forwarded unscoped.
+	for _, path := range []string{
+		"/api/v1/watch/pods",
+		"/api/v1/watch/namespaces/blip-sandbox/pods/alice-vm",
+		"/api/v1/watch/namespaces/other/pods",
+		"/apis/blip.dev/v1alpha1/watch/blips",
+		"/apis/blip.dev/v1alpha1/watch/blipstates",
+		"/apis/blip.dev/v1alpha1/watch/blipthreads",
+		"/apis/blip.dev/v1alpha1/watch/blipturns",
+		"/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blips/bob.b",
+		"/apis/blip.dev/v1alpha1/watch/namespaces/other/blips",
 	} {
 		if status, _ := proxyGet(t, p, path); status != http.StatusForbidden {
 			t.Errorf("%s status = %d, want 403", path, status)

@@ -481,6 +481,74 @@ func TestVMOwnerPolicy(t *testing.T) {
 	}
 }
 
+// withThreadLabel sets (or clears, when thread is empty) the blip.dev/thread
+// label on an object built by blipObj/stateObj.
+func withThreadLabel(o map[string]any, thread string) map[string]any {
+	meta := o["metadata"].(map[string]any)
+	labels, _ := meta["labels"].(map[string]any)
+	if labels == nil {
+		labels = map[string]any{}
+		meta["labels"] = labels
+	}
+	if thread == "" {
+		delete(labels, v1.LabelThread)
+		return o
+	}
+	labels[v1.LabelThread] = thread
+	return o
+}
+
+// A restricted VM may attach its Blip only to a thread of its own project.
+// The thread owner is the blip-vm-owners "thread.<name>" entry, so a forged
+// blip.dev/thread label cannot steer blipchat turns into another project.
+func TestVMOwnerPolicyThreadLabel(t *testing.T) {
+	v := loadVMOwnerPolicy(t)
+	project := v1.ThreadOwner(ns, "proj")
+	victim := v1.ThreadOwner(ns, "victim")
+	params := map[string]string{
+		"sa.vm":         "default",
+		"default-mine":  project,
+		"default-user":  "u-0123456789abcdef0123456789abcdef",
+		"default-admin": "-",
+		"thread.proj":   project,
+		"thread.victim": victim,
+	}
+	mine, userVM, admin := vmUser("vm", "default-mine"), vmUser("vm", "default-user"), vmUser("vm", "default-admin")
+	own := withThreadLabel(blipObj(project+".a", project), "proj")
+	noThread := blipObj(project+".a", project)
+	foreign := withThreadLabel(blipObj(project+".a", project), "victim")
+	unknown := withThreadLabel(blipObj(project+".a", project), "missing")
+
+	for _, tc := range []struct {
+		name  string
+		req   policyRequest
+		allow bool
+		msg   string
+	}{
+		{"own thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: own}, true, ""},
+		{"no thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: noThread}, true, ""},
+		{"foreign thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: foreign}, false, "thread"},
+		{"unknown thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: unknown}, false, "thread"},
+		{"user-owned VM foreign thread", policyRequest{user: userVM, op: admission.Create, resource: "blips", name: "u-0123456789abcdef0123456789abcdef.a",
+			object: withThreadLabel(blipObj("u-0123456789abcdef0123456789abcdef.a", "u-0123456789abcdef0123456789abcdef"), "proj")}, false, "thread"},
+		{"keep own thread", policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: own, oldObject: own}, true, ""},
+		{"add foreign thread", policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: foreign, oldObject: noThread}, false, "thread"},
+		{"change to foreign thread", policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: foreign, oldObject: own}, false, "thread"},
+		{"remove own thread", policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: noThread, oldObject: own}, false, "thread"},
+		{"unrestricted foreign thread", policyRequest{user: admin, op: admission.Create, resource: "blips", name: "a", object: withThreadLabel(blipObj("a", ""), "victim")}, true, ""},
+		{"non-VM foreign thread", policyRequest{user: &user.DefaultInfo{Name: "alice"}, op: admission.Create, resource: "blips", name: "a", object: withThreadLabel(blipObj("a", ""), "victim")}, true, ""},
+		{"state thread label is not a blip", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: project + ".s",
+			object: withThreadLabel(stateObj(project+".s", project, ""), "victim")}, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allow, msg := tc.req.evaluate(t, v, params)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+}
+
 func ownerReference(name string, mutate ...func(map[string]any)) map[string]any {
 	ref := map[string]any{"apiVersion": "blip.dev/v1alpha1", "kind": "Blip", "name": name, "uid": "uid-parent"}
 	for _, m := range mutate {
