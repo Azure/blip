@@ -176,9 +176,12 @@ const (
 
 // BlipTurnSpec is written by the turn's producer.
 type BlipTurnSpec struct {
-	// Thread is the name of the BlipThread this turn belongs to.
+	// Thread is the name of a BlipThread in the same namespace. It must be a
+	// valid thread (DNS subdomain) name so a typo cannot create a turn that
+	// no thread can ever claim.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	Thread string     `json:"thread"`
 	Author TurnAuthor `json:"author"`
 	// Topic is a free-form dotted label such as blip.report, chat.propose,
@@ -240,6 +243,11 @@ type BlipTurnStatus struct {
 	// turn. A deleted and recreated thread has a new UID, so turns sequenced
 	// by the old incarnation are ignored rather than adopted as history.
 	ThreadUID string `json:"threadUID,omitempty"`
+	// OrphanedAt is when blipchat stopped retrying a turn whose thread does
+	// not exist. Such a turn is never sequenced, and retention deletes it
+	// after the default turn age. The sequencer clears it if the thread
+	// appears later.
+	OrphanedAt *metav1.Time `json:"orphanedAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true

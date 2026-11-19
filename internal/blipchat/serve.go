@@ -22,6 +22,9 @@ import (
 const (
 	requeueDelay = 2 * time.Second
 	stepInterval = 2 * time.Second
+	// defaultTurnAge is the retention applied to turns that no thread can
+	// prune, and the default for threads without retention.turns.
+	defaultTurnAge = 7 * 24 * time.Hour
 	// turnField indexes BlipTurns by spec.thread.
 	turnField = "spec.thread"
 	// budgetPauseReason is the only pause blipchat clears automatically.
@@ -80,10 +83,14 @@ func (s *Server) Steps(ctx context.Context) error {
 				continue
 			}
 			s.pruneCount++
+			prune := s.pruneCount >= 150
+			if prune {
+				s.pruneCount = 0
+			}
 			for i := range threads.Items {
 				thread := &threads.Items[i]
 				s.maybeUnpause(ctx, thread)
-				if s.pruneCount >= 150 {
+				if prune {
 					if err := s.prune(ctx, thread); err != nil {
 						s.Log.Error(err, "prune thread", "thread", thread.Namespace+"/"+thread.Name)
 					}
@@ -99,8 +106,10 @@ func (s *Server) Steps(ctx context.Context) error {
 					s.deferThread(thread, errRetry)
 				}
 			}
-			if s.pruneCount >= 150 {
-				s.pruneCount = 0
+			if prune {
+				if err := s.pruneOrphanTurns(ctx, threads.Items); err != nil {
+					s.Log.Error(err, "prune orphan turns")
+				}
 			}
 		}
 	}
@@ -498,7 +507,7 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 	}
 	turnAge, keepTurns := thread.Spec.Retention.Turns, int(thread.Spec.Retention.KeepTurns)
 	if turnAge == nil {
-		turnAge = &metav1.Duration{Duration: 7 * 24 * time.Hour}
+		turnAge = &metav1.Duration{Duration: defaultTurnAge}
 	}
 	if keepTurns == 0 {
 		keepTurns = 200
@@ -577,4 +586,33 @@ func closedTaskOlder(a, b v1.ThreadTask) bool {
 		return false
 	}
 	return a.Updated.Before(b.Updated)
+}
+
+// pruneOrphanTurns deletes turns that reference no existing thread. A turn
+// whose thread was deleted, or whose spec.thread is a typo, is never sequenced
+// and no thread prune pass will ever see it. It is kept for the default turn
+// age so the cause is still visible, then garbage-collected.
+func (s *Server) pruneOrphanTurns(ctx context.Context, threads []v1.BlipThread) error {
+	live := make(map[string]bool, len(threads))
+	for i := range threads {
+		live[threads[i].Namespace+"/"+threads[i].Name] = true
+	}
+	var turns v1.BlipTurnList
+	if err := s.List(ctx, &turns); err != nil {
+		return err
+	}
+	now := timeNow()
+	for i := range turns.Items {
+		t := &turns.Items[i]
+		if t.DeletionTimestamp != nil || live[t.Namespace+"/"+t.Spec.Thread] {
+			continue
+		}
+		if now.Sub(t.CreationTimestamp.Time) < defaultTurnAge {
+			continue
+		}
+		if err := s.Delete(ctx, t); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
 }

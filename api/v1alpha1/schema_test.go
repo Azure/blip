@@ -369,6 +369,39 @@ func TestBlipTurnSchemaCaps(t *testing.T) {
 	ruleFor(t, spec.Properties["attributes"].XValidations, "attribute keys are at most 63 and values at most 256 characters")
 }
 
+// TestBlipTurnThreadNamePattern guards that spec.thread can only name a
+// BlipThread. Without the pattern an ordinary typo (a trailing space) created
+// a turn that no thread could ever claim.
+func TestBlipTurnThreadNamePattern(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipturns.yaml")
+	thread, ok := spec.Properties["thread"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.thread property")
+	}
+	re, err := regexp.Compile(thread.Pattern)
+	if err != nil {
+		t.Fatalf("compile thread pattern %q: %v", thread.Pattern, err)
+	}
+	for _, good := range []string{"project", "a.b", "a-1", "team.chat-2"} {
+		if !re.MatchString(good) {
+			t.Errorf("thread name %q rejected", good)
+		}
+	}
+	for _, bad := range []string{"", "project ", " project", "Project", "proj_ect", "a..b", "-a"} {
+		if re.MatchString(bad) {
+			t.Errorf("thread name %q accepted", bad)
+		}
+	}
+
+	validate := admissionValidator(t, "blipturns")
+	if errs := validate(`{"spec":{"thread":"project ","author":{"kind":"ServiceAccount","name":"ci"}}}`, ""); len(errs) == 0 {
+		t.Error("admitted a turn whose thread name cannot exist")
+	}
+	if errs := validate(`{"spec":{"thread":"project","author":{"kind":"ServiceAccount","name":"ci"}}}`, ""); len(errs) != 0 {
+		t.Fatal(errs.ToAggregate())
+	}
+}
+
 // TestBlipTurnImmutable guards that a producer cannot rewrite history.
 func TestBlipTurnImmutable(t *testing.T) {
 	data, err := os.ReadFile("../../deploy/crd/blip.dev_blipturns.yaml")

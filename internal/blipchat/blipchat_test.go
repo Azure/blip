@@ -324,6 +324,114 @@ func TestSequencerRepairsLaggingLastSeq(t *testing.T) {
 	}
 }
 
+// A turn whose thread can never exist is terminal immediately instead of
+// being requeued every two seconds forever. A turn racing a valid thread name
+// is given a grace period.
+func TestSequencerOrphanHandling(t *testing.T) {
+	ctx := context.Background()
+	req := func(name string) ctrl.Request {
+		return ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: name}}
+	}
+
+	invalid := testTurn("invalid", "proj ")
+	invalid.CreationTimestamp = metav1.NewTime(time.Now())
+	young := testTurn("young", "proj")
+	young.CreationTimestamp = metav1.NewTime(time.Now())
+	old := testTurn("old", "proj")
+	old.CreationTimestamp = metav1.NewTime(time.Now().Add(-orphanGrace - time.Minute))
+	c := testClient(t, invalid, young, old)
+	s := &Sequencer{Client: c}
+
+	if result, err := s.Reconcile(ctx, req("invalid")); err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("invalid thread result %+v err %v, want no requeue", result, err)
+	}
+	var turn v1.BlipTurn
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "invalid"}, &turn); err != nil {
+		t.Fatal(err)
+	}
+	if turn.Status.OrphanedAt == nil || turn.Status.Seq != 0 {
+		t.Errorf("invalid turn status = %+v, want orphaned and unsequenced", turn.Status)
+	}
+	if result, err := s.Reconcile(ctx, req("invalid")); err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("orphaned turn requeued: %+v %v", result, err)
+	}
+
+	if result, err := s.Reconcile(ctx, req("young")); err != nil || result.RequeueAfter != requeueDelay {
+		t.Fatalf("young turn result %+v err %v, want requeue after %v", result, err, requeueDelay)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "young"}, &turn); err != nil {
+		t.Fatal(err)
+	}
+	if turn.Status.OrphanedAt != nil {
+		t.Error("a turn racing a valid thread name was orphaned too early")
+	}
+
+	if result, err := s.Reconcile(ctx, req("old")); err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("old turn result %+v err %v, want no requeue", result, err)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "old"}, &turn); err != nil {
+		t.Fatal(err)
+	}
+	if turn.Status.OrphanedAt == nil {
+		t.Error("turn past the grace period was not marked orphaned")
+	}
+}
+
+// An orphaned turn is sequenced when its thread appears (the thread create
+// watch enqueues it), and the terminal marker is cleared.
+func TestSequencerAdoptsOrphanWhenThreadAppears(t *testing.T) {
+	orphaned := testTurn("waiting", "proj")
+	orphaned.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+	orphaned.Status.OrphanedAt = &metav1.Time{Time: time.Now()}
+	thread := testThread()
+	c := testClient(t, thread, orphaned)
+	s := &Sequencer{Client: c}
+	if _, err := s.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "waiting"}}); err != nil {
+		t.Fatal(err)
+	}
+	var turn v1.BlipTurn
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "waiting"}, &turn); err != nil {
+		t.Fatal(err)
+	}
+	if turn.Status.Seq != 1 || turn.Status.OrphanedAt != nil {
+		t.Errorf("turn status = %+v, want sequenced without an orphan marker", turn.Status)
+	}
+}
+
+// Turns with no thread are garbage-collected after the default retention.
+func TestPruneOrphanTurns(t *testing.T) {
+	thread := testThread()
+	old := func(t *v1.BlipTurn) *v1.BlipTurn {
+		t.CreationTimestamp = metav1.NewTime(time.Now().Add(-defaultTurnAge - time.Hour))
+		return t
+	}
+	orphan := old(testTurn("orphan", "deleted-thread"))
+	young := testTurn("young", "deleted-thread")
+	young.CreationTimestamp = metav1.NewTime(time.Now())
+	live := testTurn("live", "proj")
+	live.CreationTimestamp = metav1.NewTime(time.Now())
+	live.Status.Seq = 1
+	c := testClient(t, thread, orphan, young, live)
+	s := &Server{Client: c}
+	if err := s.pruneOrphanTurns(context.Background(), []v1.BlipThread{*thread}); err != nil {
+		t.Fatal(err)
+	}
+	var turns v1.BlipTurnList
+	if err := c.List(context.Background(), &turns, client.InNamespace("ns")); err != nil {
+		t.Fatal(err)
+	}
+	got := names(turns.Items)
+	want := map[string]bool{"young": true, "live": true}
+	if len(got) != len(want) {
+		t.Fatalf("turns after sweep = %v, want %v", got, want)
+	}
+	for _, name := range got {
+		if !want[name] {
+			t.Errorf("unexpected surviving turn %q", name)
+		}
+	}
+}
+
 func TestWatcherTurnsReportsIntoMessages(t *testing.T) {
 	b := &v1.Blip{
 		ObjectMeta: metav1.ObjectMeta{

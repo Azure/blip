@@ -124,10 +124,13 @@ spec:
                 maxLength: 2048
                 type: string
               thread:
-                description: Thread is the name of the BlipThread this turn belongs
-                  to.
+                description: |-
+                  Thread is the name of a BlipThread in the same namespace. It must be a
+                  valid thread (DNS subdomain) name so a typo cannot create a turn that
+                  no thread can ever claim.
                 maxLength: 253
                 minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                 type: string
               topic:
                 description: |-
@@ -154,6 +157,14 @@ spec:
             properties:
               acceptedTime:
                 description: AcceptedTime is when blipchat sequenced the turn.
+                format: date-time
+                type: string
+              orphanedAt:
+                description: |-
+                  OrphanedAt is when blipchat stopped retrying a turn whose thread does
+                  not exist. Such a turn is never sequenced, and retention deletes it
+                  after the default turn age. The sequencer clears it if the thread
+                  appears later.
                 format: date-time
                 type: string
               seq:
