@@ -292,6 +292,8 @@ func TestIdentityHeadersAndTokenRotation(t *testing.T) {
 			"Cf-Access-Jwt-Assertion", "X-Authentik-Username", "X-Ssl-Client-S-Dn", "Client-Cert", "X-Pomerium-Jwt-Assertion",
 			"X-Amzn-Oidc-Data", "X-Amzn-Oidc-Identity", "X-Amzn-Oidc-Accesstoken",
 			"X-Ms-Token-Aad-Access-Token", "X-Auth-Email", "X-Authenticated-User", "X-Scope", "X-Userinfo",
+			"Teleport-Jwt-Assertion", "Teleport-User", "X-Vouch-User", "X-Vouch-Idp-User",
+			"X-Username", "X-Auth-Username", "X-Impersonate-User", "X-User-Id",
 			// Underscore spellings that frameworks expose as HTTP_X_*.
 			"X_User", "X_Forwarded_User", "X_Remote_User",
 		} {
@@ -982,6 +984,19 @@ func TestStripIdentity(t *testing.T) {
 		{"X-Authenticated-User", false},
 		{"X-Scope", false},
 		{"X-Userinfo", false},
+		// Teleport, Vouch and generic front-proxy user assertions.
+		{"Teleport-Jwt-Assertion", false},
+		{"Teleport-User", false},
+		{"X-Vouch-User", false},
+		{"X-Vouch-Idp-User", false},
+		{"X-Username", false},
+		{"X-Auth-Username", false},
+		{"X-Impersonate-User", false},
+		{"X-Jwt-Assertion", false},
+		{"X-User-Id", false},
+		{"Teleport_Jwt_Assertion", false},
+		{"X_Vouch_User", false},
+		{"X_Impersonate_User", false},
 		// Underscore spellings must not bypass the denylist.
 		{"X_User", false},
 		{"X_Forwarded_User", false},

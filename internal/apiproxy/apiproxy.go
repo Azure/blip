@@ -427,8 +427,15 @@ var identityHeaderPrefixes = []string{
 	"x-remote-",
 	"x-forwarded-",
 	"x-auth-request-", // oauth2-proxy / ingress-nginx auth_request
+	"x-auth-username", // generic reverse-proxy user assertions
 	"remote-",         // Remote-User and friends from reverse proxies
-	"tailscale-user-", // Tailscale serve identity headers
+	"teleport-",       // Teleport app-access JWT assertions and user headers
+	"x-vouch-",        // Vouch Proxy user and IdP assertions
+	"x-username",      // generic front-proxy user name
+	"x-impersonate-",  // generic impersonation assertions
+	"x-jwt-assertion",
+	"x-authenticated-", // generic authenticated-user assertions
+	"tailscale-user-",  // Tailscale serve identity headers
 	"cf-access-authenticated-user-",
 	"cf-access-jwt-assertion",
 	"x-authentik-",  // authentik proxy outpost
@@ -458,6 +465,7 @@ var identityHeaders = map[string]struct{}{
 	"x-auth-email":             {},
 	"x-authenticated-user":     {},
 	"x-user":                   {},
+	"x-user-id":                {},
 	"x-email":                  {},
 	"x-scope":                  {},
 	"x-userinfo":               {},
