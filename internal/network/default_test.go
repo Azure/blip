@@ -39,6 +39,8 @@ func TestDefaultAllowsInternetAndKubeDNS(t *testing.T) {
 		{"172.16.0.1", "TCP", 443, false},
 		{"192.168.1.1", "TCP", 443, false},
 		{"169.254.169.254", "TCP", 80, false},
+		{"168.63.129.16", "TCP", 80, false},
+		{"168.63.129.16", "TCP", 443, false},
 		{"127.0.0.1", "TCP", 443, false},
 		{"100.100.100.200", "TCP", 80, false},
 	} {
