@@ -62,6 +62,15 @@ func ParentLabel(name string) string {
 	return "sha256-" + hex.EncodeToString(sum[:])[:56]
 }
 
+// ThreadOwner is the blip.dev/owner label of the blips and states a
+// BlipThread creates. It is derived from the thread's namespace and name, so
+// it is stable and cannot collide with the u- owners derived from user
+// identities.
+func ThreadOwner(namespace, name string) string {
+	sum := sha256.Sum256([]byte(namespace + "/" + name))
+	return "p-" + hex.EncodeToString(sum[:8])
+}
+
 // OwnerPrefix is the prefix of every object name scoped to owner.
 func OwnerPrefix(owner string) string { return owner + "." }
 

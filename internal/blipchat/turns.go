@@ -36,7 +36,17 @@ func createTurnIn(ctx context.Context, c client.Client, namespace, name string, 
 		spec.InReplyTo = 0
 	}
 	spec.Thread = strings.TrimSpace(spec.Thread)
-	meta := metav1.ObjectMeta{Name: name, Namespace: namespace}
+	meta := metav1.ObjectMeta{
+		Name:      name,
+		Namespace: namespace,
+		// The owner and thread labels let the in-guest API proxy scope
+		// turn reads to one project without trusting self-asserted labels
+		// on the caller's Blip.
+		Labels: map[string]string{
+			v1.LabelThread: spec.Thread,
+			v1.LabelOwner:  v1.ThreadOwner(namespace, spec.Thread),
+		},
+	}
 	// Own the turn by its thread so deleting the thread deletes its turns
 	// rather than leaving them to be adopted by a later thread of the same
 	// name. A turn may race its thread; it then stays unowned until the

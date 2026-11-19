@@ -927,3 +927,23 @@ func TestWakeNoneDoesNotStep(t *testing.T) {
 		t.Fatal("a WakeNone turn alone should not trigger a step")
 	}
 }
+
+// Turns written by the coordinator carry their thread and derived owner so
+// the in-guest API proxy can scope turn reads to one project.
+func TestCreateTurnInLabelsScope(t *testing.T) {
+	c := testClient(t, testThread())
+	turn := turnSpec{Thread: "proj", AuthorKind: v1.TurnAuthorServiceAccount, AuthorName: "system:serviceaccount:ns:ci", Text: "hello"}
+	if err := createTurnIn(context.Background(), c, "ns", "turn-a", turn); err != nil {
+		t.Fatal(err)
+	}
+	var got v1.BlipTurn
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "turn-a"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Labels[v1.LabelThread] != "proj" {
+		t.Errorf("thread label = %q", got.Labels[v1.LabelThread])
+	}
+	if want := v1.ThreadOwner("ns", "proj"); got.Labels[v1.LabelOwner] != want {
+		t.Errorf("owner label = %q, want %q", got.Labels[v1.LabelOwner], want)
+	}
+}
