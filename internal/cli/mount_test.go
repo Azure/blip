@@ -622,6 +622,106 @@ func TestUnmountWritableEndsWhenWriterFinishes(t *testing.T) {
 	}
 }
 
+// TestWaitMountSkipsGenerationWaitWithoutDemotion reproduces the concurrent
+// ro+rw race: mountState sees the transient writable spec and arms the save
+// wait, but the controller only ever saw the final read-only spec, so no save
+// will happen. The wait must finish once the mount is stably read-only at the
+// committed version.
+func TestWaitMountSkipsGenerationWaitWithoutDemotion(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+	data := readyState("data")
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Phase: v1alpha1.MountMounted, CommitID: data.Status.Committed.ID,
+	}}
+	a := mountTestApp(t, b, root, data)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- a.waitMount(ctx, b, "data", "/data", false, data.Status.Committed.Generation, "") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitMount failed without a demotion: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitMount waited for a save that never started")
+	}
+}
+
+// TestWaitMountWaitsForDemotedCommit keeps the generation wait for a demotion
+// the controller actually performed.
+func TestWaitMountWaitsForDemotedCommit(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+	data := readyState("data")
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Writable: true, Phase: v1alpha1.MountMounted, CommitID: data.Status.Committed.ID,
+	}}
+	a := mountTestApp(t, b, root, data)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- a.waitMount(ctx, b, "data", "/data", false, data.Status.Committed.Generation, "") }()
+	select {
+	case err := <-done:
+		t.Fatalf("waitMount accepted a writable mount for a read-only request: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The controller tears the writable mount down and brings it back
+	// read-only at the saved version, before the committed version moves.
+	const saved = "fedcba9876543210"
+	cur, err := a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Phase: v1alpha1.MountMounted, CommitID: saved,
+	}}
+	if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("waitMount finished before the saved version committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	st, err := a.getState(ctx, data.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status.Committed = &v1alpha1.Commit{ID: saved, Generation: data.Status.Committed.Generation + 1}
+	if err := a.c.Kube.Status().Update(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	// waitMount watches the Blip; an unrelated status change triggers the
+	// check that observes the state's new committed generation.
+	cur, err = a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.Status.Sessions++
+	if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitMount failed after the save committed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitMount did not finish after the save committed")
+	}
+}
+
 func TestMountListsRootMounts(t *testing.T) {
 	root := readyState("home")
 	root.Spec.Mounts = []v1alpha1.Mount{

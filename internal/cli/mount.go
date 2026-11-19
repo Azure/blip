@@ -353,6 +353,11 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 	r := &reporter{a: a}
 	defer r.stop()
 	start := time.Now()
+	// demoted records that the mount was actually seen writable or being
+	// saved. The spec edit that armed baseGeneration can race with another
+	// command: if the controller only ever saw the read-only spec, no save
+	// will advance the committed generation.
+	demoted := false
 	return a.waitBlip(ctx, writer.Name, func(b *v1alpha1.Blip) (bool, error) {
 		if b == nil || b.UID != writer.UID || b.Spec.State != writer.Spec.State || v1alpha1.Finished(b) ||
 			b.Spec.Stop || b.DeletionTimestamp != nil || b.Status.Phase == v1alpha1.BlipSaving {
@@ -382,6 +387,9 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			}
 			r.say("mounting %s on %s...", state, b.Name)
 			return false, nil
+		}
+		if !want && (m.Writable || m.Switching || m.Phase == v1alpha1.MountSaving) {
+			demoted = true
 		}
 		if m.Phase == v1alpha1.MountFailed || m.Switching && m.Writable != want && m.Message != "" &&
 			(!strings.Contains(m.Message, "busy") || time.Since(start) > switchBusyTimeout) {
@@ -414,6 +422,14 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 					return false, err
 				}
 				if s.Status.Committed == nil || s.Status.Committed.Generation <= baseGeneration {
+					// Only a demotion this wait actually observed still
+					// has a save to land. A concurrent command can revert
+					// the transient writable spec before the controller
+					// sees it; the mount then keeps its committed version
+					// and no new generation will ever appear.
+					if !demoted && (s.Status.Committed == nil || m.CommitID == "" || m.CommitID == s.Status.Committed.ID) {
+						return true, nil
+					}
 					r.say("saving new version of %s...", state)
 					return false, nil
 				}
