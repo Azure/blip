@@ -17,7 +17,8 @@ const (
 	// separating it from the guest's own log lines.
 	consoleMirrorPrefix = "blip: "
 	// consoleMirrorQueue bounds lines waiting for the console writer. When
-	// it is full new lines are dropped rather than blocking the command.
+	// it is full the oldest lines are dropped rather than blocking the
+	// command, so the newest output survives.
 	consoleMirrorQueue = 256
 	// consoleMirrorLineMax bounds a partial line held between writes. A
 	// longer line is flushed as-is instead of growing without bound.
@@ -127,7 +128,17 @@ func (m *consoleMirror) enqueueLocked(line string) {
 	select {
 	case m.lines <- line:
 	default:
-		m.dropped++
+		// The queue is full. Discard the oldest queued line so the window
+		// the console (and status.output) keeps is the command's tail.
+		select {
+		case <-m.lines:
+			m.dropped++
+		default:
+			// The writer drained a line first; nothing was lost.
+		}
+		// Only this goroutine sends on m.lines, so the slot just freed
+		// (or taken by the writer) is available without blocking.
+		m.lines <- line
 	}
 }
 

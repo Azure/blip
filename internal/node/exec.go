@@ -39,7 +39,12 @@ const freezeTimeout = 60 * time.Second
 // errPodGone means the VM pod disappeared while a live copy waited for it.
 // The copy cannot capture the source, but the controller can still fall back
 // to the source's last committed version, so this is not a state failure.
-var errPodGone = errors.New("VM pod is gone")
+// errPodStopping means the source's guest is shutting down and may never
+// acknowledge a freeze again; the same fallback applies.
+var (
+	errPodGone     = errors.New("VM pod is gone")
+	errPodStopping = errors.New("VM pod is stopping")
+)
 
 // mknodDevice creates (or replaces) path as a block device node with the
 // same device number as device.
@@ -410,8 +415,8 @@ func (a *Agent) liveCopy(ctx context.Context, lc liveCopy) error {
 	// observed.json may still report the freeze of a previous copy of
 	// this attachment; wait for its thaw so it isn't taken as ours.
 	if err := a.waitFrozen(ctx, lc.pod, lc.attachmentID, false); err != nil {
-		if errors.Is(err, errPodGone) {
-			slog.Info("live copy abandoned; pod is gone", "pod", lc.pod, "attachment", lc.attachmentID, "state", lc.stateUID)
+		if errors.Is(err, errPodGone) || errors.Is(err, errPodStopping) {
+			slog.Info("live copy abandoned; source pod is gone or stopping", "pod", lc.pod, "attachment", lc.attachmentID, "state", lc.stateUID)
 			return nil
 		}
 		return err
@@ -419,8 +424,8 @@ func (a *Agent) liveCopy(ctx context.Context, lc liveCopy) error {
 	a.setFreeze(lc.pod, lc.attachmentID, true)
 	defer a.setFreeze(lc.pod, lc.attachmentID, false)
 	if err := a.waitFrozen(ctx, lc.pod, lc.attachmentID, true); err != nil {
-		if errors.Is(err, errPodGone) {
-			slog.Info("live copy abandoned; pod is gone", "pod", lc.pod, "attachment", lc.attachmentID, "state", lc.stateUID)
+		if errors.Is(err, errPodGone) || errors.Is(err, errPodStopping) {
+			slog.Info("live copy abandoned; source pod is gone or stopping", "pod", lc.pod, "attachment", lc.attachmentID, "state", lc.stateUID)
 			return nil
 		}
 		return err
@@ -463,11 +468,16 @@ func (a *Agent) waitFrozen(ctx context.Context, pod, id string, frozen bool) err
 	ctx, cancel := context.WithTimeout(ctx, freezeTimeout)
 	defer cancel()
 	path := filepath.Join(a.podDirFor(pod), podapi.ObservedFile)
+	desired := filepath.Join(a.podDirFor(pod), podapi.DesiredFile)
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
 	for {
 		if podGone(a.podDirFor(pod)) {
 			return fmt.Errorf("%s: %w", pod, errPodGone)
+		}
+		var des podapi.Desired
+		if podapi.ReadJSON(desired, &des) == nil && des.Stop {
+			return fmt.Errorf("%s: %w", pod, errPodStopping)
 		}
 		var obs podapi.Observed
 		err := podapi.ReadJSON(path, &obs)

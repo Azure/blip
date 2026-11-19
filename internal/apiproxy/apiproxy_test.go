@@ -277,6 +277,9 @@ func TestIdentityHeadersAndTokenRotation(t *testing.T) {
 			"Authorization", "Proxy-Authorization", "Impersonate-User", "Impersonate-Group", "Impersonate-Uid",
 			"Impersonate-Extra-Scopes", "Impersonate-Extra-A%2fb", "X-Remote-User", "X-Remote-Group", "X-Remote-Extra-Scopes",
 			"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-Port", "X-Real-IP", "Via",
+			"X-Auth-Request-User", "X-Auth-Request-Groups", "Remote-User", "Remote-Groups", "Remote-Email",
+			"Tailscale-User-Login", "Tailscale-User-Name", "Cf-Access-Authenticated-User-Email",
+			"Cf-Access-Jwt-Assertion", "X-Authentik-Username", "X-Ssl-Client-S-Dn", "Client-Cert", "X-Pomerium-Jwt-Assertion",
 		} {
 			req.Header.Set(key, "caller-controlled")
 		}
@@ -750,5 +753,60 @@ func TestAlreadyCanceledContext(t *testing.T) {
 	cancel()
 	if err := Run(ctx, Config{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestClientHalfCloseKeepsRequest is the regression test for a client that
+// writes a complete request and then half-closes its write side. net/http
+// cancels the request context when the read side reaches EOF, but the guest
+// is still waiting for the response; the proxy must not turn that into 502.
+func TestClientHalfCloseKeepsRequest(t *testing.T) {
+	observed := make(chan string, 1)
+	upstream := tlsUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		observed <- string(body)
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	})
+	cfg := testConfig(t, upstream)
+	startProxy(t, cfg)
+	for _, tt := range []struct {
+		method string
+		body   string
+	}{
+		{http.MethodGet, ""},
+		{http.MethodPost, "hello"},
+	} {
+		t.Run(tt.method, func(t *testing.T) {
+			conn, err := net.Dial("unix", cfg.SocketPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			request := tt.method + " /halfbody HTTP/1.1\r\nHost: kube-apiserver\r\n"
+			if tt.body != "" {
+				request += fmt.Sprintf("Content-Length: %d\r\n", len(tt.body))
+			}
+			request += "\r\n" + tt.body
+			if _, err := io.WriteString(conn, request); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.(*net.UnixConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status %d body %q", resp.StatusCode, body)
+			}
+			if got := <-observed; got != tt.body {
+				t.Fatalf("upstream body = %q, want %q", got, tt.body)
+			}
+		})
 	}
 }

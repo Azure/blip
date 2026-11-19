@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -21,11 +22,25 @@ import (
 const (
 	requeueDelay = 2 * time.Second
 	stepInterval = 2 * time.Second
+	// defaultTurnAge is the retention applied to turns that no thread can
+	// prune, and the default for threads without retention.turns.
+	defaultTurnAge = 7 * 24 * time.Hour
 	// turnField indexes BlipTurns by spec.thread.
 	turnField = "spec.thread"
+	// budgetPauseReason is the only pause blipchat clears automatically.
+	budgetPauseReason = "daily token budget exhausted"
 )
 
 var timeNow = time.Now
+
+// logError logs when a logger was configured. Tests construct Server values
+// without one, and a zero logr.Logger panics on use.
+func (s *Server) logError(err error, msg string, kv ...any) {
+	if s.Log.GetSink() == nil {
+		return
+	}
+	s.Log.Error(err, msg, kv...)
+}
 
 func nowTime() *metav1.Time {
 	t := metav1.NewTime(timeNow())
@@ -39,6 +54,7 @@ type Server struct {
 	Config     Config
 	LLM        *LLM
 	RestConfig *rest.Config
+	Cache      cache.Cache
 	Log        logr.Logger
 
 	stepMu     sync.Mutex // one coordinator step at a time
@@ -67,10 +83,14 @@ func (s *Server) Steps(ctx context.Context) error {
 				continue
 			}
 			s.pruneCount++
+			prune := s.pruneCount >= 150
+			if prune {
+				s.pruneCount = 0
+			}
 			for i := range threads.Items {
 				thread := &threads.Items[i]
 				s.maybeUnpause(ctx, thread)
-				if s.pruneCount >= 150 {
+				if prune {
 					if err := s.prune(ctx, thread); err != nil {
 						s.Log.Error(err, "prune thread", "thread", thread.Namespace+"/"+thread.Name)
 					}
@@ -86,8 +106,10 @@ func (s *Server) Steps(ctx context.Context) error {
 					s.deferThread(thread, errRetry)
 				}
 			}
-			if s.pruneCount >= 150 {
-				s.pruneCount = 0
+			if prune {
+				if err := s.pruneOrphanTurns(ctx, threads.Items); err != nil {
+					s.Log.Error(err, "prune orphan turns")
+				}
 			}
 		}
 	}
@@ -126,6 +148,13 @@ func (s *Server) shouldStep(ctx context.Context, thread *v1.BlipThread) bool {
 	if wake := thread.Status.NextWake; wake != nil && !now.Before(wake.Time) {
 		return true
 	}
+	// A stored timer that is already due is a pending wake even if an older
+	// version of status did not record it in NextWake.
+	for _, timer := range thread.Status.Timers {
+		if !timer.At.After(now) {
+			return true
+		}
+	}
 	turns, err := s.pendingTurns(ctx, thread)
 	if err != nil {
 		s.Log.Error(err, "list pending turns", "thread", thread.Namespace+"/"+thread.Name)
@@ -162,8 +191,10 @@ func hasOpenTask(tasks []v1.ThreadTask) bool {
 	return false
 }
 
-// pendingTurns returns the turns not yet consumed, in sequence order,
-// excluding the coordinator's own output.
+// pendingTurns returns every turn not yet consumed, in sequence order,
+// excluding the coordinator's own output. It deliberately keeps turns older
+// than any fixed window: a step must never consume a turn it did not show to
+// the coordinator, and an old Wake=Now turn must still be able to wake it.
 func (s *Server) pendingTurns(ctx context.Context, thread *v1.BlipThread) ([]v1.BlipTurn, error) {
 	var turns v1.BlipTurnList
 	if err := s.List(ctx, &turns, client.InNamespace(thread.Namespace), client.MatchingFields{turnField: thread.Name}); err != nil {
@@ -171,15 +202,13 @@ func (s *Server) pendingTurns(ctx context.Context, thread *v1.BlipThread) ([]v1.
 	}
 	out := turns.Items[:0]
 	for _, t := range turns.Items {
-		if t.Status.Seq <= thread.Status.ConsumedSeq || t.Spec.Author.Kind == v1.TurnAuthorCoordinator {
+		if !turnBelongsToThread(&t, thread) ||
+			t.Status.Seq <= thread.Status.ConsumedSeq || t.Spec.Author.Kind == v1.TurnAuthorCoordinator {
 			continue
 		}
 		out = append(out, t)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Status.Seq < out[j].Status.Seq })
-	if len(out) > 50 {
-		out = out[len(out)-50:]
-	}
+	sortTurns(out)
 	return out, nil
 }
 
@@ -193,9 +222,12 @@ type step struct {
 	// replies become coordinator turns at the end of the step.
 	replies []v1.BlipTurnSpec
 	summary string
-	idle    bool
-	paused  string
-	usage   int64
+	// summarySet distinguishes "remember was called" (even with empty text)
+	// from a step that did not touch the summary.
+	summarySet bool
+	idle       bool
+	paused     string
+	usage      int64
 }
 
 func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
@@ -214,6 +246,18 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 		timers:  append([]v1.ThreadTimer{}, thread.Status.Timers...),
 		summary: thread.Status.Summary,
 	}
+	// Check the budget before draining timers or turns: an exhausted step does
+	// not process this input, so it must stay pending.
+	started := timeNow()
+	tokensToday := thread.Status.TokensToday
+	if thread.Status.TokenDay != started.Format("2006-01-02") {
+		tokensToday = 0
+	}
+	if thread.Spec.DailyTokens > 0 && tokensToday >= thread.Spec.DailyTokens {
+		st.paused = budgetPauseReason
+		return s.commit(ctx, st, thread.Status.ConsumedSeq, pending, started)
+	}
+
 	// Consume due timers: their notes are part of this step's input.
 	var dueTimers []v1.ThreadTimer
 	kept := st.timers[:0]
@@ -233,15 +277,6 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 	if model == "" {
 		return fmt.Errorf("no model: set spec.model or --model")
 	}
-	started := timeNow()
-	tokensToday := thread.Status.TokensToday
-	if thread.Status.TokenDay != started.Format("2006-01-02") {
-		tokensToday = 0
-	}
-	if thread.Spec.DailyTokens > 0 && tokensToday >= thread.Spec.DailyTokens {
-		st.paused = "daily token budget exhausted"
-		return s.commit(ctx, st, target, pending, started)
-	}
 
 	messages := []Message{
 		{Role: "system", Content: systemPrompt(thread)},
@@ -256,7 +291,7 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 		st.usage += usage.Total()
 		messages = append(messages, reply)
 		if thread.Spec.DailyTokens > 0 && tokensToday+st.usage >= thread.Spec.DailyTokens {
-			st.paused = "daily token budget exhausted"
+			st.paused = budgetPauseReason
 			break
 		}
 		if len(reply.ToolCalls) == 0 {
@@ -299,16 +334,17 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 			return err
 		}
 		current.Status.ConsumedSeq = target
-		if st.summary != "" {
+		if st.summarySet {
 			current.Status.Summary = truncateRunes(st.summary, 16384)
 		}
 		current.Status.Tasks = st.tasks
 		current.Status.Timers = st.timers
 		current.Status.NextWake = next
-		current.Status.TokenDay = today
-		if current.Status.TokenDay == today {
-			current.Status.TokensToday += tokens
+		if current.Status.TokenDay != today {
+			current.Status.TokenDay = today
+			current.Status.TokensToday = 0
 		}
+		current.Status.TokensToday += tokens
 		if st.paused != "" {
 			current.Status.Paused = &v1.ThreadPause{Reason: st.paused}
 		}
@@ -328,11 +364,24 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 func nextWake(st *step, now time.Time) *metav1.Time {
 	var next time.Time
 	if hasOpenTask(st.tasks) {
-		next = now.Add(st.s.Config.Heartbeat)
+		heartbeat := st.s.Config.Heartbeat
+		if st.thread != nil && st.thread.Spec.Heartbeat != nil && st.thread.Spec.Heartbeat.Duration > 0 {
+			heartbeat = st.thread.Spec.Heartbeat.Duration
+		}
+		if heartbeat <= 0 {
+			heartbeat = 30 * time.Minute
+		}
+		next = now.Add(heartbeat)
 	}
 	for _, timer := range st.timers {
-		if timer.At.After(now) && (next.IsZero() || timer.At.Time.Before(next)) {
-			next = timer.At.Time
+		at := timer.At.Time
+		if !timer.At.After(now) {
+			// A timer set for the past is due now; wake on the next tick so
+			// its note is not stranded.
+			at = now
+		}
+		if next.IsZero() || at.Before(next) {
+			next = at
 		}
 	}
 	if next.IsZero() {
@@ -422,7 +471,7 @@ func openState(open bool) string {
 
 // maybeUnpause lets a thread run again on a new day after its budget paused it.
 func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
-	if thread.Status.Paused == nil || thread.Status.TokenDay == timeNow().Format("2006-01-02") {
+	if thread.Status.Paused == nil || thread.Status.Paused.Reason != budgetPauseReason || thread.Status.TokenDay == timeNow().Format("2006-01-02") {
 		return
 	}
 	current := &v1.BlipThread{}
@@ -441,9 +490,24 @@ func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
 // prune deletes consumed turns past retention and old closed tasks.
 func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 	now := timeNow()
+	// Turns sequenced by a previous incarnation of a recreated thread are
+	// not history of this one. Delete them regardless of age or sequence.
+	var all v1.BlipTurnList
+	if err := s.List(ctx, &all, client.InNamespace(thread.Namespace), client.MatchingFields{turnField: thread.Name}); err != nil {
+		return err
+	}
+	for i := range all.Items {
+		t := &all.Items[i]
+		if turnBelongsToThread(t, thread) {
+			continue
+		}
+		if err := s.Delete(ctx, t); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
 	turnAge, keepTurns := thread.Spec.Retention.Turns, int(thread.Spec.Retention.KeepTurns)
 	if turnAge == nil {
-		turnAge = &metav1.Duration{Duration: 7 * 24 * time.Hour}
+		turnAge = &metav1.Duration{Duration: defaultTurnAge}
 	}
 	if keepTurns == 0 {
 		keepTurns = 200
@@ -474,24 +538,27 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 		maxTasks = 200
 	}
 	var keptTasks []v1.ThreadTask
-	closed := 0
 	for _, t := range thread.Status.Tasks {
 		if !t.Open && t.Updated != nil && now.Sub(t.Updated.Time) > taskAge.Duration {
 			continue
 		}
 		keptTasks = append(keptTasks, t)
-		if !t.Open {
-			closed++
-		}
 	}
-	for closed > maxTasks && len(keptTasks) > 0 {
+	for len(keptTasks) > maxTasks {
+		oldest := -1
 		for i, t := range keptTasks {
-			if !t.Open {
-				keptTasks = append(keptTasks[:i], keptTasks[i+1:]...)
-				closed--
-				break
+			if t.Open {
+				continue
+			}
+			if oldest < 0 || closedTaskOlder(t, keptTasks[oldest]) {
+				oldest = i
 			}
 		}
+		if oldest < 0 {
+			// Only open tasks remain; deleting them would lose live work.
+			break
+		}
+		keptTasks = append(keptTasks[:oldest], keptTasks[oldest+1:]...)
 	}
 	if len(keptTasks) != len(thread.Status.Tasks) {
 		current := &v1.BlipThread{}
@@ -500,6 +567,50 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 		}
 		current.Status.Tasks = keptTasks
 		if err := s.Status().Update(ctx, current); err != nil {
+			return err
+		}
+		// Steps shares this thread value; keep it in sync so a step later in
+		// the same tick cannot write the pruned tasks back.
+		thread.Status = current.Status
+	}
+	return nil
+}
+
+// closedTaskOlder reports whether a should be pruned before b. A closed task
+// without an update time is treated as the oldest.
+func closedTaskOlder(a, b v1.ThreadTask) bool {
+	if a.Updated == nil {
+		return b.Updated != nil
+	}
+	if b.Updated == nil {
+		return false
+	}
+	return a.Updated.Before(b.Updated)
+}
+
+// pruneOrphanTurns deletes turns that reference no existing thread. A turn
+// whose thread was deleted, or whose spec.thread is a typo, is never sequenced
+// and no thread prune pass will ever see it. It is kept for the default turn
+// age so the cause is still visible, then garbage-collected.
+func (s *Server) pruneOrphanTurns(ctx context.Context, threads []v1.BlipThread) error {
+	live := make(map[string]bool, len(threads))
+	for i := range threads {
+		live[threads[i].Namespace+"/"+threads[i].Name] = true
+	}
+	var turns v1.BlipTurnList
+	if err := s.List(ctx, &turns); err != nil {
+		return err
+	}
+	now := timeNow()
+	for i := range turns.Items {
+		t := &turns.Items[i]
+		if t.DeletionTimestamp != nil || live[t.Namespace+"/"+t.Spec.Thread] {
+			continue
+		}
+		if now.Sub(t.CreationTimestamp.Time) < defaultTurnAge {
+			continue
+		}
+		if err := s.Delete(ctx, t); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 	}

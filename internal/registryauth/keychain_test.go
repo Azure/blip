@@ -3,14 +3,17 @@ package registryauth_test
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/Azure/blip/internal/registryauth"
@@ -91,6 +94,32 @@ func TestKeychain(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: err = %v, want %q", name, err, want)
 		}
+		if !errors.Is(err, registryauth.ErrUnusableSecret) {
+			t.Errorf("%s: err = %v is not classified as an unusable secret", name, err)
+		}
+	}
+}
+
+type failingReader struct{ err error }
+
+func (r failingReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return r.err
+}
+
+func (r failingReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return r.err
+}
+
+// TestKeychainTransientReadErrorIsRetryable keeps an API server outage from
+// turning an otherwise valid pull secret into a permanent state failure.
+func TestKeychainTransientReadErrorIsRetryable(t *testing.T) {
+	_, err := registryauth.Keychain(context.Background(), failingReader{apierrors.NewServiceUnavailable("try later")},
+		[]registryauth.PullSecret{{Namespace: ns, Name: "pull"}})
+	if err == nil {
+		t.Fatal("transient secret read succeeded")
+	}
+	if errors.Is(err, registryauth.ErrUnusableSecret) {
+		t.Fatalf("transient secret read classified as permanent: %v", err)
 	}
 }
 

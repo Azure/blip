@@ -2,15 +2,31 @@ package blipchat
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
+	"unicode/utf8"
 
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
+)
+
+const (
+	// maxChatBody is the total request size; the same bound is advertised by
+	// the 413-style error from http.MaxBytesReader.
+	maxChatBody = 1 << 20
+	// maxMessageRunes matches the per-history-entry bound below. It keeps a
+	// single prompt from dwarfing the thread's context.
+	maxMessageRunes = 8000
+	// maxHistoryMessages and maxHistoryRunes bound the transcript the browser
+	// may replay. The body limit alone still allows hundreds of 8k messages.
+	maxHistoryMessages = 40
+	maxHistoryRunes    = 32000
 )
 
 // Chat is the engineer-facing conversation about a thread. The server keeps no
@@ -43,16 +59,29 @@ type chatStep struct {
 
 func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	user := r.Header.Get("X-Forwarded-User")
+	// X-Forwarded-User is trusted from the front end (see README). A proxy
+	// that appends instead of overwriting would let a client pre-seed the
+	// first value, so require exactly one.
+	users := r.Header.Values("X-Forwarded-User")
+	if len(users) == 0 {
+		http.Error(w, "missing X-Forwarded-User", http.StatusUnauthorized)
+		return
+	}
+	if len(users) != 1 {
+		http.Error(w, "exactly one X-Forwarded-User header is required", http.StatusBadRequest)
+		return
+	}
+	user := strings.TrimSpace(users[0])
 	if user == "" {
 		http.Error(w, "missing X-Forwarded-User", http.StatusUnauthorized)
 		return
 	}
 	var req chatRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(&req); err != nil {
 		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -60,10 +89,30 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "thread and message are required", http.StatusBadRequest)
 		return
 	}
+	if n := utf8.RuneCountInString(req.Message); n > maxMessageRunes {
+		http.Error(w, fmt.Sprintf("message is too long: %d characters, limit %d", n, maxMessageRunes), http.StatusBadRequest)
+		return
+	}
+	if len(req.History) > maxHistoryMessages {
+		http.Error(w, fmt.Sprintf("too many history messages: %d, limit %d", len(req.History), maxHistoryMessages), http.StatusBadRequest)
+		return
+	}
+	historyRunes := 0
+	for _, h := range req.History {
+		historyRunes += utf8.RuneCountInString(h.Content)
+	}
+	if historyRunes > maxHistoryRunes {
+		http.Error(w, fmt.Sprintf("history is too long: %d characters, limit %d", historyRunes, maxHistoryRunes), http.StatusBadRequest)
+		return
+	}
 	ctx := r.Context()
 	namespace := r.URL.Query().Get("namespace")
 	if namespace == "" {
 		namespace = "default"
+	}
+	if !validNamespace(namespace) {
+		http.Error(w, "invalid namespace", http.StatusBadRequest)
+		return
 	}
 	thread := &v1.BlipThread{}
 	if err := c.Server.Get(ctx, client.ObjectKey{Namespace: namespace, Name: req.Thread}, thread); err != nil {
@@ -73,7 +122,11 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	st := &chatStep{s: c.Server, thread: thread, user: user}
 	reply, err := st.run(ctx, req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		// Details can include the internal LLM URL, resolver output, and
+		// upstream response bodies. Keep them in the server log only.
+		c.Server.logError(err, "chat request failed",
+			"thread", thread.Namespace+"/"+thread.Name, "user", user)
+		http.Error(w, "chat backend unavailable", http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -232,6 +285,9 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	if err := c.s.Get(ctx, client.ObjectKey{Namespace: c.thread.Namespace, Name: name}, &b); err != nil {
 		return "", err
 	}
+	if !belongsToThread(&b, c.thread) {
+		return "", fmt.Errorf("blip %q does not belong to thread %q", name, c.thread.Name)
+	}
 	if v1.Finished(&b) || b.Status.Pod == "" {
 		summary := ""
 		if r := b.Status.Report; r != nil {
@@ -245,35 +301,141 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	if err := readOnly(argv); err != nil {
 		return "", err
 	}
-	return c.s.execIn(ctx, c.thread.Namespace, name, argv, 60)
+	return c.s.execIn(ctx, c.thread, name, argv, 60)
 }
 
+// readOnly reports whether argv is safe to run as an inspection command. It
+// checks the whole argument vector: several otherwise read-only tools can
+// execute commands or write files through options, so looking only at argv[0]
+// is not enough.
 func readOnly(argv []string) error {
 	if len(argv) == 0 {
 		return fmt.Errorf("empty command")
 	}
 	switch argv[0] {
-	case "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd":
+	case "ls", "cat", "head", "tail", "wc", "grep", "pwd":
+		return nil
+	case "rg":
+		for _, arg := range argv[1:] {
+			if isRipgrepEscape(arg) {
+				return fmt.Errorf("rg option %q can execute commands", arg)
+			}
+		}
+		return nil
+	case "find":
+		for _, arg := range argv[1:] {
+			if isFindEscape(arg) {
+				return fmt.Errorf("find option %q can execute commands or write files", arg)
+			}
+		}
 		return nil
 	case "git":
-		if len(argv) < 2 {
-			return nil
-		}
-		switch argv[1] {
-		case "status", "log", "diff", "show", "branch", "rev-parse":
-			return nil
-		}
+		return readOnlyGit(argv[1:])
 	}
 	return fmt.Errorf("only read-only commands are allowed here")
 }
 
-func shortUser(user string) string {
-	replacer := strings.NewReplacer("/", "-", ":", "-", "@", "-", ".", "-")
-	s := replacer.Replace(user)
-	if len(s) > 40 {
-		s = s[len(s)-40:]
+func isRipgrepEscape(arg string) bool {
+	return arg == "--pre" || strings.HasPrefix(arg, "--pre=") ||
+		arg == "--pre-glob" || strings.HasPrefix(arg, "--pre-glob=")
+}
+
+func isFindEscape(arg string) bool {
+	switch arg {
+	case "-exec", "-execdir", "-delete", "-ok", "-okdir",
+		"-fprint", "-fprint0", "-fprintf", "-fls":
+		return true
 	}
-	return s
+	return false
+}
+
+func readOnlyGit(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("git needs a subcommand")
+	}
+	switch args[0] {
+	case "status", "log", "diff", "show", "rev-parse":
+		for _, arg := range args[1:] {
+			if isGitEscape(arg) {
+				return fmt.Errorf("git option %q can execute commands or write files", arg)
+			}
+		}
+		return nil
+	case "branch":
+		for _, arg := range args[1:] {
+			if isGitEscape(arg) {
+				return fmt.Errorf("git option %q can execute commands or write files", arg)
+			}
+			if !strings.HasPrefix(arg, "-") {
+				return fmt.Errorf("git branch may only list branches")
+			}
+			if !isReadOnlyBranchOption(arg) {
+				return fmt.Errorf("git branch option %q is not read-only", arg)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("only read-only git subcommands are allowed here")
+}
+
+func isGitEscape(arg string) bool {
+	return arg == "--output" || strings.HasPrefix(arg, "--output=") ||
+		arg == "-O" || strings.HasPrefix(arg, "-O") ||
+		arg == "--ext-diff" || strings.HasPrefix(arg, "--ext-diff=") ||
+		arg == "--textconv" || strings.HasPrefix(arg, "--textconv=") ||
+		arg == "--open-files-in-pager" || strings.HasPrefix(arg, "--open-files-in-pager=")
+}
+
+func isReadOnlyBranchOption(arg string) bool {
+	name := arg
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+	}
+	switch name {
+	case "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose",
+		"-l", "--list", "--show-current", "-i", "--ignore-case",
+		"--merged", "--no-merged", "--contains", "--no-contains",
+		"--points-at", "--format", "--sort", "--column", "--no-column",
+		"--color", "--no-color", "--abbrev", "--no-abbrev", "--omit-empty":
+		return true
+	}
+	return false
+}
+
+// shortUser derives a deterministic DNS-1123-safe fragment from an identity
+// for use in a turn name. Identities are arbitrary header values: they may
+// contain uppercase, backslashes (DOMAIN\user), spaces, or non-ASCII, and
+// Kubernetes would reject those names. The short hash keeps distinct
+// identities distinct after sanitizing (for example "Alice" and "alice").
+func shortUser(user string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(user) {
+		if b.Len() >= 28 {
+			break
+		}
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			dash = false
+			continue
+		}
+		if b.Len() > 0 && !dash {
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	s := strings.Trim(b.String(), "-")
+	if s == "" {
+		s = "user"
+	}
+	sum := sha256.Sum256([]byte(user))
+	return s + "-" + hex.EncodeToString(sum[:4])
+}
+
+// validNamespace reports whether the namespace query parameter is a valid
+// Kubernetes namespace (a DNS-1123 label).
+func validNamespace(ns string) bool {
+	return len(validation.IsDNS1123Label(ns)) == 0
 }
 
 // recentTurns returns up to limit turns with a sequence above since.
@@ -284,12 +446,12 @@ func (s *Server) recentTurns(ctx context.Context, thread *v1.BlipThread, since i
 	}
 	out := make([]v1.BlipTurn, 0, len(turns.Items))
 	for _, t := range turns.Items {
-		if t.Status.Seq <= since {
+		if t.Status.Seq <= since || !turnBelongsToThread(&t, thread) {
 			continue
 		}
 		out = append(out, t)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Status.Seq < out[j].Status.Seq })
+	sortTurns(out)
 	if len(out) > limit {
 		out = out[len(out)-limit:]
 	}

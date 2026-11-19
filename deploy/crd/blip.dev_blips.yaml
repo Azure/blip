@@ -379,7 +379,8 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: command is immutable
-              rule: self.command == oldSelf.command
+              rule: has(self.command) == has(oldSelf.command) && (!has(self.command)
+                || self.command == oldSelf.command)
             - message: env is immutable
               rule: (has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env
                 == oldSelf.env)
@@ -463,6 +464,14 @@ spec:
                 - state
                 x-kubernetes-list-type: map
               node:
+                type: string
+              output:
+                description: |-
+                  Output is the tail of the command output recovered from the VM serial
+                  console when the Blip finishes. It lets gather -f show a command that
+                  ended before the client could attach. It is bounded and may be empty
+                  if the pod log was unavailable.
+                maxLength: 65536
                 type: string
               phase:
                 type: string

@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/mountpath"
 	"github.com/Azure/blip/internal/workspace"
 )
 
@@ -103,9 +104,72 @@ func (a *app) rootWriter(ctx context.Context, root *v1alpha1.BlipState) (*v1alph
 	return b, nil
 }
 
+// mountRequest is one desired mount addition, validated before anything is
+// created or written.
+type mountRequest struct {
+	state    string
+	path     string
+	writable bool
+}
+
+// mountPathsOverlap reports whether either path contains the other. It mirrors
+// the controller's topology rule; a root with an overlapping set is rejected on
+// every execution.
+func mountPathsOverlap(a, b string) bool {
+	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+// mountPathConflict checks mountPath against the other states already in the
+// root's mount set. Same-state entries are handled by the caller so a mode
+// change or an idempotent re-add stays valid.
+func mountPathConflict(root string, mounts []v1alpha1.Mount, state, mountPath string) error {
+	for _, other := range mounts {
+		if other.State == state {
+			continue
+		}
+		if other.Path == mountPath {
+			return fmt.Errorf("root state %q already has state %q mounted at %s", root, other.State, mountPath)
+		}
+		if mountPathsOverlap(other.Path, mountPath) {
+			return fmt.Errorf("mount %s: path %s overlaps mount %s at %s", state, mountPath, other.State, other.Path)
+		}
+	}
+	return nil
+}
+
+// validateMountPlan validates the complete mount set the CLI is about to write,
+// including earlier requests from the same invocation, before any state is
+// created or the root is edited.
+func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error {
+	mounts := append([]v1alpha1.Mount(nil), root.Spec.Mounts...)
+	for _, req := range requests {
+		if err := mountpath.Validate(req.path); err != nil {
+			return err
+		}
+		if req.state == root.Name {
+			return errors.New("a root state cannot mount itself")
+		}
+		if m := findSpecMount(mounts, req.state); m != nil {
+			if m.Path != req.path {
+				return fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", req.state, root.Name, m.Path)
+			}
+			m.Writable = req.writable
+			continue
+		}
+		if err := mountPathConflict(root.Name, mounts, req.state, req.path); err != nil {
+			return err
+		}
+		mounts = append(mounts, v1alpha1.Mount{State: req.state, Path: req.path, Writable: req.writable})
+	}
+	return nil
+}
+
 func (a *app) mountState(ctx context.Context, state, root, mountPath string, target *bool) error {
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return fmt.Errorf("invalid path %q: must be a clean absolute path other than /", mountPath)
+	}
+	if err := mountpath.Validate(mountPath); err != nil {
+		return err
 	}
 	if state == root {
 		return errors.New("a root state cannot mount itself")
@@ -130,10 +194,10 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 				oldAttachment = u.PreviousAttachment
 			}
 		} else {
-			for _, other := range s.Spec.Mounts {
-				if other.Path == mountPath {
-					return "", fmt.Errorf("root state %q already has state %q mounted at %s", root, other.State, mountPath)
-				}
+			// Re-check against the latest root: the CLI preflight can race
+			// with another writer, and direct callers skip it.
+			if err := mountPathConflict(root, s.Spec.Mounts, state, mountPath); err != nil {
+				return "", err
 			}
 			writer, err := a.rootWriter(ctx, s)
 			if err != nil {
@@ -178,6 +242,15 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 		generation = source.Status.Committed.Generation
 	}
 	if err := a.waitMount(ctx, b, state, mountPath, want, generation, oldAttachment); err != nil {
+		var refused *mountRefused
+		if errors.As(err, &refused) {
+			// The controller declined the mode change and will keep the
+			// mount as it is. Do not leave desired intent claiming a mode
+			// that can never converge.
+			if rerr := a.restoreMountMode(ctx, root, state, mountPath, want, refused.writable); rerr != nil {
+				fmt.Fprintf(a.env.Err, "warning: could not restore desired mode of state %s: %v\n", a.short(state), rerr)
+			}
+		}
 		return err
 	}
 	fmt.Fprintf(a.env.Out, "state %s mounted on blip %s at %s (%s)\n", a.short(state), a.short(b.Name), mountPath, modeName(want))
@@ -251,6 +324,33 @@ func mountBusy(msg, state string) string {
 	return ""
 }
 
+// mountRefused reports that the controller declined to change an existing
+// mount's mode. The mount keeps its current mode, so the caller restores
+// desired intent to match it.
+type mountRefused struct {
+	msg      string
+	writable bool
+}
+
+func (e *mountRefused) Error() string { return e.msg }
+
+// restoreMountMode reverts a refused mode change when desired intent still
+// matches what this command wrote; a concurrent edit wins.
+func (a *app) restoreMountMode(ctx context.Context, root, state, mountPath string, want, actual bool) error {
+	_, err := a.updateState(ctx, root, func(s *v1alpha1.BlipState) error {
+		m := findSpecMount(s.Spec.Mounts, state)
+		if m == nil || m.Path != mountPath || m.Writable != want || m.BlipUID != "" {
+			return errUnchanged
+		}
+		m.Writable = actual
+		return nil
+	})
+	if errors.Is(err, errUnchanged) {
+		return nil
+	}
+	return err
+}
+
 // waitMount observes the runtime attachment without editing desired intent.
 // oldAttachment identifies a previous mount that was still visible when the
 // desired mount was re-added, and must not be accepted as the new attachment.
@@ -260,6 +360,11 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 	r := &reporter{a: a}
 	defer r.stop()
 	start := time.Now()
+	// demoted records that the mount was actually seen writable or being
+	// saved. The spec edit that armed baseGeneration can race with another
+	// command: if the controller only ever saw the read-only spec, no save
+	// will advance the committed generation.
+	demoted := false
 	return a.waitBlip(ctx, writer.Name, func(b *v1alpha1.Blip) (bool, error) {
 		if b == nil || b.UID != writer.UID || b.Spec.State != writer.Spec.State || v1alpha1.Finished(b) ||
 			b.Spec.Stop || b.DeletionTimestamp != nil || b.Status.Phase == v1alpha1.BlipSaving {
@@ -290,12 +395,26 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			r.say("mounting %s on %s...", state, b.Name)
 			return false, nil
 		}
+		if !want && (m.Writable || m.Switching || m.Phase == v1alpha1.MountSaving) {
+			demoted = true
+		}
 		if m.Phase == v1alpha1.MountFailed || m.Switching && m.Writable != want && m.Message != "" &&
 			(!strings.Contains(m.Message, "busy") || time.Since(start) > switchBusyTimeout) {
 			if strings.Contains(m.Message, "busy") {
 				return false, fmt.Errorf("could not switch state %q on blip %q: processes are still using %s; desired mount remains applied", state, b.Name, mountPath)
 			}
 			return false, fmt.Errorf("mount of state %q on blip %q failed: %s; desired mount remains applied", state, b.Name, m.Message)
+		}
+		if m.Phase == v1alpha1.MountMounted && !m.Switching && m.Writable != want && m.Message != "" &&
+			!strings.HasPrefix(m.Message, "waiting to switch to writable") {
+			// preparePromote refusals are reported on the still-mounted
+			// entry with Switching=false: the old mount stays up and no
+			// switch will start. Treat that as final instead of waiting
+			// for a mode change that can never happen.
+			return false, &mountRefused{
+				msg:      fmt.Sprintf("mount of state %q on blip %q failed: %s; desired mount restored", state, b.Name, m.Message),
+				writable: m.Writable,
+			}
 		}
 		if m.Phase == v1alpha1.MountMounted && !m.Switching && m.Writable == want {
 			// Read-only mounts get a fresh ID; writable mounts can reuse their
@@ -310,6 +429,14 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 					return false, err
 				}
 				if s.Status.Committed == nil || s.Status.Committed.Generation <= baseGeneration {
+					// Only a demotion this wait actually observed still
+					// has a save to land. A concurrent command can revert
+					// the transient writable spec before the controller
+					// sees it; the mount then keeps its committed version
+					// and no new generation will ever appear.
+					if !demoted && (s.Status.Committed == nil || m.CommitID == "" || m.CommitID == s.Status.Committed.ID) {
+						return true, nil
+					}
 					r.say("saving new version of %s...", state)
 					return false, nil
 				}
@@ -400,6 +527,22 @@ func (a *app) unmountState(ctx context.Context, state, root string) error {
 		if m == nil {
 			return true, nil
 		}
+		if v1alpha1.Finished(current) {
+			// saving resolves every writable attachment before a Blip
+			// finishes, so an entry that is still visible is not a live
+			// mount. Report the removal instead of polling forever.
+			if m.Phase == v1alpha1.MountFailed && m.Message != "" {
+				return false, fmt.Errorf("could not unmount state %q from blip %q: %s; desired removal remains applied", state, b.Name, m.Message)
+			}
+			return true, nil
+		}
+		if current.Status.Phase == v1alpha1.BlipSaving {
+			// The writer stopped and the removal has left desired intent;
+			// the controller is now saving the last version. Wait for the
+			// Blip to finish rather than for the status entry to disappear.
+			r.say("saving %s on %s...", state, b.Name)
+			return false, nil
+		}
 		if (m.Phase == v1alpha1.MountFailed || m.Phase == v1alpha1.MountUnmounting) && m.Message != "" &&
 			(before == nil || before.Message != m.Message || time.Since(start) > 5*time.Second) {
 			if strings.Contains(m.Message, "busy") {
@@ -445,6 +588,15 @@ type mountFlags struct {
 	replicas int32
 }
 
+// newMount is a scoped --new request, parsed before any state exists so the
+// whole command can be validated first.
+type newMount struct {
+	spec     string
+	name     string
+	path     string
+	writable bool
+}
+
 func (a *app) mountCommand() *cobra.Command {
 	f := &mountFlags{}
 	cmd := &cobra.Command{
@@ -461,7 +613,11 @@ list the root's mounts.
   blip mount                        list the root's mounts
 
 Inside a blip the root defaults to its own root state, so a mount takes effect
-in the running command. Outside one, --root names the state to edit.`,
+in the running command. Outside one, --root names the state to edit.
+
+A PATH may contain ':' (for example /a:b). A trailing :rw or :ro is a mode
+only when the PATH before it contains no colon; input with both is ambiguous
+and rejected.`,
 		Example: `  blip mount repo:/work:rw
   blip mount --rm repo
   blip mount --new cache:/cache:rw --size 20Gi
@@ -483,25 +639,36 @@ in the running command. Outside one, --root names the state to edit.`,
 
 // parseMountSpec parses STATE:PATH[:rw|ro]. A nil mode leaves an existing
 // mount's mode unchanged and makes a new mount read-only.
+//
+// A trailing :rw or :ro is a mode only when the path before it contains no
+// colon, so a legal path containing ':' is not truncated. Input that both
+// contains ':' in its path and ends in a mode suffix is ambiguous: it could be
+// either, so it is rejected instead of silently choosing one.
 func parseMountSpec(s string) (state, mountPath string, writable *bool, err error) {
-	parts := strings.SplitN(s, ":", 3)
-	if len(parts) < 2 || parts[0] == "" {
+	i := strings.IndexByte(s, ':')
+	if i <= 0 {
 		return "", "", nil, fmt.Errorf("invalid mount %q: want STATE:PATH[:rw|ro]", s)
 	}
-	state, mountPath = parts[0], parts[1]
+	state, rest := s[:i], s[i+1:]
+	mountPath = rest
+	var mode string
+	switch {
+	case strings.HasSuffix(rest, ":rw"):
+		mode = "rw"
+	case strings.HasSuffix(rest, ":ro"):
+		mode = "ro"
+	}
+	if mode != "" {
+		base := strings.TrimSuffix(rest, ":"+mode)
+		if strings.Contains(base, ":") {
+			return "", "", nil, fmt.Errorf("invalid mount %q: ambiguous path %q ends with :%s but also contains ':'", s, rest, mode)
+		}
+		mountPath = base
+		want := mode == "rw"
+		writable = &want
+	}
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return "", "", nil, fmt.Errorf("invalid mount %q: PATH must be a clean absolute path other than /", s)
-	}
-	if len(parts) == 3 {
-		want := false
-		switch parts[2] {
-		case "rw":
-			want = true
-		case "ro":
-		default:
-			return "", "", nil, fmt.Errorf("invalid mount %q: mode must be rw or ro", s)
-		}
-		writable = &want
 	}
 	return state, mountPath, writable, nil
 }
@@ -510,24 +677,61 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	if err := a.mountTarget(&f.root); err != nil {
 		return err
 	}
+	if err := checkNewOnlyFlags(f, replicasSet); err != nil {
+		return err
+	}
 	if len(args) == 0 && len(f.remove) == 0 && len(f.create) == 0 {
 		return a.listMounts(ctx, f.root)
 	}
-	for _, spec := range f.create {
-		if err := a.newMountedState(ctx, spec, f, replicasSet); err != nil {
-			return err
-		}
+	news, err := a.prepareNewMounts(f, replicasSet)
+	if err != nil {
+		return err
 	}
+	requests := make([]mountRequest, 0, len(news)+len(args))
+	created := map[string]bool{}
+	for _, n := range news {
+		requests = append(requests, mountRequest{state: n.name, path: n.path, writable: n.writable})
+		created[n.name] = true
+	}
+	type addition struct {
+		state    string
+		path     string
+		writable *bool
+	}
+	adds := make([]addition, 0, len(args))
 	for _, arg := range args {
 		state, mountPath, writable, err := parseMountSpec(arg)
 		if err != nil {
 			return err
 		}
-		source, err := a.resolveState(ctx, state)
+		name, err := a.mountSource(ctx, state, created)
 		if err != nil {
 			return err
 		}
-		if err := a.mountState(ctx, source.Name, f.root, mountPath, writable); err != nil {
+		want := false
+		if writable != nil {
+			want = *writable
+		}
+		requests = append(requests, mountRequest{state: name, path: mountPath, writable: want})
+		adds = append(adds, addition{state: name, path: mountPath, writable: writable})
+	}
+	// Validate the complete topology before creating states or editing the
+	// root, so a rejected command leaves neither a partial mount set nor an
+	// orphan state behind.
+	root, err := a.getState(ctx, f.root)
+	if err != nil {
+		return err
+	}
+	if err := validateMountPlan(root, requests); err != nil {
+		return err
+	}
+	for _, n := range news {
+		if err := a.newMountedState(ctx, n.spec, f, replicasSet); err != nil {
+			return err
+		}
+	}
+	for _, add := range adds {
+		if err := a.mountState(ctx, add.state, f.root, add.path, add.writable); err != nil {
 			return err
 		}
 	}
@@ -537,6 +741,67 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		}
 	}
 	return nil
+}
+
+// checkNewOnlyFlags rejects state settings that have no state to apply to.
+// Silently discarding them would report success for a size, replica count, or
+// copy source that was never used.
+func checkNewOnlyFlags(f *mountFlags, replicasSet bool) error {
+	if len(f.create) > 0 {
+		return nil
+	}
+	var used []string
+	if f.from != "" {
+		used = append(used, "--from")
+	}
+	if f.size != "" {
+		used = append(used, "--size")
+	}
+	if replicasSet {
+		used = append(used, "--replicas")
+	}
+	if len(used) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s can only be used with --new", strings.Join(used, ", "))
+}
+
+// prepareNewMounts parses and scopes every --new request before any state is
+// created. newMountedState validates each one again against the current root.
+func (a *app) prepareNewMounts(f *mountFlags, replicasSet bool) ([]newMount, error) {
+	if replicasSet && (f.replicas < 1 || f.replicas > 3) {
+		return nil, errors.New("--replicas must be between 1 and 3")
+	}
+	news := make([]newMount, 0, len(f.create))
+	for _, spec := range f.create {
+		name, mountPath, mode, err := parseMountSpec(spec)
+		if err != nil {
+			return nil, err
+		}
+		writable := true
+		if mode != nil {
+			writable = *mode
+		}
+		if err := a.scope(&name); err != nil {
+			return nil, err
+		}
+		news = append(news, newMount{spec: spec, name: name, path: mountPath, writable: writable})
+	}
+	return news, nil
+}
+
+// mountSource resolves an existing state named by a mount argument. A state
+// created earlier in the same command has no object yet, so its planned name is
+// accepted instead.
+func (a *app) mountSource(ctx context.Context, name string, created map[string]bool) (string, error) {
+	if full := a.full(name); created[full] {
+		return full, nil
+	}
+	src, err := a.resolveState(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	return src.Name, nil
 }
 
 // newMountedState creates a state and mounts it on the root. An empty state
@@ -559,6 +824,15 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	}
 	c, err := a.clients()
 	if err != nil {
+		return err
+	}
+	// Validate the target before creating anything: a rejected mount must not
+	// leave behind a committed state that the user has to delete by hand.
+	root, err := a.getState(ctx, f.root)
+	if err != nil {
+		return err
+	}
+	if err := validateMountPlan(root, []mountRequest{{state: name, path: mountPath, writable: writable}}); err != nil {
 		return err
 	}
 	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace}}
@@ -593,10 +867,50 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 		}
 		return err
 	}
-	if _, err := a.waitStateCommitted(ctx, name); err != nil {
+	if _, err := a.waitStateCommittedWhilePending(ctx, name); err != nil {
+		a.removeCreatedState(ctx, st)
 		return err
 	}
-	return a.mountState(ctx, name, f.root, mountPath, &writable)
+	if err := a.mountState(ctx, name, f.root, mountPath, &writable); err != nil {
+		// A mount that became desired intent before failing is referenced by
+		// the root, so its state is not an orphan and must stay. Any other
+		// failure leaves the newly created state unused.
+		if !a.mountApplied(ctx, f.root, name, mountPath) {
+			a.removeCreatedState(ctx, st)
+		}
+		return err
+	}
+	return nil
+}
+
+// mountApplied reports whether the root's desired topology already references
+// the mount.
+func (a *app) mountApplied(ctx context.Context, root, state, mountPath string) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	s, err := a.getState(ctx, root)
+	if err != nil {
+		return false
+	}
+	m := findSpecMount(s.Spec.Mounts, state)
+	return m != nil && m.Path == mountPath
+}
+
+// removeCreatedState best-effort deletes a state this command created when its
+// mount never became desired intent. Cleanup must not hide the original error.
+func (a *app) removeCreatedState(ctx context.Context, st *v1alpha1.BlipState) {
+	c, err := a.clients()
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	opts := &client.DeleteOptions{}
+	if st.UID != "" {
+		uid := st.UID
+		opts.Preconditions = &metav1.Preconditions{UID: &uid}
+	}
+	_ = c.Kube.Delete(ctx, st, opts)
 }
 
 func (a *app) listMounts(ctx context.Context, root string) error {

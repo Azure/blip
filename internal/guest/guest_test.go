@@ -176,6 +176,20 @@ func TestExecProcSpecInheritsBlipDefaults(t *testing.T) {
 	}
 }
 
+func TestGuestHostnameFitsKernelLimit(t *testing.T) {
+	if got := guestHostname("alice.default"); got != "alice.default" {
+		t.Fatalf("short hostname = %q", got)
+	}
+	long := strings.Repeat("a", 70)
+	got := guestHostname(long)
+	if len(got) > 64 || len(got) == 0 {
+		t.Fatalf("long hostname = %q (%d bytes)", got, len(got))
+	}
+	if !strings.HasPrefix(long, got) {
+		t.Fatalf("long hostname %q is not a prefix of %q", got, long)
+	}
+}
+
 func TestHostsFile(t *testing.T) {
 	got := hostsFile("alice.default", "", nil)
 	for _, want := range []string{

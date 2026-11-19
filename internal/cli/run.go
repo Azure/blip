@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
@@ -59,16 +62,24 @@ they finish, so an abandoned fork cannot leak its workspace.`,
   blip run --name dev --from base -- sleep infinity`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := a.rejectAmbiguousCommandFlags(cmd, 0, "blip run [flags] -- CMD [ARG...]"); err != nil {
+				return err
+			}
 			f.timeoutSet = cmd.Flags().Changed("timeout")
 			f.ttlSet = cmd.Flags().Changed("ttl")
-			return a.run(cmd.Context(), args, f)
+			// A run that is interrupted before it returns must not leave a
+			// VM behind, so turn the signal into cancellation instead of
+			// letting the default handler kill the process.
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			return a.run(ctx, args, f)
 		},
 	}
 	fl := cmd.Flags()
 	fl.StringVar(&f.name, "name", "", "blip name (default <caller>-<random>)")
 	fl.StringVar(&f.from, "from", "", "copy workspace SRC into a new one (inside a blip, / is the caller's root)")
 	fl.StringVar(&f.state, "state", "", "run in existing workspace WS")
-	fl.StringVar(&f.pool, "pool", "", "VM pool (default \"default\")")
+	fl.StringVar(&f.pool, "pool", "", "VM pool (default \"default\"; inside a blip, the caller's pool)")
 	fl.StringVarP(&f.workdir, "workdir", "w", "", "working directory (inside a blip, the current directory)")
 	fl.StringVarP(&f.user, "user", "u", "", "user name or uid")
 	fl.StringArrayVarP(&f.env, "env", "e", nil, "environment variable KEY=VALUE (repeatable)")
@@ -163,15 +174,28 @@ func labelFlags(b *v1alpha1.Blip, values []string) error {
 	return nil
 }
 
+// wholeSeconds validates a duration that is stored in whole seconds. A
+// negative value would silently disable the field that the flag is meant to
+// set, and a fractional value would be truncated, so both are rejected.
+func wholeSeconds(flag string, d time.Duration) error {
+	switch {
+	case d < 0:
+		return fmt.Errorf("%s must not be negative: %s", flag, d)
+	case d%time.Second != 0:
+		return fmt.Errorf("%s must be a whole number of seconds: %s", flag, d)
+	}
+	return nil
+}
+
 func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	if len(command) == 0 {
 		return errors.New("a command is required: blip run -- CMD [ARG...]")
 	}
-	if f.timeout > 0 && f.timeout < time.Second {
-		return errors.New("--timeout must be at least 1s")
+	if err := wholeSeconds("--timeout", f.timeout); err != nil {
+		return err
 	}
-	if f.ttl > 0 && f.ttl < time.Second {
-		return errors.New("--ttl must be at least 1s")
+	if err := wholeSeconds("--ttl", f.ttl); err != nil {
+		return err
 	}
 	if f.from != "" && f.state != "" {
 		return errors.New("set only one of --from and --state")
@@ -186,6 +210,11 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	}
 	if err := a.scope(&name); err != nil {
 		return err
+	}
+	// Blip is a Kubernetes object, so its name is a DNS subdomain of at most
+	// 253 characters. Reject an impossible name before creating a workspace.
+	if problems := validation.IsDNS1123Subdomain(name); len(problems) > 0 {
+		return fmt.Errorf("invalid blip name %q: %s", a.short(name), strings.Join(problems, "; "))
 	}
 	env, err := parseEnv(f.env)
 	if err != nil {
@@ -213,7 +242,12 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 		if b.Labels == nil {
 			b.Labels = map[string]string{}
 		}
-		b.Labels[v1alpha1.LabelParent] = a.short(a.self.Name)
+		if b.Annotations == nil {
+			b.Annotations = map[string]string{}
+		}
+		parent := a.short(a.self.Name)
+		b.Labels[v1alpha1.LabelParent] = v1alpha1.ParentLabel(parent)
+		b.Annotations[v1alpha1.AnnotationParent] = parent
 		if !f.keep {
 			b.OwnerReferences = []metav1.OwnerReference{blipRef(a.self)}
 		}
@@ -247,7 +281,10 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 		}
 		from = "/"
 	}
-	if b.Spec.Pool == "" && a.self != nil && from != "" {
+	// Inside a blip, a fork runs in the caller's pool whether it forks the
+	// caller's root (--from /), another workspace (--from), or runs an
+	// existing one (--state). An explicit --pool still wins.
+	if b.Spec.Pool == "" && a.self != nil {
 		b.Spec.Pool = a.self.Spec.Pool
 	}
 	if err := a.preflight(ctx, c.Kube, b); err != nil {
@@ -274,12 +311,18 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 		if source, err = a.resolveState(ctx, src); err != nil {
 			return err
 		}
+		if msg := usableStateFailure(source); msg != "" {
+			return fmt.Errorf("state %q failed: %s", a.short(source.Name), msg)
+		}
 		// The fork root takes the blip's name.
 		b.Spec.State = name
 	} else {
 		root, err := a.resolveState(ctx, state)
 		if err != nil {
 			return err
+		}
+		if msg := usableStateFailure(root); msg != "" {
+			return fmt.Errorf("state %q failed: %s", a.short(root.Name), msg)
 		}
 		if root.Spec.Image != "" {
 			return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(root.Name), a.short(root.Name))
@@ -310,6 +353,16 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	}
 	if err := a.launch(ctx, b, source, !f.keep); err != nil {
 		// The blip owns its workspace; deleting it removes the copies too.
+		delErr := c.Kube.Delete(context.WithoutCancel(ctx), b)
+		if delErr != nil && !apierrors.IsNotFound(delErr) {
+			err = errors.Join(err, fmt.Errorf("remove blip %q: %w", a.short(name), delErr))
+		}
+		return err
+	}
+	// An interrupt can arrive after the last wait. Remove the blip before
+	// returning so an interrupted run does not leave a VM running. With
+	// --keep its workspace has no owner, so only the blip is removed.
+	if err := ctx.Err(); err != nil {
 		delErr := c.Kube.Delete(context.WithoutCancel(ctx), b)
 		if delErr != nil && !apierrors.IsNotFound(delErr) {
 			err = errors.Join(err, fmt.Errorf("remove blip %q: %w", a.short(name), delErr))

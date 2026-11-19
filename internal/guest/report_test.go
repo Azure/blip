@@ -73,6 +73,71 @@ func TestReportPacing(t *testing.T) {
 	}
 }
 
+// Pacing must be measured with the monotonic clock. An anchor stored as
+// time.Now().UTC() loses its monotonic reading, so a guest wall-clock step
+// (for example clock_settime from a root workload) changes the delay, accepts
+// reports back-to-back, and their sequence numbers are overwritten before the
+// observation write can see them.
+func TestReportPacingAnchorUsesMonotonicClock(t *testing.T) {
+	g := reportGuest(t)
+	reportInterval = 10 * time.Second
+	postReport(g, "one")
+
+	g.reporter.mu.Lock()
+	last := g.reporter.last
+	report := g.reporter.lastReport
+	g.reporter.mu.Unlock()
+	if last.IsZero() {
+		t.Fatal("pacing anchor was not recorded")
+	}
+	if last.Round(0) == last {
+		t.Fatalf("pacing anchor %v carries no monotonic reading; a wall-clock step would bypass pacing", last)
+	}
+	if report == nil || !report.Time.Equal(last) {
+		t.Fatalf("wire report time %v does not match pacing anchor %v", report, last)
+	}
+}
+
+// A report posted to a path other than /report is not the documented endpoint:
+// it must be rejected without consuming a sequence number.
+func TestReportEndpointRejectsOtherPaths(t *testing.T) {
+	g := reportGuest(t)
+	for _, path := range []string{"/", "/other", "/report/extra", "/REPORT", "/report/"} {
+		rec := httptest.NewRecorder()
+		g.serveReport(rec, httptest.NewRequest("POST", path, strings.NewReader("x")))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("POST %s = %d, want 404", path, rec.Code)
+		}
+	}
+	if got := g.lastReport(); got != nil {
+		t.Fatalf("report accepted on a non-/report path: %+v", got)
+	}
+	if rec := postReport(g, "real"); rec.Code != 200 || strings.TrimSpace(rec.Body.String()) != `{"seq":1}` {
+		t.Fatalf("report after rejected paths: %d %q", rec.Code, rec.Body)
+	}
+}
+
+// Wrong methods and bodies on the documented path keep their status codes.
+func TestReportEndpointStatusOnReportPath(t *testing.T) {
+	g := reportGuest(t)
+	rec := httptest.NewRecorder()
+	g.serveReport(rec, httptest.NewRequest("GET", "/report", nil))
+	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "POST" {
+		t.Errorf("GET /report = %d allow %q, want 405 POST", rec.Code, rec.Header().Get("Allow"))
+	}
+	rec = httptest.NewRecorder()
+	g.serveReport(rec, httptest.NewRequest("POST", "/report?x=1", strings.NewReader("ok")))
+	if rec.Code != 200 {
+		t.Errorf("POST /report?x=1 = %d, want 200", rec.Code)
+	}
+	if rec := postReport(g, ""); rec.Code != 400 {
+		t.Errorf("empty body = %d, want 400", rec.Code)
+	}
+	if rec := postReport(g, strings.Repeat("x", podapi.MaxReportBytes+1)); rec.Code != 413 {
+		t.Errorf("oversized body = %d, want 413", rec.Code)
+	}
+}
+
 // The report endpoint binds its configured address; tests use port 0 and
 // connect to whatever the listener reports.
 func TestReportEndpointServes(t *testing.T) {

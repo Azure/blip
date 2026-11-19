@@ -190,6 +190,23 @@ func TestFindSelfReportsForbidden(t *testing.T) {
 	}
 }
 
+// A source path containing a colon must not be silently split at the first
+// one, which would copy the wrong file to the wrong destination.
+func TestParseCollectOpRejectsAmbiguousSource(t *testing.T) {
+	const cwd = "/home/dev"
+	op, err := parseCollectOp("/home/dev/a:b:./colon-out", cwd)
+	if err == nil {
+		t.Fatalf("ambiguous source accepted as %+v", op)
+	}
+	if !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "':'") {
+		t.Fatalf("error %q does not explain the ambiguous colon", err)
+	}
+	// A colon only in the destination is equally ambiguous.
+	if _, err := parseCollectOp("/home/dev/a:./out:b", cwd); err == nil {
+		t.Fatal("colon in destination accepted")
+	}
+}
+
 func TestParseCollectOpsAndState(t *testing.T) {
 	const cwd = "/home/dev/src"
 	for _, tc := range []struct {
@@ -527,11 +544,43 @@ func TestCollectGit(t *testing.T) {
 		h.self = "alice.box"
 		t.Chdir(dst)
 		code, _, errOut := h.collect("w1", "git:"+dst+":nope")
-		if code == 0 {
-			t.Fatalf("fetch of a nonexistent ref succeeded: %s", errOut)
+		if code != 1 || !strings.Contains(errOut, "git fetch") {
+			t.Fatalf("code %d stderr %q, want 1 with a git fetch error", code, errOut)
 		}
 		assertCollectReleased(t, h, "alice.box", "alice.w1")
 	})
+}
+
+// git: collection fetches commits only. A dirty worktree must warn instead of
+// silently discarding the uncommitted and untracked work when the blip goes.
+func TestCollectGitWarnsAboutUncommittedWork(t *testing.T) {
+	requireGit(t)
+	withCollectMountRoot(t)
+	dst := filepath.Join(t.TempDir(), "dst")
+	gitInit(t, dst)
+	src := filepath.Join(collectMountRoot, "alice.w1", "home/dev/repo")
+	gitRepo(t, src) // branch w1
+	if err := os.WriteFile(filepath.Join(src, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, src, "add", "tracked.txt")
+	gitRun(t, src, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "tracked")
+	if err := os.WriteFile(filepath.Join(src, "tracked.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "untracked.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := newHarness(t, gitObjects()...)
+	h.self = "alice.box"
+	t.Chdir(dst)
+	code, _, errOut := h.collect("w1", "git:/home/dev/repo:w1")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, errOut, "uncommitted", "untracked", "only commits")
+	assertCollectReleased(t, h, "alice.box", "alice.w1")
 }
 
 func TestCollectRejections(t *testing.T) {

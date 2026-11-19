@@ -333,7 +333,7 @@ func (g *Guest) doClaim(m wire.Claim) error {
 		return err
 	}
 	if m.Hostname != "" {
-		_ = unix.Sethostname([]byte(m.Hostname))
+		_ = unix.Sethostname([]byte(guestHostname(m.Hostname)))
 	}
 	claim := m
 	g.claim = &claim
@@ -373,13 +373,22 @@ func (g *Guest) setupRootLocked(m wire.Claim) error {
 	// Resolve the sandbox name locally. Without this, sudo (and anything else
 	// that looks up the host name) prints "unable to resolve host" on every
 	// command.
-	if err := g.writeHostsLocked(m.Hostname); err != nil {
+	if err := g.writeHostsLocked(guestHostname(m.Hostname)); err != nil {
 		log.Printf("write /etc/hosts: %v", err)
 	}
-	if err := g.installKubeConfigLocked(); err != nil {
+	if err := g.installKubeConfigLocked(m.Hostname); err != nil {
 		return fmt.Errorf("Kubernetes API config: %w", err)
 	}
 	return nil
+}
+
+// guestHostname fits a Blip name into the kernel's 64-byte hostname limit.
+// Names longer than that are still found through /run/blip/name.
+func guestHostname(name string) string {
+	if len(name) <= 64 {
+		return name
+	}
+	return strings.TrimRight(name[:64], "-.")
 }
 
 // hostsFile is the /etc/hosts content for a claimed blip. The host entry uses
@@ -464,7 +473,13 @@ func (g *Guest) startPrimary() {
 	if claim == nil || started {
 		return
 	}
-	spec := procSpec{argv: claim.Command, dir: claim.WorkingDir, user: claim.User, tty: claim.TTY}
+	// A non-interactive primary command has no client that could close its
+	// stdin, so give it EOF; a TTY session stays interactive through its
+	// terminal. Exec sessions are unaffected: their client sends EOF.
+	spec := procSpec{
+		argv: claim.Command, dir: claim.WorkingDir, user: claim.User, tty: claim.TTY,
+		stdinEOF: !claim.TTY,
+	}
 	hold := claim.WaitForClient
 	s, err := g.startSession(wire.PrimarySession, spec, claim.Env, hold)
 	if err != nil {

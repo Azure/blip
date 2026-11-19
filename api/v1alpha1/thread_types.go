@@ -41,6 +41,7 @@ type BlipThreadSpec struct {
 	DailyTokens int64 `json:"dailyTokens,omitempty"`
 	// Heartbeat wakes the coordinator while it has open tasks. The default
 	// is 30 minutes.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="heartbeat must be a non-negative duration"
 	Heartbeat *metav1.Duration `json:"heartbeat,omitempty"`
 	// Retention bounds the history blipchat keeps for this thread.
 	Retention ThreadRetention `json:"retention,omitempty"`
@@ -50,11 +51,13 @@ type BlipThreadSpec struct {
 // defaults: turns 168h, keepTurns 200, closedTasks 72h, maxTasks 200.
 type ThreadRetention struct {
 	// Turns is how long processed turns are kept.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="retention.turns must be a non-negative duration"
 	Turns *metav1.Duration `json:"turns,omitempty"`
 	// KeepTurns is the minimum number of turns kept per thread.
 	// +kubebuilder:validation:Minimum=0
 	KeepTurns int32 `json:"keepTurns,omitempty"`
 	// ClosedTasks is how long closed tasks are kept after their last update.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="retention.closedTasks must be a non-negative duration"
 	ClosedTasks *metav1.Duration `json:"closedTasks,omitempty"`
 	// MaxTasks caps the task board. The oldest closed tasks are pruned first.
 	// +kubebuilder:validation:Minimum=0
@@ -125,7 +128,7 @@ type ThreadTask struct {
 	// Attributes are coordinator-owned conventions such as state, after, or
 	// pr. The engine never interprets them.
 	// +kubebuilder:validation:MaxProperties=16
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() <= 63) && self.all(k, v, v.size() <= 256)",message="attribute keys are at most 63 and values at most 256 characters"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() <= 63 && self[k].size() <= 256)",message="attribute keys are at most 63 and values at most 256 characters"
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// +kubebuilder:validation:MaxLength=256
 	Note    string       `json:"note,omitempty"`
@@ -140,7 +143,7 @@ type ThreadTask struct {
 type BlipThread struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              BlipThreadSpec   `json:"spec,omitempty"`
+	Spec              BlipThreadSpec   `json:"spec"`
 	Status            BlipThreadStatus `json:"status,omitempty"`
 }
 
@@ -173,9 +176,12 @@ const (
 
 // BlipTurnSpec is written by the turn's producer.
 type BlipTurnSpec struct {
-	// Thread is the name of the BlipThread this turn belongs to.
+	// Thread is the name of a BlipThread in the same namespace. It must be a
+	// valid thread (DNS subdomain) name so a typo cannot create a turn that
+	// no thread can ever claim.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	Thread string     `json:"thread"`
 	Author TurnAuthor `json:"author"`
 	// Topic is a free-form dotted label such as blip.report, chat.propose,
@@ -191,7 +197,7 @@ type BlipTurnSpec struct {
 	// Attributes carry structured fields from the producer. The coordinator
 	// reads them; the engine does not.
 	// +kubebuilder:validation:MaxProperties=16
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() <= 63) && self.all(k, v, v.size() <= 256)",message="attribute keys are at most 63 and values at most 256 characters"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() <= 63 && self[k].size() <= 256)",message="attribute keys are at most 63 and values at most 256 characters"
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Text is the bounded human-readable payload.
 	// +kubebuilder:validation:MaxLength=2048
@@ -230,9 +236,20 @@ type TurnSubject struct {
 // BlipTurnStatus is written only by blipchat.
 type BlipTurnStatus struct {
 	// Seq is the turn's position in the thread's single global order.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value()",optionalOldSelf=true,message="seq is immutable once set"
 	Seq int64 `json:"seq,omitempty"`
 	// AcceptedTime is when blipchat sequenced the turn.
 	AcceptedTime *metav1.Time `json:"acceptedTime,omitempty"`
+	// ThreadUID is the UID of the BlipThread incarnation that sequenced the
+	// turn. A deleted and recreated thread has a new UID, so turns sequenced
+	// by the old incarnation are ignored rather than adopted as history.
+	ThreadUID string `json:"threadUID,omitempty"`
+	// OrphanedAt is when blipchat stopped retrying a turn whose thread does
+	// not exist. Such a turn is never sequenced, and retention deletes it
+	// after the default turn age. The sequencer clears it if the thread
+	// appears later.
+	OrphanedAt *metav1.Time `json:"orphanedAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true

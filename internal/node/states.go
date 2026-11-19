@@ -274,6 +274,15 @@ func planFetch(v *view, p *plan, s *v1alpha1.BlipState) *fetch {
 	if pd := st.Pending; pd != nil && slices.Contains(pd.Replicas, v.node) && !v.holds(pd.CommitID) {
 		want = pd.CommitID
 		src = v.holder(s, pd.CommitID, pd.SourceNode)
+		if src == nil && pd.Generation > 1 {
+			// A draining source that already sealed the commit is still a
+			// valid source for the save it produced: it may not take new
+			// placements, but it can serve the disk it holds. Otherwise a
+			// drain during a save would wedge every replica on "no healthy
+			// holder". Generation 1 is different: there the source must
+			// still build and publish the commit.
+			src = v.servingSource(s, pd.CommitID, pd.SourceNode)
+		}
 	} else if c := st.Committed; c != nil && slices.Contains(st.Placements, v.node) && !v.holds(c.ID) {
 		want = c.ID
 		src = v.holder(s, c.ID, "")

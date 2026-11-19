@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -44,6 +45,7 @@ const (
 	ReasonError         = "Error"
 	ReasonPodLost       = "PodLost"
 	ReasonRuntimeFailed = "RuntimeFailed"
+	ReasonNetworkFailed = "NetworkFailed"
 	ReasonSaveFailed    = "SaveFailed"
 )
 
@@ -179,7 +181,7 @@ func (r *BlipReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	case "", v1.BlipPending:
 		result, err = r.pending(ctx, b, base)
 	case v1.BlipRunning:
-		result, err = r.running(ctx, b)
+		result, err = r.running(ctx, b, base)
 	}
 	if err == nil && b.Status.Phase == v1.BlipSaving {
 		err = r.saving(ctx, b)
@@ -247,14 +249,105 @@ func (r *BlipReconciler) flush(ctx context.Context, b, base *v1.Blip) error {
 	return nil
 }
 
-// cleanup deletes the pod of a finished Blip and removes the finalizer
-// once it is being deleted.
+// podOutput reads the serial console of a VM pod and returns the tail of the
+// lines the guest mirrored from the command, without boot noise. It is best
+// effort: a missing log or a read error simply leaves the output empty.
+func (r *BlipReconciler) podOutput(ctx context.Context, namespace, pod string) (string, bool) {
+	if r.Config.PodLogs == nil {
+		return "", false
+	}
+	rc, err := r.Config.PodLogs(ctx, namespace, pod)
+	if err != nil {
+		return "", false
+	}
+	defer rc.Close()
+	var lines []string
+	total := 0
+	truncated := false
+	sc := bufio.NewScanner(rc)
+	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	for sc.Scan() {
+		line, ok := strings.CutPrefix(sc.Text(), "blip: ")
+		if !ok {
+			continue
+		}
+		lines = append(lines, line)
+		total += len(line) + 1
+		for total > maxRetainedOutput && len(lines) > 1 {
+			total -= len(lines[0]) + 1
+			lines = lines[1:]
+			truncated = true
+		}
+	}
+	if len(lines) == 0 {
+		return "", false
+	}
+	return retainTail(lines, truncated), true
+}
+
+// retainTail joins the newest whole lines that fit in maxRetainedOutput. When
+// earlier lines were removed it reserves room for outputTruncated and prefixes
+// it, so a consumer can tell the head is missing. Only a line longer than the
+// bound is split.
+func retainTail(lines []string, truncated bool) string {
+	limit := maxRetainedOutput
+	if truncated {
+		limit -= len(outputTruncated)
+	}
+	total := 0
+	for _, line := range lines {
+		total += len(line) + 1
+	}
+	start := 0
+	// Always keep the newest line, even when it alone exceeds the bound; the
+	// byte-level cut below preserves its tail rather than losing all output.
+	for total > limit && len(lines)-start > 1 {
+		total -= len(lines[start]) + 1
+		start++
+	}
+	out := strings.Join(lines[start:], "\n")
+	if len(out) > 0 {
+		out += "\n"
+	}
+	if truncated {
+		out = outputTruncated + out
+	}
+	if len(out) > maxRetainedOutput {
+		// A single line exceeded the bound; keep its most recent bytes and
+		// start at a line boundary when one is left.
+		cut := len(out) - (maxRetainedOutput - len(outputTruncated))
+		// Start at the next line boundary when that leaves output behind;
+		// an overlong line's final newline must not discard its whole tail.
+		if i := strings.IndexByte(out[cut:], '\n'); i >= 0 && i+1 < len(out)-cut {
+			cut += i + 1
+		}
+		out = outputTruncated + out[cut:]
+	}
+	return out
+}
+
+// maxRetainedOutput bounds the command output copied from the serial console
+// into Blip status. The full output is in the pod log until it is deleted;
+// this tail is what survives.
+const maxRetainedOutput = 64 << 10
+
+const outputTruncated = "[earlier output was truncated]\n"
+
+// cleanup preserves the tail of a finished command, deletes its pod, and
+// removes the finalizer once the Blip is being deleted.
 func (r *BlipReconciler) cleanup(ctx context.Context, b *v1.Blip) error {
 	var err error
 	if b.Status.Pod != "" {
 		pod := &corev1.Pod{}
 		err = r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.Pod}, pod)
 		if err == nil && string(pod.UID) == b.Status.PodUID && pod.DeletionTimestamp == nil {
+			if out, ok := r.podOutput(ctx, b.Namespace, pod.Name); ok && b.Status.Output == "" {
+				base := b.DeepCopy()
+				b.Status.Output = out
+				if err = patchStatus(ctx, r.Client, b, base); err != nil {
+					return err
+				}
+			}
 			err = r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID})
 		}
 	}
@@ -270,6 +363,23 @@ func (r *BlipReconciler) cleanup(ctx context.Context, b *v1.Blip) error {
 }
 
 func stopping(b *v1.Blip) bool { return b.Spec.Stop || b.DeletionTimestamp != nil }
+
+// deletedByOwner reports whether st is being deleted while an owner other
+// than b is responsible. Owner references created by the CLI do not set the
+// controller flag, so every owner UID matters rather than only the controller
+// reference. Deleting a workspace through its owner removes the data, so a
+// borrowed writer cannot preserve a save into it.
+func deletedByOwner(st *v1.BlipState, b *v1.Blip) bool {
+	if len(st.OwnerReferences) == 0 {
+		return false
+	}
+	for _, owner := range st.OwnerReferences {
+		if owner.UID == b.UID {
+			return false
+		}
+	}
+	return true
+}
 
 func wait(b *v1.Blip, reason, msg string) {
 	b.Status.Phase = v1.BlipPending
@@ -300,17 +410,22 @@ func (r *BlipReconciler) deadlineExceeded(b *v1.Blip) bool {
 // stopForDeadline sets spec.stop as an expired deadline would. A conflict is
 // retried against the latest object, so a concurrent spec edit is not lost.
 func (r *BlipReconciler) stopForDeadline(ctx context.Context, b *v1.Blip) error {
+	return r.stop(ctx, b, "DeadlineExceeded")
+}
+
+// stop sets spec.stop and records why, retrying against a concurrent edit.
+// The stop reason is only recorded once, so a later cause does not overwrite
+// the first.
+func (r *BlipReconciler) stop(ctx context.Context, b *v1.Blip, reason string) error {
 	key := client.ObjectKeyFromObject(b)
 	for attempt := 0; ; attempt++ {
 		base := b.DeepCopy()
 		b.Spec.Stop = true
-		// Record only the first cause: a later stop must not overwrite why
-		// the Blip was already stopping.
 		if b.Annotations[v1.AnnotationStopReason] == "" {
 			if b.Annotations == nil {
 				b.Annotations = map[string]string{}
 			}
-			b.Annotations[v1.AnnotationStopReason] = "DeadlineExceeded"
+			b.Annotations[v1.AnnotationStopReason] = reason
 		}
 		err := patchObject(ctx, r.Client, b, base)
 		if err == nil || !apierrors.IsConflict(err) || attempt >= 4 {
@@ -466,18 +581,32 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		return reconcile.Result{}, err
 	}
 	candidates := r.warmPods(b, pool, states, pods, cl)
-	if loc := b.Status.Locality; loc != nil && !loc.Fallback {
+	if loc := b.Status.Locality; loc != nil {
 		local := slices.DeleteFunc(slices.Clone(candidates), func(p corev1.Pod) bool {
 			return !slices.Contains(home, p.Spec.NodeName)
 		})
-		if len(local) > 0 {
+		switch {
+		case len(local) > 0:
+			if loc.Fallback {
+				// Capacity is available at the data node again. Return to
+				// the pinned placement instead of keeping a fallback that a
+				// transient maxCount caused for the rest of the Blip's life.
+				loc.Fallback = false
+				loc.Node = podNode(&local[0])
+				loc.Since = nil
+			}
 			candidates = local
-		} else if why, left := r.waitLocally(b, pool, pods, home); why == "" {
-			wait(b, ReasonWaitingForVM, fmt.Sprintf("waiting for a VM on node %q, which holds the Blip's data", loc.Node))
-			return reconcile.Result{RequeueAfter: left}, r.unclaim(ctx, b)
-		} else {
-			log.FromContext(ctx).Info("starting away from the Blip's data", "node", loc.Node, "reason", why)
-			loc.Fallback = true
+		case loc.Fallback:
+			// No local VM is claimable yet. Keep the fallback eligible for
+			// any VM while the pool still treats the data node as demand.
+		default:
+			if why, left := r.waitLocally(b, pool, pods, home); why == "" {
+				wait(b, ReasonWaitingForVM, fmt.Sprintf("waiting for a VM on node %q, which holds the Blip's data", loc.Node))
+				return reconcile.Result{RequeueAfter: left}, r.unclaim(ctx, b)
+			} else {
+				log.FromContext(ctx).Info("starting away from the Blip's data", "node", loc.Node, "reason", why)
+				loc.Fallback = true
+			}
 		}
 	}
 	if len(candidates) == 0 {
@@ -733,7 +862,11 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 			p.Labels = map[string]string{}
 		}
 		p.Labels[v1.LabelBlipUID] = string(b.UID)
-		p.Labels[v1.LabelOwner] = blipOwner(b)
+		if owner := blipOwner(b); owner != "" {
+			p.Labels[v1.LabelOwner] = owner
+		} else {
+			delete(p.Labels, v1.LabelOwner)
+		}
 		if p.Annotations == nil {
 			p.Annotations = map[string]string{}
 		}
@@ -760,6 +893,28 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 	return nil, nil
 }
 
+// syncPodOwner keeps a claimed pod's owner label equal to its Blip's. The
+// label is written at claim time, but an owner added or changed afterwards
+// must propagate: the api-proxy authorizes pod reads by the pod label, so a
+// stale label hides the guest's own pod (or leaves it visible to the previous
+// owner).
+func (r *BlipReconciler) syncPodOwner(ctx context.Context, b *v1.Blip, pod *corev1.Pod) error {
+	owner := blipOwner(b)
+	if pod.Labels[v1.LabelOwner] == owner {
+		return nil
+	}
+	base := pod.DeepCopy()
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	if owner == "" {
+		delete(pod.Labels, v1.LabelOwner)
+	} else {
+		pod.Labels[v1.LabelOwner] = owner
+	}
+	return client.IgnoreNotFound(patchObject(ctx, r.Client, pod, base))
+}
+
 func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *corev1.Pod) error {
 	b.Status.Pod = pod.Name
 	b.Status.PodUID = string(pod.UID)
@@ -773,6 +928,9 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 	fresh := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: pod.Name}, fresh); err == nil && string(fresh.UID) == b.Status.PodUID {
 		pod = fresh
+	}
+	if err := r.syncPodOwner(ctx, b, pod); err != nil {
+		return err
 	}
 	if err := r.ensureWriterPods(ctx, b); err != nil {
 		return err
@@ -816,13 +974,18 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 }
 
 // running mirrors the pod's observed state and applies mount changes.
-func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Result, error) {
+func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip) (reconcile.Result, error) {
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.Pod}, pod)
 	if apierrors.IsNotFound(err) || err == nil && string(pod.UID) != b.Status.PodUID {
 		pod = nil
 	} else if err != nil {
 		return reconcile.Result{}, err
+	}
+	if pod != nil {
+		if err := r.syncPodOwner(ctx, b, pod); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 	var obs podapi.Observed
 	if pod != nil {
@@ -869,10 +1032,30 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Res
 				return reconcile.Result{}, err
 			}
 			if reason != "" {
+				if reason == reasonStateDeleting && b.DeletionTimestamp == nil && root != nil && deletedByOwner(root, b) {
+					// The owner Blip (or its TTL) is removing the
+					// workspace. Its deletion also removes the data this
+					// Blip would save, so stop now and fail the save
+					// instead of reporting success for a discarded result.
+					if err := r.stop(ctx, b, reasonStateDeleting); err != nil {
+						return reconcile.Result{}, err
+					}
+					*base = *b.DeepCopy()
+					b.Status.Reason, b.Status.Message = ReasonStateNotFound,
+						fmt.Sprintf("state %q is being deleted by its owner; stopping before the workspace is removed", root.Name)
+					return reconcile.Result{}, nil
+				}
 				b.Status.Reason, b.Status.Message = reason, msg
 				return reconcile.Result{RequeueAfter: retryAfter}, nil
 			}
 			b.Status.Reason = ""
+			// A live policy that fails to compile is replaced with default
+			// deny. The node records the cause on the pod; surface it so a
+			// Running Blip does not look healthy while all egress is blocked.
+			if perr := pod.Annotations[v1.AnnotationPrepareError]; strings.HasPrefix(perr, "network policy:") {
+				b.Status.Reason = ReasonNetworkFailed
+				b.Status.Message = perr
+			}
 			if err := r.syncMounts(ctx, b, mounts, pod, &obs); err != nil {
 				return reconcile.Result{}, err
 			}
@@ -956,6 +1139,30 @@ func finishedAt(p *corev1.Pod) time.Time {
 	return time.Time{}
 }
 
+// desiredMounts returns the root state's current mount set. ok is false when
+// the root is gone or deleting, so its topology cannot be used to decide what
+// a finishing Blip should still report.
+func (r *BlipReconciler) desiredMounts(ctx context.Context, b *v1.Blip) (map[string]bool, bool, error) {
+	if b.Spec.State == "" {
+		return nil, false, nil
+	}
+	root := &v1.BlipState{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.State}, root); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if root.DeletionTimestamp != nil {
+		return nil, false, nil
+	}
+	desired := map[string]bool{}
+	for _, m := range v1.DesiredMounts(root, b) {
+		desired[m.State] = true
+	}
+	return desired, true, nil
+}
+
 // saving waits until the root state and every writable mount resolved
 // their attachments, then finishes the Blip.
 func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
@@ -996,6 +1203,39 @@ func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
 			b.Status.Reason, b.Status.Message = ReasonSaveFailed, saveErr
 		}
 		return nil
+	}
+	// A workspace being removed by its owner's deletion or TTL cannot keep
+	// this save. attachment deliberately treats a deleting state as resolved
+	// so the finalizer cannot deadlock with the Blip; without this check the
+	// borrower would report Succeeded for data that is about to disappear.
+	if b.Spec.State != "" && saveErr == "" {
+		st := &v1.BlipState{}
+		switch err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.State}, st); {
+		case apierrors.IsNotFound(err):
+			// attachment already reports a deleted state as a failed save.
+		case err != nil:
+			return err
+		case st.DeletionTimestamp != nil && deletedByOwner(st, b):
+			saveErr = fmt.Sprintf("state %q was deleted by its owner while in use; the save was discarded", st.Name)
+		}
+	}
+	// Every attachment is resolved. A writable mount still marked Saving was
+	// saved successfully, so show its final ready phase instead of leaving
+	// the finished Blip looking like it is still saving.
+	for i := range b.Status.Mounts {
+		if m := &b.Status.Mounts[i]; m.Writable && m.Phase == v1.MountSaving {
+			m.Phase, m.Message, m.Switching = v1.MountMounted, "", false
+		}
+	}
+	// A mount removed from desired intent while the Blip was stopping has
+	// been saved above, but it is no longer part of the root's topology: a
+	// finished Blip must not keep reporting it as mounted.
+	if desired, ok, err := r.desiredMounts(ctx, b); err != nil {
+		return err
+	} else if ok {
+		b.Status.Mounts = slices.DeleteFunc(b.Status.Mounts, func(m v1.MountStatus) bool {
+			return m.Phase != v1.MountFailed && !desired[m.State]
+		})
 	}
 	if saveErr != "" {
 		if b.Status.Message != "" && b.Status.Reason != ReasonSaveFailed {

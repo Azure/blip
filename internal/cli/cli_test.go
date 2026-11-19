@@ -57,6 +57,31 @@ func TestRunRequiresCommand(t *testing.T) {
 	}
 }
 
+// pflag parses flags after the first positional. Without --, a command
+// argument that matches a blip flag is silently removed from the command.
+func TestRunRejectsFlagsAfterCommandWithoutDash(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	code, _, errOut := h.run("", "run", "--name", "argtest", "--from", "base", "echo", "-n", "ns")
+	if code != 1 || !strings.Contains(errOut, `flag "-n"`) || !strings.Contains(errOut, "put -- before the command") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !isBlipGone(t, h, "argtest") {
+		t.Fatal("run created a blip after rejecting its command")
+	}
+}
+
+// Flags before the command need no --; only ambiguous flags after it do.
+func TestRunAllowsFlagsBeforeCommandWithoutDash(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "true")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if got := strings.Join(h.blip("worker").Spec.Command, " "); got != "true" {
+		t.Fatalf("command = %q", got)
+	}
+}
+
 func TestRunRejectsBadFlags(t *testing.T) {
 	h := newHarness(t)
 	for _, tc := range []struct {
@@ -142,6 +167,52 @@ func TestExecWithoutCommandOpensLoginShell(t *testing.T) {
 	}
 	if o := opens[1].Open; !o.TTY {
 		t.Fatalf("-t did not request a terminal: %+v", o)
+	}
+}
+
+// A command that cannot start returns the conventional status, not exit 1:
+// 127 when it is missing and 126 when it exists but cannot be executed. The
+// explanation stays on stderr.
+func TestExecStartFailureExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		code int
+		msg  string
+	}{
+		{127, "nosuchcmd: command not found"},
+		{126, "start /etc/passwd: fork/exec /etc/passwd: permission denied"},
+	} {
+		h := newHarness(t, runningBlip("agent"))
+		h.guest.OpenError = tc.msg
+		h.guest.OpenCode = tc.code
+		code, _, errOut := h.run("", "exec", "agent", "--", "x")
+		if code != tc.code || !strings.Contains(errOut, tc.msg) {
+			t.Fatalf("code %d err %q, want %d containing %q", code, errOut, tc.code, tc.msg)
+		}
+	}
+}
+
+// exec has the same silent-flag problem after the blip name and command.
+func TestExecRejectsFlagsAfterCommandWithoutDash(t *testing.T) {
+	h := newHarness(t, runningBlip("agent"))
+	code, _, errOut := h.run("", "exec", "agent", "echo", "-n", "hi")
+	if code != 1 || !strings.Contains(errOut, `flag "-n"`) || !strings.Contains(errOut, "put -- before the command") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if opens := h.guest.Opens(); len(opens) != 0 {
+		t.Fatalf("exec opened a session: %+v", opens)
+	}
+}
+
+// An explicit -- still passes flag-looking command arguments through.
+func TestExecPassesFlagLikeArgsAfterDash(t *testing.T) {
+	h := newHarness(t, runningBlip("agent"))
+	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
+		s.Stdout(strings.Join(s.Open.Argv, " "))
+		return wire.Exit{}
+	}
+	code, out, errOut := h.run("", "exec", "agent", "--", "echo", "-n", "hi")
+	if code != 0 || out != "echo -n hi" {
+		t.Fatalf("code %d out %q err %q", code, out, errOut)
 	}
 }
 

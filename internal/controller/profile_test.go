@@ -409,7 +409,7 @@ func TestPoolWatchesBaseWithoutWaitingBlips(t *testing.T) {
 	e.newPool("default", 0, 0)
 	e.newPool("other", 0, 0)
 	e.newState("base", func(st *v1.BlipState) { st.Spec.Image = "reg/img:v1" })
-	rqs := e.pool.statePools(e.ctx, e.getState("base"))
+	rqs := e.pool.namespacePools(e.ctx, e.getState("base"))
 	if !slices.Contains(rqs, req(ns, "default")) || !slices.Contains(rqs, req(ns, "other")) {
 		t.Fatalf("base change did not wake pool authorization: %v", rqs)
 	}

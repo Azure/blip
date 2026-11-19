@@ -223,8 +223,20 @@ func (v *view) registeredPeers() []peer.Peer {
 // has a trusted TLS identity and endpoint, is not draining, its Kubernetes Node
 // still exists, and its heartbeat is recent. incarnation is checked when non-empty.
 func (v *view) healthyNode(name, incarnation string) *v1alpha1.BlipNode {
+	return v.presentNode(name, incarnation, false)
+}
+
+// servingNode is healthyNode without the drain check. Draining forbids new
+// placements; it does not stop a node from serving a commit it already sealed.
+// A save whose source began draining must still be replicable, or the state
+// would wait for that commit forever.
+func (v *view) servingNode(name, incarnation string) *v1alpha1.BlipNode {
+	return v.presentNode(name, incarnation, true)
+}
+
+func (v *view) presentNode(name, incarnation string, allowDrain bool) *v1alpha1.BlipNode {
 	bn := v.blipNodes[name]
-	if bn == nil || bn.Spec.Drain {
+	if bn == nil || (!allowDrain && bn.Spec.Drain) {
 		return nil
 	}
 	if p, ok := v.trusted.Lookup(name); !ok || p != nodePeer(bn) {
@@ -248,6 +260,31 @@ func (v *view) healthyNode(name, incarnation string) *v1alpha1.BlipNode {
 // from a stale incarnation or an unhealthy node are ignored. It returns nil
 // rather than a dead preferred node.
 func (v *view) holder(s *v1alpha1.BlipState, commitID, prefer string) *source {
+	return v.holderFrom(s, commitID, prefer, func(name, incarnation string) bool {
+		return v.healthyNode(name, incarnation) != nil
+	})
+}
+
+// servingSource picks a holder for a pending commit whose source is prefer.
+// It first looks for a node that is healthy for new placements; when there is
+// none, it accepts prefer itself if it is healthy and merely draining. Draining
+// blocks new placements, not reading a commit the node already sealed. Without
+// this fallback a drain that starts while a save is replicating leaves every
+// replica reporting "no healthy holder of commit ...", and the save never
+// resolves.
+func (v *view) servingSource(s *v1alpha1.BlipState, commitID, prefer string) *source {
+	if src := v.holder(s, commitID, prefer); src != nil {
+		return src
+	}
+	if prefer == "" {
+		return nil
+	}
+	return v.holderFrom(s, commitID, prefer, func(name, incarnation string) bool {
+		return name == prefer && v.servingNode(name, incarnation) != nil
+	})
+}
+
+func (v *view) holderFrom(s *v1alpha1.BlipState, commitID, prefer string, eligible func(name, incarnation string) bool) *source {
 	if s == nil {
 		return nil
 	}
@@ -256,7 +293,7 @@ func (v *view) holder(s *v1alpha1.BlipState, commitID, prefer string) *source {
 		if e.Node == v.node || !slices.Contains(e.Commits, commitID) {
 			continue
 		}
-		if v.healthyNode(e.Node, e.Incarnation) == nil {
+		if !eligible(e.Node, e.Incarnation) {
 			continue
 		}
 		candidates = append(candidates, e.Node)

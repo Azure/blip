@@ -68,10 +68,23 @@ func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (
 	}
 	if s.Opened.Error != "" {
 		rwc.Close()
+		if s.Opened.Code != 0 {
+			return nil, &OpenError{Message: s.Opened.Error, Code: s.Opened.Code}
+		}
 		return nil, errors.New(s.Opened.Error)
 	}
 	return s, nil
 }
+
+// OpenError is a rejected session open. Code is the conventional shell status
+// when the guest failed to start the command (126 not executable, 127 command
+// not found), so a caller can report it instead of a generic exit 1.
+type OpenError struct {
+	Message string
+	Code    int
+}
+
+func (e *OpenError) Error() string { return e.Message }
 
 // Session is one open guest session. Send methods are safe for concurrent
 // use; Recv and Copy must be called from one goroutine.
@@ -118,7 +131,8 @@ func (s *Session) Signal(name string) error {
 	return s.conn.WriteJSON(wire.TSignal, wire.Signal{Name: name})
 }
 
-// Close disconnects. The guest keeps the session running.
+// Close disconnects. A primary command keeps running without a client; an
+// exec command is terminated once its last client goes away.
 func (s *Session) Close() error {
 	var err error
 	s.once.Do(func() { err = s.rwc.Close() })

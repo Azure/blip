@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
 	"golang.org/x/sys/unix"
 )
@@ -73,6 +72,9 @@ const (
 	// inputNoticeInterval throttles the stdin-discarded warning so a flood
 	// produces one notice rather than one per dropped frame.
 	inputNoticeInterval = time.Second
+	// detachGrace is how long a detached exec command gets between SIGTERM
+	// and SIGKILL after its last client goes away.
+	detachGrace = 2 * time.Second
 )
 
 type client struct {
@@ -132,8 +134,6 @@ func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bo
 // startSessionOpen is startSession with a client OpenID recorded on the
 // session before it becomes visible, so removeSession can tombstone it.
 func (g *Guest) startSessionOpen(id, openID string, s procSpec, base []string, holdOutput bool) (*session, error) {
-	// Last, so image defaults and caller environment cannot redirect it.
-	base = append(append([]string(nil), base...), podapi.ReportEnv+"="+podapi.ReportURL)
 	start := g.startProc
 	if g.startProcess != nil {
 		start = g.startProcess
@@ -319,7 +319,9 @@ func (g *Guest) failedSession(id string, argv []string, err error) *session {
 	g.mu.Lock()
 	g.sessions[id] = ss
 	g.mu.Unlock()
-	ss.finish(wire.Exit{Code: 127})
+	// A start failure has a conventional shell status: 127 for a missing
+	// command, 126 for a command that cannot be executed or a bad workdir.
+	ss.finish(wire.Exit{Code: startExitCode(err)})
 	return ss
 }
 
@@ -441,7 +443,14 @@ func (s *session) endInput() {
 		return
 	}
 	if p.tty != nil {
-		_, _ = p.tty.Write([]byte{4})
+		// In canonical mode the first VEOF (Ctrl-D) delivers a partial line
+		// to the reader but does not end the read: only a VEOF at the start
+		// of an empty line makes read(2) return 0. A piped caller sends its
+		// last line without a newline, so send two: the first flushes the
+		// partial line and the second yields EOF. Interactive Ctrl-D is a
+		// normal stdin byte and does not go through endInput, so typing it
+		// still behaves as before.
+		_, _ = p.tty.Write([]byte{4, 4})
 	} else {
 		_ = p.stdin.Close()
 	}
@@ -657,6 +666,40 @@ func (s *session) info() sessionInfo {
 	return sessionInfo{ID: s.id, Argv: s.argv, TTY: s.tty, Clients: s.clients, Exited: s.exited}
 }
 
+// signal sends sig to the command's process group, falling back to the process
+// itself. It reports whether a signal was attempted.
+func (s *session) signal(sig unix.Signal) bool {
+	p := s.proc
+	if p == nil || p.pid <= 0 {
+		return false
+	}
+	if unix.Kill(-p.pid, sig) != nil {
+		_ = unix.Kill(p.pid, sig)
+	}
+	return true
+}
+
+// terminate ends a detached exec command. Its last client is gone, so no one
+// can reach the session to signal it or ever attach to it again. The command
+// gets detachGrace to clean up before the process group is killed.
+func (s *session) terminate() {
+	s.mu.Lock()
+	running := !s.exited && s.clients == 0
+	s.mu.Unlock()
+	if !running || !s.signal(unix.SIGTERM) {
+		return
+	}
+	go func() {
+		time.Sleep(detachGrace)
+		s.mu.Lock()
+		running := !s.exited && s.clients == 0
+		s.mu.Unlock()
+		if running {
+			s.signal(unix.SIGKILL)
+		}
+	}()
+}
+
 // serve attaches a client until it disconnects or the session ends. A
 // follower receives retained and live output but is not registered as a
 // reader, so its cursor never pins the replay ring and never backpressures
@@ -687,11 +730,18 @@ func (s *session) serve(c *wire.Conn, conn io.Closer, follow bool) {
 		delete(s.readers, cl)
 		s.clearReplayLocked()
 		_, drop := sessionRetention(s.id == wire.PrimarySession, s.exited, s.attached, s.clients)
+		// Exec sessions have no way to reattach from the CLI, so a command
+		// whose last client vanished would keep running unreachable. Primary
+		// commands stay detached by design.
+		detach := s.id != wire.PrimarySession && s.clients == 0 && !s.exited
 		s.cond.Broadcast()
 		s.mu.Unlock()
 		s.g.addClients(-1)
 		if drop {
 			s.g.removeSession(s)
+		}
+		if detach {
+			s.terminate()
 		}
 	}()
 	go s.write(c, conn, cl)
@@ -804,9 +854,7 @@ func (s *session) input(t wire.Type, payload []byte) error {
 		exited := s.exited
 		s.mu.Unlock()
 		if !exited {
-			if unix.Kill(-p.pid, sig) != nil {
-				_ = unix.Kill(p.pid, sig)
-			}
+			s.signal(sig)
 		}
 	}
 	return nil
@@ -849,7 +897,7 @@ func (g *Guest) serveSession(f io.ReadWriteCloser) {
 	case wire.OpenExec:
 		s, err := g.openExec(o)
 		if err != nil {
-			reject(c, f, err)
+			rejectStart(c, f, err)
 			return
 		}
 		if c.WriteJSON(wire.TOpened, wire.Opened{Session: s.id, TTY: s.tty}) != nil {
@@ -880,6 +928,20 @@ func execProcSpec(claim *wire.Claim, o wire.Open) procSpec {
 
 func reject(c *wire.Conn, f io.Closer, err error) {
 	_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error()})
+	f.Close()
+}
+
+// rejectStart rejects an exec open. If the failure happened while starting the
+// command, the conventional exit status travels with the error so the client
+// can return 126/127 instead of a plain exit 1 that is indistinguishable from
+// a command that ran and exited 1.
+func rejectStart(c *wire.Conn, f io.Closer, err error) {
+	var se *startError
+	if errors.As(err, &se) {
+		_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error(), Code: se.code})
+	} else {
+		_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error()})
+	}
 	f.Close()
 }
 

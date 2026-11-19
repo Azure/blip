@@ -173,6 +173,14 @@ type proxyServer struct {
 	cleanup func()
 }
 
+// connectionLifetimeKey carries the connection-scoped context. A client may
+// half-close its write side after sending a complete request; net/http
+// cancels the per-request context when the read side reaches EOF, even
+// though the connection is still open for the response. Proxying against the
+// connection lifetime (which follows server shutdown) keeps the in-flight
+// request and response alive.
+type connectionLifetimeKey struct{}
+
 func newProxyServer(ctx context.Context, socketPath string, handler http.Handler) (*proxyServer, error) {
 	listener, cleanup, err := listenUnix(socketPath)
 	if err != nil {
@@ -180,10 +188,18 @@ func newProxyServer(ctx context.Context, socketPath string, handler http.Handler
 	}
 	tracked := &trackedListener{Listener: listener, connections: make(map[*trackedConn]struct{})}
 	server := &http.Server{
-		Handler:           handler,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if lifetime, ok := r.Context().Value(connectionLifetimeKey{}).(context.Context); ok {
+				r = r.WithContext(lifetime)
+			}
+			handler.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
-		ErrorLog:          log.New(io.Discard, "", 0),
+		ConnContext: func(connCtx context.Context, _ net.Conn) context.Context {
+			return context.WithValue(connCtx, connectionLifetimeKey{}, connCtx)
+		},
+		ErrorLog: log.New(io.Discard, "", 0),
 	}
 	return &proxyServer{server: server, tracked: tracked, cleanup: cleanup}, nil
 }
@@ -308,13 +324,46 @@ func certPool(caFile, label string, systemRoots bool) (*x509.CertPool, error) {
 	return roots, nil
 }
 
+// identityHeaderPrefixes are headers through which an authenticating front
+// proxy asserts the caller's identity. The sidecar is the only proxy allowed
+// to speak for the workload, so none of these caller values may reach an
+// upstream: an upstream that trusts them would act as the caller.
+var identityHeaderPrefixes = []string{
+	"impersonate-",
+	"x-remote-",
+	"x-forwarded-",
+	"x-auth-request-", // oauth2-proxy / ingress-nginx auth_request
+	"remote-",         // Remote-User and friends from reverse proxies
+	"tailscale-user-", // Tailscale serve identity headers
+	"cf-access-authenticated-user-",
+	"cf-access-jwt-assertion",
+	"x-authentik-",  // authentik proxy outpost
+	"x-ssl-client-", // client-certificate assertions
+	"client-cert",
+	"x-pomerium-",
+}
+
+// identityHeaders are caller identity headers with fixed names.
+var identityHeaders = map[string]struct{}{
+	"authorization":       {},
+	"proxy-authorization": {},
+	"forwarded":           {},
+	"via":                 {},
+	"x-real-ip":           {},
+}
+
 func stripIdentity(headers http.Header) {
 	for key := range headers {
 		name := strings.ToLower(key)
-		if name == "authorization" || name == "proxy-authorization" ||
-			strings.HasPrefix(name, "impersonate-") || strings.HasPrefix(name, "x-remote-") ||
-			name == "forwarded" || name == "via" || name == "x-real-ip" || strings.HasPrefix(name, "x-forwarded-") {
+		if _, ok := identityHeaders[name]; ok {
 			delete(headers, key)
+			continue
+		}
+		for _, prefix := range identityHeaderPrefixes {
+			if strings.HasPrefix(name, prefix) {
+				delete(headers, key)
+				break
+			}
 		}
 	}
 }

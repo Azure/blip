@@ -654,6 +654,36 @@ func TestLiveCopyAbandonsGonePod(t *testing.T) {
 	}
 }
 
+func TestLiveCopyAbandonsStoppingPod(t *testing.T) {
+	a, st, _ := testAgent(t)
+	key := podKey(ns, "p")
+	dir := a.podDirFor(key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := podapi.WriteJSON(filepath.Join(dir, podapi.DesiredFile), podapi.Desired{Stop: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := podapi.WriteJSON(filepath.Join(dir, podapi.ObservedFile), podapi.Observed{Phase: podapi.PhaseRunning}); err != nil {
+		t.Fatal(err)
+	}
+	// The source started stopping: the guest may never freeze again.
+	start := time.Now()
+	err := a.liveCopy(context.Background(), liveCopy{pod: key, stateUID: "uid-cp", attachmentID: "a1", commitID: "k1"})
+	if err != nil {
+		t.Fatalf("live copy of stopping pod: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waited %s for a stopping pod", elapsed)
+	}
+	st.mu.Lock()
+	_, copied := st.volumes["k1"]
+	st.mu.Unlock()
+	if copied {
+		t.Fatal("snapshotted a stopping pod")
+	}
+}
+
 func TestWaitFrozenReportsGonePod(t *testing.T) {
 	a, _, _ := testAgent(t)
 	key := podKey(ns, "p")

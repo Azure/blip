@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"io"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +38,9 @@ type Config struct {
 	NewID func() string
 	// NewPodName defaults to the pool name plus a random five-character suffix.
 	NewPodName func(pool string) string
+	// PodLogs opens the serial console of a VM pod. It is used once when a
+	// Blip finishes to preserve the tail of its command output.
+	PodLogs func(ctx context.Context, namespace, pod string) (io.ReadCloser, error)
 }
 
 func (c *Config) now() time.Time {
@@ -106,7 +110,8 @@ func Setup(ctx context.Context, mgr ctrl.Manager, cfg Config) error {
 	if err := (&NodeReconciler{Client: c}).SetupWithManager(mgr); err != nil {
 		return err
 	}
-	if err := (&PoolReconciler{Client: c, Config: cfg}).SetupWithManager(mgr); err != nil {
+	audiences := discoverAPIServerAudiences(ctx, mgr.GetConfig())
+	if err := (&PoolReconciler{Client: c, Config: cfg, APIAudiences: audiences}).SetupWithManager(mgr); err != nil {
 		return err
 	}
 	if err := (&StateReconciler{Client: c, Live: mgr.GetAPIReader(), Config: cfg}).SetupWithManager(mgr); err != nil {

@@ -328,3 +328,43 @@ func TestAttachAfterPrimaryExitReplaysOutput(t *testing.T) {
 		}
 	}
 }
+
+// The primary command is not fed stdin by any client, so a non-TTY primary
+// must start with stdin at EOF, while a TTY primary keeps its terminal.
+func TestPrimaryStdinMode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tty  bool
+		want bool
+	}{
+		{"command", false, true},
+		{"terminal", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := testGuest(t)
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			wait := make(chan unix.WaitStatus, 1)
+			var got procSpec
+			g.startProcess = func(s procSpec, base []string) (*proc, []string, error) {
+				got = s
+				return &proc{wait: wait, tty: r}, s.argv, nil
+			}
+			t.Cleanup(func() {
+				w.Close()
+				r.Close()
+				select {
+				case wait <- unix.WaitStatus(0):
+				default:
+				}
+			})
+			g.claim = &wire.Claim{ID: "root", Command: []string{"cat"}, TTY: tc.tty}
+			g.startPrimary()
+			if got.stdinEOF != tc.want {
+				t.Fatalf("primary stdinEOF = %v, want %v", got.stdinEOF, tc.want)
+			}
+		})
+	}
+}

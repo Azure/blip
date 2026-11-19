@@ -59,7 +59,11 @@ blip gather --collect "git:$PWD:{name}" --collect "$PWD/out:./out/{name}"
 Each `run` returns as soon as its fork's snapshot is committed, each fork sees
 the same starting files, and changes stay private to their fork. `gather`
 waits for all of them, prints `blip/NAME Phase (exit N)` for each, fetches each
-blip's branch or files, and deletes each blip with its workspace. `-f` streams
+blip's branch or files, and deletes each blip with its workspace. `git:`
+collection fetches commits only: uncommitted and untracked changes are not
+collected, and gather prints a warning when it finds them. A gather whose
+operations resolve two blips to the same destination is rejected; use `{name}`
+so each blip writes somewhere different. `-f` streams
 a running fork's output; `--any` returns on the first finish; `--wait` bounds
 the wait; a fork whose command failed or whose results could not be collected
 is kept for inspection until its TTL (1h by default) deletes it.
@@ -133,7 +137,8 @@ Pod as node-local, replicated, encrypted block storage.
   finished blip, or a coordinator step. Turns are immutable, carry a bounded
   text and free-form attributes, and blipchat stamps `status.seq` to put all
   turns in one order. In-cluster producers create turns; the API server
-  validates that a non-blipchat producer names its own service account.
+  validates that only the `blip-system/blipchat` service account may author a
+  turn as someone else, and every other producer names its own service account.
 
 Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 `BlipState` status; each node agent server-side-applies only its own
@@ -200,7 +205,13 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
   header: `kube-apiserver` goes to the API server with reads scoped to the
   Blip's owner; each `spec.endpoints` name goes to its configured HTTPS URL
   (optionally with its own token audience and CA). It strips caller identity
-  headers, rejects `CONNECT`, and answers unknown hosts with `421`.
+  headers, rejects `CONNECT`, and answers unknown hosts with `421`. Endpoint
+  tokens are projected only for the configured audience, and the controller
+  rejects an audience the cluster API server accepts: the default
+  `kubernetes.default.svc[.cluster.local]` names and the service-account
+  issuer discovered from the API server's OpenID configuration. A cluster
+  that overrides `--api-audiences` with an unrelated value is not covered by
+  that check, so keep endpoint URLs off the API server on such clusters.
 
 ### Guest (`blip-guest`)
 
@@ -236,7 +247,22 @@ one status update. One worker per thread serializes status writes. The model
 is any OpenAI-compatible endpoint selected with `--llm-base-url`; the chat
 front end authenticates users and blipchat reads the identity from
 `X-Forwarded-User`. The chat is stateless: the browser sends its transcript and
-`POST /chat?namespace=NS` names the thread. Chat inspection is read-only:
+`POST /chat?namespace=NS` names the thread (a valid DNS-1123 namespace label;
+the default is `default`).
+
+**Trust boundary:** blipchat has no authentication of its own. It believes
+`X-Forwarded-User` from any caller and authorizes the namespace in the query
+string with its own cluster-wide credentials. It must only be reachable through
+a front end that authenticates users, overwrites `X-Forwarded-User`, and
+restricts which namespaces each user may reach (a NetworkPolicy or an
+authenticating proxy). Do not expose the Service directly. Requests with zero
+or multiple `X-Forwarded-User` headers are rejected.
+
+The chat endpoint accepts at most 1 MiB of JSON, an 8000-character message, 40
+history messages, and 32000 characters of total history; larger requests get
+`400`. The HTTP server bounds read, write, and idle time and closes unused
+keep-alive connections, so a slow client cannot pin a handler. Chat inspection
+is read-only:
 running blips accept a small allowlist (`git status|log|diff|show`, `ls`,
 `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `pwd`) and finished blips
 report their last report.

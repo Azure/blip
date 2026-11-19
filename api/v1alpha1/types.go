@@ -227,6 +227,10 @@ type PendingCommit struct {
 	AttachmentID string `json:"attachmentID,omitempty"`
 	// Replicas are the nodes that must hold the version before commit.
 	Replicas []string `json:"replicas"`
+	// Since is when the controller first observed this pending version. It
+	// bounds how long a save may wait for replicas before it falls back to
+	// committing on a source that still holds it.
+	Since *metav1.Time `json:"since,omitempty"`
 }
 
 // CopySource is the exact version a copy was created from.
@@ -449,7 +453,7 @@ type RuntimeDefaults struct {
 // BlipSpec is one VM lifetime: one command that runs as the primary session.
 // The blip ends when the command exits.
 //
-// +kubebuilder:validation:XValidation:rule="self.command == oldSelf.command",message="command is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.command) == has(oldSelf.command) && (!has(self.command) || self.command == oldSelf.command)",message="command is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env == oldSelf.env)",message="env is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.workingDir) == has(oldSelf.workingDir)) && (!has(self.workingDir) || self.workingDir == oldSelf.workingDir)",message="workingDir is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user == oldSelf.user)",message="user is immutable"
@@ -554,6 +558,12 @@ type BlipStatus struct {
 	// Report is the last report the workload submitted through
 	// BLIP_REPORT_URL. It is retained after the pod is gone.
 	Report *BlipReport `json:"report,omitempty"`
+	// Output is the tail of the command output recovered from the VM serial
+	// console when the Blip finishes. It lets gather -f show a command that
+	// ended before the client could attach. It is bounded and may be empty
+	// if the pod log was unavailable.
+	// +kubebuilder:validation:MaxLength=65536
+	Output string `json:"output,omitempty"`
 }
 
 // BlipReport is one bounded progress or result string published by a

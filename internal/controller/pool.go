@@ -20,10 +20,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -74,6 +76,11 @@ type PoolReconciler struct {
 	client.Client
 	Config
 
+	// APIAudiences are the cluster's accepted service-account audiences, as
+	// discovered at startup. validateEndpoints rejects an endpoint token
+	// projected for any of them.
+	APIAudiences []string
+
 	mu sync.Mutex
 	// created and deleted hold pod names (per pool) whose change the
 	// cache may not show yet.
@@ -99,7 +106,11 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1.Blip{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
 			return []reconcile.Request{req(o.GetNamespace(), poolName(o.(*v1.Blip)))}
 		})).
-		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.statePools)).
+		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.namespacePools)).
+		// Thread creation and deletion changes the turn-owner table. Status
+		// updates from blipchat do not, so ignore them.
+		Watches(&v1.BlipThread{}, handler.EnqueueRequestsFromMapFunc(r.namespacePools),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// A stale heartbeat is a status-only change, and an agent that dies
 		// sends no event at all; reconcile also requeues itself while a node
 		// it uses is still healthy (see nextCrossing).
@@ -121,9 +132,9 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// State imports and deletions refresh shared-base authorization even when no
-// Blip currently waits for a VM.
-func (r *PoolReconciler) statePools(ctx context.Context, o client.Object) []reconcile.Request {
+// State imports and deletions, and thread changes, refresh the authorization
+// table even when no Blip currently waits for a VM.
+func (r *PoolReconciler) namespacePools(ctx context.Context, o client.Object) []reconcile.Request {
 	return r.poolRequests(ctx, o.GetNamespace())
 }
 
@@ -165,7 +176,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// Refuse to create pods whose api-proxy sidecar would exit at startup.
 	// The error is visible on the controller and in events; the alternative
 	// is a Blip that waits for a VM that can never become ready.
-	if err := validateEndpoints(pool); err != nil {
+	if err := validateEndpoints(pool, r.APIAudiences...); err != nil {
 		return reconcile.Result{}, fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
 	}
 	var pods corev1.PodList
@@ -200,6 +211,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// demand while its claimed pod is no longer vacant creates a duplicate:
 	// under a burst of forks the pool booted one extra VM per claim.
 	claimed := map[types.UID]bool{}
+	blipByUID := map[types.UID]*v1.Blip{}
+	for i := range blips.Items {
+		b := &blips.Items[i]
+		blipByUID[b.UID] = b
+	}
 	for i := range pods.Items {
 		if uid := pods.Items[i].Labels[v1.LabelBlipUID]; uid != "" {
 			claimed[types.UID(uid)] = true
@@ -224,7 +240,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			continue
 		}
 		demand++
-		if loc := b.Status.Locality; loc != nil && !loc.Fallback && loc.Node != "" && usable(loc.Node) {
+		// A fallback Blip has not claimed a VM yet. Its data node is still
+		// the right place to boot one once capacity allows: falling back
+		// under transient maxCount pressure is not a reason to start the
+		// replacement away from the data.
+		if loc := b.Status.Locality; loc != nil && loc.Node != "" && usable(loc.Node) {
 			pinned[loc.Node]++
 		}
 	}
@@ -252,6 +272,10 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// runs on, so a warm VM there starts the fork without booting a VM on
 	// the critical path.
 	hot := map[string]int{}
+	// reapPending is set while a terminated claimed pod is waiting for its
+	// Blip to capture the exit status. The pool keeps it out of capacity but
+	// requeues so a controller outage cannot leak the slot forever.
+	reapPending := false
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		node := podNode(p)
@@ -261,7 +285,22 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		unusable := node != "" && !usable(node)
 		switch {
 		case !isVacant(p):
-			if !podTerminated(p) {
+			if podTerminated(p) {
+				// A finished VM is no longer capacity, whether or not the
+				// pod object is still around. Once its Blip captured the
+				// exit status, remove it so the slot can be reused even if
+				// that Blip cannot finish and clean up itself.
+				total--
+				if p.DeletionTimestamp == nil {
+					if terminalCaptured(p, blipByUID[types.UID(p.Labels[v1.LabelBlipUID])], r.now()) {
+						if err := del(p); err != nil {
+							return reconcile.Result{}, err
+						}
+					} else {
+						reapPending = true
+					}
+				}
+			} else {
 				status.Claimed++
 				if p.DeletionTimestamp == nil && p.Spec.NodeName != "" && usable(p.Spec.NodeName) {
 					hot[p.Spec.NodeName]++
@@ -439,7 +478,12 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// A node whose agent dies stops heartbeating and therefore stops
 	// producing events. Wake up when one of the nodes this pool uses is due
 	// to cross heartbeatTimeout so its capacity is retired.
-	return reconcile.Result{RequeueAfter: cl.nextCrossing(slices.Sorted(maps.Keys(used)), heartbeatTimeout, true)}, nil
+	next := cl.nextCrossing(slices.Sorted(maps.Keys(used)), heartbeatTimeout, true)
+	if reapPending && (next == 0 || next > podReapGrace) {
+		// Retry a terminated pod whose exit its Blip has not captured yet.
+		next = podReapGrace
+	}
+	return reconcile.Result{RequeueAfter: next}, nil
 }
 
 // sortForRemoval orders pods to delete or move: booting before ready, newest
@@ -453,8 +497,24 @@ func sortForRemoval(pods []*corev1.Pod) {
 	})
 }
 
+// ready reports whether a warm pod can accept a claim. A warm pod is only
+// usable when every container is ready: the api-proxy native sidecar can
+// crash-loop (for example on an invalid endpoint CA) while the privileged vm
+// container keeps the pod phase Running, and claiming such a pod gives the
+// guest a dead API/endpoint path. The kubelet's Ready condition covers the
+// native sidecar as well as the VM container.
 func ready(p *corev1.Pod) bool {
-	return p.Labels[v1.LabelWarm] == "true" && p.Status.Phase == corev1.PodRunning && p.DeletionTimestamp == nil
+	if p.Labels[v1.LabelWarm] != "true" || p.Status.Phase != corev1.PodRunning || p.DeletionTimestamp != nil {
+		return false
+	}
+	for _, condition := range p.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	// A pod that the kubelet has not yet described keeps the previous
+	// behavior; phase and warm already say it booted.
+	return true
 }
 
 // pickWarmNode picks the node where a warm spare is most useful: a node
@@ -483,6 +543,23 @@ func countsAsDemand(b *v1.Blip, pool string) bool {
 	phase := b.Status.Phase
 	return poolName(b) == pool && (phase == "" || phase == v1.BlipPending) &&
 		b.Status.Pod == "" && b.DeletionTimestamp == nil && !v1.Finished(b)
+}
+
+// podReapGrace lets a terminated claimed pod outlive a controller outage
+// before the pool deletes it even though no Blip recorded the exit.
+const podReapGrace = time.Minute
+
+// terminalCaptured reports whether a terminated claimed pod's result is safely
+// recorded, so the pool may delete it. A finished or deleted Blip no longer
+// needs the pod. Otherwise the pool waits podReapGrace after the pod finished:
+// that gives the Blip reconcile time to copy the exit status and output, while
+// still bounding a controller outage that would otherwise leak the slot.
+func terminalCaptured(p *corev1.Pod, b *v1.Blip, now time.Time) bool {
+	if b == nil || v1.Finished(b) || b.DeletionTimestamp != nil {
+		return true
+	}
+	finished := finishedAt(p)
+	return !finished.IsZero() && now.Sub(finished) > podReapGrace
 }
 
 // expectations drops entries the cache now reflects and returns how many

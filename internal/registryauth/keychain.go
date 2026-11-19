@@ -7,14 +7,34 @@ package registryauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// ErrUnusableSecret marks a missing, mistyped, or malformed image pull
+// secret. An image state's imagePullSecrets are immutable, so retrying the
+// same reference cannot fix it.
+var ErrUnusableSecret = errors.New("unusable image pull secret")
+
+// unusableSecret preserves the keychain error's message while marking it as
+// ErrUnusableSecret for terminal failure classification.
+type unusableSecret struct{ err error }
+
+func (e unusableSecret) Error() string { return e.err.Error() }
+func (e unusableSecret) Unwrap() error { return e.err }
+func (e unusableSecret) Is(target error) bool {
+	return target == ErrUnusableSecret
+}
+
+// UnusableSecret marks err as a structural image pull secret problem.
+func UnusableSecret(err error) error { return unusableSecret{err: err} }
 
 // PullSecret names a Kubernetes secret holding registry credentials.
 type PullSecret struct {
@@ -38,17 +58,23 @@ func Keychain(ctx context.Context, r client.Reader, secrets []PullSecret) (authn
 		seen[ref] = true
 		var secret corev1.Secret
 		if err := r.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &secret); err != nil {
-			return nil, fmt.Errorf("image pull secret %s/%s: %w", ref.Namespace, ref.Name, err)
+			err = fmt.Errorf("image pull secret %s/%s: %w", ref.Namespace, ref.Name, err)
+			if apierrors.IsNotFound(err) {
+				return nil, UnusableSecret(err)
+			}
+			// A timeout, conflict, or unavailable API server can recover;
+			// leave it transient so the controller retries.
+			return nil, err
 		}
 		data, ok := secret.Data[corev1.DockerConfigJsonKey]
 		if !ok {
-			return nil, fmt.Errorf("image pull secret %s/%s: type %s has no %s",
-				ref.Namespace, ref.Name, secret.Type, corev1.DockerConfigJsonKey)
+			return nil, UnusableSecret(fmt.Errorf("image pull secret %s/%s: type %s has no %s",
+				ref.Namespace, ref.Name, secret.Type, corev1.DockerConfigJsonKey))
 		}
 		var cfg dockerConfigJSON
 		if err := json.Unmarshal(data, &cfg); err != nil {
-			return nil, fmt.Errorf("image pull secret %s/%s: invalid %s: %w",
-				ref.Namespace, ref.Name, corev1.DockerConfigJsonKey, err)
+			return nil, UnusableSecret(fmt.Errorf("image pull secret %s/%s: invalid %s: %w",
+				ref.Namespace, ref.Name, corev1.DockerConfigJsonKey, err))
 		}
 		for registry, auth := range cfg.Auths {
 			if host := Host(registry); host != "" {

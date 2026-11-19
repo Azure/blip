@@ -12,6 +12,7 @@ func TestValidateEndpoints(t *testing.T) {
 	tests := []struct {
 		name      string
 		account   string
+		audiences []string
 		endpoints []v1.PoolEndpoint
 		wantErr   string
 	}{
@@ -83,6 +84,12 @@ func TestValidateEndpoints(t *testing.T) {
 		{name: "api server audience URL", account: "vm", endpoints: []v1.PoolEndpoint{
 			{Name: "whoami", URL: "https://whoami.example.com", Audience: "https://kubernetes.default.svc.cluster.local/"},
 		}, wantErr: "must not be a Kubernetes API server audience"},
+		{name: "cluster issuer audience", account: "vm", audiences: []string{"https://oidc.prod-aks.azure.com/tenant/cluster/"}, endpoints: []v1.PoolEndpoint{
+			{Name: "whoami", URL: "https://whoami.example.com", Audience: "https://oidc.prod-aks.azure.com/tenant/cluster/"},
+		}, wantErr: "must not be a Kubernetes API server audience"},
+		{name: "unrelated audience with cluster issuer", account: "vm", audiences: []string{"https://oidc.prod-aks.azure.com/tenant/cluster/"}, endpoints: []v1.PoolEndpoint{
+			{Name: "whoami", URL: "https://whoami.example.com", Audience: "blip-gateway"},
+		}},
 		{name: "bad ca configmap", endpoints: []v1.PoolEndpoint{
 			{Name: "whoami", URL: "https://whoami.example.com", CAConfigMap: "Bad_CA"},
 		}, wantErr: "must be a DNS subdomain"},
@@ -93,7 +100,7 @@ func TestValidateEndpoints(t *testing.T) {
 				ServiceAccountName: tt.account,
 				Endpoints:          tt.endpoints,
 			}}
-			err := validateEndpoints(pool)
+			err := validateEndpoints(pool, tt.audiences...)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("validateEndpoints: %v", err)

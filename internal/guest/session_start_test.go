@@ -1,6 +1,7 @@
 package guest
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/Azure/blip/internal/wire"
 )
@@ -192,25 +195,31 @@ func TestFailedPrimaryCommandDoesNotPanic(t *testing.T) {
 		name string
 		spec procSpec
 		want string
+		code int
 	}{
 		{
 			name: "missing executable",
 			spec: procSpec{argv: []string{"blip-test-no-such-binary"}},
 			want: "command not found",
+			code: 127,
 		},
 		{
 			name: "missing absolute executable",
 			spec: procSpec{argv: []string{"/does/not/exist"}},
+			// chroot may fail first when the test is not root (EPERM, 126).
+			// In a guest this is ENOENT and 127.
 		},
 		{
 			name: "missing working directory",
 			spec: procSpec{argv: []string{"/bin/sh"}, dir: "/no/such/dir"},
 			want: "chdir /no/such/dir: no such file or directory",
+			code: 126,
 		},
 		{
 			name: "unknown user",
 			spec: procSpec{argv: []string{"/bin/sh"}, user: "no-such-user-xyz"},
 			want: `user "no-such-user-xyz" not found in /etc/passwd`,
+			code: 126,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -236,16 +245,16 @@ func TestFailedPrimaryCommandDoesNotPanic(t *testing.T) {
 			if ex == nil {
 				t.Fatal("primary start failure did not report an exit status")
 			}
-			if ex.Code != 127 {
-				t.Fatalf("exit code = %d, want 127", ex.Code)
+			if tc.code != 0 && ex.Code != tc.code {
+				t.Fatalf("exit code = %d, want %d", ex.Code, tc.code)
 			}
 
 			output, status := attachAndRead(t, s)
 			if tc.want != "" && !strings.Contains(output, tc.want) {
 				t.Fatalf("client output = %q, want it to contain %q", output, tc.want)
 			}
-			if status.Code != 127 {
-				t.Fatalf("client exit code = %d, want 127", status.Code)
+			if tc.code != 0 && status.Code != tc.code {
+				t.Fatalf("client exit code = %d, want %d", status.Code, tc.code)
 			}
 
 			// Delivering the exit status must let the guest shut down
@@ -262,6 +271,89 @@ func TestFailedPrimaryCommandDoesNotPanic(t *testing.T) {
 					t.Fatal("guest did not shut down after the failed primary exited")
 				}
 				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
+// A primary command that cannot start keeps the conventional status: a
+// missing command is 127, while a workdir or credential configuration error
+// is 126 and not "command not found".
+func TestStartFailureExitStatus(t *testing.T) {
+	g := testGuest(t)
+	for _, tc := range []struct {
+		name string
+		spec procSpec
+		code int
+	}{
+		{"command not found", procSpec{argv: []string{"blip-test-no-such-binary"}}, 127},
+		{"workdir missing", procSpec{argv: []string{"/bin/sh"}, dir: "/no/such/dir"}, 126},
+		{"unknown user", procSpec{argv: []string{"/bin/sh"}, user: "no-such-user-xyz"}, 126},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := g.startProc(tc.spec, nil)
+			if err == nil {
+				t.Fatal("startProc succeeded")
+			}
+			if got := startExitCode(err); got != tc.code {
+				t.Fatalf("startExitCode(%v) = %d, want %d", err, got, tc.code)
+			}
+		})
+	}
+}
+
+// execve's ENOENT means the command is missing (127); EACCES, EPERM and
+// ENOEXEC mean it exists but cannot run (126).
+func TestClassifyStart(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code int
+	}{
+		{&os.PathError{Op: "fork/exec", Path: "x", Err: unix.ENOENT}, 127},
+		{&os.PathError{Op: "fork/exec", Path: "x", Err: unix.EACCES}, 126},
+		{&os.PathError{Op: "fork/exec", Path: "x", Err: unix.EPERM}, 126},
+		{&os.PathError{Op: "fork/exec", Path: "x", Err: unix.ENOEXEC}, 126},
+	} {
+		if got := classifyStart(tc.err); got != tc.code {
+			t.Errorf("classifyStart(%v) = %d, want %d", tc.err, got, tc.code)
+		}
+	}
+}
+
+// An exec start failure is rejected with the conventional exit status so the
+// CLI can return it instead of a plain exit 1.
+func TestExecStartFailureCarriesExitStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		msg  string
+	}{
+		{"not executable", 126, "start /etc/passwd: permission denied"},
+		{"not found", 127, "nosuchcmd: command not found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := testGuest(t)
+			g.claim = &wire.Claim{ID: "root"}
+			g.startProcess = func(s procSpec, base []string) (*proc, []string, error) {
+				return nil, nil, startFail(tc.code, errors.New(tc.msg))
+			}
+			srv, cli := sessionPair(t)
+			defer cli.Close()
+			c := wire.NewConn(cli)
+			go g.serveSession(srv)
+			if err := c.WriteJSON(wire.TOpen, wire.Open{Mode: wire.OpenExec, Argv: []string{"x"}}); err != nil {
+				t.Fatal(err)
+			}
+			typ, payload, err := c.Read()
+			if err != nil || typ != wire.TOpened {
+				t.Fatalf("read = %d, %v", typ, err)
+			}
+			var o wire.Opened
+			if err := wire.Decode(payload, &o); err != nil {
+				t.Fatal(err)
+			}
+			if o.Code != tc.code || o.Error != tc.msg {
+				t.Fatalf("opened = %+v, want code %d and %q", o, tc.code, tc.msg)
 			}
 		})
 	}

@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -68,8 +69,8 @@ func TestVMOwnersWrittenBeforeClaim(t *testing.T) {
 	if got := e.getPod(b.Status.Pod).Labels[v1.LabelOwner]; got != testOwner {
 		t.Errorf("owned pod owner label = %q", got)
 	}
-	if got := e.getPod(plain.Status.Pod).Labels[v1.LabelOwner]; got != ownerAny {
-		t.Errorf("unrestricted pod owner label = %q", got)
+	if got := e.getPod(plain.Status.Pod).Labels[v1.LabelOwner]; got != "" {
+		t.Errorf("unrestricted pod owner label = %q, want none", got)
 	}
 	if uid := e.getPod(b.Status.Pod).Labels[v1.LabelBlipUID]; uid != string(b.UID) {
 		t.Errorf("owned pod lost its blip UID label: %q", uid)
@@ -165,7 +166,7 @@ func TestVMOwnersRestoredAfterLostClaim(t *testing.T) {
 		t.Fatalf("owner of %s = %q, want %q", stale.Name, got, ownerAny)
 	}
 	// A failed claim must not relabel a pod that another Blip still owns.
-	if got := e.getPod(stale.Name).Labels[v1.LabelOwner]; got != ownerAny {
+	if got := e.getPod(stale.Name).Labels[v1.LabelOwner]; got != "" {
 		t.Fatalf("failed claim changed owner label of %s to %q", stale.Name, got)
 	}
 
@@ -335,5 +336,66 @@ func TestVMOwnersRetainsLivePodAccounts(t *testing.T) {
 				t.Errorf("deleted pod left owner/account entries: %v", got)
 			}
 		})
+	}
+}
+
+func TestPodOwnerLabelTracksBlip(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 1, 0)
+	e.readyState("root", "n1")
+	b := e.startBlip("b", "n1", withRoot("root"))
+	pod := e.getPod(b.Status.Pod)
+	if got := pod.Labels[v1.LabelOwner]; got != "" {
+		t.Fatalf("unrestricted pod owner label = %q", got)
+	}
+
+	setOwner := func(owner string) {
+		t.Helper()
+		b = e.getBlip("b")
+		if owner == "" {
+			delete(b.Labels, v1.LabelOwner)
+		} else {
+			if b.Labels == nil {
+				b.Labels = map[string]string{}
+			}
+			b.Labels[v1.LabelOwner] = owner
+		}
+		e.must(e.c.Update(e.ctx, b))
+		e.run(e.blip, ns, "b")
+		if got := e.getPod(b.Status.Pod).Labels[v1.LabelOwner]; got != owner {
+			t.Fatalf("pod owner label = %q, want %q", got, owner)
+		}
+	}
+
+	// An owner applied after the claim reaches the running pod.
+	setOwner(testOwner)
+	// A changed owner replaces the old one, so the previous owner cannot
+	// list the pod.
+	setOwner("u-other")
+	// Removing the owner makes the Blip unrestricted again.
+	setOwner("")
+}
+
+// Threads are published with their project owner hash so the turn policy can
+// bind a pod-bound producer to its own thread without trusting turn labels.
+func TestVMOwnersThreadOwners(t *testing.T) {
+	e := newEnv(t)
+	e.newPool("default", 0, 0)
+	thread := &v1.BlipThread{
+		ObjectMeta: metav1.ObjectMeta{Name: "proj", Namespace: ns},
+		Spec:       v1.BlipThreadSpec{Pool: "default"},
+	}
+	e.create(thread)
+	e.must(syncVMOwners(e.ctx, e.c, ns))
+	if got, want := e.owners()["thread.proj"], v1.ThreadOwner(ns, "proj"); got != want {
+		t.Fatalf("thread owner key = %q, want %q", got, want)
+	}
+	if err := e.c.Delete(e.ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	e.must(syncVMOwners(e.ctx, e.c, ns))
+	if got, ok := e.owners()["thread.proj"]; ok {
+		t.Fatalf("deleted thread left owner key %q", got)
 	}
 }

@@ -33,11 +33,21 @@ const (
 	// retryAfter paces retries of failures that no watch event resolves
 	// (registry errors).
 	retryAfter = 30 * time.Second
+	// drainSaveFallback bounds how long a save waits for replicas when its
+	// source node is draining but still healthy and holds the sealed commit.
+	// Draining nodes may refuse new placements, so a replica fetch can be
+	// impossible; after this bound the state commits on the source alone and
+	// repair replicates it once a usable node can read it. This keeps a drain
+	// from wedging the Blip and both finalizers forever.
+	drainSaveFallback = 5 * time.Minute
 	// maxSeals is the API limit for BlipState.status.seals.
 	maxSeals = 32
 	// recentSeals is how many seal results are kept even when no Blip
 	// references them.
 	recentSeals = 8
+	// maxCopyChain bounds the copyFrom walk used to detect cycles. A real
+	// chain is far shorter; an unbounded one cannot make progress anyway.
+	maxCopyChain = 32
 )
 
 // StateReconciler drives BlipState versions: initial version, commits,
@@ -361,6 +371,54 @@ func joinMessages(msgs []string) string {
 	return strings.Join(out, "; ")
 }
 
+// copyChainCycle reports a self or cyclic copyFrom chain, or "" when the
+// chain is acyclic. A source with a committed version can serve a copy even
+// if its own provisioning history is cyclic, so the walk stops there.
+func (r *StateReconciler) copyChainCycle(ctx context.Context, st *v1.BlipState) (string, error) {
+	seen := map[string]bool{st.Name: true}
+	path := []string{st.Name}
+	name := st.Spec.CopyFrom
+	for depth := 0; name != ""; depth++ {
+		if depth >= maxCopyChain {
+			return fmt.Sprintf("copy source chain from %q is deeper than %d states", st.Name, maxCopyChain), nil
+		}
+		if seen[name] {
+			path = append(path, name)
+			return "copy source cycle: " + strings.Join(path, " -> "), nil
+		}
+		src := &v1.BlipState{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: name}, src)
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		seen[name] = true
+		path = append(path, name)
+		if src.Status.Committed != nil {
+			return "", nil
+		}
+		name = src.Spec.CopyFrom
+	}
+	return "", nil
+}
+
+// copySourceFailure reports why a copy source that has not committed cannot
+// serve, or "" while the copy should keep waiting for it.
+func copySourceFailure(src *v1.BlipState) string {
+	if src.Status.Phase != v1.StateFailed {
+		return ""
+	}
+	if src.Status.Message != "" {
+		return src.Status.Message
+	}
+	if src.Status.LastError != "" {
+		return src.Status.LastError
+	}
+	return "initialization failed"
+}
+
 // initialize resolves the source and plans the initial version.
 func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *cluster) (msg string, retry bool, err error) {
 	s := &st.Status
@@ -371,13 +429,27 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 		s.Phase = v1.StateFailed
 		return fmt.Sprintf("size %s must be greater than 0", st.Spec.Size.String()), false, nil
 	}
+	if st.Spec.CopyFrom == st.Name {
+		s.Phase = v1.StateFailed
+		s.CopiedFrom = nil
+		s.Pending = nil
+		return fmt.Sprintf("copy source %q is the state itself", st.Name), false, nil
+	}
+	if cycle, err := r.copyChainCycle(ctx, st); err != nil {
+		return "", false, err
+	} else if cycle != "" {
+		s.Phase = v1.StateFailed
+		s.CopiedFrom = nil
+		s.Pending = nil
+		return cycle, false, nil
+	}
 	var minSize int64
 	var prefer []string
 	switch {
 	case st.Spec.Image != "":
 		if s.ImageDigest == "" {
 			d, err := r.Registry.Digest(ctx, st.Spec.Image, st.Namespace, st.Spec.ImagePullSecrets)
-			if errors.Is(err, ErrImageNotFound) || errors.Is(err, ErrInvalidImage) {
+			if terminalImageError(err) {
 				s.Phase = v1.StateFailed
 				return err.Error(), false, nil
 			}
@@ -388,6 +460,10 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 		}
 		if s.ImageConfig == nil {
 			cfg, err := r.Registry.ImageConfig(ctx, s.ImageDigest, st.Namespace, st.Spec.ImagePullSecrets)
+			if terminalImageError(err) {
+				s.Phase = v1.StateFailed
+				return err.Error(), false, nil
+			}
 			if err != nil {
 				return fmt.Sprintf("resolve image config %s: %v", st.Spec.Image, err), true, nil
 			}
@@ -412,8 +488,15 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 				return fmt.Sprintf("copy source %q is not owned by %s or a shared image template", src.Name, owner), false, nil
 			}
 			switch {
-			case src.DeletionTimestamp != nil:
+			case src.DeletionTimestamp != nil && src.Status.Committed == nil:
+				// A source with no committed version can never serve the
+				// copy once it is gone. Fail cleanly without pinning the
+				// source's finalizer on a build that cannot succeed.
+				s.Phase = v1.StateFailed
 				return fmt.Sprintf("copy source %q is being deleted", src.Name), false, nil
+			case src.Status.Committed == nil && src.Status.Phase == v1.StateFailed:
+				s.Phase = v1.StateFailed
+				return fmt.Sprintf("copy source %q failed: %s", src.Name, copySourceFailure(src)), false, nil
 			case src.Status.Committed == nil:
 				return fmt.Sprintf("waiting for copy source %q to commit", src.Name), false, nil
 			case src.Status.Pending != nil:
@@ -525,9 +608,10 @@ func (r *StateReconciler) liveCopyStale(ctx context.Context, st *v1.BlipState, c
 	if w.BlipName == "" {
 		return true, nil
 	}
-	// A live copy needs the writer's pod to freeze. If its Blip finished or
-	// is being deleted, the pod is gone or going; replan from the version the
-	// source saves instead of waiting for a freeze that cannot happen.
+	// A live copy needs the writer's pod to freeze. If its Blip finished,
+	// started saving, or is being deleted, the pod is gone or going; replan
+	// from the version the source saves instead of waiting for a freeze that
+	// cannot happen.
 	srcBlip := &v1.Blip{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: w.BlipName}, srcBlip)
 	if apierrors.IsNotFound(err) {
@@ -536,7 +620,8 @@ func (r *StateReconciler) liveCopyStale(ctx context.Context, st *v1.BlipState, c
 	if err != nil {
 		return false, err
 	}
-	if v1.Finished(srcBlip) || srcBlip.DeletionTimestamp != nil || (w.BlipUID != "" && string(srcBlip.UID) != w.BlipUID) {
+	if v1.Finished(srcBlip) || stopping(srcBlip) || srcBlip.Status.Phase == v1.BlipSaving ||
+		(w.BlipUID != "" && string(srcBlip.UID) != w.BlipUID) {
 		return true, nil
 	}
 	return false, nil
@@ -559,10 +644,27 @@ func replicas(st *v1.BlipState) int {
 func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *cluster) (string, error) {
 	s := &st.Status
 	p := s.Pending
+	if p.Since == nil {
+		now := metav1.NewTime(cl.now)
+		p.Since = &now
+	}
 	if stop, msg, err := r.pendingSource(ctx, st, cl); err != nil {
 		return "", err
 	} else if stop {
 		return msg, nil
+	}
+	if drainSaveExpired(st, cl, p) {
+		// The source sealed the commit and is only draining, but no replica
+		// could fetch it. Commit with the source and any replica that did
+		// fetch: the data is durable on the source and repair can replicate
+		// it once a usable node can read it.
+		kept := slices.DeleteFunc(slices.Clone(p.Replicas), func(n string) bool {
+			return n != p.SourceNode && !cl.holds(st, n, p.CommitID)
+		})
+		if !slices.Contains(kept, p.SourceNode) {
+			kept = append([]string{p.SourceNode}, kept...)
+		}
+		p.Replicas = kept
 	}
 	for i, n := range p.Replicas {
 		if n == p.SourceNode || !cl.bad(n) || cl.holds(st, n, p.CommitID) {
@@ -727,6 +829,18 @@ func (r *StateReconciler) pendingSource(ctx context.Context, st *v1.BlipState, c
 // cannot take new placements. Replica loss must not strand that existing save.
 func servingSource(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
 	return cl.healthyNode(p.SourceNode) && cl.holds(st, p.SourceNode, p.CommitID)
+}
+
+// drainSaveExpired reports whether a save has waited past drainSaveFallback
+// for replicas of a commit that a healthy draining source already holds. Such
+// replicas may be unable to fetch at all (draining nodes are not sources for
+// new placements), so waiting longer only wedges the save.
+func drainSaveExpired(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
+	if p.Generation <= 1 || p.Since == nil || cl.now.Sub(p.Since.Time) < drainSaveFallback {
+		return false
+	}
+	bn := cl.nodes[p.SourceNode]
+	return bn != nil && bn.Spec.Drain && servingSource(st, cl, p)
 }
 
 // usableHolder returns a usable replica that holds the pending commit.
@@ -1050,10 +1164,13 @@ func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState
 		out = append(out, "blip "+b.Name)
 	}
 	var copies v1.BlipStateList
-	if err := r.List(ctx, &copies, client.InNamespace(st.Namespace), client.MatchingFields{indexCopyFrom: st.Name}); err != nil {
+	if err := r.deletionCopiesReader().List(ctx, &copies, client.InNamespace(st.Namespace)); err != nil {
 		return nil, err
 	}
 	for _, c := range copies.Items {
+		if c.Name == st.Name || c.Spec.CopyFrom != st.Name {
+			continue
+		}
 		if copyBlocksDeletion(&c, st) {
 			out = append(out, "copy "+c.Name)
 		}
@@ -1061,15 +1178,32 @@ func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState
 	return out, nil
 }
 
+// deletionCopiesReader is the uncached reader used to confirm that no copy
+// still needs a deleting source. A just-created copy may not be in the cache
+// when the deletion is confirmed.
+func (r *StateReconciler) deletionCopiesReader() client.Reader {
+	if r.Live != nil {
+		return r.Live
+	}
+	return r.Client
+}
+
 // copyBlocksDeletion reports whether a copy still needs the source state's
 // data. A copy can only use the source while it is making progress: one that
 // failed terminally (for example a size smaller than the source) will never
 // commit, and one that is being deleted is no longer built by the controller.
 // Neither may pin the source's finalizer forever.
+//
+// A copy pins its source from creation: status.copiedFrom is only written when
+// the copy is first reconciled, so a copy that has not planned yet must still
+// block deletion. Otherwise deleting the source in that window loses the only
+// snapshot the copy could have taken.
 func copyBlocksDeletion(c, src *v1.BlipState) bool {
-	if c.DeletionTimestamp != nil || c.Status.Phase == v1.StateFailed {
+	if c.DeletionTimestamp != nil || c.Status.Phase == v1.StateFailed || c.Status.Committed != nil {
 		return false
 	}
-	return c.Status.Committed == nil && c.Status.CopiedFrom != nil &&
-		c.Status.CopiedFrom.StateUID == string(src.UID)
+	if cf := c.Status.CopiedFrom; cf != nil {
+		return cf.StateUID == string(src.UID)
+	}
+	return c.Spec.CopyFrom == src.Name
 }

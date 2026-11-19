@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -90,6 +92,173 @@ func TestStateInitialization(t *testing.T) {
 				t.Fatalf("status %+v", st.Status)
 			}
 		})
+	}
+}
+
+// imageConfigNotFound resolves any digest reference but reports its image
+// config as missing, like a syntactically valid digest that the registry does
+// not have.
+type imageConfigNotFound struct{}
+
+func (imageConfigNotFound) Digest(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (string, error) {
+	return ref, nil
+}
+
+func (imageConfigNotFound) ImageConfig(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (*v1.ImageConfig, error) {
+	return nil, fmt.Errorf("image config %s: %w", ref, ErrImageNotFound)
+}
+
+func TestStateMissingDigestFails(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.state.Registry = imageConfigNotFound{}
+	ref := "reg/img@sha256:" + strings.Repeat("1", 64)
+	e.newState("s", func(st *v1.BlipState) {
+		st.Spec.Image, st.Spec.Replicas = ref, 0
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("missing digest not terminal: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "not found") {
+		t.Fatalf("message %q does not explain the missing digest", st.Status.Message)
+	}
+}
+
+func TestStateUnusablePullSecretFails(t *testing.T) {
+	tests := []struct {
+		name   string
+		secret *corev1.Secret
+		ref    string
+		want   string
+	}{
+		{name: "missing", ref: "missing", want: `image pull secret ns/missing`},
+		{
+			name: "wrong type",
+			ref:  "opaque",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "opaque"},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"foo": []byte("bar")},
+			},
+			want: "type Opaque has no .dockerconfigjson",
+		},
+		{
+			name: "bad dockerconfigjson",
+			ref:  "bad",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "bad"},
+				Type:       corev1.SecretTypeDockerConfigJson,
+				Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{`)},
+			},
+			want: "invalid .dockerconfigjson",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.addNodes("n1", "n2")
+			e.state.Registry = RemoteRegistry{Reader: e.c}
+			if tt.secret != nil {
+				e.create(tt.secret)
+			}
+			e.newState("s", func(st *v1.BlipState) {
+				st.Spec.Image = "reg/img:v1"
+				st.Spec.Replicas = 0
+				st.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: tt.ref}}
+			})
+			e.run(e.state, ns, "s")
+			st := e.getState("s")
+			if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+				t.Fatalf("unusable pull secret not terminal: %+v", st.Status)
+			}
+			if !strings.Contains(st.Status.Message, tt.want) {
+				t.Fatalf("message %q does not contain %q", st.Status.Message, tt.want)
+			}
+		})
+	}
+}
+
+func TestStateCopyFromSelfFails(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newState("self", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "self"
+		st.Spec.Replicas = 1
+	})
+	e.run(e.state, ns, "self")
+	st := e.getState("self")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil || st.Status.CopiedFrom != nil {
+		t.Fatalf("self copy not rejected: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "state itself") {
+		t.Fatalf("message %q does not explain the self copy", st.Status.Message)
+	}
+}
+
+func TestStateCopyCycleFails(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newState("a", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "b"
+		st.Spec.Replicas = 1
+	})
+	e.newState("b", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "a"
+		st.Spec.Replicas = 1
+	})
+	for _, name := range []string{"a", "b"} {
+		e.run(e.state, ns, name)
+		st := e.getState(name)
+		if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil || st.Status.CopiedFrom != nil {
+			t.Fatalf("copy cycle at %s not rejected: %+v", name, st.Status)
+		}
+		if !strings.Contains(st.Status.Message, "copy source cycle") {
+			t.Fatalf("message %q does not explain the cycle", st.Status.Message)
+		}
+	}
+}
+
+func TestStateCopyFromFailedSourceFails(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.create(&v1.BlipState{
+		ObjectMeta: metav1.ObjectMeta{Name: "src", Namespace: ns, Generation: 1},
+		Spec:       v1.BlipStateSpec{Replicas: 1},
+		Status: v1.BlipStateStatus{
+			Phase:   v1.StateFailed,
+			Message: "storage: disk broke",
+		},
+	})
+	e.newState("cp", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "src"
+		st.Spec.Replicas = 1
+	})
+	e.run(e.state, ns, "cp")
+	st := e.getState("cp")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("copy of failed source not rejected: %+v", st.Status)
+	}
+	for _, want := range []string{`copy source "src" failed`, "disk broke"} {
+		if !strings.Contains(st.Status.Message, want) {
+			t.Fatalf("message %q does not contain %q", st.Status.Message, want)
+		}
+	}
+}
+
+func TestStateAcyclicCopyWaits(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newState("base", func(st *v1.BlipState) { st.Spec.Replicas = 1 })
+	e.newState("cp", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "base"
+		st.Spec.Replicas = 1
+	})
+	e.run(e.state, ns, "cp")
+	st := e.getState("cp")
+	if st.Status.Phase != v1.StatePending || st.Status.Pending != nil || !strings.Contains(st.Status.Message, `waiting for copy source "base" to commit`) {
+		t.Fatalf("acyclic copy did not wait for its source: %+v", st.Status)
 	}
 }
 
@@ -312,6 +481,84 @@ func TestDrainingSaveSourceCommitsWithLostReplica(t *testing.T) {
 	}
 	if e.safeToRemove("n1") {
 		t.Fatal("the only surviving save replica must remain until repaired")
+	}
+}
+
+// TestDrainingSaveFallsBackAfterBound covers a save whose replicas cannot
+// fetch from the draining source the controller considers serving. Waiting for
+// a node that can never fetch would wedge the save, the Blip, and the state
+// finalizer; after drainSaveFallback the state commits on the source and
+// repair replicates it later.
+func TestDrainingSaveFallsBackAfterBound(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	st := e.readyState("s", "n1", "n2")
+	const saved = "draining-bound-save"
+	since := metav1.NewTime(e.now)
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID: saved, Generation: 2, SourceNode: "n1",
+		AttachmentID: "save", Replicas: []string{"n1", "n2"}, Since: &since,
+	}
+	e.must(e.c.Status().Update(e.ctx, st))
+	e.hold("s", saved, "n1")
+	e.setDrain("n1")
+
+	e.run(e.state, ns, "s")
+	if st = e.getState("s"); st.Status.Pending == nil || st.Status.Committed.ID == saved {
+		t.Fatalf("save committed before the fallback bound: %+v", st.Status)
+	}
+
+	e.now = e.now.Add(drainSaveFallback + time.Second)
+	e.heartbeat()
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if st.Status.Pending != nil || st.Status.Committed == nil || st.Status.Committed.ID != saved {
+		t.Fatalf("draining save did not fall back after %s: %+v", drainSaveFallback, st.Status)
+	}
+	if !slices.Equal(st.Status.Placements, []string{"n1"}) {
+		t.Fatalf("fallback placements %v, want the source that holds the commit", st.Status.Placements)
+	}
+}
+
+// TestDrainingSaveFallbackClearsFinalizer checks the end-to-end unblock: once
+// the fallback commit resolves the attachment, deleting the Blip removes its
+// finalizer instead of waiting forever on the stuck save.
+func TestDrainingSaveFallbackClearsFinalizer(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	st := e.readyState("s", "n1", "n2")
+	const saved = "draining-finalizer-save"
+	since := metav1.NewTime(e.now.Add(-drainSaveFallback - time.Second))
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID: saved, Generation: 2, SourceNode: "n1",
+		AttachmentID: "save", Replicas: []string{"n1", "n2"}, Since: &since,
+	}
+	st.Status.Seals = []v1.SealResult{{AttachmentID: "save", CommitID: saved}}
+	e.must(e.c.Status().Update(e.ctx, st))
+	e.hold("s", saved, "n1")
+	e.setDrain("n1")
+
+	code := int32(0)
+	e.newBlip("b", withRoot("s"))
+	b := e.getBlip("b")
+	b.Finalizers = []string{v1.Finalizer}
+	b.Status.Phase = v1.BlipSaving
+	b.Status.RootAttachmentID = "save"
+	b.Status.ExitCode = &code
+	e.must(e.c.Update(e.ctx, b))
+	e.must(e.c.Status().Update(e.ctx, b))
+	e.must(e.c.Delete(e.ctx, b))
+
+	e.run(e.state, ns, "s")
+	if st = e.getState("s"); st.Status.Pending != nil || st.Status.Committed.ID != saved {
+		t.Fatalf("state did not resolve the save: %+v", st.Status)
+	}
+	e.run(e.blip, ns, "b")
+	b = &v1.Blip{}
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "b"}, b); err == nil {
+		if len(b.Finalizers) != 0 {
+			t.Fatalf("stuck save kept the Blip finalizer: %v", b.Finalizers)
+		}
 	}
 }
 

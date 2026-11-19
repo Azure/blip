@@ -1,17 +1,56 @@
 package guest
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Azure/blip/internal/podapi"
 )
+
+// startError is a failure before the command ran, carrying the conventional
+// shell status: 127 when the command was not found and 126 when it exists but
+// cannot be executed (EACCES, ENOEXEC, a bad workdir, or another start-time
+// configuration failure). Without it every primary start failure reported 127,
+// and exec reported a plain error indistinguishable from a command exiting 1.
+type startError struct {
+	code int
+	err  error
+}
+
+func (e *startError) Error() string { return e.err.Error() }
+func (e *startError) Unwrap() error { return e.err }
+
+func startFail(code int, err error) error { return &startError{code: code, err: err} }
+
+// startExitCode returns the conventional status for a command that could not
+// start. A failure that is not attributable to command lookup prevents
+// execution, which is 126.
+func startExitCode(err error) int {
+	var se *startError
+	if errors.As(err, &se) {
+		return se.code
+	}
+	return 126
+}
+
+// classifyStart maps an error from os.StartProcess to 127 only when the
+// command does not exist; execution errors are 126.
+func classifyStart(err error) int {
+	if errors.Is(err, unix.ENOENT) {
+		return 127
+	}
+	return 126
+}
 
 // reaper reaps every child (as PID 1 it also inherits orphans) and delivers
 // exit statuses to registered waiters. Processes are only started through
@@ -80,6 +119,33 @@ type procSpec struct {
 	tty  bool
 	rows uint16
 	cols uint16
+	// stdinEOF gives a non-TTY process an immediately closed stdin instead
+	// of a pipe that stays open for its whole lifetime. The primary command
+	// has no client that could feed it or send EOF, so without this `cat`
+	// waits forever. Exec sessions keep the pipe: their client uploads stdin
+	// and forwards its own end of input.
+	stdinEOF bool
+}
+
+// procStdin returns the child's stdin and the parent-side writer. For a
+// non-interactive primary command both are /dev/null, so reads see EOF and
+// stdin a client sends is discarded instead of blocking. Otherwise the child
+// reads from a pipe whose write end the session owns.
+func procStdin(stdinEOF bool) (child, parent *os.File, err error) {
+	if stdinEOF {
+		child, err = os.Open(os.DevNull)
+		if err != nil {
+			return nil, nil, err
+		}
+		parent, err = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err != nil {
+			child.Close()
+			return nil, nil, err
+		}
+		return child, parent, nil
+	}
+	child, parent, err = os.Pipe()
+	return child, parent, err
 }
 
 // proc is a running workload process and the host side of its stdio.
@@ -95,16 +161,86 @@ type proc struct {
 // workdirInRoot returns dir as an absolute path inside the workload root.
 // os.StartProcess resolves ProcAttr.Dir relative to the guest init's cwd,
 // which is outside the root after chroot, so a relative workdir has to be
-// anchored at the root first. path.Clean clamps ".." at "/", so a workdir can
-// never escape the root.
+// anchored at the root first. The path is deliberately not cleaned: chdir(2)
+// follows symlinks before resolving "..", so cleaning "/tmp/link/../other"
+// lexically would enter a different directory than the caller asked for. ".."
+// still cannot escape the root because the process's root is the chroot.
 func workdirInRoot(dir string) string {
 	if dir == "" {
 		return "/"
 	}
 	if !path.IsAbs(dir) {
-		dir = "/" + dir
+		return "/" + dir
 	}
-	return path.Clean(dir)
+	return dir
+}
+
+// checkDirAccess verifies that the target account can search every component
+// of dir inside root. Without this, os.StartProcess fails in the child with
+// "fork/exec <program>: permission denied", which makes an inaccessible
+// working directory look like a missing or unexecutable program. The
+// components come from the resolved path, not the spelling: a symlink can
+// point through a directory the account cannot search even when the target
+// itself is accessible.
+func checkDirAccess(root, dir string, acct *account) error {
+	if acct.uid == 0 {
+		return nil
+	}
+	resolved, err := resolveInRoot(root, dir)
+	if err != nil {
+		return fmt.Errorf("chdir %s: %w", dir, err)
+	}
+	p := "/"
+	for _, part := range strings.Split(strings.TrimPrefix(resolved, "/"), "/") {
+		if part == "" {
+			continue
+		}
+		p = path.Join(p, part)
+		fi, err := statInRoot(root, p)
+		if err != nil {
+			return fmt.Errorf("chdir %s: %w", dir, err)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR)
+		}
+		if !canSearchDir(fi, acct) {
+			return fmt.Errorf("chdir %s: %w for uid %d", dir, unix.EACCES, acct.uid)
+		}
+	}
+	return nil
+}
+
+// canSearchDir reports whether acct has execute (search) permission on the
+// directory, matching the kernel's owner/group/other rule.
+func canSearchDir(fi os.FileInfo, acct *account) bool {
+	return canAccess(fi, acct, 0o100, 0o010, 0o001)
+}
+
+// canExecFile reports whether acct may execute the file. Root still needs at
+// least one execute bit set, like the kernel.
+func canExecFile(fi os.FileInfo, acct *account) bool {
+	if acct.uid == 0 {
+		return fi.Mode().Perm()&0o111 != 0
+	}
+	return canAccess(fi, acct, 0o100, 0o010, 0o001)
+}
+
+// canAccess applies the owner/group/other rule with the given permission bits.
+func canAccess(fi os.FileInfo, acct *account, owner, group, other os.FileMode) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		// Without ownership information, leave the decision to the kernel.
+		return true
+	}
+	mode := fi.Mode().Perm()
+	switch {
+	case acct.uid == st.Uid:
+		return mode&owner != 0
+	case slices.Contains(acct.groups, st.Gid):
+		return mode&group != 0
+	default:
+		return mode&other != 0
+	}
 }
 
 // startProc starts a process chrooted in the root filesystem, as the
@@ -112,7 +248,7 @@ func workdirInRoot(dir string) string {
 func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	acct, err := lookupAccount(g.root, s.user)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, startFail(126, err)
 	}
 	argv := s.argv
 	argv0 := ""
@@ -121,11 +257,9 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 		argv0 = acct.shell
 	}
 	env := g.procEnv(acct, s, base)
-	if argv0 == "" {
-		if argv0, err = lookPath(g.root, argv[0], env); err != nil {
-			return nil, nil, err
-		}
-	}
+	// Validation and start failures below are not "command not found": the
+	// command may be fine but the workdir, credentials, or process setup is
+	// wrong, so they use the conventional 126 instead of the old 127.
 	dir := s.dir
 	if dir == "" {
 		dir = "/"
@@ -143,9 +277,19 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	// the executable were missing. Stat it inside the root, like the chdir
 	// will happen after chroot.
 	if fi, err := statInRoot(g.root, dir); err != nil {
-		return nil, nil, fmt.Errorf("chdir %s: %w", dir, err)
+		return nil, nil, startFail(126, fmt.Errorf("chdir %s: %w", dir, err))
 	} else if !fi.IsDir() {
-		return nil, nil, fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR)
+		return nil, nil, startFail(126, fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR))
+	}
+	if err := checkDirAccess(g.root, dir, acct); err != nil {
+		return nil, nil, startFail(126, err)
+	}
+	// Resolve a bare command after the workdir is known: a relative PATH
+	// entry is relative to the command's working directory, as in execvp.
+	if argv0 == "" {
+		if argv0, err = lookPath(g.root, dir, argv[0], env, acct); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	p := &proc{}
@@ -162,7 +306,7 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	if s.tty {
 		master, slave, err := openPTY()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, startFail(126, err)
 		}
 		_ = slave.Chown(int(acct.uid), int(acct.gid))
 		rows, cols := s.rows, s.cols
@@ -175,9 +319,9 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 		attr.Setctty = true
 		attr.Ctty = 0
 	} else {
-		inR, inW, err := os.Pipe()
+		inR, inW, err := procStdin(s.stdinEOF)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, startFail(126, err)
 		}
 		outR, outW, _ := os.Pipe()
 		errR, errW, _ := os.Pipe()
@@ -190,7 +334,7 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	}
 	if err != nil {
 		p.close()
-		return nil, nil, fmt.Errorf("start %s: %w", argv[0], err)
+		return nil, nil, startFail(classifyStart(err), fmt.Errorf("start %s: %w", argv[0], err))
 	}
 	p.pid, p.wait = pid, wait
 	return p, argv, nil
@@ -219,11 +363,49 @@ func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
 		noProxy = append(noProxy, "kube-apiserver")
 	}
 	noProxy = append(noProxy, g.endpoints...)
-	base = append([]string{
-		"NO_PROXY=" + strings.Join(noProxy, ","),
-		"no_proxy=" + strings.Join(noProxy, ","),
-	}, base...)
-	return mergeEnv(env, base, s.env)
+	// Reserved variables are applied after every caller-supplied list, so an
+	// exec caller's -e (s.env) cannot redirect a guest-owned service or drop
+	// the guest-local proxy bypass.
+	return mergeEnv(env, base, s.env, reservedEnv(), proxyEnv(noProxy, base, s.env))
+}
+
+// proxyEnv merges the guest-local names with a workload's NO_PROXY/no_proxy
+// and returns both spellings applied after every caller-supplied list, so a
+// workload proxy setting can add bypasses but can never proxy blip or
+// kube-apiserver. Go reads NO_PROXY while other tools merge both spellings;
+// keeping them identical avoids the two disagreeing inside one shell.
+func proxyEnv(reserved []string, lists ...[]string) []string {
+	var names []string
+	seen := map[string]bool{}
+	add := func(value string) {
+		for _, name := range strings.Split(value, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	for _, name := range reserved {
+		add(name)
+	}
+	for _, list := range lists {
+		for _, kv := range list {
+			if key, value, ok := strings.Cut(kv, "="); ok && (key == "NO_PROXY" || key == "no_proxy") {
+				add(value)
+			}
+		}
+	}
+	merged := strings.Join(names, ",")
+	return []string{"NO_PROXY=" + merged, "no_proxy=" + merged}
+}
+
+// reservedEnv is the environment the guest owns. Callers, including exec -e,
+// may not override it: BLIP_REPORT_URL must always point at the guest's
+// loopback report endpoint.
+func reservedEnv() []string {
+	return []string{podapi.ReportEnv + "=" + podapi.ReportURL}
 }
 
 func (p *proc) close() {

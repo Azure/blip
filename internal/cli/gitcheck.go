@@ -145,6 +145,17 @@ func checkParentInsideMount(mountPath, src, display, stateName string) error {
 	return nil
 }
 
+// warnGitWorktree tells the user that git collection is commit-only when the
+// source worktree has changes that would otherwise disappear with the blip.
+func warnGitWorktree(ctx context.Context, repo, display, branch string, errOut io.Writer) {
+	out, err := exec.CommandContext(ctx, "git", "-C", repo,
+		"-c", "safe.directory=*", "status", "--porcelain", "--untracked-files=normal").Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return
+	}
+	fmt.Fprintf(errOut, "warning: %s has uncommitted or untracked changes; git collection fetches only commits from branch %s, so those changes are not collected\n", display, branch)
+}
+
 // fetchBranch fetches branch from repo into the repository at cwd under the
 // same local name.
 func fetchBranch(ctx context.Context, in io.Reader, out, errOut io.Writer, cwd, repo, branch string) error {
@@ -161,9 +172,11 @@ func fetchBranch(ctx context.Context, in io.Reader, out, errOut io.Writer, cwd, 
 	if err := cmd.Run(); err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
-			return &ExitError{Code: exit.ExitCode()}
+			// Report this as a collect error, not as the process exit code.
+			// gather must keep exit status 1 and print every blip's error.
+			return fmt.Errorf("git fetch %s %s: exit status %d", repo, branch, exit.ExitCode())
 		}
-		return fmt.Errorf("git fetch: %w", err)
+		return fmt.Errorf("git fetch %s %s: %w", repo, branch, err)
 	}
 	return nil
 }

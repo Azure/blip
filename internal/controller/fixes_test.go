@@ -1,14 +1,18 @@
 package controller
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/podapi"
@@ -526,5 +530,194 @@ func TestPendingCommitLostWhenSourceDeleted(t *testing.T) {
 		return sr.AttachmentID == "6666666666666666" && sr.Error != ""
 	}) {
 		t.Fatalf("lost save has no failure seal: %+v", st.Status.Seals)
+	}
+}
+
+// TestFinishedBlipClearsSavingMountPhase covers a finished Blip leaving its
+// writable mounts marked Saving after their saves committed.
+func TestFinishedBlipClearsSavingMountPhase(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.readyState("data", "n1")
+	b := e.startBlip("job", "n1", withRoot("home"), e.withMount("data", "/data", true))
+
+	e.updateBlip("job", func(b *v1.Blip) { b.Spec.Stop = true })
+	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSaving, ReasonStopped)
+	if m := mountOf(b, "data"); m == nil || m.Phase != v1.MountSaving {
+		t.Fatalf("mount not saving after fencing: %+v", m)
+	}
+
+	e.saveWriter("home", newID())
+	e.saveWriter("data", newID())
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSucceeded, ReasonStopped)
+	if m := mountOf(b, "data"); m == nil || m.Phase != v1.MountMounted || m.Message != "" || m.Switching {
+		t.Fatalf("finished Blip left mount in saving state: %+v", m)
+	}
+}
+
+// TestFinishedBlipDropsRemovedWritableMount covers a mount removed while the
+// Blip is stopping: its save resolves, but the finished Blip must not keep
+// reporting the removed mount as Mounted with an attachment that was sealed.
+func TestFinishedBlipDropsRemovedWritableMount(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.readyState("data", "n1")
+	b := e.startBlip("job", "n1", withRoot("home"), e.withMount("data", "/data", true))
+
+	e.updateBlip("job", func(b *v1.Blip) { b.Spec.Stop = true })
+	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSaving, ReasonStopped)
+	if m := mountOf(b, "data"); m == nil || m.Phase != v1.MountSaving {
+		t.Fatalf("mount not saving after fencing: %+v", m)
+	}
+
+	// The removal lands while the writable mount is still saving.
+	e.updateRoot("job", func(root *v1.BlipState) { root.Spec.Mounts = nil })
+	e.saveWriter("home", newID())
+	e.saveWriter("data", newID())
+	e.run(e.blip, ns, "job")
+
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSucceeded, ReasonStopped)
+	if m := mountOf(b, "data"); m != nil {
+		t.Fatalf("finished Blip keeps a removed mount: %+v", m)
+	}
+}
+
+// TestFinishedBlipRetainsCommandOutput covers gather -f for a command that
+// ended before the client attached: the tail of the guest-mirrored output is
+// saved in status before the pod is deleted.
+func TestFinishedBlipRetainsCommandOutput(t *testing.T) {
+	e := newEnv(t)
+	e.blip.Config.PodLogs = func(context.Context, string, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("boot noise\nblip: FASTOUT\nblip: LASTLINE\nmore noise\n")), nil
+	}
+	b := &v1.Blip{
+		ObjectMeta: metav1.ObjectMeta{Name: "b", UID: types.UID("uid-b")},
+		Status: v1.BlipStatus{
+			Phase: v1.BlipSucceeded, Pod: "pod-b", PodUID: "uid-p",
+		},
+	}
+	e.create(b)
+	e.create(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-b", UID: types.UID("uid-p")}})
+	b = e.getBlip("b")
+	e.must(e.blip.cleanup(e.ctx, b))
+
+	got := e.getBlip("b")
+	if got.Status.Output != "FASTOUT\nLASTLINE\n" {
+		t.Fatalf("output %q", got.Status.Output)
+	}
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "pod-b"}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("pod not deleted: %v", err)
+	}
+}
+
+// Output beyond the retained bound keeps exactly the newest lines and says
+// that earlier output was truncated. The marker is reserved inside the bound.
+func TestPodOutputKeepsTailWithTruncationMarker(t *testing.T) {
+	e := newEnv(t)
+	const count = 65
+	line := func(i int) string {
+		return fmt.Sprintf("%04d:%s", i, strings.Repeat(string(rune('a'+i%26)), 1018))
+	}
+	var b strings.Builder
+	for i := range count {
+		b.WriteString("blip: " + line(i))
+		b.WriteByte('\n')
+	}
+	e.blip.Config.PodLogs = func(context.Context, string, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(b.String())), nil
+	}
+
+	out, ok := e.blip.podOutput(e.ctx, ns, "pod")
+	if !ok {
+		t.Fatal("podOutput reported no output")
+	}
+	if !strings.HasPrefix(out, outputTruncated) {
+		t.Fatalf("output does not start with the truncation marker: %q", out[:min(len(out), 80)])
+	}
+	if len(out) > maxRetainedOutput {
+		t.Fatalf("output is %d bytes, want at most %d", len(out), maxRetainedOutput)
+	}
+	if !strings.HasSuffix(out, line(count-1)+"\n") {
+		t.Fatalf("output does not end with the final line: %q", out[max(0, len(out)-80):])
+	}
+	body := strings.Split(strings.TrimSuffix(strings.TrimPrefix(out, outputTruncated), "\n"), "\n")
+	if len(body) != count-2 {
+		t.Fatalf("kept %d lines, want %d", len(body), count-2)
+	}
+	if body[0] != line(2) {
+		t.Fatalf("tail starts at %q, want %q", body[0][:5], line(2)[:5])
+	}
+	for i, got := range body {
+		if want := line(i + 2); got != want {
+			t.Fatalf("line %d does not match the command's tail", i+2)
+		}
+	}
+}
+
+// A single line larger than the retained bound still keeps its newest bytes
+// (and the truncation marker) instead of being dropped altogether.
+func TestPodOutputKeepsTailOfOverlongLine(t *testing.T) {
+	e := newEnv(t)
+	body := strings.Repeat("x", 3*maxRetainedOutput)
+	e.blip.Config.PodLogs = func(context.Context, string, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("blip: " + body + "\n")), nil
+	}
+
+	out, ok := e.blip.podOutput(e.ctx, ns, "pod")
+	if !ok || out == "" {
+		t.Fatal("podOutput dropped the only line")
+	}
+	if !strings.HasPrefix(out, outputTruncated) || len(out) > maxRetainedOutput {
+		t.Fatalf("output is %d bytes with marker %t, want at most %d", len(out), strings.HasPrefix(out, outputTruncated), maxRetainedOutput)
+	}
+	if len(out) <= len(outputTruncated) {
+		t.Fatalf("output kept no bytes of the overlong line: %q", out)
+	}
+	if rest := strings.Trim(out[len(outputTruncated):], "x\n"); rest != "" {
+		t.Fatalf("overlong line kept unexpected bytes: %q", rest)
+	}
+}
+
+// Output that fits is returned whole without a truncation marker.
+func TestPodOutputDoesNotMarkOutputThatFits(t *testing.T) {
+	e := newEnv(t)
+	const count = 64 // exactly maxRetainedOutput bytes of 1024-byte lines
+	line := func(i int) string {
+		return fmt.Sprintf("%04d:%s", i, strings.Repeat(string(rune('a'+i%26)), 1018))
+	}
+	var b strings.Builder
+	for i := range count {
+		b.WriteString("blip: " + line(i))
+		b.WriteByte('\n')
+	}
+	e.blip.Config.PodLogs = func(context.Context, string, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(b.String())), nil
+	}
+
+	out, ok := e.blip.podOutput(e.ctx, ns, "pod")
+	if !ok {
+		t.Fatal("podOutput reported no output")
+	}
+	if strings.Contains(out, outputTruncated) {
+		t.Fatalf("output that fits was marked truncated: %q", out[:min(len(out), 80)])
+	}
+	if len(out) != maxRetainedOutput {
+		t.Fatalf("output is %d bytes, want %d", len(out), maxRetainedOutput)
+	}
+	if !strings.HasPrefix(out, line(0)+"\n") || !strings.HasSuffix(out, line(count-1)+"\n") {
+		t.Fatalf("output lost lines that fit: %q", out[:min(len(out), 80)])
 	}
 }

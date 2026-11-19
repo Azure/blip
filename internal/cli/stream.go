@@ -2,9 +2,7 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -72,7 +70,12 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 		}
 		go a.forwardResize(ctx, s)
 	}
-	if !tty && a.env.Terminal {
+	// Forward termination signals in every mode, including a TTY session. A
+	// TTY client makes the terminal raw, so its process no longer dies from
+	// SIGTERM/SIGHUP by default and would leave both the remote command and
+	// the local terminal behind. Interactive Ctrl-C still arrives as a stdin
+	// byte in raw mode and is delivered by the guest's terminal.
+	if tty || a.env.Terminal {
 		go forwardSignals(ctx, s)
 	}
 
@@ -86,7 +89,10 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 				}
 			}
 			if err != nil {
-				if opts.sendEOF && errors.Is(err, io.EOF) {
+				// No more input can arrive, whatever ended the read (EOF,
+				// EBADF, EIO). Leaving stdin open would let a command that
+				// waits for input hang forever.
+				if opts.sendEOF {
 					s.CloseStdin()
 				}
 				return
@@ -96,7 +102,13 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 
 	exit, err := s.Copy(a.env.Out, a.env.Err, func(m string) { a.progress("blip: %s", m) })
 	if err != nil {
-		return fmt.Errorf("session %s: %w", s.Opened.Session, err)
+		if !a.stopped(ctx, opts.blip) {
+			return fmt.Errorf("session %s: %w", s.Opened.Session, err)
+		}
+		// The VM stopped before the guest could deliver TExited (for example
+		// while the session was backpressured). Report the same result as a
+		// stop that did deliver it.
+		exit = &wire.Exit{Code: 128 + int(unix.SIGTERM), Signal: "TERM", Reason: wire.ReasonStopped}
 	}
 	if exit.Reason == wire.ReasonStopped {
 		a.progress("\rblip %s stopped\r", opts.blip)

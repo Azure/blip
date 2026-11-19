@@ -93,8 +93,9 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 			if err := checkGitSource(ctx, mounts[op.state], src, op.source, a.short(op.state)); err != nil {
 				return err
 			}
+			warnGitWorktree(ctx, src, op.source, op.branch, a.env.Err)
 			if err := fetchBranch(ctx, a.env.In, a.env.Out, a.env.Err, cwd, src, op.branch); err != nil {
-				return err
+				return fmt.Errorf("collect %s: %w", op.source, err)
 			}
 			continue
 		}
@@ -131,8 +132,9 @@ func parseCollectOps(raw []string, cwd string) ([]collectOp, error) {
 	return ops, nil
 }
 
-// parseCollectOp splits SRC:DEST or git:SRC:BRANCH. A relative SRC is
-// relative to cwd in both the caller and the source blip.
+// parseCollectOp splits SRC:DEST at the last colon, or git:SRC:BRANCH for a
+// git operation. A relative SRC is relative to cwd in both the caller and the
+// source blip.
 func parseCollectOp(s, cwd string) (collectOp, error) {
 	if strings.HasPrefix(s, "git:") {
 		rest := strings.TrimPrefix(s, "git:")
@@ -150,9 +152,16 @@ func parseCollectOp(s, cwd string) (collectOp, error) {
 		}
 		return collectOp{source: src, branch: branch, git: true}, nil
 	}
-	src, dest, ok := strings.Cut(s, ":")
-	if !ok || src == "" || dest == "" {
+	// Split from the right so a source with a colon is not silently read as
+	// SRC:DEST at the first colon. A colon left in SRC is still ambiguous:
+	// either side could own it, so reject instead of copying the wrong paths.
+	i := strings.LastIndexByte(s, ':')
+	if i <= 0 || i == len(s)-1 {
 		return collectOp{}, fmt.Errorf("invalid operation %q: want SRC:DEST or git:SRC:BRANCH", s)
+	}
+	src, dest := s[:i], s[i+1:]
+	if strings.Contains(src, ":") {
+		return collectOp{}, fmt.Errorf("invalid operation %q: ambiguous source %q contains ':' (the last ':' separates SRC from DEST)", s, src)
 	}
 	src, err := collectSource(src, cwd)
 	if err != nil {

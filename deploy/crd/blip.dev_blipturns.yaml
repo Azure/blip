@@ -68,8 +68,7 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: attribute keys are at most 63 and values at most 256 characters
-                  rule: self.all(k, k.size() <= 63) && self.all(k, v, v.size() <=
-                    256)
+                  rule: self.all(k, k.size() <= 63 && self[k].size() <= 256)
               author:
                 description: TurnAuthor identifies who produced a turn.
                 properties:
@@ -125,10 +124,13 @@ spec:
                 maxLength: 2048
                 type: string
               thread:
-                description: Thread is the name of the BlipThread this turn belongs
-                  to.
+                description: |-
+                  Thread is the name of a BlipThread in the same namespace. It must be a
+                  valid thread (DNS subdomain) name so a typo cannot create a turn that
+                  no thread can ever claim.
                 maxLength: 253
                 minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                 type: string
               topic:
                 description: |-
@@ -157,11 +159,30 @@ spec:
                 description: AcceptedTime is when blipchat sequenced the turn.
                 format: date-time
                 type: string
+              orphanedAt:
+                description: |-
+                  OrphanedAt is when blipchat stopped retrying a turn whose thread does
+                  not exist. Such a turn is never sequenced, and retention deletes it
+                  after the default turn age. The sequencer clears it if the thread
+                  appears later.
+                format: date-time
+                type: string
               seq:
                 description: Seq is the turn's position in the thread's single global
                   order.
                 format: int64
+                minimum: 0
                 type: integer
+                x-kubernetes-validations:
+                - message: seq is immutable once set
+                  optionalOldSelf: true
+                  rule: '!oldSelf.hasValue() || self == oldSelf.value()'
+              threadUID:
+                description: |-
+                  ThreadUID is the UID of the BlipThread incarnation that sequenced the
+                  turn. A deleted and recreated thread has a new UID, so turns sequenced
+                  by the old incarnation are ignored rather than adopted as history.
+                type: string
             type: object
         type: object
         x-kubernetes-validations:

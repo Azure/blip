@@ -33,6 +33,8 @@ type harness struct {
 	// connect overrides the fake guest connector when set, so tests can
 	// inject transport failures.
 	connect session.Connector
+	// logs overrides the VM serial-console reader.
+	logs func(context.Context, string) (io.ReadCloser, error)
 	// self is the blip the CLI runs in, if any.
 	self string
 }
@@ -96,11 +98,15 @@ func (h *harness) env(in io.Reader, out, errOut io.Writer) *Env {
 		connect = h.connect
 	}
 	env := &Env{In: in, Out: out, Err: errOut, Connect: func(KubeFlags) (*Clients, error) {
-		return &Clients{Kube: h.kube, Sessions: &session.Client{Connect: connect}, Namespace: ns}, nil
+		return &Clients{Kube: h.kube, Sessions: &session.Client{Connect: connect}, Namespace: ns, Logs: h.logs}, nil
 	}}
 	if h.self != "" {
 		env.NamespaceFile = filepath.Join(h.t.TempDir(), "namespace")
 		if err := os.WriteFile(env.NamespaceFile, []byte(ns), 0o644); err != nil {
+			h.t.Fatal(err)
+		}
+		env.NameFile = filepath.Join(h.t.TempDir(), "name")
+		if err := os.WriteFile(env.NameFile, []byte(h.self), 0o644); err != nil {
 			h.t.Fatal(err)
 		}
 		env.Hostname = func() (string, error) { return h.self, nil }
@@ -168,9 +174,12 @@ type fakeController struct {
 	paused           bool
 	stateFail        string
 	stateFailPending bool
-	mountFail        string
-	unmountFail      string
-	exited           map[string]int32
+	// stateFailStuck leaves a failed initial version pending, modelling an
+	// immutable failure such as an image larger than the requested size.
+	stateFailStuck bool
+	mountFail      string
+	unmountFail    string
+	exited         map[string]int32
 }
 
 func (c *fakeController) set(f func(c *fakeController)) {
@@ -208,7 +217,7 @@ func (c *fakeController) tick(ctx context.Context) {
 				s.Status.Committed = &v1alpha1.Commit{ID: "0123456789abcdef", Generation: 1}
 			}
 			c.kube.Status().Update(ctx, s)
-		case s.Status.Phase == v1alpha1.StateFailed && s.Status.Pending != nil:
+		case s.Status.Phase == v1alpha1.StateFailed && s.Status.Pending != nil && !c.stateFailStuck:
 			s.Status.Phase = v1alpha1.StateReady
 			s.Status.Pending = nil
 			s.Status.Committed = &v1alpha1.Commit{ID: "0123456789abcdef", Generation: 1}

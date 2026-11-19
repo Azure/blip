@@ -45,6 +45,10 @@ type identity struct {
 	namespace string
 	// owner is the Blip's owner label, or adminOwner for an unlabelled Blip.
 	owner string
+	// thread is the Blip's thread, but only when the thread owner hash
+	// matches owner. A caller cannot widen its scope by labelling its Blip
+	// with another project's thread name.
+	thread string
 	// claimed is false until the controller has claimed this pod for a Blip.
 	claimed bool
 }
@@ -53,7 +57,7 @@ type identity struct {
 // covers.
 type scopeRequest struct {
 	namespace   string
-	resource    string // pods, blips or blipstates
+	resource    string // pods, blips, blipstates, blipthreads or blipturns
 	name        string // empty for a list or watch
 	subresource string
 	list        bool
@@ -79,10 +83,12 @@ const (
 //     isolation would depend on upgrading the API server (Kubernetes has
 //     always supported it).
 //   - Objects created before owner labels existed are handled explicitly. An
-//     unlabelled BlipState is a shared base and stays readable by name. An
-//     unlabelled Blip is administrator-owned and private. Scoped lists select
-//     the caller's owner label, so shared bases do not appear in a restricted
-//     owner's list or watch even though a GET by name works.
+//     unlabelled BlipState with spec.image set is a shared read-only base and
+//     stays readable by name; an unlabelled writable or copied state is
+//     private, matching the mount and copy policy. An unlabelled Blip is
+//     administrator-owned and private. Scoped lists select the caller's owner
+//     label, so shared bases do not appear in a restricted owner's list or
+//     watch even though a GET by name works.
 //   - VM pods created from a template older than this scope have no
 //     POD_NAME/POD_NAMESPACE and keep the previous unscoped behavior until
 //     their pool recreates them.
@@ -160,7 +166,12 @@ func (s *ownerScope) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.list {
-		s.next.ServeHTTP(w, withOwnerSelector(r, id.owner))
+		next, ok := scopedList(r, id, req.resource)
+		if !ok {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		s.next.ServeHTTP(w, next)
 		return
 	}
 	allowed, status, err := s.allowed(r.Context(), id, req)
@@ -217,7 +228,15 @@ func (s *ownerScope) identity(ctx context.Context) (identity, error) {
 	if owner == "" {
 		owner = adminOwner
 	}
-	return identity{namespace: s.namespace, owner: owner, claimed: true}, nil
+	// Threads and their turns carry the most sensitive text in the system.
+	// The Blip's thread label is self-asserted (a guest may patch its own
+	// Blip), so only trust it when the thread's derived owner equals the
+	// Blip's owner. Otherwise the caller has no thread scope at all.
+	thread := blip.Metadata.Labels[v1.LabelThread]
+	if thread == "" || owner == adminOwner || v1.ThreadOwner(s.namespace, thread) != owner {
+		thread = ""
+	}
+	return identity{namespace: s.namespace, owner: owner, thread: thread, claimed: true}, nil
 }
 
 // allowed reports whether id may read req.name, and the status to return when
@@ -227,7 +246,7 @@ func (s *ownerScope) allowed(ctx context.Context, id identity, req scopeRequest)
 	switch req.resource {
 	case "pods":
 		path = "/api/v1/namespaces/" + url.PathEscape(s.namespace) + "/pods/" + url.PathEscape(req.name)
-	case "blips", "blipstates":
+	case "blips", "blipstates", "blipthreads", "blipturns":
 		path = "/apis/blip.dev/v1alpha1/namespaces/" + url.PathEscape(s.namespace) + "/" + req.resource + "/" + url.PathEscape(req.name)
 	default:
 		return false, http.StatusNotFound, nil
@@ -247,13 +266,50 @@ func (s *ownerScope) allowed(ctx context.Context, id identity, req scopeRequest)
 	case "pods":
 		// Warm and unknown pods have no owner label and are never exposed.
 		return owner != "" && owner == id.owner, http.StatusNotFound, nil
+	case "blipthreads":
+		// A claimed VM sees only its own project's thread. Threads are not
+		// owner-labelled, so the name derived from the caller's Blip is the
+		// binding; an owner-labelled thread is also private to that owner.
+		if id.thread != "" && req.name == id.thread {
+			return true, http.StatusNotFound, nil
+		}
+		return owner != "" && owner == id.owner, http.StatusNotFound, nil
+	case "blipturns":
+		// Turns are scoped by the thread they belong to, plus any explicit
+		// owner label. An untrusted thread label never reaches id.thread.
+		if id.thread != "" && obj.Spec.Thread == id.thread {
+			return true, http.StatusNotFound, nil
+		}
+		return owner != "" && owner == id.owner, http.StatusNotFound, nil
 	default:
-		// Owner-labelled objects are private. An unlabelled state is a shared
-		// base; an unlabelled Blip is administrator-owned and private.
+		// Owner-labelled objects are private. Only an unlabelled image
+		// state is a shared base: the controller and mount policy treat an
+		// ownerless state without spec.image as private, so the proxy must
+		// not expose it by name. An unlabelled Blip is administrator-owned.
 		if owner == "" {
-			return req.resource == "blipstates", http.StatusNotFound, nil
+			return req.resource == "blipstates" && obj.Spec.Image != "", http.StatusNotFound, nil
 		}
 		return owner == id.owner, http.StatusNotFound, nil
+	}
+}
+
+// scopedList adds the selector that confines a list or watch to the caller's
+// objects. Threads and turns are scoped to the caller's project; a caller
+// without a project has no access to them at all.
+func scopedList(r *http.Request, id identity, resource string) (*http.Request, bool) {
+	switch resource {
+	case "blipthreads":
+		if id.thread == "" {
+			return nil, false
+		}
+		return withFieldSelector(r, "metadata.name", id.thread), true
+	case "blipturns":
+		if id.thread == "" {
+			return nil, false
+		}
+		return withLabelSelector(r, v1.LabelThread, id.thread), true
+	default:
+		return withOwnerSelector(r, id.owner), true
 	}
 }
 
@@ -265,6 +321,12 @@ type objectMeta struct {
 		Labels      map[string]string `json:"labels"`
 		Annotations map[string]string `json:"annotations"`
 	} `json:"metadata"`
+	Spec struct {
+		// Image distinguishes a shared read-only base from an ownerless
+		// writable state, which stays private.
+		Image  string `json:"image"`
+		Thread string `json:"thread"`
+	} `json:"spec"`
 }
 
 // object performs a trusted GET of path. Only metadata is retained.
@@ -293,16 +355,32 @@ func (s *ownerScope) object(ctx context.Context, path string) (objectMeta, int, 
 // withOwnerSelector merges an owner equality requirement into an existing
 // label selector, leaving all other query parameters alone.
 func withOwnerSelector(r *http.Request, owner string) *http.Request {
+	return withLabelSelector(r, v1.LabelOwner, owner)
+}
+
+// withLabelSelector merges one equality label requirement into an existing
+// label selector, leaving all other query parameters alone.
+func withLabelSelector(r *http.Request, key, value string) *http.Request {
+	return withSelector(r, "labelSelector", key, value)
+}
+
+// withFieldSelector merges one equality field requirement into an existing
+// field selector.
+func withFieldSelector(r *http.Request, key, value string) *http.Request {
+	return withSelector(r, "fieldSelector", key, value)
+}
+
+func withSelector(r *http.Request, query, key, value string) *http.Request {
 	out := r.Clone(r.Context())
 	q := out.URL.Query()
-	selector := q.Get("labelSelector")
-	own := v1.LabelOwner + "=" + owner
+	selector := q.Get(query)
+	requirement := key + "=" + value
 	if selector == "" {
-		selector = own
+		selector = requirement
 	} else {
-		selector += "," + own
+		selector += "," + requirement
 	}
-	q.Set("labelSelector", selector)
+	q.Set(query, selector)
 	out.URL.RawQuery = q.Encode()
 	return out
 }
@@ -318,7 +396,15 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 	}
 	seg := strings.Split(strings.TrimPrefix(p, "/"), "/")
 	scopedResource := func(s string) bool {
-		return s == "pods" || s == "blips" || s == "blipstates"
+		return s == "pods" || s == "blips" || s == "blipstates" || s == "blipthreads" || s == "blipturns"
+	}
+	namesScopedResource := func(parts []string) bool {
+		for _, s := range parts {
+			if scopedResource(s) {
+				return true
+			}
+		}
+		return false
 	}
 	namespaced := func(base int) (scopeRequest, scopeAction) {
 		// seg[base] is the resource, seg[base-1] the namespace.
@@ -343,6 +429,19 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		if len(seg) >= 5 && seg[2] == "namespaces" && scopedResource(seg[4]) {
 			return namespaced(4)
 		}
+		// Legacy namespaced watches, /api/v1/watch/namespaces/{ns}/{res},
+		// are reads of the same collection and must be scoped like the list.
+		// Only the collection shape is a real route; any other watch shape
+		// naming a scoped resource is denied rather than forwarded unscoped.
+		if len(seg) > 2 && seg[2] == "watch" {
+			if len(seg) == 6 && seg[3] == "namespaces" && scopedResource(seg[5]) {
+				return namespaced(5)
+			}
+			if namesScopedResource(seg[3:]) {
+				return scopeRequest{}, scopedDeny
+			}
+			return scopeRequest{}, passThrough
+		}
 		// /api/v1/pods (all namespaces) or another shape naming pods.
 		if len(seg) >= 3 && seg[2] == "pods" {
 			return scopeRequest{}, scopedDeny
@@ -353,8 +452,19 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		if len(seg) >= 6 && seg[3] == "namespaces" && scopedResource(seg[5]) {
 			return namespaced(5)
 		}
+		// Legacy namespaced watches,
+		// /apis/blip.dev/v1alpha1/watch/namespaces/{ns}/{res}, are scoped like
+		// the list. Unknown watch shapes naming a scoped resource are denied.
+		if len(seg) > 3 && seg[3] == "watch" {
+			if len(seg) == 7 && seg[4] == "namespaces" && scopedResource(seg[6]) {
+				return namespaced(6)
+			}
+			if namesScopedResource(seg[4:]) {
+				return scopeRequest{}, scopedDeny
+			}
+		}
 		// /apis/blip.dev/v1alpha1/blips (all namespaces) or another shape.
-		if len(seg) >= 4 && (seg[3] == "blips" || seg[3] == "blipstates") {
+		if len(seg) >= 4 && scopedResource(seg[3]) {
 			return scopeRequest{}, scopedDeny
 		}
 	}

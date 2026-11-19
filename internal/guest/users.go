@@ -2,11 +2,15 @@ package guest
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // account is a resolved user for a process in the root filesystem.
@@ -31,10 +35,17 @@ func lookupAccount(root, spec string) (*account, error) {
 
 	a := &account{home: "/", shell: "/bin/sh"}
 	var entry []string
-	if uid, err := strconv.ParseUint(userPart, 10, 32); err == nil {
-		a.uid = uint32(uid)
+	if uid, numeric, err := parseID(userPart); err != nil {
+		return nil, err
+	} else if numeric {
+		a.uid = uid
+		// Compare by value, not text: "01000" is uid 1000 and must find the
+		// same passwd entry (and therefore gid, name and home) as "1000".
 		for _, f := range passwd {
-			if len(f) >= 7 && f[2] == userPart {
+			if len(f) < 7 {
+				continue
+			}
+			if fid, err := strconv.ParseUint(f[2], 10, 32); err == nil && uint32(fid) == uid {
 				entry = f
 				break
 			}
@@ -71,8 +82,10 @@ func lookupAccount(root, spec string) (*account, error) {
 		}
 	}
 	if hasGroup {
-		if gid, err := strconv.ParseUint(groupPart, 10, 32); err == nil {
-			a.gid = uint32(gid)
+		if gid, numeric, err := parseID(groupPart); err != nil {
+			return nil, err
+		} else if numeric {
+			a.gid = gid
 		} else {
 			found := false
 			for _, f := range groups {
@@ -105,6 +118,26 @@ func lookupAccount(root, spec string) (*account, error) {
 		}
 	}
 	return a, nil
+}
+
+// parseID parses a decimal user or group ID. numeric is false for a name.
+// Leading zeros are accepted (01000 is 1000). Values the kernel cannot hold,
+// including (uid_t)-1 = 4294967295, are rejected instead of failing later with
+// "invalid argument" from exec.
+func parseID(s string) (id uint32, numeric bool, err error) {
+	if s == "" {
+		return 0, false, nil
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false, nil
+		}
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil || v >= math.MaxUint32 {
+		return 0, true, fmt.Errorf("id %q is out of range", s)
+	}
+	return uint32(v), true, nil
 }
 
 func readColonFile(path string) [][]string {
@@ -146,28 +179,63 @@ func mergeEnv(lists ...[]string) []string {
 
 const defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-// lookPath finds name in the PATH of env, inside root. It returns the path as
-// seen from inside root.
-func lookPath(root, name string, env []string) (string, error) {
+// lookPath finds name in the PATH of env, inside root and relative to the
+// command's working directory dir. It follows execvp semantics: an empty or
+// relative PATH entry is relative to dir, a candidate the account cannot
+// execute is reported as permission denied (126) rather than not found (127),
+// and a later executable candidate still wins.
+func lookPath(root, dir, name string, env []string, acct *account) (string, error) {
 	if strings.Contains(name, "/") {
 		return name, nil
 	}
-	path := defaultPath
+	pathVar := defaultPath
 	for _, kv := range env {
 		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
-			path = v
+			pathVar = v
 		}
 	}
-	for _, dir := range filepath.SplitList(path) {
-		if !strings.HasPrefix(dir, "/") {
-			continue
+	denied := false
+	for _, entry := range filepath.SplitList(pathVar) {
+		var p string
+		switch {
+		case entry == "" || entry == ".":
+			// An empty component is the current directory.
+			p = joinPath(dir, name)
+		case strings.HasPrefix(entry, "/"):
+			p = joinPath(entry, name)
+		default:
+			p = joinPath(joinPath(dir, entry), name)
 		}
-		p := filepath.Join(dir, name)
 		// Resolve inside root so absolute symlinks (e.g. /bin -> usr/bin)
 		// point at the root's files.
-		if fi, err := statInRoot(root, p); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+		fi, err := statInRoot(root, p)
+		if err != nil {
+			if errors.Is(err, unix.EACCES) {
+				denied = true
+			}
+			continue
+		}
+		if !fi.Mode().IsRegular() {
+			// execve on a directory (or other non-regular file) is EACCES.
+			denied = true
+			continue
+		}
+		if canExecFile(fi, acct) {
 			return p, nil
 		}
+		denied = true
 	}
-	return "", fmt.Errorf("%s: command not found", name)
+	if denied {
+		return "", startFail(126, fmt.Errorf("%s: permission denied", name))
+	}
+	return "", startFail(127, fmt.Errorf("%s: command not found", name))
+}
+
+// joinPath appends name to dir without lexical cleaning: the kernel resolves
+// ".." and symlinks, and cleaning here would change what it finds.
+func joinPath(dir, name string) string {
+	if strings.HasSuffix(dir, "/") {
+		return dir + name
+	}
+	return dir + "/" + name
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -370,6 +371,90 @@ func TestMountWritableUnrelatedMessageKeepsWaiting(t *testing.T) {
 	}
 }
 
+// TestMountPromotionRefusalFailsFast reproduces a promotion the controller
+// refuses: a stale read-only mount or a state whose writer is held by another
+// Blip. The refusal is reported on the still-mounted read-only entry with
+// Switching=false, so the wait must treat it as final and restore the desired
+// mode instead of polling forever for a switch that will never start.
+func TestMountPromotionRefusalFailsFast(t *testing.T) {
+	for _, tc := range []struct{ name, msg string }{
+		{"newer version", `cannot switch to writable: state "data" has a newer version; unmount and mount it again`},
+		{"writer busy", `cannot switch to writable: state "data" is in use by blip other`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBlip("writer")
+			root := readyState(b.Spec.State)
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+			b.Status.Mounts = []v1alpha1.MountStatus{{
+				State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "attachment",
+			}}
+			a := mountTestApp(t, b, root, readyState("data"))
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			writable := true
+			done := make(chan error, 1)
+			go func() { done <- a.mountState(ctx, "data", root.Name, "/data", &writable) }()
+			waitForCond(t, func() bool {
+				s, err := a.getState(ctx, root.Name)
+				return err == nil && len(s.Spec.Mounts) == 1 && s.Spec.Mounts[0].Writable
+			})
+
+			cur, err := a.getBlip(ctx, b.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cur.Status.Mounts = []v1alpha1.MountStatus{{
+				State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "attachment", Message: tc.msg,
+			}}
+			if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "cannot switch to writable") {
+					t.Fatalf("refused promotion returned %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("refused promotion kept waiting")
+			}
+			s, err := a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].Writable {
+				t.Fatalf("desired mode not restored: %+v", s.Spec.Mounts)
+			}
+		})
+	}
+}
+
+// TestWaitMountKeepsWaitingForTransientPromotionMessage makes sure the retrying
+// "waiting to switch" message is not mistaken for a final refusal.
+func TestWaitMountKeepsWaitingForTransientPromotionMessage(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "attachment",
+		Message: `waiting to switch to writable: state "data" is saving a new version`,
+	}}
+	a := mountTestApp(t, b, root)
+	a.env.ProgressDelay = 0
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.waitMount(ctx, b, "data", "/data", true, 0, "") }()
+	select {
+	case err := <-done:
+		t.Fatalf("transient promotion message treated as final: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // TestWaitMountIgnoresRevivedAttachment reproduces the back-to-back collect
 // race: the pre-add status is Unmounting with the old attachment, and the
 // controller revives that same attachment to Mounted after the spec returns.
@@ -446,6 +531,194 @@ func TestWaitMountIgnoresRevivedAttachment(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("waitMount did not accept the fresh attachment")
+	}
+}
+
+// TestUnmountWritableEndsWhenWriterFinishes reproduces mount --rm of a
+// writable mount whose writer Blip finishes while the removed mount is saving.
+// The stale status entry must not keep the command polling after the Blip is
+// terminal; a failed save on the finished Blip must still be reported.
+func TestUnmountWritableEndsWhenWriterFinishes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		phase   string
+		message string
+		wantErr bool
+	}{
+		{name: "saved entry remains mounted", phase: v1alpha1.MountMounted},
+		{name: "save failed", phase: v1alpha1.MountFailed, message: "save failed: node is gone", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBlip("writer")
+			root := readyState(b.Spec.State)
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+			b.Status.Mounts = []v1alpha1.MountStatus{{
+				State: "data", Path: "/data", Writable: true, Phase: v1alpha1.MountMounted, AttachmentID: "attachment",
+			}}
+			a := mountTestApp(t, b, root)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			done := make(chan error, 1)
+			go func() { done <- a.unmountState(ctx, "data", root.Name) }()
+			waitForCond(t, func() bool {
+				s, err := a.getState(ctx, root.Name)
+				return err == nil && len(s.Spec.Mounts) == 0
+			})
+
+			setPhase := func(phase string) {
+				t.Helper()
+				cur, err := a.getBlip(ctx, b.Name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cur.Status.Phase = phase
+				if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The writer stops; the controller fences the VM and saves.
+			cur, err := a.getBlip(ctx, b.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cur.Spec.Stop = true
+			if err := a.c.Kube.Update(ctx, cur); err != nil {
+				t.Fatal(err)
+			}
+			setPhase(v1alpha1.BlipSaving)
+			select {
+			case err := <-done:
+				t.Fatalf("unmount returned while the save was still running: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			// The finished Blip may still show the removed entry.
+			cur, err = a.getBlip(ctx, b.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cur.Status.Phase = v1alpha1.BlipSucceeded
+			cur.Status.Mounts[0].Phase = tc.phase
+			cur.Status.Mounts[0].Message = tc.message
+			if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case err := <-done:
+				if tc.wantErr {
+					if err == nil || !strings.Contains(err.Error(), tc.message) {
+						t.Fatalf("finished save failure returned %v", err)
+					}
+				} else if err != nil {
+					t.Fatalf("finished writer did not complete the removal: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("unmount kept waiting after the writer finished")
+			}
+		})
+	}
+}
+
+// TestWaitMountSkipsGenerationWaitWithoutDemotion reproduces the concurrent
+// ro+rw race: mountState sees the transient writable spec and arms the save
+// wait, but the controller only ever saw the final read-only spec, so no save
+// will happen. The wait must finish once the mount is stably read-only at the
+// committed version.
+func TestWaitMountSkipsGenerationWaitWithoutDemotion(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+	data := readyState("data")
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Phase: v1alpha1.MountMounted, CommitID: data.Status.Committed.ID,
+	}}
+	a := mountTestApp(t, b, root, data)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- a.waitMount(ctx, b, "data", "/data", false, data.Status.Committed.Generation, "") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitMount failed without a demotion: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitMount waited for a save that never started")
+	}
+}
+
+// TestWaitMountWaitsForDemotedCommit keeps the generation wait for a demotion
+// the controller actually performed.
+func TestWaitMountWaitsForDemotedCommit(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+	data := readyState("data")
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Writable: true, Phase: v1alpha1.MountMounted, CommitID: data.Status.Committed.ID,
+	}}
+	a := mountTestApp(t, b, root, data)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- a.waitMount(ctx, b, "data", "/data", false, data.Status.Committed.Generation, "") }()
+	select {
+	case err := <-done:
+		t.Fatalf("waitMount accepted a writable mount for a read-only request: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The controller tears the writable mount down and brings it back
+	// read-only at the saved version, before the committed version moves.
+	const saved = "fedcba9876543210"
+	cur, err := a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Phase: v1alpha1.MountMounted, CommitID: saved,
+	}}
+	if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("waitMount finished before the saved version committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	st, err := a.getState(ctx, data.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status.Committed = &v1alpha1.Commit{ID: saved, Generation: data.Status.Committed.Generation + 1}
+	if err := a.c.Kube.Status().Update(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	// waitMount watches the Blip; an unrelated status change triggers the
+	// check that observes the state's new committed generation.
+	cur, err = a.getBlip(ctx, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.Status.Sessions++
+	if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitMount failed after the save committed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitMount did not finish after the save committed")
 	}
 }
 
@@ -562,7 +835,7 @@ func TestMountValidationErrors(t *testing.T) {
 		{"relative path", []string{"mount", "data:work", "--root", "home"}, `invalid mount "data:work"`},
 		{"unclean path", []string{"mount", "data:/a/../b", "--root", "home"}, `invalid mount "data:/a/../b"`},
 		{"root path", []string{"mount", "data:/", "--root", "home"}, `invalid mount "data:/"`},
-		{"mode", []string{"mount", "data:/w:rx", "--root", "home"}, `invalid mount "data:/w:rx"`},
+		{"relative path with mode", []string{"mount", "data:work:rw", "--root", "home"}, `invalid mount "data:work:rw"`},
 		{"self mount", []string{"mount", "home:/data", "--root", "home"}, "a root state cannot mount itself"},
 		{"bad size", []string{"mount", "--new", "x:/data", "--size", "nope", "--root", "home"}, "invalid --size"},
 		{"zero size", []string{"mount", "--new", "x:/data", "--size", "0", "--root", "home"}, "must be positive"},
@@ -574,6 +847,39 @@ func TestMountValidationErrors(t *testing.T) {
 				t.Fatalf("code %d: %s", code, errOut)
 			}
 		})
+	}
+}
+
+// TestMountRequiresNewForStateSettings reproduces --size, --replicas and
+// --from being accepted and silently discarded on a mount that creates no
+// state. They only configure --new, so using them without it is a usage error.
+func TestMountRequiresNewForStateSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		flag string
+	}{
+		{"size", []string{"mount", "data:/data", "--size", "1Gi", "--root", "home"}, "--size"},
+		{"replicas", []string{"mount", "data:/data", "--replicas", "2", "--root", "home"}, "--replicas"},
+		{"from", []string{"mount", "data:/data", "--from", "base", "--root", "home"}, "--from"},
+		{"list", []string{"mount", "--size", "1Gi", "--root", "home"}, "--size"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"), readyState("base"))
+			code, _, errOut := h.run("", tc.args...)
+			if code != 1 || !strings.Contains(errOut, tc.flag) || !strings.Contains(errOut, "--new") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("discarded flags still changed mounts: %+v", mounts)
+			}
+		})
+	}
+
+	// The same flags remain valid with --new.
+	h := newHarness(t, readyState("home"), readyState("base"))
+	if code, _, errOut := h.run("", "mount", "--new", "dev:/work", "--from", "base", "--size", "1Gi", "--replicas", "2", "--root", "home"); code != 0 {
+		t.Fatalf("--new with state settings rejected: %d %s", code, errOut)
 	}
 }
 
@@ -604,6 +910,99 @@ func TestMountNewRejectsExisting(t *testing.T) {
 	if code != 1 || !strings.Contains(errOut, `state "taken" already exists`) {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
+}
+
+func stateNotFound(t *testing.T, h *harness, name string) bool {
+	t.Helper()
+	var s v1alpha1.BlipState
+	err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &s)
+	return apierrors.IsNotFound(err)
+}
+
+// TestMountNewDoesNotLeakStateOnPathConflict reproduces a root that already
+// has /shared mounted: --new must reject before creating the state, and a retry
+// with the same name at a free path must succeed.
+func TestMountNewDoesNotLeakStateOnPathConflict(t *testing.T) {
+	root := readyState("home")
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "m2", Path: "/shared"}}
+	h := newHarness(t, root, readyState("m2"))
+	code, _, errOut := h.run("", "mount", "--new", "leakrepro:/shared:rw", "--size", "1Gi", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `root state "home" already has state "m2" mounted at /shared`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !stateNotFound(t, h, "leakrepro") {
+		t.Fatal("rejected --new left state leakrepro behind")
+	}
+	code, out, errOut := h.run("", "mount", "--new", "leakrepro:/free:rw", "--size", "1Gi", "--root", "home")
+	if code != 0 {
+		t.Fatalf("retry code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state leakrepro mounted")
+}
+
+func TestMountNewDoesNotLeakStateWhenRootMissing(t *testing.T) {
+	h := newHarness(t)
+	code, _, errOut := h.run("", "mount", "--new", "leakrepro:/shared:rw", "--size", "1Gi", "--root", "missing")
+	if code != 1 || !strings.Contains(errOut, `state "missing" not found`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !stateNotFound(t, h, "leakrepro") {
+		t.Fatal("rejected --new left state leakrepro behind")
+	}
+}
+
+// TestMountRejectsOverlappingPaths checks the CLI preflight for the topology
+// the controller rejects with InvalidSpec: duplicate and nested mount paths.
+func TestMountRejectsOverlappingPaths(t *testing.T) {
+	t.Run("new nested under existing", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "m2", Path: "/data"}}
+		h := newHarness(t, root, readyState("m2"))
+		code, _, errOut := h.run("", "mount", "--new", "nest2:/data/sub:rw", "--size", "256Mi", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `mount nest2: path /data/sub overlaps mount m2 at /data`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if !stateNotFound(t, h, "nest2") {
+			t.Fatal("rejected --new left state nest2 behind")
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].Path != "/data" {
+			t.Fatalf("mounts changed: %+v", mounts)
+		}
+	})
+	t.Run("existing nested under new", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "m2", Path: "/data/sub"}}
+		h := newHarness(t, root, readyState("m2"), readyState("nest2"))
+		code, _, errOut := h.run("", "mount", "nest2:/data", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `mount nest2: path /data overlaps mount m2 at /data/sub`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].State != "m2" {
+			t.Fatalf("mounts changed: %+v", mounts)
+		}
+	})
+	t.Run("add nested under existing", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "m2", Path: "/data"}}
+		h := newHarness(t, root, readyState("m2"), readyState("nest2"))
+		code, _, errOut := h.run("", "mount", "nest2:/data/sub:rw", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, "overlaps") {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].State != "m2" {
+			t.Fatalf("mounts changed: %+v", mounts)
+		}
+	})
+	t.Run("batch validated before first write", func(t *testing.T) {
+		h := newHarness(t, readyState("home"), readyState("a"), readyState("b"))
+		code, _, errOut := h.run("", "mount", "a:/data", "b:/data/sub", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, "overlaps") {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("partially applied batch: %+v", mounts)
+		}
+	})
 }
 
 func TestMountNewSurfacesStateFailure(t *testing.T) {
@@ -641,6 +1040,88 @@ func TestMountNewRejectsFailedSource(t *testing.T) {
 	code, _, errOut := h.run("", "mount", "--new", "copy:/data", "--from", "bad", "--root", "home")
 	if code != 1 || !strings.Contains(errOut, `copy source "bad" failed: image too large`) {
 		t.Fatalf("code %d: %s", code, errOut)
+	}
+}
+
+// TestMountPathsMayContainColons reproduces a colon-containing path being
+// split as if its last segment were a mode. Modes are only recognized when the
+// path before them has no colon; a path that is both colon-containing and
+// mode-suffixed is genuinely ambiguous and reported as such.
+func TestMountPathsMayContainColons(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		path string
+		rw   bool
+	}{
+		{"colon path", []string{"mount", "data:/a:b", "--root", "home"}, "/a:b", false},
+		{"colon path and non-mode suffix", []string{"mount", "data:/a:b:rx", "--root", "home"}, "/a:b:rx", false},
+		{"mode", []string{"mount", "data:/a:rw", "--root", "home"}, "/a", true},
+		{"read-only mode", []string{"mount", "data:/a:ro", "--root", "home"}, "/a", false},
+		{"new colon path", []string{"mount", "--new", "cache:/a:b", "--root", "home"}, "/a:b", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", tc.args...)
+			if code != 0 {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			mounts := h.state("home").Spec.Mounts
+			if len(mounts) != 1 || mounts[0].Path != tc.path || mounts[0].Writable != tc.rw {
+				t.Fatalf("mounts %+v, want path %s rw=%v", mounts, tc.path, tc.rw)
+			}
+		})
+	}
+
+	for _, arg := range []string{"data:/a:b:rw", "data:/a:b:ro"} {
+		t.Run("ambiguous "+arg, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", "mount", arg, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "ambiguous") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("ambiguous mount written: %+v", mounts)
+			}
+		})
+	}
+}
+
+// TestMountRejectsGuestReservedAndSymlinkPaths reproduces a mount the CLI
+// accepts offline but the guest cannot create: the path is reserved for the
+// guest itself or lies below a symlink in the image. The mount must be
+// rejected before desired intent is written, or the root cannot start again.
+func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
+	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/lib64/w2", "/bin/w2", "/var/run/w2"} {
+		t.Run(path, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", "mount", "data:"+path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "mount path") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected mount written as desired intent: %+v", mounts)
+			}
+		})
+	}
+
+	// A rejected path must not leave a newly created state behind either.
+	h := newHarness(t, readyState("home"))
+	code, _, errOut := h.run("", "mount", "--new", "reserved:/proc/w2", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, "mount path") {
+		t.Fatalf("--new code %d: %s", code, errOut)
+	}
+	if !stateNotFound(t, h, "reserved") {
+		t.Fatal("rejected --new left state reserved behind")
+	}
+
+	// Prefix-sharing non-overlapping paths stay legal.
+	h = newHarness(t, readyState("home"), readyState("a"), readyState("b"))
+	if code, _, errOut := h.run("", "mount", "a:/data", "--root", "home"); code != 0 {
+		t.Fatalf("legitimate mount rejected: %d %s", code, errOut)
+	}
+	if code, _, errOut := h.run("", "mount", "b:/procdata", "--root", "home"); code != 0 {
+		t.Fatalf("legitimate nested path rejected: %d %s", code, errOut)
 	}
 }
 

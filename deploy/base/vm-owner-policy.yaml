@@ -3,22 +3,28 @@
 #   sa.<service account>: <pools>  every VM service account, with the
 #                                  space-separated pools that use it
 #   <vm pod>: <owner>              each claimed VM pod; "-" means unrestricted
+#   thread.<thread>: <owner>       each thread's project owner hash
 #   bases: <states>                space-separated shared, ownerless image states
 # A caller authenticated with a pod-bound token of a VM service account may
 # only connect to pods with `blip-runtime bridge 1025` in container vm (a blip
-# session; no other exec, attach, or port-forward). A restricted owner may
+# session; no other exec, attach, proxy, or port-forward). A restricted owner may
 # only do so into VM pods of the same owner, and may only create, change,
 # and delete blips and states named "<owner>.<name>" and labelled
 # blip.dev/owner=<owner> (before and after the change) that reference only
 # such states (or copy/read-only mount shared bases), set no imagePullSecrets,
-# and create blips only in pools of its own service account. Every
+# and create blips only in pools of its own service account. Thread specs are
+# administrator-owned: a restricted VM may read its own thread through the
+# API proxy but may not create, change or delete threads. Every
 # ownerReference it sets must name a Blip of the same owner: fork blips may
 # only be owned by blips of the same owner, and states may only be owned by
-# such blips. A VM pod without an entry (vacant, or unknown) is denied, as is
-# any other pod that uses a VM service account. Service account keys are pruned
-# only once no pool or VM pod uses the account, and a missing table denies all
-# blip and state changes made with pod-bound tokens. Grant VM service accounts
-# RBAC only in their own namespace: the table is per namespace.
+# such blips. A pod-bound token is restricted when its service account or its
+# claimed pod is in the table, or when the table exists but is empty: a
+# missing key is never treated as unrestricted for a claimed VM, because such
+# a race would bypass every check. A VM pod without an entry (vacant, or
+# unknown) is denied. Service account keys are pruned only once no pool or VM
+# pod uses the account, and a missing table denies all blip and state changes
+# made with pod-bound tokens. Grant VM service accounts RBAC only in their own
+# namespace: the table is per namespace.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -32,11 +38,11 @@ spec:
     resourceRules:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
-        resources: [blips, blips/status, blipstates, blipstates/status]
+        resources: [blips, blips/status, blipstates, blipstates/status, blipthreads, blipthreads/status]
         operations: [CREATE, UPDATE, DELETE]
       - apiGroups: [""]
         apiVersions: [v1]
-        resources: [pods/exec, pods/attach, pods/portforward]
+        resources: [pods/exec, pods/attach, pods/portforward, pods/proxy]
         operations: [CONNECT]
   matchConditions:
     - name: pod-bound-service-account-token
@@ -49,10 +55,19 @@ spec:
       expression: "has(params.data) ? params.data : {}"
     - name: callerSA
       expression: request.userInfo.username.split(':')[3]
-    - name: vm
-      expression: "('sa.' + variables.callerSA) in variables.data"
     - name: callerPod
       expression: request.userInfo.extra['authentication.kubernetes.io/pod-name'][0]
+    # matchConditions selected a pod-bound token in this namespace. A VM is
+    # identified by any of: its service account is in the table, its claimed
+    # pod has an owner entry, or the table is empty. The last two make an
+    # absent service-account key fail closed (a table race must not turn a VM
+    # into an unrestricted caller) without restricting unrelated workloads
+    # that merely share the namespace.
+    - name: vm
+      expression: >-
+        size(variables.data) == 0 ||
+        ('sa.' + variables.callerSA) in variables.data ||
+        variables.callerPod in variables.data
     - name: owner
       expression: "variables.callerPod in variables.data ? string(variables.data[variables.callerPod]) : ''"
     - name: restricted
@@ -62,9 +77,25 @@ spec:
     - name: writes
       expression: request.operation == 'CREATE' || request.operation == 'UPDATE'
     - name: pools
-      expression: "string(variables.data['sa.' + variables.callerSA]).split(' ')"
+      expression: >-
+        ('sa.' + variables.callerSA) in variables.data ?
+        string(variables.data['sa.' + variables.callerSA]).split(' ') : []
     - name: bases
       expression: "'bases' in variables.data ? string(variables.data['bases']).split(' ') : []"
+    # A blip.dev/thread label decides which project's history a Blip's reports
+    # are appended to. The label is self-asserted by the VM, so a restricted
+    # owner may only set it to a thread it owns: the "thread.<name>" table
+    # records the owner hash of every thread.
+    - name: thread
+      expression: >-
+        (request.operation == 'CREATE' || request.operation == 'UPDATE') &&
+        has(object.metadata.labels) && 'blip.dev/thread' in object.metadata.labels ?
+        string(object.metadata.labels['blip.dev/thread']) : ''
+    - name: oldThread
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.metadata.labels) &&
+        'blip.dev/thread' in oldObject.metadata.labels ?
+        string(oldObject.metadata.labels['blip.dev/thread']) : ''
   validations:
     - expression: "!variables.vm || variables.owner != ''"
       messageExpression: >-
@@ -76,6 +107,14 @@ spec:
     - expression: "!variables.restricted || !has(request.subResource) || request.subResource != 'status'"
       messageExpression: >-
         'owner ' + variables.owner + ' may not change status; only the controller writes it'
+      reason: Forbidden
+    # A thread's spec is administrator-owned and blipchat is the only writer
+    # of its status. A restricted VM token may not create, relabel, rewrite or
+    # delete a thread: its charter, system prompt, pool and base decide what
+    # the project's coordinator runs next.
+    - expression: "variables.owner == '-' || request.resource.resource != 'blipthreads'"
+      messageExpression: >-
+        'thread specs are administrator-owned; VM service account ' + variables.callerSA + ' may not change them'
       reason: Forbidden
     - expression: >-
         !variables.vm || request.operation != 'CONNECT' ||
@@ -117,6 +156,17 @@ spec:
       messageExpression: >-
         'owner ' + variables.owner + ' must label its objects blip.dev/owner=' + variables.owner
       reason: Forbidden
+    # An attacker must not steer its reports into another project's thread by
+    # relabelling its own Blip. The label may only name a thread of the same
+    # owner, and an unchanged label stays valid when the thread is gone.
+    - expression: >-
+        !variables.restricted || !variables.writes || request.resource.resource != 'blips' ||
+        variables.thread == variables.oldThread ||
+        (variables.thread != '' && ('thread.' + variables.thread) in variables.data &&
+        string(variables.data['thread.' + variables.thread]) == variables.owner)
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only attach blip.dev/thread labels of its own threads'
+      reason: Forbidden
     - expression: >-
         !variables.restricted || !variables.writes ||
         !has(object.metadata.ownerReferences) ||
@@ -157,18 +207,38 @@ spec:
       reason: Forbidden
     - expression: >-
         !variables.restricted || request.operation != 'CREATE' || request.resource.resource != 'blips' ||
-        (has(object.spec) && has(object.spec.pool) ? object.spec.pool : 'default') in variables.pools
+        (has(object.spec) && has(object.spec.pool) && object.spec.pool != '' ? object.spec.pool : 'default') in variables.pools
       messageExpression: >-
         'owner ' + variables.owner + ' may only use pools of service account ' + variables.callerSA +
         ' (' + variables.pools.join(', ') + ')'
       reason: Forbidden
 ---
-# Fail secure: without the table, pod-bound tokens of the namespace may not
-# change blips or states at all.
+# Without the table, pod-bound tokens may not create blips or states. Updates
+# and deletes must still be allowed: a terminating namespace drops the table
+# before the controller removes its finalizers, and a Deny there would leave
+# the namespace stuck in Terminating forever.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
   name: blip-vm-owner
+spec:
+  policyName: blip-vm-owner
+  validationActions: [Deny]
+  paramRef:
+    name: blip-vm-owners
+    parameterNotFoundAction: Allow
+  matchResources:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: ["*"]
+        resources: [blips, blips/status, blipstates, blipstates/status, blipthreads, blipthreads/status]
+        operations: [UPDATE, DELETE]
+---
+# New objects stay fail-secure: no table means no creation.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-vm-owner-create
 spec:
   policyName: blip-vm-owner
   validationActions: [Deny]
@@ -179,8 +249,8 @@ spec:
     resourceRules:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
-        resources: [blips, blips/status, blipstates, blipstates/status]
-        operations: [CREATE, UPDATE, DELETE]
+        resources: [blips, blips/status, blipstates, blipstates/status, blipthreads, blipthreads/status]
+        operations: [CREATE]
 ---
 # Namespaces without blips keep pod exec working for their own workloads.
 apiVersion: admissionregistration.k8s.io/v1
@@ -197,5 +267,5 @@ spec:
     resourceRules:
       - apiGroups: [""]
         apiVersions: [v1]
-        resources: [pods/exec, pods/attach, pods/portforward]
+        resources: [pods/exec, pods/attach, pods/portforward, pods/proxy]
         operations: [CONNECT]

@@ -4,10 +4,10 @@
 package blipchat
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"net/http"
 	"time"
+
+	v1 "github.com/Azure/blip/api/v1alpha1"
 )
 
 // Config holds the process-wide settings. Per-thread settings (model, pool,
@@ -65,8 +65,7 @@ func (c *Config) defaults() {
 // from the thread's namespace and name, so it is stable and cannot collide
 // with the u- owners derived from user identities.
 func Owner(thread *ThreadKey) string {
-	sum := sha256.Sum256([]byte(thread.Namespace + "/" + thread.Name))
-	return "p-" + hex.EncodeToString(sum[:8])
+	return v1.ThreadOwner(thread.Namespace, thread.Name)
 }
 
 // ThreadKey identifies a thread.

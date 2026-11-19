@@ -45,9 +45,9 @@ func TestConsoleMirrorFlushesOverlongPartialLine(t *testing.T) {
 	}
 }
 
-// A full queue drops lines instead of blocking the output pump, and the drops
-// are reported once the queue drains.
-func TestConsoleMirrorDropsWhenQueueIsFull(t *testing.T) {
+// A full queue drops the oldest lines instead of blocking the output pump,
+// so the surviving window is the command's tail.
+func TestConsoleMirrorDropsOldestWhenQueueIsFull(t *testing.T) {
 	var buf bytes.Buffer
 	m := newConsoleMirror(&buf)
 	const extra = 7
@@ -67,13 +67,48 @@ func TestConsoleMirrorDropsWhenQueueIsFull(t *testing.T) {
 	if n := strings.Count(out, "\n"); n != consoleMirrorQueue+1 {
 		t.Fatalf("console has %d lines, want %d", n, consoleMirrorQueue+1)
 	}
-	if !strings.Contains(out, "blip: line-0\n") || !strings.Contains(out, fmt.Sprintf("blip: line-%d\n", consoleMirrorQueue-1)) {
-		t.Fatal("mirror lost lines that fit in the queue")
+	if strings.Contains(out, "blip: line-0\n") {
+		t.Fatal("mirror kept the oldest line instead of dropping it")
 	}
-	if strings.Contains(out, fmt.Sprintf("blip: line-%d\n", consoleMirrorQueue)) {
-		t.Fatal("mirror wrote a dropped line")
+	if !strings.Contains(out, fmt.Sprintf("blip: line-%d\n", extra)) ||
+		!strings.Contains(out, fmt.Sprintf("blip: line-%d\n", consoleMirrorQueue+extra-1)) {
+		t.Fatal("mirror lost the newest lines")
 	}
 	if !strings.HasSuffix(out, fmt.Sprintf("blip: %d output lines dropped\n", extra)) {
 		t.Fatalf("console does not end with the drop notice: %q", out)
+	}
+}
+
+// A command that writes far more lines than the queue holds must leave the
+// newest lines on the console, including its final line.
+func TestConsoleMirrorKeepsTailOfLongOutput(t *testing.T) {
+	var buf bytes.Buffer
+	m := newConsoleMirror(&buf)
+	for i := range 1000 {
+		m.feed([]byte(fmt.Sprintf("LINE%04d\n", i)))
+	}
+	m.start()
+	m.stop()
+	out := buf.String()
+	if strings.Contains(out, "blip: LINE0000\n") {
+		t.Fatal("mirror kept the head of the output")
+	}
+	if !strings.Contains(out, "blip: LINE0999\n") {
+		t.Fatalf("mirror lost the final line: %q", out)
+	}
+	if drop := strings.Index(out, "output lines dropped"); drop < 0 {
+		t.Fatal("mirror did not report dropped lines")
+	}
+	// Every retained line is a contiguous suffix ending at LINE0999.
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	for i, line := range lines {
+		if strings.Contains(line, "output lines dropped") {
+			lines = lines[:i]
+			break
+		}
+	}
+	want := fmt.Sprintf("blip: LINE%04d", 1000-len(lines))
+	if lines[0] != want {
+		t.Fatalf("retained window starts at %q, want %q", lines[0], want)
 	}
 }

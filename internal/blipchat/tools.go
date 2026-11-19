@@ -78,7 +78,7 @@ func (s *step) tools() []Tool {
 			map[string]any{"note": str("Why to wake")},
 		), "at")),
 		FunctionTool("reply", "Write a turn answering a user or blip turn.", schema(props(
-			map[string]any{"inReplyTo": map[string]any{"type": "integer", "description": "Sequence number being answered"}},
+			map[string]any{"inReplyTo": map[string]any{"type": "integer", "minimum": 0, "description": "Sequence number being answered"}},
 			map[string]any{"text": str("Reply text, at most 2048 characters")},
 		), "text")),
 		FunctionTool("note", "Record a short decision or observation for later steps.", schema(props(
@@ -123,31 +123,46 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 				attrs[k] = fmt.Sprint(v)
 			}
 		}
-		s.tasks = append(s.tasks, v1.ThreadTask{ID: id, Title: strArg("title"), Open: true, Attributes: cleanAttributes(attrs), Note: truncateRunes(strArg("note"), 256), Updated: nowTime()})
+		s.tasks = append(s.tasks, v1.ThreadTask{ID: id, Title: truncateRunes(strArg("title"), 120), Open: true, Attributes: cleanAttributes(attrs), Note: truncateRunes(strArg("note"), 256), Updated: nowTime()})
 		return "created " + id, nil
 	case "task_update":
 		t := s.task(strArg("id"))
 		if t == nil {
 			return "", fmt.Errorf("task %q not found", strArg("id"))
 		}
+		// Validate the whole change before touching the task so a rejected
+		// update cannot leave a partial, CRD-invalid value behind.
+		title, note, attrs := t.Title, t.Note, t.Attributes
 		if v, ok := args["title"].(string); ok {
-			t.Title = truncateRunes(v, 120)
+			title = truncateRunes(v, 120)
 		}
 		if v, ok := args["note"].(string); ok {
-			t.Note = truncateRunes(v, 256)
+			note = truncateRunes(v, 256)
 		}
 		if raw, ok := args["attributes"].(map[string]any); ok {
-			if t.Attributes == nil {
-				t.Attributes = map[string]string{}
+			merged := make(map[string]string, len(t.Attributes)+len(raw))
+			for k, value := range t.Attributes {
+				merged[k] = value
 			}
 			for k, value := range raw {
-				if fmt.Sprint(value) == "" {
-					delete(t.Attributes, k)
+				if k == "" {
 					continue
 				}
-				t.Attributes[k] = truncateRunes(fmt.Sprint(value), 256)
+				key := truncateRunes(k, 63)
+				if fmt.Sprint(value) == "" {
+					delete(merged, key)
+					continue
+				}
+				merged[key] = truncateRunes(fmt.Sprint(value), 256)
 			}
+			if len(merged) > 16 {
+				return "", fmt.Errorf("task %q would have %d attributes; the maximum is 16", t.ID, len(merged))
+			}
+			attrs = merged
 		}
+		t.Title = title
+		t.Note = note
+		t.Attributes = attrs
 		if v, ok := args["open"].(bool); ok {
 			t.Open = v
 		}
@@ -166,11 +181,14 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 		if v, ok := args["timeoutSeconds"].(float64); ok {
 			timeout = time.Duration(v) * time.Second
 		}
-		return s.s.execIn(ctx, s.thread.Namespace, strArg("blip"), argv, timeout)
+		return s.s.execIn(ctx, s.thread, strArg("blip"), argv, timeout)
 	case "stop":
 		var b v1.Blip
 		if err := s.s.Get(ctx, client.ObjectKey{Namespace: s.thread.Namespace, Name: strArg("blip")}, &b); err != nil {
 			return "", err
+		}
+		if !belongsToThread(&b, s.thread) {
+			return "", fmt.Errorf("blip %q does not belong to thread %q", b.Name, s.thread.Name)
 		}
 		b.Spec.Stop = true
 		if err := s.s.Update(ctx, &b); err != nil {
@@ -190,6 +208,9 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 		return "timer " + id + " at " + at.Format(time.RFC3339), nil
 	case "reply":
 		seq, _ := args["inReplyTo"].(float64)
+		if seq < 0 {
+			return "", fmt.Errorf("inReplyTo must be a non-negative sequence number")
+		}
 		s.replies = append(s.replies, v1.BlipTurnSpec{
 			Thread: s.thread.Name, Author: v1.TurnAuthor{Kind: v1.TurnAuthorCoordinator, Name: s.thread.Name},
 			Topic: "coordinator.reply", InReplyTo: int64(seq), Text: truncateRunes(strArg("text"), 2048), Wake: v1.WakeNone,
@@ -203,6 +224,7 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 		return "note recorded", nil
 	case "remember":
 		s.summary = truncateRunes(strArg("text"), 16384)
+		s.summarySet = true
 		return "summary replaced", nil
 	case "idle":
 		s.idle = true
@@ -292,8 +314,18 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 	return "started " + name, nil
 }
 
+// belongsToThread reports whether b was created by this thread: the thread
+// label must name it and the owner label must be the thread's derived owner.
+// A coordinator may hold commands or stop only blips of its own project.
+func belongsToThread(b *v1.Blip, thread *v1.BlipThread) bool {
+	owner := Owner(&ThreadKey{Namespace: thread.Namespace, Name: thread.Name})
+	return b.Namespace == thread.Namespace &&
+		b.Labels[v1.LabelThread] == thread.Name &&
+		b.Labels[v1.LabelOwner] == owner
+}
+
 // execIn runs one command in a running blip and returns bounded output.
-func (s *Server) execIn(ctx context.Context, namespace, name string, argv []string, timeout time.Duration) (string, error) {
+func (s *Server) execIn(ctx context.Context, thread *v1.BlipThread, name string, argv []string, timeout time.Duration) (string, error) {
 	if len(argv) == 0 {
 		return "", fmt.Errorf("argv is required")
 	}
@@ -301,8 +333,11 @@ func (s *Server) execIn(ctx context.Context, namespace, name string, argv []stri
 		timeout = 60 * time.Second
 	}
 	var b v1.Blip
-	if err := s.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &b); err != nil {
+	if err := s.Get(ctx, client.ObjectKey{Namespace: thread.Namespace, Name: name}, &b); err != nil {
 		return "", err
+	}
+	if !belongsToThread(&b, thread) {
+		return "", fmt.Errorf("blip %q does not belong to thread %q", name, thread.Name)
 	}
 	if b.Status.Pod == "" || v1.Finished(&b) {
 		return "", fmt.Errorf("blip %q is not running", name)

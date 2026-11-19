@@ -8,10 +8,9 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
-)
 
-// reservedPaths are mounted by the guest itself inside the root.
-var reservedPaths = []string{"/proc", "/sys", "/dev", "/run/blip"}
+	"github.com/Azure/blip/internal/mountpath"
+)
 
 // checkMountPath validates a user mount path against the documented rules.
 // existing are the paths of current auxiliary mounts.
@@ -28,7 +27,12 @@ func checkMountPath(p string, existing []string) error {
 	if p == "/" {
 		return errors.New("mount path must not be /")
 	}
-	for _, e := range append(existing, reservedPaths...) {
+	for _, e := range existing {
+		if overlaps(p, e) {
+			return fmt.Errorf("mount path %s overlaps %s", p, e)
+		}
+	}
+	for _, e := range mountpath.Reserved {
 		if overlaps(p, e) {
 			return fmt.Errorf("mount path %s overlaps %s", p, e)
 		}
@@ -139,6 +143,45 @@ func statInRoot(root, p string) (os.FileInfo, error) {
 	f := os.NewFile(uintptr(fd), p)
 	defer f.Close()
 	return f.Stat()
+}
+
+// resolveInRoot returns dir as a canonical path inside root, resolving
+// symlinks and ".." exactly as the child's chdir will after chroot. A lexical
+// walk sees only the path components as written, so it can miss an
+// unsearchable directory that a symlink points through.
+func resolveInRoot(root, dir string) (string, error) {
+	rootfd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return "", err
+	}
+	defer unix.Close(rootfd)
+	rootPath, err := fdPath(rootfd)
+	if err != nil {
+		return "", err
+	}
+	rel := strings.TrimPrefix(dir, "/")
+	if rel == "" {
+		rel = "." // openat2 rejects an empty path
+	}
+	fd, err := openat2(rootfd, rel, unix.O_PATH|unix.O_DIRECTORY, 0, unix.RESOLVE_IN_ROOT)
+	if err != nil {
+		return "", err
+	}
+	defer unix.Close(fd)
+	p, err := fdPath(fd)
+	if err != nil {
+		return "", err
+	}
+	r, err := filepath.Rel(rootPath, p)
+	if err != nil || r == ".." || strings.HasPrefix(r, "../") {
+		// RESOLVE_IN_ROOT clamps a path to the root, so this cannot happen
+		// unless the root itself was renamed or removed.
+		return "", errors.New("workdir resolved outside the root")
+	}
+	if r == "." {
+		return "/", nil
+	}
+	return "/" + filepath.ToSlash(r), nil
 }
 
 // fdPath returns the real path of an open descriptor.

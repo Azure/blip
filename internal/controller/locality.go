@@ -100,8 +100,12 @@ func homeNodes(score map[string]int, cl *cluster, selector map[string]string) []
 	return out
 }
 
-// updateLocality records the node the Blip's data lives on. A Blip that
-// fell back keeps doing so; otherwise the node follows the data.
+// updateLocality records the node the Blip's data lives on. A fallback is
+// re-evaluated while the Blip is still waiting: if the data has moved to a
+// different usable home, the Blip follows it instead of keeping the node it
+// fell back on. A fallback on the current home node is kept until a local VM
+// is actually claimable (see pending), because the pool still boots a pinned
+// VM for a waiting fallback.
 //
 // settled means every state the Blip references is ready. A durable Blip
 // whose states are ready but which has no usable home node must fall back,
@@ -112,6 +116,15 @@ func updateLocality(b *v1.Blip, home []string, settled bool) {
 	loc := b.Status.Locality
 	switch {
 	case loc != nil && loc.Fallback:
+		if len(home) == 0 || slices.Contains(home, loc.Node) {
+			return
+		}
+		// The data moved to another usable node. Start a fresh local wait
+		// rather than pinning the replacement to a node that no longer
+		// holds it.
+		loc.Fallback = false
+		loc.Node = home[0]
+		loc.Since = nil
 	case len(home) == 0:
 		if loc != nil || (settled && b.Spec.State != "") {
 			if loc == nil {

@@ -218,6 +218,9 @@ type Opened struct {
 	Session string `json:"session,omitempty"`
 	TTY     bool   `json:"tty,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// Code is the conventional exit status of a command that could not be
+	// started (126 or 127). Zero for errors that are not start failures.
+	Code int `json:"code,omitempty"`
 }
 
 type Resize struct {

@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,11 +35,17 @@ type Env struct {
 	// ProgressDelay holds progress lines back so fast operations stay
 	// quiet.
 	ProgressDelay time.Duration
-	// NamespaceFile and Hostname find the blip the command runs in: the
-	// Blip named by the hostname in the guest metadata's namespace.
-	// Without NamespaceFile the command is never inside a blip.
+	// NamespaceFile, NameFile and Hostname find the blip the command runs
+	// in. The guest writes its Blip name to NameFile so names longer than a
+	// hostname (64 bytes) still work; Hostname is the fallback for older
+	// guests. Without NamespaceFile the command is never inside a blip.
 	NamespaceFile string
+	NameFile      string
 	Hostname      func() (string, error)
+	// Args is the raw command line. Commands use it to notice flags that
+	// pflag parsed after a positional argument, where the user meant them
+	// for the command instead.
+	Args []string
 }
 
 // KubeFlags are the kubeconfig flags.
@@ -52,6 +60,10 @@ type Clients struct {
 	Kube      client.WithWatch
 	Sessions  *session.Client
 	Namespace string
+	// Logs streams the serial console of a VM pod. It is the fallback for
+	// a command that finished before a follower could attach to its replay
+	// ring.
+	Logs func(context.Context, string) (io.ReadCloser, error)
 }
 
 // ExitError makes the process exit with Code without printing anything.
@@ -70,7 +82,7 @@ func init() {
 // DefaultEnv uses the process's stdio and kubeconfig.
 func DefaultEnv() *Env {
 	return &Env{In: os.Stdin, Out: os.Stdout, Err: os.Stderr, Terminal: true, Connect: connect, ProgressDelay: time.Second,
-		NamespaceFile: "/run/blip/namespace", Hostname: os.Hostname}
+		NamespaceFile: "/run/blip/namespace", NameFile: "/run/blip/name", Hostname: os.Hostname}
 }
 
 func connect(f KubeFlags) (*Clients, error) {
@@ -99,11 +111,19 @@ func connect(f KubeFlags) (*Clients, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Clients{Kube: kube, Sessions: sessions, Namespace: ns}, nil
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	logs := func(ctx context.Context, pod string) (io.ReadCloser, error) {
+		return clientset.CoreV1().Pods(ns).GetLogs(pod, &corev1.PodLogOptions{Container: "vm"}).Stream(ctx)
+	}
+	return &Clients{Kube: kube, Sessions: sessions, Namespace: ns, Logs: logs}, nil
 }
 
 type app struct {
 	env   *Env
+	args  []string
 	flags KubeFlags
 	c     *Clients
 	// self is the blip the command runs in, if any. prefix scopes the
@@ -128,24 +148,34 @@ func (a *app) clients() (*Clients, error) {
 }
 
 func (a *app) findSelf(ctx context.Context) error {
-	if a.env.NamespaceFile == "" || a.env.Hostname == nil {
+	if a.env.NamespaceFile == "" {
 		return nil
 	}
 	ns, err := os.ReadFile(a.env.NamespaceFile)
 	if err != nil || strings.TrimSpace(string(ns)) != a.c.Namespace {
 		return nil
 	}
-	host, err := a.env.Hostname()
-	if err != nil {
-		return nil
+	name := ""
+	if a.env.NameFile != "" {
+		if data, err := os.ReadFile(a.env.NameFile); err == nil {
+			name = strings.TrimSpace(string(data))
+		}
+	}
+	if name == "" {
+		if a.env.Hostname == nil {
+			return nil
+		}
+		if name, err = a.env.Hostname(); err != nil {
+			return nil
+		}
 	}
 	var b v1alpha1.Blip
-	err = a.c.Kube.Get(ctx, client.ObjectKey{Namespace: a.c.Namespace, Name: host}, &b)
+	err = a.c.Kube.Get(ctx, client.ObjectKey{Namespace: a.c.Namespace, Name: name}, &b)
 	switch {
 	case apierrors.IsNotFound(err):
 		return nil
 	case apierrors.IsForbidden(err):
-		return fmt.Errorf("cannot read blip %q to find out where this command runs: %w", host, err)
+		return fmt.Errorf("cannot read blip %q to find out where this command runs: %w", name, err)
 	case err != nil:
 		return err
 	}
@@ -211,7 +241,7 @@ func (a *app) progress(format string, args ...any) {
 
 // NewCommand returns the root command.
 func NewCommand(env *Env) *cobra.Command {
-	a := &app{env: env}
+	a := &app{env: env, args: env.Args}
 	root := &cobra.Command{
 		Use:         "blip",
 		Annotations: map[string]string{cobra.CommandDisplayNameAnnotation: "kubectl blip"},
@@ -244,6 +274,7 @@ shared bases. Use kubectl for everything else:
 
 // Main runs the command line and returns the process exit code.
 func Main(ctx context.Context, env *Env, args []string) int {
+	env.Args = args
 	cmd := NewCommand(env)
 	cmd.SetArgs(args)
 	err := cmd.ExecuteContext(ctx)
