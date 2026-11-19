@@ -815,6 +815,55 @@ func TestClientHalfCloseKeepsRequest(t *testing.T) {
 	}
 }
 
+// TestClientCloseCancelsUpstream checks that closing the guest connection, as
+// opposed to half-closing it, ends an in-flight watch. net/http alone only
+// reports read-side EOF, which the wave-4 half-close behaviour must tolerate;
+// the proxy distinguishes a full close and cancels the upstream request.
+func TestClientCloseCancelsUpstream(t *testing.T) {
+	upstreamDone := make(chan struct{}, 1)
+	upstream := tlsUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "{\"type\":\"ADDED\"}\n")
+		w.(http.Flusher).Flush()
+		// An idle watch produces no further bytes, so only cancellation can
+		// end this handler before the guard.
+		select {
+		case <-r.Context().Done():
+			upstreamDone <- struct{}{}
+		case <-time.After(20 * time.Second):
+		}
+	})
+	cfg := testConfig(t, upstream)
+	p := startProxy(t, cfg)
+
+	conn, err := net.Dial("unix", cfg.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprintf(conn, "GET /api/v1/pods?watch=true HTTP/1.1\r\nHost: kube-apiserver\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response headers: %v", err)
+	}
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil || line != "{\"type\":\"ADDED\"}\n" {
+		t.Fatalf("first watch event %q: %v", line, err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-upstreamDone:
+	case <-time.After(time.Second):
+		t.Error("upstream watch still running 1s after the guest closed the connection")
+	}
+	p.stop(t)
+}
+
 func TestStripIdentity(t *testing.T) {
 	for _, test := range []struct {
 		name string

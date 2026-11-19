@@ -28,6 +28,7 @@ import (
 
 	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
+	"golang.org/x/sys/unix"
 )
 
 const serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -177,8 +178,14 @@ type proxyServer struct {
 // half-close its write side after sending a complete request; net/http
 // cancels the per-request context when the read side reaches EOF, even
 // though the connection is still open for the response. Proxying against the
-// connection lifetime (which follows server shutdown) keeps the in-flight
-// request and response alive.
+// connection lifetime keeps the in-flight request and response alive for a
+// half-close, while cancelling it when the connection is really closed.
+//
+// net/http only reports read-side EOF, which is identical for a half-close
+// and a full close. The underlying Unix socket does distinguish the two:
+// a full close is reported as POLLHUP, a half-close only as POLLRDHUP. The
+// connection lifetime is cancelled immediately on POLLHUP and on Close, so a
+// guest that closes its socket stops an idle watch or stream.
 type connectionLifetimeKey struct{}
 
 func newProxyServer(ctx context.Context, socketPath string, handler http.Handler) (*proxyServer, error) {
@@ -196,8 +203,14 @@ func newProxyServer(ctx context.Context, socketPath string, handler http.Handler
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
-		ConnContext: func(connCtx context.Context, _ net.Conn) context.Context {
-			return context.WithValue(connCtx, connectionLifetimeKey{}, connCtx)
+		ConnContext: func(connCtx context.Context, conn net.Conn) context.Context {
+			lifetime, cancel := context.WithCancel(connCtx)
+			if c, ok := conn.(*trackedConn); ok {
+				c.setLifetimeCancel(cancel)
+			} else {
+				cancel()
+			}
+			return context.WithValue(lifetime, connectionLifetimeKey{}, lifetime)
 		},
 		ErrorLog: log.New(io.Discard, "", 0),
 	}
@@ -512,6 +525,64 @@ func (l *trackedListener) closeConnections() {
 type trackedConn struct {
 	net.Conn
 	listener *trackedListener
+	mu       sync.Mutex
+	closed   bool
+	// cancelLifetime ends in-flight upstream requests for this connection.
+	// It is set by ConnContext before the connection starts serving.
+	cancelLifetime context.CancelFunc
+}
+
+func (c *trackedConn) setLifetimeCancel(cancel context.CancelFunc) {
+	c.mu.Lock()
+	c.cancelLifetime = cancel
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		cancel()
+	}
+}
+
+// Read detects a fully closed peer. net/http reads the request and then runs a
+// background read; both see EOF for a half-close and for a full close. Only a
+// full close reports POLLHUP on the Unix socket, so it can end the connection
+// lifetime without breaking the wave-4 half-close behaviour.
+func (c *trackedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err != nil && errors.Is(err, io.EOF) && socketHungUp(c.Conn) {
+		c.endLifetime()
+	}
+	return n, err
+}
+
+// socketHungUp reports whether conn has been fully closed by its peer rather
+// than only half-closed. It is only meaningful after a read returned EOF.
+func socketHungUp(conn net.Conn) bool {
+	sysc, ok := conn.(syscall.Conn)
+	if !ok {
+		return false
+	}
+	raw, err := sysc.SyscallConn()
+	if err != nil {
+		return true
+	}
+	hungUp := false
+	err = raw.Control(func(fd uintptr) {
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLRDHUP}}
+		if n, _ := unix.Poll(fds, 0); n > 0 {
+			hungUp = fds[0].Revents&unix.POLLHUP != 0
+		}
+	})
+	// A connection that cannot expose its descriptor is already gone.
+	return err != nil || hungUp
+}
+
+func (c *trackedConn) endLifetime() {
+	c.mu.Lock()
+	cancel := c.cancelLifetime
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (c *trackedConn) CloseWrite() error {
@@ -523,6 +594,13 @@ func (c *trackedConn) CloseWrite() error {
 
 func (c *trackedConn) Close() error {
 	err := c.Conn.Close()
+	c.mu.Lock()
+	c.closed = true
+	cancel := c.cancelLifetime
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	c.listener.mu.Lock()
 	delete(c.listener.connections, c)
 	c.listener.mu.Unlock()
