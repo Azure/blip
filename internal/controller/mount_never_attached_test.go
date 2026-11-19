@@ -72,6 +72,70 @@ func TestRemovedNeverAttachedWritableMountIsDropped(t *testing.T) {
 	expectPhase(t, e.getBlip("git"), v1.BlipSucceeded, ReasonStopped)
 }
 
+// TestRemovedRejectedWritableMoveDoesNotFailBlip covers a writable mount
+// moved to a path the guest rejects. The CLI restores the old path, so the
+// failed entry (which never attached at the new path and never sealed) must
+// be dropped instead of being reported as a failed save that kills the
+// still-running Blip.
+func TestRemovedRejectedWritableMoveDoesNotFailBlip(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("data", "n1")
+	git := e.startBlip("git", "n1", e.withImage("reg/img:v1"))
+	pod := git.Status.Pod
+
+	e.updateRoot("git", func(b *v1.BlipState) {
+		b.Spec.Mounts = []v1.Mount{{State: "data", Path: "/data", Writable: true}}
+	})
+	e.run(e.blip, ns, "git")
+	m := mountOf(e.getBlip("git"), "data")
+	oldAttachment := m.AttachmentID
+	e.observe(pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{
+		{ID: oldAttachment, State: "data", Phase: podapi.DiskMounted},
+	}})
+	e.run(e.blip, ns, "git")
+
+	// Move the mount; the old disk is unmounted and saved, then the new
+	// attachment is refused by the guest at the destination.
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Path = "/usr/bin/awk" })
+	e.run(e.blip, ns, "git")
+	e.observe(pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{
+		{ID: oldAttachment, State: "data", Phase: podapi.DiskDetached},
+	}})
+	e.run(e.blip, ns, "git")
+	e.saveWriter("data", "c4c4c4c4c4c4c4c4")
+	e.run(e.blip, ns, "git")
+	m = mountOf(e.getBlip("git"), "data")
+	if m == nil || m.Phase != v1.MountPending || m.Path != "/usr/bin/awk" || m.AttachmentID == oldAttachment {
+		t.Fatalf("moved mount %+v", m)
+	}
+	rejected := m.AttachmentID
+	e.observe(pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{
+		{ID: rejected, State: "data", Phase: podapi.DiskFailed, Message: "/usr/bin/awk is a symlink or not a directory"},
+	}})
+	e.run(e.blip, ns, "git")
+	if m = mountOf(e.getBlip("git"), "data"); m == nil || m.Phase != v1.MountFailed {
+		t.Fatalf("rejected move %+v", m)
+	}
+	// The rejected attachment never attached, so the node has no volume to
+	// seal and releases its writer slot. This is the state the live cluster
+	// reported when the CLI rolled the path back.
+	e.setWriter("data", nil)
+
+	// The CLI restores the previous path after the guest rejection.
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Path = "/data" })
+	e.run(e.blip, ns, "git")
+	b := e.getBlip("git")
+	expectPhase(t, b, v1.BlipRunning, "")
+	if m = mountOf(b, "data"); m == nil || m.Path != "/data" || m.Phase != v1.MountPending || m.AttachmentID == rejected {
+		t.Fatalf("restored mount %+v", m)
+	}
+	if w := e.getState("data").Status.Writer; w != nil && w.AttachmentID == rejected {
+		t.Fatalf("rejected attachment still holds writer %s", rejected)
+	}
+}
+
 // TestRemovedAttachingWritableMountIsDropped covers the same removal after
 // the node reported an attaching disk that disappeared before Detached.
 func TestRemovedAttachingWritableMountIsDropped(t *testing.T) {

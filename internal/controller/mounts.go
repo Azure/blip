@@ -217,13 +217,16 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 		}
 		d, seen := disks[m.AttachmentID]
 		neverAttached := diskNeverAttached(obs, m.AttachmentID)
-		if m.Phase == v1.MountPending && m.Writable && neverAttached && !same && !stop && !m.Switching {
+		if (m.Phase == v1.MountPending || m.Phase == v1.MountFailed && !saveFailure) &&
+			m.Writable && neverAttached && !same && !stop && !m.Switching {
 			// The writable mount never attached (no disk, or only an
 			// attaching/failed one) and is being removed or changed,
-			// including a demotion. There is no working volume to save:
-			// release the writer and drop the entry instead of waiting
-			// for a seal that cannot happen. The spec loop below
-			// recreates the mount if it is still wanted.
+			// including a demotion and a failed attach that was rolled
+			// back. There is no working volume to save: release the
+			// writer and drop the entry instead of waiting for a seal
+			// that cannot happen. A recorded save failure is handled
+			// below and stays visible. The spec loop recreates the mount
+			// if it is still wanted.
 			if err := r.releaseUnattachedWriter(ctx, b, m.State, m.AttachmentID); err != nil {
 				return err
 			}
