@@ -171,6 +171,14 @@ spec:
                   reason:
                     type: string
                 type: object
+              retryAfter:
+                description: |-
+                  RetryAfter delays the next step after the pending input could not be
+                  rendered within the prompt budget. It is persisted so a restarted or
+                  newly elected blipchat retries at the same bounded cadence instead of
+                  re-rendering the same stalled prompt every tick.
+                format: date-time
+                type: string
               summary:
                 description: Summary is the coordinator's rolling summary of consumed
                   history.

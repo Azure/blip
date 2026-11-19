@@ -173,6 +173,13 @@ func (s *Server) shouldStep(ctx context.Context, thread *v1.BlipThread) bool {
 		return false
 	}
 	now := timeNow()
+	// A deferred stalled prompt is a durable decision, not just a process-local
+	// throttle. It must hold even when the input that caused the deferral (a
+	// Wake=Now turn or a kept due timer) is still pending, otherwise a restart
+	// or leader failover re-renders the same unrenderable backlog every tick.
+	if retry := thread.Status.RetryAfter; retry != nil && now.Before(retry.Time) {
+		return false
+	}
 	if wake := thread.Status.NextWake; wake != nil && !now.Before(wake.Time) {
 		return true
 	}
@@ -445,10 +452,15 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 	tokens := st.usage
 	today := started.UTC().Format("2006-01-02")
 	next := nextWake(st, started)
+	// RetryAfter is the durable form of the stalled-prompt backoff: unlike the
+	// in-memory map it survives a restart or leader change. Any completed step
+	// clears it, so it can never outlive the input it was waiting on.
+	var retryAfter *metav1.Time
 	if st.deferred {
 		// The step did not run, so retry after the bounded backoff rather
 		// than schedule an immediate wake for the same input.
-		next = &metav1.Time{Time: started.Add(stalledPromptBackoff)}
+		retryAfter = &metav1.Time{Time: started.Add(stalledPromptBackoff)}
+		next = retryAfter
 	}
 	for attempt := 0; attempt < 5; attempt++ {
 		current, err := s.currentThread(ctx, st.thread)
@@ -468,6 +480,7 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 		current.Status.Tasks = st.tasks
 		current.Status.Timers = st.timers
 		current.Status.NextWake = next
+		current.Status.RetryAfter = retryAfter
 		if current.Status.TokenDay != today {
 			current.Status.TokenDay = today
 			current.Status.TokensToday = 0

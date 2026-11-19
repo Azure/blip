@@ -88,6 +88,11 @@ type BlipThreadStatus struct {
 	Timers []ThreadTimer `json:"timers,omitempty"`
 	// NextWake is when blipchat next runs a step, if any.
 	NextWake *metav1.Time `json:"nextWake,omitempty"`
+	// RetryAfter delays the next step after the pending input could not be
+	// rendered within the prompt budget. It is persisted so a restarted or
+	// newly elected blipchat retries at the same bounded cadence instead of
+	// re-rendering the same stalled prompt every tick.
+	RetryAfter *metav1.Time `json:"retryAfter,omitempty"`
 	// TokensToday is the token spend in the current day.
 	TokensToday int64 `json:"tokensToday,omitempty"`
 	// TokenDay is the day TokensToday refers to, in YYYY-MM-DD. It resets

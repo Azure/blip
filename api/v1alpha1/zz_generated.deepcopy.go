@@ -651,6 +651,10 @@ func (in *BlipThreadStatus) DeepCopyInto(out *BlipThreadStatus) {
 		in, out := &in.NextWake, &out.NextWake
 		*out = (*in).DeepCopy()
 	}
+	if in.RetryAfter != nil {
+		in, out := &in.RetryAfter, &out.RetryAfter
+		*out = (*in).DeepCopy()
+	}
 	if in.Paused != nil {
 		in, out := &in.Paused, &out.Paused
 		*out = new(ThreadPause)
