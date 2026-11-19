@@ -835,6 +835,38 @@ func TestTurnOwnerPolicyPinsProducerIncarnation(t *testing.T) {
 	}
 }
 
+// blip-vm-owner restricts pod-bound tokens to service accounts of the request
+// namespace. blip-turn-owner must do the same: a token from another namespace
+// may reuse a pod name that happens to exist in this namespace's owner table.
+func TestTurnOwnerPolicyForeignNamespacePodTokenIgnored(t *testing.T) {
+	_, v := loadTurnPolicy(t)
+	self := "system:serviceaccount:" + ns + ":vm"
+	project := v1.ThreadOwner(ns, "proj")
+	victim := v1.ThreadOwner(ns, "victim")
+	params := map[string]string{
+		"sa.vm":                 "default",
+		"vm-pod":                project + " incarnation-proj",
+		"thread.proj":           project,
+		"thread.victim":         victim,
+		"thread-inc." + project: "incarnation-proj",
+		"thread-inc." + victim:  "incarnation-victim",
+	}
+	foreign := &user.DefaultInfo{
+		Name:  "system:serviceaccount:other:vm",
+		Extra: map[string][]string{"authentication.kubernetes.io/pod-name": {"vm-pod"}},
+	}
+	req := policyRequest{user: foreign, op: admission.Create, resource: "blipturns", name: "turn",
+		object: turnFor("victim", "ServiceAccount", self)}
+	if allow, msg := req.evaluate(t, v, params); !allow {
+		t.Fatalf("foreign-namespace pod token was matched by the policy: %s", msg)
+	}
+	// The same pod name in the request namespace is still bound to its project.
+	if allow, msg := (policyRequest{user: vmUser("vm", "vm-pod"), op: admission.Create, resource: "blipturns",
+		name: "turn", object: turnFor("victim", "ServiceAccount", self)}).evaluate(t, v, params); allow {
+		t.Fatalf("same-namespace pod token escaped its project: %s", msg)
+	}
+}
+
 // A CREATE must fail closed when the owner table is absent. The binding uses
 // parameterNotFoundAction Deny (checked in loadTurnPolicy); even a validator
 // run with no params must not treat the caller as unbound.

@@ -4,6 +4,10 @@
 # its own identity, so a turn can never claim to be a user without going
 # through the authenticated front end.
 #
+# Only a pod-bound token whose service account belongs to the request
+# namespace is matched: pod names are namespace-local, so another namespace's
+# token must never resolve an owner entry in this namespace's table.
+#
 # A pod-bound VM token is additionally bound to its own project: the
 # controller records each thread's owner hash in blip-vm-owners, and the
 # caller's claimed pod maps to the same hash. The blip.dev/thread and
@@ -138,7 +142,8 @@ spec:
     - name: pod-bound-service-account-token
       expression: >-
         has(request.userInfo.extra) &&
-        'authentication.kubernetes.io/pod-name' in request.userInfo.extra
+        'authentication.kubernetes.io/pod-name' in request.userInfo.extra &&
+        request.userInfo.username.startsWith('system:serviceaccount:' + request.namespace + ':')
   variables:
     - name: blipchat
       expression: >-
