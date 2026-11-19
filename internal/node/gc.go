@@ -151,8 +151,27 @@ func (v *view) keepCommit(c storage.Volume, sealed map[string][]v1alpha1.SealRes
 		return true
 	}
 	if st.Committed.ID == id {
+		// A node that still reports the committed commit holds its only copy
+		// when placements omitted it (for example it was not usable at
+		// save-report time). Never delete that copy just because the
+		// controller failed to list the holder.
 		return slices.Contains(st.Placements, v.node) ||
-			(st.Pending != nil && slices.Contains(st.Pending.Replicas, v.node))
+			(st.Pending != nil && slices.Contains(st.Pending.Replicas, v.node)) ||
+			v.reportsCommit(s, id)
+	}
+	return false
+}
+
+// reportsCommit reports whether this node's current incarnation still reports
+// holding id for s.
+func (v *view) reportsCommit(s *v1alpha1.BlipState, id string) bool {
+	for _, o := range s.Status.Nodes {
+		if o.Node != v.node || !slices.Contains(o.Commits, id) {
+			continue
+		}
+		if bn := v.blipNodes[o.Node]; bn != nil && bn.Status.Incarnation == o.Incarnation {
+			return true
+		}
 	}
 	return false
 }

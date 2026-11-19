@@ -812,6 +812,17 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 			fallback = fmt.Sprintf("saved generation %d with fewer replicas: %s", p.Generation, strings.Join(dropped, "; "))
 		}
 	}
+	if len(p.Replicas) == 0 {
+		// A committed generation must list a node that reports holding it:
+		// node GC keeps a committed commit only on a listed placement, so an
+		// empty list would let it delete the only copy. Prefer a holder, then
+		// wait for the sealing source if no node reports the commit yet.
+		if n := anyHolder(st, cl, p); n != "" {
+			p.Replicas = []string{n}
+		} else {
+			p.Replicas = []string{p.SourceNode}
+		}
+	}
 	var waiting, errs []string
 	for _, n := range p.Replicas {
 		if !cl.holds(st, n, p.CommitID) {
@@ -1015,6 +1026,21 @@ func drainSaveExpired(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
 	}
 	bn := cl.nodes[p.SourceNode]
 	return bn != nil && bn.Spec.Drain && servingSource(st, cl, p)
+}
+
+// anyHolder returns a node that reports holding the pending commit, preferring
+// the sealing source. It ignores health and usability: the commit exists only
+// where some node reports it, and placements must name at least one such node.
+func anyHolder(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) string {
+	if cl.holds(st, p.SourceNode, p.CommitID) {
+		return p.SourceNode
+	}
+	for _, n := range cl.names {
+		if cl.holds(st, n, p.CommitID) {
+			return n
+		}
+	}
+	return ""
 }
 
 // usableHolder returns a usable replica that holds the pending commit.
