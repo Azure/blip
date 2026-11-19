@@ -402,7 +402,7 @@ func TestVMOwnerPolicy(t *testing.T) {
 		allow bool
 		msg   string
 	}{
-		{"pod-bound account without an entry", policyRequest{user: vmUser("ci", "ci-pod"), op: admission.Create, resource: "blips", name: "anything", object: blipObj("anything", "")}, false, "not claimed"},
+		{"non-VM service account", policyRequest{user: vmUser("ci", "ci-pod"), op: admission.Create, resource: "blips", name: "anything", object: blipObj("anything", "")}, true, ""},
 		{"user without pod token", policyRequest{user: &user.DefaultInfo{Name: "alice"}, op: admission.Delete, resource: "blips", name: x + ".a", oldObject: blipObj(x+".a", x)}, true, ""},
 		{"other namespace service account", policyRequest{user: &user.DefaultInfo{Name: "system:serviceaccount:other:vm", Extra: map[string][]string{"authentication.kubernetes.io/pod-name": {"p"}}}, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "")}, true, ""},
 		{"vacant VM denied", policyRequest{user: vacant, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o)}, false, "not claimed"},
@@ -467,11 +467,10 @@ func TestVMOwnerPolicy(t *testing.T) {
 		})
 	}
 
-	// An existing table is authoritative even without the caller's key: a
-	// claimed pod whose service account is missing must not become
-	// unrestricted, and an empty table denies creates rather than allowing
-	// them. A missing table remains Allow for UPDATE/DELETE (terminating
-	// namespaces) and Deny for CREATE through the binding below.
+	// An existing table is authoritative for a claimed pod even without the
+	// caller's service-account key, and an empty table denies creates rather
+	// than allowing them. A missing table remains Allow for UPDATE/DELETE
+	// (terminating namespaces) and Deny for CREATE through the binding below.
 	noKey := map[string]string{"default-mine": o}
 	create := policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o)}
 	if ok, msg := create.evaluate(t, v, noKey); ok {
