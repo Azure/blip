@@ -447,14 +447,23 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 
 // hardenGitArgs disables repository configuration that can run commands while
 // an inspection command runs. core.fsmonitor makes `git status` execute a
-// configured helper, and diff textconv filters run for `git diff` and
-// `git log -p`. Neither is part of looking, so override both even though the
-// workspace controls its own config.
+// configured helper, diff textconv filters run for `git diff` and `git log -p`,
+// and gpg.program or log.showSignature can make a signed commit run a program
+// while its history is displayed. None of that is part of looking, so override
+// all of it even though the workspace controls its own config. This is defense
+// in depth: readOnly rejects the options that use these programs.
 func hardenGitArgs(argv []string) []string {
 	if len(argv) < 2 || argv[0] != "git" {
 		return argv
 	}
-	out := []string{"git", "-c", "core.fsmonitor=false", argv[1]}
+	out := []string{
+		"git",
+		"-c", "core.fsmonitor=false",
+		"-c", "diff.external=",
+		"-c", "gpg.program=/bin/false",
+		"-c", "log.showSignature=false",
+		argv[1],
+	}
 	switch argv[1] {
 	case "diff", "log", "show":
 		out = append(out, "--no-ext-diff", "--no-textconv")
@@ -513,16 +522,23 @@ func readOnlyGit(args []string) error {
 	}
 	switch args[0] {
 	case "status", "log", "diff", "show", "rev-parse":
-		for _, arg := range args[1:] {
-			if isGitEscape(arg) {
-				return fmt.Errorf("git option %q can execute commands or write files", arg)
+		for i := 1; i < len(args); i++ {
+			if isGitEscape(args[i]) {
+				return fmt.Errorf("git option %q can execute commands or write files", args[i])
+			}
+			if gitArgRunsProgram(args, i) {
+				return fmt.Errorf("git option %q can execute repository-configured programs", args[i])
 			}
 		}
 		return nil
 	case "branch":
-		for _, arg := range args[1:] {
+		for i := 1; i < len(args); i++ {
+			arg := args[i]
 			if isGitEscape(arg) {
 				return fmt.Errorf("git option %q can execute commands or write files", arg)
+			}
+			if gitArgRunsProgram(args, i) {
+				return fmt.Errorf("git option %q can execute repository-configured programs", arg)
 			}
 			if !strings.HasPrefix(arg, "-") {
 				return fmt.Errorf("git branch may only list branches")
@@ -534,6 +550,36 @@ func readOnlyGit(args []string) error {
 		return nil
 	}
 	return fmt.Errorf("only read-only git subcommands are allowed here")
+}
+
+// gitArgRunsProgram reports whether args[i] asks git to execute a program named
+// by repository configuration. Merge drivers run for --remerge-diff and for
+// --diff-merges=remerge; gpg runs for --show-signature and for %G format atoms
+// when a commit carries a signature.
+func gitArgRunsProgram(args []string, i int) bool {
+	arg := args[i]
+	if strings.Contains(arg, "%G") || strings.Contains(arg, "%(signature)") {
+		return true
+	}
+	switch {
+	case arg == "--remerge-diff",
+		arg == "--show-signature",
+		arg == "--gpg-sign",
+		strings.HasPrefix(arg, "--gpg-sign="):
+		return true
+	case arg == "--diff-merges":
+		return i+1 < len(args) && isRemergeValue(args[i+1])
+	case strings.HasPrefix(arg, "--diff-merges="):
+		return isRemergeValue(strings.TrimPrefix(arg, "--diff-merges="))
+	}
+	return false
+}
+
+// isRemergeValue reports whether a --diff-merges value selects the remerge
+// mode, whose implementation invokes merge.<driver>.driver from repo config.
+func isRemergeValue(v string) bool {
+	v = strings.ToLower(v)
+	return v == "remerge" || v == "r"
 }
 
 func isGitEscape(arg string) bool {
