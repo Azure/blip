@@ -88,7 +88,7 @@ func (s *step) tools() []Tool {
 			map[string]any{"text": str("Note text")},
 		), "text")),
 		FunctionTool("remember", "Replace the rolling summary of consumed history.", schema(props(
-			map[string]any{"text": str("New summary, at most 16 KiB")},
+			map[string]any{"text": str("New summary, at most 16,384 characters")},
 		), "text")),
 		FunctionTool("idle", "Record that there is nothing to do. The heartbeat still wakes the coordinator while tasks are open.", schema(props())),
 	}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -30,11 +31,27 @@ const (
 	turnField = "spec.thread"
 	// budgetPauseReason is the only pause blipchat clears automatically.
 	budgetPauseReason = "daily token budget exhausted"
-	// promptBudget bounds the turns section of one step's user prompt.
+	// promptBudget bounds one step's whole user prompt. The CRD permits fixed
+	// inputs (a summary, 32 timer notes, a task board) larger than this, so
+	// each section is bounded before the turns get the remainder.
 	promptBudget = 48000
 	// boardBudget bounds the task board so it cannot crowd the turns out of
 	// the prompt. The CRD allows a board far larger than a whole prompt.
 	boardBudget = promptBudget / 2
+	// summaryBudget bounds the rolling summary included in one prompt. The
+	// CRD limit is 16384 code points, which can be up to 64 KiB as UTF-8.
+	summaryBudget = promptBudget / 8
+	// timerBudget bounds all fired timer notes together. ThreadTimer.Note has
+	// no CRD length limit, so 32 notes can otherwise be unbounded.
+	timerBudget = promptBudget / 8
+	// timerNotePromptBudget bounds one timer note in the prompt by bytes.
+	timerNotePromptBudget = 128
+	// maxTurnPromptBytes bounds one rendered turn line. At most one such line
+	// may be forced in over the turn budget to keep the newest turn visible.
+	maxTurnPromptBytes = 2048
+	// turnPromptReserve keeps room for that forced line and the omission
+	// notices the turn renderer may add around it.
+	turnPromptReserve = maxTurnPromptBytes + 1 + 256
 	// stalledPromptBackoff delays a thread whose pending turns cannot be
 	// rendered within promptBudget at all. Without it the same unrenderable
 	// input would return to shouldStep every tick.
@@ -591,23 +608,107 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 	var b strings.Builder
 	b.WriteString("Task board:\n")
 	renderBoard(&b, tasks, boardBudget)
-	if summary != "" {
-		fmt.Fprintf(&b, "\nSummary of earlier history:\n%s\n", summary)
-	}
-	if len(timers) > 0 {
-		b.WriteString("\nTimers that fired:\n")
-		for _, timer := range timers {
-			fmt.Fprintf(&b, "- %s: %s\n", timer.At.Format(time.RFC3339), timer.Note)
-		}
-	}
+	writeSummary(&b, summary, summaryBudget)
+	writeTimers(&b, timers, timerBudget)
 	b.WriteString("\nNew turns (oldest first):\n")
 	if len(turns) == 0 {
 		b.WriteString("(none; this is a scheduled wake-up)\n")
 		return b.String(), 0
 	}
 
-	last := boardTurns(&b, turns, promptBudget-b.Len())
+	// The turn renderer may keep the newest line even when it alone exceeds
+	// the remaining budget, so reserve that space while sizing the section.
+	last := boardTurns(&b, turns, promptBudget-b.Len()-turnPromptReserve)
 	return b.String(), last
+}
+
+const (
+	truncatedSummaryNotice = "(summary truncated to fit the prompt budget)\n"
+	truncatedTimerNotice   = "(timer notes truncated to fit the prompt budget)\n"
+	timerLineOverhead      = len("- 2006-01-02T15:04:05Z: \n")
+)
+
+// writeSummary writes the rolling summary under budget. A CRD-legal summary
+// can be 64 KiB as UTF-8, so an oversized one is clipped at a rune boundary
+// with a notice instead of crowding the turns out of the prompt.
+func writeSummary(b *strings.Builder, summary string, budget int) {
+	if summary == "" {
+		return
+	}
+	b.WriteString("\nSummary of earlier history:\n")
+	if len(summary) <= budget {
+		b.WriteString(summary)
+		b.WriteString("\n")
+		return
+	}
+	keep := budget - len(truncatedSummaryNotice) - 1
+	if keep < 0 {
+		keep = 0
+	}
+	b.WriteString(truncateBytes(summary, keep))
+	if keep > 0 {
+		b.WriteString("\n")
+	}
+	b.WriteString(truncatedSummaryNotice)
+}
+
+// writeTimers writes the fired timer notes under budget. Timer notes have no
+// CRD length limit, so each is clipped and the whole section is fitted with a
+// notice. The API caps timers at 32, which normally leaves every note visible.
+func writeTimers(b *strings.Builder, timers []v1.ThreadTimer, budget int) {
+	if len(timers) == 0 {
+		return
+	}
+	b.WriteString("\nTimers that fired:\n")
+	// Reserve the truncation notice while sizing each note so a clipped set
+	// cannot grow past the section budget.
+	noteBudget := timerNotePromptBudget
+	if per := (budget-len(truncatedTimerNotice))/len(timers) - timerLineOverhead; per < noteBudget {
+		noteBudget = per
+	}
+	if noteBudget < 0 {
+		noteBudget = 0
+	}
+	lines := make([]string, len(timers))
+	used := 0
+	clipped := false
+	for i, timer := range timers {
+		note := truncateBytes(timer.Note, noteBudget)
+		if note != timer.Note {
+			clipped = true
+		}
+		lines[i] = fmt.Sprintf("- %s: %s\n", timer.At.Format(time.RFC3339), note)
+		used += len(lines[i])
+	}
+	notice := ""
+	if clipped {
+		notice = truncatedTimerNotice
+	}
+	// Defensive: a budget too small even for clipped lines drops the newest
+	// notes with a count instead of overrunning the prompt.
+	for used+len(notice) > budget && len(lines) > 0 {
+		used -= len(lines[len(lines)-1])
+		lines = lines[:len(lines)-1]
+		notice = fmt.Sprintf("(%d timer notes omitted to fit the prompt budget)\n", len(timers)-len(lines))
+	}
+	b.WriteString(notice)
+	for _, line := range lines {
+		b.WriteString(line)
+	}
+}
+
+// truncateBytes cuts s to at most n bytes without splitting a UTF-8 rune.
+func truncateBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // renderBoard writes the task board under budget. A full board can be far
@@ -746,8 +847,8 @@ func boardTurns(b *strings.Builder, turns []v1.BlipTurn, budget int) int64 {
 	lines := make([]string, len(turns))
 	for i := range turns {
 		line := renderTurn(&turns[i])
-		if len(line) > 2048 {
-			line = truncateRunes(line, 2048)
+		if len(line) > maxTurnPromptBytes {
+			line = truncateBytes(line, maxTurnPromptBytes)
 		}
 		lines[i] = line + "\n"
 	}
