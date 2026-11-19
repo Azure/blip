@@ -63,7 +63,10 @@ blip's branch or files, and deletes each blip with its workspace. `git:`
 collection fetches commits only: uncommitted and untracked changes are not
 collected, and gather prints a warning when it finds them. A gather whose
 operations resolve two blips to the same destination is rejected; use `{name}`
-so each blip writes somewhere different. `-f` streams
+so each blip writes somewhere different. `--collect` splits SRC and DEST at the
+last `:`, so neither may contain one. `blip mount` accepts paths with `:` (for
+example `/a:b`), but such a mount cannot be collected: mount that data at a
+colon-free path if you need to gather it. `-f` streams
 a running fork's output; `--any` returns on the first finish; `--wait` bounds
 the wait; a fork whose command failed or whose results could not be collected
 is kept for inspection until its TTL (1h by default) deletes it.

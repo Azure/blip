@@ -1065,7 +1065,9 @@ in the running command. Outside one, --root names the state to edit.
 
 A PATH may contain ':' (for example /a:b). A trailing :rw or :ro is a mode
 only when the PATH before it contains no colon; input with both is ambiguous
-and rejected.`,
+and rejected. gather --collect cannot name a mounted path that contains ':'
+(it splits SRC:DEST at the last colon), so mount anything you intend to
+collect at a path without a colon.`,
 		Example: `  blip mount repo:/work:rw
   blip mount --rm repo
   blip mount --new cache:/cache:rw --size 20Gi

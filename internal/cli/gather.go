@@ -53,6 +53,9 @@ operation fetches commits only; uncommitted and untracked changes are not
 collected, and a warning is printed when a worktree has them. Two operations
 that expand to the same destination are rejected instead of overwriting each
 other; {name} keeps each blip's destination distinct.
+SRC and DEST must not contain ':'; the last ':' separates them. A mount whose
+path contains ':' (which mount accepts) therefore cannot be collected
+directly: mount the data at a colon-free path to collect it.
 --collect only works inside a blip, because it copies into the caller's
 workspace. Outside a blip, gather with --keep to keep the blip and its
 workspace for later inspection.
@@ -73,7 +76,7 @@ blips are deleted with their workspaces.`,
 	}
 	fl := cmd.Flags()
 	fl.StringVarP(&f.selector, "selector", "l", "", "label selector of blips to gather")
-	fl.StringArrayVar(&f.collect, "collect", nil, "copy out of each blip: SRC:DEST (split at the last ':') or git:SRC:BRANCH (inside a blip only; commits only; {name} is the blip's name; repeatable)")
+	fl.StringArrayVar(&f.collect, "collect", nil, "copy out of each blip: SRC:DEST (split at the last ':'; neither SRC nor DEST may contain ':') or git:SRC:BRANCH (inside a blip only; commits only; {name} is the blip's name; repeatable)")
 	fl.BoolVar(&f.any, "any", false, "return as soon as one blip finishes or cannot be observed")
 	fl.DurationVar(&f.wait, "wait", 0, "give up waiting after this long (0 waits forever)")
 	fl.BoolVarP(&f.follow, "follow", "f", false, "stream the output of blips while they run")
