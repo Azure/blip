@@ -597,26 +597,31 @@ func (a *app) follow(ctx context.Context, name string) {
 		// command to the serial console, and the controller retains the tail
 		// in status. Try both even when our cached view still says Running:
 		// the pod can disappear between the wait and this attach.
-		if a.replayLogs(ctx, pod, short) {
-			return
-		}
 		ending = ending || a.blipEnding(ctx, name)
-		// A finished, empty-output Blip whose pod is gone cannot publish
-		// output later: the controller writes status.output before it deletes
-		// the pod. Do not spend the retained-output grace on it.
-		if ending && a.outputFinal(ctx, name, pod) {
-			return
-		}
-		if a.printRetainedFor(ctx, name, short, 3*time.Second) {
+		if ending {
+			if a.replayFinished(ctx, name, short, pod, 3*time.Second, true) {
+				return
+			}
+		} else if a.replayLogs(ctx, pod, short) {
 			return
 		}
 		if ctx.Err() != nil {
 			return
 		}
+		if !ending && a.printRetainedFor(ctx, name, short, 3*time.Second) {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		// The controller can still report Running for an already-exited
+		// command. Re-check before warning: losing an empty stream is not a
+		// failure, but a real attach failure for a running Blip still is.
+		if a.endedWithoutOutput(ctx, name) {
+			return
+		}
 		if ending {
-			if !a.endedWithoutOutput(ctx, name) {
-				a.progress("%s: output is no longer available: %v", short, err)
-			}
+			a.progress("%s: output is no longer available: %v", short, err)
 			return
 		}
 		a.progress("%s: could not follow output: %v", short, err)
@@ -641,7 +646,7 @@ func (a *app) follow(ctx context.Context, name string) {
 		return
 	}
 	if !out.wrote && !errw.wrote && (ending || a.blipEnding(ctx, name)) {
-		if !a.replayLogs(ctx, pod, short) && !a.printRetained(ctx, name, short) && !a.endedWithoutOutput(ctx, name) {
+		if !a.replayFinished(ctx, name, short, pod, retainedOutputWait, false) && !a.endedWithoutOutput(ctx, name) {
 			a.progress("%s: output is no longer available", short)
 		}
 	}
@@ -664,7 +669,7 @@ func (a *app) replayTruncatedOutput(ctx context.Context, name, short, pod string
 		a.progress("%s: output stream ended before the command exited; output above may be incomplete", short)
 		return
 	}
-	if a.printRetainedFor(ctx, name, short, truncatedOutputWait) || a.replayLogs(ctx, pod, short) {
+	if a.replayFinished(ctx, name, short, pod, truncatedOutputWait, false) {
 		a.progress("%s: output stream ended before the command exited; replayed the retained output (lines above may repeat)", short)
 		return
 	}
@@ -727,9 +732,19 @@ func (a *app) printRetained(ctx context.Context, name, short string) bool {
 
 // printRetainedFor is printRetained with a caller-selected grace period.
 func (a *app) printRetainedFor(ctx context.Context, name, short string, wait time.Duration) bool {
+	out, ok := a.retainedOutputFor(ctx, name, wait)
+	if !ok {
+		return false
+	}
+	return a.printCombined(short, out)
+}
+
+// retainedOutputFor polls status.output until the controller publishes it or
+// wait expires. It returns the retained output and whether any was found.
+func (a *app) retainedOutputFor(ctx context.Context, name string, wait time.Duration) (string, bool) {
 	c, err := a.clients()
 	if err != nil {
-		return false
+		return "", false
 	}
 	deadline := time.Now().Add(wait)
 	for {
@@ -737,51 +752,158 @@ func (a *app) printRetainedFor(ctx context.Context, name, short string, wait tim
 		err := c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: name}, b)
 		switch {
 		case err == nil && b.Status.Output != "":
-			// status.output is the combined stdout and stderr tail
-			// recovered from the serial console, so its streams cannot be
-			// split again. Write it to stderr rather than pretend it is
-			// the command's stdout.
-			w := &prefixWriter{out: a.env.Err, prefix: short + "|"}
-			_, _ = w.Write([]byte(b.Status.Output))
-			w.flush()
-			return w.wrote
+			return b.Status.Output, true
 		case apierrors.IsNotFound(err):
 			// The Blip is gone, so no later status write can arrive.
-			return false
+			return "", false
 		case ctx.Err() != nil || !time.Now().Before(deadline):
-			return false
+			return "", false
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return "", false
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
 
-// replayLogs prints the command output preserved on the VM serial console.
+// serialOutput reads the command output preserved on the VM serial console.
 // The guest prefixes mirrored output with "blip: ", which separates it from
-// kernel and runtime boot messages. The mirror combines stdout and stderr
-// without a stream tag, so the output goes to stderr rather than pretending
-// it is the command's stdout. It returns whether it printed anything.
-func (a *app) replayLogs(ctx context.Context, pod, short string) bool {
+// kernel and runtime boot messages. It returns the combined stdout/stderr
+// text and whether the console was readable at all.
+func (a *app) serialOutput(ctx context.Context, pod string) (string, bool) {
 	c, err := a.clients()
 	if err != nil || c.Logs == nil {
-		return false
+		return "", false
 	}
 	rc, err := c.Logs(ctx, pod)
 	if err != nil {
-		return false
+		return "", false
 	}
 	defer rc.Close()
-	w := &prefixWriter{out: a.env.Err, prefix: short + "|"}
+	var b strings.Builder
 	sc := bufio.NewScanner(rc)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
 		if line, ok := strings.CutPrefix(sc.Text(), "blip: "); ok {
-			_, _ = w.Write([]byte(line + "\n"))
+			b.WriteString(line)
+			b.WriteByte('\n')
 		}
 	}
+	return b.String(), true
+}
+
+// replayLogs prints the command output preserved on the VM serial console.
+// The mirror combines stdout and stderr without a stream tag, so the output
+// goes to stderr rather than pretending it is the command's stdout. It
+// returns whether it printed anything.
+func (a *app) replayLogs(ctx context.Context, pod, short string) bool {
+	out, ok := a.serialOutput(ctx, pod)
+	if !ok {
+		return false
+	}
+	return a.printCombined(short, out)
+}
+
+// statusOutputTruncated is the controller's marker for a status tail whose
+// head was dropped to fit the retention bound.
+const statusOutputTruncated = "[earlier output was truncated]"
+
+// droppedLinesMarker reports the guest console's in-band notice that lines
+// were dropped from its bounded queue.
+func droppedLinesMarker(line string) bool {
+	count, ok := strings.CutSuffix(strings.TrimSpace(line), " output lines dropped")
+	if !ok || count == "" {
+		return false
+	}
+	for _, r := range count {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func outputTruncated(out string) bool {
+	if strings.Contains(out, statusOutputTruncated) {
+		return true
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if droppedLinesMarker(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// bestRetained chooses one complete tail without printing both. status.output
+// is the controller's stable copy; the serial console is a fallback when its
+// replay is more complete. A truncated source only wins when the other source
+// is missing or also truncated.
+func bestRetained(status string, hasStatus bool, serial string, hasSerial bool) (string, bool) {
+	switch {
+	case !hasStatus && !hasSerial:
+		return "", false
+	case !hasStatus:
+		return serial, outputTruncated(serial)
+	case !hasSerial:
+		return status, outputTruncated(status)
+	}
+	statusTruncated, serialTruncated := outputTruncated(status), outputTruncated(serial)
+	switch {
+	case statusTruncated && !serialTruncated:
+		return serial, false
+	case serialTruncated && !statusTruncated:
+		return status, false
+	}
+	// Both sources are either complete or truncated. Never concatenate them:
+	// prefer the longer tail, and status.output on a tie because it is the
+	// controller's authoritative retention.
+	if len(serial) > len(status) {
+		return serial, statusTruncated
+	}
+	return status, serialTruncated
+}
+
+// replayFinished prints the best retained output for a Blip that is finished
+// or saving. A command that finished before the follower attached may have
+// left only a bounded serial window; the controller's status.output is the
+// authoritative tail and may be more complete. It returns whether it printed
+// anything and warns only when every available source is truncated.
+func (a *app) replayFinished(ctx context.Context, name, short, pod string, wait time.Duration, final bool) bool {
+	status, hasStatus := a.retainedOutputFor(ctx, name, 0)
+	serial, hasSerial := a.serialOutput(ctx, pod)
+	if !hasStatus && (serial == "" || outputTruncated(serial)) {
+		// The serial replay is empty or incomplete, so wait briefly for the
+		// controller to publish a more complete status tail. When the attach
+		// already failed, a finished empty-output Blip whose pod is gone
+		// cannot publish anything later, so do not spend the grace on it.
+		if final && a.outputFinal(ctx, name, pod) {
+			return false
+		}
+		status, hasStatus = a.retainedOutputFor(ctx, name, wait)
+	}
+	out, truncated := bestRetained(status, hasStatus, serial, hasSerial)
+	if out == "" {
+		return false
+	}
+	if !a.printCombined(short, out) {
+		return false
+	}
+	if truncated {
+		a.progress("%s: output is truncated; only the retained tail is available", short)
+	}
+	return true
+}
+
+// printCombined writes stdout+stderr output that cannot be split again to
+// stderr with the blip prefix. It returns whether it wrote anything.
+func (a *app) printCombined(short, out string) bool {
+	if out == "" {
+		return false
+	}
+	w := &prefixWriter{out: a.env.Err, prefix: short + "|"}
+	_, _ = w.Write([]byte(out))
 	w.flush()
 	return w.wrote
 }

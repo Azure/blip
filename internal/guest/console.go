@@ -18,8 +18,14 @@ const (
 	consoleMirrorPrefix = "blip: "
 	// consoleMirrorQueue bounds lines waiting for the console writer. When
 	// it is full the oldest lines are dropped rather than blocking the
-	// command, so the newest output survives.
-	consoleMirrorQueue = 256
+	// command, so the newest output survives. It is large enough to hold the
+	// byte budget even when every line is a single byte.
+	consoleMirrorQueue = 32 << 10
+	// consoleMirrorBudget bounds the queued line bytes. It matches the
+	// controller's retained status tail, so a command that finishes before a
+	// follower attaches can still be replayed from status.output instead of
+	// only the last few hundred console lines.
+	consoleMirrorBudget = 64 << 10
 	// consoleMirrorLineMax bounds a partial line held between writes. A
 	// longer line is flushed as-is instead of growing without bound.
 	consoleMirrorLineMax = 4 << 10
@@ -34,6 +40,7 @@ type consoleMirror struct {
 
 	mu       sync.Mutex
 	pending  []byte // partial line waiting for its newline
+	queued   int    // line bytes currently in lines
 	dropped  int    // lines discarded while the queue was full
 	closed   bool
 	started  bool
@@ -125,20 +132,38 @@ func (m *consoleMirror) feed(data []byte) {
 func (m *consoleMirror) enqueueLocked(line string) {
 	// The console must not see CR, so a CRLF line ends up as one LF.
 	line = strings.TrimSuffix(line, "\r")
+	n := len(line) + 1
 	select {
 	case m.lines <- line:
+		m.queued += n
 	default:
 		// The queue is full. Discard the oldest queued line so the window
 		// the console (and status.output) keeps is the command's tail.
-		select {
-		case <-m.lines:
-			m.dropped++
-		default:
-			// The writer drained a line first; nothing was lost.
-		}
-		// Only this goroutine sends on m.lines, so the slot just freed
-		// (or taken by the writer) is available without blocking.
+		m.dropOldestLocked()
+		// Only this goroutine sends on m.lines, so the slot just freed is
+		// available without blocking.
 		m.lines <- line
+		m.queued += n
+	}
+	// Keep the retained window within the same byte bound as status.output,
+	// even when the line channel still has capacity.
+	for m.queued > consoleMirrorBudget {
+		if !m.dropOldestLocked() {
+			return
+		}
+	}
+}
+
+// dropOldestLocked discards the oldest queued line if one is available. The
+// caller holds m.mu.
+func (m *consoleMirror) dropOldestLocked() bool {
+	select {
+	case old := <-m.lines:
+		m.queued -= len(old) + 1
+		m.dropped++
+		return true
+	default:
+		return false
 	}
 }
 
@@ -146,6 +171,9 @@ func (m *consoleMirror) enqueueLocked(line string) {
 func (m *consoleMirror) run() {
 	defer close(m.finished)
 	for line := range m.lines {
+		m.mu.Lock()
+		m.queued -= len(line) + 1
+		m.mu.Unlock()
 		m.writeLine(line)
 		if len(m.lines) == 0 {
 			m.writeDropped()

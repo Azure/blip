@@ -50,9 +50,12 @@ func TestConsoleMirrorFlushesOverlongPartialLine(t *testing.T) {
 func TestConsoleMirrorDropsOldestWhenQueueIsFull(t *testing.T) {
 	var buf bytes.Buffer
 	m := newConsoleMirror(&buf)
+	const lineLen = 70 // fixed line text plus the newline counted by the budget
+	capacity := consoleMirrorBudget / lineLen
 	const extra = 7
-	for i := range consoleMirrorQueue + extra {
-		m.feed([]byte(fmt.Sprintf("line-%d\n", i)))
+	for i := range capacity + extra {
+		line := fmt.Sprintf("line-%05d%s", i, strings.Repeat("x", lineLen-11))
+		m.feed([]byte(line + "\n"))
 	}
 	m.mu.Lock()
 	dropped := m.dropped
@@ -64,14 +67,14 @@ func TestConsoleMirrorDropsOldestWhenQueueIsFull(t *testing.T) {
 	m.start()
 	m.stop()
 	out := buf.String()
-	if n := strings.Count(out, "\n"); n != consoleMirrorQueue+1 {
-		t.Fatalf("console has %d lines, want %d", n, consoleMirrorQueue+1)
+	if n := strings.Count(out, "\n"); n != capacity+1 {
+		t.Fatalf("console has %d lines, want %d", n, capacity+1)
 	}
-	if strings.Contains(out, "blip: line-0\n") {
+	if strings.Contains(out, "blip: line-00000") {
 		t.Fatal("mirror kept the oldest line instead of dropping it")
 	}
-	if !strings.Contains(out, fmt.Sprintf("blip: line-%d\n", extra)) ||
-		!strings.Contains(out, fmt.Sprintf("blip: line-%d\n", consoleMirrorQueue+extra-1)) {
+	if !strings.Contains(out, "blip: line-00007") ||
+		!strings.Contains(out, fmt.Sprintf("blip: line-%05d", capacity+extra-1)) {
 		t.Fatal("mirror lost the newest lines")
 	}
 	if !strings.HasSuffix(out, fmt.Sprintf("blip: %d output lines dropped\n", extra)) {
@@ -79,27 +82,29 @@ func TestConsoleMirrorDropsOldestWhenQueueIsFull(t *testing.T) {
 	}
 }
 
-// A command that writes far more lines than the queue holds must leave the
+// A command that writes far more lines than the budget holds must leave the
 // newest lines on the console, including its final line.
 func TestConsoleMirrorKeepsTailOfLongOutput(t *testing.T) {
 	var buf bytes.Buffer
 	m := newConsoleMirror(&buf)
-	for i := range 1000 {
-		m.feed([]byte(fmt.Sprintf("LINE%04d\n", i)))
+	const lineLen = 11 // "LINE" + six digits + newline
+	total := consoleMirrorBudget/lineLen + 500
+	for i := range total {
+		m.feed([]byte(fmt.Sprintf("LINE%06d\n", i)))
 	}
 	m.start()
 	m.stop()
 	out := buf.String()
-	if strings.Contains(out, "blip: LINE0000\n") {
+	if strings.Contains(out, "blip: LINE000000\n") {
 		t.Fatal("mirror kept the head of the output")
 	}
-	if !strings.Contains(out, "blip: LINE0999\n") {
+	if !strings.Contains(out, fmt.Sprintf("blip: LINE%06d\n", total-1)) {
 		t.Fatalf("mirror lost the final line: %q", out)
 	}
 	if drop := strings.Index(out, "output lines dropped"); drop < 0 {
 		t.Fatal("mirror did not report dropped lines")
 	}
-	// Every retained line is a contiguous suffix ending at LINE0999.
+	// Every retained line is a contiguous suffix ending at the final line.
 	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
 	for i, line := range lines {
 		if strings.Contains(line, "output lines dropped") {
@@ -107,8 +112,31 @@ func TestConsoleMirrorKeepsTailOfLongOutput(t *testing.T) {
 			break
 		}
 	}
-	want := fmt.Sprintf("blip: LINE%04d", 1000-len(lines))
+	want := fmt.Sprintf("blip: LINE%06d", total-len(lines))
 	if lines[0] != want {
 		t.Fatalf("retained window starts at %q, want %q", lines[0], want)
+	}
+}
+
+// Output smaller than the byte budget is retained in full, even when it spans
+// far more lines than the old 256-line window. This is what lets the
+// controller's status tail replay a fast 10,000-line command without loss.
+func TestConsoleMirrorKeepsTenThousandShortLines(t *testing.T) {
+	var buf bytes.Buffer
+	m := newConsoleMirror(&buf)
+	for i := 1; i <= 10000; i++ {
+		m.feed([]byte(fmt.Sprintf("%d\n", i)))
+	}
+	m.start()
+	m.stop()
+	out := buf.String()
+	if strings.Contains(out, "output lines dropped") {
+		t.Fatalf("mirror dropped output below its byte budget: %q", out[len(out)-200:])
+	}
+	if n := strings.Count(out, "\n"); n != 10000 {
+		t.Fatalf("console has %d lines, want 10000", n)
+	}
+	if !strings.HasPrefix(out, "blip: 1\n") || !strings.HasSuffix(out, "blip: 10000\n") {
+		t.Fatalf("console lost the head or tail: %.80q ... %.80q", out, out[len(out)-80:])
 	}
 }

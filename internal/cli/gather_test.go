@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -798,6 +799,104 @@ func TestGatherFollowReplaysSerialLogWhenSessionIsGone(t *testing.T) {
 	}
 	if strings.Contains(errOut, "boot") || strings.Contains(errOut, "blip-guest") {
 		t.Fatalf("serial noise leaked into output: %q", errOut)
+	}
+}
+
+// A fast command that finished before the follower attached leaves only a
+// bounded serial window, but the controller's status.output holds the tail.
+// gather -f must prefer the complete status copy instead of printing the
+// truncated serial replay and losing the middle of the output.
+func TestGatherFollowPrefersCompleteRetainedOutputOverTruncatedSerial(t *testing.T) {
+	for _, n := range []int{300, 10000} {
+		t.Run(fmt.Sprintf("%d lines", n), func(t *testing.T) {
+			var all strings.Builder
+			for i := 1; i <= n; i++ {
+				fmt.Fprintf(&all, "%d\n", i)
+			}
+			b := finishedBlip("fast", v1alpha1.BlipSucceeded, 0)
+			b.Status.Output = all.String()
+			h := newHarness(t, b)
+			h.guest.OpenError = "no session"
+			// The serial console keeps only its newest window and says so.
+			h.logs = func(context.Context, string) (io.ReadCloser, error) {
+				start := max(1, n-255)
+				var s strings.Builder
+				for i := start; i <= n; i++ {
+					fmt.Fprintf(&s, "blip: %d\n", i)
+				}
+				if dropped := start - 1; dropped > 0 {
+					fmt.Fprintf(&s, "blip: %d output lines dropped\n", dropped)
+				}
+				return io.NopCloser(strings.NewReader(s.String())), nil
+			}
+
+			code, out, errOut := h.run("", "gather", "fast", "-f")
+			if code != 0 {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if got := strings.Count(errOut, "fast| "); got != n {
+				t.Fatalf("replayed %d lines, want %d: %s", got, n, errOut)
+			}
+			mustContain(t, out, "blip/fast Succeeded (exit 0)")
+			if strings.Contains(errOut, "output is truncated") {
+				t.Fatalf("warned about truncation although status.output is complete: %q", errOut)
+			}
+		})
+	}
+}
+
+// When both the status tail and the serial replay are complete, gather -f
+// prints the output once instead of concatenating both copies.
+func TestGatherFollowDoesNotDuplicateCompleteRetainedOutput(t *testing.T) {
+	var all strings.Builder
+	for i := 1; i <= 300; i++ {
+		fmt.Fprintf(&all, "%d\n", i)
+	}
+	b := finishedBlip("fast", v1alpha1.BlipSucceeded, 0)
+	b.Status.Output = all.String()
+	h := newHarness(t, b)
+	h.guest.OpenError = "no session"
+	h.logs = func(context.Context, string) (io.ReadCloser, error) {
+		var s strings.Builder
+		for i := 1; i <= 300; i++ {
+			fmt.Fprintf(&s, "blip: %d\n", i)
+		}
+		return io.NopCloser(strings.NewReader(s.String())), nil
+	}
+
+	code, _, errOut := h.run("", "gather", "fast", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if got := strings.Count(errOut, "fast| "); got != 300 {
+		t.Fatalf("replayed %d lines, want 300 (duplicate sources?): %s", got, errOut)
+	}
+	if strings.Contains(errOut, "output is truncated") {
+		t.Fatalf("unexpected truncation warning: %q", errOut)
+	}
+}
+
+// When both sources are truncated, gather -f prints one tail and warns that
+// earlier output is gone instead of looking like a complete replay.
+func TestGatherFollowWarnsWhenBothRetainedSourcesAreTruncated(t *testing.T) {
+	b := finishedBlip("fast", v1alpha1.BlipSucceeded, 0)
+	b.Status.Output = statusOutputTruncated + "\n299\n300\n"
+	h := newHarness(t, b)
+	h.guest.OpenError = "no session"
+	h.logs = func(context.Context, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("blip: 299\nblip: 300\nblip: 298 output lines dropped\n")), nil
+	}
+
+	code, _, errOut := h.run("", "gather", "fast", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, errOut, "fast| 299", "fast| 300", "output is truncated")
+	if got := strings.Count(errOut, "fast| 299"); got != 1 {
+		t.Fatalf("replayed the tail %d times, want once: %s", got, errOut)
+	}
+	if got := strings.Count(errOut, "fast| 300"); got != 1 {
+		t.Fatalf("replayed the final line %d times, want once: %s", got, errOut)
 	}
 }
 
