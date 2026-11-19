@@ -171,6 +171,13 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// upstream response bodies. Keep them in the server log only.
 		c.Server.logError(err, "chat request failed",
 			"thread", thread.Namespace+"/"+thread.Name, "user", user)
+		if errors.Is(err, errStaleIncarnation) {
+			// The name now belongs to a different incarnation. A retry
+			// looks the thread up again and must not deliver the old
+			// project's directive to the new one.
+			http.Error(w, "thread changed; retry", http.StatusConflict)
+			return
+		}
 		http.Error(w, "chat backend unavailable", http.StatusBadGateway)
 		return
 	}
@@ -203,11 +210,14 @@ func decodeChatRequest(w http.ResponseWriter, r *http.Request, req *chatRequest)
 }
 
 func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
+	if err := c.assertCurrent(ctx); err != nil {
+		return "", err
+	}
 	model := c.thread.Spec.Model
 	if model == "" {
 		model = c.s.Config.Model
 	}
-	messages := []Message{{Role: "system", Content: c.system()}}
+	messages := []Message{{Role: "system", Content: c.system(ctx)}}
 	for _, h := range req.History {
 		if h.Role != "user" && h.Role != "assistant" {
 			continue
@@ -232,6 +242,12 @@ func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
 		), "blip")),
 	}
 	for calls := 0; calls < 10; calls++ {
+		// The model may have deleted or recreated the thread during the
+		// previous round. Abandon rather than reading or writing the new
+		// incarnation's board, turns, or blips.
+		if err := c.assertCurrent(ctx); err != nil {
+			return "", err
+		}
 		reply, _, err := c.s.LLM.Chat(ctx, model, messages, tools)
 		if err != nil {
 			return "", err
@@ -241,6 +257,9 @@ func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
 			return reply.Content, nil
 		}
 		for _, call := range reply.ToolCalls {
+			if err := c.assertCurrent(ctx); err != nil {
+				return "", err
+			}
 			result, err := c.call(ctx, call.Function.Name, call.Function.Arguments)
 			if err != nil {
 				result = "error: " + err.Error()
@@ -251,7 +270,18 @@ func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
 	return "I could not finish that in time. Please try again.", nil
 }
 
-func (c *chatStep) system() string {
+// assertCurrent rejects a chat snapshot whose thread name was deleted or
+// recreated. A request that looked up one incarnation must never read or
+// write another's state.
+func (c *chatStep) assertCurrent(ctx context.Context) error {
+	_, err := c.s.currentThread(ctx, c.thread)
+	if apierrors.IsNotFound(err) {
+		return errStaleIncarnation
+	}
+	return err
+}
+
+func (c *chatStep) system(ctx context.Context) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are the engineer-facing assistant for the Blip project %q. Users talk to you; you can read the coordinator's board and turns and propose work by sending a turn to the coordinator. You cannot do work yourself.\n\n", c.thread.Namespace+"/"+c.thread.Name)
 	b.WriteString("Use send with topic chat.propose when the user asks for work, chat.answer to answer a question aimed at the coordinator, and chat.note for context. Do not claim work is done before a turn reports it.\n\nCharter:\n")
@@ -264,7 +294,8 @@ func (c *chatStep) system() string {
 		fmt.Fprintf(&b, "- %s %s %q\n", t.ID, openState(t.Open), t.Title)
 	}
 	b.WriteString("\nRecent turns:\n")
-	ctx := context.Background()
+	// Use the request context so a canceled or expired chat does not spend
+	// time listing turns for a prompt that can no longer be sent.
 	turns, err := c.s.recentTurns(ctx, c.thread, 0, 30)
 	if err == nil {
 		for i := range turns {
@@ -295,7 +326,8 @@ func (c *chatStep) call(ctx context.Context, name, arguments string) (string, er
 			return "", fmt.Errorf("invalid topic %q", topic)
 		}
 		if err := createTurnIn(ctx, c.s.Client, c.thread.Namespace, fmt.Sprintf("chat-%d-%s", timeNow().UnixNano(), shortUser(c.user)), turnSpec{
-			Thread: c.thread.Name, AuthorKind: v1.TurnAuthorUser, AuthorName: c.user,
+			Thread: c.thread.Name, ThreadUID: string(c.thread.UID),
+			AuthorKind: v1.TurnAuthorUser, AuthorName: c.user,
 			Topic: topic, Text: truncateRunes(strArg("text"), 2048), Wake: v1.WakeBatch,
 		}); err != nil {
 			return "", err
