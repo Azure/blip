@@ -328,3 +328,42 @@ func TestRememberEmptyTextClearsSummary(t *testing.T) {
 		t.Errorf("summary after remember(\"\") = %q, want cleared", updated.Status.Summary)
 	}
 }
+
+// A negative inReplyTo would make the BlipTurn invalid and wedge the step, so
+// the tool rejects it before recording a reply.
+func TestReplyRejectsNegativeInReplyTo(t *testing.T) {
+	st := &step{s: &Server{}, thread: testThread()}
+	ctx := context.Background()
+	if _, err := st.call(ctx, "reply", `{"inReplyTo":-1,"text":"bad reply"}`); err == nil {
+		t.Fatal("reply accepted inReplyTo=-1")
+	}
+	if len(st.replies) != 0 {
+		t.Errorf("rejected reply was recorded: %+v", st.replies)
+	}
+	if _, err := st.call(ctx, "reply", `{"inReplyTo":0,"text":"ok"}`); err != nil {
+		t.Fatalf("reply with inReplyTo=0 was rejected: %v", err)
+	}
+	if len(st.replies) != 1 || st.replies[0].InReplyTo != 0 {
+		t.Errorf("valid reply = %+v", st.replies)
+	}
+}
+
+// createTurnIn is the last gate before the API write, so it drops a negative
+// reference instead of storing a CRD-invalid turn.
+func TestCreateTurnDropsNegativeInReplyTo(t *testing.T) {
+	c := testClient(t, testThread())
+	ctx := context.Background()
+	if err := createTurnIn(ctx, c, "ns", "coord-negative", turnSpec{
+		Thread: "proj", AuthorKind: v1.TurnAuthorCoordinator, AuthorName: "proj",
+		Topic: "coordinator.reply", Text: "bad", InReplyTo: -1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var turn v1.BlipTurn
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "coord-negative"}, &turn); err != nil {
+		t.Fatal(err)
+	}
+	if turn.Spec.InReplyTo < 0 {
+		t.Errorf("stored inReplyTo = %d, want clamped to >= 0", turn.Spec.InReplyTo)
+	}
+}

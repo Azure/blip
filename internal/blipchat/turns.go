@@ -32,6 +32,9 @@ func createTurnIn(ctx context.Context, c client.Client, namespace, name string, 
 	if spec.Wake == "" {
 		spec.Wake = v1.WakeBatch
 	}
+	if spec.InReplyTo < 0 {
+		spec.InReplyTo = 0
+	}
 	turn := &v1.BlipTurn{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: v1.BlipTurnSpec{

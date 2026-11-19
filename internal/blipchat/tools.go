@@ -78,7 +78,7 @@ func (s *step) tools() []Tool {
 			map[string]any{"note": str("Why to wake")},
 		), "at")),
 		FunctionTool("reply", "Write a turn answering a user or blip turn.", schema(props(
-			map[string]any{"inReplyTo": map[string]any{"type": "integer", "description": "Sequence number being answered"}},
+			map[string]any{"inReplyTo": map[string]any{"type": "integer", "minimum": 0, "description": "Sequence number being answered"}},
 			map[string]any{"text": str("Reply text, at most 2048 characters")},
 		), "text")),
 		FunctionTool("note", "Record a short decision or observation for later steps.", schema(props(
@@ -205,6 +205,9 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 		return "timer " + id + " at " + at.Format(time.RFC3339), nil
 	case "reply":
 		seq, _ := args["inReplyTo"].(float64)
+		if seq < 0 {
+			return "", fmt.Errorf("inReplyTo must be a non-negative sequence number")
+		}
 		s.replies = append(s.replies, v1.BlipTurnSpec{
 			Thread: s.thread.Name, Author: v1.TurnAuthor{Kind: v1.TurnAuthorCoordinator, Name: s.thread.Name},
 			Topic: "coordinator.reply", InReplyTo: int64(seq), Text: truncateRunes(strArg("text"), 2048), Wake: v1.WakeNone,
