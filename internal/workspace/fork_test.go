@@ -229,8 +229,11 @@ func TestForkPreservesStatesAfterAmbiguousCreate(t *testing.T) {
 				src.Spec.Mounts = []v1alpha1.Mount{{State: "a", Path: "/a", Writable: true}, {State: "b", Path: "/b", Writable: true}}
 				base := testClient(t, src, testState("a"), testState("b"))
 				var persisted []client.ObjectKey
+				uids := 0
 				c := interceptor.NewClient(base, interceptor.Funcs{
 					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						uids++
+						obj.SetUID(types.UID(fmt.Sprintf("uid-%d", uids)))
 						// The server commits the object, but the client never gets
 						// the response (or its assigned resourceVersion and UID).
 						if err := c.Create(ctx, obj.DeepCopyObject().(client.Object), opts...); err != nil {
@@ -246,17 +249,19 @@ func TestForkPreservesStatesAfterAmbiguousCreate(t *testing.T) {
 						return nil
 					},
 					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-						t.Fatalf("ambiguous create caused deletion of %q", obj.GetName())
-						return nil
+						if stage == "root" {
+							t.Fatalf("ambiguous root create caused deletion of %q", obj.GetName())
+						}
+						options := &client.DeleteOptions{}
+						options.ApplyOptions(opts)
+						if options.Preconditions == nil || options.Preconditions.UID == nil {
+							t.Fatalf("child rollback did not pin %q's UID", obj.GetName())
+						}
+						return c.Delete(ctx, obj, opts...)
 					},
 				})
 				if _, err := Fork(ctx, c, src, dest, nil); !errors.Is(err, tc.err) {
 					t.Fatalf("error: %v, want %v", err, tc.err)
-				}
-				for _, key := range persisted {
-					if err := base.Get(context.Background(), key, &v1alpha1.BlipState{}); err != nil {
-						t.Fatalf("persisted state %q lost: %v", key.Name, err)
-					}
 				}
 				var root v1alpha1.BlipState
 				err := base.Get(context.Background(), client.ObjectKeyFromObject(dest), &root)
@@ -264,7 +269,21 @@ func TestForkPreservesStatesAfterAmbiguousCreate(t *testing.T) {
 					if !apierrors.IsNotFound(err) || len(persisted) != 2 {
 						t.Fatalf("continued after ambiguous child create: root error %v, created %v", err, persisted)
 					}
+					// Children known by UID are rolled back. The create whose
+					// response was lost may have persisted an ownerless state
+					// with no UID to pin, so it is left for explicit cleanup.
+					if err := base.Get(context.Background(), persisted[0], &v1alpha1.BlipState{}); !apierrors.IsNotFound(err) {
+						t.Fatalf("child before the ambiguous create was not rolled back: %v", err)
+					}
+					if err := base.Get(context.Background(), persisted[1], &v1alpha1.BlipState{}); err != nil {
+						t.Fatalf("ambiguous child state lost: %v", err)
+					}
 					return
+				}
+				for _, key := range persisted {
+					if err := base.Get(context.Background(), key, &v1alpha1.BlipState{}); err != nil {
+						t.Fatalf("persisted state %q lost: %v", key.Name, err)
+					}
 				}
 				if err != nil || len(root.Spec.Mounts) != 2 {
 					t.Fatalf("persisted root: %+v, %v", root, err)
@@ -307,6 +326,65 @@ func TestForkRollsBackValidationRejection(t *testing.T) {
 			for _, original := range []string{"source", "a", "b"} {
 				if err := base.Get(ctx, client.ObjectKey{Namespace: "ns", Name: original}, &v1alpha1.BlipState{}); err != nil {
 					t.Fatalf("source %q lost: %v", original, err)
+				}
+			}
+		})
+	}
+}
+
+// TestForkRollsBackChildrenAfterTransportError covers a transport error or
+// cancellation while creating the second writable-mount copy. No root exists
+// yet, so the child already created by this call is an orphan and must be
+// rolled back even though the error does not prove the failed create was
+// rejected.
+func TestForkRollsBackChildrenAfterTransportError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"canceled", context.Canceled},
+		{"deadline", context.DeadlineExceeded},
+		{"response lost", io.ErrUnexpectedEOF},
+		{"server failure", apierrors.NewInternalError(errors.New("response lost"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			src, dest := testState("source"), testState("worker")
+			src.Spec.Mounts = []v1alpha1.Mount{{State: "a", Path: "/a", Writable: true}, {State: "b", Path: "/b", Writable: true}}
+			base := testClient(t, src, testState("a"), testState("b"))
+			creates, uids := 0, 0
+			c := interceptor.NewClient(base, interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					creates++
+					if creates == 2 {
+						return tc.err
+					}
+					uids++
+					obj.SetUID(types.UID(fmt.Sprintf("uid-%d", uids)))
+					return c.Create(ctx, obj, opts...)
+				},
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					options := &client.DeleteOptions{}
+					options.ApplyOptions(opts)
+					if options.Preconditions == nil || options.Preconditions.UID == nil {
+						t.Fatalf("rollback did not pin %q's UID", obj.GetName())
+					}
+					return c.Delete(ctx, obj, opts...)
+				},
+			})
+			if _, err := Fork(ctx, c, src, dest, nil); !errors.Is(err, tc.err) {
+				t.Fatalf("error: %v, want %v", err, tc.err)
+			}
+			var states v1alpha1.BlipStateList
+			if err := base.List(ctx, &states); err != nil {
+				t.Fatal(err)
+			}
+			if len(states.Items) != 3 {
+				t.Fatalf("rollback left %d states: %+v", len(states.Items), states.Items)
+			}
+			for _, name := range []string{"source", "a", "b"} {
+				if err := base.Get(ctx, client.ObjectKey{Namespace: "ns", Name: name}, &v1alpha1.BlipState{}); err != nil {
+					t.Fatalf("source %q lost: %v", name, err)
 				}
 			}
 		})

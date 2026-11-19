@@ -31,11 +31,11 @@ type ForkOptions struct {
 //
 // The caller supplies dest's name, namespace, labels, provisioning overrides
 // (size, replicas and nodeSelector) and, in opts, the owner of the new states.
-// Fork sets copyFrom, runtime and mounts. It creates the root last. Only a
-// definitive API rejection triggers removal of states created by this call,
-// with UID preconditions protecting replaced objects. Ambiguous failures
-// preserve them: the failed create may have persisted a root referencing those
-// children even though its response was lost.
+// Fork sets copyFrom, runtime and mounts. It creates the root last. Any failure
+// before the root exists removes the child states this call created, with UID
+// preconditions protecting replaced objects. An ambiguous root create preserves
+// the children: the root may have persisted and reference them even though its
+// response was lost.
 //
 // On success Fork returns the states it created, root last. A caller that
 // cannot keep the fork (for example because the new state never became usable)
@@ -104,12 +104,17 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 		}
 	}
 	var created []*v1alpha1.BlipState
-	for _, st := range copies {
+	for i, st := range copies {
 		if err := c.Create(ctx, st); err != nil {
 			result := fmt.Errorf("create state %q: %w", st.Name, err)
-			if !createRejected(err) {
+			if i == len(copies)-1 && !createRejected(err) {
+				// The root create may have persisted an object that
+				// references the children. Keep them for that root.
 				return nil, result
 			}
+			// No root exists yet, so every child created by this call is an
+			// orphan, including after a cancellation or transport error.
+			// deleteCreated pins the UIDs of the states we know we created.
 			return nil, errors.Join(result, deleteCreated(ctx, c, created))
 		}
 		created = append(created, st)
