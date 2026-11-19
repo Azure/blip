@@ -44,7 +44,36 @@ func checkMountPath(p string, existing []string) error {
 }
 
 func overlaps(a, b string) bool {
-	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+	// Known image aliases are resolved lexically here and by mountpath.
+	// Image-specific aliases are handled by checkMountTarget, which compares
+	// the directories the guest actually opened.
+	return mountpath.Overlap(a, b)
+}
+
+// checkMountTarget rejects a resolved mount target that equals or contains an
+// existing resolved target. Written paths can differ through an image symlink
+// (/bin/x and /usr/bin/x, /var/spool/mail/x and /var/mail/x) while naming one
+// guest directory; mounting both would stack filesystems at one point and make
+// path-based unmount remove the wrong attachment. root is the guest root, used
+// only to show the resolved guest path in the error.
+func checkMountTarget(root, p, target string, existing []*mount) error {
+	for _, e := range existing {
+		if overlaps(target, e.target) {
+			return fmt.Errorf("mount path %s resolves to %s, which overlaps mount %s at %s",
+				p, guestPath(root, target), e.id, e.path)
+		}
+	}
+	return nil
+}
+
+// guestPath turns a path inside root back into the guest-visible path for an
+// error message. It falls back to the original path if it is not below root.
+func guestPath(root, p string) string {
+	rel, err := filepath.Rel(filepath.Clean(root), p)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return p
+	}
+	return "/" + filepath.ToSlash(rel)
 }
 
 // mountPointInRoot creates the directory a user mount will attach to and

@@ -186,6 +186,45 @@ func TestOverlap(t *testing.T) {
 	}
 }
 
+// TestOverlapResolvesImageAliases reproduces the alias mounts the guest used to
+// stack at one directory because every offline check compared written paths.
+func TestOverlapResolvesImageAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name, a, b string
+		want       bool
+	}{
+		{"usr-merge bin", "/bin/x", "/usr/bin/x", true},
+		{"usr-merge sbin", "/sbin/x", "/usr/sbin/x", true},
+		{"usr-merge lib", "/lib/x", "/usr/lib/x", true},
+		{"usr-merge lib64", "/lib64/x", "/usr/lib64/x", true},
+		{"mail spool", "/var/spool/mail/x", "/var/mail/x", true},
+		{"nested through alias", "/bin/x/sub", "/usr/bin/x", true},
+		{"same alias family but distinct", "/bin/x", "/usr/bin/y", false},
+		{"mail alias sibling", "/var/spool/mail/x", "/var/mail/y", false},
+		{"plain distinct", "/bin/x", "/usr/sbin/x", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Overlap(tc.a, tc.b); got != tc.want {
+				t.Errorf("Overlap(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveAliases(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"/bin/x", "/usr/bin/x"},
+		{"/usr/bin/x", "/usr/bin/x"},
+		{"/var/spool/mail/x", "/var/mail/x"},
+		{"/var/run/blip/x", "/run/blip/x"},
+		{"/binomial", "/binomial"},
+	} {
+		if got := Resolve(tc.in); got != tc.want {
+			t.Errorf("Resolve(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestCollectMountPath(t *testing.T) {
 	for _, tc := range []struct {
 		path string

@@ -373,6 +373,56 @@ func TestCheckMountPath(t *testing.T) {
 	}
 }
 
+// TestCheckMountPathResolvesAliases reproduces two states mounted at different
+// written paths that the guest resolves to one directory. The written path
+// check must already see the conflict; doMount additionally checks the actual
+// target for image-specific aliases.
+func TestCheckMountPathResolvesAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name, existing, added string
+	}{
+		{"bin", "/bin/x", "/usr/bin/x"},
+		{"sbin", "/sbin/x", "/usr/sbin/x"},
+		{"lib", "/lib/x", "/usr/lib/x"},
+		{"mail spool", "/var/spool/mail/x", "/var/mail/x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, paths := range [][2]string{{tc.existing, tc.added}, {tc.added, tc.existing}} {
+				if err := checkMountPath(paths[0], []string{paths[1]}); err == nil {
+					t.Errorf("checkMountPath(%q) accepted alias of existing %q", paths[0], paths[1])
+				}
+			}
+		})
+	}
+}
+
+// TestCheckMountTargetUsesResolvedDirectory covers an image-specific symlink
+// the offline alias list cannot know: the guest must compare the directories
+// it actually opened, not the written paths.
+func TestCheckMountTargetUsesResolvedDirectory(t *testing.T) {
+	root := t.TempDir()
+	existing := []*mount{{
+		id:     "lower",
+		path:   "/var/spool/mail/x",
+		target: filepath.Join(root, "var/mail/x"),
+	}}
+	// The same resolved directory through another spelling is a duplicate.
+	err := checkMountTarget(root, "/var/mail/x", filepath.Join(root, "var/mail/x"), existing)
+	if err == nil || !strings.Contains(err.Error(), "resolves to /var/mail/x") ||
+		!strings.Contains(err.Error(), "overlaps mount lower at /var/spool/mail/x") {
+		t.Fatalf("same target: %v", err)
+	}
+	// Nesting the other way is an overlap too.
+	err = checkMountTarget(root, "/var/mail/x/sub", filepath.Join(root, "var/mail/x/sub"), existing)
+	if err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("nested target: %v", err)
+	}
+	// A sibling stays legal.
+	if err := checkMountTarget(root, "/var/mail/y", filepath.Join(root, "var/mail/y"), existing); err != nil {
+		t.Fatalf("sibling target rejected: %v", err)
+	}
+}
+
 func TestMkdirInRoot(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

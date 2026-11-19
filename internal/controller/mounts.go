@@ -158,7 +158,9 @@ func pathError(p string) string {
 }
 
 func overlaps(a, b string) bool {
-	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+	// Resolve known image aliases so /bin/x and /usr/bin/x are one mount
+	// identity here too, not only in the guest.
+	return mountpath.Overlap(a, b)
 }
 
 // syncMounts moves status mounts through their phases from the runtime's

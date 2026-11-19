@@ -18,13 +18,22 @@ const CollectRoot = "/run/blip-collect"
 var Reserved = []string{"/proc", "/sys", "/dev", "/run/blip", CollectRoot}
 
 // Aliases are directory symlinks commonly present in the base image. The guest
-// resolves them before it checks a mount target, so the preflight must resolve
-// them too: /var/run/blip/x reaches the reserved /run/blip/x even though the
-// spelling is not lexically reserved. Only well-known system aliases belong
-// here; image-specific symlinks cannot be known offline.
+// resolves them before it checks a mount target, so everything that compares
+// mount identities offline must resolve them too: /var/run/blip/x reaches the
+// reserved /run/blip/x even though the spelling is not lexically reserved, and
+// /bin/x and /usr/bin/x name one directory. Only well-known system aliases
+// belong here; image-specific symlinks cannot be known offline and are caught
+// by the guest against its resolved mount targets.
 var Aliases = []struct{ Path, Target string }{
 	{"/var/run", "/run"},
 	{"/var/lock", "/run/lock"},
+	// usr-merge aliases in the Ubuntu/Debian base image.
+	{"/bin", "/usr/bin"},
+	{"/sbin", "/usr/sbin"},
+	{"/lib", "/usr/lib"},
+	{"/lib64", "/usr/lib64"},
+	// Debian's mail spool alias: /var/spool/mail -> ../mail.
+	{"/var/spool/mail", "/var/mail"},
 }
 
 // resolveAlias rewrites a path whose first component is a known alias. It does
@@ -37,6 +46,24 @@ func resolveAlias(p string) string {
 		if strings.HasPrefix(p, a.Path+"/") {
 			return a.Target + strings.TrimPrefix(p, a.Path)
 		}
+	}
+	return p
+}
+
+// Resolve returns the canonical offline identity of a mount path: known base
+// image directory aliases are replaced by their targets. The result is still
+// lexical. Image-specific symlinks and ".." through them can only be resolved
+// inside the guest root, so the guest repeats the overlap check against the
+// actual resolved directory.
+func Resolve(p string) string {
+	// Follow chained aliases, but bound the walk in case a future entry
+	// introduces a cycle.
+	for i := 0; i <= len(Aliases); i++ {
+		next := resolveAlias(p)
+		if next == p {
+			return p
+		}
+		p = next
 	}
 	return p
 }
@@ -86,8 +113,11 @@ var ImageFiles = []string{
 	"/etc/mtab",
 }
 
-// Overlap reports whether either path contains the other.
+// Overlap reports whether either path contains the other after both are
+// reduced to their canonical offline identity. This makes an alias such as
+// /bin/x overlap /usr/bin/x, which the guest would resolve to one directory.
 func Overlap(a, b string) bool {
+	a, b = Resolve(a), Resolve(b)
 	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
 
@@ -141,7 +171,7 @@ func Validate(p string) error {
 	if err := validatePath(p); err != nil {
 		return err
 	}
-	if target := resolveAlias(p); target != p {
+	if target := Resolve(p); target != p {
 		if err := validatePath(target); err != nil {
 			return fmt.Errorf("mount path %s resolves to %s: %w", p, target, err)
 		}

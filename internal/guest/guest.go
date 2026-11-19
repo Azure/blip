@@ -687,7 +687,9 @@ func (g *Guest) unmountAllLocked() error {
 	for _, m := range g.mounts {
 		aux = append(aux, m)
 	}
-	sort.Slice(aux, func(i, j int) bool { return len(aux[i].path) > len(aux[j].path) })
+	// Sort by the resolved target, not the written path: aliases can make a
+	// longer spelling sit above a shorter one.
+	sort.Slice(aux, func(i, j int) bool { return len(aux[i].target) > len(aux[j].target) })
 	for _, m := range aux {
 		if err := unmount(m.target, 25); err != nil {
 			errs = append(errs, err)
@@ -793,6 +795,16 @@ func (g *Guest) doMount(m wire.Mount) error {
 		return err
 	}
 	defer unix.Close(fd)
+	// The written paths may be disjoint while the guest resolves them through
+	// an image symlink to one directory. Reject that before stacking two
+	// filesystems there; unmount is path-based and would detach the top one.
+	var attached []*mount
+	for _, x := range g.mounts {
+		attached = append(attached, x)
+	}
+	if err := checkMountTarget(g.root, p, target, attached); err != nil {
+		return err
+	}
 	var flags uintptr
 	data := ""
 	if m.ReadOnly {
@@ -843,6 +855,8 @@ func (g *Guest) doUnmount(id string) error {
 	if g.anyFrozen() {
 		return errors.New("a filesystem is frozen")
 	}
+	// Mount targets are unique after checkMountTarget, so the path-based
+	// unmount can only detach this attachment.
 	if err := unmount(m.target, 1); err != nil {
 		return err
 	}

@@ -547,6 +547,8 @@ func TestBlipValidationAndWaiting(t *testing.T) {
 		{"duplicate state", "home", []v1.Mount{{State: "data", Path: "/data"}, {State: "data", Path: "/other"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"empty mount state", "home", []v1.Mount{{Path: "/data"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"overlap", "home", []v1.Mount{{State: "data", Path: "/a"}, {State: "other", Path: "/a/b"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"alias duplicate path", "home", []v1.Mount{{State: "data", Path: "/bin/x"}, {State: "other", Path: "/usr/bin/x"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"mail alias duplicate path", "home", []v1.Mount{{State: "data", Path: "/var/spool/mail/x"}, {State: "other", Path: "/var/mail/x"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"root also mounted", "home", []v1.Mount{{State: "home", Path: "/data"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"component over NAME_MAX", "home", []v1.Mount{{State: "data", Path: "/" + strings.Repeat("a", 300)}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"path at PATH_MAX", "home", []v1.Mount{{State: "data", Path: "/" + strings.Repeat("a", 4095)}}, v1.BlipFailed, ReasonInvalidSpec},

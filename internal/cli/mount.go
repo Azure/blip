@@ -111,11 +111,11 @@ type mountRequest struct {
 	writable bool
 }
 
-// mountPathsOverlap reports whether either path contains the other. It mirrors
-// the controller's topology rule; a root with an overlapping set is rejected on
-// every execution.
+// mountPathsOverlap reports whether either path contains the other after both
+// are reduced to their canonical offline identity. It mirrors the controller's
+// topology rule; a root with an overlapping set is rejected on every execution.
 func mountPathsOverlap(a, b string) bool {
-	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+	return mountpath.Overlap(a, b)
 }
 
 // mountPathConflict checks mountPath against the other states already in the
@@ -126,8 +126,8 @@ func mountPathConflict(root string, mounts []v1alpha1.Mount, state, mountPath st
 		if other.State == state {
 			continue
 		}
-		if other.Path == mountPath {
-			return fmt.Errorf("root state %q already has state %q mounted at %s", root, other.State, mountPath)
+		if mountpath.Resolve(other.Path) == mountpath.Resolve(mountPath) {
+			return fmt.Errorf("root state %q already has state %q mounted at %s", root, other.State, other.Path)
 		}
 		if mountPathsOverlap(other.Path, mountPath) {
 			return fmt.Errorf("mount %s: path %s overlaps mount %s at %s", state, mountPath, other.State, other.Path)

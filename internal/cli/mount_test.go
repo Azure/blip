@@ -1254,6 +1254,43 @@ func TestMountRejectsDuplicateMounts(t *testing.T) {
 	})
 }
 
+// TestMountRejectsAliasDuplicateMounts reproduces /bin/x and /usr/bin/x (and
+// the mail spool alias) being accepted as disjoint even though the guest
+// resolves both to one directory and stacks the filesystems there.
+func TestMountRejectsAliasDuplicateMounts(t *testing.T) {
+	for _, tc := range []struct {
+		name, existing, added string
+	}{
+		{"bin", "/bin/x", "/usr/bin/x"},
+		{"sbin", "/sbin/x", "/usr/sbin/x"},
+		{"mail spool", "/var/spool/mail/x", "/var/mail/x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := readyState("home")
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "m2", Path: tc.existing}}
+			h := newHarness(t, root, readyState("m2"), readyState("data"))
+			code, _, errOut := h.run("", "mount", "data:"+tc.added, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, `root state "home" already has state "m2" mounted at `+tc.existing) {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].Path != tc.existing {
+				t.Fatalf("rejected alias changed mounts: %+v", mounts)
+			}
+		})
+	}
+
+	// The final topology of one invocation is checked too, not only entries
+	// already in the root.
+	h := newHarness(t, readyState("home"), readyState("a"), readyState("b"))
+	code, _, errOut := h.run("", "mount", "a:/bin/x", "b:/usr/bin/x", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, "already has state") {
+		t.Fatalf("batch code %d: %s", code, errOut)
+	}
+	if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+		t.Fatalf("partially applied alias batch: %+v", mounts)
+	}
+}
+
 func TestMountValidationErrors(t *testing.T) {
 	h := newHarness(t, readyState("home"), readyState("data"))
 	for _, tc := range []struct {
