@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"unicode/utf8"
@@ -87,8 +89,19 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req chatRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(&req); err != nil {
-		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+	if err := decodeChatRequest(w, r, &req); err != nil {
+		// Read failures can contain the pod's bound socket address and the
+		// peer address; JSON syntax errors echo the payload. Keep them in
+		// the server log only.
+		status := http.StatusBadRequest
+		message := "invalid request"
+		var nerr net.Error
+		if errors.As(err, &nerr) && nerr.Timeout() {
+			status = http.StatusRequestTimeout
+			message = "request timeout"
+		}
+		c.Server.logError(err, "chat request body", "remote", r.RemoteAddr)
+		http.Error(w, message, status)
 		return
 	}
 	if req.Thread == "" || req.Message == "" {
@@ -137,6 +150,10 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(chatResponse{Reply: reply})
+}
+
+func decodeChatRequest(w http.ResponseWriter, r *http.Request, req *chatRequest) error {
+	return json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(req)
 }
 
 func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
