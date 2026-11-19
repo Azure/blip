@@ -18,9 +18,12 @@ rules:
   - apiGroups: [blip.dev]
     resources: [blipturns/status]
     verbs: [get, update, patch]
+  # A thread's spec is administrator-owned: blipchat reads it and only writes
+  # status. Granting update or patch on the resource would let a compromised
+  # coordinator rewrite every project's charter, system prompt, pool and base.
   - apiGroups: [blip.dev]
     resources: [blipthreads]
-    verbs: [get, list, watch, update, patch]
+    verbs: [get, list, watch]
   - apiGroups: [blip.dev]
     resources: [blipthreads/status]
     verbs: [get, update, patch]
