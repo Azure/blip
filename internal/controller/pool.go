@@ -418,10 +418,13 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// them (and the deletion expectation hides them only on the next
 	// reconcile), so later phases must not act on them again.
 	del := func(p *corev1.Pod) error {
-		if err := r.deletePod(ctx, rq.NamespacedName, p); err != nil {
+		ok, err := r.deletePod(ctx, rq.NamespacedName, p)
+		if err != nil {
 			return err
 		}
-		deleted[p.Name] = true
+		if ok {
+			deleted[p.Name] = true
+		}
 		return nil
 	}
 	total := len(pods.Items) + created
@@ -637,9 +640,17 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			if node == "" || !schedulable(node) {
 				break
 			}
-			if err := del(p); err != nil {
+			ok, err := r.deletePod(ctx, rq.NamespacedName, p)
+			if err != nil {
 				return reconcile.Result{}, err
 			}
+			if !ok {
+				// A concurrent update, such as a Blip claiming the spare,
+				// won the delete. Creating the replacement now would exceed
+				// maxCount if that claim stands; re-evaluate next pass.
+				break
+			}
+			deleted[p.Name] = true
 			warm[podNode(p)]--
 			if err := r.createPod(ctx, pool, avoid, node); err != nil {
 				return reconcile.Result{}, err
@@ -872,14 +883,22 @@ func (r *PoolReconciler) createPod(ctx context.Context, pool *v1.BlipPool, avoid
 	return nil
 }
 
-func (r *PoolReconciler) deletePod(ctx context.Context, pool types.NamespacedName, p *corev1.Pod) error {
+// deletePod deletes p and reports whether the pod is gone. A conflicting
+// delete lost to a concurrent update, for example a Blip claiming the spare,
+// so the pod still exists and the caller must not assume its slot is free.
+func (r *PoolReconciler) deletePod(ctx context.Context, pool types.NamespacedName, p *corev1.Pod) (bool, error) {
 	// The resourceVersion precondition loses against a concurrent claim.
 	err := r.Delete(ctx, p, client.Preconditions{UID: &p.UID, ResourceVersion: &p.ResourceVersion})
-	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
-		return err
+	switch {
+	case apierrors.IsNotFound(err):
+		return true, nil
+	case apierrors.IsConflict(err):
+		return false, nil
+	case err != nil:
+		return false, err
 	}
 	r.expect(&r.deleted, pool, p.Name, "")
-	return nil
+	return true, nil
 }
 
 // podFor builds a VM pod (see the README's implementation outline).
