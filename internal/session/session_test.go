@@ -127,6 +127,28 @@ func TestOpenOversizedRequestIsTooLarge(t *testing.T) {
 	}
 }
 
+// A 200 KB argv of JSON HTML metacharacters is well under the frame limit.
+// HTML escaping must not reject it at about one sixth of the real limit.
+func TestOpenHTMLMetacharactersAreNotOversized(t *testing.T) {
+	lt := strings.Repeat("<", 100_000)
+	amp := strings.Repeat("&", 100_000)
+	g := &fakeguest.Guest{}
+	c := &session.Client{Connect: g.Connect}
+	s, err := c.Open(context.Background(), "ns", "p", wire.Open{
+		Mode: wire.OpenExec,
+		Argv: []string{"true", lt, amp},
+	})
+	if err != nil {
+		t.Fatalf("Open rejected HTML metacharacters: %v", err)
+	}
+	s.Close()
+	opens := g.Opens()
+	if len(opens) != 1 || len(opens[0].Open.Argv) != 3 ||
+		opens[0].Open.Argv[1] != lt || opens[0].Open.Argv[2] != amp {
+		t.Fatalf("guest received changed argv: %+v", opens)
+	}
+}
+
 // Invalid UTF-8 would be silently rewritten to U+FFFD by encoding/json. The
 // client rejects it before connecting so a command never runs with different
 // arguments or environment than the caller supplied.

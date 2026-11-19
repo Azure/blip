@@ -1,7 +1,9 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -15,6 +17,36 @@ func TestOpenDecodesWithoutOpenID(t *testing.T) {
 	}
 	if o.Mode != OpenExec || len(o.Argv) != 3 || o.OpenID != "" {
 		t.Fatalf("decoded %+v", o)
+	}
+}
+
+// HTML metacharacters must not inflate the encoded frame: the frame limit is
+// a byte budget for argv/env, not a budget that depends on their content. A
+// 120 KB argument of < & > must stay about 120 KB, not grow to 720 KB.
+func TestWriteJSONDoesNotHTMLEscape(t *testing.T) {
+	arg := strings.Repeat("<&>", 40_000)
+	o := Open{Mode: OpenExec, Argv: []string{"true", arg}}
+	var buf bytes.Buffer
+	if err := NewConn(&buf).WriteJSON(TOpen, o); err != nil {
+		t.Fatal(err)
+	}
+	frame := buf.Bytes()
+	if len(frame) < 5 {
+		t.Fatalf("short frame: %d bytes", len(frame))
+	}
+	payload := frame[5:]
+	if bytes.Contains(payload, []byte(`\u003c`)) || bytes.Contains(payload, []byte(`\u003e`)) || bytes.Contains(payload, []byte(`\u0026`)) {
+		t.Fatalf("encoded payload HTML-escaped metacharacters: %s", payload[:80])
+	}
+	if len(payload) > len(arg)+64 {
+		t.Fatalf("encoded payload = %d bytes for a %d-byte argument", len(payload), len(arg))
+	}
+	var got Open
+	if err := Decode(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Argv) != 2 || got.Argv[1] != arg {
+		t.Fatalf("round trip changed argv: %d args", len(got.Argv))
 	}
 }
 

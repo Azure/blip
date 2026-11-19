@@ -286,12 +286,19 @@ func (c *Conn) Write(t Type, payload []byte) error {
 	return err
 }
 
-// WriteJSON sends one frame with v encoded as JSON.
+// WriteJSON sends one frame with v encoded as JSON. HTML characters are not
+// escaped: the frame limit counts these bytes, and escaping <, > and & would
+// make the usable argv/env budget depend on their content (a 200 KB argument
+// of '<' would grow to 1.2 MB). JSON does not need HTML escaping.
 func (c *Conn) WriteJSON(t Type, v any) error {
-	data, err := json.Marshal(v)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		return err
 	}
+	// Encode appends a newline; a frame carries only the JSON object.
+	data := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 	return c.Write(t, data)
 }
 
