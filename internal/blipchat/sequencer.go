@@ -3,6 +3,8 @@ package blipchat
 import (
 	"context"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,8 +100,10 @@ func (s *Sequencer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 
 // sequenceThread numbers every waiting turn of a thread in creation order.
 // Turns may be created before their thread exists, and the order in which
-// their requeues fire is arbitrary; sorting by creation time (then name and
-// UID) makes the assigned order deterministic.
+// their requeues fire is arbitrary; sorting by creation time (then
+// resourceVersion, name, and UID) makes the assigned order deterministic.
+// creationTimestamp has only second resolution, so several turns created in
+// one second share it; resourceVersion preserves their write order.
 func (s *Sequencer) sequenceThread(ctx context.Context, thread *v1.BlipThread) error {
 	var turns v1.BlipTurnList
 	if err := s.List(ctx, &turns, client.InNamespace(thread.Namespace), client.MatchingFields{turnField: thread.Name}); err != nil {
@@ -118,6 +122,9 @@ func (s *Sequencer) sequenceThread(ctx context.Context, thread *v1.BlipThread) e
 		if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
 			return a.CreationTimestamp.Before(&b.CreationTimestamp)
 		}
+		if c := compareResourceVersions(a.ResourceVersion, b.ResourceVersion); c != 0 {
+			return c < 0
+		}
 		if a.Name != b.Name {
 			return a.Name < b.Name
 		}
@@ -129,6 +136,27 @@ func (s *Sequencer) sequenceThread(ctx context.Context, thread *v1.BlipThread) e
 		}
 	}
 	return nil
+}
+
+// compareResourceVersions orders two resourceVersion strings. Kubernetes
+// treats resourceVersion as opaque, but the API server assigns decimal values
+// that increase with every write, so compare numerically when both parse.
+// Otherwise (an empty string, or a value from another storage backend) fall
+// back to lexical order to keep the tie-break deterministic.
+func compareResourceVersions(a, b string) int {
+	au, aerr := strconv.ParseUint(a, 10, 64)
+	bu, berr := strconv.ParseUint(b, 10, 64)
+	if aerr == nil && berr == nil {
+		switch {
+		case au < bu:
+			return -1
+		case au > bu:
+			return 1
+		default:
+			return 0
+		}
+	}
+	return strings.Compare(a, b)
 }
 
 // sequence assigns a reserved sequence number to turn. The number is claimed
