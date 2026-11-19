@@ -57,7 +57,14 @@ func TestCopyTreeMergeLeavesDestinationOnFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(filepath.Join(dst, "zsub"), 0o755) })
 
-	// ReadDir sorts names, so aaa is merged before zsub/new fails.
+	// ReadDir sorts names, so aaa is merged before zsub/new is moved.
+	mergeEntryHook = func(_, d string) error {
+		if d == filepath.Join(dst, "zsub", "new") {
+			return unix.EACCES
+		}
+		return nil
+	}
+	t.Cleanup(func() { mergeEntryHook = nil })
 	err := copyPath(context.Background(), src, dst)
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("err = %v, want a permission error", err)
@@ -253,8 +260,16 @@ func TestCopyTreeMergeFailureRestoresDestinationExactly(t *testing.T) {
 	beforeSub := lstat(t, filepath.Join(dst, "zsub"))
 	beforeOld := lstat(t, filepath.Join(dst, "zsub", "old"))
 
-	// ReadDir sorts names, so aaa is replaced and bbb created before
-	// zsub/new fails on the read-only destination directory.
+	// ReadDir sorts names, so aaa is replaced and bbb created before the
+	// hook fails zsub/new. The read-only destination directory at the merge
+	// boundary must not itself make the merge fail.
+	mergeEntryHook = func(_, d string) error {
+		if d == filepath.Join(dst, "zsub", "new") {
+			return unix.EACCES
+		}
+		return nil
+	}
+	t.Cleanup(func() { mergeEntryHook = nil })
 	err := copyPath(context.Background(), src, dst)
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("err = %v, want a permission error", err)

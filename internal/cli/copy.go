@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -266,12 +267,19 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 			return err
 		}
 		defer removeTree(staging)
-		if err := copyTreeInto(ctx, src, staging, info); err != nil {
+		modes, err := copyTreeInto(ctx, src, staging, info)
+		if err != nil {
+			return err
+		}
+		// The staging root is renamed within its own parent, which does not
+		// need write permission on it, so the new destination can appear
+		// complete, modes included, in one step.
+		if err := applyDirModes(staging, "", modes); err != nil {
 			return err
 		}
 		return os.Rename(staging, absDst)
 	}
-	staging, _, err := stageTree(ctx, src, absDst, info)
+	staging, _, modes, err := stageTree(ctx, src, absDst, info)
 	if err != nil {
 		return err
 	}
@@ -279,7 +287,7 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 	// Merge entry by entry into the existing destination. The destination
 	// directory is never renamed or copied, so it keeps its inode and all
 	// untouched entries keep their inode, mode, and hard links.
-	return mergeTree(ctx, staging, absDst)
+	return mergeTree(ctx, staging, absDst, modes)
 }
 
 // stageTree copies src into a temporary directory used to merge into dst,
@@ -287,26 +295,28 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 // mergeTree can swap the result atomically. When the parent is not writable or
 // is on another filesystem (a mount root, for example), staging happens inside
 // dst, on the filesystem the merge writes to.
-func stageTree(ctx context.Context, src, dst string, info os.FileInfo) (string, bool, error) {
+func stageTree(ctx context.Context, src, dst string, info os.FileInfo) (string, bool, []dirMode, error) {
 	parent := filepath.Dir(dst)
 	if parent != dst && copyStageDevice(parent, dst) {
 		if staging, err := os.MkdirTemp(parent, collectTempPattern); err == nil {
-			if err := copyTreeInto(ctx, src, staging, info); err != nil {
+			modes, err := copyTreeInto(ctx, src, staging, info)
+			if err != nil {
 				removeTree(staging)
-				return "", false, err
+				return "", false, nil, err
 			}
-			return staging, true, nil
+			return staging, true, modes, nil
 		}
 	}
 	staging, err := os.MkdirTemp(dst, collectTempPattern)
 	if err != nil {
-		return "", false, err
+		return "", false, nil, err
 	}
-	if err := copyTreeInto(ctx, src, staging, info); err != nil {
+	modes, err := copyTreeInto(ctx, src, staging, info)
+	if err != nil {
 		removeTree(staging)
-		return "", false, err
+		return "", false, nil, err
 	}
-	return staging, false, nil
+	return staging, false, modes, nil
 }
 
 // copyStageDevice reports whether two paths are on the same filesystem. It is
@@ -350,44 +360,87 @@ func swapUnsupported(err error) bool {
 	return errors.Is(err, unix.EXDEV) || errors.Is(err, unix.EBUSY)
 }
 
+// dirMode records the source mode a staged directory takes once it is in its
+// final place. Staged directories are created writable and only then handed
+// their final mode: renaming a directory needs write permission on the
+// directory itself when it moves to a different parent, and a merge also has
+// to rename entries out of a staged directory.
+type dirMode struct {
+	rel  string // path relative to the staging root ("" is the root)
+	mode os.FileMode
+}
+
 // copyTreeInto copies a source tree into an empty, writable directory. The
-// destination takes the source's mode and mtime; callers that merge into an
-// existing directory preserve that directory's own metadata instead.
-func copyTreeInto(ctx context.Context, src, dst string, info os.FileInfo) error {
+// destination takes the source's modes and mtime; callers that merge into an
+// existing directory preserve that directory's own metadata instead. It
+// returns the directory modes still to apply, which the caller does after the
+// tree, or part of it, has been moved into place.
+func copyTreeInto(ctx context.Context, src, dst string, info os.FileInfo) ([]dirMode, error) {
+	return copyTreeIntoAt(ctx, src, dst, info, "")
+}
+
+func copyTreeIntoAt(ctx context.Context, src, dst string, info os.FileInfo, rel string) ([]dirMode, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	entries, err := os.ReadDir(src)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var modes []dirMode
 	for _, e := range entries {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		s := filepath.Join(src, e.Name())
 		d := filepath.Join(dst, e.Name())
 		ei, err := os.Lstat(s)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if ei.IsDir() {
+			// Stay writable until the merge has moved this directory (and
+			// everything under it) somewhere else.
 			if err := os.Mkdir(d, 0o700); err != nil {
-				return err
+				return nil, err
 			}
-			if err := copyTreeInto(ctx, s, d, ei); err != nil {
-				return err
+			sub, err := copyTreeIntoAt(ctx, s, d, ei, filepath.Join(rel, e.Name()))
+			if err != nil {
+				return nil, err
 			}
+			modes = append(modes, sub...)
 			continue
 		}
 		if err := copyEntry(ctx, s, d, ei); err != nil {
+			return nil, err
+		}
+	}
+	if err := os.Chtimes(dst, info.ModTime(), info.ModTime()); err != nil {
+		return nil, err
+	}
+	return append(modes, dirMode{rel: rel, mode: info.Mode().Perm()}), nil
+}
+
+// applyDirModes sets the source mode on the staged directories at and below
+// rel, once they are in their final place. Children are handled before their
+// parents: a directory may stop being searchable as soon as it gets its mode.
+func applyDirModes(root, rel string, modes []dirMode) error {
+	var pending []dirMode
+	for _, m := range modes {
+		if underDir(rel, m.rel) {
+			pending = append(pending, m)
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		return strings.Count(pending[i].rel, string(filepath.Separator)) >
+			strings.Count(pending[j].rel, string(filepath.Separator))
+	})
+	for _, m := range pending {
+		if err := os.Chmod(filepath.Join(root, m.rel), m.mode); err != nil {
 			return err
 		}
 	}
-	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
-		return err
-	}
-	return os.Chtimes(dst, info.ModTime(), info.ModTime())
+	return nil
 }
 
 // checkMergeTypes rejects a merge whose existing destination has a directory
@@ -476,6 +529,95 @@ func (j *mergeJournal) commit() {
 	}
 }
 
+// writeGuard remembers a destination directory's mode so the merge can make it
+// writable and then put it back exactly as it was.
+type writeGuard struct {
+	path string
+	mode os.FileMode
+}
+
+// makeMergeDirsWritable grants owner write and search on every existing
+// destination directory the merge writes into, and returns the modes to
+// restore. A destination an earlier collect created takes the source root's
+// mode, which can be read-only, and a read-only directory still has to receive
+// renamed entries or have a child moved aside.
+func makeMergeDirsWritable(staged, dst string) ([]writeGuard, error) {
+	var guards []writeGuard
+	var walk func(staged, dst string) error
+	walk = func(staged, dst string) error {
+		di, err := os.Lstat(dst)
+		if err != nil {
+			return err
+		}
+		if di.Mode().Perm()&0o300 != 0o300 {
+			if err := os.Chmod(dst, di.Mode()|0o300); err != nil {
+				return err
+			}
+			guards = append(guards, writeGuard{path: dst, mode: di.Mode()})
+		}
+		entries, err := os.ReadDir(staged)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			s := filepath.Join(staged, e.Name())
+			si, err := os.Lstat(s)
+			if err != nil {
+				return err
+			}
+			if !si.IsDir() {
+				continue
+			}
+			d := filepath.Join(dst, e.Name())
+			di, err := os.Lstat(d)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return err
+			}
+			if !di.IsDir() {
+				// mergeInto reports the type conflict.
+				continue
+			}
+			if err := walk(s, d); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(staged, dst); err != nil {
+		_ = restoreDirModes(guards)
+		return nil, err
+	}
+	return guards, nil
+}
+
+// restoreDirModes puts guarded directories back, children before parents so a
+// parent that becomes unsearchable does not block its children.
+func restoreDirModes(guards []writeGuard) error {
+	var errs []error
+	for i := len(guards) - 1; i >= 0; i-- {
+		if err := os.Chmod(guards[i].path, guards[i].mode); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// mergeEntryHook, when non-nil, runs before a merge moves each entry. Tests use
+// it to fail a merge after earlier entries were already placed, since a
+// read-only destination directory no longer makes the merge fail.
+var mergeEntryHook func(staged, dst string) error
+
+// treeMerger carries the merge destination root and the directory modes that
+// are applied as each staged subtree is moved into place.
+type treeMerger struct {
+	root    string
+	journal *mergeJournal
+	modes   []dirMode
+}
+
 // mergeTree merges a complete staged tree into an existing destination in
 // place. Only entries the source provides are written: a new name is moved into
 // place, while an existing name is moved to a hidden sibling first and restored
@@ -483,7 +625,7 @@ func (j *mergeJournal) commit() {
 // rewritten, so they keep their inode, mode, ownership, and hard links, and the
 // merge needs space for the source and replaced entries rather than the whole
 // destination.
-func mergeTree(ctx context.Context, staged, dst string) error {
+func mergeTree(ctx context.Context, staged, dst string, modes []dirMode) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -494,20 +636,29 @@ func mergeTree(ctx context.Context, staged, dst string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("cannot merge into %s: not a directory", dst)
 	}
-	journal := &mergeJournal{}
-	if err := mergeTreeInto(ctx, staged, dst, journal); err != nil {
-		if rerr := journal.rollback(); rerr != nil {
+	guards, err := makeMergeDirsWritable(staged, dst)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rerr := restoreDirModes(guards); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
+	m := &treeMerger{root: dst, journal: &mergeJournal{}, modes: modes}
+	if err := m.mergeInto(ctx, staged, dst, ""); err != nil {
+		if rerr := m.journal.rollback(); rerr != nil {
 			return fmt.Errorf("%w (restoring destination: %v)", err, rerr)
 		}
 		return err
 	}
-	journal.commit()
+	m.journal.commit()
 	return nil
 }
 
-// mergeTreeInto moves the entries of a staged directory into the matching
-// existing destination directory, recursing where both have a directory.
-func mergeTreeInto(ctx context.Context, staged, dst string, journal *mergeJournal) error {
+// mergeInto moves the entries of a staged directory into the matching existing
+// destination directory, recursing where both have a directory.
+func (m *treeMerger) mergeInto(ctx context.Context, staged, dst, rel string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -521,6 +672,11 @@ func mergeTreeInto(ctx context.Context, staged, dst string, journal *mergeJourna
 		}
 		s := filepath.Join(staged, e.Name())
 		d := filepath.Join(dst, e.Name())
+		if mergeEntryHook != nil {
+			if err := mergeEntryHook(s, d); err != nil {
+				return err
+			}
+		}
 		si, err := os.Lstat(s)
 		if err != nil {
 			return err
@@ -532,18 +688,22 @@ func mergeTreeInto(ctx context.Context, staged, dst string, journal *mergeJourna
 		exists := err == nil
 		if si.IsDir() {
 			if !exists {
-				// Nothing to merge with: move the whole staged subtree.
+				// Nothing to merge with: move the whole staged subtree and
+				// only then give its directories their source modes.
 				if err := os.Rename(s, d); err != nil {
 					return err
 				}
-				journal.add(d, "")
+				m.journal.add(d, "")
+				if err := applyDirModes(m.root, filepath.Join(rel, e.Name()), m.modes); err != nil {
+					return err
+				}
 				continue
 			}
 			if !di.IsDir() {
 				return fmt.Errorf("cannot copy directory %s onto %s: not a directory", s, d)
 			}
 			// Keep the destination directory and its metadata.
-			if err := mergeTreeInto(ctx, s, d, journal); err != nil {
+			if err := m.mergeInto(ctx, s, d, filepath.Join(rel, e.Name())); err != nil {
 				return err
 			}
 			continue
@@ -552,7 +712,7 @@ func mergeTreeInto(ctx context.Context, staged, dst string, journal *mergeJourna
 			if err := os.Rename(s, d); err != nil {
 				return err
 			}
-			journal.add(d, "")
+			m.journal.add(d, "")
 			continue
 		}
 		// Move the old entry aside without copying it, then put the staged
@@ -562,7 +722,7 @@ func mergeTreeInto(ctx context.Context, staged, dst string, journal *mergeJourna
 		if err != nil {
 			return err
 		}
-		journal.add(d, backup)
+		m.journal.add(d, backup)
 		if err := os.Rename(s, d); err != nil {
 			return err
 		}
