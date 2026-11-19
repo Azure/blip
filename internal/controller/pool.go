@@ -410,9 +410,9 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			}
 		case p.DeletionTimestamp != nil || deleted[p.Name]:
 			// Its replacement is already accounted for; do not let a pod
-			// leaving an unusable node (or a rejected pinned node) hold
-			// maxCount capacity either.
-			if unusable || (unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "") {
+			// leaving an unusable node (or a node the scheduler rejected)
+			// hold maxCount capacity either.
+			if unusable || unschedulable(p) {
 				total--
 			}
 		case podTerminated(p) || unusable || p.Annotations[v1.AnnotationTemplateHash] != hash:
@@ -422,14 +422,17 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			if unusable {
 				total--
 			}
-		case unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "":
-			// The scheduler rejected this pinned pod, so it cannot satisfy
-			// pinned demand and must not hold a maxCount slot: booting the
-			// fallback VM elsewhere is the whole point. Keep it while a Blip
+		case unschedulable(p):
+			// The scheduler rejected this pod, so it cannot satisfy demand
+			// and must not hold a maxCount slot: booting the replacement
+			// elsewhere is the whole point. Keep a pinned pod while a Blip
 			// still waits locally (the scheduler may place it once the node
-			// has room); once the Blip fell back, replace it.
+			// has room); once the Blip fell back, replace it. A generic spare
+			// has no node to wait for, and its stale avoid affinity may
+			// exclude nodes that are usable again, so delete it and let
+			// createPod recompute the placement.
 			total--
-			if localWaiters[node] == 0 {
+			if p.Annotations[v1.AnnotationPinnedNode] == "" || localWaiters[node] == 0 {
 				if err := del(p); err != nil {
 					return reconcile.Result{}, err
 				}
