@@ -125,3 +125,33 @@ func TestServeDoesNotStopDeliveringInputForAnOpenPeer(t *testing.T) {
 		t.Fatal("serve did not return after the client closed")
 	}
 }
+
+// TestTruncatedNonTTYInputCannotReportSuccess is the w7-10 defect 4
+// regression: if a non-terminal upload loses bytes, the command must not
+// report exit 0 for a result computed from a prefix of the input.
+func TestTruncatedNonTTYInputCannotReportSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		tty       bool
+		truncated bool
+		code      int
+		signal    string
+		want      int
+	}{
+		{"truncated-zero-becomes-failure", false, true, 0, "", 1},
+		{"truncated-keeps-real-failure", false, true, 7, "", 7},
+		{"truncated-signal-keeps-signal", false, true, 0, "TERM", 0},
+		{"complete-stream-keeps-zero", false, false, 0, "", 0},
+		{"tty-drop-is-best-effort", true, true, 0, "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := testGuest(t)
+			s := newSession(g, "exec-"+tc.name, nil, tc.tty)
+			s.inTruncated = tc.truncated
+			s.finish(wire.Exit{Code: tc.code, Signal: tc.signal})
+			if s.status.Code != tc.want {
+				t.Fatalf("exit = %d, want %d", s.status.Code, tc.want)
+			}
+		})
+	}
+}

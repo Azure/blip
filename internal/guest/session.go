@@ -904,6 +904,15 @@ func (s *session) clearReplayLocked() {
 
 func (s *session) finish(st wire.Exit) {
 	s.closeInput()
+	// A non-terminal upload that lost bytes cannot be reported as success:
+	// the command computed its result from a truncated stream. Keep a real
+	// failure status, but never turn a failure into success.
+	s.inMu.Lock()
+	truncated := s.inTruncated
+	s.inMu.Unlock()
+	if truncated && !s.tty && st.Code == 0 && st.Signal == "" {
+		st.Code = 1
+	}
 	// The process can no longer write, so the mirror has nothing left to
 	// follow. stop drains the console queue and joins its goroutine.
 	s.mirror.stop()
@@ -1183,7 +1192,7 @@ func (s *session) serve(c *wire.Conn, conn io.Closer, follow bool) {
 		}
 		if s.takeDropped() {
 			_ = c.WriteJSON(wire.TNotice, wire.Notice{
-				Message: "stdin was discarded because the command is not reading it; interrupt the command or close the connection to stop sending",
+				Message: "stdin was discarded because the command is not reading it; the command will fail rather than report a truncated result",
 			})
 		}
 	}
