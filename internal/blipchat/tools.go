@@ -94,6 +94,9 @@ func (s *step) tools() []Tool {
 	}
 }
 
+// maxSafeInteger is the largest integer a JSON float64 represents exactly.
+const maxSafeInteger = 1<<53 - 1
+
 // call executes one tool call and returns the tool result text.
 func (s *step) call(ctx context.Context, name, arguments string) (string, error) {
 	var args map[string]any
@@ -222,12 +225,13 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 		seq := int64(0)
 		if v, ok := args["inReplyTo"]; ok {
 			f, ok := v.(float64)
-			// float64 cannot represent every int64 exactly; MaxInt64 rounds up
-			// to 2^63, so rejecting at that boundary also rejects the largest
-			// int64. Converting an out-of-range value would wrap negative and
-			// silently retarget the reply to sequence 0.
-			if !ok || math.IsNaN(f) || f < 0 || f >= float64(math.MaxInt64) || f != math.Trunc(f) {
-				return "", fmt.Errorf("inReplyTo must be a non-negative sequence number")
+			// float64 cannot represent every int64 exactly. Values above
+			// 2^53 already rounded during JSON decoding, so reject them
+			// rather than answer a different sequence than the caller
+			// named. The remaining check rejects values at or above 2^63,
+			// which would wrap negative when converted.
+			if !ok || math.IsNaN(f) || f < 0 || f > maxSafeInteger || f >= float64(math.MaxInt64) || f != math.Trunc(f) {
+				return "", fmt.Errorf("inReplyTo must be a non-negative sequence number below 2^53")
 			}
 			seq = int64(f)
 		}
