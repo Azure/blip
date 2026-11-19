@@ -269,11 +269,22 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 		return "", err
 	}
 	active := 0
+	seen := map[string]bool{}
 	for i := range running.Items {
 		// The thread label is self-asserted; require the derived owner too,
 		// like exec/stop/inspect, so a foreign Blip cannot consume this
 		// thread's concurrency budget.
 		if belongsToThread(&running.Items[i], s.thread) && !v1.Finished(&running.Items[i]) {
+			active++
+			seen[running.Items[i].Name] = true
+		}
+	}
+	// List is served from the informer cache in production, so a Blip created
+	// by an earlier start_task in this same step may still be missing. Count
+	// the step's own starts as well; the name set keeps a cache that has
+	// caught up from counting one twice.
+	for _, started := range s.started {
+		if !seen[started.blip.Name] {
 			active++
 		}
 	}
