@@ -131,18 +131,23 @@ func (s *Server) shouldStep(ctx context.Context, thread *v1.BlipThread) bool {
 		s.Log.Error(err, "list pending turns", "thread", thread.Namespace+"/"+thread.Name)
 		return false
 	}
+	// WakeNone turns are context for a later step, never a reason to step.
+	var waking []v1.BlipTurn
 	for _, t := range turns {
 		if t.Spec.Wake == v1.WakeNow {
 			return true
 		}
+		if t.Spec.Wake != v1.WakeNone {
+			waking = append(waking, t)
+		}
 	}
-	if len(turns) > 0 {
-		oldest := turns[0].Status.AcceptedTime
+	if len(waking) > 0 {
+		oldest := waking[0].Status.AcceptedTime
 		if oldest != nil && !now.Before(oldest.Add(s.Config.Debounce)) {
 			return true
 		}
 	}
-	if len(turns) == 0 && thread.Status.NextWake == nil && hasOpenTask(thread.Status.Tasks) {
+	if len(waking) == 0 && thread.Status.NextWake == nil && hasOpenTask(thread.Status.Tasks) {
 		return true
 	}
 	return false

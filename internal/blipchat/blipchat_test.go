@@ -355,3 +355,31 @@ func TestReportReachesCoordinator(t *testing.T) {
 		t.Errorf("consumedSeq = %d, want 1", thread.Status.ConsumedSeq)
 	}
 }
+
+// A turn that does not ask to wake the coordinator is context only: it is
+// consumed by the next step, but on its own it must not start one.
+func TestWakeNoneDoesNotStep(t *testing.T) {
+	old := metav1.NewTime(time.Now().Add(-time.Hour))
+	turn := &v1.BlipTurn{
+		ObjectMeta: metav1.ObjectMeta{Name: "quiet", Namespace: "ns"},
+		Spec: v1.BlipTurnSpec{
+			Thread: "proj",
+			Author: v1.TurnAuthor{Kind: v1.TurnAuthorBlip, Name: "blip-a"},
+			Topic:  "blip.report",
+			Wake:   v1.WakeNone,
+		},
+		Status: v1.BlipTurnStatus{Seq: 1, AcceptedTime: &old},
+	}
+	c := testClient(t, testThread(), turn)
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Millisecond, Heartbeat: time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+	}
+	var thread v1.BlipThread
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "proj"}, &thread); err != nil {
+		t.Fatal(err)
+	}
+	if s.shouldStep(context.Background(), &thread) {
+		t.Fatal("a WakeNone turn alone should not trigger a step")
+	}
+}
