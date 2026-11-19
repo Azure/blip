@@ -12,6 +12,7 @@ import (
 
 	"github.com/Azure/blip/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -134,6 +135,184 @@ func TestMountIntentSurvivesRuntimeFailure(t *testing.T) {
 				t.Fatalf("mount intent rolled back: %+v", s.Spec.Mounts)
 			}
 		})
+	}
+}
+
+// TestMountUnusableSourceBeforeEdit reproduces a mount racing a source state
+// deletion: a terminating state must be rejected before the root's desired
+// mounts change, so the dead mount cannot poison later executions.
+func TestMountUnusableSourceBeforeEdit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		prep func(*v1alpha1.BlipState)
+		want string
+	}{
+		{
+			name: "terminating",
+			prep: func(s *v1alpha1.BlipState) {
+				now := metav1.Now()
+				s.DeletionTimestamp = &now
+				s.Finalizers = []string{"hold"}
+			},
+			want: "is being deleted",
+		},
+		{
+			name: "missing",
+			want: `state "data" not found`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := readyState("home")
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "keep", Path: "/keep"}}
+			objs := []client.Object{root}
+			if tc.prep != nil {
+				data := readyState("data")
+				tc.prep(data)
+				objs = append(objs, data)
+			}
+			a := mountTestApp(t, objs...)
+			var errOut bytes.Buffer
+			a.env.Err = &errOut
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if code := Main(ctx, a.env, []string{"mount", "data:/data", "--root", "home"}); code != 1 {
+				t.Fatalf("mount code %d: %s", code, errOut.String())
+			}
+			mustContain(t, errOut.String(), tc.want)
+			s, err := a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].State != "keep" {
+				t.Fatalf("unusable source changed desired mounts: %+v", s.Spec.Mounts)
+			}
+		})
+	}
+}
+
+func TestMountStateGone(t *testing.T) {
+	for _, tc := range []struct{ name, msg, want string }{
+		{
+			name: "deleting",
+			msg:  `mount data: state "data" is being deleted`,
+			want: `mount data: state "data" is being deleted`,
+		},
+		{
+			name: "missing",
+			msg:  `mount data: state "data" not found`,
+			want: `mount data: state "data" not found`,
+		},
+		{
+			name: "joined waits pick the matching state",
+			msg:  `mount other: state "other" not found; mount data: state "data" is being deleted`,
+			want: `mount data: state "data" is being deleted`,
+		},
+		{
+			name: "another state",
+			msg:  `mount other: state "other" is being deleted`,
+		},
+		{
+			name: "unrelated wait",
+			msg:  `mount data: state "data" has no committed version yet`,
+		},
+		{
+			name: "empty",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mountStateGone(tc.msg, "data"); got != tc.want {
+				t.Fatalf("mountStateGone(%q) = %q, want %q", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMountGoneStateWhileWaitingRollsBackAndRetries covers the source
+// disappearing after the desired mount was written: the wait must fail fast,
+// remove only the mount this command added, and allow a retry once the source
+// is usable again.
+func TestMountGoneStateWhileWaitingRollsBackAndRetries(t *testing.T) {
+	for _, tc := range []struct{ name, msg, want string }{
+		{"terminating", `mount data: state "data" is being deleted`, "is being deleted"},
+		{"missing", `mount data: state "data" not found`, `state "data" not found`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBlip("writer")
+			root := readyState(b.Spec.State)
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "keep", Path: "/keep"}}
+			b.Status.Mounts = nil
+			b.Status.Message = tc.msg
+			a := mountTestApp(t, b, root, readyState("data"))
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			err := a.mountState(ctx, "data", root.Name, "/data", nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("mount returned %v, want %q", err, tc.want)
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Fatalf("mount took %s to fail: %v", elapsed, err)
+			}
+			if !strings.Contains(err.Error(), "desired mount was removed") {
+				t.Fatalf("error does not report rollback: %v", err)
+			}
+			s, err := a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].State != "keep" {
+				t.Fatalf("failed mount left desired intent: %+v", s.Spec.Mounts)
+			}
+
+			// The rollback leaves the root usable. With no writer the retry
+			// applies on the next execution, independent of an attachment.
+			latest, err := a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			latest.Status.Writer = nil
+			if err := a.c.Kube.Status().Update(ctx, latest); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.mountState(ctx, "data", root.Name, "/data", nil); err != nil {
+				t.Fatalf("retry after rollback failed: %v", err)
+			}
+			s, err = a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Spec.Mounts) != 2 || findSpecMount(s.Spec.Mounts, "data") == nil {
+				t.Fatalf("retry did not restore mount: %+v", s.Spec.Mounts)
+			}
+		})
+	}
+}
+
+// TestMountGoneStateKeepsPreExistingMount makes sure the rollback removes only
+// the mount this command added, not intent that another command owns.
+func TestMountGoneStateKeepsPreExistingMount(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+	b.Status.Mounts = nil
+	b.Status.Message = `mount data: state "data" is being deleted`
+	a := mountTestApp(t, b, root, readyState("data"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := a.mountState(ctx, "data", root.Name, "/data", nil)
+	if err == nil || !strings.Contains(err.Error(), "is being deleted") {
+		t.Fatalf("mount returned %v", err)
+	}
+	s, err := a.getState(ctx, root.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].State != "data" {
+		t.Fatalf("pre-existing mount was removed: %+v", s.Spec.Mounts)
 	}
 }
 

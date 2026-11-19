@@ -178,10 +178,16 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 	if err != nil {
 		return err
 	}
-	var want, demoting bool
+	if source.DeletionTimestamp != nil {
+		// A terminating state can never be attached. Reject it before writing
+		// desired intent, which would otherwise outlive this command and make
+		// every later Blip on the root wait for a state that is gone.
+		return fmt.Errorf("state %q is being deleted", a.short(state))
+	}
+	var want, demoting, added bool
 	var oldAttachment string
 	s, err := a.editMountsWaitingStale(ctx, root, state, func(s *v1alpha1.BlipState) (string, error) {
-		want, demoting = false, false
+		want, demoting, added = false, false, false
 		oldAttachment = ""
 		m := findSpecMount(s.Spec.Mounts, state)
 		if m != nil {
@@ -212,6 +218,7 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 			}
 			s.Spec.Mounts = append(s.Spec.Mounts, v1alpha1.Mount{State: state, Path: mountPath})
 			m = &s.Spec.Mounts[len(s.Spec.Mounts)-1]
+			added = true
 		}
 		if target != nil {
 			want = *target
@@ -249,6 +256,17 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 			// that can never converge.
 			if rerr := a.restoreMountMode(ctx, root, state, mountPath, want, refused.writable); rerr != nil {
 				fmt.Fprintf(a.env.Err, "warning: could not restore desired mode of state %s: %v\n", a.short(state), rerr)
+			}
+		}
+		var gone *mountStateGoneError
+		if added && errors.As(err, &gone) {
+			// The state disappeared while this command waited. Remove only
+			// the desired mount this command just added; a mount that was
+			// already in the root belongs to someone else.
+			if rerr := a.rollbackAddedMount(ctx, root, state, mountPath, want); rerr != nil {
+				fmt.Fprintf(a.env.Err, "warning: could not remove desired mount of state %s from root state %s: %v\n", a.short(state), a.short(root), rerr)
+			} else {
+				err = fmt.Errorf("%w; the desired mount was removed from root state %q", err, a.short(root))
 			}
 		}
 		return err
@@ -308,6 +326,34 @@ func (a *app) waitDetached(ctx context.Context, writer *v1alpha1.Blip, rootName,
 	})
 }
 
+// mountStateGone reports the part of a top-level Blip status message that says
+// the wanted state is terminating or no longer exists. The controller records
+// these as waits because it only needs to observe them for the current
+// execution, but a mount that is waiting for an attachment can never finish.
+// Like mountBusy, only a segment that both names this state and reports a
+// terminal lifecycle error matches, so unrelated waits for other mounts stay
+// out of the way.
+func mountStateGone(msg, state string) string {
+	quoted := strconv.Quote(state)
+	for _, part := range strings.Split(msg, "; ") {
+		part = strings.TrimSpace(part)
+		if !strings.Contains(part, quoted) {
+			continue
+		}
+		if strings.Contains(part, "is being deleted") || strings.Contains(part, "not found") {
+			return part
+		}
+	}
+	return ""
+}
+
+// mountStateGoneError marks a wait that can never finish because the mount's
+// source state is terminating or gone. mountState rolls back the desired mount
+// it added for this command.
+type mountStateGoneError struct{ msg string }
+
+func (e *mountStateGoneError) Error() string { return e.msg }
+
 // mountBusy reports the part of a top-level Blip status message that says the
 // wanted state is already written by another Blip. The controller records a
 // writable mount rejected for that reason on the Blip itself, not as a mount
@@ -351,6 +397,31 @@ func (a *app) restoreMountMode(ctx context.Context, root, state, mountPath strin
 	return err
 }
 
+// rollbackAddedMount removes the desired mount this command just added after
+// its source state disappeared. It removes only the exact entry this command
+// wrote, so a concurrent edit or a pre-existing mount is left alone.
+func (a *app) rollbackAddedMount(ctx context.Context, root, state, mountPath string, want bool) error {
+	_, err := a.updateState(ctx, root, func(s *v1alpha1.BlipState) error {
+		for i, m := range s.Spec.Mounts {
+			if m.State != state {
+				continue
+			}
+			if m.Path != mountPath || m.Writable != want || m.BlipUID != "" {
+				return errUnchanged
+			}
+			users := mountUsers(s)
+			delete(users, state)
+			s.Spec.Mounts = append(s.Spec.Mounts[:i], s.Spec.Mounts[i+1:]...)
+			return setMountUsers(s, users)
+		}
+		return errUnchanged
+	})
+	if errors.Is(err, errUnchanged) {
+		return nil
+	}
+	return err
+}
+
 // waitMount observes the runtime attachment without editing desired intent.
 // oldAttachment identifies a previous mount that was still visible when the
 // desired mount was re-added, and must not be accepted as the new attachment.
@@ -382,6 +453,12 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			return false, fmt.Errorf("mount of state %q changed concurrently", state)
 		}
 		m := findMount(b.Status.Mounts, state)
+		// A terminating or missing source never gets an attachment. The
+		// controller reports it as a wait on the Blip, so waiting for a
+		// status entry would poll forever and leave the root poisoned.
+		if gone := mountStateGone(b.Status.Message, state); gone != "" {
+			return false, &mountStateGoneError{msg: fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, gone)}
+		}
 		if m == nil || m.Path != mountPath {
 			// A writable mount can be rejected before any status entry
 			// exists: the controller leaves the reason on the Blip. Report
