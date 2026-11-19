@@ -93,6 +93,13 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 `, p.guestIP, iface)
 	if active {
 		fmt.Fprintf(&b, "  ct direction original ct status dnat ct original ip daddr %s counter accept\n", p.podIP)
+		// Path-MTU discovery and route diagnostics travel as ICMP errors
+		// RELATED to an allowed flow. Without these the guest keeps sending
+		// full-size segments after a router asks it to shrink (a PMTUD
+		// blackhole). RELATED ties the acceptance to a permitted conntrack
+		// entry, so unsolicited ICMP and echo remain denied.
+		b.WriteString("  ct state related icmp type 3 code 4 counter accept\n")
+		b.WriteString("  ct state related icmp type 11 counter accept\n")
 		// NAT already restored the private destination. Check CURRENT remote
 		// source/port on every reply; stale conntrack cannot defeat revocation.
 		b.WriteString("  ct direction reply ct state established jump reply\n")

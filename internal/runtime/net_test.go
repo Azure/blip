@@ -73,6 +73,64 @@ func TestPolicyValidation(t *testing.T) {
 	}
 }
 
+// scriptChain returns the body of one generated nftables chain.
+func scriptChain(t *testing.T, script, name string) string {
+	t.Helper()
+	marker := "chain " + name + " {"
+	start := strings.Index(script, marker)
+	if start < 0 {
+		t.Fatalf("script has no %s chain:\n%s", name, script)
+	}
+	end := strings.Index(script[start:], "\n }")
+	if end < 0 {
+		t.Fatalf("%s chain is unterminated:\n%s", name, script)
+	}
+	return script[start : start+end]
+}
+
+// TestPolicyAllowsRelatedICMPErrors covers PMTUD: a router's ICMP
+// fragmentation-needed (type 3 code 4) and time-exceeded (type 11) replies are
+// RELATED to a permitted flow, but the guest gate used to admit only
+// established TCP/UDP replies, so the guest never lowered its path MTU.
+// General ICMP (including echo) stays denied.
+func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
+	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
+		{{CIDR: "0.0.0.0/0", Protocol: "TCP", Port: 443}},
+	}}
+	script, err := testPodNet(nil).policyScript(policy, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toGuest := scriptChain(t, script, "to_guest")
+	for _, rule := range []string{
+		"ct state related icmp type 3 code 4 counter accept",
+		"ct state related icmp type 11 counter accept",
+	} {
+		if !strings.Contains(toGuest, rule) {
+			t.Errorf("to_guest does not admit %q:\n%s", rule, toGuest)
+		}
+	}
+	// No echo or other unsolicited ICMP may reach the guest.
+	for _, name := range []string{"egress", "from_guest"} {
+		if body := scriptChain(t, script, name); strings.Contains(body, "icmp") {
+			t.Errorf("%s admits ICMP:\n%s", name, body)
+		}
+	}
+	for _, rule := range []string{"icmp type 8", "icmp type 0", "meta l4proto icmp"} {
+		if strings.Contains(script, rule) {
+			t.Errorf("script admits general ICMP with %q:\n%s", rule, script)
+		}
+	}
+	// A warm VM or deny-all gate must not open the ICMP path before a policy.
+	closed, err := testPodNet(nil).policyScript(policy, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(scriptChain(t, closed, "to_guest"), "icmp") {
+		t.Errorf("inactive gate admits ICMP:\n%s", closed)
+	}
+}
+
 func TestApplyInvalidPolicyRevokesAndNftFailureDisablesTap(t *testing.T) {
 	var calls []string
 	nftFails, ipFails := false, false
