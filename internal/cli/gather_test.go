@@ -348,6 +348,63 @@ func TestGatherSelector(t *testing.T) {
 	}
 }
 
+// A negated requirement matches every object that does not carry the key, so
+// it normally selects every unlabelled blip in the namespace. gather deletes
+// successful blips, so reject a selector that matches the empty label set.
+func TestGatherRejectsSelectorMatchingEveryBlip(t *testing.T) {
+	for _, sel := range []string{"team!=nightly", "!team", "team notin ()"} {
+		t.Run(sel, func(t *testing.T) {
+			unlabelled := finishedBlip("w1", v1alpha1.BlipSucceeded, 0)
+			labelled := finishedBlip("w2", v1alpha1.BlipSucceeded, 0)
+			labelled.Labels = map[string]string{"team": "nightly"}
+			h := newHarness(t, unlabelled, labelled)
+			code, out, errOut := h.run("", "gather", "--selector", sel)
+			if code != 1 || !strings.Contains(errOut, `invalid --selector "`+sel+`"`) || !strings.Contains(errOut, "it selects every blip") {
+				t.Fatalf("selector %q: code %d out %q stderr %q", sel, code, out, errOut)
+			}
+			if h.gone("w1") || h.gone("w2") {
+				t.Fatalf("selector %q deleted a blip", sel)
+			}
+		})
+	}
+}
+
+// Positive selectors are still accepted: only selectors that match an object
+// with no labels at all are rejected.
+func TestGatherAcceptsPositiveSelectors(t *testing.T) {
+	cases := []struct {
+		sel  string
+		gone []string
+	}{
+		{"team=nightly", []string{"w1"}},
+		{"team in (nightly)", []string{"w1"}},
+		{"team", []string{"w1", "w2"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sel, func(t *testing.T) {
+			match := finishedBlip("w1", v1alpha1.BlipSucceeded, 0)
+			match.Labels = map[string]string{"team": "nightly"}
+			other := finishedBlip("w2", v1alpha1.BlipSucceeded, 0)
+			other.Labels = map[string]string{"team": "other"}
+			unlabelled := finishedBlip("w3", v1alpha1.BlipSucceeded, 0)
+			h := newHarness(t, match, other, unlabelled)
+			code, out, errOut := h.run("", "gather", "--selector", tc.sel)
+			if code != 0 {
+				t.Fatalf("selector %q: code %d out %q stderr %q", tc.sel, code, out, errOut)
+			}
+			for _, name := range []string{"w1", "w2", "w3"} {
+				want := false
+				for _, gone := range tc.gone {
+					want = want || name == gone
+				}
+				if h.gone(name) != want {
+					t.Fatalf("selector %q: %s gone=%v, want %v (out %q)", tc.sel, name, h.gone(name), want, out)
+				}
+			}
+		})
+	}
+}
+
 // A blip that finished before gather began is finished even if --wait expires
 // before the watcher observes it; gather must collect it instead of reporting
 // it as "not finished".

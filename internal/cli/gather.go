@@ -115,6 +115,7 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 	if len(names) > 0 && selector != "" {
 		return errors.New("gather takes blip names or --selector, not both")
 	}
+	defaultSelector := false
 	if len(names) == 0 && selector == "" {
 		if a.self == nil {
 			return errors.New("gather needs blip names or --selector outside a blip")
@@ -126,6 +127,7 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 			return errors.New("--selector must not be empty")
 		}
 		selector = v1alpha1.LabelParent + "=" + v1alpha1.ParentLabel(a.short(a.self.Name))
+		defaultSelector = true
 	}
 	var sel labels.Selector
 	if selector != "" {
@@ -135,7 +137,13 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		if err != nil {
 			return fmt.Errorf("invalid --selector %q: %w", selector, err)
 		}
-		if sel.Empty() {
+		// A requirement such as "key!=value", "!key" or "key notin ()"
+		// matches every object that does not carry the key. Unlabelled blips
+		// are common, so such a selector selects every blip in the namespace
+		// and gather would delete them. Check before adding the internal
+		// owner term, which would otherwise make a negated selector look
+		// constrained even though it still matches all of the owner's blips.
+		if !defaultSelector && (sel.Empty() || sel.Matches(labels.Set{})) {
 			return fmt.Errorf("invalid --selector %q: it selects every blip", selector)
 		}
 		// Inside an owner-scoped blip, every selector is intersected with the
