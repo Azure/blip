@@ -1,0 +1,23 @@
+# Local end-to-end pool for the opencode ACP browser test.
+#
+# The "unbounded" endpoint is logical: the pool sidecar dials the local
+# inference proxy and adds its CA, so neither the upstream gateway nor the
+# inference token is described here. No audience is set because the guest must
+# not receive a service-account token.
+apiVersion: blip.dev/v1alpha1
+kind: BlipPool
+metadata:
+  name: opencode
+  namespace: default
+spec:
+  serviceAccountName: blip-agent
+  nodeSelector:
+    blip.dev/node-pool: default
+  cpus: 1
+  memory: 1Gi
+  warmCount: 1
+  maxCount: 2
+  endpoints:
+    - name: unbounded
+      url: https://unbounded-proxy.blip-system.svc.cluster.local
+      caConfigMap: unbounded-proxy-ca

@@ -106,6 +106,18 @@ if [[ "$(docker container inspect -f '{{json .NetworkSettings.Networks.kind}}' "
   docker network connect kind "${REGISTRY}"
 fi
 
+# The node agent verifies the kube-apiserver's front-proxy client certificate
+# when it serves the aggregated stream API. Kind only populates this CA on the
+# control-plane; copy it to the workers before the node agent starts.
+node_restart=false
+for node in "${WORKERS[@]}"; do
+  if ! docker exec "${node}" test -s /etc/kubernetes/pki/front-proxy-ca.crt; then
+    docker exec "${CLUSTER}-control-plane" cat /etc/kubernetes/pki/front-proxy-ca.crt \
+      | docker exec -i "${node}" sh -c 'mkdir -p /etc/kubernetes/pki && cat > /etc/kubernetes/pki/front-proxy-ca.crt'
+    node_restart=true
+  fi
+done
+
 for node in "${WORKERS[@]}"; do
   docker exec "${node}" sh -c 'mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config'
   # Match deploy/kind/pools.yaml. The controller adds blip.dev/enrolled to
@@ -165,6 +177,10 @@ k apply -k deploy/crd
 # shellcheck disable=SC2046
 k wait --for condition=Established --timeout 60s $(k get -k deploy/crd -o name)
 k apply -k build/kind
+
+if [[ "${node_restart}" == true ]]; then
+  k -n blip-system rollout restart daemonset/blip-node
+fi
 
 k -n blip-system rollout status deployment/blip-controller --timeout 3m
 k -n blip-system rollout status daemonset/blip-node --timeout 3m

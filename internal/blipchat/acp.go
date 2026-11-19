@@ -234,6 +234,19 @@ func (a *acpAgent) handleRequest(id json.RawMessage, method string, params json.
 	a.reply(map[string]any{"jsonrpc": "2.0", "id": id, "result": reply})
 }
 
+// sendLine writes one newline-delimited JSON frame. ACP is NDJSON, and some
+// agents (notably opencode) do not dispatch a request until they see the
+// terminating newline.
+func (a *acpAgent) sendLine(ctx context.Context, data []byte, eof bool) error {
+	if len(data) > 0 && data[len(data)-1] == '\n' {
+		return a.send(ctx, data, eof)
+	}
+	frame := make([]byte, len(data)+1)
+	copy(frame, data)
+	frame[len(data)] = '\n'
+	return a.send(ctx, frame, eof)
+}
+
 func (a *acpAgent) reply(v any) {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -241,7 +254,7 @@ func (a *acpAgent) reply(v any) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = a.send(ctx, data, false)
+	_ = a.sendLine(ctx, data, false)
 }
 
 func choosePermission(params json.RawMessage, mode string) string {
@@ -295,7 +308,7 @@ func (a *acpAgent) call(ctx context.Context, method string, params any) (json.Ra
 		a.forget(key)
 		return nil, err
 	}
-	if err := a.send(ctx, data, false); err != nil {
+	if err := a.sendLine(ctx, data, false); err != nil {
 		a.forget(key)
 		return nil, err
 	}
@@ -411,7 +424,7 @@ func (a *acpAgent) Prompt(ctx context.Context, text string) error {
 		a.forget(key)
 		return err
 	}
-	if err := a.send(ctx, data, false); err != nil {
+	if err := a.sendLine(ctx, data, false); err != nil {
 		a.forget(key)
 		return err
 	}
@@ -431,7 +444,7 @@ func (a *acpAgent) Cancel(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return a.send(ctx, data, false)
+	return a.sendLine(ctx, data, false)
 }
 
 // Reset drops state that belonged to a dead agent process. The session id and

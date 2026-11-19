@@ -70,8 +70,13 @@ func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
 	for _, key := range sortedKeys(p.desired) {
 		d := p.desired[key]
 		path := filepath.Join(a.podDirFor(key), podapi.DesiredFile)
-		if err := podapi.EnsurePodDir(filepath.Dir(path)); err != nil {
+		podDir := filepath.Dir(path)
+		if err := podapi.EnsurePodDir(podDir); err != nil {
 			slog.Error("write desired", "pod", key, "err", err)
+			continue
+		}
+		if err := podapi.EnsureSocketDir(podDir); err != nil {
+			slog.Error("prepare socket dir", "pod", key, "err", err)
 			continue
 		}
 		if err := podapi.WriteJSON(path, d); err != nil {

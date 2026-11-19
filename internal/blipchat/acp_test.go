@@ -68,6 +68,9 @@ func TestACPPromptResponseEndsTurn(t *testing.T) {
 	if req.Method != "session/prompt" || req.ID == "" {
 		t.Fatalf("unexpected request: %s", data)
 	}
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		t.Fatalf("request is not newline-delimited: %q", data)
+	}
 	if a.Pending() != 1 {
 		t.Fatalf("pending = %d, want 1", a.Pending())
 	}

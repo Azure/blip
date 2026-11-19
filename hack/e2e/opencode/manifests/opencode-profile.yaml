@@ -1,0 +1,40 @@
+# Local end-to-end profile for the opencode ACP agent.
+#
+# This is a test-only profile: it points opencode at the logical Blip endpoint
+# "unbounded", whose TLS gateway and inference credentials live in the
+# git-ignored inference-proxy/ directory. The API key below is a local
+# placeholder, not a secret. Never deploy this to a remote cluster.
+#
+# blipchat reads this ConfigMap at startup, so changing the profile requires
+# restarting deployment/blipchat to take effect:
+#   kubectl -n blip-system rollout restart deployment/blipchat
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blip-chat-profiles
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blipchat
+    app.kubernetes.io/part-of: blip
+data:
+  opencode: |
+    {
+      "pool": "opencode",
+      "command": [
+        "/usr/local/bin/opencode",
+        "acp"
+      ],
+      "env": {
+        "HOME": "/home/dev",
+        "XDG_CONFIG_HOME": "/home/dev/.config",
+        "XDG_DATA_HOME": "/home/dev/.local/share",
+        "XDG_CACHE_HOME": "/home/dev/.cache",
+        "OPENCODE_DISABLE_AUTOUPDATE": "1",
+        "OPENCODE_DISABLE_MODELS_FETCH": "1",
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        "OPENCODE_DISABLE_FILEWATCHER": "1",
+        "OPENCODE_CONFIG_CONTENT": "{\"providers\":{\"unbounded\":{\"name\":\"Unbounded DeepSeek\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{\"baseURL\":\"http://unbounded/dsv41/v1\",\"apiKey\":\"local-e2e\"},\"models\":{\"deepseek-v4.1-flash\":{\"name\":\"DeepSeek V4.1 Flash\"}}}},\"model\":\"unbounded/deepseek-v4.1-flash\"}"
+      },
+      "idleTimeoutSeconds": 3600,
+      "title": "OpenCode (DeepSeek)"
+    }

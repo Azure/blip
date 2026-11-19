@@ -104,7 +104,7 @@ func (r *streamTLS) ensureAPIService(ctx context.Context) error {
 	if err := r.client.Get(ctx, client.ObjectKey{Namespace: r.namespace, Name: StreamTLSSecret}, &sec); err != nil {
 		return err
 	}
-	api := &unstructured.Unstructured{}
+	api := &unstructured.Unstructured{Object: map[string]any{}}
 	api.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiregistration.k8s.io", Version: "v1", Kind: "APIService"})
 	api.SetName(StreamAPIService)
 	spec := map[string]any{
@@ -121,15 +121,20 @@ func (r *streamTLS) ensureAPIService(ctx context.Context) error {
 		"insecureSkipTLSVerify": false,
 	}
 	var cur unstructured.Unstructured
+	cur.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiregistration.k8s.io", Version: "v1", Kind: "APIService"})
 	err := r.client.Get(ctx, client.ObjectKey{Name: StreamAPIService}, &cur)
 	if apierrors.IsNotFound(err) {
-		_ = unstructured.SetNestedMap(api.Object, spec, "spec")
+		if err := unstructured.SetNestedMap(api.Object, spec, "spec"); err != nil {
+			return err
+		}
 		return r.client.Create(ctx, api)
 	}
 	if err != nil {
 		return err
 	}
-	_ = unstructured.SetNestedMap(cur.Object, spec, "spec")
+	if err := unstructured.SetNestedMap(cur.Object, spec, "spec"); err != nil {
+		return err
+	}
 	return r.client.Update(ctx, &cur)
 }
 

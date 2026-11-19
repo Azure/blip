@@ -181,6 +181,20 @@ func EnsurePodDir(dir string) error {
 	return tightenDir(filepath.Dir(dir))
 }
 
+// EnsureSocketDir creates the shared vsock directory below the pod directory
+// and makes sure it is writable by the non-root API-proxy sidecar. Kubelet
+// creates a hostPath DirectoryOrCreate with root-only permissions, so the node
+// agent must widen it before the sidecar binds its listener. The directory is
+// below the root-only pod directory, so 0777 does not expose it to other
+// users.
+func EnsureSocketDir(podDir string) error {
+	dir := filepath.Join(podDir, "sock")
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o777)
+}
+
 // EnsureDir creates dir with DirMode and tightens it if it already exists
 // with broader permissions. It does not touch the parent: the runtime mounts
 // the pod directory below /run, whose parent is not a namespace directory.

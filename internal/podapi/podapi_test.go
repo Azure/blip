@@ -104,6 +104,23 @@ func TestTightenDirRejectsSymlink(t *testing.T) {
 	assertMode(t, target, 0o755)
 }
 
+func TestEnsureSocketDirIsProxyWritable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ns", "pod")
+	if err := EnsurePodDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "sock")
+	// Kubelet's hostPath DirectoryOrCreate starts root-only.
+	if err := os.Mkdir(sock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSocketDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	assertMode(t, sock, 0o777)
+	assertMode(t, dir, DirMode)
+}
+
 func assertMode(t *testing.T, path string, want os.FileMode) {
 	t.Helper()
 	info, err := os.Stat(path)

@@ -150,9 +150,9 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !requireMethod(w, r, http.MethodGet) {
 			return
 		}
-		if _, ok := s.authenticate(w, r); !ok {
-			return
-		}
+		// Discovery is public; the aggregated API server's availability check
+		// does not carry a user token. Log and stdin requests still require
+		// authentication and authorization.
 		writeJSON(w, http.StatusOK, resourceList())
 		return
 
