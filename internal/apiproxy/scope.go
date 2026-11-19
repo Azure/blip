@@ -278,12 +278,11 @@ func (s *ownerScope) allowed(ctx context.Context, id identity, req scopeRequest)
 		}
 		return owner != "" && owner == id.owner, http.StatusNotFound, nil
 	case "blipturns":
-		// Turns are scoped by the thread they belong to, plus any explicit
-		// owner label. An untrusted thread label never reaches id.thread.
-		if id.thread != "" && obj.Spec.Thread == id.thread {
-			return true, http.StatusNotFound, nil
-		}
-		return owner != "" && owner == id.owner, http.StatusNotFound, nil
+		// Turns are scoped only by the authoritative spec.thread. Labels are
+		// producer-written, and admission rejects a pod-bound turn whose
+		// thread or owner label disagrees with spec.thread; a legacy or
+		// forged object must not gain access through them here.
+		return id.thread != "" && obj.Spec.Thread == id.thread, http.StatusNotFound, nil
 	default:
 		// Owner-labelled objects are private. Only an unlabelled image
 		// state is a shared base: the controller and mount policy treat an

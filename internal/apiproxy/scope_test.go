@@ -267,6 +267,12 @@ func scopedFixture() *fakeKube {
 		Name: "admin-turn", UID: "turn-admin", Thread: "admin-proj",
 		Labels: map[string]string{v1.LabelThread: "admin-proj", v1.LabelOwner: v1.ThreadOwner(scopeNamespace, "admin-proj")},
 	}
+	// A producer can set blip.dev/owner, so a forged owner label matching
+	// alice must not expose a turn whose spec.thread belongs to bob.
+	kube.turns["forged-owner-turn"] = fakeObject{
+		Name: "forged-owner-turn", UID: "turn-forged", Thread: "bob-proj",
+		Labels: map[string]string{v1.LabelThread: "bob-proj", v1.LabelOwner: v1.ThreadOwner(scopeNamespace, "alice-proj")},
+	}
 	return kube
 }
 
@@ -406,6 +412,9 @@ func TestOwnerScopeScopesThreadsAndTurns(t *testing.T) {
 	}
 	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/bob-turn"); status != http.StatusNotFound {
 		t.Fatalf("other owner's turn status = %d", status)
+	}
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/forged-owner-turn"); status != http.StatusNotFound {
+		t.Fatalf("forged owner label exposed another thread's turn: status = %d", status)
 	}
 	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/unlabelled-alice-turn"); status != http.StatusOK {
 		t.Fatalf("own turn without labels status = %d", status)

@@ -481,6 +481,20 @@ func TestVMOwnerPolicy(t *testing.T) {
 	}
 }
 
+// withLabels adds labels to an object built by turnObj/namedTurn.
+func withLabels(o map[string]any, labels map[string]string) map[string]any {
+	meta := o["metadata"].(map[string]any)
+	existing, _ := meta["labels"].(map[string]any)
+	if existing == nil {
+		existing = map[string]any{}
+		meta["labels"] = existing
+	}
+	for k, v := range labels {
+		existing[k] = v
+	}
+	return o
+}
+
 // withThreadLabel sets (or clears, when thread is empty) the blip.dev/thread
 // label on an object built by blipObj/stateObj.
 func withThreadLabel(o map[string]any, thread string) map[string]any {
@@ -714,12 +728,29 @@ func TestTurnOwnerPolicy(t *testing.T) {
 	self := "system:serviceaccount:" + ns + ":vm"
 	project := v1.ThreadOwner(ns, "proj")
 	victim := v1.ThreadOwner(ns, "victim")
+	long := "long-" + strings.Repeat("x", 70)
+	longLabel := v1.ThreadLabel(long)
+	longOwner := v1.ThreadOwner(ns, long)
 	params := map[string]string{
-		"sa.vm":         "default",
-		"vm-pod":        project,
-		"admin-pod":     "-",
-		"thread.proj":   project,
-		"thread.victim": victim,
+		"sa.vm":                    "default",
+		"vm-pod":                   project,
+		"long-pod":                 longOwner,
+		"admin-pod":                "-",
+		"thread.proj":              project,
+		"thread.victim":            victim,
+		"thread." + long:           longOwner,
+		"thread-hash." + longLabel: longOwner,
+	}
+	labeled := func(thread, threadLabel, ownerLabel string) map[string]any {
+		o := turnFor(thread, "ServiceAccount", self)
+		labels := map[string]string{}
+		if threadLabel != "" {
+			labels[v1.LabelThread] = threadLabel
+		}
+		if ownerLabel != "" {
+			labels[v1.LabelOwner] = ownerLabel
+		}
+		return withLabels(o, labels)
 	}
 
 	for _, tc := range []struct {
@@ -730,8 +761,13 @@ func TestTurnOwnerPolicy(t *testing.T) {
 		msg   string
 	}{
 		{"own project", vmUser("vm", "vm-pod"), turnFor("proj", "ServiceAccount", self), true, ""},
+		{"own project with matching labels", vmUser("vm", "vm-pod"), labeled("proj", "proj", project), true, ""},
 		{"other project", vmUser("vm", "vm-pod"), turnFor("victim", "ServiceAccount", self), false, "does not own thread"},
+		{"other project in label", vmUser("vm", "vm-pod"), labeled("proj", "victim", ""), false, "must name the thread"},
+		{"other owner in label", vmUser("vm", "vm-pod"), labeled("proj", "proj", victim), false, "must be the owner"},
 		{"unknown thread", vmUser("vm", "vm-pod"), turnFor("missing", "ServiceAccount", self), false, "no recorded owner"},
+		{"long thread hashed label", vmUser("vm", "long-pod"), labeled(long, longLabel, longOwner), true, ""},
+		{"long thread with another thread's label", vmUser("vm", "long-pod"), labeled(long, "victim", longOwner), false, "must name the thread"},
 		{"unclaimed pod", vmUser("vm", "vacant"), turnFor("proj", "ServiceAccount", self), false, "may only author"},
 		{"unrestricted VM", vmUser("vm", "admin-pod"), turnFor("victim", "ServiceAccount", self), true, ""},
 		{"non-pod producer is left to the author policy", &user.DefaultInfo{Name: blipchat}, turnFor("victim", "User", "ceo@example.com"), true, ""},

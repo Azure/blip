@@ -6,8 +6,10 @@
 #
 # A pod-bound VM token is additionally bound to its own project: the
 # controller records each thread's owner hash in blip-vm-owners, and the
-# caller's claimed pod maps to the same hash. This keeps a VM from injecting
-# turns into another owner's thread.
+# caller's claimed pod maps to the same hash. The blip.dev/thread and
+# blip.dev/owner labels are self-asserted, so they must agree with that hash
+# too; otherwise a VM could send a turn to its own thread while labelling it
+# into another project's in-guest turn list.
 #
 # Turns are immutable history. Pod-bound producers may not update or delete
 # them, and the deterministic names blipchat uses for watcher and coordinator
@@ -152,6 +154,18 @@ spec:
       expression: >-
         variables.threadKey in variables.data ?
         string(variables.data[variables.threadKey]) : ''
+    # The turn's labels are written by its producer. A turn that names the
+    # producer's own thread in spec.thread must not carry another project's
+    # label, because the in-guest API proxy selects turns by blip.dev/thread
+    # and prefixes owner-labelled objects with blip.dev/owner.
+    - name: threadLabel
+      expression: >-
+        has(object.metadata.labels) && 'blip.dev/thread' in object.metadata.labels ?
+        string(object.metadata.labels['blip.dev/thread']) : ''
+    - name: ownerLabel
+      expression: >-
+        has(object.metadata.labels) && 'blip.dev/owner' in object.metadata.labels ?
+        string(object.metadata.labels['blip.dev/owner']) : ''
   validations:
     - expression: >-
         variables.blipchat || variables.owner == '-' ||
@@ -162,6 +176,28 @@ spec:
         (variables.threadOwner == '' ?
         'thread ' + object.spec.thread + ' has no recorded owner' :
         'owner ' + variables.owner + ' does not own thread ' + object.spec.thread)
+      reason: Forbidden
+    # Either encoding of the label is accepted, but it must resolve to the
+    # owner of spec.thread. A raw short name lives under "thread.<label>";
+    # a long name's hashed label lives under "thread-hash.<label>".
+    - expression: >-
+        variables.blipchat || request.operation != 'CREATE' ||
+        variables.threadLabel == '' ||
+        (('thread.' + variables.threadLabel) in variables.data &&
+        string(variables.data['thread.' + variables.threadLabel]) == variables.threadOwner) ||
+        (('thread-hash.' + variables.threadLabel) in variables.data &&
+        string(variables.data['thread-hash.' + variables.threadLabel]) == variables.threadOwner)
+      messageExpression: >-
+        'blip.dev/thread on a turn must name the thread in spec.thread; ' +
+        variables.threadLabel + ' does not belong to ' + object.spec.thread
+      reason: Forbidden
+    - expression: >-
+        variables.blipchat || request.operation != 'CREATE' ||
+        variables.ownerLabel == '' ||
+        variables.ownerLabel == variables.threadOwner
+      messageExpression: >-
+        'blip.dev/owner on a turn must be the owner of spec.thread ' +
+        object.spec.thread + ', not ' + variables.ownerLabel
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
