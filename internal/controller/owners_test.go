@@ -337,3 +337,41 @@ func TestVMOwnersRetainsLivePodAccounts(t *testing.T) {
 		})
 	}
 }
+
+func TestPodOwnerLabelTracksBlip(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 1, 0)
+	e.readyState("root", "n1")
+	b := e.startBlip("b", "n1", withRoot("root"))
+	pod := e.getPod(b.Status.Pod)
+	if got := pod.Labels[v1.LabelOwner]; got != "" {
+		t.Fatalf("unrestricted pod owner label = %q", got)
+	}
+
+	setOwner := func(owner string) {
+		t.Helper()
+		b = e.getBlip("b")
+		if owner == "" {
+			delete(b.Labels, v1.LabelOwner)
+		} else {
+			if b.Labels == nil {
+				b.Labels = map[string]string{}
+			}
+			b.Labels[v1.LabelOwner] = owner
+		}
+		e.must(e.c.Update(e.ctx, b))
+		e.run(e.blip, ns, "b")
+		if got := e.getPod(b.Status.Pod).Labels[v1.LabelOwner]; got != owner {
+			t.Fatalf("pod owner label = %q, want %q", got, owner)
+		}
+	}
+
+	// An owner applied after the claim reaches the running pod.
+	setOwner(testOwner)
+	// A changed owner replaces the old one, so the previous owner cannot
+	// list the pod.
+	setOwner("u-other")
+	// Removing the owner makes the Blip unrestricted again.
+	setOwner("")
+}

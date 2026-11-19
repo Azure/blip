@@ -857,6 +857,28 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 	return nil, nil
 }
 
+// syncPodOwner keeps a claimed pod's owner label equal to its Blip's. The
+// label is written at claim time, but an owner added or changed afterwards
+// must propagate: the api-proxy authorizes pod reads by the pod label, so a
+// stale label hides the guest's own pod (or leaves it visible to the previous
+// owner).
+func (r *BlipReconciler) syncPodOwner(ctx context.Context, b *v1.Blip, pod *corev1.Pod) error {
+	owner := blipOwner(b)
+	if pod.Labels[v1.LabelOwner] == owner {
+		return nil
+	}
+	base := pod.DeepCopy()
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	if owner == "" {
+		delete(pod.Labels, v1.LabelOwner)
+	} else {
+		pod.Labels[v1.LabelOwner] = owner
+	}
+	return client.IgnoreNotFound(patchObject(ctx, r.Client, pod, base))
+}
+
 func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *corev1.Pod) error {
 	b.Status.Pod = pod.Name
 	b.Status.PodUID = string(pod.UID)
@@ -870,6 +892,9 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 	fresh := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: pod.Name}, fresh); err == nil && string(fresh.UID) == b.Status.PodUID {
 		pod = fresh
+	}
+	if err := r.syncPodOwner(ctx, b, pod); err != nil {
+		return err
 	}
 	if err := r.ensureWriterPods(ctx, b); err != nil {
 		return err
@@ -920,6 +945,11 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Res
 		pod = nil
 	} else if err != nil {
 		return reconcile.Result{}, err
+	}
+	if pod != nil {
+		if err := r.syncPodOwner(ctx, b, pod); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 	var obs podapi.Observed
 	if pod != nil {
