@@ -97,6 +97,66 @@ func TestRunWithoutSourceOutsideBlip(t *testing.T) {
 	}
 }
 
+// An explicitly empty source is a mistake, not a request for the default
+// source. Inside a blip the default is a fork of the caller's root, so an
+// unset shell variable would silently run in a throwaway workspace.
+func TestRunRejectsExplicitEmptySourceInsideBlip(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"from", []string{"--from", ""}, "--from must not be empty"},
+		{"from whitespace", []string{"--from", "   "}, "--from must not be empty"},
+		{"state", []string{"--state", ""}, "--state must not be empty"},
+		{"state whitespace", []string{"--state", "\t"}, "--state must not be empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, ownedBlip("alice.box", "alice.home"))
+			h.self = "alice.box"
+			args := append([]string{"run", "--name", "child"}, tc.args...)
+			args = append(args, "--", "true")
+			code, out, errOut := h.run("", args...)
+			if code != 1 || !strings.Contains(errOut, tc.want) {
+				t.Fatalf("code %d, stdout %q, stderr %q; want %q", code, out, errOut, tc.want)
+			}
+			if !h.gone("alice.child") {
+				t.Fatal("explicit empty source created a blip")
+			}
+			var st v1alpha1.BlipState
+			if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "alice.child"}, &st); !apierrors.IsNotFound(err) {
+				t.Fatalf("explicit empty source created a state: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunRejectsExplicitEmptySourceOutsideBlip(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"from", []string{"--from", ""}, "--from must not be empty"},
+		{"state", []string{"--state", ""}, "--state must not be empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			args := append([]string{"run", "--name", "child"}, tc.args...)
+			args = append(args, "--", "true")
+			code, _, errOut := h.run("", args...)
+			if code != 1 || !strings.Contains(errOut, tc.want) {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if !h.gone("child") {
+				t.Fatal("explicit empty source created a blip")
+			}
+		})
+	}
+}
+
 func TestRunForkFailureRemovesBlip(t *testing.T) {
 	// The source exists but is being deleted, so the fork is rejected.
 	gone := readyState("gone")

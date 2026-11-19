@@ -36,6 +36,7 @@ type runFlags struct {
 	timeout, ttl              time.Duration
 	timeoutSet, ttlSet        bool
 	nameSet                   bool
+	fromSet, stateSet         bool
 	keep                      bool
 }
 
@@ -70,6 +71,8 @@ they finish, so an abandoned fork cannot leak its workspace.`,
 			f.timeoutSet = cmd.Flags().Changed("timeout")
 			f.ttlSet = cmd.Flags().Changed("ttl")
 			f.nameSet = cmd.Flags().Changed("name")
+			f.fromSet = cmd.Flags().Changed("from")
+			f.stateSet = cmd.Flags().Changed("state")
 			// A run that is interrupted before it returns must not leave a
 			// VM behind, so turn the signal into cancellation instead of
 			// letting the default handler kill the process.
@@ -214,6 +217,16 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	}
 	if err := wholeSeconds("--ttl", f.ttl); err != nil {
 		return err
+	}
+	// An explicitly empty source is a mistake, not a request for the
+	// default source. Inside a blip the default is a fork of the caller's
+	// root, so an unset shell variable would silently run in a throwaway
+	// workspace.
+	if f.fromSet && strings.TrimSpace(f.from) == "" {
+		return errors.New("--from must not be empty")
+	}
+	if f.stateSet && strings.TrimSpace(f.state) == "" {
+		return errors.New("--state must not be empty")
 	}
 	if f.from != "" && f.state != "" {
 		return errors.New("set only one of --from and --state")
