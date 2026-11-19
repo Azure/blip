@@ -127,6 +127,19 @@ func TestValidateLinuxPathLimits(t *testing.T) {
 	}
 }
 
+// A path is a NUL-terminated C string in every filesystem syscall, so a
+// control character can never name a mount point.
+func TestValidateControlCharacters(t *testing.T) {
+	for _, p := range []string{"/a\x00b", "/a\tb", "/a\nb", "/a\x7fb"} {
+		if err := Validate(p); err == nil {
+			t.Errorf("Validate(%q) accepted a control character", p)
+		}
+	}
+	if err := Validate("/a b"); err != nil {
+		t.Errorf("Validate(%q) = %v, want space allowed", "/a b", err)
+	}
+}
+
 func TestOverlap(t *testing.T) {
 	for _, tc := range []struct {
 		a, b string

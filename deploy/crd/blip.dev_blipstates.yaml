@@ -111,13 +111,41 @@ spec:
                     path:
                       description: |-
                         Path is an absolute path inside the guest root. It must be clean: no
-                        trailing slash, repeated slash, or . and .. segments.
+                        trailing slash, repeated slash, or . and .. segments. It must also be
+                        creatable by the Linux guest: shorter than PATH_MAX bytes, with every
+                        component within NAME_MAX, and not a reserved, guest-managed, or
+                        non-directory image path. These mirror internal/mountpath so kubectl
+                        apply cannot write intent that every later Blip on the root will fail
+                        to mount. A temporary collect mount is the one allowed exception below
+                        the reserved collect root.
                       maxLength: 4096
                       pattern: ^/[^/]+(/[^/]+)*$
                       type: string
                       x-kubernetes-validations:
                       - message: path must not contain . or .. segments
                         rule: '!self.split(''/'').exists(s, s == ''.'' || s == ''..'')'
+                      - message: path must be shorter than 4096 bytes, the Linux PATH_MAX
+                          limit
+                        rule: bytes(self).size() < 4096
+                      - message: path components must be at most 255 characters, the
+                          Linux NAME_MAX limit
+                        rule: self.split('/').all(s, s.size() <= 255)
+                      - message: path must not contain control characters
+                        rule: '!self.matches(''[\\x00-\\x1f\\x7f]'')'
+                      - message: path must not be at, below, or above a guest-reserved
+                          path, except a temporary collect mount
+                        rule: '![''/proc'', ''/sys'', ''/dev'', ''/run/blip'', ''/run/blip-collect''].exists(r,
+                          self == r || self.startsWith(r + ''/'') || r.startsWith(self
+                          + ''/'')) || (self.startsWith(''/run/blip-collect/'') &&
+                          self.split(''/'').size() == 4)'
+                      - message: path must not be at or below a file in the guest
+                          or base image
+                        rule: '![''/etc/hosts'', ''/etc/resolv.conf'', ''/etc/passwd'',
+                          ''/etc/group'', ''/etc/shadow'', ''/etc/gshadow'', ''/etc/hostname'',
+                          ''/etc/hostid'', ''/etc/machine-id'', ''/etc/os-release'',
+                          ''/etc/debian_version'', ''/etc/nsswitch.conf'', ''/etc/subuid'',
+                          ''/etc/subgid'', ''/etc/mtab''].exists(f, self == f || self.startsWith(f
+                          + ''/''))'
                     state:
                       description: State names a BlipState in the blip's namespace.
                       pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$

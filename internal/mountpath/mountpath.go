@@ -62,10 +62,17 @@ func CollectMountPath(p string) bool {
 	return ok && rest != "" && !strings.Contains(rest, "/")
 }
 
-// ValidateLength reports why p is too long for a Linux filesystem. Every
-// component must fit NAME_MAX and the whole path must leave room for the
-// terminating NUL within PATH_MAX, or no guest can create the mount point.
+// ValidateLength reports why p is too long or otherwise unusable as a Linux
+// filesystem path. Every component must fit NAME_MAX and the whole path must
+// leave room for the terminating NUL within PATH_MAX, or no guest can create
+// the mount point. ASCII control characters (including NUL) cannot be part of
+// a syscall path.
 func ValidateLength(p string) error {
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return fmt.Errorf("mount path contains a control character at byte %d", i)
+		}
+	}
 	if len(p) >= PathMax {
 		return fmt.Errorf("mount path is %d bytes, exceeding the Linux PATH_MAX limit of %d bytes", len(p), PathMax-1)
 	}

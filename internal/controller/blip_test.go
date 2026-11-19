@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"regexp"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -547,6 +548,11 @@ func TestBlipValidationAndWaiting(t *testing.T) {
 		{"empty mount state", "home", []v1.Mount{{Path: "/data"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"overlap", "home", []v1.Mount{{State: "data", Path: "/a"}, {State: "other", Path: "/a/b"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"root also mounted", "home", []v1.Mount{{State: "home", Path: "/data"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"component over NAME_MAX", "home", []v1.Mount{{State: "data", Path: "/" + strings.Repeat("a", 300)}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"path at PATH_MAX", "home", []v1.Mount{{State: "data", Path: "/" + strings.Repeat("a", 4095)}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"NUL byte", "home", []v1.Mount{{State: "data", Path: "/a\x00b"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"reserved path", "home", []v1.Mount{{State: "data", Path: "/proc"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"image file", "home", []v1.Mount{{State: "data", Path: "/etc/passwd"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"empty state", "", nil, v1.BlipFailed, ReasonInvalidSpec},
 		{"missing state", "nope", nil, v1.BlipPending, ReasonStateNotFound},
 		{"uncommitted state", "fresh", nil, v1.BlipPending, ReasonStateNotReady},
@@ -600,6 +606,9 @@ func TestStopAndDeleteBeforeStart(t *testing.T) {
 	}
 }
 
+// An unknown status phase used to match no reconcile path: it was neither
+// finished nor advanced, so cleanup never ran and the finalizer blocked
+// deletion forever. It must be failed and cleaned up like any terminal Blip.
 func TestDeleteRunningBlipWaitsForSave(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")

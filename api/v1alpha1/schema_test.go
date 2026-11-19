@@ -19,6 +19,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	celconfig "k8s.io/apiserver/pkg/apis/cel"
 	"sigs.k8s.io/yaml"
+
+	"github.com/Azure/blip/internal/mountpath"
 )
 
 // crdValidation is one x-kubernetes-validations entry.
@@ -265,6 +267,71 @@ func TestMountPathCRDRules(t *testing.T) {
 	}
 }
 
+// TestMountPathAdmissionLimits proves admission rejects the same paths the
+// guest cannot create. kubectl apply is the documented path for advanced state
+// fields, so relying on the CLI preflight let impossible intent become durable.
+func TestMountPathAdmissionLimits(t *testing.T) {
+	validate := admissionValidator(t, "blipstates")
+	object := func(p string) string {
+		raw, err := kubejson.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return `{"spec":{"mounts":[{"state":"data","path":` + string(raw) + `}]}}`
+	}
+	pathAtLimit := "/" + strings.Repeat(strings.Repeat("b", mountpath.NameMax)+"/", 15) + strings.Repeat("b", 254)
+	if len(pathAtLimit) != mountpath.PathMax-1 {
+		t.Fatalf("test path is %d bytes, want %d", len(pathAtLimit), mountpath.PathMax-1)
+	}
+	for _, p := range []string{
+		"/mnt/a", "/a b/c", "/.hidden", "/a.b/c", "/var/log", "/usr/bin", "/run/data",
+		// Directory symlinks are resolved by the guest, so these are legal.
+		"/bin", "/usr/lib/ssl/certs",
+		// The CLI writes one temporary collect mount below the reserved root.
+		"/run/blip-collect/data",
+		"/" + strings.Repeat("a", mountpath.NameMax),
+		pathAtLimit,
+	} {
+		if errs := validate(object(p), ""); len(errs) != 0 {
+			t.Errorf("admission rejected valid mount path (%d bytes): %v", len(p), errs.ToAggregate())
+		}
+	}
+	for _, p := range []string{
+		"/" + strings.Repeat("a", mountpath.NameMax+1),
+		"/" + strings.Repeat("a", 300),
+		"/" + strings.Repeat("é", 3000),
+		"/" + strings.Repeat("a", mountpath.PathMax-1),
+		"/a\x00b",
+		"/a\tb",
+		"/proc",
+		"/proc/cpuinfo",
+		"/dev",
+		"/run",
+		"/run/blip/x",
+		"/run/blip-collect",
+		"/run/blip-collect/data/deep",
+		"/etc/passwd",
+		"/etc/passwd/x",
+		"/etc/hosts",
+	} {
+		if errs := validate(object(p), ""); len(errs) == 0 {
+			t.Errorf("admission accepted mount path no guest can create (%d bytes): %q", len(p), p)
+		}
+	}
+	// Every path the shared preflight rejects must also be rejected by the
+	// generated schema, or the duplicated lists have drifted.
+	for _, p := range append(append([]string{}, mountpath.Reserved...), mountpath.GuestFiles...) {
+		if errs := validate(object(p), ""); len(errs) == 0 {
+			t.Errorf("admission accepted preflight-rejected reserved path %q", p)
+		}
+	}
+	for _, p := range mountpath.ImageFiles {
+		if errs := validate(object(p), ""); len(errs) == 0 {
+			t.Errorf("admission accepted preflight-rejected image file %q", p)
+		}
+	}
+}
+
 func TestStateProvisioningImmutableAndRuntimeMutable(t *testing.T) {
 	validate := admissionValidator(t, "blipstates")
 	for _, tc := range []struct{ name, initial, changed string }{
@@ -465,6 +532,8 @@ func TestBlipTurnStatusSeqRules(t *testing.T) {
 	}
 }
 
+// TestBlipStatusPhaseAdmission guards that a status writer cannot store a
+// phase no reconcile path understands. Such a phase used to wedge deletion.
 // TestBlipTurnImmutable guards that a producer cannot rewrite history.
 func TestBlipTurnImmutable(t *testing.T) {
 	data, err := os.ReadFile("../../deploy/crd/blip.dev_blipturns.yaml")
@@ -878,6 +947,9 @@ func TestReferenceNamesValidated(t *testing.T) {
 	}
 }
 
+// TestStateReferenceNameLimits guards that a reference to a BlipState is no
+// longer than a Kubernetes object name. A too-long reference can never name an
+// object and used to leave the Blip pending until its start timeout.
 // TestBlipPoolServiceAccountNameFitsOwnerTable guards the same limit on the
 // "sa.<name>" key. The field has no DNS pattern, so without a cap a 251-byte
 // name was accepted and wedged the owner table.

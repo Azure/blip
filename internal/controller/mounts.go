@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/mountpath"
 	"github.com/Azure/blip/internal/podapi"
 )
 
@@ -125,6 +126,11 @@ func mountsReconciled(b *v1.Blip, mounts []v1.Mount) bool {
 func mountError(root string, mounts []v1.Mount, m v1.Mount) string {
 	if msg := pathError(m.Path); msg != "" {
 		return msg
+	}
+	// A path the Linux guest cannot create would make the durable root
+	// unstartable, so reject it with the same rules the CLI preflights.
+	if err := mountpath.Validate(m.Path); err != nil && !mountpath.CollectMountPath(m.Path) {
+		return err.Error()
 	}
 	if m.State == root {
 		return "the root state cannot also be mounted"
