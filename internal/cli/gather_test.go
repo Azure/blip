@@ -221,3 +221,33 @@ func TestGatherRetentionHintUsesFullName(t *testing.T) {
 	mustContain(t, out, "blip/badfork Failed")
 	mustContain(t, errOut, "delete it with kubectl delete blip alice.badfork")
 }
+
+// A Pending or Saving blip is not running; --wait must report its actual
+// state instead of claiming it is running.
+func TestGatherWaitReportsActualPhase(t *testing.T) {
+	for _, tc := range []struct {
+		phase string
+		pod   string
+		want  string
+	}{
+		{v1alpha1.BlipPending, "", "still pending: p1"},
+		{v1alpha1.BlipSaving, "pod-p1", "still saving: p1"},
+	} {
+		t.Run(tc.phase, func(t *testing.T) {
+			h := newHarness(t, runningBlip("p1"))
+			h.ctrl.set(func(c *fakeController) { c.paused = true })
+			b := h.blip("p1")
+			b.Status.Phase, b.Status.Pod = tc.phase, tc.pod
+			if err := h.kube.Status().Update(context.Background(), b); err != nil {
+				t.Fatal(err)
+			}
+			code, _, errOut := h.run("", "gather", "p1", "--wait", "50ms")
+			if code != 1 || !strings.Contains(errOut, tc.want) {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if h.gone("p1") {
+				t.Fatal("unfinished blip deleted")
+			}
+		})
+	}
+}

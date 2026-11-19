@@ -208,12 +208,7 @@ func (a *app) awaitTargets(ctx context.Context, f *gatherFlags, targets []*v1alp
 	for len(left) > 0 {
 		select {
 		case <-ctx.Done():
-			names := make([]string, 0, len(left))
-			for name := range left {
-				names = append(names, a.short(name))
-			}
-			sort.Strings(names)
-			errs = append(errs, fmt.Errorf("still running: %s", strings.Join(names, ", ")))
+			errs = append(errs, a.stillWaiting(ctx, left)...)
 			return done, errs
 		case o := <-ch:
 			delete(left, o.name)
@@ -228,6 +223,40 @@ func (a *app) awaitTargets(ctx context.Context, f *gatherFlags, targets []*v1alp
 		}
 	}
 	return done, errs
+}
+
+// stillWaiting describes the blips that had not finished when the wait ended,
+// grouped by their current phase. Pending and Saving blips are not running, so
+// the message says what they are actually doing.
+func (a *app) stillWaiting(ctx context.Context, left map[string]bool) []error {
+	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	labels := []string{"still running", "still pending", "still saving", "not finished"}
+	groups := map[string][]string{}
+	for name := range left {
+		label := "not finished"
+		if b, err := a.getBlip(qctx, name); err == nil {
+			switch b.Status.Phase {
+			case v1alpha1.BlipRunning:
+				label = "still running"
+			case v1alpha1.BlipPending, "":
+				label = "still pending"
+			case v1alpha1.BlipSaving:
+				label = "still saving"
+			}
+		}
+		groups[label] = append(groups[label], a.short(name))
+	}
+	var errs []error
+	for _, label := range labels {
+		names := groups[label]
+		if len(names) == 0 {
+			continue
+		}
+		sort.Strings(names)
+		errs = append(errs, fmt.Errorf("%s: %s", label, strings.Join(names, ", ")))
+	}
+	return errs
 }
 
 // gatherOne reports one finished blip, collects its results when asked, and
