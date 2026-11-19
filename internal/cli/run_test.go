@@ -551,6 +551,10 @@ func TestRunRejectsInvalidDurations(t *testing.T) {
 		{[]string{"--timeout", "3500ms"}, "--timeout must be a whole number of seconds"},
 		{[]string{"--ttl", "1500ms"}, "--ttl must be a whole number of seconds"},
 		{[]string{"--timeout", "500ms"}, "--timeout must be a whole number of seconds"},
+		{[]string{"--ttl", "2147483648s"}, "--ttl must be at most 2147483647s"},
+		{[]string{"--ttl", "4294967295s"}, "--ttl must be at most 2147483647s"},
+		{[]string{"--ttl", "4294967296s"}, "--ttl must be at most 2147483647s"},
+		{[]string{"--timeout", "9223372037s"}, "time: invalid duration"},
 	}
 	for _, tc := range cases {
 		h := newHarness(t, readyState("base"))
@@ -578,5 +582,53 @@ func TestRunAcceptsWholeSecondDurations(t *testing.T) {
 	}
 	if b.Spec.TTLSecondsAfterFinished == nil || *b.Spec.TTLSecondsAfterFinished != 60 {
 		t.Fatalf("ttl %v", b.Spec.TTLSecondsAfterFinished)
+	}
+}
+
+// The largest TTL the CRD accepts is passed through unchanged; one second more
+// must be rejected by the CLI rather than wrapping to a small or negative
+// int32 and deleting a finished Blip.
+func TestRunAcceptsLargestTTLAndRejectsOverflow(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--ttl", "2147483647s", "--", "true")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	b := h.blip("worker")
+	if b.Spec.TTLSecondsAfterFinished == nil || *b.Spec.TTLSecondsAfterFinished != 2147483647 {
+		t.Fatalf("ttl %v", b.Spec.TTLSecondsAfterFinished)
+	}
+
+	h = newHarness(t, readyState("base"))
+	code, _, errOut = h.run("", "run", "--name", "worker", "--from", "base", "--ttl", "2147483648s", "--", "true")
+	if code != 1 || !strings.Contains(errOut, "--ttl must be at most 2147483647s") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !h.gone("worker") {
+		t.Fatal("blip created despite the overflowing ttl")
+	}
+}
+
+// --timeout is stored in an int64 but converted to a time.Duration, whose
+// largest whole-second value is 9223372036s. Values beyond it must fail before
+// anything is created.
+func TestRunRejectsTimeoutBeyondDurationRange(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--timeout", "9223372036s", "--", "true")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	b := h.blip("worker")
+	if b.Spec.ActiveDeadlineSeconds == nil || *b.Spec.ActiveDeadlineSeconds != 9223372036 {
+		t.Fatalf("deadline %v", b.Spec.ActiveDeadlineSeconds)
+	}
+
+	h = newHarness(t, readyState("base"))
+	code, _, errOut = h.run("", "run", "--name", "worker", "--from", "base", "--timeout", "9223372037s", "--", "true")
+	if code != 1 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !h.gone("worker") {
+		t.Fatal("blip created despite the overflowing timeout")
 	}
 }

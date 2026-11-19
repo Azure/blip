@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -180,15 +181,29 @@ func labelFlags(b *v1alpha1.Blip, values []string) error {
 	return nil
 }
 
+// The CRD stores these fields in whole seconds. --ttl is an int32, so a
+// larger value would wrap to a small or negative TTL and delete a finished
+// Blip (including a failed one) almost immediately. --timeout is an int64
+// whose maximum is the largest value that does not overflow a time.Duration.
+// Reject out-of-range values instead of letting the API server do it (or,
+// worse, silently wrapping them).
+const (
+	maxTTLSeconds     = int64(math.MaxInt32)
+	maxTimeoutSeconds = int64(math.MaxInt64 / int64(time.Second))
+)
+
 // wholeSeconds validates a duration that is stored in whole seconds. A
 // negative value would silently disable the field that the flag is meant to
-// set, and a fractional value would be truncated, so both are rejected.
-func wholeSeconds(flag string, d time.Duration) error {
+// set, a fractional value would be truncated, and a value above the CRD's
+// maximum would wrap or fail at the API server, so all three are rejected.
+func wholeSeconds(flag string, d time.Duration, max int64) error {
 	switch {
 	case d < 0:
 		return fmt.Errorf("%s must not be negative: %s", flag, d)
 	case d%time.Second != 0:
 		return fmt.Errorf("%s must be a whole number of seconds: %s", flag, d)
+	case int64(d/time.Second) > max:
+		return fmt.Errorf("%s must be at most %ds: %s", flag, max, d)
 	}
 	return nil
 }
@@ -212,10 +227,10 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	if len(command) == 0 {
 		return errors.New("a command is required: blip run -- CMD [ARG...]")
 	}
-	if err := wholeSeconds("--timeout", f.timeout); err != nil {
+	if err := wholeSeconds("--timeout", f.timeout, maxTimeoutSeconds); err != nil {
 		return err
 	}
-	if err := wholeSeconds("--ttl", f.ttl); err != nil {
+	if err := wholeSeconds("--ttl", f.ttl, maxTTLSeconds); err != nil {
 		return err
 	}
 	// An explicitly empty source is a mistake, not a request for the
