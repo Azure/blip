@@ -27,7 +27,12 @@
 # incarnation annotations on a Blip (blip.dev/thread-uid, blip.dev/thread-name,
 # and blip.dev/thread) are write-once: a restricted owner may neither add,
 # rewrite, nor remove them, because the API proxy and blipchat trust them when
-# pinning reads and writes to a thread incarnation. Every new or changed
+# pinning reads and writes to a thread incarnation. A restricted VM may not
+# attach a thread to a new Blip at all, by label or annotation: a Blip created
+# from a leftover VM of a deleted thread would otherwise carry the thread name
+# without its incarnation, and the proxy would adopt the recreated thread's
+# current UID. Legitimate in-guest `blip run` does not propagate thread labels;
+# blipchat and the controller are not restricted. Every new or changed
 # ownerReference it sets must name an object of the same owner: fork blips may
 # only be owned by blips, and states may be owned by such blips or by another
 # state (a durable fork's hidden children are owned by their root state). An
@@ -246,6 +251,21 @@ spec:
         string(variables.data['thread-hash.' + variables.thread]) == variables.owner)))
       messageExpression: >-
         'owner ' + variables.owner + ' may only attach blip.dev/thread labels of its own threads'
+      reason: Forbidden
+    # A Blip's thread is chosen by its creator, never by the VM it starts. A
+    # restricted VM may patch an existing thread-labelled Blip (including
+    # keeping or changing to another own thread, as checked above) but must not
+    # attach a thread to a new one. Such a Blip has no incarnation pin, and the
+    # API proxy treats an absent pin as the current incarnation, so a leftover
+    # VM of a deleted thread could otherwise read the recreated thread. The
+    # incarnation annotations are denied on CREATE by the write-once rule
+    # below; this denies the label too. In-guest `blip run` sets neither, and
+    # blipchat and the controller (not restricted) still create them.
+    - expression: >-
+        !variables.restricted || request.operation != 'CREATE' ||
+        request.resource.resource != 'blips' || variables.thread == ''
+      messageExpression: >-
+        'owner ' + variables.owner + ' may not attach a thread to a new blip; thread-labelled blips are created by an administrator'
       reason: Forbidden
     # The incarnation annotation must not move after creation. An unchanged
     # value stays valid even when the thread is gone (so status/cleanup

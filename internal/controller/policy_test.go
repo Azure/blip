@@ -660,7 +660,7 @@ func TestVMOwnerPolicyThreadLabel(t *testing.T) {
 		allow bool
 		msg   string
 	}{
-		{"own thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: own}, true, ""},
+		{"own thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: own}, false, "thread-labelled blips are created by an administrator"},
 		{"no thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: noThread}, true, ""},
 		{"foreign thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: foreign}, false, "thread"},
 		{"unknown thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: unknown}, false, "thread"},
@@ -681,6 +681,71 @@ func TestVMOwnerPolicyThreadLabel(t *testing.T) {
 				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
 			}
 		})
+	}
+}
+
+// A restricted VM must not attach a thread to a new Blip. The API proxy
+// treats a missing incarnation pin as "the current thread incarnation", so a
+// leftover VM from a deleted thread could otherwise create a thread-labelled
+// Blip with no pin and read the recreated thread's history. In-guest
+// `blip run` propagates neither the label nor the annotations, while blipchat
+// and administrator-owned VMs remain unrestricted.
+func TestVMOwnerPolicyRestrictedCreateCannotAttachThread(t *testing.T) {
+	v := loadVMOwnerPolicy(t)
+	project := v1.ThreadOwner(ns, "proj")
+	params := map[string]string{
+		"sa.vm":         "default",
+		"default-mine":  project,
+		"default-admin": "-",
+		"thread.proj":   project,
+	}
+	mine, admin := vmUser("vm", "default-mine"), vmUser("vm", "default-admin")
+	blipchat := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blipchat"}
+	tagged := func(label bool, annotations map[string]string) map[string]any {
+		obj := blipObj(project+".a", project)
+		if label {
+			obj = withThreadLabel(obj, "proj")
+		}
+		if len(annotations) > 0 {
+			obj = withAnnotations(obj, annotations)
+		}
+		return obj
+	}
+	pin := map[string]string{
+		v1.AnnotationThread:    "proj",
+		v1.AnnotationThreadUID: "thread-inc",
+	}
+
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		obj   map[string]any
+		objNm string
+		allow bool
+		msg   string
+	}{
+		{"restricted create with thread label", mine, tagged(true, nil), project + ".a", false, "attach a thread"},
+		{"restricted create with thread label and pin", mine, tagged(true, pin), project + ".a", false, "attach a thread"},
+		{"restricted create with uid annotation only", mine, tagged(false, map[string]string{v1.AnnotationThreadUID: "thread-inc"}), project + ".a", false, "incarnation annotation"},
+		{"restricted create with name annotation only", mine, tagged(false, map[string]string{v1.AnnotationThread: "proj"}), project + ".a", false, "incarnation annotation"},
+		{"restricted create without a thread", mine, tagged(false, nil), project + ".a", true, ""},
+		{"unrestricted VM create with thread label and pin", admin, withThreadLabel(withAnnotations(blipObj("a", ""), pin), "proj"), "a", true, ""},
+		{"blipchat create with thread label and pin", blipchat, withThreadLabel(withAnnotations(blipObj("a", ""), pin), "proj"), "a", true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{user: tc.user, op: admission.Create, resource: "blips", name: tc.objNm, object: tc.obj}
+			allow, msg := req.evaluate(t, v, params)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+
+	// Patching an existing thread-labelled own Blip stays allowed.
+	old := withThreadLabel(withAnnotations(blipObj(project+".a", project), pin), "proj")
+	if allow, msg := (policyRequest{user: mine, op: admission.Update, resource: "blips",
+		name: project + ".a", object: old, oldObject: old}).evaluate(t, v, params); !allow {
+		t.Fatalf("update of an existing thread-labelled Blip was denied: %s", msg)
 	}
 }
 
@@ -1302,6 +1367,7 @@ func TestVMOwnerPolicyLongThreadLabel(t *testing.T) {
 	own := withThreadLabel(blipObj(project+".a", project), label)
 	foreign := withThreadLabel(blipObj(project+".a", project), victimLabel)
 	unknown := withThreadLabel(blipObj(project+".a", project), v1.ThreadLabel("missing-thread"))
+	unlabelled := blipObj(project+".a", project)
 
 	for _, tc := range []struct {
 		name  string
@@ -1313,7 +1379,9 @@ func TestVMOwnerPolicyLongThreadLabel(t *testing.T) {
 		{"unknown hashed thread", unknown, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: tc.obj}
+			// A restricted VM may not attach a thread on CREATE, so the label
+			// lookup is exercised by attaching it to an existing own Blip.
+			req := policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: tc.obj, oldObject: unlabelled}
 			allow, msg := req.evaluate(t, v, params)
 			if allow != tc.allow || (!tc.allow && !strings.Contains(msg, "thread")) {
 				t.Fatalf("allow %v (%q), want %v", allow, msg, tc.allow)
@@ -1356,7 +1424,11 @@ func TestVMOwnerPolicyThreadHashDoesNotShadowShortName(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			obj := withThreadLabel(blipObj(tc.owner+".a", tc.owner), tc.label)
-			req := policyRequest{user: tc.user, op: admission.Create, resource: "blips", name: tc.owner + ".a", object: obj}
+			// Attach the label on UPDATE: CREATE with a thread label is denied
+			// for every restricted VM, which would hide the resolution under
+			// test.
+			old := blipObj(tc.owner+".a", tc.owner)
+			req := policyRequest{user: tc.user, op: admission.Update, resource: "blips", name: tc.owner + ".a", object: obj, oldObject: old}
 			allow, msg := req.evaluate(t, v, params)
 			if allow != tc.allow || (!tc.allow && !strings.Contains(msg, "thread")) {
 				t.Fatalf("allow %v (%q), want %v", allow, msg, tc.allow)
