@@ -59,6 +59,15 @@ const (
 	// AnnotationStopReason records why the controller set spec.stop, for the
 	// client to report when it gathers the blip.
 	AnnotationStopReason = "blip.dev/stop-reason"
+	// AnnotationPrunedReportSeq records the highest report sequence whose
+	// deterministic watcher turn retention has deleted. The watcher
+	// deduplicates by turn name, so without this tombstone it would recreate
+	// the pruned turn from the Blip's unchanged status and deliver stale
+	// input to the coordinator again.
+	AnnotationPrunedReportSeq = "blip.dev/pruned-report-seq"
+	// AnnotationPrunedFinished marks a deleted finished-phase turn. It stops
+	// the watcher from recreating that deterministic turn after retention.
+	AnnotationPrunedFinished = "blip.dev/pruned-finished"
 
 	// AnnotationWaitForClient on a Blip asks the guest to hold the primary
 	// command's output until a client attaches. A Blip created directly

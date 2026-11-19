@@ -62,15 +62,25 @@ func (w *Watcher) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		}
 		attrs["seq"] = strconv.FormatInt(r.Seq, 10)
 		name := fmt.Sprintf("blip-%s-r%d", uid, r.Seq)
-		if err := createTurnIn(ctx, w.Client, b.Namespace, name, turnSpec{
-			Thread: thread, AuthorKind: v1.TurnAuthorBlip, AuthorName: b.Name,
-			Topic: "blip.report", Text: summary, Attributes: attrs,
-			Subjects: subjects, Wake: v1.WakeBatch,
-		}); err != nil {
-			return ctrl.Result{}, err
+		// Retention may have deleted this report's deterministic turn after
+		// it was consumed. The tombstone on the Blip proves that; recreating
+		// it would deliver the same stale report as new pending input.
+		if r.Seq > prunedReportSeq(&b) {
+			if err := createTurnIn(ctx, w.Client, b.Namespace, name, turnSpec{
+				Thread: thread, AuthorKind: v1.TurnAuthorBlip, AuthorName: b.Name,
+				Topic: "blip.report", Text: summary, Attributes: attrs,
+				Subjects: subjects, Wake: v1.WakeBatch,
+			}); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 	if !v1.Finished(&b) {
+		return ctrl.Result{}, nil
+	}
+	if b.Annotations[v1.AnnotationPrunedFinished] == "true" {
+		// The finished turn was consumed and pruned; the terminal phase never
+		// changes, so there is no new input to deliver.
 		return ctrl.Result{}, nil
 	}
 	attrs := map[string]string{"phase": b.Status.Phase}
@@ -91,6 +101,16 @@ func (w *Watcher) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// prunedReportSeq returns the highest report sequence whose watcher turn
+// retention deleted, or 0 when no report turn was pruned.
+func prunedReportSeq(b *v1.Blip) int64 {
+	seq, err := strconv.ParseInt(b.Annotations[v1.AnnotationPrunedReportSeq], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return seq
 }
 
 // threadOwnedBy reports whether thread exists and belongs to the Blip's

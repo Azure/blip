@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1334,6 +1335,12 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 		if age == nil || now.Sub(age.Time) < turnAge.Duration {
 			continue
 		}
+		// The watcher deduplicates its deterministic report/finish turns by
+		// name only. Record that this turn was pruned before deleting it, so
+		// the unchanged Blip status cannot recreate it as fresh input.
+		if err := s.markPrunedWatcherTurn(ctx, t); err != nil {
+			return err
+		}
 		if err := s.Delete(ctx, t); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -1391,6 +1398,65 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 		thread.Status = current.Status
 	}
 	return nil
+}
+
+// markPrunedWatcherTurn records on the source Blip that retention deleted one
+// of the deterministic turns the watcher derives from its status. The watcher
+// deduplicates only by turn name, so without the tombstone the unchanged Blip
+// status would recreate the pruned report or finish turn as fresh pending
+// input with a new sequence.
+func (s *Server) markPrunedWatcherTurn(ctx context.Context, turn *v1.BlipTurn) error {
+	if turn.Spec.Author.Kind != v1.TurnAuthorBlip || turn.Spec.Author.Name == "" {
+		return nil
+	}
+	var b v1.Blip
+	key := client.ObjectKey{Namespace: turn.Namespace, Name: turn.Spec.Author.Name}
+	if err := s.Get(ctx, key, &b); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	patch := client.MergeFrom(b.DeepCopy())
+	if b.Annotations == nil {
+		b.Annotations = map[string]string{}
+	}
+	uid := string(b.UID)
+	if uid == "" {
+		uid = b.Name
+	}
+	switch turn.Spec.Topic {
+	case "blip.report":
+		seq, ok := reportSeqFromTurn(turn)
+		// A Blip recreated under the same name has a different UID and its
+		// own deterministic turns; only tombstone this incarnation's.
+		if !ok || turn.Name != fmt.Sprintf("blip-%s-r%d", uid, seq) || seq <= prunedReportSeq(&b) {
+			return nil
+		}
+		b.Annotations[v1.AnnotationPrunedReportSeq] = strconv.FormatInt(seq, 10)
+	case "blip.finished":
+		if turn.Name != "blip-"+uid+"-fin" || b.Annotations[v1.AnnotationPrunedFinished] == "true" {
+			return nil
+		}
+		b.Annotations[v1.AnnotationPrunedFinished] = "true"
+	default:
+		return nil
+	}
+	return s.Patch(ctx, &b, patch)
+}
+
+// reportSeqFromTurn recovers the report sequence a watcher turn carries. The
+// attribute is authoritative; the deterministic name suffix is the fallback
+// for turns written before the attribute was always set.
+func reportSeqFromTurn(turn *v1.BlipTurn) (int64, bool) {
+	if raw := turn.Spec.Attributes["seq"]; raw != "" {
+		if seq, err := strconv.ParseInt(raw, 10, 64); err == nil && seq > 0 {
+			return seq, true
+		}
+	}
+	if i := strings.LastIndex(turn.Name, "-r"); i >= 0 {
+		if seq, err := strconv.ParseInt(turn.Name[i+2:], 10, 64); err == nil && seq > 0 {
+			return seq, true
+		}
+	}
+	return 0, false
 }
 
 // closedTaskOlder reports whether a should be pruned before b. A closed task
