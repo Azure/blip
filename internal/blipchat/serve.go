@@ -193,12 +193,13 @@ func (s *Server) pendingTurns(ctx context.Context, thread *v1.BlipThread) ([]v1.
 	}
 	out := turns.Items[:0]
 	for _, t := range turns.Items {
-		if t.Status.Seq <= thread.Status.ConsumedSeq || t.Spec.Author.Kind == v1.TurnAuthorCoordinator {
+		if !turnBelongsToThread(&t, thread) ||
+			t.Status.Seq <= thread.Status.ConsumedSeq || t.Spec.Author.Kind == v1.TurnAuthorCoordinator {
 			continue
 		}
 		out = append(out, t)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Status.Seq < out[j].Status.Seq })
+	sortTurns(out)
 	return out, nil
 }
 
@@ -480,6 +481,21 @@ func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
 // prune deletes consumed turns past retention and old closed tasks.
 func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 	now := timeNow()
+	// Turns sequenced by a previous incarnation of a recreated thread are
+	// not history of this one. Delete them regardless of age or sequence.
+	var all v1.BlipTurnList
+	if err := s.List(ctx, &all, client.InNamespace(thread.Namespace), client.MatchingFields{turnField: thread.Name}); err != nil {
+		return err
+	}
+	for i := range all.Items {
+		t := &all.Items[i]
+		if turnBelongsToThread(t, thread) {
+			continue
+		}
+		if err := s.Delete(ctx, t); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
 	turnAge, keepTurns := thread.Spec.Retention.Turns, int(thread.Spec.Retention.KeepTurns)
 	if turnAge == nil {
 		turnAge = &metav1.Duration{Duration: 7 * 24 * time.Hour}

@@ -236,6 +236,10 @@ type BlipTurnStatus struct {
 	Seq int64 `json:"seq,omitempty"`
 	// AcceptedTime is when blipchat sequenced the turn.
 	AcceptedTime *metav1.Time `json:"acceptedTime,omitempty"`
+	// ThreadUID is the UID of the BlipThread incarnation that sequenced the
+	// turn. A deleted and recreated thread has a new UID, so turns sequenced
+	// by the old incarnation are ignored rather than adopted as history.
+	ThreadUID string `json:"threadUID,omitempty"`
 }
 
 // +kubebuilder:object:root=true

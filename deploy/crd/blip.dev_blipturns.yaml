@@ -161,6 +161,12 @@ spec:
                   order.
                 format: int64
                 type: integer
+              threadUID:
+                description: |-
+                  ThreadUID is the UID of the BlipThread incarnation that sequenced the
+                  turn. A deleted and recreated thread has a new UID, so turns sequenced
+                  by the old incarnation are ignored rather than adopted as history.
+                type: string
             type: object
         type: object
         x-kubernetes-validations:

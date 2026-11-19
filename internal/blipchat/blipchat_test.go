@@ -94,6 +94,97 @@ func testTurn(name, thread string) *v1.BlipTurn {
 	}
 }
 
+// A thread that is deleted and recreated reuses its name but gets a new UID.
+// Turns sequenced by the old incarnation must not be adopted by the new one.
+func TestSequencerScopesTurnsToThreadIncarnation(t *testing.T) {
+	thread := testThread()
+	thread.UID = types.UID("new-incarnation")
+	old := testTurn("old", "proj")
+	old.Status = v1.BlipTurnStatus{Seq: 7, ThreadUID: "old-incarnation"}
+	fresh := testTurn("fresh", "proj")
+	c := testClient(t, thread, old, fresh)
+	ctx := context.Background()
+	if _, err := (&Sequencer{Client: c}).Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "fresh"}}); err != nil {
+		t.Fatal(err)
+	}
+	var turn v1.BlipTurn
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "fresh"}, &turn); err != nil {
+		t.Fatal(err)
+	}
+	if turn.Status.Seq != 1 || turn.Status.ThreadUID != "new-incarnation" {
+		t.Errorf("fresh turn status = %+v, want seq 1 for the new incarnation", turn.Status)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "proj"}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.LastSeq != 1 {
+		t.Errorf("lastSeq = %d, want 1", updated.Status.LastSeq)
+	}
+	s := &Server{Client: c}
+	pending, err := s.pendingTurns(ctx, &updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Name != "fresh" {
+		t.Errorf("pending turns = %v, want only fresh", names(pending))
+	}
+}
+
+func names(turns []v1.BlipTurn) []string {
+	out := make([]string, len(turns))
+	for i := range turns {
+		out[i] = turns[i].Name
+	}
+	return out
+}
+
+// Pruning deletes turns left behind by a previous thread incarnation even when
+// their sequence is higher than the current thread's consumed sequence.
+func TestPruneDeletesStaleIncarnationTurns(t *testing.T) {
+	thread := testThread()
+	thread.UID = types.UID("new-incarnation")
+	old := testTurn("old", "proj")
+	old.Status = v1.BlipTurnStatus{Seq: 99, ThreadUID: "old-incarnation"}
+	current := testTurn("current", "proj")
+	current.Status = v1.BlipTurnStatus{Seq: 1, ThreadUID: "new-incarnation"}
+	c := testClient(t, thread, old, current)
+	s := &Server{Client: c}
+	if err := s.prune(context.Background(), thread); err != nil {
+		t.Fatal(err)
+	}
+	var turns v1.BlipTurnList
+	if err := c.List(context.Background(), &turns, client.InNamespace("ns")); err != nil {
+		t.Fatal(err)
+	}
+	if got := names(turns.Items); len(got) != 1 || got[0] != "current" {
+		t.Errorf("turns after prune = %v, want only current", got)
+	}
+}
+
+// A turn created while its thread exists is owned by that thread, so deleting
+// the thread cascades instead of leaving an orphan behind.
+func TestCreateTurnInOwnsTurn(t *testing.T) {
+	thread := testThread()
+	thread.UID = types.UID("thread-uid")
+	c := testClient(t, thread)
+	ctx := context.Background()
+	if err := createTurnIn(ctx, c, "ns", "turn", turnSpec{Thread: "proj", AuthorKind: v1.TurnAuthorUser, AuthorName: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	var turn v1.BlipTurn
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "turn"}, &turn); err != nil {
+		t.Fatal(err)
+	}
+	if len(turn.OwnerReferences) != 1 {
+		t.Fatalf("ownerReferences = %v, want one", turn.OwnerReferences)
+	}
+	ref := turn.OwnerReferences[0]
+	if ref.Kind != "BlipThread" || ref.Name != "proj" || ref.UID != "thread-uid" {
+		t.Errorf("owner reference = %+v", ref)
+	}
+}
+
 func TestSequencerOrdersTurns(t *testing.T) {
 	c := testClient(t, testThread(), testTurn("one", "proj"), testTurn("two", "proj"))
 	s := &Sequencer{Client: c}

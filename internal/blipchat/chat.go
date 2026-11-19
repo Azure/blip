@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -448,12 +447,12 @@ func (s *Server) recentTurns(ctx context.Context, thread *v1.BlipThread, since i
 	}
 	out := make([]v1.BlipTurn, 0, len(turns.Items))
 	for _, t := range turns.Items {
-		if t.Status.Seq <= since {
+		if t.Status.Seq <= since || !turnBelongsToThread(&t, thread) {
 			continue
 		}
 		out = append(out, t)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Status.Seq < out[j].Status.Seq })
+	sortTurns(out)
 	if len(out) > limit {
 		out = out[len(out)-limit:]
 	}

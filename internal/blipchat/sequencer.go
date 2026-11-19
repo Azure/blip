@@ -47,12 +47,18 @@ func (s *Sequencer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 		}
 		return ctrl.Result{}, err
 	}
+	if !turnBelongsToThread(&turn, &thread) {
+		// A previous incarnation of a same-named thread already sequenced
+		// (or owned) this turn. Leave it for pruning; never adopt it.
+		return ctrl.Result{}, nil
+	}
 	seq := thread.Status.LastSeq + 1
 	thread.Status.LastSeq = seq
 	if err := s.Status().Update(ctx, &thread); err != nil {
 		return ctrl.Result{}, err
 	}
 	turn.Status.Seq = seq
+	turn.Status.ThreadUID = string(thread.UID)
 	turn.Status.AcceptedTime = &metav1.Time{Time: timeNow()}
 	if err := s.Status().Update(ctx, &turn); err != nil {
 		return ctrl.Result{}, err
