@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"sync"
@@ -41,9 +42,10 @@ func TestSignalWhileStdinIsBlocked(t *testing.T) {
 	s := newInputTestSession(w, cmd.Process.Pid)
 	defer s.closeInput()
 
-	// More than a pipe buffer, so the input pump is stuck in write when the
-	// signal frame arrives.
-	if err := s.queueInput(bytes.Repeat([]byte("x"), 1<<20)); err != nil {
+	// More than the queue budget, so the input pump is stuck in write and the
+	// frame loop used to block waiting for space when the signal frame
+	// arrived. The backlog absorbs it without blocking.
+	if err := s.queueInput(bytes.Repeat([]byte("x"), maxPendingInput+(1<<20))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -64,6 +66,141 @@ func TestSignalWhileStdinIsBlocked(t *testing.T) {
 	select {
 	case <-exited:
 	case <-time.After(2 * time.Second):
+		t.Fatal("process did not receive the signal")
+	}
+}
+
+// TestSignalWhileStdinQueueIsFull verifies that a forwarded signal still
+// reaches a process that has stopped reading after the full hard stdin bound.
+// The frame loop may wait for pump space, but the stall escape must release it
+// so later control frames are read rather than lost behind unread input.
+func TestSignalWhileStdinQueueIsFull(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+
+	old := inputStallTimeout
+	inputStallTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { inputStallTimeout = old })
+
+	s := newInputTestSession(w, cmd.Process.Pid)
+	defer s.closeInput()
+
+	if err := s.queueInput(make([]byte, maxQueuedInput)); err != nil {
+		t.Fatal(err)
+	}
+	// This frame cannot fit and the process never reads, so only the stall
+	// escape lets queueInput return.
+	blocked := make(chan error, 1)
+	go func() { blocked <- s.queueInput(make([]byte, 1<<20)) }()
+	select {
+	case err := <-blocked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queueInput did not shed input after a progress-free stall")
+	}
+	if !s.inTruncated {
+		t.Fatal("shed input was not recorded as truncated")
+	}
+	if !s.takeDropped() {
+		t.Fatal("shed input was not reported to the client")
+	}
+
+	payload, _ := json.Marshal(wire.Signal{Name: "TERM"})
+	done := make(chan struct{})
+	go func() {
+		_ = s.input(wire.TSignal, payload)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("signal frame blocked behind a full stdin queue")
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("process did not receive the signal after the queue was shed")
+	}
+}
+
+// TestServeDeliversSignalAfterFullInputQueue exercises the real frame loop:
+// a client floods stdin past the hard bound to a process that never reads,
+// then sends a signal. The serve loop must not stay blocked in queueInput.
+func TestServeDeliversSignalAfterFullInputQueue(t *testing.T) {
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rd.Close()
+	defer wr.Close()
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+
+	old := inputStallTimeout
+	inputStallTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { inputStallTimeout = old })
+
+	g, _ := lifecycleGuest(t)
+	s := newSession(g, "exec-wire", nil, false)
+	s.proc = &proc{pid: cmd.Process.Pid, stdin: wr}
+	go s.pumpInput()
+	defer s.closeInput()
+
+	clientNet, guestNet := net.Pipe()
+	defer clientNet.Close()
+	go s.serve(wire.NewConn(guestNet), guestNet, false)
+
+	client := wire.NewConn(clientNet)
+	// Drain notices and output so the guest's frame loop never blocks writing
+	// a dropped-input notice to a client that is not reading.
+	go func() {
+		for {
+			if _, _, err := client.Read(); err != nil {
+				return
+			}
+		}
+	}()
+	wrote := make(chan error, 1)
+	go func() {
+		chunk := make([]byte, 32<<10)
+		for sent := 0; sent < maxQueuedInput+(1<<20); sent += len(chunk) {
+			if err := client.Write(wire.TStdin, chunk); err != nil {
+				wrote <- err
+				return
+			}
+		}
+		wrote <- client.WriteJSON(wire.TSignal, wire.Signal{Name: "TERM"})
+	}()
+	select {
+	case err := <-wrote:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("signal frame stayed blocked behind a full stdin queue")
+	}
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
 		t.Fatal("process did not receive the signal")
 	}
 }
@@ -125,7 +262,7 @@ func TestNonTTYInputWaitsInsteadOfDropping(t *testing.T) {
 	s.inCond = sync.NewCond(&s.inMu)
 	defer s.closeInput()
 
-	if err := s.queueInput(make([]byte, maxPendingInput)); err != nil {
+	if err := s.queueInput(make([]byte, maxQueuedInput)); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
@@ -703,7 +840,7 @@ func TestNonTTYSlowReaderReceivesWholeStream(t *testing.T) {
 func TestNonTTYInputIsNeverDropped(t *testing.T) {
 	s := &session{out: ring{max: ringSize}}
 	s.inCond = sync.NewCond(&s.inMu)
-	s.inBytes = maxPendingInput
+	s.inBytes = maxQueuedInput
 	done := make(chan error, 1)
 	go func() { done <- s.queueInput([]byte("tail")) }()
 	select {

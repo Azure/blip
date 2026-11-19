@@ -42,15 +42,18 @@ type session struct {
 	// or PTY blocks when the process does not read it; doing that in the
 	// frame loop would also block resize and signal frames, so a command
 	// like `sleep` could not be interrupted after its stdin filled up.
-	inMu      sync.Mutex
-	inCond    *sync.Cond
-	inQueue   [][]byte
-	inBytes   int // queued but not yet handed to the pump
-	inFlight  int // dequeued and being written by the pump
-	inEOF     bool
-	inDone    bool      // no more input will be queued
-	inDropped bool      // input was discarded because the process is not reading
-	inNotice  time.Time // when the stdin-discarded notice was last sent
+	inMu        sync.Mutex
+	inCond      *sync.Cond
+	inQueue     [][]byte
+	inBytes     int       // queued but not yet handed to the pump
+	inFlight    int       // dequeued and being written by the pump
+	inFullSince time.Time // when the hard bound last became full without progress
+	inEOF       bool
+	inDone      bool      // no more input will be queued
+	inStalled   bool      // the process is not reading, so input is being shed
+	inDropped   bool      // input was discarded because the process is not reading
+	inTruncated bool      // at least one non-terminal input frame was shed
+	inNotice    time.Time // when the stdin-discarded notice was last sent
 
 	// Exec sessions hold output pumps until the client is attached (right
 	// after TOpened), so output produced during the open handshake cannot
@@ -63,10 +66,26 @@ type session struct {
 	mirror *consoleMirror
 }
 
-// maxPendingInput bounds stdin queued for a process that is not reading it.
+// maxPendingInput is the stdin budget that is always accepted without waiting.
 // A client write burst is smaller, so this leaves room for a control frame
 // (resize or signal) behind a burst of input without buffering without limit.
 const maxPendingInput = 8 << 20
+
+// maxInputBacklog is extra in-memory stdin accepted beyond maxPendingInput.
+// A non-terminal upload that pauses (or a command that is still starting up)
+// is absorbed here instead of being dropped, without blocking the frame loop
+// long enough for a forwarded signal to be lost. The total covers a 32 MiB
+// redirected upload, the size used by the stdin-backpressure regression.
+const maxInputBacklog = 24 << 20
+
+// maxQueuedInput is the hard bound on queued plus in-flight stdin.
+const maxQueuedInput = maxPendingInput + maxInputBacklog
+
+// inputStallTimeout is how long the hard-input bound may stay full without
+// the pump writing anything before the process is treated as not reading.
+// Only then is input shed, so a slow but steadily reading process (and a
+// command that pauses for a few seconds before reading) is never truncated.
+var inputStallTimeout = 5 * time.Second
 
 const (
 	// inputNoticeInterval throttles the stdin-discarded warning so a flood
@@ -480,6 +499,10 @@ func (s *session) writeInput(b []byte) {
 		if s.inFlight < 0 {
 			s.inFlight = 0
 		}
+		// Progress is what tells a slow reader from a stuck one: any chunk
+		// written resets a waiting writer's stall clock.
+		s.inFullSince = time.Time{}
+		s.inStalled = false
 		s.inCond.Broadcast()
 		s.inMu.Unlock()
 	}
@@ -727,11 +750,15 @@ func ttySetCanonical(f *os.File) bool {
 // megabytes without the process reading them.
 //
 // A non-terminal session is a byte stream, not a person typing: commands
-// upload data through it and dropping a frame would corrupt the stream. Wait
-// for the input pump to make space instead; the wait propagates through the
-// client's transport as backpressure. The pump frees space after every
-// written chunk, so a slow but steadily reading process is never
-// misclassified. closeInput wakes the wait when the process exits.
+// upload data through it and dropping a frame would corrupt the stream. The
+// first maxQueuedInput bytes are accepted without waiting, so a burst or a
+// multi-second pause before the reader starts is absorbed and the frame loop
+// keeps reading control frames. Beyond that the writer waits for the pump to
+// make space; the wait propagates through the client's transport as
+// backpressure. If the hard bound stays full and the pump writes nothing for
+// inputStallTimeout, the process is not reading: further input is shed (with
+// one throttled notice) so a forwarded signal or a client disconnect can
+// still be read. closeInput wakes the wait when the process exits.
 func (s *session) queueInput(payload []byte) error {
 	s.inMu.Lock()
 	defer s.inMu.Unlock()
@@ -742,26 +769,86 @@ func (s *session) queueInput(payload []byte) error {
 	// must count against the limit too. inBytes alone made the queue look
 	// empty while the pump was blocked writing a batch.
 	space := func() int {
-		n := maxPendingInput - s.inBytes - s.inFlight
+		n := maxQueuedInput - s.inBytes - s.inFlight
 		if n < 0 {
 			return 0
 		}
 		return n
 	}
 	if s.tty {
-		if len(payload) > space() {
+		if len(payload) > maxPendingInput-s.inBytes-s.inFlight {
 			s.dropInputLocked()
 			return nil
 		}
-	} else {
-		for !s.inDone && len(payload) > space() {
-			s.inCond.Wait()
+		s.inQueue = append(s.inQueue, payload)
+		s.inBytes += len(payload)
+		s.inCond.Signal()
+		return nil
+	}
+	// The process is reading again (or was never stalled): accept input that
+	// now fits instead of continuing to shed it.
+	if s.inStalled && len(payload) <= space() {
+		s.inStalled = false
+	}
+	if s.inStalled {
+		s.inTruncated = true
+		s.dropInputLocked()
+		return nil
+	}
+	if len(payload) <= space() {
+		s.inQueue = append(s.inQueue, payload)
+		s.inBytes += len(payload)
+		s.inCond.Signal()
+		return nil
+	}
+	// The hard bound is full. Wait for the pump, but time out when it makes
+	// no write progress at all: a reader that is merely slow frees budget
+	// after every chunk and resets the stall clock.
+	if s.inFullSince.IsZero() {
+		s.inFullSince = time.Now()
+	}
+	var timer *time.Timer
+	arm := func() {
+		if timer != nil {
+			timer.Stop()
 		}
-		// closeInput may have woken a writer waiting for queue space. Do not
-		// resurrect the queue after EOF or process exit.
-		if s.inDone {
+		timer = time.AfterFunc(inputStallTimeout, func() {
+			s.inMu.Lock()
+			s.inCond.Broadcast()
+			s.inMu.Unlock()
+		})
+	}
+	arm()
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for !s.inDone && len(payload) > space() {
+		s.inCond.Wait()
+		if s.inDone || len(payload) <= space() {
+			break
+		}
+		if !s.inFullSince.IsZero() && time.Since(s.inFullSince) >= inputStallTimeout {
+			// The hard bound stayed full with no write progress long
+			// enough to call the reader stuck. Shed the frame so the
+			// frame loop can read the signal, EOF or transport close
+			// behind it.
+			s.inStalled = true
+			s.inTruncated = true
+			s.dropInputLocked()
 			return nil
 		}
+		if s.inFullSince.IsZero() {
+			// The pump made progress; the clock starts over from here.
+			s.inFullSince = time.Now()
+		}
+		arm()
+	}
+	// closeInput may have woken a writer waiting for queue space. Do not
+	// resurrect the queue after EOF or process exit.
+	if s.inDone {
+		return nil
 	}
 	s.inQueue = append(s.inQueue, payload)
 	s.inBytes += len(payload)
@@ -799,6 +886,8 @@ func (s *session) closeInput() {
 	s.inMu.Lock()
 	s.inDone = true
 	s.inQueue, s.inBytes, s.inEOF = nil, 0, false
+	s.inStalled = false
+	s.inFullSince = time.Time{}
 	s.inCond.Broadcast()
 	s.inMu.Unlock()
 }

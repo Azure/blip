@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -91,17 +92,24 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 	// the local terminal behind. Interactive Ctrl-C still arrives as a stdin
 	// byte in raw mode and is delivered by the guest's terminal.
 	detached := make(chan string, 1)
+	var abandonStdin atomic.Bool
 	if tty || a.env.Terminal {
 		grace := a.signalGrace
 		if grace <= 0 {
 			grace = signalGrace
 		}
-		go forwardSignals(ctx, s, detached, grace)
+		go forwardSignals(ctx, s, detached, grace, &abandonStdin)
 	}
 
 	go func() {
 		buf := make([]byte, 32<<10)
 		for {
+			if abandonStdin.Load() {
+				// The command is being interrupted. Stop feeding stdin so a
+				// forwarded signal is not queued behind the rest of a large
+				// upload on a backpressured transport.
+				return
+			}
 			n, err := a.env.In.Read(buf)
 			if n > 0 {
 				if _, werr := s.Write(buf[:n]); werr != nil {
@@ -197,7 +205,7 @@ func detachedSignal(ch <-chan string) (string, bool) {
 // restore runs. Progress restarting the grace keeps a command that is still
 // cleaning up, or output the local writer is still draining, from being
 // reported as an unacknowledged signal.
-func forwardSignals(ctx context.Context, s *session.Session, detached chan<- string, grace time.Duration) {
+func forwardSignals(ctx context.Context, s *session.Session, detached chan<- string, grace time.Duration, abandonStdin *atomic.Bool) {
 	ch := make(chan os.Signal, 4)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(ch)
@@ -209,6 +217,10 @@ func forwardSignals(ctx context.Context, s *session.Session, detached chan<- str
 		case sig = <-ch:
 		}
 		name := strings.TrimPrefix(unix.SignalName(sig.(syscall.Signal)), "SIG")
+		// Stop forwarding local stdin before the signal: a termination
+		// signal behind a full stdin transport would otherwise be delayed by
+		// the rest of the upload.
+		abandonStdin.Store(true)
 		_ = s.Signal(name)
 
 		if !waitSignalGrace(ctx, s, ch, grace) {

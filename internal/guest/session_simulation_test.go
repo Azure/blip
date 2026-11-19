@@ -493,7 +493,7 @@ func TestSessionInputCloseWakesBackpressuredWriter(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g, _ := lifecycleGuest(t)
 		s := newSession(g, "input", nil, false)
-		if err := s.queueInput(make([]byte, maxPendingInput)); err != nil {
+		if err := s.queueInput(make([]byte, maxQueuedInput)); err != nil {
 			t.Fatal(err)
 		}
 		done := make(chan struct{})
@@ -519,12 +519,12 @@ func TestSessionInputWaitsForReaderThroughWire(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer attached.Close()
-		if _, err := attached.Write(make([]byte, maxPendingInput)); err != nil {
+		if _, err := attached.Write(make([]byte, maxQueuedInput)); err != nil {
 			t.Fatal(err)
 		}
 		synctest.Wait()
-		if s.inBytes != maxPendingInput {
-			t.Fatalf("queued %d bytes, want %d", s.inBytes, maxPendingInput)
+		if s.inBytes != maxQueuedInput {
+			t.Fatalf("queued %d bytes, want %d", s.inBytes, maxQueuedInput)
 		}
 		// The guest keeps the queue bounded instead of dropping the excess:
 		// the next frame waits for the pump to make space. No notice about
@@ -538,7 +538,7 @@ func TestSessionInputWaitsForReaderThroughWire(t *testing.T) {
 		if s.takeDropped() {
 			t.Fatal("a non-terminal byte stream was dropped")
 		}
-		if s.inBytes != maxPendingInput {
+		if s.inBytes != maxQueuedInput {
 			t.Fatalf("queue grew past its limit: %d bytes", s.inBytes)
 		}
 		// A process that exits releases the waiter so the session cannot wedge.
