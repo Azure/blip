@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -26,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/network"
 )
 
 const (
@@ -57,6 +59,13 @@ const (
 	// maxCopyChain bounds the copyFrom walk used to detect cycles. A real
 	// chain is far shorter; an unbounded one cannot make progress anyway.
 	maxCopyChain = 32
+	// stateInvalidConfiguration is the Warning Event reason for a state
+	// whose inherited runtime network policy cannot compile.
+	stateInvalidConfiguration = "InvalidConfiguration"
+	// stateNetworkErrorPrefix identifies the diagnostic this controller adds
+	// to BlipState.status.lastError so a repaired policy can clear it
+	// without discarding a node-side preparation error.
+	stateNetworkErrorPrefix = "network policy: spec.runtime.network: state network:"
 )
 
 // StateReconciler drives BlipState versions: initial version, commits,
@@ -65,12 +74,19 @@ type StateReconciler struct {
 	client.Client
 	// Live is an uncached reader used to confirm destructive decisions.
 	Live client.Reader
+	// Recorder publishes invalid inherited runtime network policies as
+	// Warning Events. SetupWithManager sets it; direct callers may leave it
+	// nil.
+	Recorder record.EventRecorder
 	Config
 }
 
 func (r *StateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Live == nil {
 		r.Live = mgr.GetAPIReader()
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("blipstate")
 	}
 	allStates := handler.EnqueueRequestsFromMapFunc(r.allStates)
 	return ctrl.NewControllerManagedBy(mgr).
@@ -238,6 +254,16 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 	}
 
 	base := st.DeepCopy()
+	// A state can hold runtime defaults for Blips that do not override
+	// them. Validate its network policy here, where the operator can see it:
+	// the node fails closed and reports NetworkFailed on each Blip, but the
+	// invalid rules live on this state. Deletion stays unblocked.
+	st.Status.LastError = withoutStateNetworkError(st.Status.LastError)
+	st.Status.Message = withoutStateNetworkError(st.Status.Message)
+	var networkErr error
+	if !deleting {
+		networkErr = validateStateNetwork(st)
+	}
 	var msgs []string
 	var result reconcile.Result
 	var forceRecovered bool
@@ -322,6 +348,15 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 			msgs = append(msgs, "deleting: waiting for "+strings.Join(blockers, ", "))
 		}
 	}
+	if networkErr != nil {
+		msg := "network policy: " + networkErr.Error()
+		if st.Status.LastError == "" {
+			st.Status.LastError = msg
+		} else {
+			st.Status.LastError += "; " + msg
+		}
+		msgs = append(msgs, msg)
+	}
 	if st.Status.Phase != v1.StateFailed || st.Status.Committed != nil {
 		st.Status.Phase = statePhase(st)
 	}
@@ -330,6 +365,9 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 		if err := patchStatus(ctx, r.Client, st, base); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
+	}
+	if networkErr != nil && r.Recorder != nil && !strings.Contains(base.Status.LastError, stateNetworkErrorPrefix) {
+		r.Recorder.Event(st, corev1.EventTypeWarning, stateInvalidConfiguration, "network policy: "+networkErr.Error())
 	}
 	if deleting && len(blockers) == 0 && controllerutil.ContainsFinalizer(st, v1.Finalizer) {
 		base := st.DeepCopy()
@@ -368,6 +406,30 @@ func statePhase(st *v1.BlipState) string {
 	default:
 		return v1.StateReady
 	}
+}
+
+// validateStateNetwork rejects an inherited spec.runtime.network that
+// network.Compile cannot turn into rules. Admission accepts unknown selector
+// operators; without this check the state stays Ready or InUse with no
+// diagnostic while every Blip that inherits the policy reports NetworkFailed.
+func validateStateNetwork(st *v1.BlipState) error {
+	if st.Spec.Runtime == nil || st.Spec.Runtime.Network == nil {
+		return nil
+	}
+	if _, err := network.CompileNamed(st.Namespace, nil, st.Spec.Runtime.Network, network.Destinations{}, "state network"); err != nil {
+		return fmt.Errorf("spec.runtime.network: %w", err)
+	}
+	return nil
+}
+
+// withoutStateNetworkError removes the diagnostic added for an invalid
+// inherited runtime network policy from a status field, leaving any node-side
+// preparation error intact. The diagnostic is always appended last.
+func withoutStateNetworkError(msg string) string {
+	if i := strings.Index(msg, stateNetworkErrorPrefix); i >= 0 {
+		return strings.TrimSuffix(strings.TrimSpace(msg[:i]), ";")
+	}
+	return msg
 }
 
 func joinMessages(msgs []string) string {
