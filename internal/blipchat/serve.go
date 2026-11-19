@@ -499,7 +499,8 @@ func systemPrompt(thread *v1.BlipThread) string {
 // highest turn sequence it actually rendered, so the caller never consumes a
 // turn the coordinator did not see. When the turns do not fit the budget, the
 // newest turns win: they are the ones most likely to be actionable, and the
-// notice reports exactly how many older turns were left out.
+// older turns are summarized so the notice is accurate and consuming them
+// does not silently lose input.
 func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTurn, timers []v1.ThreadTimer, summary string) (string, int64) {
 	var b strings.Builder
 	b.WriteString("Task board:\n")
@@ -539,6 +540,53 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 		return b.String(), 0
 	}
 
+	last := boardTurns(&b, turns, 48000-b.Len())
+	return b.String(), last
+}
+
+// summarizeTurn renders a compact one-line form of a turn. It keeps the
+// sequence, author, and topic plus a short excerpt so a prompt that cannot fit
+// the full text still shows the coordinator that the turn happened.
+func summarizeTurn(t *v1.BlipTurn, excerpt int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "#%d %s/%s %s", t.Status.Seq, t.Spec.Author.Kind, t.Spec.Author.Name, t.Spec.Topic)
+	if t.Spec.Text != "" && excerpt > 0 {
+		fmt.Fprintf(&b, ": %s", truncateRunes(t.Spec.Text, excerpt))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// summarizeTurns fits a compact form of every turn into budget. It reports
+// false when even the metadata-only summaries do not fit: the caller must then
+// render a prefix and leave the rest pending rather than consuming turns it
+// cannot show.
+func summarizeTurns(turns []v1.BlipTurn, budget int) (string, bool) {
+	if budget <= 0 {
+		return "", false
+	}
+	for _, excerpt := range []int{240, 120, 60, 0} {
+		var b strings.Builder
+		for i := range turns {
+			b.WriteString(summarizeTurn(&turns[i], excerpt))
+		}
+		if b.Len() <= budget {
+			return b.String(), true
+		}
+	}
+	return "", false
+}
+
+// boardTurns renders the turn section under budget and returns the highest
+// sequence it showed. Newest-wins: the suffix that fits is rendered in full,
+// and the older turns are summarized so consuming them loses no input
+// silently. When the older turns cannot be represented even compactly, the
+// oldest turns are rendered instead and the newer ones stay pending, because
+// consumedSeq can only advance over a contiguous prefix that was shown.
+func boardTurns(b *strings.Builder, turns []v1.BlipTurn, budget int) int64 {
+	if len(turns) == 0 {
+		return 0
+	}
 	lines := make([]string, len(turns))
 	for i := range turns {
 		line := renderTurn(&turns[i])
@@ -547,24 +595,14 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 		}
 		lines[i] = line + "\n"
 	}
-	// Walk backwards from the newest turn, reserving room for an accurate
-	// notice about the older turns that will not fit. Keep at least the
-	// newest turn even when the board alone is already over budget, so a step
-	// always has something it may consume.
-	budget := 48000 - b.Len()
-	start, _ := suffixTurns(lines, budget)
-	if start == len(turns) {
-		start = len(turns) - 1
+	if budget < 0 {
+		budget = 0
 	}
-	rendered := make([]bool, len(turns))
-	for i := start; i < len(turns); i++ {
-		rendered[i] = true
-	}
-	lastRendered := turns[len(turns)-1].Status.Seq
+	start, used := suffixTurns(lines, budget)
 	// A turn that asked to wake the coordinator must not be dropped in favour
-	// of newer context: it is the input this step exists for. Keep the prefix
-	// through the last omitted wake turn, and consume only the contiguous
-	// prefix that was rendered so the dropped context stays pending.
+	// of newer context: it is the input this step exists for. When one is
+	// outside the newest suffix, render the contiguous prefix through it and
+	// consume only that prefix so the skipped context stays pending.
 	keepEnd := -1
 	for i := 0; i < start; i++ {
 		if turns[i].Spec.Wake != v1.WakeNone {
@@ -572,40 +610,97 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 		}
 	}
 	if keepEnd >= 0 {
-		// Only a contiguous prefix may be consumed; the dropped context must
-		// stay pending.
-		lastRendered = 0
-		prefix := 0
-		for i := 0; i <= keepEnd; i++ {
-			prefix += len(lines[i])
+		return renderWakePrefix(b, turns, lines, budget, start, keepEnd)
+	}
+	if start == 0 {
+		for i := range lines {
+			b.WriteString(lines[i])
 		}
-		if prefix <= budget {
-			for i := 0; i <= keepEnd; i++ {
-				rendered[i] = true
-			}
-			// Let the newest turns use what the kept prefix leaves.
-			if remaining := budget - prefix; remaining > 0 {
-				s, _ := suffixTurns(lines[keepEnd+1:], remaining)
-				for i := s + keepEnd + 1; i < len(turns); i++ {
-					rendered[i] = true
-				}
-			}
-		} else {
-			// The context before the wake turn is itself over budget. Keep
-			// every wake turn, but never consume across a gap.
-			for i := 0; i <= keepEnd; i++ {
-				rendered[i] = turns[i].Spec.Wake != v1.WakeNone
-			}
+		return turns[len(turns)-1].Status.Seq
+	}
+	notice := fmt.Sprintf("(%d older turns summarized)\n", start)
+	if summaries, ok := summarizeTurns(turns[:start], budget-used-len(notice)); ok {
+		b.WriteString(notice)
+		b.WriteString(summaries)
+		for i := start; i < len(lines); i++ {
+			b.WriteString(lines[i])
 		}
-		for i := 0; i < len(turns); i++ {
-			if !rendered[i] {
-				break
-			}
-			lastRendered = turns[i].Status.Seq
+		return turns[len(turns)-1].Status.Seq
+	}
+	// The omitted turns cannot be shown in any form. Rendering the newest
+	// suffix would consume them without ever presenting them, so render the
+	// oldest turns and leave the newer ones for a later step instead. Any
+	// wake turn in the pending suffix is still shown compactly, but the
+	// returned sequence stops at the rendered prefix so it stays pending.
+	omittedStart := start
+	start = 0
+	used = 0
+	for start < len(turns) {
+		rest := len(turns) - start - 1
+		notice := 0
+		if rest > 0 {
+			notice = len(fmt.Sprintf("(%d newer turns left for a later step)\n", rest))
+		}
+		if used+len(lines[start])+notice > budget {
+			break
+		}
+		used += len(lines[start])
+		start++
+	}
+	if start == 0 {
+		start = 1
+	}
+	if rest := len(turns) - start; rest > 0 {
+		fmt.Fprintf(b, "(%d newer turns left for a later step)\n", rest)
+	}
+	for i := 0; i < start; i++ {
+		b.WriteString(lines[i])
+	}
+	for i := omittedStart; i < len(turns); i++ {
+		if turns[i].Spec.Wake != v1.WakeNone {
+			fmt.Fprintf(b, "(wake turn %d shown, left for a later step)\n", turns[i].Status.Seq)
+			b.WriteString(summarizeTurn(&turns[i], 0))
 		}
 	}
-	// Render in sequence order, reporting each gap so omitted input is not
-	// invisible to the coordinator.
+	return turns[start-1].Status.Seq
+}
+
+// renderWakePrefix renders a contiguous prefix through the last omitted wake
+// turn plus as much of the newest suffix as fits. It returns the highest
+// sequence of the contiguous rendered prefix; gaps stay pending.
+func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, budget, newestStart, keepEnd int) int64 {
+	rendered := make([]bool, len(turns))
+	for i := newestStart; i < len(turns); i++ {
+		rendered[i] = true
+	}
+	prefix := 0
+	for i := 0; i <= keepEnd; i++ {
+		prefix += len(lines[i])
+	}
+	if prefix <= budget {
+		for i := 0; i <= keepEnd; i++ {
+			rendered[i] = true
+		}
+		if remaining := budget - prefix; remaining > 0 {
+			s, _ := suffixTurns(lines[keepEnd+1:], remaining)
+			for i := s + keepEnd + 1; i < len(turns); i++ {
+				rendered[i] = true
+			}
+		}
+	} else {
+		// The context before the wake turn is itself over budget. Keep every
+		// wake turn, but never consume across a gap.
+		for i := 0; i <= keepEnd; i++ {
+			rendered[i] = turns[i].Spec.Wake != v1.WakeNone
+		}
+	}
+	lastRendered := int64(0)
+	for i := 0; i < len(turns); i++ {
+		if !rendered[i] {
+			break
+		}
+		lastRendered = turns[i].Status.Seq
+	}
 	gap := 0
 	for i := 0; i < len(turns); i++ {
 		if !rendered[i] {
@@ -614,18 +709,18 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 		}
 		if gap > 0 {
 			if i == gap {
-				fmt.Fprintf(&b, "(%d older turns omitted)\n", gap)
+				fmt.Fprintf(b, "(%d older turns omitted)\n", gap)
 			} else {
-				fmt.Fprintf(&b, "(%d context turns omitted)\n", gap)
+				fmt.Fprintf(b, "(%d context turns omitted)\n", gap)
 			}
 			gap = 0
 		}
 		b.WriteString(lines[i])
 	}
 	if gap > 0 {
-		fmt.Fprintf(&b, "(%d newer turns omitted)\n", gap)
+		fmt.Fprintf(b, "(%d newer turns omitted)\n", gap)
 	}
-	return b.String(), lastRendered
+	return lastRendered
 }
 
 // suffixTurns returns the index where the newest suffix of lines that fits
@@ -638,7 +733,7 @@ func suffixTurns(lines []string, budget int) (int, int) {
 		i := start - 1
 		notice := 0
 		if i > 0 {
-			notice = len(fmt.Sprintf("(%d older turns omitted)\n", i))
+			notice = len(fmt.Sprintf("(%d older turns summarized)\n", i))
 		}
 		if used+len(lines[i])+notice > budget {
 			break

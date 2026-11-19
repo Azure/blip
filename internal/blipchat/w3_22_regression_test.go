@@ -56,32 +56,29 @@ func TestBoardPromptTruncatesOldestTurnsNotNewest(t *testing.T) {
 	if !strings.Contains(prompt, "TURN30-MARKER") {
 		t.Errorf("prompt omitted the newest turn:\n%s", prompt)
 	}
-	shown, highest := 0, int64(0)
+	// Every turn is shown: the newest as full text and the older ones as
+	// compact summaries, so consuming them is not a silent loss.
 	for i := 1; i <= count; i++ {
-		if strings.Contains(prompt, fmt.Sprintf("TURN%02d-MARKER", i)) {
-			shown++
-			highest = int64(i)
+		if !strings.Contains(prompt, fmt.Sprintf("TURN%02d-MARKER", i)) {
+			t.Errorf("turn %d was neither rendered nor summarized:\n%s", i, prompt)
 		}
 	}
-	if shown == count {
-		t.Fatalf("test did not exceed the prompt budget: all %d turns fit", count)
+	if strings.Contains(prompt, "TURN01-MARKER "+strings.Repeat("x", 500)) {
+		t.Errorf("oldest turn was not summarized to fit the budget")
 	}
-	notice := regexp.MustCompile(`\((\d+) older turns omitted\)`).FindStringSubmatch(prompt)
+	notice := regexp.MustCompile(`\((\d+) older turns summarized\)`).FindStringSubmatch(prompt)
 	if notice == nil {
-		t.Fatalf("prompt kept %d/%d turns without an accurate omission notice:\n%s", shown, count, prompt)
+		t.Fatalf("prompt without an accurate omission notice:\n%s", prompt)
 	}
 	omitted, err := strconv.Atoi(notice[1])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := count - shown; omitted != want {
-		t.Errorf("omission notice says %d older turns omitted, want %d:\n%s", omitted, want, prompt)
+	if omitted < 1 || omitted >= count {
+		t.Errorf("omission notice says %d of %d turns were summarized, want a non-empty subset", omitted, count)
 	}
-	if updated.Status.ConsumedSeq != highest {
-		t.Errorf("consumedSeq = %d, want the highest rendered seq %d", updated.Status.ConsumedSeq, highest)
-	}
-	if updated.Status.ConsumedSeq > int64(count) {
-		t.Errorf("consumedSeq = %d passed the newest pending turn %d", updated.Status.ConsumedSeq, count)
+	if updated.Status.ConsumedSeq != count {
+		t.Errorf("consumedSeq = %d, want the newest seq %d (all turns were shown)", updated.Status.ConsumedSeq, count)
 	}
 
 	// The newest pending turn must still be able to step after the truncated

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -17,6 +19,83 @@ import (
 
 // cleanAttributes must select the same subset of oversized attribute maps on
 // every call: a random subset makes an idempotent turn re-create itself.
+// A prompt that cannot fit every turn must not advance consumedSeq past a
+// turn it neither rendered nor summarized: that permanently loses input.
+func TestPromptOverflowDoesNotConsumeUnshownTurns(t *testing.T) {
+	const count = 30
+	fresh := metav1.NewTime(timeNow())
+	thread := testThread()
+	objs := []client.Object{thread}
+	for i := 1; i <= count; i++ {
+		turn := testTurn(fmt.Sprintf("turn-%02d", i), "proj")
+		turn.Status.Seq = int64(i)
+		turn.Status.AcceptedTime = &fresh
+		turn.Spec.Wake = v1.WakeNone
+		turn.Spec.Text = fmt.Sprintf("TURN%02d-MARKER %s", i, strings.Repeat("x", 1900))
+		objs = append(objs, turn)
+	}
+	c := testClient(t, objs...)
+	upstream, requests := llmServerWithRequests(t, Message{Role: "assistant", Content: "ok"})
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 100000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: upstream.URL, HTTP: upstream.Client()},
+	}
+	ctx := context.Background()
+	if err := s.step(ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) == 0 {
+		t.Fatal("no LLM request recorded")
+	}
+	prompt := requestPrompt(t, (*requests)[0])
+	if !strings.Contains(prompt, "TURN30-MARKER") {
+		t.Errorf("prompt omitted the newest turn")
+	}
+	for i := 1; i <= count; i++ {
+		if strings.Contains(prompt, fmt.Sprintf("TURN%02d-MARKER", i)) {
+			continue
+		}
+		if updated.Status.ConsumedSeq >= int64(i) {
+			t.Errorf("turn %d was neither rendered nor summarized, but consumedSeq = %d passed it", i, updated.Status.ConsumedSeq)
+		}
+	}
+}
+
+// When even compact summaries of the older turns cannot fit, the renderer
+// must consume a prefix it rendered and leave the newer turns pending.
+func TestBoardTurnsLeavesNewestPendingWithoutRoomToSummarize(t *testing.T) {
+	fresh := metav1.NewTime(timeNow())
+	turns := make([]v1.BlipTurn, 0, 20)
+	for i := 1; i <= 20; i++ {
+		turn := testTurn(fmt.Sprintf("turn-%02d", i), "proj")
+		turn.Status.Seq = int64(i)
+		turn.Status.AcceptedTime = &fresh
+		turn.Spec.Wake = v1.WakeNone
+		turn.Spec.Text = fmt.Sprintf("TURN%02d-MARKER %s", i, strings.Repeat("x", 400))
+		turns = append(turns, *turn)
+	}
+	var b strings.Builder
+	last := boardTurns(&b, turns, 200)
+	out := b.String()
+	if !strings.Contains(out, "TURN01-MARKER") {
+		t.Errorf("oldest turn was not rendered:\n%s", out)
+	}
+	if strings.Contains(out, "TURN20-MARKER") {
+		t.Errorf("newest turn was rendered although consuming it would skip older ones:\n%s", out)
+	}
+	if last != 1 {
+		t.Errorf("highest shown seq = %d, want the rendered prefix ending at 1", last)
+	}
+	if !strings.Contains(out, "newer turns left for a later step") {
+		t.Errorf("missing notice about the pending newer turns:\n%s", out)
+	}
+}
+
 func TestCleanAttributesUsesStableSubset(t *testing.T) {
 	in := map[string]string{}
 	for i := 0; i < 20; i++ {
