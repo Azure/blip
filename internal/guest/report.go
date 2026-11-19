@@ -20,6 +20,9 @@ const (
 	// Workloads reach it as http://blip/report; it is never exposed outside
 	// the VM.
 	ReportAddress = "127.0.2.1:80"
+
+	// reportPath is the only path the report endpoint serves.
+	reportPath = "/report"
 )
 
 // reportInterval spaces accepted reports so two reports are never coalesced
@@ -40,6 +43,10 @@ type reporter struct {
 // sequence assigned to it. A report is acknowledged only after it has been
 // handed to the runtime, so the workload can rely on it having been seen.
 func (g *Guest) serveReport(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != reportPath {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
