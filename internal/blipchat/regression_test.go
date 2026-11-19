@@ -260,3 +260,43 @@ func TestPastTimerWakesImmediatelyAndDeliversNote(t *testing.T) {
 		t.Errorf("due timer note was not delivered:\n%s", content)
 	}
 }
+
+// Only the automatic budget pause is cleared at a day boundary. A pause set by
+// an operator stays in effect with its token counter untouched.
+func TestMaybeUnpauseOnlyClearsBudgetPause(t *testing.T) {
+	yesterday := timeNow().UTC().Add(-24 * time.Hour).Format("2006-01-02")
+	tests := []struct {
+		name       string
+		reason     string
+		wantPaused bool
+		wantTokens int64
+	}{
+		{name: "budget pause", reason: budgetPauseReason, wantPaused: false, wantTokens: 0},
+		{name: "manual pause", reason: "operator hold", wantPaused: true, wantTokens: 42},
+		{name: "empty reason", reason: "", wantPaused: true, wantTokens: 42},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			thread := testThread()
+			thread.Status.Paused = &v1.ThreadPause{Reason: tt.reason}
+			thread.Status.TokenDay = yesterday
+			thread.Status.TokensToday = 42
+			c := testClient(t, thread)
+			s := &Server{Client: c}
+			s.maybeUnpause(context.Background(), thread)
+			var updated v1.BlipThread
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(thread), &updated); err != nil {
+				t.Fatal(err)
+			}
+			if got := updated.Status.Paused != nil; got != tt.wantPaused {
+				t.Errorf("paused = %+v, want paused=%v", updated.Status.Paused, tt.wantPaused)
+			}
+			if updated.Status.TokensToday != tt.wantTokens {
+				t.Errorf("tokensToday = %d, want %d", updated.Status.TokensToday, tt.wantTokens)
+			}
+			if tt.wantPaused && updated.Status.TokenDay != yesterday {
+				t.Errorf("tokenDay = %q, want unchanged %q", updated.Status.TokenDay, yesterday)
+			}
+		})
+	}
+}

@@ -458,7 +458,7 @@ func openState(open bool) string {
 
 // maybeUnpause lets a thread run again on a new day after its budget paused it.
 func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
-	if thread.Status.Paused == nil || thread.Status.TokenDay == timeNow().Format("2006-01-02") {
+	if thread.Status.Paused == nil || thread.Status.Paused.Reason != budgetPauseReason || thread.Status.TokenDay == timeNow().Format("2006-01-02") {
 		return
 	}
 	current := &v1.BlipThread{}
