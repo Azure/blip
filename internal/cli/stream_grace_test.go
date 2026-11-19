@@ -196,3 +196,100 @@ func TestStreamSignalGraceWaitsForBackpressuredOutput(t *testing.T) {
 		t.Fatalf("delivered %d of %d output bytes", n, output)
 	}
 }
+
+// blockingWriter blocks every write until the test ends. It models a local
+// stdout consumer that never drains, so Copy stays inside Write forever.
+type blockingWriter struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.started) })
+	select {} // never returns; the process must exit without this write.
+}
+
+// TestStreamSignalGraceMaxAbandonsBlockedOutput is the w7-10 defect 2
+// regression: after a forwarded signal's hard grace, a stdout consumer that
+// never reads must not keep the client alive past signalGraceMax. The client
+// must stop waiting for the blocked write, detach, and report 143.
+func TestStreamSignalGraceMaxAbandonsBlockedOutput(t *testing.T) {
+	own := make(chan os.Signal, 16)
+	signal.Notify(own, syscall.SIGTERM)
+	defer signal.Stop(own)
+
+	disconnected := make(chan struct{}, 1)
+	observed := make(chan struct{}, 1)
+	guest := &fakeguest.Guest{Run: func(s *fakeguest.Session) wire.Exit {
+		s.Stdout(strings.Repeat("x", 64<<10))
+		for ev := range s.Events {
+			switch {
+			case ev.Signal == "TERM":
+				select {
+				case observed <- struct{}{}:
+				default:
+				}
+			case ev.Disconnected:
+				select {
+				case disconnected <- struct{}{}:
+				default:
+				}
+				return wire.Exit{}
+			}
+		}
+		return wire.Exit{}
+	}}
+	client := &session.Client{Connect: guest.Connect}
+	s, err := client.Open(context.Background(), "ns", "pod", wire.Open{
+		Mode: wire.OpenExec, Argv: []string{"sh"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	w := &blockingWriter{started: make(chan struct{})}
+	a := testApp(strings.NewReader(""), w, io.Discard)
+	a.signalGrace = 200 * time.Millisecond
+	a.signalGraceMax = 500 * time.Millisecond
+	done := make(chan error, 1)
+	go func() { done <- a.stream(context.Background(), s, streamOpts{blip: "test", sendEOF: true}) }()
+
+	awaitSignal(t, syscall.SIGTERM, func() bool {
+		select {
+		case <-observed:
+			return true
+		default:
+			return false
+		}
+	})
+	select {
+	case <-w.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("guest output never reached the local writer")
+	}
+
+	start := time.Now()
+	select {
+	case err := <-done:
+		var exitErr *ExitError
+		if !errors.As(err, &exitErr) || exitErr.Code != 128+int(syscall.SIGTERM) {
+			t.Fatalf("stream returned %v, want exit 143", err)
+		}
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Fatalf("stream took %v after the hard grace, want <= 3s", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		select {
+		case <-w.started:
+			t.Fatal("client stayed blocked in stdout.Write past signalGraceMax")
+		default:
+			t.Fatal("stream did not return after signalGraceMax")
+		}
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("guest command was not torn down after detach")
+	}
+}

@@ -132,8 +132,10 @@ type app struct {
 	owner  string
 	prefix string
 
-	// signalGrace overrides the default grace for tests.
-	signalGrace time.Duration
+	// signalGrace overrides the default grace for tests. signalGraceMax
+	// overrides the hard cap.
+	signalGrace    time.Duration
+	signalGraceMax time.Duration
 }
 
 func (a *app) clients() (*Clients, error) {

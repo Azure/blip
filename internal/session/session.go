@@ -111,7 +111,7 @@ func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (
 		rwc.Close()
 		return nil, fmt.Errorf("open session: unexpected frame type %d", t)
 	}
-	s := &Session{rwc: rwc, conn: conn}
+	s := &Session{rwc: rwc, conn: conn, closed: make(chan struct{})}
 	if err := wire.Decode(payload, &s.Opened); err != nil {
 		rwc.Close()
 		return nil, fmt.Errorf("open session: %w", err)
@@ -143,6 +143,10 @@ type Session struct {
 	rwc    io.ReadWriteCloser
 	conn   *wire.Conn
 	once   sync.Once
+	// closed is closed by Close. Copy stops waiting for a local writer once
+	// the transport is gone, so a blocked stdout.Write cannot outlive the
+	// signal grace.
+	closed chan struct{}
 
 	// progress counts completed output writes, and pending counts output
 	// frames received but not yet written to the caller's writer. A caller
@@ -202,7 +206,10 @@ func (s *Session) Signal(name string) error {
 // exec command is terminated once its last client goes away.
 func (s *Session) Close() error {
 	var err error
-	s.once.Do(func() { err = s.rwc.Close() })
+	s.once.Do(func() {
+		close(s.closed)
+		err = s.rwc.Close()
+	})
 	return err
 }
 
@@ -511,13 +518,17 @@ func decodeSpoolFrame(t wire.Type, payload []byte) (Frame, error) {
 // Copy writes output until the session exits and returns its exit status.
 // notice may be nil.
 //
-// A reader goroutine drains the transport into a bounded queue so a slow local
-// stdout consumer cannot make the transport idle (which used to lose the tail
-// of a command that had already exited) and so every complete frame received
-// before a transport failure is still delivered. If the queue bound is
-// reached, the transport is backpressured: a live consumer drains it and gets
-// every byte, while a dead peer still fails with ErrDisconnected instead of
-// silently reporting success.
+// A reader goroutine drains the transport into a memory queue backed by a
+// temporary file, so a slow local stdout consumer cannot make the transport
+// idle (which used to lose the tail of a command that had already exited) and
+// so every complete frame received before a transport failure is still
+// delivered. Memory stays bounded and the spool has its own bound; exceeding
+// it returns an error instead of reporting a successful, truncated result.
+//
+// Output delivery runs on its own goroutine. If Close is called (for example
+// when a forwarded signal's grace expires) Copy stops waiting for a write that
+// a local consumer is not draining, so the caller can restore the terminal and
+// exit even when stdout is blocked forever.
 func (s *Session) Copy(stdout, stderr io.Writer, notice func(string)) (*wire.Exit, error) {
 	q := newOutputQueue(outputReadAhead)
 	defer q.cleanup()
@@ -539,13 +550,41 @@ func (s *Session) Copy(stdout, stderr io.Writer, notice func(string)) (*wire.Exi
 				}
 				continue
 			}
-			q.put(f)
+			if !q.put(f) {
+				return
+			}
 			if f.Type == wire.TExited {
 				q.finish(nil)
 				return
 			}
 		}
 	}()
+	type result struct {
+		exit *wire.Exit
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		exit, err := s.deliver(q, stdout, stderr, notice)
+		done <- result{exit: exit, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.exit, r.err
+	case <-s.closed:
+		// Prefer a result that completed before the close was observed.
+		select {
+		case r := <-done:
+			return r.exit, r.err
+		default:
+		}
+		q.stop()
+		s.pending.Store(0)
+		return nil, ErrDisconnected
+	}
+}
+
+func (s *Session) deliver(q *outputQueue, stdout, stderr io.Writer, notice func(string)) (*wire.Exit, error) {
 	for {
 		f, err := q.get()
 		if err != nil {
@@ -560,7 +599,8 @@ func (s *Session) Copy(stdout, stderr io.Writer, notice func(string)) (*wire.Exi
 			s.pending.Add(-1)
 			s.progress.Add(1)
 			if err != nil {
-				s.pending.Add(-int64(q.stop()))
+				q.stop()
+				s.pending.Store(0)
 				return nil, err
 			}
 		case wire.TStderr:
@@ -568,7 +608,8 @@ func (s *Session) Copy(stdout, stderr io.Writer, notice func(string)) (*wire.Exi
 			s.pending.Add(-1)
 			s.progress.Add(1)
 			if err != nil {
-				s.pending.Add(-int64(q.stop()))
+				q.stop()
+				s.pending.Store(0)
 				return nil, err
 			}
 		case wire.TNotice:

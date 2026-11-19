@@ -104,7 +104,11 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 		if grace <= 0 {
 			grace = signalGrace
 		}
-		go forwardSignals(ctx, s, detached, grace, &abandonStdin)
+		hard := a.signalGraceMax
+		if hard <= 0 {
+			hard = signalGraceMax
+		}
+		go forwardSignals(ctx, s, detached, grace, hard, &abandonStdin)
 	}
 
 	go func() {
@@ -211,7 +215,7 @@ func detachedSignal(ch <-chan string) (string, bool) {
 // restore runs. Progress restarting the grace keeps a command that is still
 // cleaning up, or output the local writer is still draining, from being
 // reported as an unacknowledged signal.
-func forwardSignals(ctx context.Context, s *session.Session, detached chan<- string, grace time.Duration, abandonStdin *atomic.Bool) {
+func forwardSignals(ctx context.Context, s *session.Session, detached chan<- string, grace, hard time.Duration, abandonStdin *atomic.Bool) {
 	ch := make(chan os.Signal, 4)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(ch)
@@ -229,7 +233,7 @@ func forwardSignals(ctx context.Context, s *session.Session, detached chan<- str
 		abandonStdin.Store(true)
 		_ = s.Signal(name)
 
-		if !waitSignalGrace(ctx, s, ch, grace) {
+		if !waitSignalGrace(ctx, s, ch, grace, hard) {
 			return
 		}
 		// Publish first: the channel is buffered, and stream only consults
@@ -243,10 +247,11 @@ func forwardSignals(ctx context.Context, s *session.Session, detached chan<- str
 // waitSignalGrace waits for the guest to end the session after a signal. It
 // returns false when ctx is done and true when the grace expired without any
 // progress. Immediate signals are still forwarded while waiting, but a
-// repeated signal does not extend the grace by itself.
-func waitSignalGrace(ctx context.Context, s *session.Session, ch <-chan os.Signal, grace time.Duration) bool {
+// repeated signal does not extend the grace by itself. hard caps the total
+// wait even while output is still being delivered to a stalled consumer.
+func waitSignalGrace(ctx context.Context, s *session.Session, ch <-chan os.Signal, grace, hard time.Duration) bool {
 	deadline := time.Now().Add(grace)
-	hard := time.Now().Add(signalGraceMax)
+	hardDeadline := time.Now().Add(hard)
 	progress := s.Progress()
 	tick := time.NewTicker(signalPoll)
 	defer tick.Stop()
@@ -265,8 +270,8 @@ func waitSignalGrace(ctx context.Context, s *session.Session, ch <-chan os.Signa
 			if p := s.Progress(); p != progress || s.PendingOutput() > 0 {
 				progress = p
 				next := time.Now().Add(grace)
-				if next.After(hard) {
-					next = hard
+				if next.After(hardDeadline) {
+					next = hardDeadline
 				}
 				deadline = next
 			}
