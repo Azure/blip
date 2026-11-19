@@ -1135,6 +1135,58 @@ func TestTurnAuthorPolicyFinalizers(t *testing.T) {
 	}
 }
 
+// A pod-bound producer must not attach ownerReferences to a turn. A foreign or
+// blocking reference outlives the producer and can stall retention, which only
+// calls Delete; Blips and states already reject them. blipchat and non-pod
+// producers keep their existing abilities.
+func TestTurnAuthorPolicyOwnerReferences(t *testing.T) {
+	v, _ := loadTurnPolicy(t)
+	const blipchat = "system:serviceaccount:blip-system:blipchat"
+	self := "system:serviceaccount:" + ns + ":vm"
+	threadRef := func(name, kind string, mutate ...func(map[string]any)) map[string]any {
+		return ownerReference(name, append([]func(map[string]any){func(ref map[string]any) { ref["kind"] = kind }}, mutate...)...)
+	}
+	turn := func(refs ...map[string]any) map[string]any {
+		o := turnFor("proj", "ServiceAccount", self)
+		if len(refs) > 0 {
+			o = withOwnerReferences(o, refs...)
+		}
+		return o
+	}
+
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		op    admission.Operation
+		obj   map[string]any
+		old   map[string]any
+		allow bool
+		msg   string
+	}{
+		{"pod-bound create without refs", vmUser("vm", "default-mine"), admission.Create, turn(), nil, true, ""},
+		{"pod-bound create with own thread ref", vmUser("vm", "default-mine"), admission.Create,
+			turn(threadRef("proj", "BlipThread")), nil, false, "ownerReferences"},
+		{"pod-bound create with foreign ref", vmUser("vm", "default-mine"), admission.Create,
+			turn(threadRef("other-project.parent", "Blip")), nil, false, "ownerReferences"},
+		{"pod-bound create with blocking own ref", vmUser("vm", "default-mine"), admission.Create,
+			turn(threadRef("proj", "BlipThread", func(ref map[string]any) { ref["blockOwnerDeletion"] = true })), nil, false, "ownerReferences"},
+		{"pod-bound update adds a ref", vmUser("vm", "default-mine"), admission.Update,
+			turn(threadRef("proj", "BlipThread")), turn(), false, "immutable history"},
+		{"blipchat create with a ref", &user.DefaultInfo{Name: blipchat}, admission.Create,
+			withOwnerReferences(turnFor("proj", "User", "ceo@example.com"), ownerReference("proj", func(ref map[string]any) { ref["kind"] = "BlipThread" })), nil, true, ""},
+		{"non-pod producer create with a ref", &user.DefaultInfo{Name: self}, admission.Create,
+			turn(threadRef("proj", "BlipThread")), nil, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns", name: "turn", object: tc.obj, oldObject: tc.old}
+			allow, msg := req.evaluate(t, v, nil)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+}
+
 // TestTurnOwnerPolicy guards the project binding for pod-bound turn
 // producers: a VM may only write to the thread whose derived owner owns it.
 func TestTurnOwnerPolicy(t *testing.T) {

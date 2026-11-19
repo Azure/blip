@@ -19,9 +19,10 @@
 # from a deleted thread therefore cannot write turns into the recreated one.
 #
 # Turns are immutable history. Pod-bound producers may not update or delete
-# them, may not add finalizers that would outlive a system Delete, and the
-# deterministic names blipchat uses for watcher and coordinator turns are
-# reserved.
+# them, may not add finalizers that would outlive a system Delete, may not set
+# ownerReferences (a foreign or blocking reference would outlive the producer
+# and stall retention, which only calls Delete), and the deterministic names
+# blipchat uses for watcher and coordinator turns are reserved.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -63,6 +64,14 @@ spec:
       expression: >-
         request.operation == 'UPDATE' && has(oldObject.metadata.finalizers) ?
         oldObject.metadata.finalizers : []
+    # An ownerReference outlives its producer and can affect garbage
+    # collection: a foreign reference or blockOwnerDeletion stalls deletion of
+    # an object the producer does not own. Blips and states already reject
+    # such references. The object is null on DELETE, so guard that operation.
+    - name: ownerReferences
+      expression: >-
+        (request.operation == 'CREATE' || request.operation == 'UPDATE') &&
+        has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []
   validations:
     - expression: >-
         variables.blipchat || request.operation != 'CREATE' ||
@@ -99,6 +108,16 @@ spec:
       messageExpression: >-
         'pod-bound producer ' + request.userInfo.username +
         ' may not add finalizers to a turn'
+      reason: Forbidden
+    # A turn's producer never owns another object: the thread belongs to the
+    # project and other turns to blipchat. Denying every reference also blocks
+    # blockOwnerDeletion and foreign names, matching the Blip/state rules.
+    - expression: >-
+        variables.blipchat || !variables.podBound ||
+        size(variables.ownerReferences) == 0
+      messageExpression: >-
+        'pod-bound producer ' + request.userInfo.username +
+        ' may not set ownerReferences on a turn'
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
