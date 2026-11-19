@@ -1209,7 +1209,14 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 		return reconcile.Result{}, err
 	}
 	b.Status.Sessions = int32(obs.Sessions)
-	b.Status.Message = obs.Error
+	// Mirror the observation error, but never erase the cause recorded when
+	// the controller stopped this Blip. A stop caused by a deleted state (or
+	// any other controller reason) must survive the following reconciles,
+	// whose observation carries no error, so status.message still explains
+	// why an otherwise successful command was stopped.
+	if obs.Error != "" || !stopping(b) || b.Annotations[v1.AnnotationStopReason] == "" {
+		b.Status.Message = obs.Error
+	}
 	if obs.Report != nil && (b.Status.Report == nil || int64(obs.Report.Seq) > b.Status.Report.Seq) {
 		t := metav1.NewTime(obs.Report.Time)
 		b.Status.Report = &v1.BlipReport{Seq: int64(obs.Report.Seq), Text: obs.Report.Text, Time: &t}

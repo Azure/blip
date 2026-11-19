@@ -243,6 +243,54 @@ func TestDirectlyDeletedReadOnlyMountStopsRunningBlip(t *testing.T) {
 	}
 }
 
+// TestDeletedReadOnlyMountStopKeepsReason covers w6-09 F2: a reader stopped
+// because its mounted state was deleted must keep the deletion cause in
+// status.message. An empty observation error on the next reconcile used to
+// erase the reason, leaving a finished Succeeded/Stopped Blip with no
+// explanation for why its command was stopped.
+func TestDeletedReadOnlyMountStopKeepsReason(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.readyState("data", "n1")
+	b := e.startBlip("job", "n1", withRoot("home"), e.withMount("data", "/data", false))
+	m := mountOf(b, "data")
+	if m == nil || m.Writable || m.AttachmentID == "" {
+		t.Fatalf("no attached read-only mount: %+v", b.Status.Mounts)
+	}
+	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{{
+		ID: m.AttachmentID, State: "data", Phase: podapi.DiskMounted,
+	}}})
+	e.run(e.blip, ns, "job")
+
+	e.must(e.c.Delete(e.ctx, e.getState("data")))
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	if !strings.Contains(b.Status.Message, "being deleted") {
+		t.Fatalf("no deletion message: %+v", b.Status)
+	}
+	reason := b.Status.Message
+
+	// The node applies the stop and reports an exit without an observation
+	// error. The reason must survive both the stopping reconcile and the
+	// finished Succeeded/Stopped result.
+	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSaving, ReasonStopped)
+	if b.Status.Message != reason {
+		t.Fatalf("stop reason lost while saving: %q, want %q", b.Status.Message, reason)
+	}
+	e.saveWriter("home", newID())
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipSucceeded, ReasonStopped)
+	if b.Status.Message != reason {
+		t.Fatalf("stop reason lost after finishing: %q, want %q", b.Status.Message, reason)
+	}
+}
+
 func TestDirectlyDeletedWritableMountFailsRunningBlip(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")
