@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -25,6 +26,7 @@ func (a *Agent) sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	a.cancelGoneBuilds(v)
 	peerErr := a.syncPeers(v)
 	p := compute(v)
 	a.execute(ctx, v, p)
@@ -200,6 +202,13 @@ func (a *Agent) confirmGone(ctx context.Context, v *view) {
 	}
 
 	a.mu.Lock()
+	// A build's creating record is not in List, so the state of a running
+	// operation is the only evidence that its state may have disappeared.
+	for key := range a.opCancels {
+		if uid, ok := strings.CutPrefix(key, "state/"); ok && !stateUIDs[uid] {
+			missingStates = append(missingStates, uid)
+		}
+	}
 	needPods := false
 	for _, n := range missingPods {
 		needPods = needPods || !a.podsGone[n]

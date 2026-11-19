@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,8 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func mkfsExt4(dev string) error {
-	_, err := run("mkfs.ext4", "-q", "-F", "-m", "0", "-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1", dev)
+func mkfsExt4(ctx context.Context, dev string) error {
+	_, err := runInContext(ctx, "", nil, "mkfs.ext4", "-q", "-F", "-m", "0", "-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1", dev)
 	return err
 }
 
@@ -23,19 +24,19 @@ var fixedTimeEnv = []string{"E2FSPROGS_FAKE_TIME=1735689600", "E2FSCK_TIME=17356
 
 // growExt4 grows the filesystem on dev to fill the device. With reproducible
 // set, the result depends only on the input bytes and the device size.
-func growExt4(dev string, reproducible bool) error {
+func growExt4(ctx context.Context, dev string, reproducible bool) error {
 	var env []string
 	if reproducible {
 		env = fixedTimeEnv
 	}
-	if _, err := runIn("", env, "e2fsck", "-f", "-y", dev); err != nil {
+	if _, err := runInContext(ctx, "", env, "e2fsck", "-f", "-y", dev); err != nil {
 		var ee *exec.ExitError
 		// 1 and 2 mean errors were corrected.
 		if !errors.As(err, &ee) || ee.ExitCode() > 2 {
 			return err
 		}
 	}
-	_, err := runIn("", env, "resize2fs", dev)
+	_, err := runInContext(ctx, "", env, "resize2fs", dev)
 	return err
 }
 
