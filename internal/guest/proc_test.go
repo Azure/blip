@@ -53,3 +53,36 @@ func TestStartProcNormalizesRelativeWorkdir(t *testing.T) {
 		t.Fatalf("dot-dot workdir was not normalized inside the root: %v", err)
 	}
 }
+
+func TestProcEnvNoProxy(t *testing.T) {
+	acct := &account{name: "root", home: "/root", shell: "/bin/sh"}
+	for _, tc := range []struct {
+		name    string
+		g       *Guest
+		base    []string
+		session []string
+		want    [2]string // NO_PROXY, no_proxy
+	}{
+		{"no names", &Guest{}, nil, nil, [2]string{"blip", "blip"}},
+		{"kubernetes", &Guest{kubeNamespace: "sandbox"}, nil, nil, [2]string{"blip,kube-apiserver", "blip,kube-apiserver"}},
+		{"endpoints", &Guest{endpoints: []string{"api.default", "db.default"}}, nil, nil, [2]string{"blip,api.default,db.default", "blip,api.default,db.default"}},
+		{"all", &Guest{kubeNamespace: "sandbox", endpoints: []string{"api.default"}}, nil, nil, [2]string{"blip,kube-apiserver,api.default", "blip,kube-apiserver,api.default"}},
+		{"claim override", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=corp.example"}, nil, [2]string{"corp.example", "blip,kube-apiserver"}},
+		{"session override", &Guest{kubeNamespace: "sandbox"}, nil, []string{"no_proxy=corp.example"}, [2]string{"blip,kube-apiserver", "corp.example"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := tc.g.procEnv(acct, procSpec{env: tc.session}, tc.base)
+			for i, key := range []string{"NO_PROXY", "no_proxy"} {
+				var vals []string
+				for _, entry := range env {
+					if v, ok := strings.CutPrefix(entry, key+"="); ok {
+						vals = append(vals, v)
+					}
+				}
+				if len(vals) != 1 || vals[0] != tc.want[i] {
+					t.Fatalf("%s entries = %v, want %q", key, vals, tc.want[i])
+				}
+			}
+		})
+	}
+}

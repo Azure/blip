@@ -42,12 +42,14 @@ func testConfig(t *testing.T, upstream *httptest.Server) Config {
 	dir := t.TempDir()
 	cfg := Config{
 		SocketPath: filepath.Join(dir, "vsock", "api.sock"),
-		APIAddress: strings.TrimPrefix(upstream.URL, "https://"),
-		TokenFile:  filepath.Join(dir, "token"),
-		CAFile:     filepath.Join(dir, "ca.crt"),
+		API: &API{
+			Address:   strings.TrimPrefix(upstream.URL, "https://"),
+			TokenFile: filepath.Join(dir, "token"),
+			CAFile:    filepath.Join(dir, "ca.crt"),
+		},
 	}
-	writeFile(t, cfg.TokenFile, []byte("projected-secret\n"))
-	writeFile(t, cfg.CAFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: upstream.Certificate().Raw}))
+	writeFile(t, cfg.API.TokenFile, []byte("projected-secret\n"))
+	writeFile(t, cfg.API.CAFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: upstream.Certificate().Raw}))
 	return cfg
 }
 
@@ -142,6 +144,8 @@ func responseBody(t *testing.T, response *http.Response) string {
 
 func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("BLIP_DIR", "")
+	t.Setenv("BLIP_KUBE_API", "1")
+	t.Setenv("BLIP_ENDPOINTS", "")
 	t.Setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "443")
 	t.Setenv("POD_NAME", "vm-0")
@@ -150,9 +154,9 @@ func TestConfigFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.APIAddress != "10.96.0.1:443" || cfg.SocketPath != "/run/blip/vsock/vsock.sock_1026" ||
-		cfg.TokenFile != serviceAccountDir+"/token" || cfg.CAFile != serviceAccountDir+"/ca.crt" ||
-		cfg.PodName != "vm-0" || cfg.PodNamespace != "blip-sandbox" {
+	if cfg.API == nil || cfg.API.Address != "10.96.0.1:443" || cfg.SocketPath != "/run/blip/vsock/vsock.sock_1027" ||
+		cfg.API.TokenFile != serviceAccountDir+"/token" || cfg.API.CAFile != serviceAccountDir+"/ca.crt" ||
+		cfg.PodName != "vm-0" || cfg.PodNamespace != "blip-sandbox" || len(cfg.Endpoints) != 0 {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 	// The trusted identity is all-or-nothing.
@@ -171,10 +175,31 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 	t.Setenv("POD_NAME", "")
 	t.Setenv("POD_NAMESPACE", "")
+
+	// An idle sidecar with neither route is a configuration error.
+	t.Setenv("BLIP_KUBE_API", "")
+	if _, err := ConfigFromEnv(); err == nil {
+		t.Fatal("accepted a config with no API or endpoints")
+	}
+
+	// A JSON endpoint list alone is valid.
+	t.Setenv("BLIP_ENDPOINTS", `[{"name":"payments","url":"https://payments.example:8443","tokenFile":"/t","caFile":"/c"}]`)
+	cfg, err = ConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Endpoint{Name: "payments", URL: "https://payments.example:8443", TokenFile: "/t", CAFile: "/c"}
+	if cfg.API != nil || len(cfg.Endpoints) != 1 || cfg.Endpoints[0] != want {
+		t.Fatalf("endpoint config: %+v, %v", cfg, err)
+	}
+
+	// IPv6 API address and custom directory.
+	t.Setenv("BLIP_ENDPOINTS", "")
+	t.Setenv("BLIP_KUBE_API", "1")
 	t.Setenv("BLIP_DIR", "/custom")
 	t.Setenv("KUBERNETES_SERVICE_HOST", "fd00::1")
 	cfg, err = ConfigFromEnv()
-	if err != nil || cfg.APIAddress != "[fd00::1]:443" || cfg.SocketPath != "/custom/vsock/vsock.sock_1026" {
+	if err != nil || cfg.API.Address != "[fd00::1]:443" || cfg.SocketPath != "/custom/vsock/vsock.sock_1027" {
 		t.Fatalf("IPv6/custom config: %+v, %v", cfg, err)
 	}
 	for _, test := range []struct{ host, port string }{
@@ -187,6 +212,43 @@ func TestConfigFromEnv(t *testing.T) {
 		if _, err := ConfigFromEnv(); err == nil {
 			t.Errorf("accepted host=%q port=%q", test.host, test.port)
 		}
+	}
+
+	// Endpoint parsing and validation.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "443")
+	t.Setenv("BLIP_KUBE_API", "")
+	for _, endpoints := range []string{
+		`[`,
+		`null`,
+		`{}`,
+		`{"name":"payments","url":"https://payments.example"}`,
+		`[{"name":"payments","url":"https://payments.example"},{"name":"payments","url":"https://other.example"}]`,
+		`[{"name":"Bad","url":"https://payments.example"}]`,
+		`[{"name":"-bad","url":"https://payments.example"}]`,
+		`[{"name":"` + strings.Repeat("a", 64) + `","url":"https://payments.example"}]`,
+		`[{"name":"blip","url":"https://payments.example"}]`,
+		`[{"name":"kube-apiserver","url":"https://payments.example"}]`,
+		`[{"name":"localhost","url":"https://payments.example"}]`,
+		`[{"name":"payments","url":"http://payments.example"}]`,
+		`[{"name":"payments","url":"https://user@payments.example"}]`,
+		`[{"name":"payments","url":"https://payments.example?x=1"}]`,
+		`[{"name":"payments","url":"https://payments.example#f"}]`,
+		`[{"name":"payments","url":"https://payments.example/path"}]`,
+		`[{"name":"payments","url":"https://127.0.0.1"}]`,
+		`[{"name":"payments","url":"https://[::1]"}]`,
+		`[{"name":"payments","url":"https://payments.example:0"}]`,
+		`[{"name":"payments","url":"https://payments.example:65536"}]`,
+		`[{"name":"payments","url":"https://"}]`,
+	} {
+		t.Setenv("BLIP_ENDPOINTS", endpoints)
+		if _, err := ConfigFromEnv(); err == nil {
+			t.Errorf("accepted endpoints %s", endpoints)
+		}
+	}
+	t.Setenv("BLIP_ENDPOINTS", `[{"name":"payments","url":"https://payments.example/"}]`)
+	if _, err := ConfigFromEnv(); err != nil {
+		t.Fatalf("rejected a root-path endpoint URL: %v", err)
 	}
 }
 
@@ -202,12 +264,12 @@ func TestIdentityHeadersAndTokenRotation(t *testing.T) {
 		if i != 0 {
 			// Projected volumes rotate by replacing files/symlinks, not by
 			// modifying an open file descriptor.
-			writeFile(t, cfg.TokenFile+".next", []byte(token))
-			if err := os.Rename(cfg.TokenFile+".next", cfg.TokenFile); err != nil {
+			writeFile(t, cfg.API.TokenFile+".next", []byte(token))
+			if err := os.Rename(cfg.API.TokenFile+".next", cfg.API.TokenFile); err != nil {
 				t.Fatal(err)
 			}
 		}
-		req, err := http.NewRequest(http.MethodGet, "http://guest/api/v1/pods", nil)
+		req, err := http.NewRequest(http.MethodGet, "http://kube-apiserver/api/v1/pods", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -258,28 +320,28 @@ func TestFixedTargetAndOrdinaryMethods(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		req.Host = "another-attacker.invalid"
+		req.Host = "kube-apiserver"
 		resp, err := p.client.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = responseBody(t, resp)
 		got := <-observed
-		if got.method != method || got.host != cfg.APIAddress || got.body != "body" || got.uri != "/api/v1/pods/name/exec?command=sh&command=-c" {
+		if got.method != method || got.host != cfg.API.Address || got.body != "body" || got.uri != "/api/v1/pods/name/exec?command=sh&command=-c" {
 			t.Errorf("unexpected upstream request: %+v", got)
 		}
 	}
 	for _, target := range []string{
-		"https://attacker.invalid:444/api/a%2Fb?x=%2F&x=two+words&semi=a;b",
-		"http://user:password@attacker.invalid/api/a%2Fb?x=%2F&x=two+words&semi=a;b",
-		"//attacker.invalid/api/a%2Fb?x=%2F&x=two+words&semi=a;b",
+		"https://kube-apiserver:80/api/a%2Fb?x=%2F&x=two+words&semi=a;b",
+		"http://user:password@kube-apiserver:80/api/a%2Fb?x=%2F&x=two+words&semi=a;b",
+		"//kube-apiserver/api/a%2Fb?x=%2F&x=two+words&semi=a;b",
 	} {
 		conn, err := net.Dial("unix", cfg.SocketPath)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-		_, err = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: attacker.invalid\r\nConnection: close\r\n\r\n", target)
+		_, err = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: kube-apiserver\r\nConnection: close\r\n\r\n", target)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -295,9 +357,9 @@ func TestFixedTargetAndOrdinaryMethods(t *testing.T) {
 		got := <-observed
 		wantURI := "/api/a%2Fb?x=%2F&x=two+words&semi=a;b"
 		if strings.HasPrefix(target, "//") {
-			wantURI = "//attacker.invalid" + wantURI
+			wantURI = "//kube-apiserver" + wantURI
 		}
-		if got.host != cfg.APIAddress || got.uri != wantURI || got.auth != "Bearer projected-secret" {
+		if got.host != cfg.API.Address || got.uri != wantURI || got.auth != "Bearer projected-secret" {
 			t.Errorf("target %q reached upstream as %+v", target, got)
 		}
 	}
@@ -335,8 +397,8 @@ func TestNoEnvironmentProxyOrRedirectFollowing(t *testing.T) {
 	cfg := testConfig(t, upstream)
 	// Avoid localhost's implicit exemption in http.ProxyFromEnvironment.
 	// The test certificate covers example.com; the dialer stands in for DNS.
-	cfg.APIAddress = "example.com:443"
-	handler, transport, err := newProxy(cfg)
+	cfg.API.Address = "example.com:443"
+	handler, transport, err := newAPIProxy(cfg.API, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,13 +407,13 @@ func TestNoEnvironmentProxyOrRedirectFollowing(t *testing.T) {
 		t.Fatal("transport has a proxy selector")
 	}
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		if address != cfg.APIAddress {
+		if address != cfg.API.Address {
 			return nil, fmt.Errorf("unexpected outbound address: %s", address)
 		}
 		return (&net.Dialer{}).DialContext(ctx, network, strings.TrimPrefix(upstream.URL, "https://"))
 	}
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://guest/api", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://kube-apiserver/api", nil))
 	resp := recorder.Result()
 	_ = responseBody(t, resp)
 	if resp.StatusCode != http.StatusTemporaryRedirect || resp.Header.Get("Location") != other.URL+"/redirected" || escaped.Load() != 0 {
@@ -383,13 +445,13 @@ func TestTLSVerification(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				writeFile(t, cfg.CAFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+				writeFile(t, cfg.API.CAFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 			case "wrong-hostname":
-				_, port, _ := net.SplitHostPort(cfg.APIAddress)
-				cfg.APIAddress = net.JoinHostPort("localhost", port)
+				_, port, _ := net.SplitHostPort(cfg.API.Address)
+				cfg.API.Address = net.JoinHostPort("localhost", port)
 			}
 			p := startProxy(t, cfg)
-			resp, err := p.client.Get("http://guest/api")
+			resp, err := p.client.Get("http://kube-apiserver/api")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -414,13 +476,13 @@ func TestTokenReadFailuresDoNotLeakOrForward(t *testing.T) {
 	cfg := testConfig(t, upstream)
 	p := startProxy(t, cfg)
 	for _, contents := range []string{"", "a-secret\nAuthorization: another-secret", "missing-file"} {
-		writeFile(t, cfg.TokenFile, []byte(contents))
+		writeFile(t, cfg.API.TokenFile, []byte(contents))
 		if contents == "missing-file" {
-			if err := os.Remove(cfg.TokenFile); err != nil {
+			if err := os.Remove(cfg.API.TokenFile); err != nil {
 				t.Fatal(err)
 			}
 		}
-		resp, err := p.client.Get("http://guest/api")
+		resp, err := p.client.Get("http://kube-apiserver/api")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -444,7 +506,7 @@ func TestStreamingWatchAndShutdown(t *testing.T) {
 	})
 	cfg := testConfig(t, upstream)
 	p := startProxy(t, cfg)
-	resp, err := p.client.Get("http://guest/api/v1/pods?watch=true")
+	resp, err := p.client.Get("http://kube-apiserver/api/v1/pods?watch=true")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +550,7 @@ func TestRequestBodyStreamsWithoutBuffering(t *testing.T) {
 	reader, writer := io.Pipe()
 	defer reader.Close()
 	defer writer.Close()
-	req, _ := http.NewRequest(http.MethodPost, "http://guest/api/v1/configmaps", reader)
+	req, _ := http.NewRequest(http.MethodPost, "http://kube-apiserver/api/v1/configmaps", reader)
 	result := make(chan error, 1)
 	go func() {
 		resp, err := p.client.Do(req)
@@ -544,7 +606,7 @@ func TestUpgradeAndShutdown(t *testing.T) {
 			}
 			defer conn.Close()
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-			_, _ = fmt.Fprintf(conn, "GET /api/v1/pods/p/exec HTTP/1.1\r\nHost: guest\r\nConnection: Upgrade, Authorization\r\nUpgrade: %s\r\nAuthorization: attacker\r\n\r\n", protocol)
+			_, _ = fmt.Fprintf(conn, "GET /api/v1/pods/p/exec HTTP/1.1\r\nHost: kube-apiserver\r\nConnection: Upgrade, Authorization\r\nUpgrade: %s\r\nAuthorization: attacker\r\n\r\n", protocol)
 			reader := bufio.NewReader(conn)
 			resp, err := http.ReadResponse(reader, nil)
 			if err != nil {
@@ -611,7 +673,7 @@ func TestUpgradeBackendHalfClose(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.WriteString(conn, "GET /api/v1/pods/p/exec HTTP/1.1\r\nHost: guest\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(conn, "GET /api/v1/pods/p/exec HTTP/1.1\r\nHost: kube-apiserver\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	reader := bufio.NewReader(conn)
@@ -654,7 +716,7 @@ func TestSocketLifecycle(t *testing.T) {
 	if err := Run(context.Background(), cfg); err == nil {
 		t.Fatal("second proxy replaced an active listener")
 	}
-	resp, err := p.client.Get("http://guest/api")
+	resp, err := p.client.Get("http://kube-apiserver/api")
 	if err != nil {
 		t.Fatal(err)
 	}

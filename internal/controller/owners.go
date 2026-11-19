@@ -53,7 +53,9 @@ func podServiceAccount(p *corev1.Pod) string {
 
 func hasAPIProxyToken(p *corev1.Pod) bool {
 	for _, v := range p.Spec.Volumes {
-		if v.Projected == nil || !slices.ContainsFunc(v.Projected.Sources, func(s corev1.VolumeProjection) bool {
+		// Endpoint tokens have other audiences; only api-token authenticates
+		// to the Kubernetes API.
+		if v.Name != apiTokenVolume || v.Projected == nil || !slices.ContainsFunc(v.Projected.Sources, func(s corev1.VolumeProjection) bool {
 			return s.ServiceAccountToken != nil
 		}) {
 			continue

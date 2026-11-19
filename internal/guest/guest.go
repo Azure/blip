@@ -45,7 +45,8 @@ type Guest struct {
 	cgroupFD      int
 	reaper        *reaper
 	kubeNamespace string
-	api           *apiForwarder
+	endpoints     []string
+	proxy         *apiForwarder
 	reporter      *reporter
 	reportServer  *http.Server
 	shutdownCh    chan struct{}
@@ -125,10 +126,11 @@ func Main() {
 	}
 	g := newGuest(rootDir, workCgroup)
 	g.kubeNamespace = cfg.KubeNamespace
-	if cfg.KubeNamespace != "" {
-		g.api, err = startForwarder("Kubernetes API", 8001, dialHost(wire.APIPort))
+	g.endpoints = cfg.Endpoints
+	if g.kubeNamespace != "" || len(g.endpoints) > 0 {
+		g.proxy, err = startForwarder("guest proxy", "127.0.2.2:80", dialHost(wire.EndpointPort))
 		if err != nil {
-			log.Printf("listen Kubernetes API: %v", err)
+			log.Printf("listen guest proxy: %v", err)
 			powerOff()
 		}
 	}
@@ -310,8 +312,8 @@ func (g *Guest) doClaim(m wire.Claim) error {
 	if g.stopping {
 		return errors.New("guest is stopping")
 	}
-	if g.kubeNamespace != "" && (g.api == nil || !g.api.ready()) {
-		return errors.New("Kubernetes API forwarding is unavailable")
+	if (g.kubeNamespace != "" || len(g.endpoints) > 0) && (g.proxy == nil || !g.proxy.ready()) {
+		return errors.New("guest proxy forwarding is unavailable")
 	}
 	if !isInit() {
 		return errNotInit
@@ -383,18 +385,36 @@ func (g *Guest) setupRootLocked(m wire.Claim) error {
 // hostsFile is the /etc/hosts content for a claimed blip. The host entry uses
 // 127.0.1.1 (the Debian convention) so name lookups resolve without a DNS
 // round trip.
-func hostsFile(hostname string) string {
+func hostsFile(hostname, kubeNamespace string, endpoints []string) string {
 	var b strings.Builder
 	b.WriteString("127.0.0.1 localhost\n")
 	if hostname != "" && !strings.ContainsAny(hostname, " \t\r\n") {
 		fmt.Fprintf(&b, "127.0.1.1 %s\n", hostname)
 	}
 	b.WriteString("::1 localhost ip6-localhost ip6-loopback\n")
+	b.WriteString(blipHosts(kubeNamespace, endpoints))
+	return b.String()
+}
+
+// blipHosts resolves the guest's fixed HTTP names: the report server on
+// 127.0.2.1 and, when there is anything for the sidecar to route, the sidecar
+// proxy on 127.0.2.2.
+func blipHosts(kubeNamespace string, endpoints []string) string {
+	var b strings.Builder
+	b.WriteString("127.0.2.1 blip\n")
+	names := endpoints
+	if kubeNamespace != "" {
+		names = append([]string{"kube-apiserver"}, endpoints...)
+	}
+	if len(names) > 0 {
+		fmt.Fprintf(&b, "127.0.2.2 %s\n", strings.Join(names, " "))
+	}
 	return b.String()
 }
 
 // writeHostsLocked replaces the guest's /etc/hosts (a bind mount of the
-// initramfs file) with content that resolves the blip's host name.
+// initramfs file) with content that resolves the blip's host name and the
+// guest-local HTTP names.
 func (g *Guest) writeHostsLocked(hostname string) error {
 	fd, err := openFileInRootWritable(g.root, "/etc/hosts")
 	if err != nil {
@@ -405,7 +425,7 @@ func (g *Guest) writeHostsLocked(hostname string) error {
 	if err := f.Truncate(0); err != nil {
 		return err
 	}
-	_, err = f.WriteAt([]byte(hostsFile(hostname)), 0)
+	_, err = f.WriteAt([]byte(hostsFile(hostname, g.kubeNamespace, g.endpoints)), 0)
 	return err
 }
 
@@ -542,8 +562,8 @@ func (g *Guest) shutdown() {
 	log.Printf("shutting down")
 	stopWork(g.cgroup, stopGrace)
 	g.stopReporter()
-	if g.api != nil {
-		g.api.Close()
+	if g.proxy != nil {
+		g.proxy.Close()
 	}
 	g.mu.Lock()
 	err := g.unmountAllLocked()

@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -391,11 +393,16 @@ func TestPoolPodCredentials(t *testing.T) {
 			if memory := proxy.Resources.Limits.Memory(); memory.Sign() <= 0 || memory.Value() > 128<<20 {
 				t.Errorf("proxy memory limit = %s", memory.String())
 			}
-			if len(proxy.Env) != 2 {
-				t.Fatalf("proxy should only carry its trusted identity: %+v", proxy.Env)
+			if len(proxy.Env) != 3 {
+				t.Fatalf("proxy should carry its trusted identity and API mode: %+v", proxy.Env)
 			}
 			wantProxyEnv := map[string]string{"POD_NAME": "metadata.name", "POD_NAMESPACE": "metadata.namespace"}
+			kubeAPI := ""
 			for _, env := range proxy.Env {
+				if env.Name == kubeAPIEnv {
+					kubeAPI = env.Value
+					continue
+				}
 				if env.Value != "" || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil ||
 					env.ValueFrom.FieldRef.FieldPath != wantProxyEnv[env.Name] {
 					t.Errorf("proxy identity must come from the DownwardAPI: %+v", env)
@@ -404,6 +411,9 @@ func TestPoolPodCredentials(t *testing.T) {
 			}
 			if len(wantProxyEnv) != 0 {
 				t.Errorf("missing proxy identity env: %v", wantProxyEnv)
+			}
+			if kubeAPI != "1" {
+				t.Errorf("proxy API mode = %q, want 1", kubeAPI)
 			}
 			if len(proxy.VolumeMounts) != 2 {
 				t.Fatalf("proxy should mount only sockets and credentials: %+v", proxy.VolumeMounts)
@@ -441,6 +451,169 @@ func TestPoolPodCredentials(t *testing.T) {
 				t.Errorf("missing namespace projection: %+v", s)
 			}
 		})
+	}
+}
+
+func envValue(c corev1.Container, name string) string {
+	for _, env := range c.Env {
+		if env.Name == name {
+			return env.Value
+		}
+	}
+	return ""
+}
+
+// TestPoolPodEndpoints checks the sidecar an endpoint-only pool gets: no API
+// credentials, a projection per endpoint that needs one, and only hostnames in
+// the guest.
+func TestPoolPodEndpoints(t *testing.T) {
+	e := newEnv(t)
+	pool := &v1.BlipPool{ObjectMeta: metadata("p"), Spec: v1.BlipPoolSpec{Endpoints: []v1.PoolEndpoint{
+		{Name: "whoami", URL: "https://whoami.example.com", Audience: "blip-gateway", CAConfigMap: "whoami-ca"},
+		{Name: "metrics", URL: "https://metrics.example.com:8443"},
+		{Name: "ca-only", URL: "https://ca.example.com", CAConfigMap: "ca-only-ca"},
+	}}}
+	p := e.pool.podFor(pool, "p-vm")
+	vm := p.Spec.Containers[0]
+	if len(p.Spec.InitContainers) != 1 {
+		t.Fatalf("want one native sidecar, got %+v", p.Spec.InitContainers)
+	}
+	proxy := p.Spec.InitContainers[0]
+	if proxy.Name != apiProxyName || !slices.Equal(proxy.Command, []string{"blip-runtime", "api-proxy"}) {
+		t.Errorf("API proxy invocation: %+v", proxy)
+	}
+	if got := envValue(vm, endpointNamesEnv); got != "whoami,metrics,ca-only" {
+		t.Errorf("%s = %q, want whoami,metrics,ca-only", endpointNamesEnv, got)
+	}
+	if got := envValue(vm, endpointsEnv); got != "" {
+		t.Errorf("guest received sidecar endpoint config: %q", got)
+	}
+	if got := envValue(proxy, kubeAPIEnv); got != "" {
+		t.Errorf("endpoint-only pool enabled the Kubernetes API: %q", got)
+	}
+	for _, m := range vm.VolumeMounts {
+		if strings.HasPrefix(m.Name, "endpoint-") {
+			t.Errorf("guest mounts endpoint credentials: %+v", m)
+		}
+	}
+
+	var got []proxyEndpoint
+	if err := json.Unmarshal([]byte(envValue(proxy, endpointsEnv)), &got); err != nil {
+		t.Fatalf("%s is not JSON: %v", endpointsEnv, err)
+	}
+	want := []proxyEndpoint{
+		{Name: "whoami", URL: "https://whoami.example.com", TokenFile: endpointMountRoot + "/0/token", CAFile: endpointMountRoot + "/0/ca.crt"},
+		{Name: "metrics", URL: "https://metrics.example.com:8443"},
+		{Name: "ca-only", URL: "https://ca.example.com", CAFile: endpointMountRoot + "/2/ca.crt"},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("%s = %+v, want %+v", endpointsEnv, got, want)
+	}
+
+	volumes := map[string]corev1.Volume{}
+	for _, v := range p.Spec.Volumes {
+		volumes[v.Name] = v
+	}
+	if _, ok := volumes[apiTokenVolume]; ok {
+		t.Error("endpoint-only pool has an API token volume")
+	}
+	if _, ok := volumes["endpoint-1"]; ok {
+		t.Error("metrics endpoint without credentials has a volume")
+	}
+	tokenAndCA := volumes["endpoint-0"].Projected
+	if tokenAndCA == nil || len(tokenAndCA.Sources) != 2 {
+		t.Fatalf("whoami projection: %+v", tokenAndCA)
+	}
+	if s := tokenAndCA.Sources[0].ServiceAccountToken; s == nil || s.Path != "token" ||
+		s.Audience != "blip-gateway" || s.ExpirationSeconds == nil || *s.ExpirationSeconds != 3600 {
+		t.Errorf("whoami token projection: %+v", s)
+	}
+	if s := tokenAndCA.Sources[1].ConfigMap; s == nil || s.Name != "whoami-ca" ||
+		len(s.Items) != 1 || s.Items[0].Key != "ca.crt" || s.Items[0].Path != "ca.crt" {
+		t.Errorf("whoami CA projection: %+v", s)
+	}
+	if ca := volumes["endpoint-2"].Projected; ca == nil || len(ca.Sources) != 1 ||
+		ca.Sources[0].ConfigMap == nil || ca.Sources[0].ConfigMap.Name != "ca-only-ca" {
+		t.Errorf("ca-only projection: %+v", ca)
+	}
+	if !mounted(proxy, "endpoint-0", endpointMountRoot+"/0", true) {
+		t.Errorf("sidecar does not mount endpoint 0: %+v", proxy.VolumeMounts)
+	}
+	if !mounted(proxy, "endpoint-2", endpointMountRoot+"/2", true) {
+		t.Errorf("sidecar does not mount endpoint 2: %+v", proxy.VolumeMounts)
+	}
+	if mounted(proxy, "endpoint-1", endpointMountRoot+"/1") {
+		t.Errorf("sidecar mounts credential-free endpoint 1: %+v", proxy.VolumeMounts)
+	}
+}
+
+// TestPoolPodEndpointsWithServiceAccount keeps the API credential alongside
+// endpoint credentials.
+func TestPoolPodEndpointsWithServiceAccount(t *testing.T) {
+	e := newEnv(t)
+	pool := &v1.BlipPool{ObjectMeta: metadata("p"), Spec: v1.BlipPoolSpec{
+		ServiceAccountName: "agent",
+		Endpoints:          []v1.PoolEndpoint{{Name: "whoami", URL: "https://whoami.example.com"}},
+	}}
+	p := e.pool.podFor(pool, "p-vm")
+	vm, proxy := p.Spec.Containers[0], p.Spec.InitContainers[0]
+	if got := envValue(proxy, kubeAPIEnv); got != "1" {
+		t.Errorf("%s = %q, want 1", kubeAPIEnv, got)
+	}
+	if !mounted(proxy, apiTokenVolume, serviceAccountPath, true) {
+		t.Errorf("sidecar does not mount the API token: %+v", proxy.VolumeMounts)
+	}
+	if !slices.ContainsFunc(vm.Env, func(env corev1.EnvVar) bool {
+		return env.Name == "BLIP_KUBE_NAMESPACE" && env.ValueFrom != nil &&
+			env.ValueFrom.FieldRef != nil && env.ValueFrom.FieldRef.FieldPath == "metadata.namespace"
+	}) {
+		t.Errorf("runtime has no namespace env: %+v", vm.Env)
+	}
+	if got := envValue(proxy, endpointsEnv); got == "" {
+		t.Error("sidecar has no endpoint config")
+	}
+}
+
+// TestPoolRejectsInvalidEndpoints checks that a bad endpoint fails reconcile
+// before any warm pod exists.
+func TestPoolRejectsInvalidEndpoints(t *testing.T) {
+	e := newEnv(t)
+	e.newPool("default", 1, 0)
+	e.updatePool("default", func(p *v1.BlipPool) {
+		p.Spec.Endpoints = []v1.PoolEndpoint{{Name: "whoami", URL: "http://whoami.example.com"}}
+	})
+	_, err := e.pool.Reconcile(e.ctx, req(ns, "default"))
+	if err == nil || !strings.Contains(err.Error(), "invalid endpoints for pool ns/default") {
+		t.Fatalf("reconcile error %v", err)
+	}
+	if n := len(e.pods()); n != 0 {
+		t.Errorf("%d pods created for an invalid pool", n)
+	}
+}
+
+func TestTemplateHashTracksEndpoints(t *testing.T) {
+	pool := func(endpoints ...v1.PoolEndpoint) *v1.BlipPool {
+		return &v1.BlipPool{Spec: v1.BlipPoolSpec{Endpoints: endpoints}}
+	}
+	whoami := v1.PoolEndpoint{Name: "whoami", URL: "https://whoami.example.com"}
+	ref := templateHash(pool(whoami), runtimeImage)
+	if got := templateHash(pool(whoami), runtimeImage); got != ref {
+		t.Fatalf("hash is not stable: %q != %q", got, ref)
+	}
+	mutations := []struct {
+		name string
+		pool *v1.BlipPool
+	}{
+		{"name", pool(v1.PoolEndpoint{Name: "other", URL: whoami.URL})},
+		{"url", pool(v1.PoolEndpoint{Name: whoami.Name, URL: "https://other.example.com"})},
+		{"audience", pool(v1.PoolEndpoint{Name: whoami.Name, URL: whoami.URL, Audience: "blip-gateway"})},
+		{"ca configmap", pool(v1.PoolEndpoint{Name: whoami.Name, URL: whoami.URL, CAConfigMap: "whoami-ca"})},
+		{"added endpoint", pool(whoami, v1.PoolEndpoint{Name: "metrics", URL: "https://metrics.example.com"})},
+	}
+	for _, m := range mutations {
+		if templateHash(m.pool, runtimeImage) == ref {
+			t.Errorf("%s does not change the template hash", m.name)
+		}
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -45,6 +46,8 @@ type Options struct {
 	SkipNetwork bool
 	// KubeNamespace enables the guest's tokenless Kubernetes API connection.
 	KubeNamespace string
+	// Endpoints are the guest hostnames the sidecar routes.
+	Endpoints []string
 }
 
 func (o Options) path(name string) string { return filepath.Join(o.Dir, name) }
@@ -75,6 +78,11 @@ func OptionsFromEnv() Options {
 	str("BLIP_INITRAMFS", &o.Initramfs)
 	str("BLIP_CH", &o.CH)
 	str("BLIP_KUBE_NAMESPACE", &o.KubeNamespace)
+	for _, name := range strings.Split(os.Getenv("BLIP_ENDPOINT_NAMES"), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			o.Endpoints = append(o.Endpoints, name)
+		}
+	}
 	num("BLIP_CPUS", &o.CPUs)
 	num("BLIP_MEMORY_MB", &o.MemoryMB)
 	o.SkipNetwork = os.Getenv("BLIP_SKIP_NETWORK") == "1"
@@ -359,7 +367,7 @@ func (r *runtime) writeObserved() {
 // boot writes the config disk, sets up networking and starts the VMM.
 func (r *runtime) boot() (*podNet, error) {
 	hostname, _ := os.Hostname()
-	cfg := bootconfig.Config{Hostname: hostname, KubeNamespace: r.o.KubeNamespace}
+	cfg := bootconfig.Config{Hostname: hostname, KubeNamespace: r.o.KubeNamespace, Endpoints: r.o.Endpoints}
 	var pn *podNet
 	started := false
 	defer func() {

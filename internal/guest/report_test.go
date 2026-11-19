@@ -1,6 +1,8 @@
 package guest
 
 import (
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -68,5 +70,28 @@ func TestReportPacing(t *testing.T) {
 	postReport(g, "two")
 	if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
 		t.Fatalf("second report was not paced: %v", elapsed)
+	}
+}
+
+// The report endpoint binds its configured address; tests use port 0 and
+// connect to whatever the listener reports.
+func TestReportEndpointServes(t *testing.T) {
+	g := reportGuest(t)
+	addr, err := g.startReportServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.stopReporter()
+	resp, err := http.Post("http://"+addr.String()+"/report", "text/plain", strings.NewReader("building"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != `{"seq":1}` {
+		t.Fatalf("report endpoint = %d %q", resp.StatusCode, body)
 	}
 }

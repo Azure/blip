@@ -54,6 +54,12 @@ type BlipPoolSpec struct {
 	MaxCount int32 `json:"maxCount,omitempty"`
 	// ServiceAccountName is the identity of VMs in this pool.
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+	// Endpoints exposes fixed HTTPS endpoints to workloads at http://<name>/.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	Endpoints []PoolEndpoint `json:"endpoints,omitempty"`
 	// NodeSelector selects the nodes that run this pool's VMs. It must be
 	// non-empty: matching nodes are enrolled automatically and run the node
 	// agent.
@@ -68,6 +74,27 @@ type BlipPoolSpec struct {
 	// non-public ranges denied, and cluster DNS (kube-dns) allowed. An
 	// explicitly empty policy denies all egress. Changes apply to running blips.
 	Network *NetworkPolicy `json:"network,omitempty"`
+}
+
+// PoolEndpoint is one HTTPS endpoint the pool's sidecar routes guest requests
+// to. The guest reaches it at http://<name>/.
+type PoolEndpoint struct {
+	// Name is the guest hostname.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+	// URL is the HTTPS URL. Its host is dialed, used for TLS SNI and the
+	// outbound Host header.
+	// +kubebuilder:validation:Pattern=`^https://[a-z0-9]([-.a-z0-9]*[a-z0-9])?(:[0-9]{1,5})?$`
+	URL string `json:"url"`
+	// Audience is the projected service account token audience. It requires
+	// spec.serviceAccountName.
+	// +optional
+	Audience string `json:"audience,omitempty"`
+	// CAConfigMap holds a ca.crt key that verifies the endpoint. Omitted
+	// uses system roots.
+	// +optional
+	CAConfigMap string `json:"caConfigMap,omitempty"`
 }
 
 type BlipPoolStatus struct {

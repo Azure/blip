@@ -5,6 +5,12 @@ metadata:
   namespace: default
 spec:
   serviceAccountName: blip-agent
+  # Fixed HTTPS endpoints are exposed to workloads at http://<name>/. The
+  # sidecar adds the projected token and CA, so the guest never holds them.
+  # endpoints:
+  #   - name: whoami
+  #     url: https://whoami.example.com
+  #     audience: blip-gateway
   # Direct egress is denied unless explicitly allowed. The tokenless
   # Kubernetes API endpoint is separate from these rules.
   network:

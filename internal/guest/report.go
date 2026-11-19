@@ -17,9 +17,9 @@ import (
 
 const (
 	// ReportAddress is the guest loopback address of the report endpoint.
-	// Workloads reach it through podapi.ReportEnv; it is never exposed outside
+	// Workloads reach it as http://blip/report; it is never exposed outside
 	// the VM.
-	ReportAddress = "127.0.0.1:8002"
+	ReportAddress = "127.0.2.1:80"
 )
 
 // reportInterval spaces accepted reports so two reports are never coalesced
@@ -176,13 +176,20 @@ func (g *Guest) lastReportLocked() *wire.Report {
 }
 
 func (g *Guest) startReporter() error {
+	_, err := g.startReportServer(ReportAddress)
+	return err
+}
+
+// startReportServer starts the report endpoint on address and returns the
+// bound address, so tests can bind 127.0.0.1:0.
+func (g *Guest) startReportServer(address string) (net.Addr, error) {
 	rep := &reporter{}
 	g.mu.Lock()
 	g.reporter = rep
 	g.mu.Unlock()
-	listener, err := net.Listen("tcp", ReportAddress)
+	listener, err := net.Listen("tcp4", address)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	server := &http.Server{
 		Handler:           http.HandlerFunc(g.serveReport),
@@ -197,7 +204,7 @@ func (g *Guest) startReporter() error {
 			log.Printf("report endpoint: %v", err)
 		}
 	}()
-	return nil
+	return listener.Addr(), nil
 }
 
 // stopReporter stops accepting reports. Reports already waiting are released

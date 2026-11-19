@@ -37,7 +37,7 @@ func TestKubeConfigContainsNoCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rest.Host != "http://127.0.0.1:8001" || rest.BearerToken != "" || rest.BearerTokenFile != "" ||
+	if rest.Host != "http://kube-apiserver" || rest.BearerToken != "" || rest.BearerTokenFile != "" ||
 		rest.Username != "" || rest.Password != "" || rest.CAFile != "" || len(rest.CAData) != 0 ||
 		rest.CertFile != "" || len(rest.CertData) != 0 || rest.KeyFile != "" || len(rest.KeyData) != 0 ||
 		rest.ExecProvider != nil || rest.AuthProvider != nil {

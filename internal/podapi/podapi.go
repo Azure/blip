@@ -54,7 +54,7 @@ const (
 	// bounded UTF-8 text here to publish progress into Blip status.
 	ReportEnv = "BLIP_REPORT_URL"
 	// ReportURL is the fixed guest loopback report endpoint.
-	ReportURL = "http://127.0.0.1:8002/report"
+	ReportURL = "http://blip/report"
 	// MaxReportBytes bounds one report body.
 	MaxReportBytes = 1024
 )

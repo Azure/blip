@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
@@ -29,9 +28,9 @@ type apiForwarder struct {
 	conns    map[apiStream]struct{}
 }
 
-// startForwarder binds only IPv4 loopback, including when tests use port 0.
-func startForwarder(name string, port int, dial func() (apiStream, error)) (*apiForwarder, error) {
-	l, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+// startForwarder binds the requested IPv4 address, including port 0 in tests.
+func startForwarder(name, address string, dial func() (apiStream, error)) (*apiForwarder, error) {
+	l, err := net.Listen("tcp4", address)
 	if err != nil {
 		return nil, err
 	}

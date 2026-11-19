@@ -454,7 +454,7 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 	}
 	o := Options{Dir: dir, SkipNetwork: true, KubeNamespace: "tenant", CH: "/bin/true"}
 	// The API sidecar can bind its suffix socket before the VMM starts.
-	suffix := o.path(podapi.VsockSocket) + "_1026"
+	suffix := podapi.VsockListenerPath(dir, wire.EndpointPort)
 	vsockDir := filepath.Dir(suffix)
 	if err := os.MkdirAll(vsockDir, 0o770); err != nil { // kubelet fsGroup mode
 		t.Fatal(err)
@@ -508,6 +508,14 @@ func modeOf(t *testing.T, path string) os.FileMode {
 		t.Fatal(err)
 	}
 	return info.Mode().Perm()
+}
+
+func TestOptionsFromEnvEndpoints(t *testing.T) {
+	t.Setenv("BLIP_ENDPOINT_NAMES", " api.default , db.default,,")
+	o := OptionsFromEnv()
+	if got := strings.Join(o.Endpoints, ","); got != "api.default,db.default" {
+		t.Fatalf("endpoints %q", got)
+	}
 }
 
 func TestWaitSocketChmodsExistingSocket(t *testing.T) {

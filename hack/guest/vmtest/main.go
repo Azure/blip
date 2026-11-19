@@ -352,10 +352,11 @@ func probeAPI(p *pod) {
 	must(os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: upstream.Certificate().Raw}), 0o600), "write host API CA")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	socket := p.path(podapi.VsockSocket) + fmt.Sprintf("_%d", wire.APIPort)
+	socket := p.path(podapi.VsockSocket) + fmt.Sprintf("_%d", wire.EndpointPort)
 	go func() {
 		done <- apiproxy.Run(ctx, apiproxy.Config{
-			SocketPath: socket, APIAddress: strings.TrimPrefix(upstream.URL, "https://"), TokenFile: tokenFile, CAFile: caFile,
+			SocketPath: socket,
+			API:        &apiproxy.API{Address: strings.TrimPrefix(upstream.URL, "https://"), TokenFile: tokenFile, CAFile: caFile},
 		})
 	}()
 	defer func() {
@@ -380,12 +381,12 @@ func probeAPI(p *pod) {
 	r := sh(p, `test "$KUBECONFIG" = /run/blip/kubeconfig &&
 test ! -e /var/run/secrets/kubernetes.io/serviceaccount &&
 cat /run/blip/kubeconfig && echo && cat /run/blip/namespace && echo && env`)
-	check(r.exit.Code == 0 && strings.Contains(r.stdout, `"server":"http://127.0.0.1:8001"`) &&
+	check(r.exit.Code == 0 && strings.Contains(r.stdout, `"server":"http://kube-apiserver"`) &&
 		strings.Contains(r.stdout, `"namespace":"vmtest-system"`) && strings.Contains(r.stdout, "\nvmtest-system\n") &&
 		!strings.Contains(r.stdout, token) && !strings.Contains(r.stdout, `"token"`),
 		"guest has namespace/kubeconfig metadata and no service-account files or credential")
-	r = run(p, wire.Open{Argv: []string{"timeout", "10", "bash", "-c", `exec 3<>/dev/tcp/127.0.0.1/8001
-printf 'GET /api/v1/namespaces/vmtest-system/pods HTTP/1.1\r\nHost: guest.invalid\r\nAuthorization: Bearer guest-forged\r\nImpersonate-User: admin\r\nConnection: close\r\n\r\n' >&3
+	r = run(p, wire.Open{Argv: []string{"timeout", "10", "bash", "-c", `exec 3<>/dev/tcp/127.0.2.2/80
+printf 'GET /api/v1/namespaces/vmtest-system/pods HTTP/1.1\r\nHost: kube-apiserver\r\nAuthorization: Bearer guest-forged\r\nImpersonate-User: admin\r\nConnection: close\r\n\r\n' >&3
 cat <&3`}}, "")
 	check(r.exit.Code == 0 && strings.HasPrefix(r.stdout, "HTTP/1.1 200") && strings.Contains(r.stdout, "api-vsock-ok"),
 		"guest localhost API works over vsock while direct egress is denied: %q (stderr %q)", r.stdout, r.stderr)

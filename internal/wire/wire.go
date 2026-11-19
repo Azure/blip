@@ -9,8 +9,9 @@
 //   - ControlPort: the in-pod runtime only (claim, mounts, shutdown).
 //   - SessionPort: command and exec sessions.
 //
-// APIPort is a host listener for credential-free Kubernetes API streams from
-// the guest. The runtime authenticates those requests on the host side.
+// EndpointPort is a host listener for the guest's loopback HTTP proxy. The
+// guest forwards raw bytes to it; the sidecar routes each request by Host to
+// the Kubernetes API or a configured endpoint and adds credentials.
 //
 // The guest accepts connections only from the host CID (2). Anyone who can
 // reach the Cloud Hypervisor vsock socket already controls the VM, so there
@@ -32,10 +33,10 @@ import (
 )
 
 const (
-	Version            = 1
-	ControlPort        = 1024
-	SessionPort        = 1025
-	APIPort     uint32 = 1026
+	Version             = 1
+	ControlPort         = 1024
+	SessionPort         = 1025
+	EndpointPort uint32 = 1027
 	// MaxFrame bounds one frame payload.
 	MaxFrame = 1 << 20
 )

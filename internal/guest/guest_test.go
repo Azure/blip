@@ -177,13 +177,30 @@ func TestExecProcSpecInheritsBlipDefaults(t *testing.T) {
 }
 
 func TestHostsFile(t *testing.T) {
-	got := hostsFile("alice.default")
-	for _, want := range []string{"127.0.0.1 localhost\n", "127.0.1.1 alice.default\n", "::1 localhost"} {
+	got := hostsFile("alice.default", "", nil)
+	for _, want := range []string{
+		"127.0.0.1 localhost\n",
+		"127.0.1.1 alice.default\n",
+		"::1 localhost",
+		"127.0.2.1 blip\n",
+	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("hostsFile = %q, want %q", got, want)
 		}
 	}
-	if got := hostsFile("bad\nname"); strings.Contains(got, "bad") {
+	if strings.Contains(got, "127.0.2.2") {
+		t.Fatalf("hostsFile without names wrote a proxy line: %q", got)
+	}
+	if got := hostsFile("alice.default", "sandbox", nil); !strings.Contains(got, "127.0.2.2 kube-apiserver\n") {
+		t.Fatalf("hostsFile with Kubernetes = %q", got)
+	}
+	if got := hostsFile("alice.default", "", []string{"api.default", "db.default"}); !strings.Contains(got, "127.0.2.2 api.default db.default\n") {
+		t.Fatalf("hostsFile with endpoints = %q", got)
+	}
+	if got := hostsFile("alice.default", "sandbox", []string{"api.default"}); !strings.Contains(got, "127.0.2.2 kube-apiserver api.default\n") {
+		t.Fatalf("hostsFile with Kubernetes and endpoints = %q", got)
+	}
+	if got := hostsFile("bad\nname", "", nil); strings.Contains(got, "bad") {
 		t.Fatalf("hostsFile accepted a host name with whitespace: %q", got)
 	}
 }

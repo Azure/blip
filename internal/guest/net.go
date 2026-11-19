@@ -91,6 +91,7 @@ func writeEtc(c bootconfig.Config) {
 	if c.IP != "" && c.Hostname != "" {
 		hosts += fmt.Sprintf("%s\t%s\n", c.IP, c.Hostname)
 	}
+	hosts += blipHosts(c.KubeNamespace, c.Endpoints)
 	_ = os.WriteFile("/etc/hosts", []byte(hosts), 0o644)
 }
 

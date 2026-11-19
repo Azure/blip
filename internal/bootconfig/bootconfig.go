@@ -30,6 +30,8 @@ type Config struct {
 	Options  []string `json:"options,omitempty"` // resolv.conf options, e.g. ndots:5
 	// KubeNamespace enables the credential-free loopback Kubernetes API.
 	KubeNamespace string `json:"kubeNamespace,omitempty"`
+	// Endpoints are guest hostnames for the sidecar's configured endpoints.
+	Endpoints []string `json:"endpoints,omitempty"`
 }
 
 // EncodeConfig returns the config disk image for c.

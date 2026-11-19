@@ -1,8 +1,9 @@
-// Package apiproxy serves the pod's Kubernetes API identity over the
-// guest-to-host vsock Unix socket. The service account credential stays in
-// the sidecar; the API server remains responsible for authorization. Reads of
-// Blips, BlipStates and Pods from a claimed VM are additionally scoped to the
-// owner recorded on the pod and its Blip.
+// Package apiproxy serves the pod's Kubernetes API identity and configured
+// HTTPS endpoints over the guest-to-host vsock Unix socket, routing by Host.
+// Service account and endpoint credentials stay in the sidecar; upstreams
+// remain responsible for authorization. Reads of Blips, BlipStates and Pods
+// from a claimed VM are additionally scoped to the owner recorded on the pod
+// and its Blip.
 package apiproxy
 
 import (
@@ -31,13 +32,30 @@ import (
 
 const serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 
+// API is the Kubernetes API upstream and the credential the sidecar uses.
+type API struct {
+	// Address is the Kubernetes HTTPS authority, including its port.
+	Address   string
+	TokenFile string
+	CAFile    string
+}
+
+// Endpoint is one named HTTPS upstream reachable from the guest by Host.
+type Endpoint struct {
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	TokenFile string `json:"tokenFile,omitempty"`
+	CAFile    string `json:"caFile,omitempty"`
+}
+
 // Config contains trusted sidecar configuration, never guest request data.
 type Config struct {
 	SocketPath string
-	// APIAddress is the Kubernetes HTTPS authority, including its port.
-	APIAddress string
-	TokenFile  string
-	CAFile     string
+	// API is the Kubernetes API upstream. When nil, the kube-apiserver host is
+	// not served.
+	API *API
+	// Endpoints are additional HTTPS upstreams, selected by Host.
+	Endpoints []Endpoint
 	// PodName and PodNamespace identify this API proxy's own pod. They come
 	// from the downward API, never from the guest, and let the proxy derive
 	// the owner it acts for. When both are empty, Kubernetes object reads are
@@ -47,23 +65,16 @@ type Config struct {
 }
 
 // ConfigFromEnv uses the in-cluster API endpoint and explicitly projected
-// service account files. BLIP_DIR defaults to /run/blip.
+// service account files. BLIP_DIR defaults to /run/blip. BLIP_KUBE_API=1
+// enables the Kubernetes API route; BLIP_ENDPOINTS is a JSON array of named
+// HTTPS endpoints.
 func ConfigFromEnv() (Config, error) {
-	host := os.Getenv("KUBERNETES_SERVICE_HOST")
-	port := os.Getenv("KUBERNETES_SERVICE_PORT")
-	address, err := apiAddress(host, port)
-	if err != nil {
-		return Config{}, err
-	}
 	dir := os.Getenv("BLIP_DIR")
 	if dir == "" {
 		dir = podapi.MountPath
 	}
 	cfg := Config{
-		SocketPath:   podapi.VsockListenerPath(dir, wire.APIPort),
-		APIAddress:   address,
-		TokenFile:    filepath.Join(serviceAccountDir, "token"),
-		CAFile:       filepath.Join(serviceAccountDir, "ca.crt"),
+		SocketPath:   podapi.VsockListenerPath(dir, wire.EndpointPort),
 		PodName:      os.Getenv("POD_NAME"),
 		PodNamespace: os.Getenv("POD_NAMESPACE"),
 	}
@@ -72,6 +83,27 @@ func ConfigFromEnv() (Config, error) {
 	}
 	if cfg.PodName != "" && (!validPodIdentity(cfg.PodName) || !validPodIdentity(cfg.PodNamespace)) {
 		return Config{}, errors.New("invalid POD_NAME or POD_NAMESPACE")
+	}
+	if os.Getenv("BLIP_KUBE_API") == "1" {
+		host := os.Getenv("KUBERNETES_SERVICE_HOST")
+		port := os.Getenv("KUBERNETES_SERVICE_PORT")
+		address, err := apiAddress(host, port)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.API = &API{
+			Address:   address,
+			TokenFile: filepath.Join(serviceAccountDir, "token"),
+			CAFile:    filepath.Join(serviceAccountDir, "ca.crt"),
+		}
+	}
+	endpoints, err := parseEndpoints(os.Getenv("BLIP_ENDPOINTS"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Endpoints = endpoints
+	if cfg.API == nil && len(cfg.Endpoints) == 0 {
+		return Config{}, errors.New("no API or endpoints configured")
 	}
 	return cfg, nil
 }
@@ -95,11 +127,15 @@ func Run(ctx context.Context, cfg Config) error {
 	if ctx.Err() != nil {
 		return nil
 	}
-	proxy, transport, err := newProxy(cfg)
+	proxy, transports, err := newRouter(cfg)
 	if err != nil {
 		return err
 	}
-	defer transport.CloseIdleConnections()
+	defer func() {
+		for _, transport := range transports {
+			transport.CloseIdleConnections()
+		}
+	}()
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	server, err := newProxyServer(serveCtx, cfg.SocketPath, proxy)
@@ -171,56 +207,34 @@ func (s *proxyServer) close() {
 
 // upstreamOptions describes a fixed HTTPS upstream.
 type upstreamOptions struct {
-	address    string // validated host:port
-	serverName string // TLS SNI; empty means the URL host
-	hostHeader string // outbound Host header
-	caFile     string
-	caLabel    string // error text for CA read/parse failures
-	tokenFile  string
-	errorBody  string
-}
-
-func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
-	host, port, err := net.SplitHostPort(cfg.APIAddress)
-	if err != nil {
-		return nil, nil, errors.New("invalid Kubernetes API address")
-	}
-	address, err := apiAddress(host, port)
-	if err != nil {
-		return nil, nil, err
-	}
-	handler, transport, err := newUpstreamProxy(upstreamOptions{
-		address:    address,
-		serverName: host,
-		hostHeader: address,
-		caFile:     cfg.CAFile,
-		caLabel:    "Kubernetes CA",
-		tokenFile:  cfg.TokenFile,
-		errorBody:  "Kubernetes API unavailable",
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	if (cfg.PodName == "") != (cfg.PodNamespace == "") {
-		return nil, nil, errors.New("API proxy pod identity is incomplete")
-	}
-	if cfg.PodName != "" {
-		handler = newOwnerScope(cfg, transport, handler)
-	}
-	return handler, transport, nil
+	address     string // validated host:port
+	serverName  string // TLS SNI; empty disables SNI
+	hostHeader  string // outbound Host header
+	caFile      string
+	caLabel     string // error text for CA read/parse failures
+	systemRoots bool   // use the system pool when caFile is empty
+	tokenFile   string
+	errorBody   string
 }
 
 func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error) {
-	roots, err := certPool(cfg.caFile, cfg.caLabel)
+	roots, err := certPool(cfg.caFile, cfg.caLabel, cfg.systemRoots)
 	if err != nil {
 		return nil, nil, err
 	}
-	if _, err := projectedToken(cfg.tokenFile); err != nil {
-		return nil, nil, err
+	if cfg.tokenFile != "" {
+		if _, err := projectedToken(cfg.tokenFile); err != nil {
+			return nil, nil, err
+		}
 	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		// Proxy is deliberately nil: HTTP(S)_PROXY cannot change the destination.
-		DialContext: (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		// The dial target is fixed too, so neither the request URL nor a
+		// redirect can move the connection away from the configured upstream.
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, cfg.address)
+		},
 		TLSClientConfig: &tls.Config{
 			RootCAs:    roots,
 			ServerName: cfg.serverName,
@@ -234,6 +248,10 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
+	}
+	var roundTripper http.RoundTripper = transport
+	if cfg.tokenFile != "" {
+		roundTripper = tokenTransport{base: transport, tokenFile: cfg.tokenFile}
 	}
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -250,7 +268,7 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error
 			stripIdentity(r.Out.Header)
 			stripIdentity(r.Out.Trailer)
 		},
-		Transport:     tokenTransport{base: transport, tokenFile: cfg.tokenFile},
+		Transport:     roundTripper,
 		FlushInterval: -1, // Flush watches and logs as bytes arrive.
 		ErrorLog:      log.New(io.Discard, "", 0),
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
@@ -268,7 +286,17 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error
 	return handler, transport, nil
 }
 
-func certPool(caFile, label string) (*x509.CertPool, error) {
+func certPool(caFile, label string, systemRoots bool) (*x509.CertPool, error) {
+	if caFile == "" {
+		if !systemRoots {
+			return nil, fmt.Errorf("read %s: CA file is empty", label)
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("load system certificates for %s: %w", label, err)
+		}
+		return roots, nil
+	}
 	ca, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", label, err)

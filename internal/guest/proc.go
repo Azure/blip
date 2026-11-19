@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -211,6 +212,17 @@ func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
 	if g.kubeNamespace != "" {
 		env = append(env, "KUBECONFIG="+kubeconfigPath)
 	}
+	// Guest-local names are resolved through /etc/hosts and must not go
+	// through a workload's HTTP proxy.
+	noProxy := []string{"blip"}
+	if g.kubeNamespace != "" {
+		noProxy = append(noProxy, "kube-apiserver")
+	}
+	noProxy = append(noProxy, g.endpoints...)
+	base = append([]string{
+		"NO_PROXY=" + strings.Join(noProxy, ","),
+		"no_proxy=" + strings.Join(noProxy, ","),
+	}, base...)
 	return mergeEnv(env, base, s.env)
 }
 

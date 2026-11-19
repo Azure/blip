@@ -206,7 +206,7 @@ func startScoped(t *testing.T, kube *fakeKube, podName string) *runningProxy {
 
 func proxyGet(t *testing.T, p *runningProxy, path string) (int, string) {
 	t.Helper()
-	resp, err := p.client.Get("http://guest" + path)
+	resp, err := p.client.Get("http://kube-apiserver" + path)
 	if err != nil {
 		t.Fatalf("GET %s: %v", path, err)
 	}
@@ -371,7 +371,7 @@ func TestOwnerScopeSelectorAndPaths(t *testing.T) {
 
 	// Writes are not read-scoped: they keep their exact query for RBAC and the
 	// owner admission policy to decide.
-	request, err := http.NewRequest(http.MethodPost, "http://guest/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips", strings.NewReader("{}"))
+	request, err := http.NewRequest(http.MethodPost, "http://kube-apiserver/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips", strings.NewReader("{}"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestOwnerScopeWatchStreams(t *testing.T) {
 	cfg.PodName, cfg.PodNamespace = "alice-vm", scopeNamespace
 	p := startProxy(t, cfg)
 
-	resp, err := p.client.Get("http://guest/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips?watch=true")
+	resp, err := p.client.Get("http://kube-apiserver/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips?watch=true")
 	if err != nil {
 		t.Fatal(err)
 	}

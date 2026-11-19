@@ -58,6 +58,44 @@ spec:
                 format: int32
                 minimum: 1
                 type: integer
+              endpoints:
+                description: Endpoints exposes fixed HTTPS endpoints to workloads
+                  at http://<name>/.
+                items:
+                  description: |-
+                    PoolEndpoint is one HTTPS endpoint the pool's sidecar routes guest requests
+                    to. The guest reaches it at http://<name>/.
+                  properties:
+                    audience:
+                      description: |-
+                        Audience is the projected service account token audience. It requires
+                        spec.serviceAccountName.
+                      type: string
+                    caConfigMap:
+                      description: |-
+                        CAConfigMap holds a ca.crt key that verifies the endpoint. Omitted
+                        uses system roots.
+                      type: string
+                    name:
+                      description: Name is the guest hostname.
+                      maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    url:
+                      description: |-
+                        URL is the HTTPS URL. Its host is dialed, used for TLS SNI and the
+                        outbound Host header.
+                      pattern: ^https://[a-z0-9]([-.a-z0-9]*[a-z0-9])?(:[0-9]{1,5})?$
+                      type: string
+                  required:
+                  - name
+                  - url
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               hypervisor:
                 default: kvm
                 enum:

@@ -13,7 +13,7 @@ import (
 // in the root's /run tmpfs, never on a durable disk.
 const (
 	kubeconfigPath = "/run/blip/kubeconfig"
-	apiServer      = "http://127.0.0.1:8001"
+	apiServer      = "http://kube-apiserver"
 )
 
 // installKubeConfigLocked runs during root setup, before accepting the claim

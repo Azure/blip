@@ -112,7 +112,8 @@ Pod as node-local, replicated, encrypted block storage.
 ### API (`blip.dev/v1alpha1`)
 
 - **`BlipPool`** — VM shape (CPUs, memory), `warmCount`/`maxCount`, node selector,
-  service account, and egress policy.
+  service account, egress policy, and `endpoints` (guest-visible names proxied
+  to fixed HTTPS URLs).
 - **`BlipState`** — one durable ext4 filesystem. Provisioning is immutable:
   `image` (OCI image converted to ext4), `copyFrom`, `size`, `replicas` (default
   3), `nodeSelector`. `mounts` and `runtime` persist across executions.
@@ -194,28 +195,32 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
   internet plus cluster DNS and denies private/LAN ranges and metadata.
 - Writes complete `desired.json`/`observed.json` snapshots and reconciles guest
   claims, mounts, freeze requests, and shutdown.
-- The `api-proxy` native sidecar holds the projected service-account token and
-  proxies the guest's loopback port 8001 (Kubernetes API) over vsock to the
-  HTTPS API server. It strips caller identity headers and scopes reads to the
-  Blip's owner.
+- The `api-proxy` native sidecar holds projected service-account tokens and
+  proxies the guest's loopback HTTP names over vsock. It routes by `Host`
+  header: `kube-apiserver` goes to the API server with reads scoped to the
+  Blip's owner; each `spec.endpoints` name goes to its configured HTTPS URL
+  (optionally with its own token audience and CA). It strips caller identity
+  headers, rejects `CONNECT`, and answers unknown hosts with `421`.
 
 ### Guest (`blip-guest`)
 
 - PID 1 in the initramfs: reads its config disk, mounts pseudo-filesystems, loads
   modules, configures `eth0` over rtnetlink, and serves the framed vsock
-  protocol on port 1024 (control) and 1025 (sessions), with a loopback relay
-  to the API proxy and a report endpoint on 127.0.0.1:8002.
+  protocol on port 1024 (control) and 1025 (sessions). A second loopback
+  listener on `127.0.2.2:80` raw-forwards to the API-proxy sidecar, and
+  `/etc/hosts` maps `kube-apiserver` and the pool's endpoint names to it.
 - Claims the root ext4 filesystem, chroots into it, resolves users/groups from
   the image's `/etc/passwd` and `/etc/group`, runs processes in a cgroup, and
   supports PTYs, multiple command sessions, signals, and window resize. Each
   session keeps a 1 MiB output replay ring.
 - Uses `FIFREEZE`/`FITHAW` with a 90s auto-thaw for live snapshots.
-- Writes `/run/blip/kubeconfig` pointing at the loopback API proxy; the proxy
+- Writes `/run/blip/kubeconfig` pointing at `http://kube-apiserver`; the proxy
   injects the real token, so no credential enters the workload filesystem.
-- Serves a report endpoint on `127.0.0.1:8002`, exposed to the command as
-  `BLIP_REPORT_URL`. A workload POSTs up to 1 KiB of UTF-8 text and receives
-  `{"seq": n}`; the text becomes `status.report` on the Blip and survives the
-  pod. Reports are spaced at least 10 seconds apart and are never coalesced.
+- Serves a report endpoint at `http://blip/report` (`127.0.2.1:80`), exposed to
+  the command as `BLIP_REPORT_URL`. A workload POSTs up to 1 KiB of UTF-8 text
+  and receives `{"seq": n}`; the text becomes `status.report` on the Blip and
+  survives the pod. Reports are spaced at least 10 seconds apart and are never
+  coalesced.
 
 ### Coordinator (`blipchat`, `cmd/blipchat` and `internal/blipchat`)
 

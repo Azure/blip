@@ -98,9 +98,9 @@ func newOwnerScope(cfg Config, transport *http.Transport, next http.Handler) htt
 	return &ownerScope{
 		namespace:  cfg.PodNamespace,
 		podName:    cfg.PodName,
-		apiAddress: cfg.APIAddress,
+		apiAddress: cfg.API.Address,
 		client: &http.Client{
-			Transport: tokenTransport{base: transport, tokenFile: cfg.TokenFile},
+			Transport: tokenTransport{base: transport, tokenFile: cfg.API.TokenFile},
 			Timeout:   scopeTimeout,
 			// Never follow a redirect: it could leave the fixed upstream.
 			CheckRedirect: func(*http.Request, []*http.Request) error {

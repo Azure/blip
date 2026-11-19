@@ -2,7 +2,7 @@
 //
 //	blip-runtime              supervise Cloud Hypervisor (see the README's implementation outline)
 //	blip-runtime bridge PORT  relay stdin/stdout to a guest vsock port
-//	blip-runtime api-proxy    serve the VM-only Kubernetes API proxy
+//	blip-runtime api-proxy    serve the VM-only HTTP proxy for the API and endpoints
 package main
 
 import (
