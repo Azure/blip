@@ -1281,6 +1281,8 @@ func (a *app) prepareNewMounts(f *mountFlags, replicasSet bool) ([]newMount, err
 		return nil, errors.New("--replicas must be between 1 and 3")
 	}
 	news := make([]newMount, 0, len(f.create))
+	seenNames := make(map[string]bool, len(f.create))
+	seenPaths := make(map[string]string, len(f.create))
 	for _, spec := range f.create {
 		name, mountPath, mode, err := parseMountSpec(spec)
 		if err != nil {
@@ -1296,6 +1298,20 @@ func (a *app) prepareNewMounts(f *mountFlags, replicasSet bool) ([]newMount, err
 		if err := a.validateName("state", name); err != nil {
 			return nil, err
 		}
+		// A repeated --new for the same state would be created twice: the
+		// preflight would treat the second as an idempotent update of the
+		// first while execution still calls Create again. Reject duplicates
+		// here, before any state is created or the root edited.
+		if seenNames[name] {
+			return nil, fmt.Errorf("--new state %q is specified more than once", name)
+		}
+		seenNames[name] = true
+		// Two names at one destination are just as ambiguous, including
+		// paths that resolve to the same directory.
+		if other, ok := seenPaths[mountpath.Resolve(mountPath)]; ok {
+			return nil, fmt.Errorf("--new state %q uses the same destination %s as state %q", name, mountPath, other)
+		}
+		seenPaths[mountpath.Resolve(mountPath)] = name
 		news = append(news, newMount{spec: spec, name: name, path: mountPath, writable: writable})
 	}
 	return news, nil

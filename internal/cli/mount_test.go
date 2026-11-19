@@ -1382,6 +1382,59 @@ func TestMountNewRejectsExisting(t *testing.T) {
 	}
 }
 
+// TestMountNewRejectsDuplicateArguments reproduces repeated --new entries:
+// validateMountPlan treats an identical repeat as an idempotent update, but
+// execution still creates the state once per entry, so the command applies the
+// first mount and then fails with "already exists". Duplicates must be rejected
+// in the preflight, leaving no state or mount intent behind.
+func TestMountNewRejectsDuplicateArguments(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			name: "identical state and destination",
+			args: []string{"--new", "dup:/d", "--new", "dup:/d"},
+			want: []string{`--new state "dup"`, "more than once"},
+		},
+		{
+			name: "same state at another path",
+			args: []string{"--new", "dup:/a", "--new", "dup:/b"},
+			want: []string{`--new state "dup"`, "more than once"},
+		},
+		{
+			name: "same destination",
+			args: []string{"--new", "a:/same", "--new", "b:/same"},
+			want: []string{`--new state "b"`, "same destination", `state "a"`},
+		},
+		{
+			name: "aliased destination",
+			args: []string{"--new", "a:/bin/x", "--new", "b:/usr/bin/x"},
+			want: []string{`--new state "b"`, "same destination", `state "a"`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("home"))
+			args := append([]string{"mount"}, tc.args...)
+			args = append(args, "--root", "home")
+			code, _, errOut := h.run("", args...)
+			if code != 1 {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			mustContain(t, errOut, tc.want...)
+			for _, name := range []string{"dup", "a", "b"} {
+				if !stateNotFound(t, h, name) {
+					t.Fatalf("rejected --new left state %q behind", name)
+				}
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected --new wrote desired intent: %+v", mounts)
+			}
+		})
+	}
+}
+
 func stateNotFound(t *testing.T, h *harness, name string) bool {
 	t.Helper()
 	var s v1alpha1.BlipState
