@@ -156,19 +156,23 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	namespace := "default"
 	if rawQuery := r.URL.RawQuery; rawQuery != "" {
 		query, err := url.ParseQuery(rawQuery)
-		if values, ok := query["namespace"]; ok {
+		values := query["namespace"]
+		if len(values) > 1 {
 			// A repeated parameter is ambiguous: this server would act on the
 			// first value while an authorizing front end may inspect another.
 			// Require exactly one so both see the same namespace.
-			if len(values) != 1 {
-				http.Error(w, "invalid namespace", http.StatusBadRequest)
-				return
-			}
+			http.Error(w, "invalid namespace", http.StatusBadRequest)
+			return
+		}
+		if len(values) == 1 {
 			namespace = values[0]
-		} else if err != nil && rawQueryHasParam(rawQuery, "namespace") {
-			// ParseQuery drops a pair whose value does not unescape, so a
-			// malformed namespace such as ?namespace=%zz would otherwise
-			// look absent and silently query the default namespace.
+		}
+		// ParseQuery drops a pair whose key or value does not unescape, so a
+		// malformed namespace such as ?namespace=%zz or ?%6eamespace=%zz
+		// would otherwise look absent and silently query the default
+		// namespace. Count the raw pairs (decoding their keys) to tell a
+		// present-but-invalid parameter from an omitted one.
+		if err != nil && rawQueryParamCount(rawQuery, "namespace") != len(values) {
 			http.Error(w, "invalid namespace", http.StatusBadRequest)
 			return
 		}
@@ -643,18 +647,24 @@ func shortUser(user string) string {
 	return s + "-" + hex.EncodeToString(sum[:4])
 }
 
-// rawQueryHasParam reports whether rawQuery names param, including a pair
-// whose value failed to unescape and was therefore dropped by url.ParseQuery.
-func rawQueryHasParam(rawQuery, param string) bool {
+// rawQueryParamCount counts the pairs whose parameter name decodes to param,
+// including a pair whose value failed to unescape and was therefore dropped by
+// url.ParseQuery. A key that cannot itself be unescaped is compared raw.
+func rawQueryParamCount(rawQuery, param string) int {
+	count := 0
 	for rawQuery != "" {
 		var pair string
 		pair, rawQuery, _ = strings.Cut(rawQuery, "&")
-		key, _, _ := strings.Cut(pair, "=")
+		rawKey, _, _ := strings.Cut(pair, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			key = rawKey
+		}
 		if key == param {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
 }
 
 // validNamespace reports whether the namespace query parameter is a valid
