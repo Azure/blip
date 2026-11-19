@@ -157,6 +157,13 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rawQuery := r.URL.RawQuery; rawQuery != "" {
 		query, err := url.ParseQuery(rawQuery)
 		if values, ok := query["namespace"]; ok {
+			// A repeated parameter is ambiguous: this server would act on the
+			// first value while an authorizing front end may inspect another.
+			// Require exactly one so both see the same namespace.
+			if len(values) != 1 {
+				http.Error(w, "invalid namespace", http.StatusBadRequest)
+				return
+			}
 			namespace = values[0]
 		} else if err != nil && rawQueryHasParam(rawQuery, "namespace") {
 			// ParseQuery drops a pair whose value does not unescape, so a

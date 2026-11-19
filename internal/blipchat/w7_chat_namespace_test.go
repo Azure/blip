@@ -21,6 +21,9 @@ func TestChatNamespaceParameterPresence(t *testing.T) {
 		{name: "empty", rawQuery: "?namespace=", namespace: "default", want: http.StatusBadRequest},
 		{name: "malformed escape", rawQuery: "?namespace=%zz", namespace: "default", want: http.StatusBadRequest},
 		{name: "valid", rawQuery: "?namespace=ns", namespace: "ns", want: http.StatusOK},
+		{name: "duplicate same value", rawQuery: "?namespace=ns&namespace=ns", namespace: "ns", want: http.StatusBadRequest},
+		{name: "duplicate different values", rawQuery: "?namespace=ns&namespace=default", namespace: "ns", want: http.StatusBadRequest},
+		{name: "duplicate reversed", rawQuery: "?namespace=default&namespace=ns", namespace: "ns", want: http.StatusBadRequest},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
