@@ -136,3 +136,23 @@ func TestLookupAccountNumericNormalization(t *testing.T) {
 		}
 	}
 }
+
+// A failure to read the account database must be reported as such, not as a
+// missing user. Descriptor exhaustion used to surface as "user ... not found
+// in /etc/passwd" even though the lookup never read the file.
+func TestLookupAccountReportsFileErrors(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "etc"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := lookupAccount(root, "root")
+	if err == nil {
+		t.Fatal("lookupAccount ignored an unreadable /etc/passwd")
+	}
+	if !strings.Contains(err.Error(), "read /etc/passwd") {
+		t.Fatalf("lookupAccount error = %v, want a read error for /etc/passwd", err)
+	}
+	if strings.Contains(err.Error(), "not found") {
+		t.Fatalf("read failure was reported as a missing user: %v", err)
+	}
+}

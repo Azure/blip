@@ -30,8 +30,14 @@ func lookupAccount(root, spec string) (*account, error) {
 		spec = "root"
 	}
 	userPart, groupPart, hasGroup := strings.Cut(spec, ":")
-	passwd := readColonFile(filepath.Join(root, "etc/passwd"))
-	groups := readColonFile(filepath.Join(root, "etc/group"))
+	passwd, err := readColonFile(filepath.Join(root, "etc/passwd"))
+	if err != nil {
+		return nil, fmt.Errorf("read /etc/passwd: %w", err)
+	}
+	groups, err := readColonFile(filepath.Join(root, "etc/group"))
+	if err != nil {
+		return nil, fmt.Errorf("read /etc/group: %w", err)
+	}
 
 	a := &account{home: "/", shell: "/bin/sh"}
 	var entry []string
@@ -140,10 +146,15 @@ func parseID(s string) (id uint32, numeric bool, err error) {
 	return uint32(v), true, nil
 }
 
-func readColonFile(path string) [][]string {
+func readColonFile(path string) ([][]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil
+		// A missing file is an empty database, not a read failure: callers
+		// fall back to defaults for root.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	defer f.Close()
 	var out [][]string
@@ -155,7 +166,10 @@ func readColonFile(path string) [][]string {
 		}
 		out = append(out, strings.Split(line, ":"))
 	}
-	return out
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // mergeEnv returns base with every KEY=VALUE of each later list applied in
