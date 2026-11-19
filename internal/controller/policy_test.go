@@ -402,8 +402,9 @@ func TestVMOwnerPolicy(t *testing.T) {
 		allow bool
 		msg   string
 	}{
-		{"non-VM service account", policyRequest{user: vmUser("ci", "ci-pod"), op: admission.Create, resource: "blips", name: "anything", object: blipObj("anything", "")}, true, ""},
+		{"same-namespace pod without an owner entry", policyRequest{user: vmUser("ci", "ci-pod"), op: admission.Create, resource: "blips", name: "anything", object: blipObj("anything", "")}, false, "not claimed"},
 		{"user without pod token", policyRequest{user: &user.DefaultInfo{Name: "alice"}, op: admission.Delete, resource: "blips", name: x + ".a", oldObject: blipObj(x+".a", x)}, true, ""},
+		{"controller without a pod token", policyRequest{user: &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blip-controller"}, op: admission.Create, resource: "blips", name: "anything", object: blipObj("anything", "")}, true, ""},
 		{"other namespace service account", policyRequest{user: &user.DefaultInfo{Name: "system:serviceaccount:other:vm", Extra: map[string][]string{"authentication.kubernetes.io/pod-name": {"p"}}}, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "")}, true, ""},
 		{"vacant VM denied", policyRequest{user: vacant, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o)}, false, "not claimed"},
 		{"unrestricted owner", policyRequest{user: admin, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "", withState("b"))}, true, ""},
@@ -478,6 +479,25 @@ func TestVMOwnerPolicy(t *testing.T) {
 	}
 	if ok, msg := (policyRequest{user: vacant, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "")}).evaluate(t, v, nil); ok {
 		t.Fatalf("empty table allowed a create: %s", msg)
+	}
+
+	// A non-empty table that lacks the caller's service-account and pod keys
+	// must fail closed rather than skipping every owner check.
+	partial := map[string]string{"bases": "base", "sa.other": ""}
+	if ok, msg := (policyRequest{user: vmUser("vm", "vacant-pod"), op: admission.Create, resource: "blips",
+		name: "a", object: blipObj("a", "")}).evaluate(t, v, partial); ok {
+		t.Fatalf("partial table allowed a pod-bound create: %s", msg)
+	}
+	noPod := map[string]string{"sa.vm": "default", "sa.other": ""}
+	if ok, msg := (policyRequest{user: vmUser("vm", "vacant-pod"), op: admission.Create, resource: "blips",
+		name: o + ".a", object: blipObj(o+".a", o)}).evaluate(t, v, noPod); ok {
+		t.Fatalf("table without the caller's pod entry allowed a create: %s", msg)
+	}
+	// A valid claimed pod still works, including its pools.
+	claimed := map[string]string{"sa.vm": "default", "default-mine": o}
+	if ok, msg := (policyRequest{user: mine, op: admission.Create, resource: "blips",
+		name: o + ".a", object: blipObj(o+".a", o)}).evaluate(t, v, claimed); !ok {
+		t.Fatalf("valid claimed pod was denied: %s", msg)
 	}
 }
 
