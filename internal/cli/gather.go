@@ -228,6 +228,11 @@ func (a *app) gatherTargets(ctx context.Context, c *Clients, names []string, sel
 		if err != nil {
 			return nil, err
 		}
+		// A Blip cannot wait for or delete itself, just as the selector
+		// path below cannot target the caller.
+		if a.self != nil && b.Name == a.self.Name {
+			return nil, fmt.Errorf("cannot gather %s, the blip running this gather; name another blip or gather its forks with no arguments", a.short(b.Name))
+		}
 		add(b)
 	}
 	if selector != "" {

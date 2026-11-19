@@ -550,6 +550,30 @@ func TestGatherSelectorExcludesCaller(t *testing.T) {
 	}
 }
 
+// Naming the caller explicitly must fail quickly instead of waiting forever
+// or reporting the caller as still running.
+func TestGatherExplicitNameRejectsCaller(t *testing.T) {
+	caller := ownedBlip("alice.box", "alice.home")
+	h := newHarness(t, caller)
+	h.self = "alice.box"
+	start := time.Now()
+	code, out, errOut := h.run("", "gather", "alice.box")
+	elapsed := time.Since(start)
+	if code != 1 {
+		t.Fatalf("code %d out %q err %q", code, out, errOut)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("gather of the caller took %s", elapsed)
+	}
+	mustContain(t, errOut, "cannot gather box, the blip running this gather")
+	if strings.Contains(errOut, "still running") {
+		t.Fatalf("caller treated as a target: %q", errOut)
+	}
+	if h.gone("alice.box") {
+		t.Fatal("caller gathered itself")
+	}
+}
+
 // A finished command whose pod is already gone still reports the output the
 // controller retained in status.
 func TestGatherFollowUsesRetainedStatusOutput(t *testing.T) {
