@@ -464,30 +464,56 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	return c.s.execIn(ctx, c.thread, name, hardenGitArgs(argv), maxExecTimeout)
 }
 
+// gitHardenScript neutralizes repository configuration that can run commands
+// while a read-only git command runs, then executes the requested command.
+// It runs inside the inspected workspace, where the repository config lives:
+// the names of clean/smudge/process filters, merge drivers, and textconv
+// helpers are attacker-controlled, so they must be discovered there and
+// overridden by name. `git config --get-regexp` only reads config; it never
+// runs a configured program. Fixed overrides cover config that can select a
+// program without a per-driver name (fsmonitor, external diff, gpg, signature
+// display, pager-free log formats).
+const gitHardenScript = `set -f
+keys=$(git config --get-regexp --name-only '^(filter\..*\.(clean|smudge|process)|merge\..*\.driver|diff\..*\.textconv|gpg\.(program|ssh\.program|x509\.program)|diff\.external|core\.fsmonitor|core\.sshCommand)$' 2>/dev/null) || keys=
+n=0
+oldIFS=$IFS
+IFS='
+'
+for k in $keys; do
+  case "$k" in
+    filter.*.clean|filter.*.smudge) v=/bin/cat ;;
+    filter.*.process) v= ;;
+    merge.*.driver|diff.*.textconv) v=/bin/false ;;
+    gpg.program|gpg.ssh.program|gpg.x509.program) v=/bin/false ;;
+    diff.external|core.sshCommand) v= ;;
+    core.fsmonitor) v=false ;;
+    *) continue ;;
+  esac
+  export "GIT_CONFIG_KEY_$n=$k"
+  export "GIT_CONFIG_VALUE_$n=$v"
+  n=$((n+1))
+done
+IFS=$oldIFS
+export GIT_CONFIG_COUNT=$n
+sub=$1
+shift
+case "$sub" in
+  diff|log|show) exec git -c core.fsmonitor=false -c diff.external= -c gpg.program=/bin/false -c gpg.ssh.program=/bin/false -c gpg.x509.program=/bin/false -c log.showSignature=false -c log.diffMerges=separate -c format.pretty=medium -c core.sshCommand= "$sub" --no-ext-diff --no-textconv "$@" ;;
+  *) exec git -c core.fsmonitor=false -c diff.external= -c gpg.program=/bin/false -c gpg.ssh.program=/bin/false -c gpg.x509.program=/bin/false -c log.showSignature=false -c log.diffMerges=separate -c format.pretty=medium -c core.sshCommand= "$sub" "$@" ;;
+esac`
+
 // hardenGitArgs disables repository configuration that can run commands while
-// an inspection command runs. core.fsmonitor makes `git status` execute a
-// configured helper, diff textconv filters run for `git diff` and `git log -p`,
-// and gpg.program or log.showSignature can make a signed commit run a program
-// while its history is displayed. None of that is part of looking, so override
-// all of it even though the workspace controls its own config. This is defense
-// in depth: readOnly rejects the options that use these programs.
+// an inspection command runs. The command must be neutralized where the
+// repository lives, not where this process runs, so the returned argv runs a
+// small shell script in the workspace that discovers repo-declared filter,
+// merge, and textconv driver names and overrides each one. This is defense in
+// depth: readOnly rejects the options that explicitly ask for these programs.
 func hardenGitArgs(argv []string) []string {
 	if len(argv) < 2 || argv[0] != "git" {
 		return argv
 	}
-	out := []string{
-		"git",
-		"-c", "core.fsmonitor=false",
-		"-c", "diff.external=",
-		"-c", "gpg.program=/bin/false",
-		"-c", "log.showSignature=false",
-		argv[1],
-	}
-	switch argv[1] {
-	case "diff", "log", "show":
-		out = append(out, "--no-ext-diff", "--no-textconv")
-	}
-	return append(out, argv[2:]...)
+	out := []string{"/bin/sh", "-c", gitHardenScript, "git-harden"}
+	return append(out, argv[1:]...)
 }
 
 // readOnly reports whether argv is safe to run as an inspection command. It

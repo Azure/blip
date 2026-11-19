@@ -25,6 +25,16 @@ func runInspectGit(t *testing.T, dir string, argv []string) {
 	}
 }
 
+// runInspectGitMayFail records only that the command ran. It is used to prove
+// a malicious repository configuration is live before checking hardening, even
+// when that configuration makes the unhardened command exit non-zero.
+func runInspectGitMayFail(t *testing.T, dir string, argv []string) {
+	t.Helper()
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = dir
+	_ = cmd.Run()
+}
+
 func writeMarkerScript(t *testing.T, dir, name, marker string) string {
 	t.Helper()
 	script := filepath.Join(dir, name)
@@ -112,7 +122,7 @@ func TestInspectGitDisablesTextconv(t *testing.T) {
 	}
 }
 
-func TestHardenGitArgsOnlyChangesGitSubcommands(t *testing.T) {
+func TestHardenGitArgsWrapsGitSubcommands(t *testing.T) {
 	for _, argv := range [][]string{
 		{"ls", "-la"},
 		{"git"},
@@ -122,24 +132,24 @@ func TestHardenGitArgsOnlyChangesGitSubcommands(t *testing.T) {
 		}
 	}
 	got := hardenGitArgs([]string{"git", "status", "--short"})
-	want := []string{"git",
-		"-c", "core.fsmonitor=false",
-		"-c", "diff.external=",
-		"-c", "gpg.program=/bin/false",
-		"-c", "log.showSignature=false",
-		"status", "--short"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("hardenGitArgs(status) = %v, want %v", got, want)
+	if len(got) < 5 || got[0] != "/bin/sh" || got[1] != "-c" {
+		t.Fatalf("hardenGitArgs(status) = %v, want a shell wrapper", got)
+	}
+	for _, want := range []string{
+		"GIT_CONFIG_COUNT", "filter.*.clean", "merge.*.driver",
+		"diff.*.textconv", "gpg.ssh.program", "gpg.x509.program",
+		"log.diffMerges=separate", "core.sshCommand=",
+	} {
+		if !strings.Contains(got[2], want) {
+			t.Errorf("harden script does not mention %q", want)
+		}
+	}
+	if want := []string{"status", "--short"}; !reflect.DeepEqual(got[4:], want) {
+		t.Errorf("hardenGitArgs(status) args = %v, want %v", got[4:], want)
 	}
 	got = hardenGitArgs([]string{"git", "diff", "--", "a.bin"})
-	want = []string{"git",
-		"-c", "core.fsmonitor=false",
-		"-c", "diff.external=",
-		"-c", "gpg.program=/bin/false",
-		"-c", "log.showSignature=false",
-		"diff", "--no-ext-diff", "--no-textconv", "--", "a.bin"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("hardenGitArgs(diff) = %v, want %v", got, want)
+	if want := []string{"diff", "--", "a.bin"}; !reflect.DeepEqual(got[4:], want) {
+		t.Errorf("hardenGitArgs(diff) args = %v, want %v", got[4:], want)
 	}
 }
 
@@ -325,4 +335,169 @@ func runInspectGitInput(t *testing.T, dir string, argv []string, input string) s
 		t.Fatalf("%v: %v", argv, err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func writeCatMarkerScript(t *testing.T, dir, name, marker string) string {
+	t.Helper()
+	script := filepath.Join(dir, name)
+	body := "#!/bin/sh\necho hit >> " + marker + "\n/bin/cat\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+// A repository may declare filter.<driver>.clean/smudge/process in its own
+// config and select it from .gitattributes. Plain git status and diff then
+// execute that program. The hardened inspect invocation must discover and
+// override the driver by name before git reads the worktree.
+func TestInspectGitDisablesRepoFilters(t *testing.T) {
+	requireInspectGit(t)
+	dir := t.TempDir()
+	runInspectGit(t, dir, []string{"git", "init", "-q", "."})
+	runInspectGit(t, dir, []string{"git", "config", "user.email", "a@b"})
+	runInspectGit(t, dir, []string{"git", "config", "user.name", "a"})
+	marker := filepath.Join(dir, "filter-hits")
+	clean := writeCatMarkerScript(t, dir, "clean.sh", marker)
+	process := writeMarkerScript(t, dir, "process.sh", marker)
+	runInspectGit(t, dir, []string{"git", "config", "filter.evil.clean", clean})
+	runInspectGit(t, dir, []string{"git", "config", "filter.evil.smudge", clean})
+	if err := os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte("*.txt filter=evil\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runInspectGit(t, dir, []string{"git", "add", "."})
+	runInspectGit(t, dir, []string{"git", "commit", "-qm", "base"})
+	// Configure the process filter only after the setup commit: it speaks the
+	// long-running filter protocol, so it cannot be used to create the base
+	// commit, but a plain status still tries it before falling back to clean.
+	runInspectGit(t, dir, []string{"git", "config", "filter.evil.process", process})
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	for _, argv := range [][]string{{"git", "status"}, {"git", "diff"}} {
+		if err := readOnly(argv); err != nil {
+			t.Fatalf("readOnly rejected %v: %v", argv, err)
+		}
+		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		runInspectGitMayFail(t, dir, argv)
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("setup: %v did not run the clean filter: %v", argv, err)
+		}
+		if err := os.Remove(marker); err != nil {
+			t.Fatal(err)
+		}
+		runInspectGit(t, dir, hardenGitArgs(argv))
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Errorf("hardened inspect %v ran a repository filter: %v", argv, err)
+		}
+	}
+}
+
+// log.diffMerges=remerge makes an allowed --diff-merges=on select a merge
+// driver declared by repository config. The hardened invocation must override
+// both the config selection and the driver name.
+func TestInspectGitDisablesMergeDriverSelectedByConfig(t *testing.T) {
+	requireInspectGit(t)
+	dir, marker := setupMergeDriverRepo(t)
+	runInspectGit(t, dir, []string{"git", "config", "log.diffMerges", "remerge"})
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	for _, argv := range [][]string{
+		{"git", "log", "-p", "--diff-merges=on", "-1"},
+		{"git", "show", "--diff-merges=on", "-1"},
+	} {
+		if err := readOnly(argv); err != nil {
+			t.Fatalf("readOnly rejected %v: %v", argv, err)
+		}
+		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		runInspectGit(t, dir, argv)
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("setup: %v did not run the merge driver: %v", argv, err)
+		}
+		if err := os.Remove(marker); err != nil {
+			t.Fatal(err)
+		}
+		runInspectGit(t, dir, hardenGitArgs(argv))
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Errorf("hardened inspect %v ran the merge driver: %v", argv, err)
+		}
+	}
+}
+
+// format.pretty from repository config can ask for %G?, which makes a plain
+// `git log -1` run gpg.ssh.program or gpg.x509.program even though the legacy
+// gpg.program alias is disabled.
+func TestInspectGitDisablesConfiguredSignaturePrograms(t *testing.T) {
+	requireInspectGit(t)
+	for _, tc := range []struct {
+		name  string
+		key   string
+		begin string
+		end   string
+	}{
+		{name: "ssh", key: "gpg.ssh.program", begin: "SSH SIGNATURE", end: "SSH SIGNATURE"},
+		{name: "x509", key: "gpg.x509.program", begin: "SIGNED MESSAGE", end: "SIGNED MESSAGE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			runInspectGit(t, dir, []string{"git", "init", "-q", "."})
+			runInspectGit(t, dir, []string{"git", "config", "user.email", "a@b"})
+			runInspectGit(t, dir, []string{"git", "config", "user.name", "a"})
+			marker := filepath.Join(dir, "signature-hits")
+			script := writeMarkerScript(t, dir, "fakegpg.sh", marker)
+			runInspectGit(t, dir, []string{"git", "config", tc.key, script})
+			if tc.name == "ssh" {
+				allowed := filepath.Join(dir, "allowed_signers")
+				if err := os.WriteFile(allowed, []byte("a@b ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZha2U=\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				runInspectGit(t, dir, []string{"git", "config", "gpg.ssh.allowedSignersFile", allowed})
+			}
+			runInspectGit(t, dir, []string{"git", "config", "format.pretty", "%H %G?"})
+			if err := os.WriteFile(filepath.Join(dir, "f"), []byte("one\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runInspectGit(t, dir, []string{"git", "add", "f"})
+			runInspectGit(t, dir, []string{"git", "commit", "-qm", "base"})
+			tree := runInspectGitOutput(t, dir, []string{"git", "write-tree"})
+			spec := "tree " + tree + "\n" +
+				"author A <a@b> 1234567890 +0000\n" +
+				"committer A <a@b> 1234567890 +0000\n" +
+				"gpgsig -----BEGIN " + tc.begin + "-----\n fake\n -----END " + tc.end + "-----\n\nsigned commit\n"
+			commit := runInspectGitInput(t, dir, []string{"git", "hash-object", "-t", "commit", "-w", "--stdin"}, spec)
+			runInspectGit(t, dir, []string{"git", "update-ref", "refs/heads/master", commit})
+
+			argv := []string{"git", "log", "-1"}
+			if err := readOnly(argv); err != nil {
+				t.Fatalf("readOnly rejected %v: %v", argv, err)
+			}
+			if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			runInspectGit(t, dir, argv)
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatalf("setup: %v did not run %s: %v", argv, tc.key, err)
+			}
+			if err := os.Remove(marker); err != nil {
+				t.Fatal(err)
+			}
+			runInspectGit(t, dir, hardenGitArgs(argv))
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Errorf("hardened inspect %v ran %s: %v", argv, tc.key, err)
+			}
+		})
+	}
 }
