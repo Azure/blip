@@ -113,8 +113,9 @@ spec:
 # Pod-bound producers may only author turns for their own project. The
 # controller maintains thread.<name>: <owner> in blip-vm-owners; the caller's
 # pod entry must carry the same owner. blipchat and unrestricted VMs are not
-# bound. A missing table skips this policy (and already denies new blips and
-# states), so it cannot be used to widen a VM's reach.
+# bound. A missing table denies turn creation, like blip-vm-owner-create:
+# skipping the policy would leave a pod-bound producer free to write any
+# thread, so the table must be present before turns can be produced.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -209,4 +210,4 @@ spec:
   validationActions: [Deny]
   paramRef:
     name: blip-vm-owners
-    parameterNotFoundAction: Allow
+    parameterNotFoundAction: Deny

@@ -226,7 +226,7 @@ func loadTurnPolicy(t *testing.T) (validating.Validator, validating.Validator) {
 	}
 	if ref := byPolicy["blip-turn-owner"].Spec.ParamRef; ref == nil ||
 		ref.Name != VMOwnersConfigMap || ref.ParameterNotFoundAction == nil ||
-		*ref.ParameterNotFoundAction != admissionv1.AllowAction {
+		*ref.ParameterNotFoundAction != admissionv1.DenyAction {
 		t.Fatalf("turn owner binding params = %v", byPolicy["blip-turn-owner"].Spec.ParamRef)
 	}
 	return compilePolicy(t, author, false), compilePolicy(t, owner, true)
@@ -779,6 +779,21 @@ func TestTurnOwnerPolicy(t *testing.T) {
 				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
 			}
 		})
+	}
+}
+
+// A CREATE must fail closed when the owner table is absent. The binding uses
+// parameterNotFoundAction Deny (checked in loadTurnPolicy); even a validator
+// run with no params must not treat the caller as unbound.
+func TestTurnOwnerPolicyMissingTableDenies(t *testing.T) {
+	_, v := loadTurnPolicy(t)
+	self := "system:serviceaccount:" + ns + ":vm"
+	req := policyRequest{
+		user: vmUser("vm", "vm-pod"), op: admission.Create, resource: "blipturns",
+		name: "turn", object: turnFor("proj", "ServiceAccount", self),
+	}
+	if allow, msg := req.evaluate(t, v, nil); allow {
+		t.Fatalf("turn create allowed without the owner table: %s", msg)
 	}
 }
 
