@@ -2,6 +2,7 @@ package guest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	sessionclient "github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/wire"
 )
 
@@ -202,6 +204,82 @@ func TestServeDeliversSignalAfterFullInputQueue(t *testing.T) {
 	case <-waited:
 	case <-time.After(5 * time.Second):
 		t.Fatal("process did not receive the signal")
+	}
+}
+
+// TestClientSignalWhileStdinWriteIsBlocked exercises the client's real write
+// path: Session.Write holds the wire write serialization while stdin is
+// backpressured, and Session.Signal must still reach the guest. This is the
+// ordering that made a forwarded SIGTERM hang behind a full stdin queue.
+func TestClientSignalWhileStdinWriteIsBlocked(t *testing.T) {
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rd.Close()
+	defer wr.Close()
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+
+	old := inputStallTimeout
+	inputStallTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { inputStallTimeout = old })
+
+	g, _ := lifecycleGuest(t)
+	s := newSession(g, "exec-signal", nil, false)
+	s.proc = &proc{pid: cmd.Process.Pid, stdin: wr}
+	go s.pumpInput()
+	defer s.closeInput()
+	g.mu.Lock()
+	g.sessions[s.id] = s
+	g.mu.Unlock()
+
+	c := &sessionclient.Client{Connect: lifecycleConnector(t, g)}
+	sess, err := c.Open(context.Background(), "ns", "pod", wire.Open{Mode: wire.OpenAttach, Session: s.id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	// Drain output/notices so the guest is never blocked writing to a client
+	// that is not reading while the test backpressures stdin.
+	go func() {
+		for {
+			if _, err := sess.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		chunk := make([]byte, 32<<10)
+		for sent := 0; sent < maxQueuedInput+(1<<20); sent += len(chunk) {
+			if _, err := sess.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	// Let the writer fill the queue and block inside the wire write.
+	time.Sleep(200 * time.Millisecond)
+
+	signaled := make(chan error, 1)
+	go func() { signaled <- sess.Signal("TERM") }()
+	select {
+	case err := <-signaled:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Signal stayed blocked behind a backpressured stdin write")
+	}
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("process did not receive the forwarded signal")
 	}
 }
 
