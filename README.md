@@ -267,6 +267,12 @@ report their last report.
 ## Local development
 
 `hack/kind-up.sh` builds and installs a local kind cluster and prints connection
-examples. `hack/e2e.sh` exercises durable workspace reuse, concurrent forks,
-gathering, deadlines, and command exit codes against that cluster. Tear it down with `hack/kind-down.sh`
+examples. `hack/e2e.sh` runs the end-to-end scenarios in `hack/e2e/` against that
+cluster. They cover the CLI lifecycle, durable workspaces, mounts, concurrent
+forks, workload reports, the endpoint proxy, in-guest Kubernetes access,
+network policy, state serialization and finalizers, cluster scheduling, and the
+blipchat coordinator with a fake LLM. The slow drain and node-restart scenarios
+run only with `BLIP_E2E_RESILIENCE=1` (nightly in CI). Set `BLIP_E2E_SCENARIOS`
+to a space-separated list of scenario number prefixes (for example `20 40`) to
+run a subset while developing. Tear the cluster down with `hack/kind-down.sh`
 (`--purge` also discards local storage).

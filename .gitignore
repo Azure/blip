@@ -3,3 +3,5 @@
 /blip
 /blip-*
 *.test
+__pycache__/
+*.pyc
