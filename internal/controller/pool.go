@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,6 +32,14 @@ import (
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/podapi"
 )
+
+// recordWarning publishes a pool problem as a Warning Event when a recorder
+// is configured.
+func (r *PoolReconciler) recordWarning(obj client.Object, reason string, err error) {
+	if r.Recorder != nil {
+		r.Recorder.Event(obj, corev1.EventTypeWarning, reason, err.Error())
+	}
+}
 
 // expectTimeout bounds how long a created or deleted pod that the cache does
 // not reflect yet is accounted for.
@@ -81,6 +90,10 @@ var (
 type PoolReconciler struct {
 	client.Client
 	Config
+	// Recorder publishes validation failures as Kubernetes Events.
+	// SetupWithManager sets it; callers that reconcile directly may leave it
+	// nil.
+	Recorder record.EventRecorder
 
 	// APIAudiences are the cluster's accepted service-account audiences, as
 	// discovered at startup. validateEndpoints rejects an endpoint token
@@ -105,6 +118,7 @@ type expectation struct {
 }
 
 func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.Recorder = mgr.GetEventRecorderFor("blippool")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1.BlipPool{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
@@ -185,10 +199,19 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		return reconcile.Result{}, nil
 	}
 	// Refuse to create pods whose api-proxy sidecar would exit at startup.
-	// The error is visible on the controller and in events; the alternative
-	// is a Blip that waits for a VM that can never become ready.
+	// The failure is recorded as an Event on the pool, so an operator can see
+	// why no VM becomes ready instead of only finding it in the controller log.
 	if err := validateEndpoints(pool, r.APIAudiences...); err != nil {
-		return reconcile.Result{}, fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
+		err = fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
+		r.recordWarning(pool, "InvalidEndpoints", err)
+		return reconcile.Result{}, err
+	}
+	// The API checks the ConfigMap reference's shape; its contents must also
+	// be a usable CA bundle or the sidecar crash-loops before the pod is ready.
+	if err := validateEndpointCAs(ctx, r.Client, pool); err != nil {
+		err = fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
+		r.recordWarning(pool, "InvalidEndpointCA", err)
+		return reconcile.Result{}, err
 	}
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels{v1.LabelPool: pool.Name}); err != nil {

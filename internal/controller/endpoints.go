@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -9,7 +11,10 @@ import (
 	"strconv"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -66,6 +71,29 @@ func validateEndpoint(pool *v1.BlipPool, e *v1.PoolEndpoint, clusterAudiences []
 	if e.CAConfigMap != "" {
 		if errs := validation.IsDNS1123Subdomain(e.CAConfigMap); len(errs) > 0 {
 			return fmt.Errorf("caConfigMap %q must be a DNS subdomain", e.CAConfigMap)
+		}
+	}
+	return nil
+}
+
+// validateEndpointCAs checks that each referenced CA ConfigMap exists in the
+// pool's namespace and contains a parseable ca.crt. validateEndpoints can only
+// check the reference's shape; without this check an unparseable bundle makes
+// the sidecar exit and the pool silently never becomes ready.
+func validateEndpointCAs(ctx context.Context, c client.Client, pool *v1.BlipPool) error {
+	seen := map[string]bool{}
+	for i := range pool.Spec.Endpoints {
+		e := &pool.Spec.Endpoints[i]
+		if e.CAConfigMap == "" || seen[e.CAConfigMap] {
+			continue
+		}
+		seen[e.CAConfigMap] = true
+		var cm corev1.ConfigMap
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: e.CAConfigMap}, &cm); err != nil {
+			return fmt.Errorf("endpoints[%d] %q: caConfigMap %q: %w", i, e.Name, e.CAConfigMap, err)
+		}
+		if !x509.NewCertPool().AppendCertsFromPEM([]byte(cm.Data["ca.crt"])) {
+			return fmt.Errorf("endpoints[%d] %q: caConfigMap %q has no parseable ca.crt", i, e.Name, e.CAConfigMap)
 		}
 	}
 	return nil
