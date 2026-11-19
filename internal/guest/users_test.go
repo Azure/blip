@@ -64,3 +64,46 @@ func TestLookPathMatchesExecvp(t *testing.T) {
 		t.Fatalf("missing command: %v, code %d; want 127 command not found", err, startExitCode(err))
 	}
 }
+
+// A numeric user is matched by value, not by its spelling: 01000 is uid 1000
+// and must get the same name, gid, groups and home as 1000. Out-of-range IDs
+// are rejected before they reach the kernel.
+func TestLookupAccountNumericNormalization(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/passwd"),
+		[]byte("root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/zsh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/group"),
+		[]byte("root:x:0:\nalice:x:1000:\nwheel:x:10:alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := lookupAccount(root, "1000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range []string{"01000", "0001000"} {
+		got, err := lookupAccount(root, spec)
+		if err != nil {
+			t.Fatalf("%s: %v", spec, err)
+		}
+		if got.name != want.name || got.uid != want.uid || got.gid != want.gid ||
+			got.home != want.home || len(got.groups) != len(want.groups) {
+			t.Fatalf("%s: %+v, want %+v", spec, got, want)
+		}
+	}
+	got, err := lookupAccount(root, "01000:01000")
+	if err != nil || got.gid != 1000 || got.uid != 1000 {
+		t.Fatalf("01000:01000 = %+v, %v", got, err)
+	}
+
+	for _, spec := range []string{"4294967295", "99999999999", "1000:4294967295", "1000:99999999999"} {
+		if _, err := lookupAccount(root, spec); err == nil || !strings.Contains(err.Error(), "out of range") {
+			t.Fatalf("%s: error = %v, want out of range", spec, err)
+		}
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,10 +35,17 @@ func lookupAccount(root, spec string) (*account, error) {
 
 	a := &account{home: "/", shell: "/bin/sh"}
 	var entry []string
-	if uid, err := strconv.ParseUint(userPart, 10, 32); err == nil {
-		a.uid = uint32(uid)
+	if uid, numeric, err := parseID(userPart); err != nil {
+		return nil, err
+	} else if numeric {
+		a.uid = uid
+		// Compare by value, not text: "01000" is uid 1000 and must find the
+		// same passwd entry (and therefore gid, name and home) as "1000".
 		for _, f := range passwd {
-			if len(f) >= 7 && f[2] == userPart {
+			if len(f) < 7 {
+				continue
+			}
+			if fid, err := strconv.ParseUint(f[2], 10, 32); err == nil && uint32(fid) == uid {
 				entry = f
 				break
 			}
@@ -74,8 +82,10 @@ func lookupAccount(root, spec string) (*account, error) {
 		}
 	}
 	if hasGroup {
-		if gid, err := strconv.ParseUint(groupPart, 10, 32); err == nil {
-			a.gid = uint32(gid)
+		if gid, numeric, err := parseID(groupPart); err != nil {
+			return nil, err
+		} else if numeric {
+			a.gid = gid
 		} else {
 			found := false
 			for _, f := range groups {
@@ -108,6 +118,26 @@ func lookupAccount(root, spec string) (*account, error) {
 		}
 	}
 	return a, nil
+}
+
+// parseID parses a decimal user or group ID. numeric is false for a name.
+// Leading zeros are accepted (01000 is 1000). Values the kernel cannot hold,
+// including (uid_t)-1 = 4294967295, are rejected instead of failing later with
+// "invalid argument" from exec.
+func parseID(s string) (id uint32, numeric bool, err error) {
+	if s == "" {
+		return 0, false, nil
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false, nil
+		}
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil || v >= math.MaxUint32 {
+		return 0, true, fmt.Errorf("id %q is out of range", s)
+	}
+	return uint32(v), true, nil
 }
 
 func readColonFile(path string) [][]string {
