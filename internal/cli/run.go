@@ -227,6 +227,12 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	if len(command) == 0 {
 		return errors.New("a command is required: blip run -- CMD [ARG...]")
 	}
+	// An unset shell variable expands to an empty argument, which the guest
+	// reports as exit 127 only after the blip and its fork state exist. Reject
+	// it before anything is created, like an explicitly empty --from/--state.
+	if strings.TrimSpace(command[0]) == "" {
+		return errors.New("command name must not be empty: blip run -- CMD [ARG...]")
+	}
 	if err := wholeSeconds("--timeout", f.timeout, maxTimeoutSeconds); err != nil {
 		return err
 	}

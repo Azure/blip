@@ -24,6 +24,12 @@ func isBlipGone(t *testing.T, h *harness, name string) bool {
 	return apierrors.IsNotFound(err)
 }
 
+func isStateGone(t *testing.T, h *harness, name string) bool {
+	t.Helper()
+	err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &v1alpha1.BlipState{})
+	return apierrors.IsNotFound(err)
+}
+
 func TestRunCreatesBlipAndReturnsName(t *testing.T) {
 	h := newHarness(t, readyState("workspace"))
 	code, out, errOut := h.run("", "run", "--name", "worker-1", "--state", "workspace",
@@ -54,6 +60,41 @@ func TestRunRequiresCommand(t *testing.T) {
 	code, _, errOut := h.run("", "run")
 	if code != 1 || !strings.Contains(errOut, "requires at least 1 arg") {
 		t.Fatalf("code %d err %q", code, errOut)
+	}
+}
+
+// An explicit empty or whitespace-only argv[0] is the `run -- "$CMD"`
+// footgun: the guest would fail with exit 127 only after the blip and its
+// fork state were created. It must be rejected before anything exists.
+func TestRunRejectsEmptyCommandName(t *testing.T) {
+	for _, command := range []string{"", " ", "\t\n"} {
+		h := newHarness(t, readyState("base"))
+		code, out, errOut := h.run("", "run", "--name", "empty", "--from", "base", "--", command)
+		if code != 1 || !strings.Contains(errOut, "command name must not be empty") {
+			t.Fatalf("command %q: code %d out %q stderr %q", command, code, out, errOut)
+		}
+		if out != "" {
+			t.Fatalf("command %q: output %q", command, out)
+		}
+		if !isBlipGone(t, h, "empty") {
+			t.Fatalf("command %q: run created a blip", command)
+		}
+		if !isStateGone(t, h, "empty") {
+			t.Fatalf("command %q: run created a state", command)
+		}
+	}
+}
+
+// The empty-name check must not reject real commands or turn flags after --
+// back into blip flags.
+func TestRunAllowsCommandAfterEmptyNameCheck(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	code, out, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--", "echo", "-n", "hi")
+	if code != 0 || strings.TrimSpace(out) != "worker" {
+		t.Fatalf("code %d out %q stderr %q", code, out, errOut)
+	}
+	if got := strings.Join(h.blip("worker").Spec.Command, "|"); got != "echo|-n|hi" {
+		t.Fatalf("command = %q", got)
 	}
 }
 
