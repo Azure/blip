@@ -138,9 +138,17 @@ func mountPathConflict(root string, mounts []v1alpha1.Mount, state, mountPath st
 
 // validateMountPlan validates the complete mount set the CLI is about to write,
 // including earlier requests from the same invocation, before any state is
-// created or the root is edited.
-func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error {
-	mounts := append([]v1alpha1.Mount(nil), root.Spec.Mounts...)
+// created or the root is edited. removed holds the states this invocation will
+// unmount before the adds, so their current entries do not participate in the
+// final topology. allowMove permits an add for a state that is already mounted
+// at another path to replace that path in the same command.
+func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest, removed map[string]bool, allowMove bool) error {
+	mounts := make([]v1alpha1.Mount, 0, len(root.Spec.Mounts))
+	for _, m := range root.Spec.Mounts {
+		if !removed[m.State] {
+			mounts = append(mounts, m)
+		}
+	}
 	for _, req := range requests {
 		if err := mountpath.Validate(req.path); err != nil {
 			return err
@@ -150,7 +158,22 @@ func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error 
 		}
 		if m := findSpecMount(mounts, req.state); m != nil {
 			if m.Path != req.path {
-				return fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", req.state, root.Name, m.Path)
+				if !allowMove {
+					return fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", req.state, root.Name, m.Path)
+				}
+				// The new path must be free before the old entry is
+				// replaced, so check the remaining topology without it.
+				for i := range mounts {
+					if mounts[i].State == req.state {
+						mounts = append(mounts[:i], mounts[i+1:]...)
+						break
+					}
+				}
+				if err := mountPathConflict(root.Name, mounts, req.state, req.path); err != nil {
+					return err
+				}
+				mounts = append(mounts, v1alpha1.Mount{State: req.state, Path: req.path, Writable: req.writable})
+				continue
 			}
 			m.Writable = req.writable
 			continue
@@ -164,6 +187,13 @@ func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error 
 }
 
 func (a *app) mountState(ctx context.Context, state, root, mountPath string, target *bool) error {
+	return a.mountStatePlanned(ctx, state, root, mountPath, target, false)
+}
+
+// mountStatePlanned mounts state, optionally moving an existing mount to a new
+// path when the same invocation also removes mounts. The move is validated
+// against the final topology by validateMountPlan before this edit.
+func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath string, target *bool, move bool) error {
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return fmt.Errorf("invalid path %q: must be a clean absolute path other than /", mountPath)
 	}
@@ -191,7 +221,16 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 		m := findSpecMount(s.Spec.Mounts, state)
 		if m != nil {
 			if m.Path != mountPath {
-				return "", fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", state, root, m.Path)
+				if !move {
+					return "", fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", state, root, m.Path)
+				}
+				// Replace the path in place. The controller unmounts the
+				// old attachment and mounts the new path; waitMount below
+				// waits for the status entry to move too.
+				if err := mountPathConflict(root, s.Spec.Mounts, state, mountPath); err != nil {
+					return "", err
+				}
+				m.Path = mountPath
 			}
 			want = m.Writable
 			// Adoption of a collect mount must finish its pending reattach.
@@ -798,8 +837,26 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	if err != nil {
 		return err
 	}
-	if err := validateMountPlan(root, requests); err != nil {
+	removed := make(map[string]bool, len(f.remove))
+	for _, arg := range f.remove {
+		state, err := a.removalState(ctx, arg, root)
+		if err != nil {
+			return err
+		}
+		removed[state] = true
+	}
+	// A move is only implicit when the invocation also frees mount paths;
+	// a plain add at a second path still tells the user to unmount first.
+	move := len(removed) > 0
+	if err := validateMountPlan(root, requests, removed, move); err != nil {
 		return err
+	}
+	// Removals run first so the final topology validated above is the one
+	// the adds are applied to.
+	for _, state := range f.remove {
+		if err := a.unmountArg(ctx, state, f.root); err != nil {
+			return err
+		}
 	}
 	for _, n := range news {
 		if err := a.newMountedState(ctx, n.spec, f, replicasSet); err != nil {
@@ -807,12 +864,7 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		}
 	}
 	for _, add := range adds {
-		if err := a.mountState(ctx, add.state, f.root, add.path, add.writable); err != nil {
-			return err
-		}
-	}
-	for _, state := range f.remove {
-		if err := a.unmountArg(ctx, state, f.root); err != nil {
+		if err := a.mountStatePlanned(ctx, add.state, f.root, add.path, add.writable, move); err != nil {
 			return err
 		}
 	}
@@ -908,7 +960,7 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	if err != nil {
 		return err
 	}
-	if err := validateMountPlan(root, []mountRequest{{state: name, path: mountPath, writable: writable}}); err != nil {
+	if err := validateMountPlan(root, []mountRequest{{state: name, path: mountPath, writable: writable}}, nil, false); err != nil {
 		return err
 	}
 	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace}}
@@ -1027,13 +1079,10 @@ func (a *app) listMounts(ctx context.Context, root string) error {
 	return nil
 }
 
-// unmountArg removes a mount, accepting an owner-local name or the qualified
-// name that is actually in the root's spec.
-func (a *app) unmountArg(ctx context.Context, arg, root string) error {
-	s, err := a.getState(ctx, root)
-	if err != nil {
-		return err
-	}
+// removalState resolves a --rm argument to the state name used by the root's
+// spec, accepting an owner-local name or the qualified name that is actually
+// in it.
+func (a *app) removalState(ctx context.Context, arg string, s *v1alpha1.BlipState) (string, error) {
 	state := a.full(arg)
 	if state != arg && findSpecMount(s.Spec.Mounts, state) == nil {
 		if findSpecMount(s.Spec.Mounts, arg) != nil {
@@ -1041,12 +1090,26 @@ func (a *app) unmountArg(ctx context.Context, arg, root string) error {
 		} else {
 			b, err := a.rootWriter(ctx, s)
 			if err != nil {
-				return err
+				return "", err
 			}
 			if b != nil && findMount(b.Status.Mounts, state) == nil && findMount(b.Status.Mounts, arg) != nil {
 				state = arg
 			}
 		}
+	}
+	return state, nil
+}
+
+// unmountArg removes a mount, accepting an owner-local name or the qualified
+// name that is actually in the root's spec.
+func (a *app) unmountArg(ctx context.Context, arg, root string) error {
+	s, err := a.getState(ctx, root)
+	if err != nil {
+		return err
+	}
+	state, err := a.removalState(ctx, arg, s)
+	if err != nil {
+		return err
 	}
 	return a.unmountState(ctx, state, root)
 }

@@ -985,6 +985,48 @@ func TestMountNewReadOnly(t *testing.T) {
 	}
 }
 
+// TestMountRemoveFreesPathInSameCommand reproduces a combined move or
+// replacement that is legal after the requested removals: mounting a state
+// at the path freed by --rm must validate against the final topology instead
+// of rejecting the path that this same invocation is about to free.
+func TestMountRemoveFreesPathInSameCommand(t *testing.T) {
+	t.Run("move existing mount", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{
+			{State: "a", Path: "/a"},
+			{State: "b", Path: "/b"},
+		}
+		h := newHarness(t, root, readyState("a"), readyState("b"))
+		code, out, errOut := h.run("", "mount", "a:/b", "--rm", "b", "--root", "home")
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		mustContain(t, out, "state a mounted on root state home at /b")
+		mounts := h.state("home").Spec.Mounts
+		if len(mounts) != 1 || mounts[0].State != "a" || mounts[0].Path != "/b" {
+			t.Fatalf("final mounts %+v, want only a at /b", mounts)
+		}
+	})
+
+	t.Run("replace with new state", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "b", Path: "/b"}}
+		h := newHarness(t, root, readyState("a"), readyState("b"))
+		code, out, errOut := h.run("", "mount", "--new", "d:/b", "--rm", "b", "--root", "home")
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		mustContain(t, out, "state d mounted on root state home at /b")
+		mounts := h.state("home").Spec.Mounts
+		if len(mounts) != 1 || mounts[0].State != "d" || mounts[0].Path != "/b" {
+			t.Fatalf("final mounts %+v, want only d at /b", mounts)
+		}
+		if s := h.state("d"); s.Status.Committed == nil {
+			t.Fatal("new state has no commit")
+		}
+	})
+}
+
 func TestMountRejectsDuplicateMounts(t *testing.T) {
 	t.Run("duplicate state", func(t *testing.T) {
 		h := newHarness(t, readyState("home"), readyState("data"))
