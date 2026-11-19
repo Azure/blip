@@ -232,8 +232,9 @@ func TestAuthRejectionIsTerminal(t *testing.T) {
 	}
 }
 
-// TestAuthRejectionClassification pins the classification itself, including
-// that a 401 without supplied credentials is left to the existing retry path.
+// TestAuthRejectionClassification pins the classification itself: a 401/403 is
+// terminal whether the state supplied credentials or pulled anonymously,
+// because the reference and secrets are immutable. Transient errors retry.
 func TestAuthRejectionClassification(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -246,11 +247,12 @@ func TestAuthRejectionClassification(t *testing.T) {
 			Errors: []transport.Diagnostic{{Code: transport.UnauthorizedErrorCode, Message: "incorrect username or password"}}}, true},
 		{"500", &transport.Error{StatusCode: http.StatusInternalServerError}, false},
 		{"503", &transport.Error{StatusCode: http.StatusServiceUnavailable}, false},
+		{"429", &transport.Error{StatusCode: http.StatusTooManyRequests}, false},
 		{"timeout", &transport.Error{StatusCode: http.StatusGatewayTimeout}, false},
 		{"network", errors.New("connection reset"), false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			wrapped := classifyAuthRejection(tt.err, "reg/img:latest", []corev1.LocalObjectReference{{Name: "creds"}})
+			wrapped := classifyAuthRejection(tt.err, "reg/img:latest")
 			if got := terminalImageError(wrapped); got != tt.want {
 				t.Fatalf("terminalImageError(%v) = %v, want %v", wrapped, got, tt.want)
 			}
@@ -260,7 +262,7 @@ func TestAuthRejectionClassification(t *testing.T) {
 		})
 	}
 	if got := terminalImageError(classifyAuthRejection(
-		&transport.Error{StatusCode: http.StatusUnauthorized}, "reg/img:latest", nil)); got {
-		t.Fatal("anonymous 401 classified as terminal without supplied credentials")
+		&transport.Error{StatusCode: http.StatusUnauthorized}, "reg/img:latest")); !got {
+		t.Fatal("anonymous 401 not classified as terminal without supplied credentials")
 	}
 }

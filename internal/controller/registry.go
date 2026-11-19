@@ -33,11 +33,11 @@ var ErrInvalidImage = errors.New("invalid image reference")
 // retrying the same reference can never succeed.
 var ErrUnsupportedImage = errors.New("image has no manifest for this platform")
 
-// ErrAuthRejected means the registry rejected the image pull credentials the
-// state supplied. The imagePullSecrets reference is immutable, so the same
-// credentials are retried forever on every reconcile while `blip pull` waits
-// on Pending. Mark it terminal so the user sees the auth error and can fix the
-// Secret.
+// ErrAuthRejected means the registry rejected the credentials used for the
+// pull, including anonymous access when the state supplied no secrets. The
+// image reference and imagePullSecrets are immutable, so the same credentials
+// are retried forever on every reconcile while `blip pull` waits on Pending.
+// Mark it terminal so the user sees the auth error and can fix the Secret.
 var ErrAuthRejected = errors.New("registry rejected image pull credentials")
 
 // terminalImageError reports whether an image resolution error is permanent.
@@ -54,12 +54,14 @@ func terminalImageError(err error) bool {
 		platformMismatch(err)
 }
 
-// classifyAuthRejection marks a 401/403 from the registry as terminal when the
-// state supplied image pull secrets: retrying the same rejected credentials
-// cannot succeed. Without supplied secrets the existing retry path is kept,
-// and transient network/5xx errors are never reclassified.
-func classifyAuthRejection(err error, ref string, secrets []corev1.LocalObjectReference) error {
-	if err == nil || len(secrets) == 0 {
+// classifyAuthRejection marks a 401/403 from the registry as terminal. The
+// image reference and imagePullSecrets are immutable, so retrying the same
+// reference with the same (possibly anonymous) credentials cannot succeed;
+// this includes a private or nonexistent Docker Hub repository, which returns
+// 401 to anonymous pulls. Transient network/5xx/429 errors are never
+// reclassified.
+func classifyAuthRejection(err error, ref string) error {
+	if err == nil {
 		return err
 	}
 	var terr *transport.Error
@@ -156,7 +158,7 @@ func (r RemoteRegistry) Digest(ctx context.Context, ref, namespace string, secre
 	}
 	pinned, err := r.digest(ctx, ref, kc)
 	if err != nil {
-		return "", classifyAuthRejection(err, ref, secrets)
+		return "", classifyAuthRejection(err, ref)
 	}
 	return pinned, nil
 }
@@ -188,7 +190,7 @@ func (r RemoteRegistry) ImageConfig(ctx context.Context, ref, namespace string, 
 	}
 	cfg, err := r.imageConfig(ctx, ref, kc)
 	if err != nil {
-		return nil, classifyAuthRejection(err, ref, secrets)
+		return nil, classifyAuthRejection(err, ref)
 	}
 	return cfg, nil
 }

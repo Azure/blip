@@ -56,6 +56,28 @@ func TestPullFailedInitialVersionExits(t *testing.T) {
 	}
 }
 
+// A private or missing Docker Hub repository returns 401 to an anonymous pull.
+// The controller treats that as terminal, so pull must surface it and exit
+// instead of waiting for a retry that cannot succeed.
+func TestPullAnonymousUnauthorizedExits(t *testing.T) {
+	h := newHarness(t)
+	h.ctrl.set(func(c *fakeController) {
+		c.stateFail = "registry rejected image pull credentials for image docker.io/azure/private:latest: UNAUTHORIZED: authentication required"
+	})
+	start := time.Now()
+	code, _, errOut := h.run("", "pull", "private", "docker.io/azure/private:latest", "--size", "8Mi")
+	if code != 1 || !strings.Contains(errOut, "registry rejected image pull credentials") ||
+		!strings.Contains(errOut, "authentication required") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("pull waited %v for an anonymous auth failure", elapsed)
+	}
+	if st := h.state("private"); st.Status.Phase != v1alpha1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("test did not leave a terminal auth failure: %+v", st.Status)
+	}
+}
+
 // An image-too-large build error is immutable, so the controller clears
 // pending and fails the state. Pull must surface the node error instead of
 // waiting for a retry that can never happen.
