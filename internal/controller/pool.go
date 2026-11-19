@@ -322,6 +322,17 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	schedulable := func(node string) bool {
 		return node == "" || cl.schedulable(node, poolSelector(pool), pool.Spec.Tolerations)
 	}
+	// anotherSchedulable reports whether a node other than name can host a VM
+	// of this pool. Excluding the only eligible node makes a generic
+	// replacement impossible to schedule, so the pool retries it instead.
+	anotherSchedulable := func(name string) bool {
+		for _, n := range cl.names {
+			if n != name && schedulable(n) {
+				return true
+			}
+		}
+		return false
+	}
 	// avoid holds every enrolled node a new VM must not use. A generic
 	// replacement is otherwise free to land on the dead node it replaces.
 	avoid := cl.avoidNodes()
@@ -541,7 +552,12 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			// node instead of repeating the same failed placement.
 			if pinnedNode := p.Annotations[v1.AnnotationPinnedNode]; pinnedNode != "" {
 				blocked[pinnedNode] = true
-				avoid[pinnedNode] = true
+				// A replacement must still have somewhere to go. When the
+				// failed node is the only eligible one, do not exclude it:
+				// the next pod would be unschedulable by construction.
+				if anotherSchedulable(pinnedNode) {
+					avoid[pinnedNode] = true
+				}
 				r.blockNode(rq.NamespacedName, pinnedNode, r.now().Add(warmTimeout))
 			}
 			gone, err := del(p)
