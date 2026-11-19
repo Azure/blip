@@ -75,7 +75,11 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	st := &chatStep{s: c.Server, thread: thread, user: user}
 	reply, err := st.run(ctx, req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		// Details can include the internal LLM URL, resolver output, and
+		// upstream response bodies. Keep them in the server log only.
+		c.Server.logError(err, "chat request failed",
+			"thread", thread.Namespace+"/"+thread.Name, "user", user)
+		http.Error(w, "chat backend unavailable", http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

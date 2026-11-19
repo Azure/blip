@@ -27,6 +27,15 @@ const (
 
 var timeNow = time.Now
 
+// logError logs when a logger was configured. Tests construct Server values
+// without one, and a zero logr.Logger panics on use.
+func (s *Server) logError(err error, msg string, kv ...any) {
+	if s.Log.GetSink() == nil {
+		return
+	}
+	s.Log.Error(err, msg, kv...)
+}
+
 func nowTime() *metav1.Time {
 	t := metav1.NewTime(timeNow())
 	return &t
