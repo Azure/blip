@@ -31,7 +31,7 @@ var reportInterval = 10 * time.Second
 type reporter struct {
 	mu         sync.Mutex
 	seq        uint64
-	last       time.Time
+	last       time.Time // pacing anchor with monotonic reading; never wall-only
 	waiting    bool
 	lastReport *wire.Report
 }
@@ -126,9 +126,15 @@ func (g *Guest) report(r *http.Request, text string) (uint64, error) {
 	rep.mu.Lock()
 	rep.seq++
 	seq := rep.seq
-	report := &wire.Report{Seq: seq, Text: text, Time: time.Now().UTC()}
+	// Keep the pacing anchor with its monotonic reading: the guest wall clock
+	// can be stepped by the workload (clock_settime), and time.Since must
+	// measure real elapsed time, not wall time, so accepted reports stay at
+	// least reportInterval apart and every sequence is observable. Only the
+	// wire copy is converted to UTC.
+	now := time.Now()
+	report := &wire.Report{Seq: seq, Text: text, Time: now.UTC()}
 	rep.lastReport = report
-	rep.last = report.Time
+	rep.last = now
 	rep.waiting = false
 	rep.mu.Unlock()
 

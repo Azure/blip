@@ -73,6 +73,31 @@ func TestReportPacing(t *testing.T) {
 	}
 }
 
+// Pacing must be measured with the monotonic clock. An anchor stored as
+// time.Now().UTC() loses its monotonic reading, so a guest wall-clock step
+// (for example clock_settime from a root workload) changes the delay, accepts
+// reports back-to-back, and their sequence numbers are overwritten before the
+// observation write can see them.
+func TestReportPacingAnchorUsesMonotonicClock(t *testing.T) {
+	g := reportGuest(t)
+	reportInterval = 10 * time.Second
+	postReport(g, "one")
+
+	g.reporter.mu.Lock()
+	last := g.reporter.last
+	report := g.reporter.lastReport
+	g.reporter.mu.Unlock()
+	if last.IsZero() {
+		t.Fatal("pacing anchor was not recorded")
+	}
+	if last.Round(0) == last {
+		t.Fatalf("pacing anchor %v carries no monotonic reading; a wall-clock step would bypass pacing", last)
+	}
+	if report == nil || !report.Time.Equal(last) {
+		t.Fatalf("wire report time %v does not match pacing anchor %v", report, last)
+	}
+}
+
 // The report endpoint binds its configured address; tests use port 0 and
 // connect to whatever the listener reports.
 func TestReportEndpointServes(t *testing.T) {
