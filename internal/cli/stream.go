@@ -2,9 +2,7 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -91,7 +89,10 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 				}
 			}
 			if err != nil {
-				if opts.sendEOF && errors.Is(err, io.EOF) {
+				// No more input can arrive, whatever ended the read (EOF,
+				// EBADF, EIO). Leaving stdin open would let a command that
+				// waits for input hang forever.
+				if opts.sendEOF {
 					s.CloseStdin()
 				}
 				return
