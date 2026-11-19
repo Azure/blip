@@ -67,8 +67,11 @@ func CollectTerminatedBlips(ctx context.Context, c client.Client, threshold int)
 		})
 		for i := 0; i < len(finished)-threshold; i++ {
 			b := &finished[i]
-			if err := c.Delete(ctx, b); err != nil {
-				if apierrors.IsNotFound(err) {
+			// Delete only the incarnation this pass observed, so a same-name
+			// Blip created since the List survives. NotFound and Conflict
+			// mean the observed Blip is already gone and nothing was deleted.
+			if err := c.Delete(ctx, b, client.Preconditions{UID: &b.UID}); err != nil {
+				if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 					continue
 				}
 				errs = append(errs, fmt.Errorf("delete blip %s/%s: %w", namespace, b.Name, err))

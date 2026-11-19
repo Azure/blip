@@ -223,7 +223,10 @@ func (r *BlipReconciler) finished(ctx context.Context, b *v1.Blip) (reconcile.Re
 	if left := deadline.Sub(r.now()); left > 0 {
 		return reconcile.Result{RequeueAfter: left}, nil
 	}
-	if err := r.Delete(ctx, b); err != nil && !apierrors.IsNotFound(err) {
+	// Delete only the incarnation this reconcile observed. A same-name Blip
+	// created after the observed one was deleted must survive; the API server
+	// reports that as a conflict.
+	if err := r.Delete(ctx, b, client.Preconditions{UID: &b.UID}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil

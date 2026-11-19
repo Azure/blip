@@ -123,6 +123,56 @@ func TestFinishedTTLDeletesBlip(t *testing.T) {
 	}
 }
 
+// TestFinishedTTLDeleteKeepsReplacement covers a stale cached Get: the
+// finished Blip is gone by the time the TTL delete reaches the API server and a
+// different Blip now owns the name. The delete must be pinned to the observed
+// UID so the replacement survives.
+func TestFinishedTTLDeleteKeepsReplacement(t *testing.T) {
+	e := newEnv(t)
+	e.newBlip("job", withCommand("true"))
+	e.updateBlip("job", func(b *v1.Blip) { b.Spec.TTLSecondsAfterFinished = int32Ptr(0) })
+	e.setBlipStatus("job", func(b *v1.Blip) {
+		b.Status.Phase = v1.BlipSucceeded
+		finish := metav1.NewTime(e.now)
+		b.Status.FinishTime = &finish
+	})
+	replaced := false
+	var pinned types.UID
+	e.blip.Client = interceptor.NewClient(e.c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			b, ok := obj.(*v1.Blip)
+			if !ok || b.Name != "job" || replaced {
+				return c.Delete(ctx, obj, opts...)
+			}
+			replaced = true
+			// The observed incarnation is already gone; another Blip has
+			// since been created under the same name.
+			if err := c.Delete(ctx, &v1.Blip{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "job"}}); err != nil {
+				return err
+			}
+			if err := c.Create(ctx, &v1.Blip{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "job", UID: "uid-replacement"}}); err != nil {
+				return err
+			}
+			var do client.DeleteOptions
+			do.ApplyOptions(opts)
+			if do.Preconditions != nil && do.Preconditions.UID != nil {
+				pinned = *do.Preconditions.UID
+			}
+			return deleteLikeAPI(ctx, c, obj, "uid-replacement", opts...)
+		},
+	})
+	e.run(e.blip, ns, "job")
+	if !replaced {
+		t.Fatal("TTL did not attempt to delete the finished blip")
+	}
+	if pinned != "uid-job" {
+		t.Fatalf("TTL delete precondition UID = %q, want the observed uid-job", pinned)
+	}
+	if got := e.getBlip("job"); got.UID != "uid-replacement" {
+		t.Fatalf("TTL delete removed the replacement Blip: uid %q", got.UID)
+	}
+}
+
 func TestFinishedTTLRequeuesUntilDue(t *testing.T) {
 	e := newEnv(t)
 	e.newBlip("job", withCommand("true"))

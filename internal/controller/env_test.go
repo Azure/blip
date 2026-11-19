@@ -11,9 +11,11 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,6 +34,25 @@ const ns = "ns"
 const runtimeImage = "reg/blip-runtime:dev"
 
 func metadata(name string) metav1.ObjectMeta { return metav1.ObjectMeta{Name: name} }
+
+// deleteLikeAPI applies UID preconditions the way the API server does. The
+// fake client ignores DeleteOptions.Preconditions.UID, so a test that replaces
+// an object between observation and delete would otherwise lose the
+// replacement even when the controller pinned the delete. A delete without a
+// UID precondition stays name-addressed, as it is against a real API server.
+func deleteLikeAPI(ctx context.Context, c client.WithWatch, obj client.Object, liveUID types.UID, opts ...client.DeleteOption) error {
+	var do client.DeleteOptions
+	do.ApplyOptions(opts)
+	var pinned types.UID
+	if do.Preconditions != nil && do.Preconditions.UID != nil {
+		pinned = *do.Preconditions.UID
+	}
+	if pinned != "" && pinned != liveUID {
+		return apierrors.NewConflict(schema.GroupResource{Group: "blip.dev", Resource: "blips"}, obj.GetName(),
+			fmt.Errorf("the UID in the precondition (%q) does not match the UID in record (%q)", pinned, liveUID))
+	}
+	return c.Delete(ctx, obj, opts...)
+}
 
 type fakeRegistry struct {
 	digests map[string]string
