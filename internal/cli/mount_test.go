@@ -1242,7 +1242,7 @@ func TestMountRejectsDuplicateMounts(t *testing.T) {
 	t.Run("duplicate state", func(t *testing.T) {
 		h := newHarness(t, readyState("home"), readyState("data"))
 		code, _, errOut := h.run("", "mount", "data:/a", "data:/b", "--root", "home")
-		if code != 1 || !strings.Contains(errOut, `state "data" is already mounted on root state "home" at /a`) {
+		if code != 1 || !strings.Contains(errOut, `state "data" is specified more than once`) {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
 	})
@@ -1536,6 +1536,86 @@ func TestMountRejectsExplicitEmptySize(t *testing.T) {
 	}
 	if s := h.state("cache"); s.Spec.Size != nil {
 		t.Fatalf("unset --size set a size: %v", s.Spec.Size)
+	}
+}
+
+// TestMountRejectsRepeatedStateAcrossNewAndArgs reproduces a state named by
+// both --new and a positional mount (or twice positionally). When the same
+// command also removes a mount, validateMountPlan treats the second reference
+// as a legal move, so execution creates or mounts the state twice and reports
+// both attempts. Any repeated state must be rejected in preflight, regardless
+// of --rm, while a genuine move alongside a removal still works.
+func TestMountRejectsRepeatedStateAcrossNewAndArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		create  string
+		mounted bool
+	}{
+		{
+			name:   "new and positional",
+			args:   []string{"mount", "--new", "dup:/a", "dup:/b", "--root", "home"},
+			create: "dup",
+		},
+		{
+			name:    "new and positional with rm",
+			args:    []string{"mount", "--new", "dup:/a", "dup:/b", "--rm", "old", "--root", "home"},
+			create:  "dup",
+			mounted: true,
+		},
+		{
+			name:   "new and positional identical",
+			args:   []string{"mount", "--new", "dup:/a", "dup:/a", "--root", "home"},
+			create: "dup",
+		},
+		{
+			name: "positional duplicate with rm",
+			args: []string{"mount", "data:/a", "data:/b", "--rm", "old", "--root", "home"},
+			// old is mounted below.
+			mounted: true,
+		},
+		{
+			name: "positional identical",
+			args: []string{"mount", "data:/a", "data:/a", "--root", "home"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := readyState("home")
+			if tc.mounted {
+				root.Spec.Mounts = []v1alpha1.Mount{{State: "old", Path: "/old", Writable: true}}
+			}
+			h := newHarness(t, root, readyState("data"), readyState("old"))
+			code, _, errOut := h.run("", tc.args...)
+			if code != 1 || !strings.Contains(errOut, "is specified more than once") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if tc.create != "" && !stateNotFound(t, h, tc.create) {
+				t.Fatalf("rejected duplicate left state %q behind", tc.create)
+			}
+			mounts := h.state("home").Spec.Mounts
+			if tc.mounted {
+				if len(mounts) != 1 || mounts[0].State != "old" || mounts[0].Path != "/old" {
+					t.Fatalf("rejected duplicate mutated the root: %+v", mounts)
+				}
+			} else if len(mounts) != 0 {
+				t.Fatalf("rejected duplicate wrote desired intent: %+v", mounts)
+			}
+		})
+	}
+
+	// A removal that frees space for a single move remains legal.
+	root := readyState("home")
+	root.Spec.Mounts = []v1alpha1.Mount{
+		{State: "old", Path: "/old", Writable: true},
+		{State: "data", Path: "/data", Writable: true},
+	}
+	h := newHarness(t, root, readyState("data"), readyState("old"))
+	if code, _, errOut := h.run("", "mount", "--rm", "old", "data:/moved", "--root", "home"); code != 0 {
+		t.Fatalf("move+replace rejected: %d %s", code, errOut)
+	}
+	mounts := h.state("home").Spec.Mounts
+	if len(mounts) != 1 || mounts[0].State != "data" || mounts[0].Path != "/moved" {
+		t.Fatalf("move+replace final mounts %+v, want only data at /moved", mounts)
 	}
 }
 

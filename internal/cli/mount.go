@@ -186,6 +186,25 @@ func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest, remove
 	return nil
 }
 
+// rejectRepeatedMountRequests rejects an invocation that names the same state
+// more than once across --new and positional arguments. validateMountPlan
+// treats an identical repeat as an idempotent update and, when a removal allows
+// moves, a second path as a legal move, but execution would still create or
+// mount that state twice and report both attempts.
+func rejectRepeatedMountRequests(requests []mountRequest) error {
+	seen := make(map[string]string, len(requests))
+	for _, req := range requests {
+		if prev, ok := seen[req.state]; ok {
+			if prev == req.path {
+				return fmt.Errorf("state %q is specified more than once (at %s)", req.state, req.path)
+			}
+			return fmt.Errorf("state %q is specified more than once (at %s and %s)", req.state, prev, req.path)
+		}
+		seen[req.state] = req.path
+	}
+	return nil
+}
+
 func (a *app) mountState(ctx context.Context, state, root, mountPath string, target *bool) error {
 	return a.mountStatePlanned(ctx, state, root, mountPath, target, false)
 }
@@ -1195,6 +1214,14 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		}
 		requests = append(requests, mountRequest{state: name, path: mountPath, writable: want})
 		adds = append(adds, addition{state: name, path: mountPath, writable: writable})
+	}
+	// Reject a state named more than once across --new and positional
+	// arguments. Two entries for one state are ambiguous even when they name
+	// the same path: execution would create or mount it twice. --rm does not
+	// turn this into a move, so the check applies regardless of move
+	// allowance.
+	if err := rejectRepeatedMountRequests(requests); err != nil {
+		return err
 	}
 	// Validate the complete topology before creating states or editing the
 	// root, so a rejected command leaves neither a partial mount set nor an
