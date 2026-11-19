@@ -418,18 +418,19 @@ func TestVMOwnersThreadOwnersLongName(t *testing.T) {
 	e.create(thread)
 	e.must(syncVMOwners(e.ctx, e.c, ns))
 	owner := v1.ThreadOwner(ns, long)
-	for _, name := range []string{long, v1.ThreadLabel(long)} {
-		if got := e.owners()["thread."+name]; got != owner {
-			t.Errorf("thread owner key %q = %q, want %q", "thread."+name, got, owner)
+	keys := []string{"thread." + long, ownersThreadHashPrefix + v1.ThreadLabel(long)}
+	for _, key := range keys {
+		if got := e.owners()[key]; got != owner {
+			t.Errorf("thread owner key %q = %q, want %q", key, got, owner)
 		}
 	}
 	if err := e.c.Delete(e.ctx, thread); err != nil {
 		t.Fatal(err)
 	}
 	e.must(syncVMOwners(e.ctx, e.c, ns))
-	for _, name := range []string{long, v1.ThreadLabel(long)} {
-		if got, ok := e.owners()["thread."+name]; ok {
-			t.Errorf("deleted thread left owner key %q = %q", "thread."+name, got)
+	for _, key := range keys {
+		if got, ok := e.owners()[key]; ok {
+			t.Errorf("deleted thread left owner key %q = %q", key, got)
 		}
 	}
 }

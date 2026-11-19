@@ -3,7 +3,11 @@
 #   sa.<service account>: <pools>  every VM service account, with the
 #                                  space-separated pools that use it
 #   <vm pod>: <owner>              each claimed VM pod; "-" means unrestricted
-#   thread.<thread>: <owner>       each thread's project owner hash
+#   thread.<thread>: <owner>       each thread's project owner hash, keyed by
+#                                  the raw thread name used in spec.thread
+#   thread-hash.<label>: <owner>   the same, keyed by the ThreadLabel a
+#                                  blip.dev/thread label carries when the
+#                                  thread name is too long for a label value
 #   bases: <states>                space-separated shared, ownerless image states
 # A caller authenticated with a pod-bound token of a VM service account may
 # only connect to pods with `blip-runtime bridge 1025` in container vm (a blip
@@ -84,10 +88,11 @@ spec:
       expression: "'bases' in variables.data ? string(variables.data['bases']).split(' ') : []"
     # A blip.dev/thread label decides which project's history a Blip's reports
     # are appended to. The label is self-asserted by the VM, so a restricted
-    # owner may only set it to a thread it owns: the "thread.<label>" table
-    # records the owner hash of every thread. Label values are ThreadLabel(name),
-    # which is hashed when the name is too long for a label; the table records
-    # the owner under that value as well as under the raw thread name.
+    # owner may only set it to a thread it owns. Label values are
+    # ThreadLabel(name): the raw name when it fits a label, otherwise a hash
+    # recorded under "thread-hash.<label>". A raw thread name that happens to
+    # equal another thread's hash is a separate "thread.<label>" key, so both
+    # are checked and either one may match.
     - name: thread
       expression: >-
         (request.operation == 'CREATE' || request.operation == 'UPDATE') &&
@@ -164,8 +169,11 @@ spec:
     - expression: >-
         !variables.restricted || !variables.writes || request.resource.resource != 'blips' ||
         variables.thread == variables.oldThread ||
-        (variables.thread != '' && ('thread.' + variables.thread) in variables.data &&
-        string(variables.data['thread.' + variables.thread]) == variables.owner)
+        (variables.thread != '' &&
+        ((('thread.' + variables.thread) in variables.data &&
+        string(variables.data['thread.' + variables.thread]) == variables.owner) ||
+        (('thread-hash.' + variables.thread) in variables.data &&
+        string(variables.data['thread-hash.' + variables.thread]) == variables.owner)))
       messageExpression: >-
         'owner ' + variables.owner + ' may only attach blip.dev/thread labels of its own threads'
       reason: Forbidden

@@ -803,13 +803,14 @@ func TestVMOwnerPolicyLongThreadLabel(t *testing.T) {
 	victimOwner := v1.ThreadOwner(ns, victim)
 	label, victimLabel := v1.ThreadLabel(long), v1.ThreadLabel(victim)
 	params := map[string]string{
-		"sa.vm":                 "default",
-		"default-mine":          project,
-		"default-admin":         "-",
-		"thread." + long:        project, // spec.thread key read by blip-turn-owner
-		"thread." + label:       project, // label key read by blip-vm-owner
-		"thread." + victim:      victimOwner,
-		"thread." + victimLabel: victimOwner,
+		"sa.vm":                      "default",
+		"default-mine":               project,
+		"default-admin":              "-",
+		"thread." + long:             project, // spec.thread key read by blip-turn-owner
+		"thread-hash." + label:       project, // label key read by blip-vm-owner
+		"thread." + victim:           victimOwner,
+		"thread-hash." + victimLabel: victimOwner,
+		"thread." + victimLabel:      victimOwner + "-short", // a same-named short thread must not grant the long label
 	}
 	mine := vmUser("vm", "default-mine")
 	own := withThreadLabel(blipObj(project+".a", project), label)
@@ -827,6 +828,49 @@ func TestVMOwnerPolicyLongThreadLabel(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: tc.obj}
+			allow, msg := req.evaluate(t, v, params)
+			if allow != tc.allow || (!tc.allow && !strings.Contains(msg, "thread")) {
+				t.Fatalf("allow %v (%q), want %v", allow, msg, tc.allow)
+			}
+		})
+	}
+}
+
+// A short thread may legally be named exactly like another thread's hashed
+// label. The owner table keeps the two entries under different prefixes, and
+// each producer may use its own label: neither lookup shadows the other.
+func TestVMOwnerPolicyThreadHashDoesNotShadowShortName(t *testing.T) {
+	v := loadVMOwnerPolicy(t)
+	long := "project-" + strings.Repeat("z", 70)
+	short := v1.ThreadLabel(long)
+	if len(short) != 63 || len(long) <= 63 {
+		t.Fatalf("test names: short %q (%d), long %q (%d)", short, len(short), long, len(long))
+	}
+	longOwner, shortOwner := v1.ThreadOwner(ns, long), v1.ThreadOwner(ns, short)
+	const other = "p-0000000000000000"
+	params := map[string]string{
+		"sa.vm":                "default",
+		"long-pod":             longOwner,
+		"short-pod":            shortOwner,
+		"thread." + long:       longOwner,
+		"thread-hash." + short: longOwner,
+		"thread." + short:      shortOwner,
+		"thread.other":         other,
+	}
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		owner string
+		label string
+		allow bool
+	}{
+		{"long thread uses its hashed label", vmUser("vm", "long-pod"), longOwner, short, true},
+		{"short thread uses its raw name", vmUser("vm", "short-pod"), shortOwner, short, true},
+		{"long thread may not use another thread", vmUser("vm", "long-pod"), longOwner, "other", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := withThreadLabel(blipObj(tc.owner+".a", tc.owner), tc.label)
+			req := policyRequest{user: tc.user, op: admission.Create, resource: "blips", name: tc.owner + ".a", object: obj}
 			allow, msg := req.evaluate(t, v, params)
 			if allow != tc.allow || (!tc.allow && !strings.Contains(msg, "thread")) {
 				t.Fatalf("allow %v (%q), want %v", allow, msg, tc.allow)

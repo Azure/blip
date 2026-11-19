@@ -134,7 +134,7 @@ func TestVMOwnersLongThreadNameDoesNotWedgePool(t *testing.T) {
 
 	owner := v1.ThreadOwner(ns, long)
 	owners := e.owners()
-	if got := owners["thread."+v1.ThreadLabel(long)]; got != owner {
+	if got := owners[ownersThreadHashPrefix+v1.ThreadLabel(long)]; got != owner {
 		t.Errorf("hashed thread owner key = %q, want %q", got, owner)
 	}
 	if _, ok := owners["thread."+long]; ok {

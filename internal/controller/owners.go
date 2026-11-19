@@ -23,18 +23,24 @@ import (
 // "sa.<service account>" for every VM service account, with the sorted,
 // space-separated names of the pools using it, and "<pod>" with the owner of
 // each claimed VM pod ("-" for an unrestricted Blip). "thread.<name>" maps a
-// thread to the owner hash of its project for turn producers, and
-// "thread.<ThreadLabel(name)>" does the same for the blip.dev/thread label
-// (which is hashed for long names). A name too long for a ConfigMap key is
-// omitted: the missing entry keeps its VMs restricted. "bases" lists the
-// ownerless imported states available for shared read-only use and copying.
+// thread to the owner hash of its project for turn producers. Labels are
+// hashed for names longer than a label value, and live under their own
+// "thread-hash.<ThreadLabel(name)>" prefix so a hashed label can never
+// overwrite the raw entry of a short thread whose name happens to equal that
+// hash. A name too long for a ConfigMap key is omitted: the missing entry
+// keeps its VMs restricted. "bases" lists the ownerless imported states
+// available for shared read-only use and copying.
 const VMOwnersConfigMap = "blip-vm-owners"
 
 const (
 	ownersSAPrefix     = "sa."
 	ownersThreadPrefix = "thread."
-	ownersBasesKey     = "bases"
-	ownerAny           = "-"
+	// ownersThreadHashPrefix holds owners keyed by ThreadLabel(name) for
+	// names too long for a label. Keeping it separate from the raw-name
+	// keys makes the encoding unambiguous.
+	ownersThreadHashPrefix = "thread-hash."
+	ownersBasesKey         = "bases"
+	ownerAny               = "-"
 )
 
 // ownersKey returns the table key for prefix+name and whether it is a valid
@@ -261,11 +267,13 @@ func syncVMOwnersEvents(ctx context.Context, c client.Client, ns string, recorde
 		want[ownersBasesKey] = strings.Join(bases, " ")
 	}
 	// Thread ownership lets the turn policy bind a pod-bound producer to its
-	// own project without trusting labels on the turn. Keys use both the raw
-	// thread name (spec.thread on a turn) and ThreadLabel(name) (the
-	// blip.dev/thread label, which is hashed for names over 63 characters).
-	// A raw name too long for a ConfigMap key is omitted; the hashed key
-	// still authorizes Blips, and turns for it fail closed at admission.
+	// own project without trusting labels on the turn. Raw thread names
+	// (spec.thread on a turn) live under "thread.<name>"; a label that had to
+	// be hashed for length lives under "thread-hash.<label>". The separate
+	// prefix means a long thread's hash cannot collide with a short thread
+	// whose name equals that hash. A raw name too long for a ConfigMap key is
+	// omitted; the hashed key still authorizes Blips, and turns for it fail
+	// closed at admission.
 	var threads v1.BlipThreadList
 	if err := c.List(ctx, &threads, client.InNamespace(ns)); err != nil {
 		return err
@@ -273,7 +281,9 @@ func syncVMOwnersEvents(ctx context.Context, c client.Client, ns string, recorde
 	for i := range threads.Items {
 		name := threads.Items[i].Name
 		owner := v1.ThreadOwner(ns, name)
-		want[ownersThreadPrefix+v1.ThreadLabel(name)] = owner
+		if label := v1.ThreadLabel(name); label != name {
+			want[ownersThreadHashPrefix+label] = owner
+		}
 		if key, ok := ownersKey(ownersThreadPrefix, name); ok {
 			want[key] = owner
 		} else {
