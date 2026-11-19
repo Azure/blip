@@ -152,6 +152,22 @@ func TestGatherWhitespaceSelectorFallsBackToCallerForks(t *testing.T) {
 	}
 }
 
+// Help says "blip names or --selector". Accepting both unions two sets, which
+// can gather blips the user did not name, so reject the combination.
+func TestGatherRejectsNamesWithSelector(t *testing.T) {
+	named := finishedBlip("w1", v1alpha1.BlipSucceeded, 0)
+	other := finishedBlip("w2", v1alpha1.BlipSucceeded, 0)
+	other.Labels = map[string]string{"team": "y"}
+	h := newHarness(t, named, other)
+	code, _, errOut := h.run("", "gather", "w1", "--selector", "team=y")
+	if code != 1 || !strings.Contains(errOut, "not both") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if h.gone("w1") || h.gone("w2") {
+		t.Fatal("gather deleted a blip despite the invalid target set")
+	}
+}
+
 func TestGatherSelector(t *testing.T) {
 	a := finishedBlip("w1", v1alpha1.BlipSucceeded, 0)
 	a.Labels = map[string]string{"team": "nightly"}

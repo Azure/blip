@@ -41,7 +41,7 @@ func (a *app) gatherCommand() *cobra.Command {
 them.
 
 Inside a blip, gather with no arguments targets the forks that blip started.
-Select any other set with blip names or --selector.
+Select any other set with blip names or --selector, not both.
 
 With --collect, each operation is applied to every finished blip. Operations
 are the same as the collect syntax, and {name} is replaced with the blip's
@@ -85,6 +85,9 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 	// labels.Parse treats whitespace as a selector that matches everything,
 	// and an unset shell variable is easy to pass by accident.
 	selector := strings.TrimSpace(f.selector)
+	if len(names) > 0 && selector != "" {
+		return errors.New("gather takes blip names or --selector, not both")
+	}
 	if len(names) == 0 && selector == "" {
 		if a.self == nil {
 			return errors.New("gather needs blip names or --selector outside a blip")
