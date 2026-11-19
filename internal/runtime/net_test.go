@@ -89,16 +89,62 @@ func scriptChain(t *testing.T, script, name string) string {
 	return script[start : start+end]
 }
 
+// relatedChainAllows evaluates the simple address match that a generated
+// related_<i> chain emits. The chains contain only positive
+// `ct original ip daddr CIDR` terms and negative `!=` exceptions, so an
+// address matches the layer when it is inside a positive prefix and outside
+// every exception.
+func relatedChainAllows(t *testing.T, chain, addr string) bool {
+	t.Helper()
+	ip := netip.MustParseAddr(addr)
+	for _, line := range strings.Split(chain, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "ct original ip daddr") || !strings.HasSuffix(line, "counter return") {
+			continue
+		}
+		fields := strings.Fields(line)
+		allowed, positive := true, false
+		for i := 0; i+3 < len(fields); i++ {
+			if fields[i] != "ct" || fields[i+1] != "original" || fields[i+2] != "ip" || fields[i+3] != "daddr" {
+				continue
+			}
+			negative, at := false, i+4
+			if at < len(fields) && fields[at] == "!=" {
+				negative, at = true, at+1
+			}
+			if at >= len(fields) {
+				t.Fatalf("malformed original destination match: %q", line)
+			}
+			prefix := netip.MustParsePrefix(fields[at])
+			if negative {
+				if prefix.Contains(ip) {
+					allowed = false
+				}
+			} else {
+				positive = true
+				if !prefix.Contains(ip) {
+					allowed = false
+				}
+			}
+		}
+		if positive && allowed {
+			return true
+		}
+	}
+	return false
+}
+
 // TestPolicyAllowsRelatedICMPErrors covers PMTUD and related transport
 // errors: router ICMP destination-unreachable replies (type 3: fragmentation
 // needed, port/host/net/protocol unreachable) and time-exceeded (type 11) are
 // RELATED to a permitted flow, but the guest gate used to admit only
 // established TCP/UDP replies and frag-needed, so the guest never lowered its
 // path MTU and UDP sockets never learned that an allowed port was closed.
-// General ICMP (echo, router advertisements) stays denied.
+// General ICMP (echo, router advertisements) stays denied. The errors are
+// admitted only through the policy layers, so a revoked flow loses them.
 func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
-		{{CIDR: "0.0.0.0/0", Protocol: "TCP", Port: 443}},
+		{{CIDR: "198.51.100.0/24", Protocol: "UDP", Port: 53}},
 	}}
 	script, err := testPodNet(nil).policyScript(policy, true)
 	if err != nil {
@@ -109,13 +155,41 @@ func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 		"net-unreachable", "host-unreachable", "prot-unreachable",
 		"port-unreachable", "frag-needed",
 	} {
-		rule := "ct state related icmp type destination-unreachable icmp code " + code + " counter accept"
+		rule := "ct state related icmp type destination-unreachable icmp code " + code + " jump related"
 		if !strings.Contains(toGuest, rule) {
 			t.Errorf("to_guest does not admit %q:\n%s", rule, toGuest)
 		}
 	}
-	if rule := "ct state related icmp type time-exceeded counter accept"; !strings.Contains(toGuest, rule) {
+	if rule := "ct state related icmp type time-exceeded jump related"; !strings.Contains(toGuest, rule) {
 		t.Errorf("to_guest does not admit %q:\n%s", rule, toGuest)
+	}
+	// No ICMP accept may bypass the layer chains: every RELATED error must go
+	// through the dispatcher, and the dispatcher accepts only after all layer
+	// chains return. The DNAT rules use `meta l4proto != icmp`, so select only
+	// the related-error rules here.
+	for _, line := range strings.Split(toGuest, "\n") {
+		if !strings.Contains(line, "ct state related icmp type") {
+			continue
+		}
+		if strings.Contains(line, "counter accept") {
+			t.Errorf("to_guest accepts an ICMP error without a layer gate: %s", strings.TrimSpace(line))
+		}
+		if !strings.Contains(line, "jump related") {
+			t.Errorf("to_guest has an ICMP path that bypasses the layer gate: %s", strings.TrimSpace(line))
+		}
+	}
+	related := scriptChain(t, script, "related")
+	if !strings.Contains(related, "jump related_0") || !strings.Contains(related, "counter accept") {
+		t.Errorf("related dispatcher is not layer gated:\n%s", related)
+	}
+	layer := scriptChain(t, script, "related_0")
+	if !strings.Contains(layer, "ct original ip daddr 198.51.100.0/24 counter return") {
+		t.Errorf("related_0 does not match the allowed original destination:\n%s", layer)
+	}
+	// PMTUD/ECONNREFUSED for the allowed flow remains reachable: the original
+	// destination of the quoted packet passes every layer.
+	if !relatedChainAllows(t, layer, "198.51.100.10") {
+		t.Errorf("related_0 denies a permitted flow:\n%s", layer)
 	}
 	// The pod-IP DNAT accepts carry non-ICMP traffic only. In particular the
 	// reply rule must not accept the echo reply that an unsolicited, spoofed
@@ -144,6 +218,107 @@ func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 	}
 	if strings.Contains(scriptChain(t, closed, "to_guest"), "icmp") {
 		t.Errorf("inactive gate admits ICMP:\n%s", closed)
+	}
+}
+
+// TestPolicyDenyAllHasNoRelatedICMPPath is the live-revocation regression:
+// `spec.network.egress: []` compiles to an empty layer, and a stale
+// conntrack entry must not keep delivering related ICMP errors (PMTUD or
+// ECONNREFUSED) to the guest. With any empty layer the whole related-ICMP
+// path is omitted; the data path falls through to drop as well.
+func TestPolicyDenyAllHasNoRelatedICMPPath(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		policy *netpolicy.Policy
+	}{
+		{"no layers", &netpolicy.Policy{Revision: "deny"}},
+		{"empty layer", &netpolicy.Policy{Revision: "deny", Layers: [][]netpolicy.Rule{{}}}},
+		{"pool allow plus empty blip layer", &netpolicy.Policy{Revision: "deny", Layers: [][]netpolicy.Rule{
+			{{CIDR: "10.96.0.0/12", Protocol: "UDP", Port: 53}},
+			{},
+		}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			script, err := testPodNet(nil).policyScript(tt.policy, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			toGuest := scriptChain(t, script, "to_guest")
+			if strings.Contains(toGuest, "ct state related icmp") {
+				t.Errorf("deny-all to_guest still has a related ICMP path:\n%s", toGuest)
+			}
+			for _, chain := range []string{"related", "related_0", "related_1"} {
+				if strings.Contains(script, "chain "+chain+" {") {
+					t.Errorf("deny-all generates %s:\n%s", chain, script)
+				}
+			}
+		})
+	}
+}
+
+// TestPolicyRelatedICMPMatchesOriginalDestination pins the revocation check:
+// the layer must match the ICMP error's ORIGINAL flow destination, including
+// the rule's private exceptions, so an error for a stale flow to a now-denied
+// address is dropped even when the outer ICMP source would pass a public
+// wildcard.
+func TestPolicyRelatedICMPMatchesOriginalDestination(t *testing.T) {
+	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{{
+		{CIDR: "0.0.0.0/0", Except: []string{"10.0.0.0/8"}, Protocol: "TCP", Port: 443},
+	}}}
+	script, err := testPodNet(nil).policyScript(policy, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer := scriptChain(t, script, "related_0")
+	if !strings.Contains(layer, "ct original ip daddr 0.0.0.0/0 ct original ip daddr != 10.0.0.0/8 counter return") {
+		t.Errorf("related_0 does not carry the rule's exceptions:\n%s", layer)
+	}
+	if !relatedChainAllows(t, layer, "203.0.113.10") {
+		t.Errorf("related_0 denies a public original destination:\n%s", layer)
+	}
+	// The hunt's post-SNAT DNS peer is private and excluded, so its stale
+	// ICMP port-unreachable/frag-needed must no longer match.
+	if relatedChainAllows(t, layer, "10.96.0.10") {
+		t.Errorf("related_0 still admits an excluded private destination:\n%s", layer)
+	}
+
+	// A policy naming only public CIDRs must not match a private original
+	// destination either.
+	public := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{{
+		{CIDR: "203.0.113.0/24", Protocol: "UDP", Port: 53},
+	}}}
+	script, err = testPodNet(nil).policyScript(public, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicLayer := scriptChain(t, script, "related_0")
+	if relatedChainAllows(t, publicLayer, "10.96.0.10") || relatedChainAllows(t, publicLayer, "192.0.2.2") {
+		t.Errorf("public-only related_0 admits a private original destination:\n%s", publicLayer)
+	}
+	if !relatedChainAllows(t, publicLayer, "203.0.113.53") {
+		t.Errorf("public-only related_0 denies its own peer:\n%s", publicLayer)
+	}
+
+	// The AND still applies: every layer must return before the dispatcher
+	// accepts, so a layer that excludes the original destination revokes the
+	// ICMP path even if an earlier layer would have allowed it.
+	layered := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
+		{{CIDR: "0.0.0.0/0", Except: []string{"10.0.0.0/8"}}},
+		{{CIDR: "10.0.0.0/8"}},
+	}}
+	script, err = testPodNet(nil).policyScript(layered, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := scriptChain(t, script, "related_0")
+	second := scriptChain(t, script, "related_1")
+	if relatedChainAllows(t, first, "10.96.0.10") || !relatedChainAllows(t, second, "10.96.0.10") {
+		t.Errorf("layer AND is not preserved for related ICMP:\n%s\n%s", first, second)
+	}
+	related := scriptChain(t, script, "related")
+	if !strings.Contains(related, "jump related_0\n  jump related_1") ||
+		!strings.HasSuffix(strings.TrimSpace(related), "counter accept") {
+		t.Errorf("related dispatcher does not require every layer:\n%s", related)
 	}
 }
 

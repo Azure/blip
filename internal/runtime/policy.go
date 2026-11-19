@@ -62,6 +62,38 @@ func inboundMatch(r netpolicy.Rule) string {
 	return addrMatch(r, "saddr") + portMatch(r, "dport")
 }
 
+// relatedMatch admits a related ICMP error only when the conntrack entry's
+// ORIGINAL destination (the peer of the guest-initiated flow) is inside the
+// rule and outside its exceptions. That destination is what a stale flow would
+// otherwise carry an ICMP error for after the policy is narrowed, so it must
+// pass the same layers as the original packet. Ports and protocol are omitted
+// deliberately: they describe the quoted packet, not the outer ICMP packet,
+// and ct original l4proto/proto-dst are newer than the minimum nft supports.
+func relatedMatch(r netpolicy.Rule) string {
+	match := "ct original ip daddr " + r.CIDRPrefix().String()
+	for _, value := range r.Except {
+		p, _ := netip.ParsePrefix(value)
+		match += " ct original ip daddr != " + p.Masked().String()
+	}
+	return match
+}
+
+// relatedICMPAllowed reports whether some policy layer grants related ICMP
+// errors at all. An empty layer is default deny, so no related error can pass
+// every layer; omitting the whole path keeps deny-all scripts free of ICMP
+// accept rules.
+func relatedICMPAllowed(policy *netpolicy.Policy) bool {
+	if policy == nil || len(policy.Layers) == 0 {
+		return false
+	}
+	for _, layer := range policy.Layers {
+		if len(layer) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, error) {
 	if err := policy.Validate(); err != nil {
 		return "", err
@@ -99,12 +131,11 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 	// the rule's protocol and port. A wildcard rule (0.0.0.0/0, with or
 	// without private exceptions) names no peer and is an egress allowance,
 	// not an ingress policy, so it admits no new inbound connections.
-	// Replies to an allowed egress flow and related ICMP errors stay broadly
-	// allowed through the reply chains below. Replies to an inbound
-	// connection check the peer address only, because that peer's source
-	// port is ephemeral. The same peer set checks replies to an inbound
-	// connection, so narrowing a policy also stops an established flow from
-	// carrying replies to a now-denied peer.
+	// Replies to an inbound connection check the peer address only, because
+	// that peer's source port is ephemeral. The same peer set checks replies
+	// to an inbound connection, so narrowing a policy also stops an
+	// established flow from carrying replies to a now-denied peer. Related
+	// ICMP errors get their own layer chains below.
 	if policy != nil && len(policy.Layers) > 0 {
 		for i, layer := range policy.Layers {
 			fmt.Fprintf(&b, " chain inbound_%d {\n", i)
@@ -121,6 +152,25 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 			}
 			b.WriteString("  counter drop\n }\n")
 		}
+	}
+	// Related ICMP errors (PMTUD and transport errors) are only delivered when
+	// the conntrack entry they quote still passes EVERY policy layer. Each
+	// related_<i> chain returns only if the original flow's destination is
+	// allowed by that layer and drops otherwise, mirroring the egress AND.
+	// The dispatcher then accepts only after all layers have returned.
+	if relatedICMPAllowed(policy) {
+		for i, layer := range policy.Layers {
+			fmt.Fprintf(&b, " chain related_%d {\n", i)
+			for _, rule := range layer {
+				fmt.Fprintf(&b, "  %s counter return\n", relatedMatch(rule))
+			}
+			b.WriteString("  counter drop\n }\n")
+		}
+		b.WriteString(" chain related {\n")
+		for i := range policy.Layers {
+			fmt.Fprintf(&b, "  jump related_%d\n", i)
+		}
+		b.WriteString("  counter accept\n }\n")
 	}
 	iface, tap := strconv.Quote(p.iface), strconv.Quote(tapName)
 	fmt.Fprintf(&b, ` chain from_guest {
@@ -172,16 +222,21 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 		// never learns that an allowed destination port is closed (no
 		// ECONNREFUSED) or that a route is unusable. RELATED ties the
 		// acceptance to a permitted conntrack entry, so unsolicited ICMP,
-		// echo, and router advertisements remain denied. Type and code must
-		// stay symbolic: nftables rejects numeric ICMP selectors on some
-		// versions.
-		for _, code := range []string{
-			"net-unreachable", "host-unreachable", "prot-unreachable",
-			"port-unreachable", "frag-needed",
-		} {
-			fmt.Fprintf(&b, "  ct state related icmp type destination-unreachable icmp code %s counter accept\n", code)
+		// echo, and router advertisements remain denied. The policy layers
+		// are still consulted through the original flow's destination, so a
+		// stale conntrack entry cannot deliver an error after the policy is
+		// narrowed; with deny-all no ICMP is admitted at all. Type and code
+		// must stay symbolic: nftables rejects numeric ICMP selectors on
+		// some versions.
+		if relatedICMPAllowed(policy) {
+			for _, code := range []string{
+				"net-unreachable", "host-unreachable", "prot-unreachable",
+				"port-unreachable", "frag-needed",
+			} {
+				fmt.Fprintf(&b, "  ct state related icmp type destination-unreachable icmp code %s jump related\n", code)
+			}
+			b.WriteString("  ct state related icmp type time-exceeded jump related\n")
 		}
-		b.WriteString("  ct state related icmp type time-exceeded counter accept\n")
 		// NAT already restored the private destination. Check CURRENT remote
 		// source/port on every reply; stale conntrack cannot defeat revocation.
 		b.WriteString("  ct direction reply ct state established jump reply\n")
