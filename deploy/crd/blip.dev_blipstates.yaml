@@ -104,8 +104,12 @@ spec:
                   Mounts attaches states when this state is used as a blip's root.
                   Changes apply to the running blip.
                 items:
-                  description: Mount attaches a state's filesystem inside a running
-                    blip.
+                  description: |-
+                    Mount attaches a state's filesystem inside a running blip.
+
+                    A path reserved by the guest may not be used at, below, or above. The one
+                    exception is a read-only temporary collect mount, scoped to one blip, at
+                    exactly one level below the reserved collect root.
                   properties:
                     blipUID:
                       description: |-
@@ -122,8 +126,8 @@ spec:
                         apply cannot write intent that every later Blip on the root will fail
                         to mount. Admission also caps the component count so the per-component
                         byte check stays within the API server's CEL cost budget. A temporary
-                        collect mount is the one allowed exception below the reserved collect
-                        root.
+                        collect mount (read-only and scoped to one blip) is the one allowed
+                        exception below the reserved collect root.
                       maxLength: 4096
                       pattern: ^/[^/]+(/[^/]+)*$
                       type: string
@@ -140,23 +144,13 @@ spec:
                         rule: self.split('/', 256).all(s, bytes(s).size() <= 255)
                       - message: path must not contain control characters
                         rule: '!self.matches(''[\\x00-\\x1f\\x7f]'')'
-                      - message: path must not be at, below, or above a guest-reserved
-                          path, except a temporary collect mount
-                        rule: '![''/proc'', ''/sys'', ''/dev'', ''/run/blip'', ''/run/blip-collect'',
-                          ''/var/run/blip'', ''/var/run/blip-collect''].exists(r,
-                          self == r || self.startsWith(r + ''/'') || r.startsWith(self
-                          + ''/'')) || (self.startsWith(''/run/blip-collect/'') &&
-                          self.split(''/'').size() == 4)'
                       - message: path must not be at or below a file in the guest
                           or base image
                         rule: '![''/etc/hosts'', ''/etc/resolv.conf'', ''/etc/passwd'',
                           ''/etc/group'', ''/etc/shadow'', ''/etc/gshadow'', ''/etc/hostname'',
                           ''/etc/hostid'', ''/etc/machine-id'', ''/etc/os-release'',
                           ''/etc/debian_version'', ''/etc/nsswitch.conf'', ''/etc/subuid'',
-                          ''/etc/subgid'', ''/etc/ld.so.cache'', ''/etc/ld.so.conf'',
-                          ''/etc/bash.bashrc'', ''/etc/environment'', ''/etc/profile'',
-                          ''/etc/inputrc'', ''/etc/login.defs'', ''/etc/host.conf'',
-                          ''/etc/gai.conf'', ''/etc/mtab''].exists(f, self == f || self.startsWith(f
+                          ''/etc/subgid'', ''/etc/mtab''].exists(f, self == f || self.startsWith(f
                           + ''/''))'
                     state:
                       description: State names a BlipState in the blip's namespace.
@@ -172,6 +166,15 @@ spec:
                   - path
                   - state
                   type: object
+                  x-kubernetes-validations:
+                  - message: path must not be at, below, or above a guest-reserved
+                      path, except a read-only temporary collect mount
+                    rule: '![''/proc'', ''/sys'', ''/dev'', ''/run/blip'', ''/run/blip-collect'',
+                      ''/var/run/blip'', ''/var/run/blip-collect''].exists(r, self.path
+                      == r || self.path.startsWith(r + ''/'') || r.startsWith(self.path
+                      + ''/'')) || (self.path.startsWith(''/run/blip-collect/'') &&
+                      self.path.split(''/'').size() == 4 && has(self.blipUID) && self.blipUID
+                      != '''' && (!has(self.writable) || !self.writable))'
                 maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:

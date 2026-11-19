@@ -272,6 +272,10 @@ func TestMountPathCRDRules(t *testing.T) {
 	if rule := ruleFor(t, path.XValidations, "path must have at most 255 components"); rule != componentCap {
 		t.Errorf("mount path component cap rule %q, want %q", rule, componentCap)
 	}
+	const reserved = "!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect'].exists(r, self.path == r || self.path.startsWith(r + '/') || r.startsWith(self.path + '/')) || (self.path.startsWith('/run/blip-collect/') && self.path.split('/').size() == 4 && has(self.blipUID) && self.blipUID != '' && (!has(self.writable) || !self.writable))"
+	if rule := ruleFor(t, mounts.Items.XValidations, "path must not be at, below, or above a guest-reserved path, except a read-only temporary collect mount"); rule != reserved {
+		t.Errorf("mount path reserved rule %q, want %q", rule, reserved)
+	}
 	const unique = "self.all(m, self.exists_one(o, o.path == m.path))"
 	if rule := ruleFor(t, mounts.XValidations, "mount paths must be unique"); rule != unique {
 		t.Errorf("mount path uniqueness rule %q, want %q", rule, unique)
@@ -330,8 +334,6 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 		"/mnt/a", "/a b/c", "/.hidden", "/a.b/c", "/var/log", "/usr/bin", "/run/data",
 		// Directory symlinks are resolved by the guest, so these are legal.
 		"/bin", "/usr/lib/ssl/certs",
-		// The CLI writes one temporary collect mount below the reserved root.
-		"/run/blip-collect/data",
 		"/" + strings.Repeat("a", mountpath.NameMax),
 		// NAME_MAX is 255 bytes, so 127 two-byte characters (254 bytes) fit.
 		"/" + strings.Repeat("é", 127),
@@ -358,6 +360,8 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 		"/run",
 		"/run/blip/x",
 		"/run/blip-collect",
+		// A durable mount (no blipUID) may not use the reserved collect root.
+		"/run/blip-collect/data",
 		"/run/blip-collect/data/deep",
 		// /var/run is the standard image alias of /run.
 		"/var/run",
@@ -368,6 +372,21 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 	} {
 		if errs := validate(object(p), ""); len(errs) == 0 {
 			t.Errorf("admission accepted mount path no guest can create (%d bytes): %q", len(p), p)
+		}
+	}
+	// The controller and the CLI create one temporary, read-only collect
+	// mount below the reserved root; that form stays accepted.
+	temporaryCollect := `{"spec":{"mounts":[{"state":"data","path":"/run/blip-collect/data","blipUID":"execution-uid"}]}}`
+	if errs := validate(temporaryCollect, ""); len(errs) != 0 {
+		t.Errorf("admission rejected the temporary collect mount: %v", errs.ToAggregate())
+	}
+	for _, object := range []string{
+		`{"spec":{"mounts":[{"state":"data","path":"/run/blip-collect/data","blipUID":""}]}}`,
+		`{"spec":{"mounts":[{"state":"data","path":"/run/blip-collect/data","blipUID":"execution-uid","writable":true}]}}`,
+		`{"spec":{"mounts":[{"state":"data","path":"/run/blip-collect/data","writable":true}]}}`,
+	} {
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admission accepted a durable or writable mount at the reserved collect root: %s", object)
 		}
 	}
 	// Every path the shared preflight rejects must also be rejected by the

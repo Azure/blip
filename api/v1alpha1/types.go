@@ -458,6 +458,12 @@ type NetworkPort struct {
 }
 
 // Mount attaches a state's filesystem inside a running blip.
+//
+// A path reserved by the guest may not be used at, below, or above. The one
+// exception is a read-only temporary collect mount, scoped to one blip, at
+// exactly one level below the reserved collect root.
+//
+// +kubebuilder:validation:XValidation:rule="!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect', '/var/run/blip', '/var/run/blip-collect'].exists(r, self.path == r || self.path.startsWith(r + '/') || r.startsWith(self.path + '/')) || (self.path.startsWith('/run/blip-collect/') && self.path.split('/').size() == 4 && has(self.blipUID) && self.blipUID != '' && (!has(self.writable) || !self.writable))",message="path must not be at, below, or above a guest-reserved path, except a read-only temporary collect mount"
 type Mount struct {
 	// State names a BlipState in the blip's namespace.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
@@ -471,8 +477,8 @@ type Mount struct {
 	// apply cannot write intent that every later Blip on the root will fail
 	// to mount. Admission also caps the component count so the per-component
 	// byte check stays within the API server's CEL cost budget. A temporary
-	// collect mount is the one allowed exception below the reserved collect
-	// root.
+	// collect mount (read-only and scoped to one blip) is the one allowed
+	// exception below the reserved collect root.
 	// +kubebuilder:validation:Pattern=`^/[^/]+(/[^/]+)*$`
 	// +kubebuilder:validation:MaxLength=4096
 	// +kubebuilder:validation:XValidation:rule="!self.split('/').exists(s, s == '.' || s == '..')",message="path must not contain . or .. segments"
@@ -480,7 +486,6 @@ type Mount struct {
 	// +kubebuilder:validation:XValidation:rule="self.split('/').size() <= 256",message="path must have at most 255 components"
 	// +kubebuilder:validation:XValidation:rule="self.split('/', 256).all(s, bytes(s).size() <= 255)",message="path components must be at most 255 bytes, the Linux NAME_MAX limit"
 	// +kubebuilder:validation:XValidation:rule="!self.matches('[\\\\x00-\\\\x1f\\\\x7f]')",message="path must not contain control characters"
-	// +kubebuilder:validation:XValidation:rule="!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect'].exists(r, self == r || self.startsWith(r + '/') || r.startsWith(self + '/')) || (self.startsWith('/run/blip-collect/') && self.split('/').size() == 4)",message="path must not be at, below, or above a guest-reserved path, except a temporary collect mount"
 	// +kubebuilder:validation:XValidation:rule="!['/etc/hosts', '/etc/resolv.conf', '/etc/passwd', '/etc/group', '/etc/shadow', '/etc/gshadow', '/etc/hostname', '/etc/hostid', '/etc/machine-id', '/etc/os-release', '/etc/debian_version', '/etc/nsswitch.conf', '/etc/subuid', '/etc/subgid', '/etc/mtab'].exists(f, self == f || self.startsWith(f + '/'))",message="path must not be at or below a file in the guest or base image"
 	Path string `json:"path"`
 	// Writable mounts take the state's single writer slot and save a new
