@@ -285,8 +285,7 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	if err := c.s.Get(ctx, client.ObjectKey{Namespace: c.thread.Namespace, Name: name}, &b); err != nil {
 		return "", err
 	}
-	owner := Owner(&ThreadKey{Namespace: c.thread.Namespace, Name: c.thread.Name})
-	if b.Labels[v1.LabelThread] != c.thread.Name || b.Labels[v1.LabelOwner] != owner {
+	if !belongsToThread(&b, c.thread) {
 		return "", fmt.Errorf("blip %q does not belong to thread %q", name, c.thread.Name)
 	}
 	if v1.Finished(&b) || b.Status.Pod == "" {
@@ -302,7 +301,7 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	if err := readOnly(argv); err != nil {
 		return "", err
 	}
-	return c.s.execIn(ctx, c.thread.Namespace, name, argv, 60)
+	return c.s.execIn(ctx, c.thread, name, argv, 60)
 }
 
 // readOnly reports whether argv is safe to run as an inspection command. It

@@ -181,11 +181,14 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 		if v, ok := args["timeoutSeconds"].(float64); ok {
 			timeout = time.Duration(v) * time.Second
 		}
-		return s.s.execIn(ctx, s.thread.Namespace, strArg("blip"), argv, timeout)
+		return s.s.execIn(ctx, s.thread, strArg("blip"), argv, timeout)
 	case "stop":
 		var b v1.Blip
 		if err := s.s.Get(ctx, client.ObjectKey{Namespace: s.thread.Namespace, Name: strArg("blip")}, &b); err != nil {
 			return "", err
+		}
+		if !belongsToThread(&b, s.thread) {
+			return "", fmt.Errorf("blip %q does not belong to thread %q", b.Name, s.thread.Name)
 		}
 		b.Spec.Stop = true
 		if err := s.s.Update(ctx, &b); err != nil {
@@ -311,8 +314,18 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 	return "started " + name, nil
 }
 
+// belongsToThread reports whether b was created by this thread: the thread
+// label must name it and the owner label must be the thread's derived owner.
+// A coordinator may hold commands or stop only blips of its own project.
+func belongsToThread(b *v1.Blip, thread *v1.BlipThread) bool {
+	owner := Owner(&ThreadKey{Namespace: thread.Namespace, Name: thread.Name})
+	return b.Namespace == thread.Namespace &&
+		b.Labels[v1.LabelThread] == thread.Name &&
+		b.Labels[v1.LabelOwner] == owner
+}
+
 // execIn runs one command in a running blip and returns bounded output.
-func (s *Server) execIn(ctx context.Context, namespace, name string, argv []string, timeout time.Duration) (string, error) {
+func (s *Server) execIn(ctx context.Context, thread *v1.BlipThread, name string, argv []string, timeout time.Duration) (string, error) {
 	if len(argv) == 0 {
 		return "", fmt.Errorf("argv is required")
 	}
@@ -320,8 +333,11 @@ func (s *Server) execIn(ctx context.Context, namespace, name string, argv []stri
 		timeout = 60 * time.Second
 	}
 	var b v1.Blip
-	if err := s.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &b); err != nil {
+	if err := s.Get(ctx, client.ObjectKey{Namespace: thread.Namespace, Name: name}, &b); err != nil {
 		return "", err
+	}
+	if !belongsToThread(&b, thread) {
+		return "", fmt.Errorf("blip %q does not belong to thread %q", name, thread.Name)
 	}
 	if b.Status.Pod == "" || v1.Finished(&b) {
 		return "", fmt.Errorf("blip %q is not running", name)

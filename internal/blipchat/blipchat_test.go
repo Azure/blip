@@ -996,3 +996,53 @@ func TestCreateTurnInRetryIsIdempotent(t *testing.T) {
 		t.Fatalf("turn = %+v", got.Spec)
 	}
 }
+
+// The coordinator's exec and stop tools are as strict as inspect: they may
+// only act on blips labelled with this thread and its derived owner.
+func TestExecAndStopRequireThreadOwnedBlip(t *testing.T) {
+	thread := testThread()
+	owner := Owner(&ThreadKey{Namespace: "ns", Name: "proj"})
+	foreign := &v1.Blip{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "blip-a", Namespace: "ns",
+			Labels: map[string]string{v1.LabelThread: "other", v1.LabelOwner: owner},
+		},
+		Status: v1.BlipStatus{Phase: v1.BlipRunning, Pod: "pod-a"},
+	}
+	c := testClient(t, thread, foreign)
+	s := &Server{Client: c}
+	if _, err := s.execIn(context.Background(), thread, "blip-a", []string{"true"}, time.Second); err == nil {
+		t.Fatal("exec accepted a blip outside the thread")
+	}
+
+	st := &step{s: s, thread: thread}
+	if _, err := st.call(context.Background(), "stop", `{"blip":"blip-a"}`); err == nil {
+		t.Fatal("stop accepted a blip outside the thread")
+	}
+	var got v1.Blip
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "blip-a"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Stop {
+		t.Fatal("foreign blip was stopped")
+	}
+
+	own := &v1.Blip{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "blip-b", Namespace: "ns",
+			Labels: map[string]string{v1.LabelThread: "proj", v1.LabelOwner: owner},
+		},
+		Status: v1.BlipStatus{Phase: v1.BlipRunning, Pod: "pod-b"},
+	}
+	c = testClient(t, thread, own)
+	st = &step{s: &Server{Client: c}, thread: thread}
+	if _, err := st.call(context.Background(), "stop", `{"blip":"blip-b"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "blip-b"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Spec.Stop {
+		t.Fatal("own blip was not stopped")
+	}
+}
