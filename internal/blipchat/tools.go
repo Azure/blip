@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -210,13 +211,21 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 		s.timers = append(s.timers, v1.ThreadTimer{ID: id, At: metav1.NewTime(at), Note: truncateRunes(strArg("note"), 256)})
 		return "timer " + id + " at " + at.Format(time.RFC3339), nil
 	case "reply":
-		seq, _ := args["inReplyTo"].(float64)
-		if seq < 0 {
-			return "", fmt.Errorf("inReplyTo must be a non-negative sequence number")
+		seq := int64(0)
+		if v, ok := args["inReplyTo"]; ok {
+			f, ok := v.(float64)
+			// float64 cannot represent every int64 exactly; MaxInt64 rounds up
+			// to 2^63, so rejecting at that boundary also rejects the largest
+			// int64. Converting an out-of-range value would wrap negative and
+			// silently retarget the reply to sequence 0.
+			if !ok || math.IsNaN(f) || f < 0 || f >= float64(math.MaxInt64) || f != math.Trunc(f) {
+				return "", fmt.Errorf("inReplyTo must be a non-negative sequence number")
+			}
+			seq = int64(f)
 		}
 		s.replies = append(s.replies, v1.BlipTurnSpec{
 			Thread: s.thread.Name, Author: v1.TurnAuthor{Kind: v1.TurnAuthorCoordinator, Name: s.thread.Name},
-			Topic: "coordinator.reply", InReplyTo: int64(seq), Text: truncateRunes(strArg("text"), 2048), Wake: v1.WakeNone,
+			Topic: "coordinator.reply", InReplyTo: seq, Text: truncateRunes(strArg("text"), 2048), Wake: v1.WakeNone,
 		})
 		return "reply recorded", nil
 	case "note":
