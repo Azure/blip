@@ -585,6 +585,92 @@ func TestTTYRawEOFSubmitsPartialLine(t *testing.T) {
 	}
 }
 
+// TestNonTTYSlowReaderReceivesWholeStream verifies that a slow but steadily
+// reading process is not mistaken for one that stopped reading. Input that was
+// dequeued and is being written must still count against the queue limit, and
+// progress within that batch must reset the stall clock. Otherwise 20 MB
+// uploads were silently truncated while the client exited 0.
+func TestNonTTYSlowReaderReceivesWholeStream(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	const total = 20 << 20
+	const chunkSize = 1 << 20
+
+	var (
+		mu       sync.Mutex
+		received int
+	)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 64<<10)
+		for {
+			n, rerr := r.Read(buf)
+			mu.Lock()
+			received += n
+			mu.Unlock()
+			if rerr != nil {
+				return
+			}
+			// Slow, but never stalled: the pipe always makes progress.
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+
+	s := newInputTestSession(w, 0)
+	defer s.closeInput()
+
+	block := bytes.Repeat([]byte("x"), chunkSize)
+	for sent := 0; sent < total; sent += chunkSize {
+		if err := s.queueInput(block); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.queueEOF()
+
+	select {
+	case <-readDone:
+	case <-time.After(60 * time.Second):
+		t.Fatal("slow reader never reached EOF")
+	}
+	mu.Lock()
+	n := received
+	mu.Unlock()
+	if n != total {
+		t.Fatalf("slow reader received %d of %d stdin bytes: input was truncated", n, total)
+	}
+	if s.takeDropped() {
+		t.Fatal("stdin was dropped for a slow but steadily reading process")
+	}
+}
+
+// TestNonTTYInputLossIsNotReportedAsSuccess verifies that if the guest really
+// must discard a non-terminal byte stream, the command does not report success
+// as if the whole stream had been delivered.
+func TestNonTTYInputLossIsNotReportedAsSuccess(t *testing.T) {
+	g := &Guest{sessions: map[string]*session{}}
+	s := &session{g: g, id: "exec-lost", out: ring{max: ringSize}}
+	s.cond = sync.NewCond(&s.mu)
+	s.inCond = sync.NewCond(&s.inMu)
+	// No pump and a full queue: the next frame makes no progress and is
+	// discarded after inputStallTimeout.
+	s.inBytes = maxPendingInput
+	if err := s.queueInput([]byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+	if !s.takeDropped() {
+		t.Fatal("lost input was not reported")
+	}
+	s.finish(wire.Exit{Code: 0})
+	if s.status.Code == 0 {
+		t.Fatal("a command that lost stdin reported exit status 0")
+	}
+}
+
 // TestQueuedInputPreservesOrder checks that stdin and its end-of-file marker
 // are written in order by the input pump.
 func TestQueuedInputPreservesOrder(t *testing.T) {

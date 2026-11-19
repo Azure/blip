@@ -39,17 +39,20 @@ type session struct {
 	// or PTY blocks when the process does not read it; doing that in the
 	// frame loop would also block resize and signal frames, so a command
 	// like `sleep` could not be interrupted after its stdin filled up.
-	inMu      sync.Mutex
-	inCond    *sync.Cond
-	inQueue   [][]byte
-	inBytes   int
-	inEOF     bool
-	inDone    bool      // no more input will be queued
-	inDropped bool      // input was discarded because the process is not reading
-	inStalled bool      // no input space was freed for inputStallTimeout
-	inNotice  time.Time // when the stdin-discarded notice was last sent
-	inWrote   bool      // input has reached the process
-	inLast    byte      // last input byte written, for terminal EOF handling
+	inMu       sync.Mutex
+	inCond     *sync.Cond
+	inQueue    [][]byte
+	inBytes    int    // queued but not yet handed to the pump
+	inFlight   int    // dequeued and being written by the pump
+	inProgress uint64 // completed write chunks, for stall-clock resets
+	inEOF      bool
+	inDone     bool      // no more input will be queued
+	inDropped  bool      // input was discarded because the process is not reading
+	inStalled  bool      // no input space was freed for inputStallTimeout
+	inLost     bool      // a non-terminal stream lost bytes; do not report success
+	inNotice   time.Time // when the stdin-discarded notice was last sent
+	inWrote    bool      // input has reached the process
+	inLast     byte      // last input byte written, for terminal EOF handling
 
 	// Exec sessions hold output pumps until the client is attached (right
 	// after TOpened), so output produced during the open handshake cannot
@@ -78,6 +81,11 @@ const (
 	// detachGrace is how long a detached exec command gets between SIGTERM
 	// and SIGKILL after its last client goes away.
 	detachGrace = 2 * time.Second
+	// inputWriteChunk bounds one stdin write. Counting progress at this
+	// granularity keeps the stall clock alive while a slow reader drains a
+	// large dequeued batch; without it a slow-but-steady reader looked dead
+	// for as long as it took to write the whole batch.
+	inputWriteChunk = 32 << 10
 	// ttyEOFSettle lets a program that is switching the terminal to raw
 	// mode (line editors do this at startup) finish before the guest
 	// decides whether a canonical VEOF will be interpreted as EOF or data.
@@ -420,7 +428,14 @@ func (s *session) pumpInput() {
 		}
 		queue, eof := s.inQueue, s.inEOF
 		s.inQueue, s.inBytes, s.inEOF = nil, 0, false
-		s.inCond.Broadcast() // space is available again
+		// A dequeued frame is still occupying the byte budget: writing it
+		// can block for as long as the reader takes. Count it as in flight
+		// until each chunk is written, or a slow reader looks like it made
+		// no progress while the pump sits in write.
+		for _, b := range queue {
+			s.inFlight += len(b)
+		}
+		s.inCond.Broadcast()
 		s.inMu.Unlock()
 		for _, b := range queue {
 			s.writeInput(b)
@@ -428,6 +443,7 @@ func (s *session) pumpInput() {
 		// The process consumed this batch, so it is reading again. A stalled
 		// writer may resume queuing input.
 		s.inMu.Lock()
+		s.inFlight = 0 // writeInput accounts per chunk; be safe after errors
 		if s.inStalled {
 			s.inStalled = false
 		}
@@ -443,19 +459,34 @@ func (s *session) pumpInput() {
 	}
 }
 
+// writeInput writes one queued frame in chunks, releasing its byte-budget
+// reservation and reporting progress after each chunk. The per-chunk progress
+// is what lets queueInput tell a slow reader (which keeps freeing pipe space)
+// from a process that stopped reading (which frees nothing for a full second).
 func (s *session) writeInput(b []byte) {
 	p := s.proc
 	if p == nil {
 		return
 	}
-	if p.tty != nil {
-		_, _ = p.tty.Write(b)
-	} else {
-		_, _ = p.stdin.Write(b)
-	}
-	if len(b) > 0 {
+	for len(b) > 0 {
+		n := min(len(b), inputWriteChunk)
+		if p.tty != nil {
+			_, _ = p.tty.Write(b[:n])
+		} else {
+			_, _ = p.stdin.Write(b[:n])
+		}
 		s.inWrote = true
-		s.inLast = b[len(b)-1]
+		s.inLast = b[n-1]
+		b = b[n:]
+
+		s.inMu.Lock()
+		s.inFlight -= n
+		if s.inFlight < 0 {
+			s.inFlight = 0
+		}
+		s.inProgress++
+		s.inCond.Broadcast()
+		s.inMu.Unlock()
 	}
 }
 
@@ -590,23 +621,47 @@ func (s *session) queueInput(payload []byte) error {
 	if s.inDone {
 		return nil
 	}
+	// Bytes dequeued by the pump are still in flight to the process and
+	// must count against the limit too. inBytes alone made the queue look
+	// empty while the pump was blocked writing a batch, so a slow reader
+	// could be miscounted as stalled and have its stream dropped.
+	space := func() int {
+		n := maxPendingInput - s.inBytes - s.inFlight
+		if n < 0 {
+			return 0
+		}
+		return n
+	}
 	if s.tty {
-		if len(payload) > maxPendingInput-s.inBytes {
+		if len(payload) > space() {
 			s.dropInputLocked()
 			return nil
 		}
-	} else if !s.inStalled && len(payload) > maxPendingInput-s.inBytes {
+	} else if !s.inStalled && len(payload) > space() {
+		// Wait for the pump to make room, but only while it makes progress.
+		// The stall clock restarts after every written chunk, so a slow but
+		// steadily reading process is never mistaken for one that stopped
+		// reading.
+		deadline := time.Now().Add(inputStallTimeout)
+		gen := s.inProgress
 		timer := time.AfterFunc(inputStallTimeout, func() {
 			s.inMu.Lock()
 			s.inCond.Broadcast()
 			s.inMu.Unlock()
 		})
-		deadline := time.Now().Add(inputStallTimeout)
-		for !s.inDone && !s.inStalled && len(payload) > maxPendingInput-s.inBytes && time.Now().Before(deadline) {
+		for !s.inDone && !s.inStalled && len(payload) > space() {
+			if !time.Now().Before(deadline) {
+				break
+			}
 			s.inCond.Wait()
+			if s.inProgress != gen {
+				gen = s.inProgress
+				deadline = time.Now().Add(inputStallTimeout)
+				timer.Reset(inputStallTimeout)
+			}
 		}
 		timer.Stop()
-		if !s.inDone && len(payload) > maxPendingInput-s.inBytes {
+		if !s.inDone && len(payload) > space() {
 			s.inStalled = true
 			// Wake other clients' writers so they drop promptly too.
 			s.inCond.Broadcast()
@@ -630,6 +685,12 @@ func (s *session) queueInput(payload []byte) error {
 // dropInputLocked records discarded stdin. Notices are throttled: a client
 // flooding input must not produce one warning per frame.
 func (s *session) dropInputLocked() {
+	// A non-terminal stdin is a byte stream (an upload). Losing part of it
+	// must not be reported as a successful command, even when the stream is
+	// dropped to keep control frames responsive.
+	if !s.tty {
+		s.inLost = true
+	}
 	if s.inDropped {
 		return
 	}
@@ -672,6 +733,14 @@ func (s *session) clearReplayLocked() {
 
 func (s *session) finish(st wire.Exit) {
 	s.closeInput()
+	s.inMu.Lock()
+	lost := s.inLost
+	s.inMu.Unlock()
+	if lost && st.Code == 0 && st.Signal == "" {
+		// The command itself succeeded, but its stdin was truncated. A
+		// caller cannot detect that from exit 0, so report a failure.
+		st.Code = 1
+	}
 	// The process can no longer write, so the mirror has nothing left to
 	// follow. stop drains the console queue and joins its goroutine.
 	s.mirror.stop()
