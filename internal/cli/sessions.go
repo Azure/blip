@@ -168,6 +168,15 @@ func (a *app) execSession(ctx context.Context, name, pod string, argv []string, 
 	a.ttyOpen(&o, tty)
 	s, err := a.open(ctx, pod, o)
 	if err != nil {
+		// A start failure has a conventional shell status. Print the
+		// explanation, then return that status so a script can distinguish
+		// "not found" (127) or "not executable" (126) from a command that
+		// ran and exited 1.
+		var oe *session.OpenError
+		if errors.As(err, &oe) {
+			fmt.Fprintf(a.env.Err, "error: %v\n", err)
+			return &ExitError{Code: oe.Code}
+		}
 		return err
 	}
 	return a.stream(ctx, s, streamOpts{blip: name, sendEOF: true})

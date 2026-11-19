@@ -1,6 +1,7 @@
 package guest
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -15,6 +16,41 @@ import (
 
 	"github.com/Azure/blip/internal/podapi"
 )
+
+// startError is a failure before the command ran, carrying the conventional
+// shell status: 127 when the command was not found and 126 when it exists but
+// cannot be executed (EACCES, ENOEXEC, a bad workdir, or another start-time
+// configuration failure). Without it every primary start failure reported 127,
+// and exec reported a plain error indistinguishable from a command exiting 1.
+type startError struct {
+	code int
+	err  error
+}
+
+func (e *startError) Error() string { return e.err.Error() }
+func (e *startError) Unwrap() error { return e.err }
+
+func startFail(code int, err error) error { return &startError{code: code, err: err} }
+
+// startExitCode returns the conventional status for a command that could not
+// start. A failure that is not attributable to command lookup prevents
+// execution, which is 126.
+func startExitCode(err error) int {
+	var se *startError
+	if errors.As(err, &se) {
+		return se.code
+	}
+	return 126
+}
+
+// classifyStart maps an error from os.StartProcess to 127 only when the
+// command does not exist; execution errors are 126.
+func classifyStart(err error) int {
+	if errors.Is(err, unix.ENOENT) {
+		return 127
+	}
+	return 126
+}
 
 // reaper reaps every child (as PID 1 it also inherits orphans) and delivers
 // exit statuses to registered waiters. Processes are only started through
@@ -189,7 +225,7 @@ func canSearchDir(fi os.FileInfo, acct *account) bool {
 func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	acct, err := lookupAccount(g.root, s.user)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, startFail(126, err)
 	}
 	argv := s.argv
 	argv0 := ""
@@ -203,6 +239,9 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 			return nil, nil, err
 		}
 	}
+	// Validation and start failures below are not "command not found": the
+	// command may be fine but the workdir, credentials, or process setup is
+	// wrong, so they use the conventional 126 instead of the old 127.
 	dir := s.dir
 	if dir == "" {
 		dir = "/"
@@ -220,12 +259,12 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	// the executable were missing. Stat it inside the root, like the chdir
 	// will happen after chroot.
 	if fi, err := statInRoot(g.root, dir); err != nil {
-		return nil, nil, fmt.Errorf("chdir %s: %w", dir, err)
+		return nil, nil, startFail(126, fmt.Errorf("chdir %s: %w", dir, err))
 	} else if !fi.IsDir() {
-		return nil, nil, fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR)
+		return nil, nil, startFail(126, fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR))
 	}
 	if err := checkDirAccess(g.root, dir, acct); err != nil {
-		return nil, nil, err
+		return nil, nil, startFail(126, err)
 	}
 
 	p := &proc{}
@@ -242,7 +281,7 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	if s.tty {
 		master, slave, err := openPTY()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, startFail(126, err)
 		}
 		_ = slave.Chown(int(acct.uid), int(acct.gid))
 		rows, cols := s.rows, s.cols
@@ -257,7 +296,7 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	} else {
 		inR, inW, err := procStdin(s.stdinEOF)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, startFail(126, err)
 		}
 		outR, outW, _ := os.Pipe()
 		errR, errW, _ := os.Pipe()
@@ -270,7 +309,7 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	}
 	if err != nil {
 		p.close()
-		return nil, nil, fmt.Errorf("start %s: %w", argv[0], err)
+		return nil, nil, startFail(classifyStart(err), fmt.Errorf("start %s: %w", argv[0], err))
 	}
 	p.pid, p.wait = pid, wait
 	return p, argv, nil

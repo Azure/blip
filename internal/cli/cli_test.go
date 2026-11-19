@@ -145,6 +145,27 @@ func TestExecWithoutCommandOpensLoginShell(t *testing.T) {
 	}
 }
 
+// A command that cannot start returns the conventional status, not exit 1:
+// 127 when it is missing and 126 when it exists but cannot be executed. The
+// explanation stays on stderr.
+func TestExecStartFailureExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		code int
+		msg  string
+	}{
+		{127, "nosuchcmd: command not found"},
+		{126, "start /etc/passwd: fork/exec /etc/passwd: permission denied"},
+	} {
+		h := newHarness(t, runningBlip("agent"))
+		h.guest.OpenError = tc.msg
+		h.guest.OpenCode = tc.code
+		code, _, errOut := h.run("", "exec", "agent", "--", "x")
+		if code != tc.code || !strings.Contains(errOut, tc.msg) {
+			t.Fatalf("code %d err %q, want %d containing %q", code, errOut, tc.code, tc.msg)
+		}
+	}
+}
+
 func TestExecSignalExitCode(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"))
 	h.guest.Run = func(s *fakeguest.Session) wire.Exit { return wire.Exit{Signal: "KILL"} }

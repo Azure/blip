@@ -169,5 +169,5 @@ func lookPath(root, name string, env []string) (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("%s: command not found", name)
+	return "", startFail(127, fmt.Errorf("%s: command not found", name))
 }

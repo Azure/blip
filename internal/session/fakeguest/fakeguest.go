@@ -17,8 +17,10 @@ type Guest struct {
 	// Run handles exec and attach sessions and returns the exit status.
 	// The default exits 0 immediately.
 	Run func(s *Session) wire.Exit
-	// OpenError, if set, rejects exec and attach requests.
+	// OpenError, if set, rejects exec and attach requests. OpenCode is the
+	// conventional exit status carried with a start failure.
 	OpenError string
+	OpenCode  int
 
 	mu    sync.Mutex
 	opens []Request
@@ -94,7 +96,7 @@ func (g *Guest) serve(pod string, c net.Conn) {
 	}
 	n := g.record(Request{Pod: pod, Open: o})
 	if g.OpenError != "" {
-		conn.WriteJSON(wire.TOpened, wire.Opened{Error: g.OpenError})
+		conn.WriteJSON(wire.TOpened, wire.Opened{Error: g.OpenError, Code: g.OpenCode})
 		return
 	}
 	id := o.Session

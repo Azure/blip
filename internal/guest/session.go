@@ -316,7 +316,9 @@ func (g *Guest) failedSession(id string, argv []string, err error) *session {
 	g.mu.Lock()
 	g.sessions[id] = ss
 	g.mu.Unlock()
-	ss.finish(wire.Exit{Code: 127})
+	// A start failure has a conventional shell status: 127 for a missing
+	// command, 126 for a command that cannot be executed or a bad workdir.
+	ss.finish(wire.Exit{Code: startExitCode(err)})
 	return ss
 }
 
@@ -853,7 +855,7 @@ func (g *Guest) serveSession(f io.ReadWriteCloser) {
 	case wire.OpenExec:
 		s, err := g.openExec(o)
 		if err != nil {
-			reject(c, f, err)
+			rejectStart(c, f, err)
 			return
 		}
 		if c.WriteJSON(wire.TOpened, wire.Opened{Session: s.id, TTY: s.tty}) != nil {
@@ -884,6 +886,20 @@ func execProcSpec(claim *wire.Claim, o wire.Open) procSpec {
 
 func reject(c *wire.Conn, f io.Closer, err error) {
 	_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error()})
+	f.Close()
+}
+
+// rejectStart rejects an exec open. If the failure happened while starting the
+// command, the conventional exit status travels with the error so the client
+// can return 126/127 instead of a plain exit 1 that is indistinguishable from
+// a command that ran and exited 1.
+func rejectStart(c *wire.Conn, f io.Closer, err error) {
+	var se *startError
+	if errors.As(err, &se) {
+		_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error(), Code: se.code})
+	} else {
+		_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error()})
+	}
 	f.Close()
 }
 
