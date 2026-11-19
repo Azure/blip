@@ -400,7 +400,9 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 			current.Status.TokensToday = 0
 		}
 		current.Status.TokensToday += tokens
-		if st.paused != "" {
+		// A pause set while the step ran (an operator hold) is not ours to
+		// replace: only install the budget pause on an otherwise idle thread.
+		if st.paused != "" && current.Status.Paused == nil {
 			current.Status.Paused = &v1.ThreadPause{Reason: st.paused}
 		}
 		if err := s.Status().Update(ctx, current); err != nil {

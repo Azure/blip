@@ -263,3 +263,46 @@ func TestOverBudgetPromptKeepsLateWakingTurnWithoutConsuming(t *testing.T) {
 		t.Errorf("consumedSeq = %d, want 0 when the prefix was not rendered", updated.Status.ConsumedSeq)
 	}
 }
+
+// A manual pause set while a step is in flight must survive the step's budget
+// pause: overwriting it would let maybeUnpause clear an operator hold at the
+// next UTC midnight.
+func TestMidStepOperatorPauseSurvivesBudgetPause(t *testing.T) {
+	now := timeNow()
+	thread := testThread()
+	thread.Spec.DailyTokens = 10
+	thread.Status.TokenDay = now.UTC().Format("2006-01-02")
+	thread.Status.TokensToday = 9
+	turn := testTurn("one", "proj")
+	turn.Status.Seq = 1
+	turn.Status.AcceptedTime = &metav1.Time{Time: now.Add(-time.Minute)}
+	c := testClient(t, thread, turn)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.Background()
+		var live v1.BlipThread
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "proj"}, &live); err == nil {
+			live.Status.Paused = &v1.ThreadPause{Reason: "operator hold"}
+			_ = c.Status().Update(ctx, &live)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": Message{Role: "assistant", Content: "ok"}}},
+			"usage":   map[string]any{"prompt_tokens": 10, "completion_tokens": 5},
+		})
+	}))
+	defer server.Close()
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 100000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	if err := s.step(context.Background(), thread); err != nil {
+		t.Fatal(err)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(thread), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Paused == nil || updated.Status.Paused.Reason != "operator hold" {
+		t.Errorf("mid-step operator pause was replaced by %+v", updated.Status.Paused)
+	}
+}
