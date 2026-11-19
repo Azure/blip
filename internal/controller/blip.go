@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -443,6 +444,18 @@ func (r *BlipReconciler) finish(b *v1.Blip, phase, reason, msg string) {
 	b.Status.FinishTime = &now
 }
 
+// deadlineTime returns start plus seconds, saturating seconds at the largest
+// value whose nanosecond duration fits in an int64. The CRD rejects larger
+// values, but an object stored before that bound existed must not wrap the
+// duration negative and stop the Blip immediately.
+func deadlineTime(start time.Time, seconds int64) time.Time {
+	const maxSeconds = int64(math.MaxInt64 / int64(time.Second))
+	if seconds > maxSeconds {
+		seconds = maxSeconds
+	}
+	return start.Add(time.Duration(seconds) * time.Second)
+}
+
 // deadlineExceeded reports whether a started, unfinished Blip has outlived
 // spec.activeDeadlineSeconds. A Blip that is already stopping is left to that
 // stop so the deadline cannot restart it, and Saving means the command already
@@ -452,7 +465,7 @@ func (r *BlipReconciler) deadlineExceeded(b *v1.Blip) bool {
 		b.Spec.ActiveDeadlineSeconds == nil || b.Status.StartTime == nil {
 		return false
 	}
-	return !r.now().Before(b.Status.StartTime.Add(time.Duration(*b.Spec.ActiveDeadlineSeconds) * time.Second))
+	return !r.now().Before(deadlineTime(b.Status.StartTime.Time, *b.Spec.ActiveDeadlineSeconds))
 }
 
 // stopForDeadline sets spec.stop as an expired deadline would. A conflict is
@@ -507,7 +520,7 @@ func (r *BlipReconciler) startDeadline(b *v1.Blip) (time.Time, bool) {
 		add(b.CreationTimestamp.Add(pendingTimeout))
 	}
 	if !v1.Finished(b) && b.Spec.ActiveDeadlineSeconds != nil && b.Status.StartTime != nil {
-		add(b.Status.StartTime.Add(time.Duration(*b.Spec.ActiveDeadlineSeconds) * time.Second))
+		add(deadlineTime(b.Status.StartTime.Time, *b.Spec.ActiveDeadlineSeconds))
 	}
 	return deadline, !deadline.IsZero()
 }

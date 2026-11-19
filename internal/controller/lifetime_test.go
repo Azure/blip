@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -71,6 +72,39 @@ func TestActiveDeadlineStopsAndFinishes(t *testing.T) {
 	expectPhase(t, b, v1.BlipSucceeded, ReasonStopped)
 	if b.Status.ExitCode != nil || b.Status.FinishTime == nil {
 		t.Fatalf("deadline stop recorded a command failure or no finish: %+v", b.Status)
+	}
+}
+
+// TestActiveDeadlineOverflowDoesNotStop guards the seconds-to-duration
+// conversion. An activeDeadlineSeconds near int64 max used to overflow
+// time.Duration, wrap negative, and stop the Blip immediately. Admission now
+// bounds the field, but a stored object must also be saturated rather than
+// interpreted as already expired.
+func TestActiveDeadlineOverflowDoesNotStop(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if got, want := deadlineTime(start, 9223372036), start.Add(time.Duration(9223372036)*time.Second); !got.Equal(want) {
+		t.Errorf("largest safe deadline = %s, want %s", got, want)
+	}
+	for _, seconds := range []int64{9223372037, math.MaxInt64} {
+		got := deadlineTime(start, seconds)
+		if got.Before(start) {
+			t.Errorf("deadline for %d wrapped negative: %s", seconds, got)
+		}
+		if !got.After(start.Add(100 * 365 * 24 * time.Hour)) {
+			t.Errorf("deadline for %d = %s, want a saturated far-future bound", seconds, got)
+		}
+	}
+
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	b := e.startBlip("job", "n1", withRoot("home"))
+	e.updateBlip("job", func(b *v1.Blip) { b.Spec.ActiveDeadlineSeconds = int64Ptr(math.MaxInt64) })
+	e.now = b.Status.StartTime.Time.Add(time.Minute)
+	e.run(e.blip, ns, "job")
+	if b = e.getBlip("job"); b.Spec.Stop {
+		t.Fatal("an overflowing activeDeadlineSeconds stopped the blip immediately")
 	}
 }
 

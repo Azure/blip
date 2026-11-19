@@ -42,15 +42,18 @@ type BlipPoolSpec struct {
 	// +kubebuilder:default=kvm
 	Hypervisor string `json:"hypervisor,omitempty"`
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2147483647
 	// +kubebuilder:default=2
 	CPUs int32 `json:"cpus,omitempty"`
 	// +kubebuilder:default="2Gi"
 	Memory resource.Quantity `json:"memory,omitempty"`
 	// WarmCount is the number of vacant, booted VMs to keep ready.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	WarmCount int32 `json:"warmCount,omitempty"`
 	// MaxCount caps vacant plus claimed VM pods. 0 means no cap.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	MaxCount int32 `json:"maxCount,omitempty"`
 	// ServiceAccountName is the identity of VMs in this pool.
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
@@ -100,8 +103,14 @@ type PoolEndpoint struct {
 
 type BlipPoolStatus struct {
 	// Ready counts vacant VMs that finished booting.
-	Ready   int32 `json:"ready,omitempty"`
-	Vacant  int32 `json:"vacant,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	Ready int32 `json:"ready,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	Vacant int32 `json:"vacant,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	Claimed int32 `json:"claimed,omitempty"`
 	// Reason is a CamelCase cause set when the pool configuration cannot
 	// produce VMs, for example InvalidConfiguration for an endpoint that
@@ -502,11 +511,13 @@ type BlipSpec struct {
 	// long. The VM is stopped as if spec.stop were set. `blip run --timeout`
 	// sets it.
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9223372036
 	// +optional
 	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
 	// TTLSecondsAfterFinished deletes the blip this long after it finished,
 	// whether or not anyone gathered its results. `blip run --ttl` sets it.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	// +optional
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 	// Network narrows the pool's egress policy. Omitted inherits the root
@@ -572,8 +583,16 @@ type BlipStatus struct {
 	RootAttachmentID string       `json:"rootAttachmentID,omitempty"`
 	StartTime        *metav1.Time `json:"startTime,omitempty"`
 	FinishTime       *metav1.Time `json:"finishTime,omitempty"`
-	ExitCode         *int32       `json:"exitCode,omitempty"`
-	Sessions         int32        `json:"sessions,omitempty"`
+	// ExitCode is the command's exit status. It is 0-255 for a real process,
+	// but the bound is the int32 range so a malformed status cannot break the
+	// controller's typed list/watch decode.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	ExitCode *int32 `json:"exitCode,omitempty"`
+	// Sessions is the number of attached sessions.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	Sessions int32 `json:"sessions,omitempty"`
 	// +listType=map
 	// +listMapKey=state
 	Mounts []MountStatus `json:"mounts,omitempty"`

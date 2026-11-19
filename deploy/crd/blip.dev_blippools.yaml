@@ -56,6 +56,7 @@ spec:
               cpus:
                 default: 2
                 format: int32
+                maximum: 2147483647
                 minimum: 1
                 type: integer
               endpoints:
@@ -129,6 +130,7 @@ spec:
                 description: MaxCount caps vacant plus claimed VM pods. 0 means no
                   cap.
                 format: int32
+                maximum: 2147483647
                 minimum: 0
                 type: integer
               memory:
@@ -440,6 +442,7 @@ spec:
                 description: WarmCount is the number of vacant, booted VMs to keep
                   ready.
                 format: int32
+                maximum: 2147483647
                 minimum: 0
                 type: integer
             required:
@@ -449,6 +452,8 @@ spec:
             properties:
               claimed:
                 format: int32
+                maximum: 2147483647
+                minimum: 0
                 type: integer
               message:
                 description: Message is a human-readable explanation of Reason.
@@ -456,6 +461,8 @@ spec:
               ready:
                 description: Ready counts vacant VMs that finished booting.
                 format: int32
+                maximum: 2147483647
+                minimum: 0
                 type: integer
               reason:
                 description: |-
@@ -465,6 +472,8 @@ spec:
                 type: string
               vacant:
                 format: int32
+                maximum: 2147483647
+                minimum: 0
                 type: integer
             type: object
         type: object

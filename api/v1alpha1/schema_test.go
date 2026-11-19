@@ -33,6 +33,7 @@ type crdSchema struct {
 	Pattern      string               `json:"pattern"`
 	MaxLength    int64                `json:"maxLength"`
 	Minimum      int64                `json:"minimum"`
+	Maximum      int64                `json:"maximum"`
 	MinItems     int64                `json:"minItems"`
 	MaxItems     int64                `json:"maxItems"`
 	Required     []string             `json:"required"`
@@ -580,5 +581,124 @@ func TestBlipThreadTaskIDPattern(t *testing.T) {
 	}
 	if id.MaxLength != 16 {
 		t.Errorf("task id maxLength = %d, want 16", id.MaxLength)
+	}
+}
+
+// schemaAt walks a generated CRD schema to a property path.
+func schemaAt(t *testing.T, root crdSchema, path ...string) crdSchema {
+	t.Helper()
+	current := root
+	for _, name := range path {
+		next, ok := current.Properties[name]
+		if !ok {
+			t.Fatalf("generated CRD has no %s property", strings.Join(path, "."))
+		}
+		current = next
+	}
+	return current
+}
+
+// TestInt32FieldsBounded guards every int32 field the API generates.
+// format: int32 is metadata only: the API server stores 2147483648, and one
+// such value makes the controller's cluster-wide typed list/watch decode fail,
+// breaking every namespace. Maximums are therefore explicit in the schema.
+func TestInt32FieldsBounded(t *testing.T) {
+	type int32Field struct {
+		crd  string
+		root func(*testing.T) crdSchema
+		path []string
+		min  int64
+	}
+	const maxInt32 = 2147483647
+	root := func(crd string) func(*testing.T) crdSchema {
+		return func(t *testing.T) crdSchema { return loadCRDRoot(t, "../../deploy/crd/blip.dev_"+crd+".yaml") }
+	}
+	for _, tc := range []int32Field{
+		{crd: "blips", root: root("blips"), path: []string{"spec", "ttlSecondsAfterFinished"}, min: 0},
+		{crd: "blips", root: root("blips"), path: []string{"status", "exitCode"}, min: 0},
+		{crd: "blips", root: root("blips"), path: []string{"status", "sessions"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"spec", "cpus"}, min: 1},
+		{crd: "blippools", root: root("blippools"), path: []string{"spec", "warmCount"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"spec", "maxCount"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"status", "ready"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"status", "vacant"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"status", "claimed"}, min: 0},
+		{crd: "blipthreads", root: root("blipthreads"), path: []string{"spec", "maxRunning"}, min: 1},
+		{crd: "blipthreads", root: root("blipthreads"), path: []string{"spec", "retention", "keepTurns"}, min: 0},
+		{crd: "blipthreads", root: root("blipthreads"), path: []string{"spec", "retention", "maxTasks"}, min: 0},
+	} {
+		field := schemaAt(t, tc.root(t), tc.path...)
+		if field.Maximum != maxInt32 {
+			t.Errorf("%s %s maximum = %d, want %d", tc.crd, strings.Join(tc.path, "."), field.Maximum, maxInt32)
+		}
+		if field.Minimum != tc.min {
+			t.Errorf("%s %s minimum = %d, want %d", tc.crd, strings.Join(tc.path, "."), field.Minimum, tc.min)
+		}
+	}
+}
+
+// TestInt32AdmissionBoundaries proves admission rejects one past int32 max and
+// still accepts the exact maximum.
+func TestInt32AdmissionBoundaries(t *testing.T) {
+	const tooBig = 2147483648
+	blip := admissionValidator(t, "blips")
+	for _, tc := range []struct {
+		name   string
+		object string
+	}{
+		{"ttl", fmt.Sprintf(`{"spec":{"state":"root","command":["true"],"ttlSecondsAfterFinished":%d}}`, tooBig)},
+		{"exitCode", fmt.Sprintf(`{"spec":{"state":"root","command":["true"]},"status":{"exitCode":%d}}`, tooBig)},
+		{"sessions", fmt.Sprintf(`{"spec":{"state":"root","command":["true"]},"status":{"sessions":%d}}`, tooBig)},
+	} {
+		if errs := blip(tc.object, ""); len(errs) == 0 {
+			t.Errorf("admitted out-of-range blip %s", tc.name)
+		}
+	}
+	if errs := blip(`{"spec":{"state":"root","command":["true"],"ttlSecondsAfterFinished":2147483647}}`, ""); len(errs) != 0 {
+		t.Errorf("rejected max int32 ttl: %v", errs.ToAggregate())
+	}
+
+	pool := admissionValidator(t, "blippools")
+	for _, field := range []string{"cpus", "warmCount", "maxCount"} {
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"blip.dev/node-pool":"default"},"%s":%d}}`, field, tooBig)
+		if errs := pool(object, ""); len(errs) == 0 {
+			t.Errorf("admitted out-of-range pool spec.%s", field)
+		}
+	}
+
+	thread := admissionValidator(t, "blipthreads")
+	for _, object := range []string{
+		fmt.Sprintf(`{"spec":{"pool":"p","maxRunning":%d}}`, tooBig),
+		fmt.Sprintf(`{"spec":{"pool":"p","retention":{"keepTurns":%d}}}`, tooBig),
+		fmt.Sprintf(`{"spec":{"pool":"p","retention":{"maxTasks":%d}}}`, tooBig),
+	} {
+		if errs := thread(object, ""); len(errs) == 0 {
+			t.Errorf("admitted out-of-range thread field: %s", object)
+		}
+	}
+}
+
+// TestActiveDeadlineOverflowRejected guards the seconds-to-duration bound.
+// The controller multiplies activeDeadlineSeconds by time.Second; a value
+// above 9223372036 overflows int64 nanoseconds, wrapped negative, and stopped
+// the Blip immediately.
+func TestActiveDeadlineOverflowRejected(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blips.yaml")
+	deadline := schemaAt(t, crdSchema{Properties: map[string]crdSchema{"spec": spec}}, "spec", "activeDeadlineSeconds")
+	if deadline.Maximum != 9223372036 {
+		t.Errorf("activeDeadlineSeconds maximum = %d, want 9223372036", deadline.Maximum)
+	}
+
+	validate := admissionValidator(t, "blips")
+	blip := func(seconds int64) string {
+		return fmt.Sprintf(`{"spec":{"state":"root","command":["true"],"activeDeadlineSeconds":%d}}`, seconds)
+	}
+	if errs := validate(blip(9223372036), ""); len(errs) != 0 {
+		t.Errorf("rejected the largest safe deadline: %v", errs.ToAggregate())
+	}
+	for _, seconds := range []int64{9223372037, 9223372036854775807} {
+		if errs := validate(blip(seconds), ""); len(errs) == 0 {
+			t.Errorf("admitted overflowing deadline %d", seconds)
+		}
 	}
 }

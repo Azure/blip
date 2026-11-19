@@ -85,6 +85,7 @@ spec:
                 description: MaxRunning caps concurrently running blips labelled with
                   this thread.
                 format: int32
+                maximum: 2147483647
                 minimum: 1
                 type: integer
               model:
@@ -110,12 +111,14 @@ spec:
                     description: KeepTurns is the minimum number of turns kept per
                       thread.
                     format: int32
+                    maximum: 2147483647
                     minimum: 0
                     type: integer
                   maxTasks:
                     description: MaxTasks caps the task board. The oldest closed tasks
                       are pruned first.
                     format: int32
+                    maximum: 2147483647
                     minimum: 0
                     type: integer
                   turns:

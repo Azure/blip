@@ -31,6 +31,7 @@ type BlipThreadSpec struct {
 	Base string `json:"base,omitempty"`
 	// MaxRunning caps concurrently running blips labelled with this thread.
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2147483647
 	// +kubebuilder:default=1
 	MaxRunning int32 `json:"maxRunning,omitempty"`
 	// Model is the model name passed to the OpenAI-compatible endpoint.
@@ -55,12 +56,14 @@ type ThreadRetention struct {
 	Turns *metav1.Duration `json:"turns,omitempty"`
 	// KeepTurns is the minimum number of turns kept per thread.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	KeepTurns int32 `json:"keepTurns,omitempty"`
 	// ClosedTasks is how long closed tasks are kept after their last update.
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="retention.closedTasks must be a non-negative duration"
 	ClosedTasks *metav1.Duration `json:"closedTasks,omitempty"`
 	// MaxTasks caps the task board. The oldest closed tasks are pruned first.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	MaxTasks int32 `json:"maxTasks,omitempty"`
 }
 
