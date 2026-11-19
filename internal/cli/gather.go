@@ -422,12 +422,14 @@ func (a *app) follow(ctx context.Context, name string) {
 		if ctx.Err() != nil {
 			return
 		}
+		// The replay ring died with the VM. The guest still mirrored the
+		// command to the serial console, and the controller retains the tail
+		// in status. Try both even when our cached view still says Running:
+		// the pod can disappear between the wait and this attach.
+		if a.replayLogs(ctx, pod, short) || a.printRetainedFor(ctx, name, short, 3*time.Second) {
+			return
+		}
 		if ending || a.blipEnding(ctx, name) {
-			// The replay ring died with the VM. The guest still mirrored the
-			// command to the serial console, which the pod keeps as its log.
-			if a.replayLogs(ctx, pod, short) || a.printRetained(ctx, name, short) {
-				return
-			}
 			a.progress("%s: output is no longer available: %v", short, err)
 			return
 		}
@@ -466,11 +468,16 @@ var retainedOutputWait = 15 * time.Second
 // follower, so poll for the status write until retainedOutputWait expires. It
 // returns whether it printed anything.
 func (a *app) printRetained(ctx context.Context, name, short string) bool {
+	return a.printRetainedFor(ctx, name, short, retainedOutputWait)
+}
+
+// printRetainedFor is printRetained with a caller-selected grace period.
+func (a *app) printRetainedFor(ctx context.Context, name, short string, wait time.Duration) bool {
 	c, err := a.clients()
 	if err != nil {
 		return false
 	}
-	deadline := time.Now().Add(retainedOutputWait)
+	deadline := time.Now().Add(wait)
 	for {
 		b := &v1alpha1.Blip{}
 		err := c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: name}, b)
