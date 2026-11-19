@@ -108,6 +108,9 @@ func Main() {
 	if !isInit() {
 		log.Fatal("blip-guest must run as PID 1")
 	}
+	if err := raiseWorkloadLimits(); err != nil {
+		log.Printf("workload limits: %v", err)
+	}
 	bootMounts()
 	loadModules("/lib/modules")
 	cfg, err := readConfig()
