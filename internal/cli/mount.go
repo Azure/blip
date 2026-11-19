@@ -876,6 +876,7 @@ func (a *app) unmountState(ctx context.Context, state, root string) error {
 	if err != nil && !errors.Is(err, errUnchanged) {
 		return err
 	}
+	terminating := s != nil && s.DeletionTimestamp != nil
 	b, err := a.rootWriter(ctx, s)
 	if err != nil {
 		return err
@@ -884,6 +885,12 @@ func (a *app) unmountState(ctx context.Context, state, root string) error {
 		return fmt.Errorf("state %q is not mounted on root state %q", state, root)
 	}
 	if b == nil {
+		if terminating {
+			// The removal was recorded, but the root is being deleted and
+			// will never execute again, so promising a later application
+			// would be false.
+			return fmt.Errorf("state %q is being deleted; the mount of state %q was removed but the root will not execute again", a.short(root), a.short(state))
+		}
 		fmt.Fprintf(a.env.Out, "state %s unmounted from root state %s; applied on next execution\n", a.short(state), a.short(root))
 		return nil
 	}
@@ -938,6 +945,9 @@ func (a *app) unmountState(ctx context.Context, state, root string) error {
 	})
 	if err != nil {
 		return err
+	}
+	if terminating {
+		return fmt.Errorf("state %q is being deleted; the mount of state %q was removed but the root will not execute again", a.short(root), a.short(state))
 	}
 	fmt.Fprintf(a.env.Out, "state %s unmounted from blip %s\n", a.short(state), a.short(b.Name))
 	return nil

@@ -1090,13 +1090,16 @@ func TestMountRejectsTerminatingRoot(t *testing.T) {
 			t.Fatal("terminating root left the new state behind")
 		}
 	})
-	t.Run("remove still allowed", func(t *testing.T) {
+	t.Run("remove still allowed but reports deletion", func(t *testing.T) {
 		root := newRoot()
 		root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
 		h := newHarness(t, root, readyState("data"))
 		code, _, errOut := h.run("", "mount", "--rm", "data", "--root", "home")
-		if code != 0 {
+		if code != 1 || !strings.Contains(errOut, `state "home" is being deleted`) {
 			t.Fatalf("--rm code %d: %s", code, errOut)
+		}
+		if strings.Contains(errOut, "applied on next execution") {
+			t.Fatalf("--rm promised a next execution on a terminating root: %s", errOut)
 		}
 		if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
 			t.Fatalf("--rm left desired intent: %+v", mounts)
