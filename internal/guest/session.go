@@ -927,11 +927,12 @@ func (g *Guest) serveSession(f io.ReadWriteCloser) {
 		if c.WriteJSON(wire.TOpened, wire.Opened{Session: s.id, TTY: s.tty}) != nil {
 			f.Close()
 			s.releasePumps()
-			// The client never learned the session ID, so an exec with no
-			// OpenID can never attach to or retry it: treat the failed reply
-			// like a detach so the just-started group cannot run unreachable.
-			// With an OpenID a retry must still be able to reuse the session,
-			// so leave that case for the retry (or the VM's end of life).
+			// Without an OpenID, no client can retry and attach to this
+			// session: the session ID only travels in the TOpened that
+			// failed. Treat that like a detach so the just-started group
+			// cannot run unreachable. With an OpenID the client is expected
+			// to retry and attach to this very session (see
+			// TestExecOpenIDDeduplicatesRetries), so it must survive.
 			if s.openID == "" {
 				s.terminate()
 			}

@@ -50,6 +50,12 @@ func TestLookPathMatchesExecvp(t *testing.T) {
 	if err != nil || p != "/home/dev/tool" {
 		t.Fatalf("empty PATH entry: %q, %v; want /home/dev/tool", p, err)
 	}
+	// An entirely empty PATH is a single empty component (the working
+	// directory), exactly like execvp's PATH="" handling.
+	p, err = lookPath(root, "/home/dev", "tool", []string{"PATH="}, acct)
+	if err != nil || p != "/home/dev/tool" {
+		t.Fatalf("empty PATH: %q, %v; want /home/dev/tool", p, err)
+	}
 	p, err = lookPath(root, "/tmp", "hello", []string{"PATH=/usr/bin"}, acct)
 	if err != nil || p != "/usr/bin/hello" {
 		t.Fatalf("absolute PATH entry: %q, %v; want /usr/bin/hello", p, err)

@@ -1,10 +1,14 @@
 package guest
 
 import (
+	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -239,6 +243,76 @@ func TestExecOpenIDDeduplicatesRetries(t *testing.T) {
 	if n := procs.starts.Load(); n != 1 {
 		t.Fatalf("third open started %d processes, want 1 total", n)
 	}
+}
+
+// failingWriteConn is a server-side connection whose reads work but whose
+// writes fail, simulating a client that disappears during the open handshake.
+type failingWriteConn struct {
+	io.ReadWriteCloser
+}
+
+func (failingWriteConn) Write([]byte) (int, error) {
+	return 0, errors.New("client went away")
+}
+
+// An exec open without an OpenID whose TOpened cannot be written must terminate
+// the command it started. No retry can attach to that session because its ID
+// only travels in the TOpened that failed, so the process would otherwise run
+// unreachable until the blip stops. An OpenID open must keep the session for
+// the retry (see TestExecOpenIDDeduplicatesRetries).
+func TestExecOpenWithoutOpenIDTerminatesWhenTOpenedWriteFails(t *testing.T) {
+	g := testGuest(t)
+	g.claim = &wire.Claim{ID: "root"}
+
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	wait := make(chan unix.WaitStatus, 1)
+	g.startProcess = func(s procSpec, base []string) (*proc, []string, error) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			return nil, nil, err
+		}
+		t.Cleanup(func() { w.Close() })
+		go func() {
+			// Only a terminated command should let the test finish; report
+			// whatever exit it had.
+			_, _ = cmd.Process.Wait()
+			wait <- unix.WaitStatus(0)
+		}()
+		return &proc{pid: cmd.Process.Pid, wait: wait, tty: r}, s.argv, nil
+	}
+
+	srv, cli := sessionPair(t)
+	_ = cli.SetDeadline(time.Now().Add(10 * time.Second))
+	go g.serveSession(failingWriteConn{srv})
+	if err := wire.NewConn(cli).WriteJSON(wire.TOpen, wire.Open{Mode: wire.OpenExec, Argv: []string{"sh"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var s *session
+	waitFor(t, "the exec session", func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		for _, cur := range g.sessions {
+			s = cur
+			return true
+		}
+		return false
+	})
+	id := s.id
+	waitFor(t, "the terminated session to leave the list", func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.sessions[id] == nil
+	})
 }
 
 // Clients that do not send an OpenID keep the old behavior: every open starts
