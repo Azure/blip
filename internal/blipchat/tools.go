@@ -181,7 +181,9 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 			}
 		}
 		timeout := maxExecTimeout
-		if v, ok := args["timeoutSeconds"].(float64); ok {
+		if v, ok := args["timeoutSeconds"].(float64); ok && !math.IsNaN(v) && v >= 1 && v <= maxExecTimeout.Seconds() {
+			// Check the range before converting: a huge float64 overflows
+			// time.Duration and can wrap to a positive sub-second deadline.
 			timeout = time.Duration(v) * time.Second
 		}
 		return s.s.execIn(ctx, s.thread, strArg("blip"), argv, timeout)
