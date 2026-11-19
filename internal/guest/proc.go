@@ -211,6 +211,20 @@ func checkDirAccess(root, dir string, acct *account) error {
 // canSearchDir reports whether acct has execute (search) permission on the
 // directory, matching the kernel's owner/group/other rule.
 func canSearchDir(fi os.FileInfo, acct *account) bool {
+	return canAccess(fi, acct, 0o100, 0o010, 0o001)
+}
+
+// canExecFile reports whether acct may execute the file. Root still needs at
+// least one execute bit set, like the kernel.
+func canExecFile(fi os.FileInfo, acct *account) bool {
+	if acct.uid == 0 {
+		return fi.Mode().Perm()&0o111 != 0
+	}
+	return canAccess(fi, acct, 0o100, 0o010, 0o001)
+}
+
+// canAccess applies the owner/group/other rule with the given permission bits.
+func canAccess(fi os.FileInfo, acct *account, owner, group, other os.FileMode) bool {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
 		// Without ownership information, leave the decision to the kernel.
@@ -219,11 +233,11 @@ func canSearchDir(fi os.FileInfo, acct *account) bool {
 	mode := fi.Mode().Perm()
 	switch {
 	case acct.uid == st.Uid:
-		return mode&0o100 != 0
+		return mode&owner != 0
 	case slices.Contains(acct.groups, st.Gid):
-		return mode&0o010 != 0
+		return mode&group != 0
 	default:
-		return mode&0o001 != 0
+		return mode&other != 0
 	}
 }
 
@@ -241,11 +255,6 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 		argv0 = acct.shell
 	}
 	env := g.procEnv(acct, s, base)
-	if argv0 == "" {
-		if argv0, err = lookPath(g.root, argv[0], env); err != nil {
-			return nil, nil, err
-		}
-	}
 	// Validation and start failures below are not "command not found": the
 	// command may be fine but the workdir, credentials, or process setup is
 	// wrong, so they use the conventional 126 instead of the old 127.
@@ -272,6 +281,13 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	}
 	if err := checkDirAccess(g.root, dir, acct); err != nil {
 		return nil, nil, startFail(126, err)
+	}
+	// Resolve a bare command after the workdir is known: a relative PATH
+	// entry is relative to the command's working directory, as in execvp.
+	if argv0 == "" {
+		if argv0, err = lookPath(g.root, dir, argv[0], env, acct); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	p := &proc{}

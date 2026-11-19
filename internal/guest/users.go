@@ -2,11 +2,14 @@ package guest
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // account is a resolved user for a process in the root filesystem.
@@ -146,28 +149,63 @@ func mergeEnv(lists ...[]string) []string {
 
 const defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-// lookPath finds name in the PATH of env, inside root. It returns the path as
-// seen from inside root.
-func lookPath(root, name string, env []string) (string, error) {
+// lookPath finds name in the PATH of env, inside root and relative to the
+// command's working directory dir. It follows execvp semantics: an empty or
+// relative PATH entry is relative to dir, a candidate the account cannot
+// execute is reported as permission denied (126) rather than not found (127),
+// and a later executable candidate still wins.
+func lookPath(root, dir, name string, env []string, acct *account) (string, error) {
 	if strings.Contains(name, "/") {
 		return name, nil
 	}
-	path := defaultPath
+	pathVar := defaultPath
 	for _, kv := range env {
 		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
-			path = v
+			pathVar = v
 		}
 	}
-	for _, dir := range filepath.SplitList(path) {
-		if !strings.HasPrefix(dir, "/") {
-			continue
+	denied := false
+	for _, entry := range filepath.SplitList(pathVar) {
+		var p string
+		switch {
+		case entry == "" || entry == ".":
+			// An empty component is the current directory.
+			p = joinPath(dir, name)
+		case strings.HasPrefix(entry, "/"):
+			p = joinPath(entry, name)
+		default:
+			p = joinPath(joinPath(dir, entry), name)
 		}
-		p := filepath.Join(dir, name)
 		// Resolve inside root so absolute symlinks (e.g. /bin -> usr/bin)
 		// point at the root's files.
-		if fi, err := statInRoot(root, p); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+		fi, err := statInRoot(root, p)
+		if err != nil {
+			if errors.Is(err, unix.EACCES) {
+				denied = true
+			}
+			continue
+		}
+		if !fi.Mode().IsRegular() {
+			// execve on a directory (or other non-regular file) is EACCES.
+			denied = true
+			continue
+		}
+		if canExecFile(fi, acct) {
 			return p, nil
 		}
+		denied = true
+	}
+	if denied {
+		return "", startFail(126, fmt.Errorf("%s: permission denied", name))
 	}
 	return "", startFail(127, fmt.Errorf("%s: command not found", name))
+}
+
+// joinPath appends name to dir without lexical cleaning: the kernel resolves
+// ".." and symlinks, and cleaning here would change what it finds.
+func joinPath(dir, name string) string {
+	if strings.HasSuffix(dir, "/") {
+		return dir + name
+	}
+	return dir + "/" + name
 }
