@@ -3,7 +3,9 @@ package session_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -88,6 +90,54 @@ func TestOpenClosedPipeIsUnreachable(t *testing.T) {
 	if !errors.Is(err, session.ErrUnreachable) {
 		t.Fatalf("err = %v, want ErrUnreachable", err)
 	}
+}
+
+// An Open whose encoded argv and env exceed one wire frame is rejected
+// locally and must not look like a VM lifecycle race that callers retry.
+func TestOpenOversizedRequestIsTooLarge(t *testing.T) {
+	var request bytes.Buffer
+	closed := false
+	c := &session.Client{Connect: func(context.Context, string, string) (io.ReadWriteCloser, error) {
+		return &recordingConn{request: &request, closed: &closed}, nil
+	}}
+	big := strings.Repeat("z", 120_000)
+	o := wire.Open{Mode: wire.OpenExec, Argv: []string{"true"}, OpenID: "too-big"}
+	for i := 0; i < 10; i++ {
+		o.Env = append(o.Env, fmt.Sprintf("K%d=%s", i, big))
+	}
+	_, openErr := c.Open(context.Background(), "ns", "p", o)
+	if openErr == nil {
+		t.Fatal("oversized Open succeeded")
+	}
+	payload, err := json.Marshal(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(openErr, session.ErrRequestTooLarge) {
+		t.Fatalf("err = %v, want ErrRequestTooLarge", openErr)
+	}
+	if errors.Is(openErr, session.ErrUnreachable) || strings.Contains(openErr.Error(), "not reachable") {
+		t.Fatalf("oversized request misclassified as VM lifecycle failure: %v", openErr)
+	}
+	if !strings.Contains(openErr.Error(), "request too large") || !strings.Contains(openErr.Error(), fmt.Sprintf("%d bytes", len(payload))) {
+		t.Fatalf("error does not explain the size: %v", openErr)
+	}
+	if !closed || request.Len() != 0 {
+		t.Fatalf("closed=%v wrote=%d bytes; want close and no write", closed, request.Len())
+	}
+}
+
+// recordingConn records the request bytes and whether the client closed it.
+type recordingConn struct {
+	request *bytes.Buffer
+	closed  *bool
+}
+
+func (c *recordingConn) Read([]byte) (int, error)    { return 0, io.EOF }
+func (c *recordingConn) Write(p []byte) (int, error) { return c.request.Write(p) }
+func (c *recordingConn) Close() error {
+	*c.closed = true
+	return nil
 }
 
 func TestOpenError(t *testing.T) {

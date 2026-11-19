@@ -53,6 +53,20 @@ func TestConnFragmentationAndEveryTruncation(t *testing.T) {
 	}
 }
 
+// An over-limit payload is a local validation error with its size, not a
+// transport failure; nothing reaches the peer.
+func TestConnOversizedWriteIsTypedAndWritesNothing(t *testing.T) {
+	var buf bytes.Buffer
+	err := NewConn(&buf).Write(TOpen, make([]byte, MaxFrame+1))
+	var sizeErr *FrameSizeError
+	if !errors.Is(err, ErrFrameTooLarge) || !errors.As(err, &sizeErr) || sizeErr.Size != MaxFrame+1 {
+		t.Fatalf("err = %v, want FrameSizeError(%d)", err, MaxFrame+1)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("wrote %d bytes of an oversized frame", buf.Len())
+	}
+}
+
 func TestConnRejectsOversizedLengthBeforePayload(t *testing.T) {
 	for _, n := range []uint32{MaxFrame + 1, 1 << 31, ^uint32(0)} {
 		var hdr [5]byte
