@@ -139,6 +139,9 @@ func (v *view) keepCommit(c storage.Volume, sealed map[string][]v1alpha1.SealRes
 	if st.Pending != nil && st.Pending.CommitID == id {
 		return true
 	}
+	if v.lostCommitHeld(s, id) {
+		return true
+	}
 	for _, r := range sealed[c.StateUID] {
 		if r.CommitID == id {
 			return true
@@ -150,6 +153,32 @@ func (v *view) keepCommit(c storage.Volume, sealed map[string][]v1alpha1.SealRes
 	if st.Committed.ID == id {
 		return slices.Contains(st.Placements, v.node) ||
 			(st.Pending != nil && slices.Contains(st.Pending.Replicas, v.node))
+	}
+	return false
+}
+
+// lostCommitHeld reports whether a live node still reports holding id while
+// the state's latest seal failed and id is not the committed version. A save
+// the controller gave up on can leave its only durable copy on a node that
+// still reports it (for example after a brief heartbeat lag or while
+// draining). Deleting that commit would turn a recoverable save into data
+// loss. A later successful seal replaces the failure and lets normal GC drop
+// the superseded commit.
+func (v *view) lostCommitHeld(s *v1alpha1.BlipState, id string) bool {
+	st := s.Status
+	if st.Committed == nil || st.Committed.ID == id || len(st.Seals) == 0 {
+		return false
+	}
+	if st.Seals[len(st.Seals)-1].Error == "" {
+		return false
+	}
+	for _, o := range st.Nodes {
+		if !slices.Contains(o.Commits, id) {
+			continue
+		}
+		if bn := v.blipNodes[o.Node]; bn != nil && bn.Status.Incarnation == o.Incarnation {
+			return true
+		}
 	}
 	return false
 }

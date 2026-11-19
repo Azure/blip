@@ -699,6 +699,7 @@ func TestSimulationLostSaveNeverSucceeds(t *testing.T) {
 			w := s.getState("root").Status.Writer.DeepCopy()
 			if beforeSeal {
 				s.must(s.c.Delete(s.ctx, &corev1.Node{ObjectMeta: metadata("n1")}))
+				s.must(s.c.Delete(s.ctx, &v1.BlipNode{ObjectMeta: metadata("n1")}))
 				s.deliver()
 				for range 3 {
 					s.step("state", "root")
@@ -716,6 +717,7 @@ func TestSimulationLostSaveNeverSucceeds(t *testing.T) {
 			if !beforeSeal {
 				s.until("pending save", func() bool { return s.getState("root").Status.Pending != nil }, "state", "root")
 				s.must(s.c.Delete(s.ctx, &corev1.Node{ObjectMeta: metadata("n1")}))
+				s.must(s.c.Delete(s.ctx, &v1.BlipNode{ObjectMeta: metadata("n1")}))
 			}
 			s.deliver()
 			s.api.loseAt = s.api.writes + 1

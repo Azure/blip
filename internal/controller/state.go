@@ -922,8 +922,21 @@ func (r *StateReconciler) pendingSource(ctx context.Context, st *v1.BlipState, c
 		p.SourceNode = n
 		return false, "", nil
 	}
+	if n := healthyHolder(st, cl, p, p.Replicas); n != "" {
+		// The only holder is healthy but draining. It can still serve (or
+		// keep) the commit it sealed, and drainSaveExpired commits on it
+		// once replicas cannot fetch. Draining only forbids new placements.
+		p.SourceNode = n
+		return false, "", nil
+	}
 	if !cl.bad(p.SourceNode) {
 		// The source may simply not have reported the commit yet.
+		return false, "", nil
+	}
+	// A briefly stale or draining holder still has the only durable copy.
+	// Never declare the save lost while any node reports it: a heartbeat
+	// lag is not data loss, and a draining or unreachable node can recover.
+	if saveHeld(st, cl, p) {
 		return false, "", nil
 	}
 	// The node that sealed the pending version is gone and no replica
@@ -964,6 +977,18 @@ func drainSaveExpired(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
 func usableHolder(st *v1.BlipState, cl *cluster, p *v1.PendingCommit, replicas []string) string {
 	for _, n := range replicas {
 		if cl.usable(n, st.Spec.NodeSelector) && cl.holds(st, n, p.CommitID) {
+			return n
+		}
+	}
+	return ""
+}
+
+// healthyHolder returns a healthy replica that holds the pending commit even
+// if it is draining. Draining forbids new placements, not serving or keeping a
+// commit the node already sealed, so such a holder can complete the save.
+func healthyHolder(st *v1.BlipState, cl *cluster, p *v1.PendingCommit, replicas []string) string {
+	for _, n := range replicas {
+		if cl.healthyNode(n) && cl.holds(st, n, p.CommitID) {
 			return n
 		}
 	}
