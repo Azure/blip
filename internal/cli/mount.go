@@ -232,6 +232,9 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 	if r.DeletionTimestamp != nil {
 		return fmt.Errorf("state %q is being deleted", a.short(root))
 	}
+	if r.Spec.Image != "" {
+		return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(root), a.short(root))
+	}
 	source, err := a.getState(ctx, state)
 	if err != nil {
 		return err
@@ -1024,6 +1027,12 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		// and release the state's finalizer.
 		return fmt.Errorf("state %q is being deleted", a.short(f.root))
 	}
+	if hasAdds && root.Spec.Image != "" {
+		// An imported base is a shared template; edits to its mounts would
+		// be inherited by every later fork. Reject it as a mount target, as
+		// run --state does. A removal-only command stays legal for cleanup.
+		return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(f.root), a.short(f.root))
+	}
 	original := append([]v1alpha1.Mount(nil), root.Spec.Mounts...)
 	removed := make(map[string]bool, len(f.remove))
 	for _, arg := range f.remove {
@@ -1150,6 +1159,9 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	}
 	if root.DeletionTimestamp != nil {
 		return fmt.Errorf("state %q is being deleted", a.short(f.root))
+	}
+	if root.Spec.Image != "" {
+		return fmt.Errorf("state %q is an imported base and cannot be executed directly; use --from %s", a.short(f.root), a.short(f.root))
 	}
 	if err := validateMountPlan(root, []mountRequest{{state: name, path: mountPath, writable: writable}}, nil, false); err != nil {
 		return err

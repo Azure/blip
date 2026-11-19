@@ -1839,6 +1839,31 @@ func TestMountRemoveThenRejectedNewRestoresMount(t *testing.T) {
 	}
 }
 
+// TestMountRejectsImportedBaseRoot reproduces mounting onto (or creating a
+// mount state on) an imported base image. A base is a shared template; edits
+// to its mounts propagate into every later fork.
+func TestMountRejectsImportedBaseRoot(t *testing.T) {
+	base := readyState("base")
+	base.Spec.Image = "registry/base:1"
+	h := newHarness(t, readyState("home"), base, readyState("data"))
+	for _, args := range [][]string{
+		{"mount", "data:/data", "--root", "base"},
+		{"mount", "--new", "cache:/cache", "--root", "base"},
+		{"mount", "--new", "cache:/cache", "--from", "base", "--root", "base"},
+	} {
+		code, _, errOut := h.run("", args...)
+		if code != 1 || !strings.Contains(errOut, "imported base") {
+			t.Fatalf("%v: code %d: %s", args, code, errOut)
+		}
+		if !stateNotFound(t, h, "cache") {
+			t.Fatalf("%v: rejected command created state cache", args)
+		}
+		if mounts := h.state("base").Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("%v: imported base mutated: %+v", args, mounts)
+		}
+	}
+}
+
 // TestMountNewMountFailureLeavesState ports create's attach-failure coverage:
 // the created state keeps its first commit even when mounting it fails.
 func TestMountNewMountFailureLeavesState(t *testing.T) {
