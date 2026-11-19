@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/wire"
 	"golang.org/x/sys/unix"
 )
@@ -132,8 +131,6 @@ func (g *Guest) startSession(id string, s procSpec, base []string, holdOutput bo
 // startSessionOpen is startSession with a client OpenID recorded on the
 // session before it becomes visible, so removeSession can tombstone it.
 func (g *Guest) startSessionOpen(id, openID string, s procSpec, base []string, holdOutput bool) (*session, error) {
-	// Last, so image defaults and caller environment cannot redirect it.
-	base = append(append([]string(nil), base...), podapi.ReportEnv+"="+podapi.ReportURL)
 	start := g.startProc
 	if g.startProcess != nil {
 		start = g.startProcess

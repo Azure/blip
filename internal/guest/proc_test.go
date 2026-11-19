@@ -3,6 +3,8 @@ package guest
 import (
 	"strings"
 	"testing"
+
+	"github.com/Azure/blip/internal/podapi"
 )
 
 func TestWorkdirInRoot(t *testing.T) {
@@ -51,6 +53,41 @@ func TestStartProcNormalizesRelativeWorkdir(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "chdir") {
 		t.Fatalf("dot-dot workdir was not normalized inside the root: %v", err)
+	}
+}
+
+// TestProcEnvReservedValuesCannotBeOverridden keeps a caller's exec -e from
+// redirecting the guest-owned report endpoint. The reserved value must appear
+// exactly once and win over both the claim environment and the session's
+// environment, while ordinary variables still follow the usual last-wins rule.
+func TestProcEnvReservedValuesCannotBeOverridden(t *testing.T) {
+	acct := &account{name: "root", home: "/root", shell: "/bin/sh"}
+	for _, tc := range []struct {
+		name    string
+		base    []string
+		session []string
+	}{
+		{"session override", nil, []string{podapi.ReportEnv + "=http://127.0.0.1:1"}},
+		{"claim and session override", []string{podapi.ReportEnv + "=http://claim.invalid"}, []string{podapi.ReportEnv + "=http://127.0.0.1:1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := (&Guest{}).procEnv(acct, procSpec{env: append(tc.session, "A=session")}, append(tc.base, "A=claim"))
+			var report, values []string
+			for _, entry := range env {
+				if v, ok := strings.CutPrefix(entry, podapi.ReportEnv+"="); ok {
+					report = append(report, v)
+				}
+				if v, ok := strings.CutPrefix(entry, "A="); ok {
+					values = append(values, v)
+				}
+			}
+			if len(report) != 1 || report[0] != podapi.ReportURL {
+				t.Fatalf("%s entries = %v, want one %q", podapi.ReportEnv, report, podapi.ReportURL)
+			}
+			if len(values) != 1 || values[0] != "session" {
+				t.Fatalf("ordinary variable A = %v, want one %q", values, "session")
+			}
+		})
 	}
 }
 

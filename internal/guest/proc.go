@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Azure/blip/internal/podapi"
 )
 
 // reaper reaps every child (as PID 1 it also inherits orphans) and delivers
@@ -223,7 +225,16 @@ func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
 		"NO_PROXY=" + strings.Join(noProxy, ","),
 		"no_proxy=" + strings.Join(noProxy, ","),
 	}, base...)
-	return mergeEnv(env, base, s.env)
+	// Reserved variables are applied after every caller-supplied list, so an
+	// exec caller's -e (s.env) cannot redirect a guest-owned service.
+	return mergeEnv(env, base, s.env, reservedEnv())
+}
+
+// reservedEnv is the environment the guest owns. Callers, including exec -e,
+// may not override it: BLIP_REPORT_URL must always point at the guest's
+// loopback report endpoint.
+func reservedEnv() []string {
+	return []string{podapi.ReportEnv + "=" + podapi.ReportURL}
 }
 
 func (p *proc) close() {
