@@ -98,7 +98,8 @@ func (w *Watcher) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 // Blip, so appending its reports to that thread's history also requires the
 // derived thread owner to match blip.dev/owner. A foreign, unknown, or
 // ownerless label is ignored rather than allowed to inject turns into another
-// project.
+// project. A Blip from a previous incarnation of a recreated thread is also
+// ignored: its reports are not input for the new thread.
 func (w *Watcher) threadOwnedBy(ctx context.Context, b *v1.Blip, thread string) (bool, error) {
 	owner := b.Labels[v1.LabelOwner]
 	if owner == "" || owner != v1.ThreadOwner(b.Namespace, thread) {
@@ -112,6 +113,10 @@ func (w *Watcher) threadOwnedBy(ctx context.Context, b *v1.Blip, thread string) 
 			return false, nil
 		}
 		return false, err
+	}
+	if !belongsToThread(b, &t) {
+		log.FromContext(ctx).Info("ignoring blip report from a previous thread incarnation", "blip", b.Name, "thread", thread)
+		return false, nil
 	}
 	return true, nil
 }

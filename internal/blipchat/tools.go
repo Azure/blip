@@ -90,7 +90,7 @@ func (s *step) tools() []Tool {
 		FunctionTool("remember", "Replace the rolling summary of consumed history.", schema(props(
 			map[string]any{"text": str("New summary, at most 16 KiB")},
 		), "text")),
-		FunctionTool("idle", "End the step without scheduling another wake. Use when there is nothing to do.", schema(props())),
+		FunctionTool("idle", "Record that there is nothing to do. The heartbeat still wakes the coordinator while tasks are open.", schema(props())),
 	}
 }
 
@@ -230,7 +230,8 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 		s.summarySet = true
 		return "summary replaced", nil
 	case "idle":
-		s.idle = true
+		// The heartbeat still schedules the next wake while tasks are open;
+		// idle only records that this step found nothing to change.
 		return "idle", nil
 	default:
 		return "", fmt.Errorf("unknown tool %q", name)
@@ -244,6 +245,14 @@ func (s *step) task(id string) *v1.ThreadTask {
 		}
 	}
 	return nil
+}
+
+// startedTask records the objects one start_task call created. A step that is
+// abandoned because its thread incarnation is gone removes them, so the
+// recreated thread does not inherit work it never asked for.
+type startedTask struct {
+	blip   *v1.Blip
+	states []*v1.BlipState
 }
 
 // startTask forks a workspace and starts one agent blip for a task.
@@ -295,7 +304,8 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 			Namespace: s.thread.Namespace,
 			Labels:    map[string]string{v1.LabelOwner: owner, v1.LabelThread: v1.ThreadLabel(s.thread.Name), v1.LabelTask: taskID},
 			Annotations: map[string]string{
-				v1.AnnotationThread: s.thread.Name,
+				v1.AnnotationThread:    s.thread.Name,
+				v1.AnnotationThreadUID: string(s.thread.UID),
 			},
 		},
 		Spec: v1.BlipSpec{Pool: s.thread.Spec.Pool, State: name, Command: command},
@@ -310,14 +320,17 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 			Namespace: s.thread.Namespace,
 			Labels:    map[string]string{v1.LabelOwner: owner, v1.LabelThread: v1.ThreadLabel(s.thread.Name), v1.LabelTask: taskID},
 			Annotations: map[string]string{
-				v1.AnnotationThread: s.thread.Name,
+				v1.AnnotationThread:    s.thread.Name,
+				v1.AnnotationThreadUID: string(s.thread.UID),
 			},
 		},
 	}
-	if _, err := workspace.Fork(ctx, s.s.Client, &src, state, &workspace.ForkOptions{Owner: &ref}); err != nil {
+	states, err := workspace.Fork(ctx, s.s.Client, &src, state, &workspace.ForkOptions{Owner: &ref})
+	if err != nil {
 		_ = s.s.Delete(context.WithoutCancel(ctx), b)
 		return "", fmt.Errorf("fork state for %q: %w", name, err)
 	}
+	s.started = append(s.started, startedTask{blip: b, states: states})
 	t.Blips = append(t.Blips, name)
 	if len(t.Blips) > 8 {
 		t.Blips = t.Blips[len(t.Blips)-8:]
@@ -326,14 +339,24 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 	return "started " + name, nil
 }
 
-// belongsToThread reports whether b was created by this thread: the thread
-// label must name it and the owner label must be the thread's derived owner.
-// A coordinator may hold commands or stop only blips of its own project.
+// belongsToThread reports whether b was created by this incarnation of the
+// thread: the thread label must name it, the owner label must be the thread's
+// derived owner, and the thread UID annotation must match. Labels are
+// name-derived and survive a delete/recreate, so the UID is what scopes a
+// recreated thread to its own work. Legacy Blips without the annotation
+// belong only when they were created at or after this thread incarnation.
 func belongsToThread(b *v1.Blip, thread *v1.BlipThread) bool {
 	owner := Owner(&ThreadKey{Namespace: thread.Namespace, Name: thread.Name})
-	return b.Namespace == thread.Namespace &&
-		b.Labels[v1.LabelThread] == v1.ThreadLabel(thread.Name) &&
-		b.Labels[v1.LabelOwner] == owner
+	if b.Namespace != thread.Namespace ||
+		b.Labels[v1.LabelThread] != v1.ThreadLabel(thread.Name) ||
+		b.Labels[v1.LabelOwner] != owner {
+		return false
+	}
+	uid, tagged := b.Annotations[v1.AnnotationThreadUID]
+	if tagged {
+		return uid == string(thread.UID)
+	}
+	return !b.CreationTimestamp.Before(&thread.CreationTimestamp)
 }
 
 // execIn runs one command in a running blip and returns bounded output.

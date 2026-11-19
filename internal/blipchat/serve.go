@@ -240,11 +240,13 @@ type step struct {
 	timers []v1.ThreadTimer
 	// replies become coordinator turns at the end of the step.
 	replies []v1.BlipTurnSpec
+	// started records the blips and states this step's start_task calls
+	// created, so an abandoned step can remove them.
+	started []startedTask
 	summary string
 	// summarySet distinguishes "remember was called" (even with empty text)
 	// from a step that did not touch the summary.
 	summarySet bool
-	idle       bool
 	paused     string
 	usage      int64
 }
@@ -351,13 +353,41 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 
 // commitStep commits a finished step. A thread deleted and recreated while
 // the completion was in flight is left untouched: the step belongs to the
-// previous incarnation, whose turn history and board are already gone.
+// previous incarnation, whose turn history and board are already gone. Work
+// the abandoned step started is removed so it does not outlive its thread.
 func (s *Server) commitStep(ctx context.Context, st *step, target int64, pending []v1.BlipTurn, started time.Time) error {
 	err := s.commit(ctx, st, target, pending, started)
 	if errors.Is(err, errStaleIncarnation) {
+		s.discardStarted(ctx, st)
 		return nil
 	}
 	return err
+}
+
+// discardStarted removes the blips and states this step started. Only objects
+// created by the step are deleted: everything recorded in st.started carries
+// the UID assigned when it was created, so an object replaced in the meantime
+// is never touched. States go first because deleting a Blip cascades to its
+// owned workspace.
+func (s *Server) discardStarted(ctx context.Context, st *step) {
+	ctx = context.WithoutCancel(ctx)
+	for i := len(st.started) - 1; i >= 0; i-- {
+		started := st.started[i]
+		for j := len(started.states) - 1; j >= 0; j-- {
+			s.deleteCreated(ctx, started.states[j])
+		}
+		s.deleteCreated(ctx, started.blip)
+	}
+}
+
+func (s *Server) deleteCreated(ctx context.Context, obj client.Object) {
+	opts := &client.DeleteOptions{}
+	if uid := obj.GetUID(); uid != "" {
+		opts.Preconditions = &metav1.Preconditions{UID: &uid}
+	}
+	if err := s.Delete(ctx, obj, opts); err != nil && !apierrors.IsNotFound(err) {
+		s.logError(err, "remove stale step object", "name", obj.GetName())
+	}
 }
 
 // commit writes the step's coordinator turns and then one thread status

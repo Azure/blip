@@ -27,6 +27,11 @@ const (
 	// AnnotationThread carries the full BlipThread name when LabelThread is
 	// hashed for a long name.
 	AnnotationThread = "blip.dev/thread-name"
+	// AnnotationThreadUID pins a Blip and its BlipState to the incarnation of
+	// the BlipThread that created them. Labels are name-derived and survive a
+	// delete/recreate of the thread, so the UID is what tells two incarnations
+	// of the same name apart.
+	AnnotationThreadUID = "blip.dev/thread-uid"
 	// LabelTask marks a blip as work for one ThreadTask.
 	LabelTask = "blip.dev/task"
 
