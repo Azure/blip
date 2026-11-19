@@ -699,6 +699,53 @@ func TestPoolRejectsInvalidEndpoints(t *testing.T) {
 	}
 }
 
+// TestPoolInvalidNetworkIsReported guards a pool-wide egress policy that
+// admission accepts but network.Compile rejects. Every Blip already reports
+// NetworkFailed; without this check the pool itself keeps empty status and
+// emits no Event, so it looks healthy while booting deny-all VMs.
+func TestPoolInvalidNetworkIsReported(t *testing.T) {
+	e := newEnv(t)
+	e.newPool("default", 1, 0)
+	e.updatePool("default", func(p *v1.BlipPool) {
+		p.Spec.Network = &v1.NetworkPolicy{Egress: []v1.NetworkEgressRule{{
+			To: []v1.NetworkPeer{{PodSelector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: "Bogus"}},
+			}}},
+		}}}
+	})
+	recorder := record.NewFakeRecorder(10)
+	e.pool.Recorder = recorder
+
+	_, err := e.pool.Reconcile(e.ctx, req(ns, "default"))
+	if err == nil || !strings.Contains(err.Error(), "not a valid selector operator") {
+		t.Fatalf("reconcile error %v, want a network validation error", err)
+	}
+	event := waitForEvent(t, recorder)
+	if !strings.Contains(event, corev1.EventTypeWarning+" InvalidConfiguration") {
+		t.Errorf("event = %q, want a Warning InvalidConfiguration event", event)
+	}
+	pool := e.getPool("default")
+	if pool.Status.Reason != poolInvalidConfiguration {
+		t.Errorf("status reason %q, want %s", pool.Status.Reason, poolInvalidConfiguration)
+	}
+	if !strings.Contains(pool.Status.Message, "spec.network") ||
+		!strings.Contains(pool.Status.Message, "not a valid selector operator") {
+		t.Errorf("status message %q does not report the network problem", pool.Status.Message)
+	}
+	if n := len(e.pods()); n != 0 {
+		t.Errorf("%d pods created for an invalid pool", n)
+	}
+
+	// Repairing the policy clears the diagnostic and lets the pool run.
+	e.updatePool("default", func(p *v1.BlipPool) { p.Spec.Network = nil })
+	if _, err := e.pool.Reconcile(e.ctx, req(ns, "default")); err != nil {
+		t.Fatalf("reconcile repaired pool: %v", err)
+	}
+	if pool := e.getPool("default"); pool.Status.Reason != "" || pool.Status.Message != "" {
+		t.Errorf("repaired pool still reports %q: %q", pool.Status.Reason, pool.Status.Message)
+	}
+}
+
 func TestTemplateHashTracksEndpoints(t *testing.T) {
 	pool := func(endpoints ...v1.PoolEndpoint) *v1.BlipPool {
 		return &v1.BlipPool{Spec: v1.BlipPoolSpec{Endpoints: endpoints}}

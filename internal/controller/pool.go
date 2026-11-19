@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/network"
 	"github.com/Azure/blip/internal/podapi"
 )
 
@@ -257,6 +258,13 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// rejects it, but an object stored before that rule existed must fail
 	// visibly instead of leaving empty status and no Event.
 	if err := validatePoolResources(pool); err != nil {
+		return reconcile.Result{}, r.invalidPoolSpec(ctx, pool, "InvalidConfiguration", err)
+	}
+	// Admission accepts unknown selector operators, so a pool-wide policy
+	// edit can compile for every Blip as an empty deny-all layer. Surface the
+	// bad spec.network on the pool instead of leaving empty pool status while
+	// each Blip reports NetworkFailed.
+	if err := validatePoolNetwork(pool); err != nil {
 		return reconcile.Result{}, r.invalidPoolSpec(ctx, pool, "InvalidConfiguration", err)
 	}
 	// Refuse to create pods whose api-proxy sidecar would exit at startup.
@@ -1084,6 +1092,18 @@ func addAPIProxy(pod *corev1.Pod, pool *v1.BlipPool, image string) {
 		proxy.Env = append(proxy.Env, corev1.EnvVar{Name: endpointsEnv, Value: string(data)})
 	}
 	pod.Spec.InitContainers = []corev1.Container{proxy}
+}
+
+// validatePoolNetwork rejects a spec.network that network.Compile cannot turn
+// into rules. Admission accepts unknown selector operators, and a pool-wide
+// failure otherwise leaves empty pool status while every Blip reports
+// NetworkFailed. Compiling with no destinations still validates every selector,
+// CIDR, port, and layer shape.
+func validatePoolNetwork(pool *v1.BlipPool) error {
+	if _, err := network.Compile(pool.Namespace, pool.Spec.Network, nil, network.Destinations{}); err != nil {
+		return fmt.Errorf("spec.network: %w", err)
+	}
+	return nil
 }
 
 // validatePoolResources rejects a pool shape that cannot become a valid Pod.
