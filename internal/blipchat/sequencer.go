@@ -188,8 +188,11 @@ func (s *Sequencer) reserveSeq(ctx context.Context, thread *v1.BlipThread) (int6
 		current.Status.LastSeq = seq
 		err := s.Status().Update(ctx, current)
 		if err == nil {
-			thread.Status.LastSeq = seq
-			thread.ResourceVersion = current.ResourceVersion
+			// The name may have been deleted and recreated during a
+			// conflicting CAS. Copy the whole refreshed object, including
+			// its UID, so the turn is pinned to the live incarnation rather
+			// than stamping a dead thread UID.
+			*thread = *current
 			return seq, nil
 		}
 		if !apierrors.IsConflict(err) || attempt+1 >= seqRetries {
@@ -211,15 +214,13 @@ func (s *Sequencer) releaseSeq(ctx context.Context, thread *v1.BlipThread, seq i
 			}
 		}
 		if current.Status.LastSeq != seq {
-			thread.Status.LastSeq = current.Status.LastSeq
-			thread.ResourceVersion = current.ResourceVersion
+			*thread = *current
 			return
 		}
 		current.Status.LastSeq = seq - 1
 		err := s.Status().Update(ctx, current)
 		if err == nil {
-			thread.Status.LastSeq = seq - 1
-			thread.ResourceVersion = current.ResourceVersion
+			*thread = *current
 			return
 		}
 		if !apierrors.IsConflict(err) || attempt+1 >= seqRetries {
@@ -242,15 +243,13 @@ func (s *Sequencer) raiseLastSeq(ctx context.Context, thread *v1.BlipThread, seq
 			}
 		}
 		if current.Status.LastSeq >= seq {
-			thread.Status.LastSeq = current.Status.LastSeq
-			thread.ResourceVersion = current.ResourceVersion
+			*thread = *current
 			return nil
 		}
 		current.Status.LastSeq = seq
 		err := s.Status().Update(ctx, current)
 		if err == nil {
-			thread.Status.LastSeq = seq
-			thread.ResourceVersion = current.ResourceVersion
+			*thread = *current
 			return nil
 		}
 		if !apierrors.IsConflict(err) || attempt+1 >= seqRetries {
