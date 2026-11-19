@@ -73,7 +73,7 @@ func TestStateInitialization(t *testing.T) {
 		{name: "missing image", spec: v1.BlipStateSpec{Image: "reg/nope:v1"}, message: "image reg/nope:v1: not found", phase: v1.StateFailed},
 		{name: "invalid image", spec: v1.BlipStateSpec{Image: "bad image!!"}, message: "invalid image reference", phase: v1.StateFailed},
 		{name: "missing copy source", spec: v1.BlipStateSpec{CopyFrom: "nope", Replicas: 1}, message: `copy source "nope" not found`, phase: v1.StateFailed},
-		{name: "no matching nodes", spec: v1.BlipStateSpec{Replicas: 1, NodeSelector: map[string]string{"zone": "x"}}, message: "no healthy node"},
+		{name: "no matching nodes", spec: v1.BlipStateSpec{Replicas: 1, NodeSelector: map[string]string{"zone": "x"}}, message: "no eligible node can hold the state; retrying"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

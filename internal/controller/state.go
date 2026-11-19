@@ -662,7 +662,23 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 	}
 	if len(nodes) == 0 {
 		if st.Spec.CopyFrom == "" {
-			return "no healthy node can hold the state", false, nil
+			// A state with no eligible node can commit only if a node later
+			// becomes healthy or gains a matching label. Nothing in the spec
+			// can change to wake it, so bound the wait like an unplaceable
+			// copy and then fail terminally; otherwise `run --from` waits
+			// forever for a commit that cannot happen.
+			msg := "no eligible node can hold the state"
+			if s.UnplaceableSince == nil {
+				now := metav1.NewTime(cl.now)
+				s.UnplaceableSince = &now
+				return msg + "; retrying", true, nil
+			}
+			if cl.now.Sub(s.UnplaceableSince.Time) < pendingTimeout {
+				return msg + "; retrying", true, nil
+			}
+			s.Phase = v1.StateFailed
+			s.UnplaceableSince = nil
+			return fmt.Sprintf("%s after %s: its nodeSelector matches no healthy node", msg, pendingTimeout), false, nil
 		}
 		// A copy pins its source until it commits. When no node matches its
 		// immutable selector it can never make progress, so bound the wait
