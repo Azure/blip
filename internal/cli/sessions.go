@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/session"
@@ -193,15 +192,24 @@ func (a *app) execSession(ctx context.Context, name, pod string, argv []string, 
 	// the CLI before signal forwarding is installed, and Ctrl-D would turn
 	// into a NUL byte sent as data instead of a remote EOF. Raw mode buffers
 	// startup input as ordinary bytes until stream can deliver it.
+	//
+	// Signals need a handler for the same window: once the terminal is raw,
+	// the default disposition would kill the process without restoring it.
+	// The watcher installed here restores the terminal and exits with
+	// 128+signal; stream then takes over the same signal channel so there is
+	// no unhandled gap or double delivery.
 	var raw bool
+	var signals *signalWatch
 	if tty {
 		if ft := a.terminal(); ft != nil {
-			old, err := term.MakeRaw(int(ft.Fd()))
-			if err != nil {
+			termState := &rawTerminal{}
+			signals = watchSignals(termState.restore)
+			defer signals.stop()
+			if err := termState.makeRaw(ft); err != nil {
 				return err
 			}
 			raw = true
-			defer term.Restore(int(ft.Fd()), old)
+			defer termState.restore()
 		}
 	}
 	s, err := a.open(ctx, pod, o)
@@ -217,7 +225,7 @@ func (a *app) execSession(ctx context.Context, name, pod string, argv []string, 
 		}
 		return err
 	}
-	return a.stream(ctx, s, streamOpts{blip: name, sendEOF: true, raw: raw})
+	return a.stream(ctx, s, streamOpts{blip: name, sendEOF: true, raw: raw, signals: signals})
 }
 
 type execFlags struct {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -61,6 +62,90 @@ func (a *app) ttyOpen(o *wire.Open, tty bool) {
 	}
 }
 
+// rawTerminal owns a local terminal's saved state. MakeRaw and restore take
+// the same lock, so a signal handler that restores while MakeRaw is running
+// waits for the saved state instead of observing nil and leaving the terminal
+// raw.
+type rawTerminal struct {
+	mu  sync.Mutex
+	fd  int
+	old *term.State
+}
+
+func (r *rawTerminal) makeRaw(f *os.File) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	old, err := term.MakeRaw(int(f.Fd()))
+	if err != nil {
+		return err
+	}
+	r.fd, r.old = int(f.Fd()), old
+	return nil
+}
+
+func (r *rawTerminal) restore() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.old == nil {
+		return
+	}
+	_ = term.Restore(r.fd, r.old)
+	r.old = nil
+}
+
+// signalWatch catches termination signals from before MakeRaw until stream
+// installs the forwarder. Without it a signal in that window uses the default
+// disposition and kills the process while the terminal is still raw. Once the
+// stream is ready it takes over the same channel, so there is no gap in which
+// a signal would be handled twice or not at all.
+type signalWatch struct {
+	ch      chan os.Signal
+	done    chan struct{}
+	exited  chan struct{}
+	once    sync.Once
+	rest    func()
+	stopped sync.Once
+}
+
+// watchSignals catches the termination signals forwardSignals handles and
+// restores the terminal before exiting with the conventional 128+signal code.
+func watchSignals(restore func()) *signalWatch {
+	w := &signalWatch{
+		ch:     make(chan os.Signal, 4),
+		done:   make(chan struct{}),
+		exited: make(chan struct{}),
+		rest:   restore,
+	}
+	signal.Notify(w.ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	go func() {
+		defer close(w.exited)
+		select {
+		case sig := <-w.ch:
+			w.rest()
+			os.Exit(128 + int(sig.(syscall.Signal)))
+		case <-w.done:
+		}
+	}()
+	return w
+}
+
+// handoff stops the early-exit goroutine and returns the still-registered
+// signal channel for forwardSignals to use.
+func (w *signalWatch) handoff() <-chan os.Signal {
+	w.once.Do(func() {
+		close(w.done)
+		<-w.exited
+	})
+	return w.ch
+}
+
+// stop unregisters the channel. It is safe after a handoff and when no stream
+// was opened (for example a failed session open).
+func (w *signalWatch) stop() {
+	w.handoff()
+	w.stopped.Do(func() { signal.Stop(w.ch) })
+}
+
 type streamOpts struct {
 	blip string
 	// sendEOF forwards the end of local stdin to the session.
@@ -69,6 +154,9 @@ type streamOpts struct {
 	// and will restore it. stream must not change it: startup input stays
 	// buffered as ordinary bytes across the session open.
 	raw bool
+	// signals is the handler installed before a TTY session open. stream
+	// hands its channel to forwardSignals instead of registering a new one.
+	signals *signalWatch
 }
 
 // stream connects the local terminal or stdio to s until the session exits.
@@ -108,7 +196,19 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 		if hard <= 0 {
 			hard = signalGraceMax
 		}
-		go forwardSignals(ctx, s, detached, grace, hard, &abandonStdin)
+		var ch <-chan os.Signal
+		if opts.signals != nil {
+			// execSession owns the registration: it restores the terminal
+			// before unregistering, so a signal after stream returns cannot
+			// kill the process with the terminal still raw.
+			ch = opts.signals.handoff()
+		} else {
+			own := make(chan os.Signal, 4)
+			signal.Notify(own, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+			defer signal.Stop(own)
+			ch = own
+		}
+		go forwardSignals(ctx, s, ch, detached, grace, hard, &abandonStdin)
 	}
 
 	go func() {
@@ -220,10 +320,7 @@ func detachedSignal(ch <-chan string) (string, bool) {
 // backpressured transport holds the wire write serialization, and waiting for
 // it here would keep the grace timer from ever starting (w7-10 defect 3).
 // Closing the transport when the grace expires unblocks the pending write.
-func forwardSignals(ctx context.Context, s *session.Session, detached chan<- string, grace, hard time.Duration, abandonStdin *atomic.Bool) {
-	ch := make(chan os.Signal, 4)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
-	defer signal.Stop(ch)
+func forwardSignals(ctx context.Context, s *session.Session, ch <-chan os.Signal, detached chan<- string, grace, hard time.Duration, abandonStdin *atomic.Bool) {
 	// Buffered so a burst of signals never blocks the grace timer; a single
 	// writer preserves their order on the wire.
 	signals := make(chan string, 4)
