@@ -100,12 +100,22 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 		// guest. Accepting it would let the guest answer a spoofed source and
 		// bypass the pool's egress policy with the reply.
 		fmt.Fprintf(&b, "  ct direction original ct status dnat ct original ip daddr %s meta l4proto != icmp counter accept\n", p.podIP)
-		// Path-MTU discovery and route diagnostics travel as ICMP errors
-		// RELATED to an allowed flow. Without these the guest keeps sending
-		// full-size segments after a router asks it to shrink (a PMTUD
-		// blackhole). RELATED ties the acceptance to a permitted conntrack
-		// entry, so unsolicited ICMP and echo remain denied.
-		b.WriteString("  ct state related icmp type destination-unreachable icmp code frag-needed counter accept\n")
+		// Path-MTU discovery and transport errors travel as ICMP
+		// destination-unreachable messages RELATED to an allowed flow.
+		// Without these the guest keeps sending full-size segments after a
+		// router asks it to shrink (a PMTUD blackhole), and a UDP socket
+		// never learns that an allowed destination port is closed (no
+		// ECONNREFUSED) or that a route is unusable. RELATED ties the
+		// acceptance to a permitted conntrack entry, so unsolicited ICMP,
+		// echo, and router advertisements remain denied. Type and code must
+		// stay symbolic: nftables rejects numeric ICMP selectors on some
+		// versions.
+		for _, code := range []string{
+			"net-unreachable", "host-unreachable", "prot-unreachable",
+			"port-unreachable", "frag-needed",
+		} {
+			fmt.Fprintf(&b, "  ct state related icmp type destination-unreachable icmp code %s counter accept\n", code)
+		}
 		b.WriteString("  ct state related icmp type time-exceeded counter accept\n")
 		// NAT already restored the private destination. Check CURRENT remote
 		// source/port on every reply; stale conntrack cannot defeat revocation.
