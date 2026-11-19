@@ -302,8 +302,10 @@ func TestGatherGitCollectFailureKeepsBlipError(t *testing.T) {
 	h.self = "alice.box"
 	t.Chdir(callerRepo)
 
-	// Fetching into the branch the caller has checked out is refused by git.
-	code, _, errOut := h.run("", "gather", "w1", "--collect", "git:/home/dev/src:main")
+	// Fetching a branch that does not exist fails with a git error. (The
+	// branch the caller has checked out is rejected earlier, with an
+	// actionable message; see the test below.)
+	code, _, errOut := h.run("", "gather", "w1", "--collect", "git:/home/dev/src:missing")
 	if code != 1 {
 		t.Fatalf("code %d, want 1 for a failed gather: %s", code, errOut)
 	}
