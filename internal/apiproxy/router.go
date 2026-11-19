@@ -87,14 +87,31 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // normalizeHost reduces a request Host to a route name. It accepts a bare
-// hostname or an explicit port 80, ignoring case and one trailing dot. Ports
-// other than 80 and IPv6 literals are rejected.
+// hostname, an explicit port 80, or a bracketed IPv6 literal, ignoring case
+// and one FQDN trailing dot. Malformed authorities, ports other than 80, and
+// names with more than one trailing dot are rejected.
 func normalizeHost(host string) (string, bool) {
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if host == "" || strings.ContainsAny(host, "[]") {
+	host = strings.ToLower(host)
+	if host == "" || strings.ContainsAny(host, " \t\r\n/\\@?#") {
 		return "", false
 	}
 	name := host
+	if strings.HasPrefix(host, "[") {
+		if strings.HasSuffix(host, "]") {
+			ip := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+			if net.ParseIP(ip) == nil {
+				return "", false
+			}
+			return ip, true
+		}
+		var port string
+		var err error
+		name, port, err = net.SplitHostPort(host)
+		if err != nil || port != "80" || net.ParseIP(name) == nil {
+			return "", false
+		}
+		return name, true
+	}
 	if strings.Contains(host, ":") {
 		var port string
 		var err error
@@ -103,11 +120,32 @@ func normalizeHost(host string) (string, bool) {
 			return "", false
 		}
 	}
+	// One trailing dot marks a fully qualified name. Trim only that one:
+	// leaving another dot behind means the authority was malformed.
 	name = strings.TrimSuffix(name, ".")
-	if name == "" || strings.Contains(name, ":") {
+	if name == "" || strings.HasSuffix(name, ".") || !validHostName(name) {
 		return "", false
 	}
 	return name, true
+}
+
+// validHostName reports whether name is a DNS name of valid labels. IPv4
+// literals also pass this check; they simply never match a configured route.
+func validHostName(name string) bool {
+	if len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func newAPIProxy(api *API, podName, podNamespace string) (http.Handler, *http.Transport, error) {

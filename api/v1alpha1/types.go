@@ -59,6 +59,7 @@ type BlipPoolSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(e, !(e.name in ['blip', 'kube-apiserver', 'localhost']))",message="endpoint name is reserved"
 	Endpoints []PoolEndpoint `json:"endpoints,omitempty"`
 	// NodeSelector selects the nodes that run this pool's VMs. It must be
 	// non-empty: matching nodes are enrolled automatically and run the node
@@ -102,6 +103,14 @@ type BlipPoolStatus struct {
 	Ready   int32 `json:"ready,omitempty"`
 	Vacant  int32 `json:"vacant,omitempty"`
 	Claimed int32 `json:"claimed,omitempty"`
+	// Reason is a CamelCase cause set when the pool configuration cannot
+	// produce VMs, for example InvalidConfiguration for an endpoint that
+	// admission could not reject.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// Message is a human-readable explanation of Reason.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -180,6 +189,11 @@ type BlipStateSpec struct {
 	// Blip execution overrides take precedence.
 	Runtime *RuntimeDefaults `json:"runtime,omitempty"`
 }
+
+// MaxStateSizeBytes is the largest filesystem size a BlipState accepts. It is
+// far beyond any practical thin-pool volume and keeps block-rounding
+// arithmetic safely inside int64.
+const MaxStateSizeBytes int64 = 1 << 50 // 1 PiB
 
 const (
 	StatePending = "Pending" // initial version not committed yet
@@ -525,8 +539,14 @@ type MountStatus struct {
 	CommitID string `json:"commitID,omitempty"`
 	// AttachmentID is unique per mount operation.
 	AttachmentID string `json:"attachmentID,omitempty"`
-	Phase        string `json:"phase"`
-	Message      string `json:"message,omitempty"`
+	// InClaim records that this writable mount was part of the claim the
+	// guest accepted. The guest only accepts a claim after every such mount
+	// is attached, so its disk must be saved on stop even if the last
+	// observation predates the attachment. A mount added to a running Blip
+	// is not in the claim and may never attach.
+	InClaim bool   `json:"inClaim,omitempty"`
+	Phase   string `json:"phase"`
+	Message string `json:"message,omitempty"`
 	// Switching is set while the mount is being changed between read-only
 	// and writable. It remains set if the switch fails so the previous
 	// mode stays visible.
@@ -542,6 +562,10 @@ type BlipStatus struct {
 	Node    string `json:"node,omitempty"`
 	// StateGeneration is the observed desired generation of the root state.
 	StateGeneration int64 `json:"stateGeneration,omitempty"`
+	// RootStateUID is the UID of the root state once a pending Blip has seen
+	// it. A root that disappears after that was deleted; it is never
+	// recreated for this Blip, so waiting for it cannot succeed.
+	RootStateUID string `json:"rootStateUID,omitempty"`
 	// RootAttachmentID is the writer attachment of a durable root.
 	RootAttachmentID string       `json:"rootAttachmentID,omitempty"`
 	StartTime        *metav1.Time `json:"startTime,omitempty"`

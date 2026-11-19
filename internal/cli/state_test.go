@@ -25,9 +25,6 @@ func TestStateFailureIsTerminalWithPending(t *testing.T) {
 	if got, want := stateFailure(pending()), "needs 1186988032 bytes, more than the requested 8388608"; got != want {
 		t.Fatalf("stateFailure = %q, want %q", got, want)
 	}
-	if got := stateFailureWhilePending(pending()); got != "" {
-		t.Fatalf("stateFailureWhilePending = %q, want retryable", got)
-	}
 	if got := stateFailure(readyState("ready")); got != "" {
 		t.Fatalf("ready state classified as failed: %q", got)
 	}

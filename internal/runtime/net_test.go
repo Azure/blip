@@ -110,11 +110,14 @@ func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 			t.Errorf("to_guest does not admit %q:\n%s", rule, toGuest)
 		}
 	}
-	// No echo or other unsolicited ICMP may reach the guest.
-	for _, name := range []string{"egress", "from_guest"} {
-		if body := scriptChain(t, script, name); strings.Contains(body, "icmp") {
-			t.Errorf("%s admits ICMP:\n%s", name, body)
-		}
+	// The pod-IP DNAT accepts carry non-ICMP traffic only. In particular the
+	// reply rule must not accept the echo reply that an unsolicited, spoofed
+	// echo request would provoke.
+	if !strings.Contains(toGuest, "ct status dnat ct original ip daddr 192.0.2.2 meta l4proto != icmp counter accept") {
+		t.Errorf("to_guest DNAT accept does not exclude ICMP:\n%s", toGuest)
+	}
+	if body := scriptChain(t, script, "from_guest"); !strings.Contains(body, "ct state established meta l4proto != icmp counter accept") {
+		t.Errorf("from_guest DNAT reply accept does not exclude ICMP:\n%s", body)
 	}
 	for _, rule := range []string{"icmp type 8", "icmp type 0", "meta l4proto icmp", "icmp type 3"} {
 		if strings.Contains(script, rule) {
@@ -128,6 +131,37 @@ func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 	}
 	if strings.Contains(scriptChain(t, closed, "to_guest"), "icmp") {
 		t.Errorf("inactive gate admits ICMP:\n%s", closed)
+	}
+}
+
+// TestPolicyDropsNewInboundICMPEcho guards the reflection bypass: an
+// unsolicited echo request addressed to the pod IP was DNATed to the guest,
+// and the guest's echo reply matched the pod-IP DNAT reply accept, reaching a
+// spoofed (possibly denied) source without consulting egress policy. Every
+// accept rule must either exclude ICMP or be the RELATED-error rule, so a new
+// echo request and its reply fall through to drop.
+func TestPolicyDropsNewInboundICMPEcho(t *testing.T) {
+	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
+		{{CIDR: "0.0.0.0/0", Protocol: "TCP", Port: 443}},
+	}}
+	script, err := testPodNet(nil).policyScript(policy, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"to_guest", "from_guest"} {
+		for _, line := range strings.Split(scriptChain(t, script, name), "\n") {
+			if !strings.Contains(line, "counter accept") {
+				continue
+			}
+			// A non-ICMP rule cannot match an echo. The RELATED rules only
+			// match ICMP errors tied to an allowed conntrack entry, never a
+			// new echo request or its reply.
+			if strings.Contains(line, "meta l4proto != icmp") ||
+				strings.Contains(line, "ct state related icmp type") {
+				continue
+			}
+			t.Errorf("%s can accept an unsolicited ICMP echo: %s", name, strings.TrimSpace(line))
+		}
 	}
 }
 

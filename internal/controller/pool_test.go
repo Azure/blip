@@ -662,19 +662,39 @@ func TestPoolPodEndpointsWithServiceAccount(t *testing.T) {
 }
 
 // TestPoolRejectsInvalidEndpoints checks that a bad endpoint fails reconcile
-// before any warm pod exists.
+// before any warm pod exists and surfaces the reason in pool status. Admission
+// normally rejects these, but a controller-side validation error must not leave
+// empty status while Blips wait for a VM that can never exist.
 func TestPoolRejectsInvalidEndpoints(t *testing.T) {
-	e := newEnv(t)
-	e.newPool("default", 1, 0)
-	e.updatePool("default", func(p *v1.BlipPool) {
-		p.Spec.Endpoints = []v1.PoolEndpoint{{Name: "whoami", URL: "http://whoami.example.com"}}
-	})
-	_, err := e.pool.Reconcile(e.ctx, req(ns, "default"))
-	if err == nil || !strings.Contains(err.Error(), "invalid endpoints for pool ns/default") {
-		t.Fatalf("reconcile error %v", err)
-	}
-	if n := len(e.pods()); n != 0 {
-		t.Errorf("%d pods created for an invalid pool", n)
+	for _, tt := range []struct {
+		name     string
+		endpoint v1.PoolEndpoint
+		want     string
+	}{
+		{"bad url", v1.PoolEndpoint{Name: "whoami", URL: "http://whoami.example.com"}, "must use https"},
+		{"reserved name", v1.PoolEndpoint{Name: "blip", URL: "https://whoami.example.com"}, "name is reserved"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.newPool("default", 1, 0)
+			e.updatePool("default", func(p *v1.BlipPool) {
+				p.Spec.Endpoints = []v1.PoolEndpoint{tt.endpoint}
+			})
+			_, err := e.pool.Reconcile(e.ctx, req(ns, "default"))
+			if err == nil || !strings.Contains(err.Error(), "invalid endpoints for pool ns/default") {
+				t.Fatalf("reconcile error %v", err)
+			}
+			if n := len(e.pods()); n != 0 {
+				t.Errorf("%d pods created for an invalid pool", n)
+			}
+			pool := e.getPool("default")
+			if pool.Status.Reason != poolInvalidConfiguration {
+				t.Errorf("status reason %q, want %s", pool.Status.Reason, poolInvalidConfiguration)
+			}
+			if !strings.Contains(pool.Status.Message, tt.want) {
+				t.Errorf("status message %q does not contain %q", pool.Status.Message, tt.want)
+			}
+		})
 	}
 }
 

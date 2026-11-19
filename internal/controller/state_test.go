@@ -44,6 +44,8 @@ func TestStateInitialization(t *testing.T) {
 	size20G := resource.MustParse("20Gi")
 	zeroSize := resource.MustParse("0")
 	negativeSize := resource.MustParse("-1Gi")
+	hugeSize := resource.MustParse("10Ei")
+	maxInt64Size := resource.MustParse("9223372036854775807")
 	tests := []struct {
 		name    string
 		spec    v1.BlipStateSpec
@@ -56,6 +58,8 @@ func TestStateInitialization(t *testing.T) {
 		{name: "empty size", spec: v1.BlipStateSpec{Replicas: 2, Size: &size20G}, size: 20 << 30},
 		{name: "zero size", spec: v1.BlipStateSpec{Replicas: 2, Size: &zeroSize}, message: "size 0 must be greater than 0", phase: v1.StateFailed},
 		{name: "negative size", spec: v1.BlipStateSpec{Replicas: 2, Size: &negativeSize}, message: "size -1Gi must be greater than 0", phase: v1.StateFailed},
+		{name: "huge size", spec: v1.BlipStateSpec{Replicas: 2, Size: &hugeSize}, message: "too large", phase: v1.StateFailed},
+		{name: "max int64 size", spec: v1.BlipStateSpec{Replicas: 2, Size: &maxInt64Size}, message: "too large", phase: v1.StateFailed},
 		{name: "image", spec: v1.BlipStateSpec{Image: "reg/img:v1"}, size: 10 << 30, nodes: 2},
 		{name: "image size", spec: v1.BlipStateSpec{Image: "reg/img:v1", Size: &size20G}, size: 20 << 30, nodes: 2},
 		{name: "missing image", spec: v1.BlipStateSpec{Image: "reg/nope:v1"}, message: "image reg/nope:v1: not found", phase: v1.StateFailed},
@@ -106,6 +110,37 @@ func (imageConfigNotFound) Digest(_ context.Context, ref, _ string, _ []corev1.L
 
 func (imageConfigNotFound) ImageConfig(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (*v1.ImageConfig, error) {
 	return nil, fmt.Errorf("image config %s: %w", ref, ErrImageNotFound)
+}
+
+// imageConfigUnsupported resolves any digest but reports that the pinned image
+// has no manifest for the node platform.
+type imageConfigUnsupported struct{}
+
+func (imageConfigUnsupported) Digest(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (string, error) {
+	return ref, nil
+}
+
+func (imageConfigUnsupported) ImageConfig(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (*v1.ImageConfig, error) {
+	return nil, fmt.Errorf("%w: image config %s: no child with platform linux/amd64", ErrUnsupportedImage, ref)
+}
+
+func TestStatePlatformMismatchFailsTerminally(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.state.Registry = imageConfigUnsupported{}
+	ref := "reg/img@sha256:" + strings.Repeat("1", 64)
+	e.newState("s", func(st *v1.BlipState) {
+		st.Spec.Image, st.Spec.Replicas = ref, 0
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("platform mismatch not terminal: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "no manifest for this platform") ||
+		!strings.Contains(st.Status.Message, "no child with platform") {
+		t.Fatalf("message %q does not explain the platform mismatch", st.Status.Message)
+	}
 }
 
 func TestStateMissingDigestFails(t *testing.T) {
@@ -750,11 +785,12 @@ func TestStateDeletionBlockedByActiveWriter(t *testing.T) {
 	}
 
 	// A deleting state does not keep the saving Blip alive: its seal can
-	// never be recorded against the state. The state keeps its finalizer
-	// until the node reports the seal, then the last save is discarded.
+	// never be recorded against the state, so the save is reported as
+	// discarded. The state keeps its finalizer until the node reports the
+	// seal, then the last save is discarded.
 	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
 	e.run(e.blip, ns, "b")
-	expectPhase(t, e.getBlip("b"), v1.BlipSucceeded, ReasonStopped)
+	expectPhase(t, e.getBlip("b"), v1.BlipFailed, ReasonSaveFailed)
 	e.run(e.state, ns, "s")
 	if st := e.getState("s"); !strings.Contains(st.Status.Message, "writer b") || len(st.Finalizers) == 0 {
 		t.Fatalf("writer released without a seal: %+v", st.Status)
@@ -797,11 +833,11 @@ func TestQueuedBlipDoesNotBlockStateDeletion(t *testing.T) {
 		t.Fatalf("deletion not blocked by the holder: %+v", st.Status)
 	}
 
-	// Stop the holder. A deleting root does not keep the saving Blip alive,
-	// so it finishes immediately; the state still waits for its writer.
+	// Stop the holder. A deleting root does not keep the saving Blip alive:
+	// the discarded save fails it; the state still waits for its writer.
 	e.observe(holder.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
 	e.run(e.blip, ns, "holder")
-	expectPhase(t, e.getBlip("holder"), v1.BlipSucceeded, ReasonStopped)
+	expectPhase(t, e.getBlip("holder"), v1.BlipFailed, ReasonSaveFailed)
 	e.run(e.state, ns, "s")
 	if st := e.getState("s"); !strings.Contains(st.Status.Message, "writer holder") || len(st.Finalizers) == 0 {
 		t.Fatalf("writer released without a seal: %+v", st.Status)

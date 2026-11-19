@@ -19,19 +19,6 @@ func stateFailure(s *v1alpha1.BlipState) string {
 	return stateFailureMessage(s)
 }
 
-// stateFailureWhilePending is the historical classification for callers that
-// create a state and wait for its first version. The controller retries a
-// failed initial version while it remains pending, so those failures are not
-// terminal for this wait. Pull and run deliberately use stateFailure instead:
-// an immutable provisioning failure can leave the same phase and pending
-// combination but can never recover.
-func stateFailureWhilePending(s *v1alpha1.BlipState) string {
-	if s.Status.Phase != v1alpha1.StateFailed || s.Status.Pending != nil {
-		return ""
-	}
-	return stateFailureMessage(s)
-}
-
 // usableStateFailure returns why an existing state cannot be used as a run
 // source or root. A state with a committed version remains usable even if its
 // initialization history left a failed phase behind.
@@ -57,13 +44,6 @@ func stateFailureMessage(s *v1alpha1.BlipState) string {
 // usable once its first commit exists, so run can return.
 func (a *app) waitStateCommitted(ctx context.Context, name string) (*v1alpha1.BlipState, error) {
 	return a.waitStateCommittedUnless(ctx, name, stateFailure)
-}
-
-// waitStateCommittedWhilePending waits for a newly created state's first
-// version, allowing a failed initial replication to recover while it is still
-// pending.
-func (a *app) waitStateCommittedWhilePending(ctx context.Context, name string) (*v1alpha1.BlipState, error) {
-	return a.waitStateCommittedUnless(ctx, name, stateFailureWhilePending)
 }
 
 func (a *app) waitStateCommittedUnless(ctx context.Context, name string, failure func(*v1alpha1.BlipState) string) (*v1alpha1.BlipState, error) {

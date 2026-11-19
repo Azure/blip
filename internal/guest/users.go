@@ -195,7 +195,14 @@ func lookPath(root, dir, name string, env []string, acct *account) (string, erro
 		}
 	}
 	denied := false
-	for _, entry := range filepath.SplitList(pathVar) {
+	entries := filepath.SplitList(pathVar)
+	if pathVar == "" {
+		// execvp treats PATH="" as one empty component: the current
+		// directory. filepath.SplitList returns no entries for "", which
+		// would make the command unfindable.
+		entries = []string{""}
+	}
+	for _, entry := range entries {
 		var p string
 		switch {
 		case entry == "" || entry == ".":

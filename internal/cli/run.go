@@ -391,7 +391,7 @@ func (a *app) launch(ctx context.Context, b *v1alpha1.Blip, source *v1alpha1.Bli
 		ref := blipRef(b)
 		opts = &workspace.ForkOptions{Owner: &ref}
 	}
-	if err := workspace.Fork(ctx, c.Kube, source, fork, opts); err != nil {
+	if _, err := workspace.Fork(ctx, c.Kube, source, fork, opts); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("state for blip %q already exists: %w", a.short(b.Name), err)
 		}

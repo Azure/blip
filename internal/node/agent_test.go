@@ -28,12 +28,13 @@ import (
 )
 
 type fakeStore struct {
-	mu        sync.Mutex
-	volumes   map[string]storage.Volume
-	pending   map[string]bool
-	deleted   []string
-	imports   map[string]int64
-	createErr error
+	mu          sync.Mutex
+	volumes     map[string]storage.Volume
+	pending     map[string]bool
+	deleted     []string
+	imports     map[string]int64
+	createErr   error
+	activations int
 }
 
 func newFakeStore() *fakeStore {
@@ -110,6 +111,19 @@ func (f *fakeStore) CreateWorking(ctx context.Context, req storage.CreateWorking
 	}
 	f.add(storage.Volume{ID: req.AttachmentID, Kind: storage.KindWorking, StateUID: req.StateUID, Device: "/dev/fake/" + req.AttachmentID})
 	return "/dev/fake/" + req.AttachmentID, nil
+}
+
+func (f *fakeStore) Activate(id string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.volumes[id]
+	if !ok {
+		return "", storage.ErrNotFound
+	}
+	f.activations++
+	v.Device = "/dev/fake/" + id
+	f.volumes[id] = v
+	return v.Device, nil
 }
 
 func (f *fakeStore) Seal(ctx context.Context, attachmentID, commitID string) (int64, error) {
@@ -565,6 +579,59 @@ func TestPrepareErrorAnnotation(t *testing.T) {
 	}
 	if msg := got.Annotations[v1alpha1.AnnotationPrepareError]; msg != "" {
 		t.Fatalf("prepare error annotation not cleared: %q", msg)
+	}
+}
+
+// TestPrepareReactivatesReadyWorkingVolume: a ready working volume whose
+// device was missing from the pass's snapshot is reactivated during prepare
+// instead of failing and putting "has no active device" on the pod.
+func TestPrepareReactivatesReadyWorkingVolume(t *testing.T) {
+	b := blip("b")
+	b.Status.RootAttachmentID = "r1"
+	pod := vmPod("p", string(b.UID))
+	s := state("root")
+	s.Status.Writer = &v1alpha1.Writer{AttachmentID: "r1", PodUID: string(pod.UID), PodName: pod.Name,
+		BlipUID: string(b.UID), Node: self, BaseCommit: "c1"}
+	a, st, _ := testAgent(t, pod, b, s)
+	st.add(storage.Volume{ID: "r1", Kind: storage.KindWorking, StateUID: string(s.UID)})
+	var gotPath, gotDev string
+	a.mknod = func(path, device string) error {
+		gotPath, gotDev = path, device
+		return nil
+	}
+	podDir := a.podDirFor(podKey(ns, "p"))
+	if err := os.MkdirAll(podDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := podapi.WriteJSON(filepath.Join(podDir, podapi.ObservedFile), podapi.Observed{Phase: podapi.PhaseWarm}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := a.sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitIdle(t, a)
+
+	st.mu.Lock()
+	activations := st.activations
+	vol := st.volumes["r1"]
+	st.mu.Unlock()
+	if activations != 1 {
+		t.Fatalf("Activate calls = %d, want 1", activations)
+	}
+	if vol.Device != "/dev/fake/r1" {
+		t.Fatalf("volume still has no device: %+v", vol)
+	}
+	if gotDev != vol.Device || gotPath != filepath.Join(podDir, podapi.DevDir, "r1") {
+		t.Fatalf("device node = %q -> %q", gotPath, gotDev)
+	}
+	var got corev1.Pod
+	if err := a.client.Get(ctx, client.ObjectKeyFromObject(pod), &got); err != nil {
+		t.Fatal(err)
+	}
+	if msg := got.Annotations[v1alpha1.AnnotationPrepareError]; msg != "" {
+		t.Fatalf("prepare error annotation = %q", msg)
 	}
 }
 

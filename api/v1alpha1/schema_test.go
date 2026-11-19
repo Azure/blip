@@ -351,6 +351,33 @@ func admissionValidator(t *testing.T, name string) func(object, old string) fiel
 	}
 }
 
+// TestBlipPoolReservedEndpointNames guards that admission rejects an endpoint
+// whose name already names something else in the guest. Such a pool used to be
+// accepted, then the controller failed validation on every reconcile, leaving
+// empty status and no VMs while Blips waited for a VM indefinitely.
+func TestBlipPoolReservedEndpointNames(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blippools.yaml")
+	endpoints, ok := spec.Properties["endpoints"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.endpoints property")
+	}
+	ruleFor(t, endpoints.XValidations, "endpoint name is reserved")
+
+	validate := admissionValidator(t, "blippools")
+	for _, name := range []string{"blip", "kube-apiserver", "localhost"} {
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"blip.dev/node-pool":"default"},"endpoints":[{"name":%q,"url":"https://whoami.example.com"}]}}`, name)
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted reserved endpoint name %q", name)
+		}
+	}
+	for _, name := range []string{"whoami", "api", "whoami-8443"} {
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"blip.dev/node-pool":"default"},"endpoints":[{"name":%q,"url":"https://whoami.example.com"}]}}`, name)
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected valid endpoint name %q: %v", name, errs.ToAggregate())
+		}
+	}
+}
+
 // TestBlipTurnSchemaCaps guards the bounded turn payload: the engine renders
 // every turn into a coordinator step, so text and attributes must stay small.
 func TestBlipTurnSchemaCaps(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -32,7 +33,12 @@ const orphanGrace = 10 * time.Minute
 
 // Sequencer stamps every new turn with the next sequence number of its thread.
 // It is the only writer of status.seq and the only writer of
-// BlipThread.status.lastSeq, and it is serialized per thread.
+// BlipThread.status.lastSeq. Only the elected leader runs it; the deployment
+// passes --leader-elect.
+//
+// The per-thread mutex serializes reconciles inside one process. Sequence
+// allocation additionally uses a compare-and-swap on thread.status.lastSeq,
+// so even a second process with its own mutex cannot hand out the same number.
 type Sequencer struct {
 	client.Client
 	mu sync.Map // namespace/name -> *sync.Mutex
@@ -113,24 +119,38 @@ func (s *Sequencer) sequenceThread(ctx context.Context, thread *v1.BlipThread) e
 	return nil
 }
 
-// sequence assigns the next sequence number to turn. The turn write happens
-// first: a conflict on the turn is retried without consuming a number, so
-// producers updating a turn cannot burn sequence numbers. Only after the turn
-// holds its number does the sequencer advance status.lastSeq.
+// sequence assigns a reserved sequence number to turn. The number is claimed
+// first with reserveSeq: a number can only be handed out once, even when two
+// sequencer processes race on the same thread. If the turn cannot be updated,
+// releaseSeq gives the number back so a producer conflict does not leave a
+// permanent hole.
 func (s *Sequencer) sequence(ctx context.Context, thread *v1.BlipThread, turn *v1.BlipTurn) error {
-	seq := thread.Status.LastSeq + 1
+	if turn.Status.Seq != 0 {
+		return nil
+	}
+	seq, err := s.reserveSeq(ctx, thread)
+	if err != nil {
+		return err
+	}
 	current := turn
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
 			current = &v1.BlipTurn{}
 			if err := s.Get(ctx, client.ObjectKeyFromObject(turn), current); err != nil {
+				s.releaseSeq(ctx, thread, seq)
 				return client.IgnoreNotFound(err)
 			}
 			if current.Status.Seq != 0 {
-				// Another sequencer won; do not consume this number.
+				// Another sequencer won the turn. Give our number back unless
+				// the winner used it (for example a peer that read the counter
+				// before our CAS landed), in which case the counter must stay.
+				if current.Status.Seq != seq {
+					s.releaseSeq(ctx, thread, seq)
+				}
 				return nil
 			}
 			if !turnBelongsToThread(current, thread) {
+				s.releaseSeq(ctx, thread, seq)
 				return nil
 			}
 		}
@@ -140,18 +160,79 @@ func (s *Sequencer) sequence(ctx context.Context, thread *v1.BlipThread, turn *v
 		current.Status.AcceptedTime = &metav1.Time{Time: timeNow()}
 		err := s.Status().Update(ctx, current)
 		if err == nil {
-			return s.advanceLastSeq(ctx, thread, seq)
+			return nil
 		}
 		if !apierrors.IsConflict(err) || attempt+1 >= seqRetries {
+			s.releaseSeq(ctx, thread, seq)
 			return err
 		}
 	}
 }
 
-// advanceLastSeq persists a reserved sequence number. It retries conflicts
-// against a fresh thread so a concurrent coordinator commit cannot leave the
-// counter behind.
-func (s *Sequencer) advanceLastSeq(ctx context.Context, thread *v1.BlipThread, seq int64) error {
+// reserveSeq claims the next sequence number for thread by advancing
+// status.lastSeq with a compare-and-swap. A conflict means another writer (a
+// second sequencer, or the coordinator updating another status field) got
+// there first, so it re-reads the thread and recomputes the number instead of
+// reusing the stale in-memory lastSeq. Exhausting the retries is an error;
+// an already-used number is never returned as success.
+func (s *Sequencer) reserveSeq(ctx context.Context, thread *v1.BlipThread) (int64, error) {
+	current := thread
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			current = &v1.BlipThread{}
+			if err := s.Get(ctx, client.ObjectKeyFromObject(thread), current); err != nil {
+				return 0, err
+			}
+		}
+		seq := current.Status.LastSeq + 1
+		current.Status.LastSeq = seq
+		err := s.Status().Update(ctx, current)
+		if err == nil {
+			thread.Status.LastSeq = seq
+			thread.ResourceVersion = current.ResourceVersion
+			return seq, nil
+		}
+		if !apierrors.IsConflict(err) || attempt+1 >= seqRetries {
+			return 0, err
+		}
+	}
+}
+
+// releaseSeq returns a reserved but unused number. It rewinds the counter only
+// while it still names our reservation, so it can never move lastSeq below a
+// number another writer has already claimed.
+func (s *Sequencer) releaseSeq(ctx context.Context, thread *v1.BlipThread, seq int64) {
+	current := thread
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			current = &v1.BlipThread{}
+			if err := s.Get(ctx, client.ObjectKeyFromObject(thread), current); err != nil {
+				return
+			}
+		}
+		if current.Status.LastSeq != seq {
+			thread.Status.LastSeq = current.Status.LastSeq
+			thread.ResourceVersion = current.ResourceVersion
+			return
+		}
+		current.Status.LastSeq = seq - 1
+		err := s.Status().Update(ctx, current)
+		if err == nil {
+			thread.Status.LastSeq = seq - 1
+			thread.ResourceVersion = current.ResourceVersion
+			return
+		}
+		if !apierrors.IsConflict(err) || attempt+1 >= seqRetries {
+			return
+		}
+	}
+}
+
+// raiseLastSeq repairs a lagging counter after a turn was numbered by an
+// earlier process. It never assigns a number to a turn; reserveSeq is the only
+// path that hands out new numbers. A counter that already covers seq needs no
+// repair, so this can be retried safely.
+func (s *Sequencer) raiseLastSeq(ctx context.Context, thread *v1.BlipThread, seq int64) error {
 	current := thread
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
@@ -162,12 +243,14 @@ func (s *Sequencer) advanceLastSeq(ctx context.Context, thread *v1.BlipThread, s
 		}
 		if current.Status.LastSeq >= seq {
 			thread.Status.LastSeq = current.Status.LastSeq
+			thread.ResourceVersion = current.ResourceVersion
 			return nil
 		}
 		current.Status.LastSeq = seq
 		err := s.Status().Update(ctx, current)
 		if err == nil {
 			thread.Status.LastSeq = seq
+			thread.ResourceVersion = current.ResourceVersion
 			return nil
 		}
 		if !apierrors.IsConflict(err) || attempt+1 >= seqRetries {
@@ -195,7 +278,7 @@ func (s *Sequencer) repairLastSeq(ctx context.Context, turn *v1.BlipTurn) error 
 	if thread.Status.LastSeq >= turn.Status.Seq {
 		return nil
 	}
-	return s.advanceLastSeq(ctx, &thread, turn.Status.Seq)
+	return s.raiseLastSeq(ctx, &thread, turn.Status.Seq)
 }
 
 // orphan decides what to do with a turn whose thread does not exist. A turn
@@ -253,8 +336,15 @@ func (s *Sequencer) turnsForThread(ctx context.Context, obj client.Object) []rec
 // SetupWithManager registers the sequencer. Thread creates are watched so
 // turns that were waiting for a thread are sequenced as soon as it appears,
 // even after they were marked orphaned.
+//
+// The sequencer requires leader election: two replicas assigning numbers from
+// their own per-thread mutex produced duplicate status.seq values, and a
+// duplicate that is stamped after the coordinator consumed that number is
+// silently skipped forever.
 func (s *Sequencer) SetupWithManager(mgr ctrl.Manager) error {
+	needLeaderElection := true
 	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(controller.Options{NeedLeaderElection: &needLeaderElection}).
 		For(&v1.BlipTurn{}).
 		Watches(&v1.BlipThread{}, handler.EnqueueRequestsFromMapFunc(s.turnsForThread),
 			builder.WithPredicates(predicate.Funcs{

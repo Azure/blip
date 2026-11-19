@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/session/fakeguest"
 	"github.com/Azure/blip/internal/wire"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,6 +36,14 @@ func withRetainedOutputWait(t *testing.T, d time.Duration) {
 	old := retainedOutputWait
 	retainedOutputWait = d
 	t.Cleanup(func() { retainedOutputWait = old })
+}
+
+// withTruncatedOutputWait shortens the wait after a cut-off live stream.
+func withTruncatedOutputWait(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := truncatedOutputWait
+	truncatedOutputWait = d
+	t.Cleanup(func() { truncatedOutputWait = old })
 }
 
 // setOutput writes status.output directly, like the controller does.
@@ -332,6 +342,107 @@ func TestGatherRejectsDuplicateCollectDestinations(t *testing.T) {
 	}
 }
 
+// A file collected onto an existing directory is stored under its basename,
+// so a destination that looks distinct can be the same file. gather must
+// reject the pair before copying instead of letting the second overwrite the
+// first.
+func TestGatherRejectsCollectIntoExistingDirectoryCollision(t *testing.T) {
+	root := withCollectMountRoot(t)
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/src/marker", "MARKER1\n", 0o644)
+	writeCollectFile(t, root, "alice.w1", "/home/dev/big", "BIG-DATA\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir("out", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := h.run("", "gather", "w1",
+		"--collect", "/home/dev/src/marker:./out",
+		"--collect", "/home/dev/big:./out/marker")
+	if code != 1 {
+		t.Fatalf("code %d, want 1: %s", code, errOut)
+	}
+	mustContain(t, errOut, "destination", "/home/dev/src/marker", "/home/dev/big")
+	if _, err := os.Stat(filepath.Join(dir, "out/marker")); !os.IsNotExist(err) {
+		t.Fatalf("a colliding destination was written: %v", err)
+	}
+	if h.gone("alice.w1") {
+		t.Fatal("blip deleted despite the collision")
+	}
+}
+
+// A directory merge spreads over everything below its destination, so a
+// second operation beneath that destination overlaps it even though the two
+// declared destinations differ.
+func TestGatherRejectsCollectDirectoryOverlap(t *testing.T) {
+	root := withCollectMountRoot(t)
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/tree/sub/marker", "TREE\n", 0o644)
+	writeCollectFile(t, root, "alice.w1", "/home/dev/marker", "MARKER2\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir("out", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := h.run("", "gather", "w1",
+		"--collect", "/home/dev/tree:./out",
+		"--collect", "/home/dev/marker:./out/sub")
+	if code != 1 {
+		t.Fatalf("code %d, want 1: %s", code, errOut)
+	}
+	mustContain(t, errOut, "destination", "/home/dev/tree", "/home/dev/marker")
+	if _, err := os.Stat(filepath.Join(dir, "out/sub")); !os.IsNotExist(err) {
+		t.Fatalf("an overlapping destination was written: %v", err)
+	}
+	if h.gone("alice.w1") {
+		t.Fatal("blip deleted despite the overlap")
+	}
+}
+
+// Files with distinct names still share an existing destination directory;
+// their effective destinations do not collide.
+func TestGatherAllowsDistinctFilesIntoExistingDirectory(t *testing.T) {
+	root := withCollectMountRoot(t)
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/src/a", "AAA\n", 0o644)
+	writeCollectFile(t, root, "alice.w1", "/home/dev/src/b", "BBB\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir("out", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := h.run("", "gather", "w1",
+		"--collect", "/home/dev/src/a:./out/a",
+		"--collect", "/home/dev/src/b:./out/b")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if got := readFile(t, filepath.Join(dir, "out/a")); got != "AAA\n" {
+		t.Fatalf("a = %q", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "out/b")); got != "BBB\n" {
+		t.Fatalf("b = %q", got)
+	}
+	if !h.gone("alice.w1") {
+		t.Fatal("blip kept")
+	}
+}
+
 func TestGatherCollectNeedsBlip(t *testing.T) {
 	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
 	code, _, errOut := h.run("", "gather", "w1", "--collect", "/out:./out")
@@ -361,6 +472,90 @@ func TestGatherFollowReplaysFastFinishedBlip(t *testing.T) {
 	if len(opens) != 1 || opens[0].Open.Mode != wire.OpenAttach ||
 		opens[0].Open.Session != wire.PrimarySession || !opens[0].Open.Follow {
 		t.Fatalf("opens = %+v", opens)
+	}
+}
+
+// truncatedConnector serves one primary attach, writes prefix, and then drops
+// the connection without a TExited frame. That is what a follower sees when
+// the guest closes a finished primary session while the follower is still
+// backpressured and the delivery deadline expires.
+func truncatedConnector(prefix string) session.Connector {
+	return func(context.Context, string, string) (io.ReadWriteCloser, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			conn := wire.NewConn(server)
+			t, payload, err := conn.Read()
+			if err != nil || t != wire.TOpen {
+				return
+			}
+			var o wire.Open
+			if err := wire.Decode(payload, &o); err != nil {
+				return
+			}
+			_ = conn.WriteJSON(wire.TOpened, wire.Opened{Session: o.Session, TTY: o.TTY})
+			_ = conn.Write(wire.TStdout, []byte(prefix))
+		}()
+		return client, nil
+	}
+}
+
+// A follower that is cut off before TExited has printed only a prefix of the
+// command output. The controller's retained status.output still has the tail,
+// so gather -f must warn and replay it instead of silently losing it.
+func TestGatherFollowReplaysRetainedOutputAfterTruncatedStream(t *testing.T) {
+	b := finishedBlip("cut", v1alpha1.BlipSucceeded, 0)
+	b.Status.Output = "RETAINED1\nFINAL_MARKER\n"
+	h := newHarness(t, b)
+	h.connect = truncatedConnector("LIVE1\nLIVE2\n")
+
+	code, out, errOut := h.run("", "gather", "cut", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "cut| LIVE1", "cut| LIVE2", "cut| RETAINED1", "cut| FINAL_MARKER", "blip/cut Succeeded (exit 0)")
+	mustContain(t, errOut, "output stream ended before the command exited", "replayed the retained output")
+	if !h.gone("cut") {
+		t.Fatal("blip kept")
+	}
+}
+
+// The same cut with no retained output must still warn instead of looking like
+// a clean, complete follow.
+func TestGatherFollowWarnsWhenTruncatedOutputIsGone(t *testing.T) {
+	withTruncatedOutputWait(t, 50*time.Millisecond)
+	h := newHarness(t, finishedBlip("cut", v1alpha1.BlipSucceeded, 0))
+	h.connect = truncatedConnector("LIVE1\n")
+
+	code, out, errOut := h.run("", "gather", "cut", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "cut| LIVE1", "blip/cut Succeeded (exit 0)")
+	mustContain(t, errOut, "output stream ended before the command exited", "rest of the output is no longer available")
+}
+
+// A clean TExited follow is complete output, not truncation; do not replay
+// status.output or print the truncation warning.
+func TestGatherFollowDoesNotReplayAfterCleanExit(t *testing.T) {
+	b := finishedBlip("clean", v1alpha1.BlipSucceeded, 0)
+	b.Status.Output = "RETAINED1\n"
+	h := newHarness(t, b)
+	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
+		s.Stdout("LIVE1\n")
+		return wire.Exit{}
+	}
+
+	code, out, errOut := h.run("", "gather", "clean", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "clean| LIVE1", "blip/clean Succeeded (exit 0)")
+	if strings.Contains(out, "RETAINED1") {
+		t.Fatalf("clean completion replayed retained output: %q", out)
+	}
+	if strings.Contains(errOut, "output stream ended before the command exited") {
+		t.Fatalf("clean completion warned about truncation: %q", errOut)
 	}
 }
 
@@ -419,6 +614,33 @@ func TestGatherFollowWaitsForDelayedStatusOutput(t *testing.T) {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	mustContain(t, out, "lagged| LATEOUT", "blip/lagged Succeeded (exit 0)")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}
+
+// A Blip can finish before claiming a VM, for example when it is stopped
+// while pending. It never ran a command, so no status.output can arrive and
+// gather -f must not wait out the retained-output poll for it.
+func TestGatherFollowReturnsPromptlyWhenBlipNeverStarted(t *testing.T) {
+	b := finishedBlip("nodop", v1alpha1.BlipFailed, 0)
+	b.Status.Pod = ""
+	b.Status.StartTime = nil
+	b.Status.ExitCode = nil
+	b.Status.Reason = "Stopped"
+	b.Status.Message = "stopped before start"
+	h := newHarness(t, b)
+	start := time.Now()
+	code, out, errOut := h.run("", "gather", "nodop", "-f", "--wait", "2s")
+	elapsed := time.Since(start)
+	if code != 1 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("gather -f took %s for a Blip that never started", elapsed)
+	}
+	mustContain(t, out, "blip/nodop Failed")
+	mustContain(t, errOut, "stopped before start")
 	if strings.Contains(errOut, "output is no longer available") {
 		t.Fatalf("unexpected unavailable message: %q", errOut)
 	}
@@ -517,6 +739,30 @@ func TestGatherSelectorExcludesCaller(t *testing.T) {
 	mustContain(t, out, "blip/w1 Succeeded")
 	if !h.gone("alice.w1") {
 		t.Fatal("matched blip kept")
+	}
+	if h.gone("alice.box") {
+		t.Fatal("caller gathered itself")
+	}
+}
+
+// Naming the caller explicitly must fail quickly instead of waiting forever
+// or reporting the caller as still running.
+func TestGatherExplicitNameRejectsCaller(t *testing.T) {
+	caller := ownedBlip("alice.box", "alice.home")
+	h := newHarness(t, caller)
+	h.self = "alice.box"
+	start := time.Now()
+	code, out, errOut := h.run("", "gather", "alice.box")
+	elapsed := time.Since(start)
+	if code != 1 {
+		t.Fatalf("code %d out %q err %q", code, out, errOut)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("gather of the caller took %s", elapsed)
+	}
+	mustContain(t, errOut, "cannot gather box, the blip running this gather")
+	if strings.Contains(errOut, "still running") {
+		t.Fatalf("caller treated as a target: %q", errOut)
 	}
 	if h.gone("alice.box") {
 		t.Fatal("caller gathered itself")

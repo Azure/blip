@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"runtime"
 	"slices"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -27,14 +28,29 @@ var ErrImageNotFound = errors.New("not found")
 // cannot fix it.
 var ErrInvalidImage = errors.New("invalid image reference")
 
+// ErrUnsupportedImage means the pinned image has no manifest for the node's
+// platform. Both the image digest and the node architecture are fixed, so
+// retrying the same reference can never succeed.
+var ErrUnsupportedImage = errors.New("image has no manifest for this platform")
+
 // terminalImageError reports whether an image resolution error is permanent.
 // Image references and imagePullSecrets are immutable on a state, so a
-// missing image, an unparsable reference, or an unusable pull secret can
-// never recover by retrying. Other registry errors remain transient.
+// missing image, an unparsable reference, an image without a manifest for the
+// node platform, or an unusable pull secret can never recover by retrying.
+// Other registry errors remain transient.
 func terminalImageError(err error) bool {
 	return errors.Is(err, ErrImageNotFound) ||
 		errors.Is(err, ErrInvalidImage) ||
-		errors.Is(err, registryauth.ErrUnusableSecret)
+		errors.Is(err, ErrUnsupportedImage) ||
+		errors.Is(err, registryauth.ErrUnusableSecret) ||
+		platformMismatch(err)
+}
+
+// platformMismatch reports whether err is go-containerregistry's "no child
+// with platform ..." error. It is a plain error, not a *transport.Error, so
+// notFound cannot classify it.
+func platformMismatch(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no child with platform ")
 }
 
 // notFound reports whether err is a permanent registry lookup failure. A 404
@@ -151,6 +167,9 @@ func (r RemoteRegistry) imageConfig(ctx context.Context, ref string, kc authn.Ke
 	opts := append(r.options(ctx, kc), remote.WithPlatform(ociv1.Platform{OS: "linux", Architecture: runtime.GOARCH}))
 	img, err := remote.Image(parsed, opts...)
 	if err != nil {
+		if platformMismatch(err) {
+			return nil, fmt.Errorf("%w: image config %s: %v", ErrUnsupportedImage, ref, err)
+		}
 		if notFound(err) {
 			return nil, fmt.Errorf("image config %s: %v: %w", ref, err, ErrImageNotFound)
 		}
@@ -158,6 +177,9 @@ func (r RemoteRegistry) imageConfig(ctx context.Context, ref string, kc authn.Ke
 	}
 	cf, err := img.ConfigFile()
 	if err != nil {
+		if platformMismatch(err) {
+			return nil, fmt.Errorf("%w: image config %s: %v", ErrUnsupportedImage, ref, err)
+		}
 		if notFound(err) {
 			return nil, fmt.Errorf("image config %s: %v: %w", ref, err, ErrImageNotFound)
 		}

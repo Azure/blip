@@ -44,7 +44,7 @@ func createTurnIn(ctx context.Context, c client.Client, namespace, name string, 
 		// turn reads to one project without trusting self-asserted labels
 		// on the caller's Blip.
 		Labels: map[string]string{
-			v1.LabelThread: spec.Thread,
+			v1.LabelThread: v1.ThreadLabel(spec.Thread),
 			v1.LabelOwner:  v1.ThreadOwner(namespace, spec.Thread),
 		},
 	}

@@ -429,6 +429,11 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 		s.Phase = v1.StateFailed
 		return fmt.Sprintf("size %s must be greater than 0", st.Spec.Size.String()), false, nil
 	}
+	if st.Spec.Size != nil && st.Spec.Size.CmpInt64(v1.MaxStateSizeBytes) > 0 {
+		s.Phase = v1.StateFailed
+		max := resource.NewQuantity(v1.MaxStateSizeBytes, resource.BinarySI)
+		return fmt.Sprintf("size %s is too large (maximum %s)", st.Spec.Size.String(), max.String()), false, nil
+	}
 	if st.Spec.CopyFrom == st.Name {
 		s.Phase = v1.StateFailed
 		s.CopiedFrom = nil

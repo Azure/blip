@@ -44,7 +44,24 @@ func TestKeychain(t *testing.T) {
 		Type:       corev1.SecretTypeOpaque,
 		Data:       map[string][]byte{"other": []byte("x")},
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pull, bad, empty).Build()
+	dockercfg := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "dockercfg"},
+		Type:       corev1.SecretTypeDockercfg,
+		Data: map[string][]byte{corev1.DockerConfigKey: []byte(
+			`{"registry.local":{"username":"cfguser","password":"cfgpass"}}`)},
+	}
+	dockercfgMissing := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "dockercfg-missing"},
+		Type:       corev1.SecretTypeDockercfg,
+		Data:       map[string][]byte{"other": []byte("x")},
+	}
+	dockercfgBad := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "dockercfg-bad"},
+		Type:       corev1.SecretTypeDockercfg,
+		Data:       map[string][]byte{corev1.DockerConfigKey: []byte(`{`)},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(pull, bad, empty, dockercfg, dockercfgMissing, dockercfgBad).Build()
 	ctx := context.Background()
 
 	kc, err := registryauth.Keychain(ctx, c, []registryauth.PullSecret{{Namespace: ns, Name: "pull"}})
@@ -71,6 +88,23 @@ func TestKeychain(t *testing.T) {
 			t.Errorf("%s: got %q/%q, want %q/%q", ref, cfg.Username, cfg.Password, want[0], want[1])
 		}
 	}
+	// A legacy dockercfg secret stores the same registry map without the
+	// {"auths": ...} wrapper.
+	kc, err = registryauth.Keychain(ctx, c, []registryauth.PullSecret{{Namespace: ns, Name: "dockercfg"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedDockercfg, err := name.ParseReference("registry.local/repo:tag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authDockercfg, err := authn.Resolve(ctx, kc, parsedDockercfg.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg, _ := authDockercfg.Authorization(); cfg.Username != "cfguser" || cfg.Password != "cfgpass" {
+		t.Fatalf("dockercfg credentials = %q/%q", cfg.Username, cfg.Password)
+	}
 	// An unknown registry falls through to the default keychain, which has no
 	// credentials for this test registry.
 	parsed, err := name.ParseReference("other.example.com/library/x:y")
@@ -86,9 +120,11 @@ func TestKeychain(t *testing.T) {
 	}
 
 	for name, want := range map[string]string{
-		"missing": "image pull secret default/missing",
-		"bad":     "invalid",
-		"opaque":  "has no .dockerconfigjson",
+		"missing":           "image pull secret default/missing",
+		"bad":               "invalid",
+		"opaque":            "has no .dockerconfigjson",
+		"dockercfg-missing": "has no .dockercfg",
+		"dockercfg-bad":     "invalid .dockercfg",
 	} {
 		_, err := registryauth.Keychain(ctx, c, []registryauth.PullSecret{{Namespace: ns, Name: name}})
 		if err == nil || !strings.Contains(err.Error(), want) {

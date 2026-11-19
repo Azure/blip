@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,7 +138,12 @@ func TestPruneTemporaryMountDropsDeletingTarget(t *testing.T) {
 	}
 }
 
-func TestSavingSkipsDeletingAttachments(t *testing.T) {
+// TestSavingFailsDeletingAttachments covers a stopped Blip whose workspace
+// (root or writable mount) is deleted before its save resolves. attachment
+// treats a deleting state as resolved so the state finalizers cannot deadlock
+// with the Blip; the discarded save must still be reported as a failure
+// rather than as a successful stop.
+func TestSavingFailsDeletingAttachments(t *testing.T) {
 	for _, target := range []string{"root", "mount"} {
 		t.Run(target, func(t *testing.T) {
 			e := newEnv(t)
@@ -168,9 +174,12 @@ func TestSavingSkipsDeletingAttachments(t *testing.T) {
 
 			e.run(e.blip, ns, "job")
 			b = e.getBlip("job")
-			expectPhase(t, b, v1.BlipSucceeded, ReasonStopped)
+			expectPhase(t, b, v1.BlipFailed, ReasonSaveFailed)
+			if !strings.Contains(b.Status.Message, "save was discarded") {
+				t.Fatalf("deleted state did not report a discarded save: %+v", b.Status)
+			}
 			if b.Status.ExitCode != nil {
-				t.Fatalf("deleted state made a stopped command fail: %+v", b.Status)
+				t.Fatalf("deleted state gave the stopped command an exit code: %+v", b.Status)
 			}
 		})
 	}

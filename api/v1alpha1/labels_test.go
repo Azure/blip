@@ -26,3 +26,23 @@ func TestParentLabelFitsLabelValueLimit(t *testing.T) {
 		t.Fatal("different names share a parent label")
 	}
 }
+
+func TestThreadLabelFitsLabelValueLimit(t *testing.T) {
+	if got := ThreadLabel("proj"); got != "proj" {
+		t.Fatalf("short thread label = %q", got)
+	}
+	long := "alice-" + strings.Repeat("a", 70)
+	got := ThreadLabel(long)
+	if len(got) > 63 {
+		t.Fatalf("long thread label %q is %d bytes", got, len(got))
+	}
+	if problems := validation.IsValidLabelValue(got); len(problems) > 0 {
+		t.Fatalf("long thread label %q: %v", got, problems)
+	}
+	if got != ThreadLabel(long) {
+		t.Fatal("thread label is not stable")
+	}
+	if got == ThreadLabel(long+"x") {
+		t.Fatal("different names share a thread label")
+	}
+}

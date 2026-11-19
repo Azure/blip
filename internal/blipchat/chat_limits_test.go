@@ -60,3 +60,44 @@ func TestChatMessageAndHistoryLimits(t *testing.T) {
 		})
 	}
 }
+
+// json.Decoder stops at the end of the first value, so a valid prefix must not
+// let the rest of an oversized body through.
+func TestChatRejectsBodyOverLimitAfterJSON(t *testing.T) {
+	body := `{"thread":"proj","message":"hi"}` + "\n" + strings.Repeat("A", 2<<20)
+	upstream, requests := llmServerWithRequests(t, Message{Role: "assistant", Content: "ok"})
+	c := testClient(t, testThread())
+	rec := chatRequestFor(t, c, upstream, "alice", "ns", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if len(*requests) != 0 {
+		t.Errorf("oversized body reached the model (%d requests)", len(*requests))
+	}
+}
+
+func TestChatRejectsTrailingJSONValue(t *testing.T) {
+	body := `{"thread":"proj","message":"hi"}{"thread":"proj","message":"again"}`
+	upstream, requests := llmServerWithRequests(t, Message{Role: "assistant", Content: "ok"})
+	c := testClient(t, testThread())
+	rec := chatRequestFor(t, c, upstream, "alice", "ns", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if len(*requests) != 0 {
+		t.Errorf("trailing JSON value reached the model (%d requests)", len(*requests))
+	}
+}
+
+func TestChatAllowsTrailingWhitespace(t *testing.T) {
+	body := `{"thread":"proj","message":"hi"}` + "\n\t  "
+	upstream, requests := llmServerWithRequests(t, Message{Role: "assistant", Content: "ok"})
+	c := testClient(t, testThread())
+	rec := chatRequestFor(t, c, upstream, "alice", "ns", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if len(*requests) != 1 {
+		t.Errorf("trailing whitespace produced %d model requests, want 1", len(*requests))
+	}
+}

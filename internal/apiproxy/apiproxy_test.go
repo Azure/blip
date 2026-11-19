@@ -810,3 +810,45 @@ func TestClientHalfCloseKeepsRequest(t *testing.T) {
 		})
 	}
 }
+
+func TestStripIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kept bool
+	}{
+		// Identity assertions from authenticating front proxies.
+		{"X-Goog-Authenticated-User-Email", false},
+		{"X-Goog-Authenticated-User-Id", false},
+		{"X-Goog-Iap-Jwt-Assertion", false},
+		{"X-Ms-Client-Principal", false},
+		{"X-Ms-Client-Principal-Name", false},
+		{"X-Webauth-User", false},
+		{"X-Client-Cert", false},
+		{"X-Client-Dn", false},
+		{"X-Original-User", false},
+		{"X-Auth-User", false},
+		{"X-Envoy-Peer-Metadata", false},
+		{"X-User", false},
+		{"X-Email", false},
+		{"Authorization", false},
+		{"X-Forwarded-For", false},
+		{"X-Remote-User", false},
+		// Ordinary caller headers, including lookalikes of the fixed names,
+		// must survive.
+		{"User-Agent", true},
+		{"X-User-Agent", true},
+		{"X-Safe", true},
+		{"X-Client-Version", true},
+		{"X-Email-Digest", true},
+	} {
+		headers := http.Header{}
+		// Store the spelling as written so matching is genuinely
+		// case-insensitive rather than relying on Header.Set canonicalization.
+		headers[test.name] = []string{"value"}
+		stripIdentity(headers)
+		_, present := headers[test.name]
+		if present != test.kept {
+			t.Errorf("stripIdentity(%q): present = %v, want kept = %v", test.name, present, test.kept)
+		}
+	}
+}

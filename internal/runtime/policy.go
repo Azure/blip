@@ -81,7 +81,11 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 		// Only replies to externally initiated pod-IP DNAT connections bypass
 		// egress policy. This is ingress return traffic, not a blanket
 		// established-flow exception for VM-initiated connections.
-		fmt.Fprintf(&b, "  ct direction reply ct status dnat ct original ip daddr %s ct state established counter accept\n", p.podIP)
+		// Exclude ICMP: an unsolicited echo request creates a DNAT conntrack
+		// entry whose echo reply is "established" in the reply direction, and
+		// accepting it would let a spoofed source make the guest emit an echo
+		// reply to a denied destination. ICMP errors are handled separately.
+		fmt.Fprintf(&b, "  ct direction reply ct status dnat ct original ip daddr %s ct state established meta l4proto != icmp counter accept\n", p.podIP)
 		b.WriteString("  ct direction original jump egress\n")
 	}
 	b.WriteString("  counter drop\n }\n")
@@ -92,7 +96,10 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
   ct state invalid counter drop
 `, p.guestIP, iface)
 	if active {
-		fmt.Fprintf(&b, "  ct direction original ct status dnat ct original ip daddr %s counter accept\n", p.podIP)
+		// Exclude ICMP so a new inbound echo request is not delivered to the
+		// guest. Accepting it would let the guest answer a spoofed source and
+		// bypass the pool's egress policy with the reply.
+		fmt.Fprintf(&b, "  ct direction original ct status dnat ct original ip daddr %s meta l4proto != icmp counter accept\n", p.podIP)
 		// Path-MTU discovery and route diagnostics travel as ICMP errors
 		// RELATED to an allowed flow. Without these the guest keeps sending
 		// full-size segments after a router asks it to shrink (a PMTUD

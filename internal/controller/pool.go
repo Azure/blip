@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,9 +33,40 @@ import (
 	"github.com/Azure/blip/internal/podapi"
 )
 
+// recordWarning publishes a pool problem as a Warning Event when a recorder
+// is configured.
+func (r *PoolReconciler) recordWarning(obj client.Object, reason string, err error) {
+	if r.Recorder != nil {
+		r.Recorder.Event(obj, corev1.EventTypeWarning, reason, err.Error())
+	}
+}
+
+// invalidPool records an endpoint validation failure in pool status and, when
+// a recorder is configured, as a Warning Event. Status is written only when it
+// changes, so the error-driven requeue does not patch forever.
+func (r *PoolReconciler) invalidPool(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
+	err = fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
+	if pool.Status.Reason != poolInvalidConfiguration || pool.Status.Message != err.Error() {
+		base := pool.DeepCopy()
+		pool.Status.Reason = poolInvalidConfiguration
+		pool.Status.Message = err.Error()
+		if patchErr := r.Status().Patch(ctx, pool, client.MergeFrom(base)); patchErr != nil {
+			return fmt.Errorf("%w (status update: %v)", err, patchErr)
+		}
+	}
+	r.recordWarning(pool, reason, err)
+	return err
+}
+
 // expectTimeout bounds how long a created or deleted pod that the cache does
 // not reflect yet is accounted for.
 const expectTimeout = time.Minute
+
+// blockedGrace bounds how long a node whose pinned pod the scheduler rejected
+// is avoided. The pool retries it after the grace, so a node that regained
+// room is used again, but deleting one rejected pod cannot immediately
+// recreate another unschedulable one there.
+const blockedGrace = time.Minute
 
 const (
 	// Bump when pod topology changes without a pool spec change, so warm
@@ -60,6 +92,10 @@ const (
 	terminationGracePeriod = int64(90)
 
 	defaultVMCPUs = int32(2)
+
+	// poolInvalidConfiguration is the BlipPool.status.reason for a spec that
+	// admission accepted but the controller cannot turn into VMs.
+	poolInvalidConfiguration = "InvalidConfiguration"
 )
 
 var (
@@ -75,6 +111,10 @@ var (
 type PoolReconciler struct {
 	client.Client
 	Config
+	// Recorder publishes validation failures as Kubernetes Events.
+	// SetupWithManager sets it; callers that reconcile directly may leave it
+	// nil.
+	Recorder record.EventRecorder
 
 	// APIAudiences are the cluster's accepted service-account audiences, as
 	// discovered at startup. validateEndpoints rejects an endpoint token
@@ -86,6 +126,10 @@ type PoolReconciler struct {
 	// cache may not show yet.
 	created map[types.NamespacedName]map[string]expectation
 	deleted map[types.NamespacedName]map[string]expectation
+	// blocked holds, per pool, when a node whose pinned pod the scheduler
+	// rejected may be tried again. A rejected pod is deleted, so the nodes
+	// cannot be re-derived from the pod list on the next pass.
+	blocked map[types.NamespacedName]map[string]time.Time
 }
 
 type expectation struct {
@@ -95,6 +139,7 @@ type expectation struct {
 }
 
 func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.Recorder = mgr.GetEventRecorderFor("blippool")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1.BlipPool{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
@@ -166,6 +211,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			r.mu.Lock()
 			delete(r.created, rq.NamespacedName)
 			delete(r.deleted, rq.NamespacedName)
+			delete(r.blocked, rq.NamespacedName)
 			r.mu.Unlock()
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
@@ -174,10 +220,16 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		return reconcile.Result{}, nil
 	}
 	// Refuse to create pods whose api-proxy sidecar would exit at startup.
-	// The error is visible on the controller and in events; the alternative
-	// is a Blip that waits for a VM that can never become ready.
+	// The failure is recorded in pool status and as an Event on the pool, so
+	// an operator can see why no VM becomes ready instead of only finding it
+	// in the controller log.
 	if err := validateEndpoints(pool, r.APIAudiences...); err != nil {
-		return reconcile.Result{}, fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
+		return reconcile.Result{}, r.invalidPool(ctx, pool, "InvalidEndpoints", err)
+	}
+	// The API checks the ConfigMap reference's shape; its contents must also
+	// be a usable CA bundle or the sidecar crash-loops before the pod is ready.
+	if err := validateEndpointCAs(ctx, r.Client, pool); err != nil {
+		return reconcile.Result{}, r.invalidPool(ctx, pool, "InvalidEndpointCA", err)
 	}
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels{v1.LabelPool: pool.Name}); err != nil {
@@ -228,8 +280,38 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// the pool. Wait for the locality the Blip reconciler writes with its
 	// state.
 	deferred := 0
+	// blocked holds the nodes whose pinned VM the scheduler rejected. A
+	// rejected pod is not capacity: another pinned pod on the same node
+	// would be rejected too, so demand for that node moves to another home
+	// node (or an unpinned VM) instead. The nodes are remembered for
+	// blockedGrace because the rejected pod itself is deleted.
+	observed := map[string]bool{}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.DeletionTimestamp == nil && unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "" {
+			observed[podNode(p)] = true
+		}
+	}
+	blocked := r.poolBlocked(rq.NamespacedName, observed, r.now())
+	// An alternate home node is only needed once a node is blocked. Load the
+	// states lazily so the common path keeps its single Blip list.
+	var states map[string]*v1.BlipState
+	if len(blocked) > 0 {
+		var list v1.BlipStateList
+		if err := r.List(ctx, &list, client.InNamespace(pool.Namespace)); err != nil {
+			return reconcile.Result{}, err
+		}
+		states = make(map[string]*v1.BlipState, len(list.Items))
+		for i := range list.Items {
+			states[list.Items[i].Name] = &list.Items[i]
+		}
+	}
 	// pinned counts, per node, the waiting Blips whose data lives there.
+	// localWaiters counts the Blips still waiting on their data node and not
+	// fallen back: their pinned pod is worth keeping while the scheduler may
+	// still place it once the node has room.
 	pinned := map[string]int{}
+	localWaiters := map[string]int{}
 	for i := range blips.Items {
 		b := &blips.Items[i]
 		if !countsAsDemand(b, pool.Name) || claimed[b.UID] {
@@ -244,8 +326,28 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		// the right place to boot one once capacity allows: falling back
 		// under transient maxCount pressure is not a reason to start the
 		// replacement away from the data.
-		if loc := b.Status.Locality; loc != nil && loc.Node != "" && usable(loc.Node) {
-			pinned[loc.Node]++
+		loc := b.Status.Locality
+		if loc == nil || loc.Node == "" || !usable(loc.Node) {
+			continue
+		}
+		if !loc.Fallback {
+			localWaiters[loc.Node]++
+		}
+		node := loc.Node
+		if blocked[node] {
+			// The first home node rejected the VM. Prefer another node that
+			// holds the same data before falling back to a remote/unpinned
+			// start.
+			node = ""
+			for _, n := range homeNodes(placementScores(b, states), cl, poolSelector(pool)) {
+				if !blocked[n] {
+					node = n
+					break
+				}
+			}
+		}
+		if node != "" {
+			pinned[node]++
 		}
 	}
 
@@ -308,8 +410,9 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			}
 		case p.DeletionTimestamp != nil || deleted[p.Name]:
 			// Its replacement is already accounted for; do not let a pod
-			// leaving an unusable node hold maxCount capacity either.
-			if unusable {
+			// leaving an unusable node (or a rejected pinned node) hold
+			// maxCount capacity either.
+			if unusable || (unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "") {
 				total--
 			}
 		case podTerminated(p) || unusable || p.Annotations[v1.AnnotationTemplateHash] != hash:
@@ -318,6 +421,18 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			}
 			if unusable {
 				total--
+			}
+		case unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "":
+			// The scheduler rejected this pinned pod, so it cannot satisfy
+			// pinned demand and must not hold a maxCount slot: booting the
+			// fallback VM elsewhere is the whole point. Keep it while a Blip
+			// still waits locally (the scheduler may place it once the node
+			// has room); once the Blip fell back, replace it.
+			total--
+			if localWaiters[node] == 0 {
+				if err := del(p); err != nil {
+					return reconcile.Result{}, err
+				}
 			}
 		default:
 			vacant = append(vacant, p)
@@ -349,29 +464,20 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			short[node] = need
 		}
 	}
-	// A pinned pod that cannot be scheduled and no longer serves a waiting
-	// Blip only holds a slot.
-	kept := vacant[:0]
-	for _, p := range vacant {
-		if !reserved[p.Name] && p.Annotations[v1.AnnotationPinnedNode] != "" && unschedulable(p) {
-			if err := del(p); err != nil {
-				return reconcile.Result{}, err
-			}
-			continue
-		}
-		kept = append(kept, p)
-	}
-	vacant = kept
-
 	target := int(pool.Spec.WarmCount) + demand
 	maxCount := int(pool.Spec.MaxCount)
 	if maxCount > 0 {
 		target = min(target, maxCount)
 	}
 	have := len(vacant) + created
-	log.FromContext(ctx).V(1).Info("pool sizing", "demand", demand, "deferred", deferred, "claimed", len(claimed), "pinned", pinned, "vacant", len(vacant), "created", created, "target", target, "have", have, "total", total)
+	log.FromContext(ctx).V(1).Info("pool sizing", "demand", demand, "deferred", deferred, "claimed", len(claimed), "pinned", pinned, "vacant", len(vacant), "created", created, "target", target, "have", have, "total", total, "blocked", blocked)
 	room := func() bool { return maxCount <= 0 || total < maxCount }
 	for _, node := range slices.Sorted(maps.Keys(short)) {
+		// Pinned demand was already moved off a blocked node above; never
+		// create another pod the scheduler is known to reject.
+		if blocked[node] {
+			continue
+		}
 		for range short[node] {
 			if !room() {
 				break
@@ -391,13 +497,6 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	}
 	for n, c := range createdOn {
 		warm[n] += c
-	}
-	blocked := map[string]bool{}
-	for i := range pods.Items {
-		p := &pods.Items[i]
-		if unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "" {
-			blocked[podNode(p)] = true
-		}
 	}
 	if want := target - have; want > 0 {
 		// If every waiting Blip can claim an existing warm VM, do not boot
@@ -448,7 +547,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		sortForRemoval(spare)
 		for _, p := range spare {
 			node := pickWarmNode(hot, warm, blocked)
-			if node == "" || !room() {
+			// Moving a spare deletes and recreates a pod, so it does not grow
+			// the pool: maxCount is no reason to keep a spare on an idle
+			// node. Without this a warmCount==maxCount pool can never follow
+			// the node that runs VMs.
+			if node == "" {
 				break
 			}
 			if err := del(p); err != nil {
@@ -532,6 +635,38 @@ func pickWarmNode(hot, warm map[string]int, blocked map[string]bool) string {
 		}
 	}
 	return best
+}
+
+// poolBlocked merges the nodes the scheduler rejected in this pass with the
+// nodes still inside their retry grace, and drops expired entries. Keeping the
+// memory across passes matters because the rejected pod is deleted: without it
+// the next pass would immediately pin a new pod to the same node.
+func (r *PoolReconciler) poolBlocked(pool types.NamespacedName, observed map[string]bool, now time.Time) map[string]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	nodes := r.blocked[pool]
+	if nodes == nil {
+		nodes = map[string]time.Time{}
+		if r.blocked == nil {
+			r.blocked = map[types.NamespacedName]map[string]time.Time{}
+		}
+		r.blocked[pool] = nodes
+	}
+	for node := range observed {
+		nodes[node] = now.Add(blockedGrace)
+	}
+	out := map[string]bool{}
+	for node, until := range nodes {
+		if now.Before(until) {
+			out[node] = true
+		} else {
+			delete(nodes, node)
+		}
+	}
+	if len(nodes) == 0 {
+		delete(r.blocked, pool)
+	}
+	return out
 }
 
 // countsAsDemand reports whether b is waiting for a VM from this pool. Blips

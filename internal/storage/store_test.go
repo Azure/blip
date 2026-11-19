@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"math"
 	"reflect"
 	"testing"
 
@@ -12,6 +13,35 @@ func TestMergeRegions(t *testing.T) {
 	want := []Region{{0, 192}, {400, 15}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+// TestRoundUpOverflow: a size near int64 max must not wrap to a negative
+// device-mapper length. It saturates at the largest representable aligned
+// value; the CLI and controller reject such sizes before they reach here.
+func TestRoundUpOverflow(t *testing.T) {
+	saturated := int64(math.MaxInt64/blockSize) * blockSize
+	for _, n := range []int64{math.MaxInt64, math.MaxInt64 - 1, saturated + 1, saturated} {
+		got := roundUp(n, blockSize)
+		if got < 0 {
+			t.Fatalf("roundUp(%d) wrapped negative: %d", n, got)
+		}
+		if got%blockSize != 0 {
+			t.Fatalf("roundUp(%d) = %d is not block aligned", n, got)
+		}
+		if n > saturated && got != saturated {
+			t.Fatalf("roundUp(%d) = %d, want saturation %d", n, got, saturated)
+		}
+	}
+	for _, tc := range []struct{ n, want int64 }{
+		{0, 0},
+		{1, blockSize},
+		{blockSize, blockSize},
+		{blockSize + 1, 2 * blockSize},
+	} {
+		if got := roundUp(tc.n, blockSize); got != tc.want {
+			t.Errorf("roundUp(%d) = %d, want %d", tc.n, got, tc.want)
+		}
 	}
 }
 

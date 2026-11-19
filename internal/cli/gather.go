@@ -167,7 +167,14 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 }
 
 // checkCollectDestinations rejects a gather whose expanded operations would
-// copy two blips to the same path. {name} makes each destination unique.
+// copy two blips to the same path or into overlapping trees. {name} makes
+// each destination unique.
+//
+// A destination is compared the way copyPath will use it: symlinks in the
+// existing part are resolved, and a destination that is already a directory
+// receives a file under the source's basename. Comparing the declared strings
+// alone missed both that rewrite (DEST and DEST/basename(SRC)) and a
+// directory merge spreading over everything below DEST.
 func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) error {
 	if len(raw) == 0 {
 		return nil
@@ -177,9 +184,9 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 		return err
 	}
 	type use struct {
-		blip, source string
+		blip, source, dest string
 	}
-	seen := map[string]use{}
+	var seen []use
 	for _, b := range done {
 		ops := make([]string, len(raw))
 		for i, op := range raw {
@@ -194,15 +201,36 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 			if op.git {
 				continue
 			}
-			dst, err := filepath.Abs(op.dest)
+			dst, err := resolvePath(op.dest)
 			if err != nil {
-				dst = op.dest
+				// A destination that cannot be resolved can still be
+				// compared literally.
+				if dst, err = filepath.Abs(op.dest); err != nil {
+					dst = op.dest
+				}
 			}
 			dst = filepath.Clean(dst)
-			if prev, ok := seen[dst]; ok {
-				return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, a.short(b.Name), op.source)
+			isDir := false
+			if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
+				isDir = true
 			}
-			seen[dst] = use{blip: a.short(b.Name), source: op.source}
+			for _, prev := range seen {
+				if prev.dest == dst {
+					// Two files with distinct basenames can share an
+					// existing directory without colliding.
+					if isDir && filepath.Base(prev.source) != filepath.Base(op.source) {
+						continue
+					}
+					return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, a.short(b.Name), op.source)
+				}
+				// A directory destination covers everything below it: the
+				// tree is merged into place, and a file source is stored at
+				// DEST/basename(SRC).
+				if underDir(prev.dest, dst) || underDir(dst, prev.dest) {
+					return fmt.Errorf("collect destinations %s for blip %s (%s) and %s for blip %s (%s) overlap; add {name} or give each blip a distinct DEST", prev.dest, prev.blip, prev.source, dst, a.short(b.Name), op.source)
+				}
+			}
+			seen = append(seen, use{blip: a.short(b.Name), source: op.source, dest: dst})
 		}
 	}
 	return nil
@@ -227,6 +255,11 @@ func (a *app) gatherTargets(ctx context.Context, c *Clients, names []string, sel
 		b, err := a.getBlip(ctx, name)
 		if err != nil {
 			return nil, err
+		}
+		// A Blip cannot wait for or delete itself, just as the selector
+		// path below cannot target the caller.
+		if a.self != nil && b.Name == a.self.Name {
+			return nil, fmt.Errorf("cannot gather %s, the blip running this gather; name another blip or gather its forks with no arguments", a.short(b.Name))
 		}
 		add(b)
 	}
@@ -411,6 +444,12 @@ func (a *app) follow(ctx context.Context, name string) {
 	pod := b.Status.Pod
 	if pod == "" {
 		if ending {
+			// A Blip that finished before claiming a VM never ran a
+			// command, so no status.output can ever arrive. Do not wait
+			// out the retained-output poll for it.
+			if b.Status.Output == "" && b.Status.StartTime == nil {
+				return
+			}
 			if !a.printRetained(ctx, name, short) && !a.endedWithoutOutput(ctx, name) {
 				a.progress("%s: output is no longer available (the VM pod is gone)", short)
 			}
@@ -441,14 +480,50 @@ func (a *app) follow(ctx context.Context, name string) {
 	defer s.Close()
 	out := &prefixWriter{out: a.env.Out, prefix: short + "|"}
 	errw := &prefixWriter{out: a.env.Err, prefix: short + "|"}
-	_, _ = s.Copy(out, errw, func(m string) { a.progress("%s: %s", short, m) })
+	_, copyErr := s.Copy(out, errw, func(m string) { a.progress("%s: %s", short, m) })
 	out.flush()
 	errw.flush()
+	if copyErr != nil {
+		// The live stream ended before the guest delivered TExited, so the
+		// bytes above are only a prefix. A follower that stops reading while
+		// the command finishes is cut off when the guest closes the finished
+		// primary session at its delivery deadline; the controller's retained
+		// status.output still has the tail. Do not warn when gather itself
+		// stopped the follower (ctx is done), for example after --wait or --any.
+		if ctx.Err() == nil {
+			a.replayTruncatedOutput(ctx, name, short, pod, ending || a.blipEnding(ctx, name))
+		}
+		return
+	}
 	if !out.wrote && !errw.wrote && (ending || a.blipEnding(ctx, name)) {
 		if !a.replayLogs(ctx, pod, short) && !a.printRetained(ctx, name, short) && !a.endedWithoutOutput(ctx, name) {
 			a.progress("%s: output is no longer available", short)
 		}
 	}
+}
+
+// truncatedOutputWait bounds how long a follower waits for the controller to
+// publish status.output after its live stream was cut off. The controller
+// writes the output before it deletes the VM pod, so this only covers client
+// staleness.
+var truncatedOutputWait = 3 * time.Second
+
+// replayTruncatedOutput reports that a followed stream ended before the
+// command's exit status arrived and, when the blip is finishing, prints the
+// output the controller retained in status. Line-oriented prefixing cannot
+// resume mid-stream, so the retained print repeats any lines the follower
+// already saw. A blip that is still running may have more output, but nothing
+// available to print now, so the follower only warns.
+func (a *app) replayTruncatedOutput(ctx context.Context, name, short, pod string, ended bool) {
+	if !ended {
+		a.progress("%s: output stream ended before the command exited; output above may be incomplete", short)
+		return
+	}
+	if a.printRetainedFor(ctx, name, short, truncatedOutputWait) || a.replayLogs(ctx, pod, short) {
+		a.progress("%s: output stream ended before the command exited; replayed the retained output (lines above may repeat)", short)
+		return
+	}
+	a.progress("%s: output stream ended before the command exited; the rest of the output is no longer available", short)
 }
 
 // blipEnding reports whether the blip is saving or finished now. A follower

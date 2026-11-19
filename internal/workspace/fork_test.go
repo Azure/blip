@@ -58,7 +58,7 @@ func TestForkWorkspaceSnapshot(t *testing.T) {
 	size := resource.MustParse("20Gi")
 	dest.Spec.Size, dest.Spec.Replicas = &size, 2
 	dest.Spec.NodeSelector = map[string]string{"disk": "ssd"}
-	if err := Fork(ctx, c, src, dest, nil); err != nil {
+	if _, err := Fork(ctx, c, src, dest, nil); err != nil {
 		t.Fatal(err)
 	}
 	if dest.Spec.CopyFrom != src.Name || dest.Spec.Image != "" || len(dest.Spec.Mounts) != 3 || !reflect.DeepEqual(dest.Spec.Runtime, src.Spec.Runtime) {
@@ -120,7 +120,7 @@ func TestForkRollbackPreservesExistingStates(t *testing.T) {
 				}
 				return c.Create(ctx, obj, opts...)
 			}})
-			if err := Fork(ctx, c, src, dest, nil); !apierrors.IsAlreadyExists(err) {
+			if _, err := Fork(ctx, c, src, dest, nil); !apierrors.IsAlreadyExists(err) {
 				t.Fatalf("error: %v", err)
 			}
 			var states v1alpha1.BlipStateList
@@ -143,7 +143,7 @@ func TestForkPreflightAndReplacementSafety(t *testing.T) {
 	src, dest := testState("source"), testState("worker")
 	src.Spec.Mounts = []v1alpha1.Mount{{State: "a", Path: "/a", Writable: true}}
 	c := testClient(t, src, testState("a"), dest)
-	if err := Fork(ctx, c, src, dest, nil); !apierrors.IsAlreadyExists(err) {
+	if _, err := Fork(ctx, c, src, dest, nil); !apierrors.IsAlreadyExists(err) {
 		t.Fatalf("existing root: %v", err)
 	}
 	var states v1alpha1.BlipStateList
@@ -181,7 +181,7 @@ func TestForkPreflightAndReplacementSafety(t *testing.T) {
 			return c.Create(ctx, obj, opts...)
 		},
 	})
-	if err := Fork(ctx, c, src, dest, nil); !errors.Is(err, failure) {
+	if _, err := Fork(ctx, c, src, dest, nil); !errors.Is(err, failure) {
 		t.Fatalf("fork failure: %v", err)
 	}
 	if !cleanupAttempted {
@@ -233,7 +233,7 @@ func TestForkPreservesStatesAfterAmbiguousCreate(t *testing.T) {
 						return nil
 					},
 				})
-				if err := Fork(ctx, c, src, dest, nil); !errors.Is(err, tc.err) {
+				if _, err := Fork(ctx, c, src, dest, nil); !errors.Is(err, tc.err) {
 					t.Fatalf("error: %v, want %v", err, tc.err)
 				}
 				for _, key := range persisted {
@@ -277,7 +277,7 @@ func TestForkRollsBackValidationRejection(t *testing.T) {
 				}
 				return c.Create(ctx, obj, opts...)
 			}})
-			if err := Fork(ctx, c, src, dest, nil); !apierrors.IsInvalid(err) {
+			if _, err := Fork(ctx, c, src, dest, nil); !apierrors.IsInvalid(err) {
 				t.Fatalf("error: %v", err)
 			}
 			var states v1alpha1.BlipStateList
@@ -317,7 +317,7 @@ func TestForkOwnerReference(t *testing.T) {
 	c := testClient(t, src, testState("repo"), testState("tools"))
 	dest := testState("w1")
 	owner := metav1.OwnerReference{APIVersion: v1alpha1.GroupVersion.String(), Kind: "Blip", Name: "w1", UID: types.UID("uid-w1")}
-	if err := Fork(ctx, c, src, dest, &ForkOptions{Owner: &owner}); err != nil {
+	if _, err := Fork(ctx, c, src, dest, &ForkOptions{Owner: &owner}); err != nil {
 		t.Fatal(err)
 	}
 	refs := dest.OwnerReferences
@@ -335,7 +335,54 @@ func TestForkOwnerReference(t *testing.T) {
 	// The caller passes ownership through options, never through dest.
 	dest = testState("w2")
 	dest.OwnerReferences = refs
-	if err := Fork(ctx, c, src, dest, nil); err == nil || !strings.Contains(err.Error(), "owner references") {
+	if _, err := Fork(ctx, c, src, dest, nil); err == nil || !strings.Contains(err.Error(), "owner references") {
 		t.Fatalf("dest owner references accepted: %v", err)
+	}
+}
+
+// TestForkReturnsEveryCreatedState lets a caller roll back a fork it cannot
+// keep. Every state Fork created must be named in the result, root last;
+// read-only references and a Blip's transient mounts are not created.
+func TestForkReturnsEveryCreatedState(t *testing.T) {
+	ctx := context.Background()
+	src := testState("src")
+	src.Spec.Mounts = []v1alpha1.Mount{
+		{State: "repo", Path: "/work", Writable: true},
+		{State: "cache", Path: "/cache", Writable: true},
+		{State: "tools", Path: "/tools"},
+		{State: "transient", Path: "/temporary", Writable: true, BlipUID: "blip-uid"},
+	}
+	c := testClient(t, src, testState("repo"), testState("cache"), testState("tools"))
+	dest := testState("dev")
+	created, err := Fork(ctx, c, src, dest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 3 {
+		t.Fatalf("created %d states, want root plus two writable copies", len(created))
+	}
+	for _, st := range created {
+		var live v1alpha1.BlipState
+		if err := c.Get(ctx, client.ObjectKeyFromObject(st), &live); err != nil {
+			t.Fatalf("created state %q is not readable: %v", st.Name, err)
+		}
+	}
+	if created[len(created)-1].Name != dest.Name {
+		t.Fatalf("root is not last: %q", created[len(created)-1].Name)
+	}
+	want := map[string]bool{
+		dest.Name:                 true,
+		dest.Spec.Mounts[0].State: true,
+		dest.Spec.Mounts[1].State: true,
+	}
+	for _, st := range created {
+		if !want[st.Name] {
+			t.Fatalf("unexpected created state %q", st.Name)
+		}
+	}
+	for _, st := range created {
+		if st.Name == "transient" || st.Name == "tools" {
+			t.Fatalf("Fork claims to have created pre-existing state %q", st.Name)
+		}
 	}
 }

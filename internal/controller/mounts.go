@@ -179,6 +179,25 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 		// A failed save stays visible even after its mount leaves the spec;
 		// a mount that merely never attached is forgotten with it.
 		saveFailure := strings.HasPrefix(m.Message, "save failed:")
+		if m.Writable && !stop {
+			// attachment treats a deleting state as resolved so its
+			// finalizers cannot deadlock with this Blip. Never let an
+			// already-attached mount keep writing into it (and keep the
+			// state's finalizer waiting) after it is deleted, whether by
+			// its owner or directly.
+			st, err := r.deletingState(ctx, b, m.State)
+			if err != nil {
+				return err
+			}
+			if st != nil {
+				msg := discardedSave(st, b)
+				m.Phase, m.Message = v1.MountFailed, "save failed: "+msg
+				saveErrs = append(saveErrs, msg)
+				out = append(out, m)
+				present[m.State] = true
+				continue
+			}
+		}
 		if !pathSame && m.Switching {
 			// Removing the mount or changing its path cancels a switch in
 			// progress. A writable mount still goes through the normal
@@ -191,7 +210,7 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 			m.Switching, m.Message = false, ""
 		}
 		d, seen := disks[m.AttachmentID]
-		neverAttached := !seen || d.Phase == podapi.DiskAttaching || d.Phase == podapi.DiskFailed
+		neverAttached := diskNeverAttached(obs, m.AttachmentID)
 		if m.Phase == v1.MountPending && m.Writable && neverAttached && !same && !stop && !m.Switching {
 			// The writable mount never attached (no disk, or only an
 			// attaching/failed one) and is being removed or changed,
@@ -413,6 +432,19 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 		b.Status.Message = strings.Join(waits, "; ")
 	}
 	return nil
+}
+
+// diskNeverAttached reports whether the node's last observation shows no
+// attached disk for id: either no entry, or one that only reached Attaching or
+// Failed. Such a mount was never writable on the VM, so there is nothing to
+// save for it.
+func diskNeverAttached(obs *podapi.Observed, id string) bool {
+	for _, d := range obs.Mounts {
+		if d.ID == id {
+			return d.Phase == podapi.DiskAttaching || d.Phase == podapi.DiskFailed
+		}
+	}
+	return true
 }
 
 // busyPath reports an active mount of another state that overlaps m.

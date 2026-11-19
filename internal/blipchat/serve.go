@@ -250,7 +250,7 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 	// not process this input, so it must stay pending.
 	started := timeNow()
 	tokensToday := thread.Status.TokensToday
-	if thread.Status.TokenDay != started.Format("2006-01-02") {
+	if thread.Status.TokenDay != started.UTC().Format("2006-01-02") {
 		tokensToday = 0
 	}
 	if thread.Spec.DailyTokens > 0 && tokensToday >= thread.Spec.DailyTokens {
@@ -280,21 +280,32 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 
 	messages := []Message{
 		{Role: "system", Content: systemPrompt(thread)},
-		{Role: "user", Content: boardPrompt(thread, st.tasks, pending, dueTimers, st.summary)},
 	}
+	prompt, lastRendered := boardPrompt(thread, st.tasks, pending, dueTimers, st.summary)
+	// Never advance ConsumedSeq past a turn the prompt did not render.
+	if len(pending) > 0 && lastRendered < target {
+		target = lastRendered
+	}
+	messages = append(messages, Message{Role: "user", Content: prompt})
 	toollist := st.tools()
 	for calls := 0; calls < s.Config.MaxToolCalls; calls++ {
 		reply, usage, err := s.LLM.Chat(ctx, model, messages, toollist)
 		if err != nil {
+			// The completion was paid for even though the step fails, so the
+			// spend must still count against the daily budget.
+			s.chargeUsage(ctx, thread, st.usage)
 			return err
 		}
 		st.usage += usage.Total()
 		messages = append(messages, reply)
-		if thread.Spec.DailyTokens > 0 && tokensToday+st.usage >= thread.Spec.DailyTokens {
-			st.paused = budgetPauseReason
-			break
-		}
+		// Crossing the daily budget mid-step must not strand the completion
+		// we already paid for: run its tool calls (including reply) and then
+		// stop before requesting another completion.
+		overBudget := thread.Spec.DailyTokens > 0 && tokensToday+st.usage >= thread.Spec.DailyTokens
 		if len(reply.ToolCalls) == 0 {
+			if overBudget {
+				st.paused = budgetPauseReason
+			}
 			break
 		}
 		for _, call := range reply.ToolCalls {
@@ -304,11 +315,19 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 			}
 			messages = append(messages, Message{Role: "tool", ToolCallID: call.ID, Content: result})
 		}
+		if overBudget {
+			st.paused = budgetPauseReason
+			break
+		}
 		if st.usage >= s.Config.StepTokenLimit {
 			break
 		}
 	}
-	return s.commit(ctx, st, target, pending, started)
+	if err := s.commit(ctx, st, target, pending, started); err != nil {
+		s.chargeUsage(ctx, thread, st.usage)
+		return err
+	}
+	return nil
 }
 
 // commit writes the step's coordinator turns and then one thread status
@@ -326,7 +345,7 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 		}
 	}
 	tokens := st.usage
-	today := started.Format("2006-01-02")
+	today := started.UTC().Format("2006-01-02")
 	next := nextWake(st, started)
 	for attempt := 0; attempt < 5; attempt++ {
 		current := &v1.BlipThread{}
@@ -357,6 +376,34 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 		return nil
 	}
 	return fmt.Errorf("thread status update kept conflicting")
+}
+
+// chargeUsage records tokens already spent on a step that will not reach a
+// successful commit, so retries still count against the daily budget. It is
+// best effort: the step's original error is more important than accounting.
+func (s *Server) chargeUsage(ctx context.Context, thread *v1.BlipThread, usage int64) {
+	if usage <= 0 {
+		return
+	}
+	today := timeNow().UTC().Format("2006-01-02")
+	for attempt := 0; attempt < 5; attempt++ {
+		current := &v1.BlipThread{}
+		if err := s.Get(ctx, client.ObjectKeyFromObject(thread), current); err != nil {
+			return
+		}
+		if current.Status.TokenDay != today {
+			current.Status.TokenDay = today
+			current.Status.TokensToday = 0
+		}
+		current.Status.TokensToday += usage
+		if err := s.Status().Update(ctx, current); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return
+		}
+		return
+	}
 }
 
 // nextWake picks the next step time: the heartbeat while tasks are open, or a
@@ -410,7 +457,12 @@ func systemPrompt(thread *v1.BlipThread) string {
 	return prompt + "\n\nCharter:\n" + thread.Spec.Charter
 }
 
-func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTurn, timers []v1.ThreadTimer, summary string) string {
+// boardPrompt renders one step's input. It returns the prompt and the
+// highest turn sequence it actually rendered, so the caller never consumes a
+// turn the coordinator did not see. When the turns do not fit the budget, the
+// newest turns win: they are the ones most likely to be actionable, and the
+// notice reports exactly how many older turns were left out.
+func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTurn, timers []v1.ThreadTimer, summary string) (string, int64) {
 	var b strings.Builder
 	b.WriteString("Task board:\n")
 	if len(tasks) == 0 {
@@ -446,20 +498,46 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 	b.WriteString("\nNew turns (oldest first):\n")
 	if len(turns) == 0 {
 		b.WriteString("(none; this is a scheduled wake-up)\n")
+		return b.String(), 0
 	}
+
+	lines := make([]string, len(turns))
 	for i := range turns {
 		line := renderTurn(&turns[i])
 		if len(line) > 2048 {
 			line = truncateRunes(line, 2048)
 		}
-		if b.Len()+len(line) > 48000 {
-			b.WriteString("(older turns omitted)\n")
+		lines[i] = line + "\n"
+	}
+	// Walk backwards from the newest turn, reserving room for an accurate
+	// notice about the older turns that will not fit. Keep at least the
+	// newest turn even when the board alone is already over budget, so a step
+	// always has something it may consume.
+	budget := 48000 - b.Len()
+	start := len(turns)
+	used := 0
+	for start > 0 {
+		i := start - 1
+		notice := 0
+		if i > 0 {
+			notice = len(fmt.Sprintf("(%d older turns omitted)\n", i))
+		}
+		if used+len(lines[i])+notice > budget {
 			break
 		}
-		b.WriteString(line)
-		b.WriteString("\n")
+		used += len(lines[i])
+		start = i
 	}
-	return b.String()
+	if start == len(turns) {
+		start = len(turns) - 1
+	}
+	if start > 0 {
+		fmt.Fprintf(&b, "(%d older turns omitted)\n", start)
+	}
+	for i := start; i < len(turns); i++ {
+		b.WriteString(lines[i])
+	}
+	return b.String(), turns[len(turns)-1].Status.Seq
 }
 
 func openState(open bool) string {
@@ -471,7 +549,8 @@ func openState(open bool) string {
 
 // maybeUnpause lets a thread run again on a new day after its budget paused it.
 func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
-	if thread.Status.Paused == nil || thread.Status.Paused.Reason != budgetPauseReason || thread.Status.TokenDay == timeNow().Format("2006-01-02") {
+	today := timeNow().UTC().Format("2006-01-02")
+	if thread.Status.Paused == nil || thread.Status.Paused.Reason != budgetPauseReason || thread.Status.TokenDay == today {
 		return
 	}
 	current := &v1.BlipThread{}
@@ -480,7 +559,7 @@ func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
 	}
 	current.Status.Paused = nil
 	current.Status.TokensToday = 0
-	current.Status.TokenDay = timeNow().Format("2006-01-02")
+	current.Status.TokenDay = today
 	if err := s.Status().Update(ctx, current); err != nil {
 		return
 	}

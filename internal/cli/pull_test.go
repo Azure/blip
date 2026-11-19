@@ -42,6 +42,10 @@ func TestPullBadOptionsAndExistingBase(t *testing.T) {
 	}{
 		{[]string{"pull", "base"}, "accepts 2 arg(s)"},
 		{[]string{"pull", "base", "registry/dev:v1", "--size", "0"}, "must be positive"},
+		{[]string{"pull", "base", "registry/dev:v1", "--size", "8Ei"}, "too large"},
+		{[]string{"pull", "base", "registry/dev:v1", "--size", "10Ei"}, "too large"},
+		{[]string{"pull", "base", "registry/dev:v1", "--size", "100Ei"}, "too large"},
+		{[]string{"pull", "base", "registry/dev:v1", "--size", "9223372036854775807"}, "too large"},
 		{[]string{"pull", "base", "registry/dev:v1", "--replicas", "1"}, "unknown flag: --replicas"},
 		{[]string{"pull", "base", "registry/dev:v1", "--image-pull-secret", "bad/name"}, "invalid --image-pull-secret"},
 		{[]string{"pull", "taken", "registry/dev:v1", "-d"}, `state "taken" already exists`},

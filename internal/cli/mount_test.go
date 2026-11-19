@@ -12,6 +12,7 @@ import (
 
 	"github.com/Azure/blip/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -134,6 +135,184 @@ func TestMountIntentSurvivesRuntimeFailure(t *testing.T) {
 				t.Fatalf("mount intent rolled back: %+v", s.Spec.Mounts)
 			}
 		})
+	}
+}
+
+// TestMountUnusableSourceBeforeEdit reproduces a mount racing a source state
+// deletion: a terminating state must be rejected before the root's desired
+// mounts change, so the dead mount cannot poison later executions.
+func TestMountUnusableSourceBeforeEdit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		prep func(*v1alpha1.BlipState)
+		want string
+	}{
+		{
+			name: "terminating",
+			prep: func(s *v1alpha1.BlipState) {
+				now := metav1.Now()
+				s.DeletionTimestamp = &now
+				s.Finalizers = []string{"hold"}
+			},
+			want: "is being deleted",
+		},
+		{
+			name: "missing",
+			want: `state "data" not found`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := readyState("home")
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "keep", Path: "/keep"}}
+			objs := []client.Object{root}
+			if tc.prep != nil {
+				data := readyState("data")
+				tc.prep(data)
+				objs = append(objs, data)
+			}
+			a := mountTestApp(t, objs...)
+			var errOut bytes.Buffer
+			a.env.Err = &errOut
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if code := Main(ctx, a.env, []string{"mount", "data:/data", "--root", "home"}); code != 1 {
+				t.Fatalf("mount code %d: %s", code, errOut.String())
+			}
+			mustContain(t, errOut.String(), tc.want)
+			s, err := a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].State != "keep" {
+				t.Fatalf("unusable source changed desired mounts: %+v", s.Spec.Mounts)
+			}
+		})
+	}
+}
+
+func TestMountStateGone(t *testing.T) {
+	for _, tc := range []struct{ name, msg, want string }{
+		{
+			name: "deleting",
+			msg:  `mount data: state "data" is being deleted`,
+			want: `mount data: state "data" is being deleted`,
+		},
+		{
+			name: "missing",
+			msg:  `mount data: state "data" not found`,
+			want: `mount data: state "data" not found`,
+		},
+		{
+			name: "joined waits pick the matching state",
+			msg:  `mount other: state "other" not found; mount data: state "data" is being deleted`,
+			want: `mount data: state "data" is being deleted`,
+		},
+		{
+			name: "another state",
+			msg:  `mount other: state "other" is being deleted`,
+		},
+		{
+			name: "unrelated wait",
+			msg:  `mount data: state "data" has no committed version yet`,
+		},
+		{
+			name: "empty",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mountStateGone(tc.msg, "data"); got != tc.want {
+				t.Fatalf("mountStateGone(%q) = %q, want %q", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMountGoneStateWhileWaitingRollsBackAndRetries covers the source
+// disappearing after the desired mount was written: the wait must fail fast,
+// remove only the mount this command added, and allow a retry once the source
+// is usable again.
+func TestMountGoneStateWhileWaitingRollsBackAndRetries(t *testing.T) {
+	for _, tc := range []struct{ name, msg, want string }{
+		{"terminating", `mount data: state "data" is being deleted`, "is being deleted"},
+		{"missing", `mount data: state "data" not found`, `state "data" not found`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBlip("writer")
+			root := readyState(b.Spec.State)
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "keep", Path: "/keep"}}
+			b.Status.Mounts = nil
+			b.Status.Message = tc.msg
+			a := mountTestApp(t, b, root, readyState("data"))
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			err := a.mountState(ctx, "data", root.Name, "/data", nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("mount returned %v, want %q", err, tc.want)
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Fatalf("mount took %s to fail: %v", elapsed, err)
+			}
+			if !strings.Contains(err.Error(), "desired mount was removed") {
+				t.Fatalf("error does not report rollback: %v", err)
+			}
+			s, err := a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].State != "keep" {
+				t.Fatalf("failed mount left desired intent: %+v", s.Spec.Mounts)
+			}
+
+			// The rollback leaves the root usable. With no writer the retry
+			// applies on the next execution, independent of an attachment.
+			latest, err := a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			latest.Status.Writer = nil
+			if err := a.c.Kube.Status().Update(ctx, latest); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.mountState(ctx, "data", root.Name, "/data", nil); err != nil {
+				t.Fatalf("retry after rollback failed: %v", err)
+			}
+			s, err = a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Spec.Mounts) != 2 || findSpecMount(s.Spec.Mounts, "data") == nil {
+				t.Fatalf("retry did not restore mount: %+v", s.Spec.Mounts)
+			}
+		})
+	}
+}
+
+// TestMountGoneStateKeepsPreExistingMount makes sure the rollback removes only
+// the mount this command added, not intent that another command owns.
+func TestMountGoneStateKeepsPreExistingMount(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+	b.Status.Mounts = nil
+	b.Status.Message = `mount data: state "data" is being deleted`
+	a := mountTestApp(t, b, root, readyState("data"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := a.mountState(ctx, "data", root.Name, "/data", nil)
+	if err == nil || !strings.Contains(err.Error(), "is being deleted") {
+		t.Fatalf("mount returned %v", err)
+	}
+	s, err := a.getState(ctx, root.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].State != "data" {
+		t.Fatalf("pre-existing mount was removed: %+v", s.Spec.Mounts)
 	}
 }
 
@@ -839,6 +1018,8 @@ func TestMountValidationErrors(t *testing.T) {
 		{"self mount", []string{"mount", "home:/data", "--root", "home"}, "a root state cannot mount itself"},
 		{"bad size", []string{"mount", "--new", "x:/data", "--size", "nope", "--root", "home"}, "invalid --size"},
 		{"zero size", []string{"mount", "--new", "x:/data", "--size", "0", "--root", "home"}, "must be positive"},
+		{"huge size", []string{"mount", "--new", "x:/data", "--size", "10Ei", "--root", "home"}, "too large"},
+		{"max int64 size", []string{"mount", "--new", "x:/data", "--size", "9223372036854775807", "--root", "home"}, "too large"},
 		{"missing source", []string{"mount", "--new", "x:/data", "--from", "missing", "--root", "home"}, `state "missing" not found`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1017,19 +1198,103 @@ func TestMountNewSurfacesStateFailure(t *testing.T) {
 	}
 }
 
-func TestMountNewWaitsThroughRecoverableFailure(t *testing.T) {
+// TestMountNewFailsTerminalInitialVersion: a Failed initial version can retain
+// a pending commit while the controller keeps retrying. Mount must not wait
+// forever for such a state, and must roll back the state it created.
+func TestMountNewFailsTerminalInitialVersion(t *testing.T) {
 	h := newHarness(t, readyState("home"))
 	h.ctrl.set(func(c *fakeController) {
 		c.stateFail = "initial version failed: retrying"
 		c.stateFailPending = true
+		c.stateFailStuck = true
 	})
-	code, out, errOut := h.run("", "mount", "--new", "flaky:/data", "--root", "home")
+	start := time.Now()
+	code, _, errOut := h.run("", "mount", "--new", "stuck:/data", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `state "stuck" failed: initial version failed: retrying`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("mount waited %v for a terminal failure", elapsed)
+	}
+	if root := h.state("home"); len(root.Spec.Mounts) != 0 {
+		t.Fatalf("failed state mounted: %+v", root.Spec.Mounts)
+	}
+	var st v1alpha1.BlipState
+	err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "stuck"}, &st)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("failed mount left its state behind: %v", err)
+	}
+}
+
+// TestMountNewFromFailureRemovesForkCopies reproduces a failed
+// `mount --new NAME --from SRC` where the new root never becomes usable. Fork
+// creates a copy state for each writable mount of the source before the root;
+// rollback must remove those copies too, not just the destination root.
+func TestMountNewFromFailureRemovesForkCopies(t *testing.T) {
+	src := readyState("src")
+	src.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+	h := newHarness(t, readyState("home"), src, readyState("data"))
+	h.ctrl.set(func(c *fakeController) {
+		c.stateFail = `size 1Gi is smaller than copy source "src" (10Gi)`
+	})
+	code, _, errOut := h.run("", "mount", "--new", "dev:/work:rw", "--from", "src", "--size", "1Gi", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `state "dev" failed: size 1Gi is smaller than copy source "src" (10Gi)`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	var states v1alpha1.BlipStateList
+	if err := h.kube.List(context.Background(), &states); err != nil {
+		t.Fatal(err)
+	}
+	keep := map[string]bool{"home": true, "src": true, "data": true}
+	for _, s := range states.Items {
+		if !keep[s.Name] {
+			t.Fatalf("failed --new leaked state %q (copyFrom %q)", s.Name, s.Spec.CopyFrom)
+		}
+	}
+	if root := h.state("home"); len(root.Spec.Mounts) != 0 {
+		t.Fatalf("failed mount written as desired intent: %+v", root.Spec.Mounts)
+	}
+}
+
+// TestMountNewFromKeepsForkCopiesOnSuccess is the success counterpart: the new
+// root and the copies Fork created for its writable mounts all stay, and the
+// root is mounted at the requested path.
+func TestMountNewFromKeepsForkCopiesOnSuccess(t *testing.T) {
+	src := readyState("src")
+	src.Spec.Mounts = []v1alpha1.Mount{
+		{State: "data", Path: "/data", Writable: true},
+		{State: "tools", Path: "/tools"},
+	}
+	h := newHarness(t, readyState("home"), src, readyState("data"), readyState("tools"))
+	code, out, errOut := h.run("", "mount", "--new", "dev:/work:rw", "--from", "src", "--root", "home")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	mustContain(t, out, "state flaky mounted on root state home at /data")
-	if s := h.state("flaky"); s.Status.Committed == nil {
-		t.Fatal("state has no first commit")
+	mustContain(t, out, "state dev mounted on root state home at /work (writable)")
+	s := h.state("dev")
+	if s.Spec.CopyFrom != "src" || len(s.Spec.Mounts) != 2 {
+		t.Fatalf("new state %+v", s.Spec)
+	}
+	copyName := s.Spec.Mounts[0].State
+	if copyName == "data" || !s.Spec.Mounts[0].Writable || s.Spec.Mounts[0].Path != "/data" {
+		t.Fatalf("writable mount %+v", s.Spec.Mounts[0])
+	}
+	child := h.state(copyName)
+	if child.Spec.CopyFrom != "data" {
+		t.Fatalf("copy %q copyFrom %q", copyName, child.Spec.CopyFrom)
+	}
+	// Read-only mounts stay references to the existing state.
+	if s.Spec.Mounts[1] != (v1alpha1.Mount{State: "tools", Path: "/tools"}) {
+		t.Fatalf("read-only mount %+v", s.Spec.Mounts[1])
+	}
+	if root := h.state("home"); len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0].State != "dev" {
+		t.Fatalf("root mounts %+v", root.Spec.Mounts)
+	}
+	// The pre-existing source and its mount survive a successful --new.
+	for _, name := range []string{"src", "data", "tools"} {
+		if stateNotFound(t, h, name) {
+			t.Fatalf("pre-existing state %q was deleted", name)
+		}
 	}
 }
 
@@ -1092,7 +1357,7 @@ func TestMountPathsMayContainColons(t *testing.T) {
 // guest itself or lies below a symlink in the image. The mount must be
 // rejected before desired intent is written, or the root cannot start again.
 func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
-	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/lib64/w2", "/bin/w2", "/var/run/w2"} {
+	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/lib64/w2", "/bin/w2", "/var/run/w2", "/var/spool/mail", "/var/spool/mail/w2", "/usr/local/man/w2", "/usr/lib/ssl/certs/w2", "/usr/share/perl/5.38/w2"} {
 		t.Run(path, func(t *testing.T) {
 			h := newHarness(t, readyState("home"), readyState("data"))
 			code, _, errOut := h.run("", "mount", "data:"+path, "--root", "home")
@@ -1122,6 +1387,60 @@ func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
 	}
 	if code, _, errOut := h.run("", "mount", "b:/procdata", "--root", "home"); code != 0 {
 		t.Fatalf("legitimate nested path rejected: %d %s", code, errOut)
+	}
+}
+
+// TestMountRejectsMailSpoolSymlink reproduces the base image's
+// /var/spool/mail -> ../mail directory symlink. Both a running root and an
+// offline root must reject the path at preflight, before creating a state or
+// writing desired intent. Otherwise the next execution fails while creating
+// the mount point in the guest, and the root never starts again.
+func TestMountRejectsMailSpoolSymlink(t *testing.T) {
+	const guestErr = "/var/spool/mail is a symlink or not a directory"
+	for _, live := range []bool{false, true} {
+		name := "offline"
+		if live {
+			name = "live"
+		}
+		t.Run(name, func(t *testing.T) {
+			var root *v1alpha1.BlipState
+			objs := []client.Object{readyState("data")}
+			if live {
+				b := runningBlip("agent")
+				root = readyState(b.Spec.State)
+				objs = append(objs, b, root)
+			} else {
+				root = readyState("home")
+				objs = append(objs, root)
+			}
+			h := newHarness(t, objs...)
+			if live {
+				// Model the guest's dynamic rejection: without a
+				// preflight the mount becomes durable intent and the
+				// root fails on every later execution.
+				h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
+			}
+			for _, path := range []string{"/var/spool/mail", "/var/spool/mail/w3"} {
+				code, _, errOut := h.run("", "mount", "data:"+path, "--root", root.Name)
+				if code != 1 || !strings.Contains(errOut, "symlink in the image") {
+					t.Fatalf("mount %s: code %d: %s", path, code, errOut)
+				}
+				if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+					t.Fatalf("mount %s left desired intent: %+v", path, mounts)
+				}
+			}
+			// --new must reject before creating the state it would mount.
+			code, _, errOut := h.run("", "mount", "--new", "spool:/var/spool/mail/w3", "--root", root.Name)
+			if code != 1 || !strings.Contains(errOut, "symlink in the image") {
+				t.Fatalf("--new code %d: %s", code, errOut)
+			}
+			if !stateNotFound(t, h, "spool") {
+				t.Fatal("rejected --new left state spool behind")
+			}
+			if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected --new left desired intent: %+v", mounts)
+			}
+		})
 	}
 }
 

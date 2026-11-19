@@ -1,11 +1,15 @@
 package blipchat
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"unicode/utf8"
@@ -23,6 +27,9 @@ const (
 	// maxMessageRunes matches the per-history-entry bound below. It keeps a
 	// single prompt from dwarfing the thread's context.
 	maxMessageRunes = 8000
+	// maxUserRunes matches TurnAuthor.Name's CRD limit. A longer identity
+	// would reach the model but could never author a turn.
+	maxUserRunes = 253
 	// maxHistoryMessages and maxHistoryRunes bound the transcript the browser
 	// may replay. The body limit alone still allows hundreds of 8k messages.
 	maxHistoryMessages = 40
@@ -80,9 +87,34 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing X-Forwarded-User", http.StatusUnauthorized)
 		return
 	}
+	// Header.Values returns one element per header line, so a proxy that
+	// joins repeated values with commas still arrives as one element here.
+	if strings.Contains(user, ",") {
+		http.Error(w, "exactly one X-Forwarded-User identity is required", http.StatusBadRequest)
+		return
+	}
+	if !utf8.ValidString(user) {
+		http.Error(w, "invalid X-Forwarded-User", http.StatusBadRequest)
+		return
+	}
+	if n := utf8.RuneCountInString(user); n > maxUserRunes {
+		http.Error(w, fmt.Sprintf("X-Forwarded-User is too long: %d characters, limit %d", n, maxUserRunes), http.StatusBadRequest)
+		return
+	}
 	var req chatRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(&req); err != nil {
-		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+	if err := decodeChatRequest(w, r, &req); err != nil {
+		// Read failures can contain the pod's bound socket address and the
+		// peer address; JSON syntax errors echo the payload. Keep them in
+		// the server log only.
+		status := http.StatusBadRequest
+		message := "invalid request"
+		var nerr net.Error
+		if errors.As(err, &nerr) && nerr.Timeout() {
+			status = http.StatusRequestTimeout
+			message = "request timeout"
+		}
+		c.Server.logError(err, "chat request body", "remote", r.RemoteAddr)
+		http.Error(w, message, status)
 		return
 	}
 	if req.Thread == "" || req.Message == "" {
@@ -131,6 +163,30 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(chatResponse{Reply: reply})
+}
+
+func decodeChatRequest(w http.ResponseWriter, r *http.Request, req *chatRequest) error {
+	// Read the whole body through the limiter before decoding. json.Decoder
+	// stops at the end of the first value, so decoding directly from the
+	// limited reader would leave trailing bytes unbounded.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChatBody))
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(req); err != nil {
+		return err
+	}
+	// A second value means the request has data after the JSON object.
+	// Trailing whitespace is not a value and yields io.EOF.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body has data after the JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
@@ -301,7 +357,7 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	if err := readOnly(argv); err != nil {
 		return "", err
 	}
-	return c.s.execIn(ctx, c.thread, name, argv, 60)
+	return c.s.execIn(ctx, c.thread, name, argv, maxExecTimeout)
 }
 
 // readOnly reports whether argv is safe to run as an inspection command. It

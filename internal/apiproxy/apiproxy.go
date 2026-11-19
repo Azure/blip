@@ -341,15 +341,27 @@ var identityHeaderPrefixes = []string{
 	"x-ssl-client-", // client-certificate assertions
 	"client-cert",
 	"x-pomerium-",
+	"x-goog-authenticated-user-", // Google IAP and Cloud Run identity
+	"x-ms-client-principal",      // Azure Easy Auth principal and its -Name/-Id variants
+	"x-envoy-",                   // Envoy peer metadata and external-address assertions
 }
 
 // identityHeaders are caller identity headers with fixed names.
 var identityHeaders = map[string]struct{}{
-	"authorization":       {},
-	"proxy-authorization": {},
-	"forwarded":           {},
-	"via":                 {},
-	"x-real-ip":           {},
+	"authorization":            {},
+	"proxy-authorization":      {},
+	"forwarded":                {},
+	"via":                      {},
+	"x-real-ip":                {},
+	"x-goog-iap-jwt-assertion": {},
+	"x-webauth-user":           {},
+	"x-client-cert":            {},
+	"x-client-dn":              {},
+	"x-original-user":          {},
+	"x-auth-user":              {},
+	"x-user":                   {},
+	"x-email":                  {},
+	"x-envoy-peer-metadata":    {},
 }
 
 func stripIdentity(headers http.Header) {

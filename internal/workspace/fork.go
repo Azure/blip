@@ -36,18 +36,24 @@ type ForkOptions struct {
 // with UID preconditions protecting replaced objects. Ambiguous failures
 // preserve them: the failed create may have persisted a root referencing those
 // children even though its response was lost.
-func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest *v1alpha1.BlipState, opts *ForkOptions) error {
+//
+// On success Fork returns the states it created, root last. A caller that
+// cannot keep the fork (for example because the new state never became usable)
+// can delete every returned state without guessing the copy names. The
+// returned objects carry the UIDs assigned at creation, so cleanup can guard
+// against deleting a state that was replaced in the meantime.
+func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest *v1alpha1.BlipState, opts *ForkOptions) ([]*v1alpha1.BlipState, error) {
 	if source == nil || dest == nil || source.Name == "" || dest.Name == "" || source.Namespace != dest.Namespace {
-		return errors.New("fork requires named source and destination states in the same namespace")
+		return nil, errors.New("fork requires named source and destination states in the same namespace")
 	}
 	if dest.Spec.Image != "" || len(dest.Spec.ImagePullSecrets) != 0 || len(dest.OwnerReferences) != 0 {
-		return errors.New("fork destination cannot have an image, image pull secrets, or owner references")
+		return nil, errors.New("fork destination cannot have an image, image pull secrets, or owner references")
 	}
 	if opts == nil {
 		opts = &ForkOptions{}
 	}
 	if err := CheckSource(source); err != nil {
-		return err
+		return nil, err
 	}
 	root := dest.DeepCopy()
 	root.Spec.CopyFrom = source.Name
@@ -61,10 +67,10 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 		if mount.Writable {
 			var src v1alpha1.BlipState
 			if err := c.Get(ctx, client.ObjectKey{Namespace: source.Namespace, Name: mount.State}, &src); err != nil {
-				return fmt.Errorf("read mount source %q: %w", mount.State, err)
+				return nil, fmt.Errorf("read mount source %q: %w", mount.State, err)
 			}
 			if err := CheckSource(&src); err != nil {
-				return err
+				return nil, err
 			}
 			child := &v1alpha1.BlipState{
 				ObjectMeta: metav1.ObjectMeta{Name: childName(root, mount), Namespace: root.Namespace, Labels: maps.Clone(root.Labels)},
@@ -87,10 +93,10 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 	for _, st := range copies {
 		err := c.Get(ctx, client.ObjectKeyFromObject(st), &v1alpha1.BlipState{})
 		if err == nil {
-			return apierrors.NewAlreadyExists(v1alpha1.GroupVersion.WithResource("blipstates").GroupResource(), st.Name)
+			return nil, apierrors.NewAlreadyExists(v1alpha1.GroupVersion.WithResource("blipstates").GroupResource(), st.Name)
 		}
 		if !apierrors.IsNotFound(err) {
-			return err
+			return nil, err
 		}
 	}
 	var created []*v1alpha1.BlipState
@@ -98,7 +104,7 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 		if err := c.Create(ctx, st); err != nil {
 			result := fmt.Errorf("create state %q: %w", st.Name, err)
 			if !createRejected(err) {
-				return result
+				return nil, result
 			}
 			for i := len(created) - 1; i >= 0; i-- {
 				obj := created[i]
@@ -110,12 +116,12 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 					result = errors.Join(result, fmt.Errorf("remove newly created state %q: %w", obj.Name, cleanupErr))
 				}
 			}
-			return result
+			return nil, result
 		}
 		created = append(created, st)
 	}
 	*dest = *root
-	return nil
+	return created, nil
 }
 
 // createRejected identifies explicit rejections that guarantee this request

@@ -17,11 +17,33 @@ func TestValidate(t *testing.T) {
 		{"/lib64/x", false},
 		{"/bin/x", false},
 		{"/var/run/x", false},
+		{"/var/spool/mail", false},
+		{"/var/spool/mail/x", false},
+		{"/usr/local/man", false},
+		{"/usr/local/man/x", false},
+		{"/usr/lib/ssl/certs", false},
+		{"/usr/lib/ssl/certs/x", false},
+		{"/usr/lib/ssl/private/x", false},
+		{"/usr/share/perl/5.38/x", false},
 		{"/run/data", true},
 		{"/procdata", true},
 		{"/lib64x", true},
 		{"/data", true},
 		{"/data/sub", true},
+		// Real directories and prefix-sharing paths the guest accepts must
+		// stay legal; only exact base-image symlinks are rejected.
+		{"/var/mail", true},
+		{"/var/spool/maillog", true},
+		{"/usr/local/manual", true},
+		{"/usr/lib/ssl", true},
+		{"/usr/share/perl/5.40", true},
+		{"/usr/share/doc/example", true},
+		// Ancestors of a symlink are real directories the guest can create
+		// or mount over; only the symlink itself and its descendants fail.
+		{"/var/spool", true},
+		{"/usr/local", true},
+		{"/usr/share/perl", true},
+		{"/usr/share", true},
 	} {
 		err := Validate(tc.path)
 		if (err == nil) != tc.ok {

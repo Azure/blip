@@ -59,6 +59,7 @@ type Store interface {
 	CreateCommit(ctx context.Context, req storage.CreateCommit) error
 	FetchCommit(ctx context.Context, stateUID, commitID string, src storage.Remote, progress func(done, total int64)) error
 	CreateWorking(ctx context.Context, req storage.CreateWorking) (string, error)
+	Activate(id string) (string, error)
 	Seal(ctx context.Context, attachmentID, commitID string) (int64, error)
 	LiveCopy(ctx context.Context, attachmentID, commitID, stateUID string) (int64, error)
 	Delete(ctx context.Context, id string) error

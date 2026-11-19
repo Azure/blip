@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 
@@ -55,14 +54,11 @@ func (a *app) pull(ctx context.Context, name, image string, f *pullFlags) error 
 		Spec:       v1alpha1.BlipStateSpec{Image: image},
 	}
 	if f.size != "" {
-		size, err := resource.ParseQuantity(f.size)
+		size, err := parseSizeFlag(f.size)
 		if err != nil {
-			return fmt.Errorf("invalid --size %q: %w", f.size, err)
+			return err
 		}
-		if size.Sign() <= 0 {
-			return fmt.Errorf("invalid --size %q: must be positive", f.size)
-		}
-		st.Spec.Size = &size
+		st.Spec.Size = size
 	}
 	for _, secret := range f.secrets {
 		if problems := validation.IsDNS1123Subdomain(secret); len(problems) > 0 {

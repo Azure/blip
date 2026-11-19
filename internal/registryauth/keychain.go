@@ -67,14 +67,30 @@ func Keychain(ctx context.Context, r client.Reader, secrets []PullSecret) (authn
 			return nil, err
 		}
 		data, ok := secret.Data[corev1.DockerConfigJsonKey]
-		if !ok {
-			return nil, UnusableSecret(fmt.Errorf("image pull secret %s/%s: type %s has no %s",
-				ref.Namespace, ref.Name, secret.Type, corev1.DockerConfigJsonKey))
-		}
 		var cfg dockerConfigJSON
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return nil, UnusableSecret(fmt.Errorf("image pull secret %s/%s: invalid %s: %w",
-				ref.Namespace, ref.Name, corev1.DockerConfigJsonKey, err))
+		if secret.Type == corev1.SecretTypeDockercfg {
+			// Legacy kubernetes.io/dockercfg secrets store the bare registry
+			// map under .dockercfg instead of an {"auths": ...} wrapper.
+			data, ok = secret.Data[corev1.DockerConfigKey]
+			if !ok {
+				return nil, UnusableSecret(fmt.Errorf("image pull secret %s/%s: type %s has no %s",
+					ref.Namespace, ref.Name, secret.Type, corev1.DockerConfigKey))
+			}
+			var auths map[string]authn.AuthConfig
+			if err := json.Unmarshal(data, &auths); err != nil {
+				return nil, UnusableSecret(fmt.Errorf("image pull secret %s/%s: invalid %s: %w",
+					ref.Namespace, ref.Name, corev1.DockerConfigKey, err))
+			}
+			cfg.Auths = auths
+		} else {
+			if !ok {
+				return nil, UnusableSecret(fmt.Errorf("image pull secret %s/%s: type %s has no %s",
+					ref.Namespace, ref.Name, secret.Type, corev1.DockerConfigJsonKey))
+			}
+			if err := json.Unmarshal(data, &cfg); err != nil {
+				return nil, UnusableSecret(fmt.Errorf("image pull secret %s/%s: invalid %s: %w",
+					ref.Namespace, ref.Name, corev1.DockerConfigJsonKey, err))
+			}
 		}
 		for registry, auth := range cfg.Auths {
 			if host := Host(registry); host != "" {
