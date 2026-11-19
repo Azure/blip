@@ -79,10 +79,12 @@ const (
 //     isolation would depend on upgrading the API server (Kubernetes has
 //     always supported it).
 //   - Objects created before owner labels existed are handled explicitly. An
-//     unlabelled BlipState is a shared base and stays readable by name. An
-//     unlabelled Blip is administrator-owned and private. Scoped lists select
-//     the caller's owner label, so shared bases do not appear in a restricted
-//     owner's list or watch even though a GET by name works.
+//     unlabelled BlipState with spec.image set is a shared read-only base and
+//     stays readable by name; an unlabelled writable or copied state is
+//     private, matching the mount and copy policy. An unlabelled Blip is
+//     administrator-owned and private. Scoped lists select the caller's owner
+//     label, so shared bases do not appear in a restricted owner's list or
+//     watch even though a GET by name works.
 //   - VM pods created from a template older than this scope have no
 //     POD_NAME/POD_NAMESPACE and keep the previous unscoped behavior until
 //     their pool recreates them.
@@ -248,10 +250,12 @@ func (s *ownerScope) allowed(ctx context.Context, id identity, req scopeRequest)
 		// Warm and unknown pods have no owner label and are never exposed.
 		return owner != "" && owner == id.owner, http.StatusNotFound, nil
 	default:
-		// Owner-labelled objects are private. An unlabelled state is a shared
-		// base; an unlabelled Blip is administrator-owned and private.
+		// Owner-labelled objects are private. Only an unlabelled image
+		// state is a shared base: the controller and mount policy treat an
+		// ownerless state without spec.image as private, so the proxy must
+		// not expose it by name. An unlabelled Blip is administrator-owned.
 		if owner == "" {
-			return req.resource == "blipstates", http.StatusNotFound, nil
+			return req.resource == "blipstates" && obj.Spec.Image != "", http.StatusNotFound, nil
 		}
 		return owner == id.owner, http.StatusNotFound, nil
 	}
@@ -265,6 +269,11 @@ type objectMeta struct {
 		Labels      map[string]string `json:"labels"`
 		Annotations map[string]string `json:"annotations"`
 	} `json:"metadata"`
+	Spec struct {
+		// Image distinguishes a shared read-only base from an ownerless
+		// writable state, which stays private.
+		Image string `json:"image"`
+	} `json:"spec"`
 }
 
 // object performs a trusted GET of path. Only metadata is retained.

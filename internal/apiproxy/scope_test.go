@@ -24,6 +24,7 @@ type fakeObject struct {
 	Labels      map[string]string
 	Annotations map[string]string
 	Secret      string
+	Image       string
 }
 
 func (o fakeObject) value(kind string) map[string]any {
@@ -35,8 +36,15 @@ func (o fakeObject) value(kind string) map[string]any {
 		meta["annotations"] = o.Annotations
 	}
 	out := map[string]any{"apiVersion": "v1", "kind": kind, "metadata": meta}
+	spec := map[string]any{}
+	if o.Image != "" {
+		spec["image"] = o.Image
+	}
 	if o.Secret != "" {
-		out["spec"] = map[string]any{"env": []any{map[string]any{"name": "SECRET", "value": o.Secret}}}
+		spec["env"] = []any{map[string]any{"name": "SECRET", "value": o.Secret}}
+	}
+	if len(spec) > 0 {
+		out["spec"] = spec
 	}
 	return out
 }
@@ -191,7 +199,8 @@ func scopedFixture() *fakeKube {
 	kube.blips["admin.a"] = fakeObject{Name: "admin.a", UID: "uid-admin", Secret: "admin-secret"}
 	kube.states["alice.home"] = fakeObject{Name: "alice.home", UID: "state-alice", Labels: map[string]string{v1.LabelOwner: "alice"}}
 	kube.states["bob.home"] = fakeObject{Name: "bob.home", UID: "state-bob", Labels: map[string]string{v1.LabelOwner: "bob"}}
-	kube.states["shared-base"] = fakeObject{Name: "shared-base", UID: "state-base"}
+	kube.states["shared-base"] = fakeObject{Name: "shared-base", UID: "state-base", Image: "reg/base:v1"}
+	kube.states["legacy-copy"] = fakeObject{Name: "legacy-copy", UID: "state-legacy"}
 	return kube
 }
 
@@ -272,6 +281,11 @@ func TestOwnerScopeHidesOtherOwners(t *testing.T) {
 	}
 	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipstates/shared-base"); status != http.StatusOK {
 		t.Fatalf("shared base status = %d", status)
+	}
+	// An ownerless state without an image is not a shared base; the same
+	// object is private to the mount and copy policy.
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipstates/legacy-copy"); status != http.StatusNotFound {
+		t.Fatalf("unowned non-image state status = %d, want 404", status)
 	}
 	if status, _ := proxyGet(t, p, "/api/v1/namespaces/blip-sandbox/pods/bob-vm"); status != http.StatusNotFound {
 		t.Fatalf("other owner's pod status = %d", status)
