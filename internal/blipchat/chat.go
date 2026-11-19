@@ -14,6 +14,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -148,7 +149,19 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	thread := &v1.BlipThread{}
 	if err := c.Server.Get(ctx, client.ObjectKey{Namespace: namespace, Name: req.Thread}, thread); err != nil {
-		http.Error(w, "thread: "+err.Error(), http.StatusNotFound)
+		// The API error names the resource, echoes the caller's name (which
+		// may contain control bytes), and on transport failures contains the
+		// internal API URL. Keep all of it in the server log. A missing
+		// thread is the only client-visible distinction; anything else is a
+		// backend failure, not a hint about whether some other tenant's
+		// thread exists.
+		c.Server.logError(err, "chat thread lookup",
+			"thread", namespace+"/"+req.Thread, "user", user)
+		if apierrors.IsNotFound(err) {
+			http.Error(w, "thread not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "chat backend unavailable", http.StatusBadGateway)
 		return
 	}
 	st := &chatStep{s: c.Server, thread: thread, user: user}

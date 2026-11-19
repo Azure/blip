@@ -4,18 +4,72 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
+
+// Thread lookup failures must not reflect API details, internal URLs, or the
+// caller-supplied name (which can contain NUL bytes) back to the browser.
+func TestChatHidesThreadLookupErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "not found",
+			err:        apierrors.NewNotFound(k8sschema.GroupResource{Group: "blip.dev", Resource: "BlipThread"}, "bad\x00name"),
+			wantStatus: http.StatusNotFound,
+			wantBody:   "thread not found",
+		},
+		{
+			name:       "transport",
+			err:        fmt.Errorf(`Get "https://10.0.0.5:6443/api/v1/namespaces/ns": dial tcp 10.0.0.5:6443: i/o timeout`),
+			wantStatus: http.StatusBadGateway,
+			wantBody:   "chat backend unavailable",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := testClientWith(t, interceptor.Funcs{
+				Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, ok := obj.(*v1.BlipThread); ok {
+						return tt.err
+					}
+					return cl.Get(ctx, key, obj, opts...)
+				},
+			}, testThread())
+			rec := chatRequestFor(t, c, llmServer(t, Message{Role: "assistant", Content: "ok"}), "alice", "ns",
+				`{"thread":"proj","message":"hi"}`)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			body := rec.Body.String()
+			for _, leak := range []string{"BlipThread", "blip.dev", "bad", "10.0.0.5", "6443", "i/o timeout", "thread:"} {
+				if strings.Contains(body, leak) {
+					t.Errorf("response leaks %q: %s", leak, body)
+				}
+			}
+			if !strings.Contains(body, tt.wantBody) {
+				t.Errorf("response = %q, want %q", body, tt.wantBody)
+			}
+		})
+	}
+}
 
 // A Blip whose owner label is not the thread's derived owner must be neither
 // listed to the model nor counted against maxRunning, even when it carries the
