@@ -9,7 +9,10 @@
 # caller's claimed pod maps to the same hash. The blip.dev/thread and
 # blip.dev/owner labels are self-asserted, so they must agree with that hash
 # too; otherwise a VM could send a turn to its own thread while labelling it
-# into another project's in-guest turn list.
+# into another project's in-guest turn list. The table also records the
+# current thread incarnation under thread-inc.<owner>, and the claimed pod's
+# entry carries the incarnation its Blip was created for. A producer left over
+# from a deleted thread therefore cannot write turns into the recreated one.
 #
 # Turns are immutable history. Pod-bound producers may not update or delete
 # them, and the deterministic names blipchat uses for watcher and coordinator
@@ -145,16 +148,36 @@ spec:
       expression: "has(params.data) ? params.data : {}"
     - name: callerPod
       expression: request.userInfo.extra['authentication.kubernetes.io/pod-name'][0]
-    - name: owner
+    # A claimed pod's value is "<owner>" or "<owner> <thread UID>". Split it
+    # so the owner checks stay backward compatible with entries written before
+    # incarnation tracking.
+    - name: podEntry
       expression: >-
         variables.callerPod in variables.data ?
-        string(variables.data[variables.callerPod]) : ''
+        string(variables.data[variables.callerPod]).split(' ') : []
+    - name: owner
+      expression: >-
+        size(variables.podEntry) > 0 ?
+        variables.podEntry[0] : ''
+    - name: podThreadUID
+      expression: >-
+        size(variables.podEntry) > 1 ?
+        variables.podEntry[1] : ''
     - name: threadKey
       expression: "'thread.' + object.spec.thread"
     - name: threadOwner
       expression: >-
         variables.threadKey in variables.data ?
         string(variables.data[variables.threadKey]) : ''
+    # The controller publishes the current incarnation of each thread owner
+    # under "thread-inc.<owner>". A pod created for the previous incarnation of
+    # a recreated thread carries its old UID in its pod entry and is rejected.
+    - name: threadIncKey
+      expression: "'thread-inc.' + variables.threadOwner"
+    - name: threadUID
+      expression: >-
+        variables.threadOwner != '' && variables.threadIncKey in variables.data ?
+        string(variables.data[variables.threadIncKey]) : ''
     # The turn's labels are written by its producer. A turn that names the
     # producer's own thread in spec.thread must not carry another project's
     # label, because the in-guest API proxy selects turns by blip.dev/thread
@@ -170,13 +193,19 @@ spec:
   validations:
     - expression: >-
         variables.blipchat || variables.owner == '-' ||
-        (variables.owner != '' && variables.threadOwner == variables.owner)
+        (variables.owner != '' && variables.threadOwner == variables.owner &&
+        variables.threadUID != '' && variables.podThreadUID == variables.threadUID)
       messageExpression: >-
         'pod-bound producer ' + request.userInfo.username +
         ' may only author turns for a thread of its own project; ' +
         (variables.threadOwner == '' ?
         'thread ' + object.spec.thread + ' has no recorded owner' :
-        'owner ' + variables.owner + ' does not own thread ' + object.spec.thread)
+        variables.threadOwner != variables.owner ?
+        'owner ' + variables.owner + ' does not own thread ' + object.spec.thread :
+        variables.threadUID == '' ?
+        'thread ' + object.spec.thread + ' has no recorded incarnation' :
+        'the producer was not created for the current incarnation of thread ' +
+        object.spec.thread)
       reason: Forbidden
     # Either encoding of the label is accepted, but it must resolve to the
     # owner of spec.thread. A raw short name lives under "thread.<label>";

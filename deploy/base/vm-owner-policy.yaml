@@ -2,12 +2,17 @@
 # ConfigMap blip-vm-owners in every namespace with a BlipPool:
 #   sa.<service account>: <pools>  every VM service account, with the
 #                                  space-separated pools that use it
-#   <vm pod>: <owner>              each claimed VM pod; "-" means unrestricted
+#   <vm pod>: <owner>[ <uid>]      each claimed VM pod; "-" means unrestricted.
+#                                  The optional UID is the thread incarnation
+#                                  its Blip was created for.
 #   thread.<thread>: <owner>       each thread's project owner hash, keyed by
 #                                  the raw thread name used in spec.thread
 #   thread-hash.<label>: <owner>   the same, keyed by the ThreadLabel a
 #                                  blip.dev/thread label carries when the
 #                                  thread name is too long for a label value
+#   thread-inc.<owner>: <uid>      the current incarnation of that project's
+#                                  thread, used to reject turns from a producer
+#                                  created for a deleted thread
 #   bases: <states>                space-separated shared, ownerless image states
 # A caller authenticated with a pod-bound token of a VM service account may
 # only connect to pods with `blip-runtime bridge 1025` in container vm (a blip
@@ -72,8 +77,17 @@ spec:
         size(variables.data) == 0 ||
         ('sa.' + variables.callerSA) in variables.data ||
         variables.callerPod in variables.data
+    # A claimed pod's value is "<owner>" or "<owner> <thread UID>"; the
+    # incarnation is used by blip-turn-owner, while this policy only needs the
+    # owner field.
+    - name: podEntry
+      expression: >-
+        variables.callerPod in variables.data ?
+        string(variables.data[variables.callerPod]).split(' ') : []
     - name: owner
-      expression: "variables.callerPod in variables.data ? string(variables.data[variables.callerPod]) : ''"
+      expression: >-
+        size(variables.podEntry) > 0 ?
+        variables.podEntry[0] : ''
     - name: restricted
       expression: variables.vm && variables.owner != '-'
     - name: prefix
@@ -134,7 +148,8 @@ spec:
       reason: Forbidden
     - expression: >-
         !variables.restricted || request.operation != 'CONNECT' ||
-        (request.name in variables.data && variables.data[request.name] == variables.owner)
+        (request.name in variables.data &&
+        string(variables.data[request.name]).split(' ')[0] == variables.owner)
       messageExpression: >-
         'owner ' + variables.owner + ' may only connect to VM pods of its own blips, not ' + request.name
       reason: Forbidden

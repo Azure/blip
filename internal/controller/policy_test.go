@@ -733,13 +733,16 @@ func TestTurnOwnerPolicy(t *testing.T) {
 	longOwner := v1.ThreadOwner(ns, long)
 	params := map[string]string{
 		"sa.vm":                    "default",
-		"vm-pod":                   project,
-		"long-pod":                 longOwner,
+		"vm-pod":                   project + " incarnation-proj",
+		"long-pod":                 longOwner + " incarnation-long",
 		"admin-pod":                "-",
 		"thread.proj":              project,
 		"thread.victim":            victim,
 		"thread." + long:           longOwner,
 		"thread-hash." + longLabel: longOwner,
+		"thread-inc." + project:    "incarnation-proj",
+		"thread-inc." + victim:     "incarnation-victim",
+		"thread-inc." + longOwner:  "incarnation-long",
 	}
 	labeled := func(thread, threadLabel, ownerLabel string) map[string]any {
 		o := turnFor(thread, "ServiceAccount", self)
@@ -779,6 +782,56 @@ func TestTurnOwnerPolicy(t *testing.T) {
 				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
 			}
 		})
+	}
+}
+
+// A direct turn has no thread UID of its own. The controller records the
+// current incarnation under thread-inc.<owner> and the claimed pod's entry
+// carries the incarnation its Blip was created for, so a token from before a
+// delete/recreate cannot write into the new project.
+func TestTurnOwnerPolicyPinsProducerIncarnation(t *testing.T) {
+	_, v := loadTurnPolicy(t)
+	self := "system:serviceaccount:" + ns + ":vm"
+	project := v1.ThreadOwner(ns, "proj")
+	params := map[string]string{
+		"sa.vm":                 "default",
+		"old-pod":               project + " old-incarnation",
+		"new-pod":               project + " new-incarnation",
+		"admin-pod":             "-",
+		"thread.proj":           project,
+		"thread-inc." + project: "new-incarnation",
+	}
+	for _, tc := range []struct {
+		name  string
+		pod   string
+		allow bool
+		msg   string
+	}{
+		{"producer from the previous incarnation", "old-pod", false, "current incarnation"},
+		{"producer created for the current incarnation", "new-pod", true, ""},
+		{"unrestricted VM", "admin-pod", true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{
+				user: vmUser("vm", tc.pod), op: admission.Create, resource: "blipturns",
+				name: "turn", object: turnFor("proj", "ServiceAccount", self),
+			}
+			allow, msg := req.evaluate(t, v, params)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+
+	// A table that predates incarnation tracking has no thread-inc entry and
+	// must not silently accept the producer.
+	delete(params, "thread-inc."+project)
+	req := policyRequest{
+		user: vmUser("vm", "new-pod"), op: admission.Create, resource: "blipturns",
+		name: "turn", object: turnFor("proj", "ServiceAccount", self),
+	}
+	if allow, msg := req.evaluate(t, v, params); allow {
+		t.Fatalf("turn create allowed without a recorded thread incarnation: %s", msg)
 	}
 }
 
