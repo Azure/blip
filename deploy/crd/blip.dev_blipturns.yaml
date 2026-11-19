@@ -161,7 +161,9 @@ spec:
               The struct-level rule makes seq immutable once it has been set. A rule on
               the seq property alone does not run when seq is removed: a status writer
               could clear it with `seq: null`, and the sequencer would then stamp a later
-              sequence, reordering the thread's history.
+              sequence, reordering the thread's history. A turn that was orphaned (or
+              otherwise written before sequencing) may still receive its first sequence;
+              only changing or clearing an assigned seq is rejected.
             properties:
               acceptedTime:
                 description: AcceptedTime is when blipchat sequenced the turn.
@@ -195,8 +197,8 @@ spec:
             x-kubernetes-validations:
             - message: seq is immutable once set
               optionalOldSelf: true
-              rule: '!oldSelf.hasValue() || (has(self.seq) == has(oldSelf.value().seq)
-                && (!has(self.seq) || self.seq == oldSelf.value().seq))'
+              rule: '!oldSelf.hasValue() || !has(oldSelf.value().seq) || (has(self.seq)
+                && self.seq == oldSelf.value().seq)'
         type: object
         x-kubernetes-validations:
         - message: turns are immutable

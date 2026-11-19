@@ -253,9 +253,11 @@ type TurnSubject struct {
 // The struct-level rule makes seq immutable once it has been set. A rule on
 // the seq property alone does not run when seq is removed: a status writer
 // could clear it with `seq: null`, and the sequencer would then stamp a later
-// sequence, reordering the thread's history.
+// sequence, reordering the thread's history. A turn that was orphaned (or
+// otherwise written before sequencing) may still receive its first sequence;
+// only changing or clearing an assigned seq is rejected.
 //
-// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || (has(self.seq) == has(oldSelf.value().seq) && (!has(self.seq) || self.seq == oldSelf.value().seq))",optionalOldSelf=true,message="seq is immutable once set"
+// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || !has(oldSelf.value().seq) || (has(self.seq) && self.seq == oldSelf.value().seq)",optionalOldSelf=true,message="seq is immutable once set"
 type BlipTurnStatus struct {
 	// Seq is the turn's position in the thread's single global order.
 	// +kubebuilder:validation:Minimum=0

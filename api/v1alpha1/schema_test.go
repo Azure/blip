@@ -809,6 +809,34 @@ func TestBlipTurnStatusSeqCannotBeCleared(t *testing.T) {
 	}
 }
 
+// A turn written before sequencing (for example when it was orphaned) must
+// still be able to receive its first sequence when the thread appears. The
+// rule only protects an already assigned sequence.
+func TestBlipTurnSequenceCanBeSetAfterOrphanMarker(t *testing.T) {
+	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipturns.yaml")
+	ruleFor(t, status.XValidations, "seq is immutable once set")
+
+	validate := admissionValidator(t, "blipturns")
+	turn := func(status string) string {
+		return fmt.Sprintf(`{"spec":{"thread":"project","author":{"kind":"User","name":"alice"}},"status":%s}`, status)
+	}
+	orphaned := turn(`{"orphanedAt":"2026-01-01T00:00:00Z"}`)
+	sequenced := turn(`{"orphanedAt":"2026-01-01T00:00:00Z","seq":1,"threadUID":"uid","acceptedTime":"2026-01-01T00:01:00Z"}`)
+	if errs := validate(sequenced, orphaned); len(errs) != 0 {
+		t.Fatalf("rejected sequencing a previously orphaned turn: %v", errs.ToAggregate())
+	}
+	// Any status write made before sequencing has the same shape.
+	if errs := validate(turn(`{"seq":1}`), turn(`{"threadUID":"uid"}`)); len(errs) != 0 {
+		t.Errorf("rejected the first sequence after another status write: %v", errs.ToAggregate())
+	}
+	if errs := validate(turn(`{"seq":2}`), sequenced); len(errs) == 0 {
+		t.Error("admitted changing an assigned sequence")
+	}
+	if errs := validate(turn(`{"orphanedAt":"2026-01-01T00:00:00Z"}`), sequenced); len(errs) == 0 {
+		t.Error("admitted clearing an assigned sequence")
+	}
+}
+
 // TestReferenceNamesValidated guards that pool and base references look like
 // Kubernetes object names. Names with '/', spaces, or underscores can never
 // exist, so failing at admission avoids a pending Blip or a later coordinator
