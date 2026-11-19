@@ -1237,15 +1237,89 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 		return fmt.Errorf("state %q is being deleted", a.short(f.root))
 	}
 	if err := a.mountState(ctx, name, f.root, mountPath, &writable); err != nil {
-		// A mount that became desired intent before failing is referenced by
-		// the root, so its state is not an orphan and must stay. Any other
-		// failure leaves the newly created states unused.
-		if !a.mountApplied(ctx, f.root, name, mountPath) {
-			a.removeCreatedStates(ctx, built)
-		}
+		a.removeUnusedCreatedStates(ctx, f.root, name, mountPath, built)
 		return err
 	}
 	return nil
+}
+
+// removeUnusedCreatedStates deletes the states a failed --new created, but
+// only if they never became desired intent and the running writer has released
+// them. Deleting a state that the writer still reports makes the controller
+// finish the execution with a discarded save and fail it.
+func (a *app) removeUnusedCreatedStates(ctx context.Context, root, state, mountPath string, built []*v1alpha1.BlipState) {
+	// A mount that became desired intent before failing is referenced by the
+	// root, so its state is not an orphan and must stay.
+	if a.mountApplied(ctx, root, state, mountPath) {
+		return
+	}
+	if !a.createdStateUnused(ctx, root, state) {
+		fmt.Fprintf(a.env.Err, "warning: state %s created for the failed mount is still in use; leaving it in place\n", a.short(state))
+		return
+	}
+	a.removeCreatedStates(ctx, built)
+}
+
+// createdStateUnused reports whether a state this command created may be
+// deleted: no desired intent references it and the root's running writer no
+// longer reports it. A state still visible as a writable mount, or still
+// attached or pre-acquired, belongs to the live execution; deleting it makes
+// the controller report a discarded save and fail the Blip. The check is
+// repeated briefly because the controller drops a failed entry and releases
+// its writer slot a moment after the mount's intent is rolled back.
+func (a *app) createdStateUnused(ctx context.Context, root, state string) bool {
+	c, err := a.clients()
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for {
+		s, err := a.getState(ctx, root)
+		if err != nil {
+			return false
+		}
+		// Serialize against the current root intent: a concurrent command
+		// may have put the mount back, in which case the state is in use.
+		if findSpecMount(s.Spec.Mounts, state) != nil {
+			return false
+		}
+		b, err := a.rootWriter(ctx, s)
+		if err != nil {
+			return false
+		}
+		var st v1alpha1.BlipState
+		err = c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: state}, &st)
+		if apierrors.IsNotFound(err) {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+		w := st.Status.Writer
+		if w != nil && w.PodUID != "" {
+			// Attached to a VM: never delete it.
+			return false
+		}
+		if b == nil {
+			return true
+		}
+		if m := findMount(b.Status.Mounts, state); m != nil {
+			if m.InClaim || m.Phase == v1alpha1.MountMounted || m.Phase == v1alpha1.MountSaving ||
+				m.Phase == v1alpha1.MountUnmounting {
+				return false
+			}
+			// Pending or Failed: never attached. Wait for the controller to
+			// drop the failed entry and release the pre-acquired writer.
+		} else if w == nil || w.BlipUID != string(b.UID) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // mountApplied reports whether the root's desired topology already references

@@ -1914,6 +1914,107 @@ func TestMountRejectsUnusableStates(t *testing.T) {
 	})
 }
 
+// TestCreatedStateUnusedProtectsRunningWriter covers the rollback of a state
+// created for a failed --new mount. The state may only be deleted once the
+// running writer no longer reports or holds it; deleting it earlier makes the
+// controller fail the execution with a discarded save.
+func TestCreatedStateUnusedProtectsRunningWriter(t *testing.T) {
+	newRoot := func(b *v1alpha1.Blip) *v1alpha1.BlipState {
+		root := readyState(b.Spec.State)
+		root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+		return root
+	}
+	t.Run("failed writable entry keeps state", func(t *testing.T) {
+		b := runningBlip("agent")
+		b.Status.Mounts = []v1alpha1.MountStatus{{
+			State: "leak", Path: "/blocker/x", Writable: true, Phase: v1alpha1.MountFailed, Message: "rejected",
+		}}
+		leak := readyState("leak")
+		leak.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID), AttachmentID: "pre-acquired"}
+		a := mountTestApp(t, b, newRoot(b), leak)
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		if a.createdStateUnused(ctx, b.Spec.State, "leak") {
+			t.Fatal("state still reported by the writer treated as unused")
+		}
+	})
+	t.Run("attached writer keeps state", func(t *testing.T) {
+		b := runningBlip("agent")
+		leak := readyState("leak")
+		leak.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID), PodUID: "pod-agent"}
+		a := mountTestApp(t, b, newRoot(b), leak)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		start := time.Now()
+		if a.createdStateUnused(ctx, b.Spec.State, "leak") {
+			t.Fatal("attached state treated as unused")
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("attached state was waited on: %s", elapsed)
+		}
+	})
+	t.Run("root intent keeps state", func(t *testing.T) {
+		b := runningBlip("agent")
+		root := newRoot(b)
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "leak", Path: "/leak", Writable: true}}
+		a := mountTestApp(t, b, root, readyState("leak"))
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		if a.createdStateUnused(ctx, b.Spec.State, "leak") {
+			t.Fatal("state referenced by root intent treated as unused")
+		}
+	})
+	t.Run("released state is unused", func(t *testing.T) {
+		b := runningBlip("agent")
+		a := mountTestApp(t, b, newRoot(b), readyState("leak"))
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if !a.createdStateUnused(ctx, b.Spec.State, "leak") {
+			t.Fatal("released state still treated as in use")
+		}
+	})
+}
+
+// TestRemoveUnusedCreatedStatesKeepsReferencedState drives the rollback that
+// follows a rejected --new mount: an unused state is removed, but one the
+// running writer still reports is left in place so the controller does not
+// fail the execution with a discarded save.
+func TestRemoveUnusedCreatedStatesKeepsReferencedState(t *testing.T) {
+	newApp := func(b *v1alpha1.Blip, root *v1alpha1.BlipState, leak *v1alpha1.BlipState) *app {
+		root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+		return mountTestApp(t, b, root, leak)
+	}
+	t.Run("referenced state stays", func(t *testing.T) {
+		b := runningBlip("agent")
+		leak := readyState("leak")
+		leak.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+		b.Status.Mounts = []v1alpha1.MountStatus{{
+			State: "leak", Path: "/blocker/x", Writable: true, Phase: v1alpha1.MountFailed, Message: "rejected",
+		}}
+		a := newApp(b, readyState(b.Spec.State), leak)
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		a.removeUnusedCreatedStates(ctx, b.Spec.State, "leak", "/blocker/x", []*v1alpha1.BlipState{leak})
+		var st v1alpha1.BlipState
+		if err := a.c.Kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "leak"}, &st); err != nil {
+			t.Fatalf("state still referenced by the writer was deleted: %v", err)
+		}
+	})
+	t.Run("unused state is removed", func(t *testing.T) {
+		b := runningBlip("agent")
+		leak := readyState("leak")
+		a := newApp(b, readyState(b.Spec.State), leak)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		a.removeUnusedCreatedStates(ctx, b.Spec.State, "leak", "/blocker/x", []*v1alpha1.BlipState{leak})
+		var st v1alpha1.BlipState
+		err := a.c.Kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "leak"}, &st)
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("unused created state was not removed: %v", err)
+		}
+	})
+}
+
 // TestMountNewMountFailureLeavesState ports create's attach-failure coverage:
 // the created state keeps its first commit even when mounting it fails.
 func TestMountNewMountFailureLeavesState(t *testing.T) {
