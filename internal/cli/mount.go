@@ -1217,6 +1217,13 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		if err != nil {
 			return err
 		}
+		// Repeating --rm for the same state must not unmount twice: the
+		// second removal would run after the first succeeded and report the
+		// state as not mounted. Resolve and de-duplicate before preflight,
+		// while still rejecting a genuinely unmounted state.
+		if removed[state] {
+			continue
+		}
 		removed[state] = true
 		removeOrder = append(removeOrder, state)
 	}
@@ -1233,8 +1240,8 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	}
 	// Removals run first so the final topology validated above is the one
 	// the adds are applied to.
-	for _, state := range f.remove {
-		if err := a.unmountArg(ctx, state, f.root); err != nil {
+	for _, state := range removeOrder {
+		if err := a.unmountState(ctx, state, f.root); err != nil {
 			return err
 		}
 	}
@@ -1621,18 +1628,4 @@ func (a *app) removalState(ctx context.Context, arg string, s *v1alpha1.BlipStat
 		}
 	}
 	return state, nil
-}
-
-// unmountArg removes a mount, accepting an owner-local name or the qualified
-// name that is actually in the root's spec.
-func (a *app) unmountArg(ctx context.Context, arg, root string) error {
-	s, err := a.getState(ctx, root)
-	if err != nil {
-		return err
-	}
-	state, err := a.removalState(ctx, arg, s)
-	if err != nil {
-		return err
-	}
-	return a.unmountState(ctx, state, root)
 }

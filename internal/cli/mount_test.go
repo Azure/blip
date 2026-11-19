@@ -2285,6 +2285,51 @@ func TestMountRemoveThenRejectedAddRestoresMount(t *testing.T) {
 	}
 }
 
+// TestMountRemoveDuplicatesUnmountsOnce reproduces repeated --rm entries for
+// one state. Preflight accepted both, then the first removal succeeded and the
+// second failed with "is not mounted", so the command exited 1 after mutating
+// the root. Identical removals are de-duplicated; a genuinely unmounted state
+// is still rejected before anything changes.
+func TestMountRemoveDuplicatesUnmountsOnce(t *testing.T) {
+	t.Run("offline", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+		h := newHarness(t, root, readyState("data"))
+		code, _, errOut := h.run("", "mount", "--rm", "data", "--rm", "data", "--root", "home")
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("duplicate removal left desired intent: %+v", mounts)
+		}
+	})
+
+	t.Run("running", func(t *testing.T) {
+		b := runningBlip("agent", v1alpha1.Mount{State: "data", Path: "/data", Writable: true})
+		h := newHarness(t, b, readyState("data"))
+		code, _, errOut := h.run("", "mount", "--rm", "data", "--rm", "data", "--root", b.Spec.State)
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state(b.Spec.State).Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("duplicate removal left desired intent: %+v", mounts)
+		}
+	})
+
+	t.Run("unmounted still rejected", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+		h := newHarness(t, root, readyState("data"))
+		code, _, errOut := h.run("", "mount", "--rm", "data", "--rm", "data", "--rm", "ghost", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `state "ghost" is not mounted`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].State != "data" {
+			t.Fatalf("rejected removal mutated the root: %+v", mounts)
+		}
+	})
+}
+
 // TestMountRemoveUnmountedRejectsWholeCommand covers --rm naming a state that
 // is not mounted after an earlier --rm named one that is. The command must be
 // rejected before the first removal is applied, leaving the root untouched.
