@@ -190,6 +190,22 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 	return a.mountStatePlanned(ctx, state, root, mountPath, target, false)
 }
 
+// collectPath reports whether p is at or below collect's reserved mount root.
+func collectPath(p string) bool {
+	return p == collectMountRoot || strings.HasPrefix(p, collectMountRoot+"/")
+}
+
+// collectAdoption reports whether s still holds the temporary collect mount of
+// state at mountPath. Adopting that entry as a durable mount is the only edit
+// permitted below the reserved collect root.
+func collectAdoption(s *v1alpha1.BlipState, state, mountPath string) bool {
+	if !collectPath(mountPath) {
+		return false
+	}
+	m := findSpecMount(s.Spec.Mounts, state)
+	return m != nil && m.Path == mountPath && m.BlipUID != ""
+}
+
 // mountStatePlanned mounts state, optionally moving an existing mount to a new
 // path when the same invocation also removes mounts. The move is validated
 // against the final topology by validateMountPlan before this edit.
@@ -198,7 +214,13 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 		return fmt.Errorf("invalid path %q: must be a clean absolute path other than /", mountPath)
 	}
 	if err := mountpath.Validate(mountPath); err != nil {
-		return err
+		// Adopting a temporary collect mount edits its existing entry rather
+		// than adding a user mount below the reserved collect root. The final
+		// state is checked in the edit below, where the temporary entry is
+		// visible.
+		if !collectPath(mountPath) {
+			return err
+		}
 	}
 	if state == root {
 		return errors.New("a root state cannot mount itself")
@@ -230,6 +252,9 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 		}
 		want, demoting, added = false, false, false
 		oldAttachment = ""
+		if err := mountpath.Validate(mountPath); err != nil && !collectAdoption(s, state, mountPath) {
+			return "", err
+		}
 		m := findSpecMount(s.Spec.Mounts, state)
 		if m != nil {
 			if m.Path != mountPath {
@@ -318,7 +343,11 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 			if rerr := a.rollbackAddedMount(ctx, root, state, mountPath, want); rerr != nil {
 				fmt.Fprintf(a.env.Err, "warning: could not remove desired mount of state %s from root state %s: %v\n", a.short(state), a.short(root), rerr)
 			} else {
-				err = fmt.Errorf("%w; the desired mount was removed from root state %q", err, a.short(root))
+				// The wait error says the desired mount remains applied.
+				// It does not any more, so replace that claim instead of
+				// appending a contradiction.
+				msg := strings.TrimSuffix(err.Error(), "; desired mount remains applied")
+				err = fmt.Errorf("%s; the desired mount was removed from root state %q", msg, a.short(root))
 			}
 		}
 		return err
@@ -407,9 +436,9 @@ type mountStateGoneError struct{ msg string }
 func (e *mountStateGoneError) Error() string { return e.msg }
 
 // mountRejectedError marks a mount the guest refused to create, usually
-// because an ancestor of the mount point is a symlink or a regular file.
-// Retrying cannot help, so mountState rolls back the desired mount it added
-// instead of leaving a root that can never start.
+// because an ancestor of the mount point is a symlink to a file or a regular
+// file. Retrying cannot help, so mountState rolls back the desired mount it
+// added instead of leaving a root that can never start.
 type mountRejectedError struct{ msg string }
 
 func (e *mountRejectedError) Error() string { return e.msg }

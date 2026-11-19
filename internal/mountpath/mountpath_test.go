@@ -16,54 +16,61 @@ func TestValidate(t *testing.T) {
 		{"/dev/x", false},
 		{"/run/blip", false},
 		{"/run/blip/x", false},
-		{"/lib64", false},
-		{"/lib64/x", false},
-		{"/bin/x", false},
-		{"/var/run/x", false},
-		{"/var/spool/mail", false},
-		{"/var/spool/mail/x", false},
-		{"/usr/local/man", false},
-		{"/usr/local/man/x", false},
-		{"/usr/lib/ssl/certs", false},
-		{"/usr/lib/ssl/certs/x", false},
-		{"/usr/lib/ssl/private/x", false},
-		{"/usr/share/perl/5.38/x", false},
-		// Package-specific directory symlinks shipped in the dev/base image.
-		// They are not usr-merge aliases, but the guest still refuses a mount
-		// point below them.
-		{"/usr/share/doc/gcc", false},
-		{"/usr/share/doc/gcc/x", false},
-		{"/usr/share/doc/libatomic1/y", false},
-		{"/usr/share/doc/git/contrib/hooks/z", false},
-		{"/usr/lib/x86_64-linux-gnu/perl/5.38/x", false},
-		{"/usr/lib/aarch64-linux-gnu/perl/5.38/x", false},
+		{"/run/blip-collect", false},
+		{"/run/blip-collect/x", false},
 		// Permanent guest-managed files: they are bind-mounted over the
 		// root before any user mount and are not directories.
 		{"/etc/hosts", false},
 		{"/etc/hosts/x", false},
 		{"/etc/resolv.conf", false},
 		{"/etc/resolv.conf/x", false},
-		// Regular files shipped by the base image are not directories
+		// Non-directories shipped by the base image are not mount points
 		// either; an offline mount below them must be rejected.
 		{"/etc/passwd", false},
 		{"/etc/passwd/x", false},
 		{"/etc/group/x", false},
 		{"/etc/mtab", false},
+		{"/etc/mtab/x", false},
+		{"/etc/os-release/x", false},
+		{"/etc/hostname", false},
 		{"/run/data", true},
+		{"/run/blip-collector", true},
 		{"/procdata", true},
 		{"/lib64x", true},
 		{"/data", true},
 		{"/data/sub", true},
-		// Real directories and prefix-sharing paths the guest accepts must
-		// stay legal; only exact base-image symlinks are rejected.
+		// Directory symlinks in the base image are legal mount points: the
+		// guest resolves them inside the root, as Linux mount does. This
+		// includes usr-merge aliases and image-specific package aliases
+		// such as the dev image's /usr/share/doc/gcc-13.
+		{"/lib64", true},
+		{"/lib64/x", true},
+		{"/bin/x", true},
+		{"/var/run/x", true},
+		{"/var/spool/mail", true},
+		{"/var/spool/mail/x", true},
+		{"/usr/local/man", true},
+		{"/usr/local/man/x", true},
+		{"/usr/lib/ssl/certs", true},
+		{"/usr/lib/ssl/certs/x", true},
+		{"/usr/lib/ssl/private/x", true},
+		{"/usr/share/perl/5.38/x", true},
+		{"/usr/share/doc/gcc", true},
+		{"/usr/share/doc/gcc/x", true},
+		{"/usr/share/doc/libatomic1/y", true},
+		{"/usr/share/doc/git/contrib/hooks/z", true},
+		{"/usr/share/doc/gcc-13/probe", true},
+		{"/usr/lib/x86_64-linux-gnu/perl/5.38/x", true},
+		{"/usr/lib/aarch64-linux-gnu/perl/5.38/x", true},
+		// Real directories and prefix-sharing paths stay legal too.
 		{"/var/mail", true},
 		{"/var/spool/maillog", true},
 		{"/usr/local/manual", true},
 		{"/usr/lib/ssl", true},
 		{"/usr/share/perl/5.40", true},
 		{"/usr/share/doc/example", true},
-		// Ancestors of a symlink are real directories the guest can create
-		// or mount over; only the symlink itself and its descendants fail.
+		// Ancestors of an image symlink are real directories the guest can
+		// create or mount over; they stay legal.
 		{"/var/spool", true},
 		{"/usr/local", true},
 		{"/usr/share/perl", true},
@@ -133,6 +140,23 @@ func TestOverlap(t *testing.T) {
 	} {
 		if got := Overlap(tc.a, tc.b); got != tc.want {
 			t.Errorf("Overlap(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestCollectMountPath(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{CollectRoot, false},
+		{CollectRoot + "/data", true},
+		{CollectRoot + "/data/sub", false},
+		{CollectRoot + "x/data", false},
+		{"/data", false},
+	} {
+		if got := CollectMountPath(tc.path); got != tc.want {
+			t.Errorf("CollectMountPath(%q) = %v, want %v", tc.path, got, tc.want)
 		}
 	}
 }

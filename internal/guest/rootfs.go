@@ -36,7 +36,7 @@ func checkMountPath(p string, existing []string) error {
 		}
 	}
 	for _, e := range mountpath.Reserved {
-		if overlaps(p, e) {
+		if overlaps(p, e) && !mountpath.CollectMountPath(p) {
 			return fmt.Errorf("mount path %s overlaps %s", p, e)
 		}
 	}
@@ -45,6 +45,49 @@ func checkMountPath(p string, existing []string) error {
 
 func overlaps(a, b string) bool {
 	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+// mountPointInRoot creates the directory a user mount will attach to and
+// returns an O_PATH descriptor for it with the directory's resolved path.
+// Unlike the guest's own directories, user mount points follow symlinks inside
+// the root as Linux mount does, so image aliases such as
+// /usr/share/doc/gcc-13 work. Symlinks to files, escapes, and reserved targets
+// are still rejected.
+func mountPointInRoot(root, p string) (int, string, error) {
+	fd, err := mkdirInRoot(root, p, true)
+	if err != nil {
+		return -1, "", err
+	}
+	if err := validateMountTarget(root, p); err != nil {
+		unix.Close(fd)
+		return -1, "", err
+	}
+	target, err := fdPath(fd)
+	if err != nil {
+		unix.Close(fd)
+		return -1, "", err
+	}
+	return fd, target, nil
+}
+
+// validateMountTarget reports why the directory p resolves to inside root
+// cannot receive a user mount. Symlinks are allowed when their target is a
+// directory inside the root, as Linux mount itself follows them, but the
+// resolved directory must not be the root or one the guest reserves.
+func validateMountTarget(root, p string) error {
+	resolved, err := resolveInRoot(root, p)
+	if err != nil {
+		return fmt.Errorf("resolve mount path %s: %w", p, err)
+	}
+	if resolved == "/" {
+		return fmt.Errorf("mount path %s resolves to /", p)
+	}
+	for _, r := range mountpath.Reserved {
+		if overlaps(resolved, r) && !mountpath.CollectMountPath(resolved) {
+			return fmt.Errorf("mount path %s resolves to %s, which the guest reserves", p, resolved)
+		}
+	}
+	return nil
 }
 
 func openat2(dirfd int, path string, flags uint64, mode uint64, resolve uint64) (int, error) {
@@ -59,14 +102,15 @@ func openat2(dirfd int, path string, flags uint64, mode uint64, resolve uint64) 
 
 // mkdirInRoot creates directory p (absolute, inside root) and its parents and
 // returns an O_PATH descriptor for it. With follow, symlinks are resolved as
-// if root were "/"; without, any symlink component is an error.
+// if root were "/"; without, any symlink component is an error. Magic links
+// are never followed, so a symlink inside the root cannot escape it.
 func mkdirInRoot(root, p string, follow bool) (int, error) {
 	rootfd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, err
 	}
 	defer unix.Close(rootfd)
-	resolve := uint64(unix.RESOLVE_IN_ROOT)
+	resolve := uint64(unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS)
 	if !follow {
 		resolve = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS
 	}

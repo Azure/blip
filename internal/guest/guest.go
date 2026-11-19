@@ -757,15 +757,11 @@ func (g *Guest) doMount(m wire.Mount) error {
 	if err != nil {
 		return err
 	}
-	fd, err := mkdirInRoot(g.root, p, false)
+	fd, target, err := mountPointInRoot(g.root, p)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(fd)
-	target, err := fdPath(fd)
-	if err != nil {
-		return err
-	}
 	var flags uintptr
 	data := ""
 	if m.ReadOnly {

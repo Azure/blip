@@ -12,11 +12,12 @@ import (
 	"syscall"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/mountpath"
 )
 
 // collectMountRoot is where collect mounts a worker's state in the calling
 // blip.
-var collectMountRoot = "/run/blip-collect"
+var collectMountRoot = mountpath.CollectRoot
 
 // collectSelfRoot is the calling blip's own root filesystem. A state that is
 // the caller's root is already in use by the caller, so it cannot be mounted;

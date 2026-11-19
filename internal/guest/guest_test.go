@@ -335,20 +335,26 @@ func TestWaitDeliveredNoClient(t *testing.T) {
 func TestCheckMountPath(t *testing.T) {
 	existing := []string{"/data"}
 	for p, ok := range map[string]bool{
-		"/work":                                 true,
-		"/mnt/a/b":                              true,
-		"/datax":                                true,
-		"/":                                     false,
-		"relative":                              false,
-		"/a/../b":                               false,
-		"/data":                                 false,
-		"/data/sub":                             false,
-		"/proc/x":                               false,
-		"/dev":                                  false,
-		"/run":                                  false,
-		"/run/blip":                             false,
-		"/run/blip/metadata":                    false,
+		"/work":              true,
+		"/mnt/a/b":           true,
+		"/datax":             true,
+		"/":                  false,
+		"relative":           false,
+		"/a/../b":            false,
+		"/data":              false,
+		"/data/sub":          false,
+		"/proc/x":            false,
+		"/dev":               false,
+		"/run":               false,
+		"/run/blip":          false,
+		"/run/blip/metadata": false,
+		"/run/blip-collect":  false,
+		// Collect's own generated mounts below its reserved root are
+		// accepted; deeper or user paths are not.
+		"/run/blip-collect/data":                true,
+		"/run/blip-collect/data/x":              false,
 		"/run/work":                             true,
+		"/run/blip-collector":                   true,
 		"/" + strings.Repeat("a", 300):          false,
 		"/" + strings.Repeat("a", 260):          false,
 		"/" + strings.Repeat("a", 255):          true,
@@ -379,9 +385,14 @@ func TestMkdirInRoot(t *testing.T) {
 	must(os.MkdirAll(filepath.Join(root, "run"), 0o755))
 	must(os.MkdirAll(filepath.Join(root, "var"), 0o755))
 	must(os.MkdirAll(filepath.Join(root, "var/spool"), 0o755))
-	must(os.MkdirAll(filepath.Join(root, "mail"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "var/mail"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "proc"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "etc"), 0o755))
+	must(os.WriteFile(filepath.Join(root, "etc/hosts"), []byte("127.0.0.1 localhost\n"), 0o644))
 	must(os.Symlink("/run", filepath.Join(root, "var/run")))
 	must(os.Symlink("../mail", filepath.Join(root, "var/spool/mail")))
+	must(os.Symlink("/etc/hosts", filepath.Join(root, "hosts-link")))
+	must(os.Symlink("/proc", filepath.Join(root, "proc-link")))
 	must(os.Symlink(outside, filepath.Join(root, "escape")))
 
 	fd, err := mkdirInRoot(root, "/a/b/c", false)
@@ -391,11 +402,11 @@ func TestMkdirInRoot(t *testing.T) {
 	if p != filepath.Join(root, "a/b/c") {
 		t.Fatalf("created %s", p)
 	}
+	// Guest-owned directories are still created without following symlinks;
+	// only user mount points use Linux mount semantics below.
 	if _, err := mkdirInRoot(root, "/var/run/x", false); err == nil {
 		t.Fatalf("symlink component accepted without follow")
 	}
-	// The standard base image's /var/spool/mail -> ../mail is the same
-	// class of directory symlink, so the guest rejects a mount below it.
 	if _, err := mkdirInRoot(root, "/var/spool/mail/x", false); err == nil ||
 		!strings.Contains(err.Error(), "/var/spool/mail is a symlink or not a directory") {
 		t.Fatalf("mail spool symlink: %v", err)
@@ -410,6 +421,29 @@ func TestMkdirInRoot(t *testing.T) {
 	if p != filepath.Join(root, "run/secrets/sa") {
 		t.Fatalf("followed symlink to %s", p)
 	}
+	// A user mount point may follow a directory symlink inside the root, as
+	// Linux mount does for /usr/share/doc/gcc-13 and /var/spool/mail.
+	fd, err = mkdirInRoot(root, "/var/spool/mail/x", true)
+	must(err)
+	p, _ = fdPath(fd)
+	syscall.Close(fd)
+	if p != filepath.Join(root, "var/mail/x") {
+		t.Fatalf("followed mail spool symlink to %s", p)
+	}
+	if err := validateMountTarget(root, "/var/spool/mail/x"); err != nil {
+		t.Fatalf("directory symlink target rejected: %v", err)
+	}
+	// A symlink to a regular file is still not a mount point.
+	if _, err := mkdirInRoot(root, "/hosts-link", true); err == nil ||
+		!strings.Contains(err.Error(), "/hosts-link is a symlink or not a directory") {
+		t.Fatalf("file symlink: %v", err)
+	}
+	// A symlink that resolves to a guest-reserved directory is rejected even
+	// though its written path looks ordinary.
+	if err := validateMountTarget(root, "/proc-link"); err == nil ||
+		!strings.Contains(err.Error(), "reserves") {
+		t.Fatalf("reserved symlink target: %v", err)
+	}
 	// The absolute symlink resolves inside the root, where its target does
 	// not exist: either an error or a directory inside the root is fine.
 	if fd, err = mkdirInRoot(root, "/escape/y", true); err == nil {
@@ -417,6 +451,63 @@ func TestMkdirInRoot(t *testing.T) {
 		syscall.Close(fd)
 		if !strings.HasPrefix(p, root+"/") {
 			t.Fatalf("absolute symlink escaped the root: %s", p)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(outside, "y")); err == nil {
+		t.Fatalf("directory created outside the root")
+	}
+}
+
+func TestMountPointInRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.MkdirAll(filepath.Join(root, "usr/share/doc/gcc-13-x86-64-linux-gnu"), 0o755))
+	must(os.Symlink("gcc-13-x86-64-linux-gnu", filepath.Join(root, "usr/share/doc/gcc-13")))
+	must(os.MkdirAll(filepath.Join(root, "etc"), 0o755))
+	must(os.WriteFile(filepath.Join(root, "etc/hosts"), []byte("127.0.0.1 localhost\n"), 0o644))
+	must(os.Symlink("hosts", filepath.Join(root, "etc/hosts-link")))
+	must(os.MkdirAll(filepath.Join(root, "run/blip"), 0o755))
+	must(os.Symlink("/run/blip", filepath.Join(root, "reserved-link")))
+	must(os.MkdirAll(filepath.Join(root, "run/blip-collect"), 0o755))
+	must(os.Symlink(outside, filepath.Join(root, "escape")))
+
+	// The dev image's package documentation alias resolves to a directory
+	// inside the root, so the mount point is created in the real directory.
+	fd, target, err := mountPointInRoot(root, "/usr/share/doc/gcc-13/probe")
+	must(err)
+	syscall.Close(fd)
+	if target != filepath.Join(root, "usr/share/doc/gcc-13-x86-64-linux-gnu/probe") {
+		t.Fatalf("mount point resolved to %s", target)
+	}
+	// Collect's generated mounts are allowed below its reserved root.
+	fd, target, err = mountPointInRoot(root, "/run/blip-collect/data")
+	must(err)
+	syscall.Close(fd)
+	if target != filepath.Join(root, "run/blip-collect/data") {
+		t.Fatalf("collect mount point resolved to %s", target)
+	}
+	// A symlink to a regular file is not a directory.
+	if _, _, err := mountPointInRoot(root, "/etc/hosts-link/x"); err == nil ||
+		!strings.Contains(err.Error(), "is a symlink or not a directory") {
+		t.Fatalf("file symlink mount point: %v", err)
+	}
+	// A symlink that resolves to a guest-reserved directory is rejected.
+	if _, _, err := mountPointInRoot(root, "/reserved-link/x"); err == nil ||
+		!strings.Contains(err.Error(), "reserves") {
+		t.Fatalf("reserved symlink mount point: %v", err)
+	}
+	// An absolute symlink resolves inside the root and never creates the
+	// directory outside it.
+	if fd, target, err = mountPointInRoot(root, "/escape/y"); err == nil {
+		syscall.Close(fd)
+		if !strings.HasPrefix(target, root+"/") {
+			t.Fatalf("absolute symlink escaped the root: %s", target)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(outside, "y")); err == nil {

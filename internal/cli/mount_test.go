@@ -1492,10 +1492,11 @@ func TestMountPathsMayContainColons(t *testing.T) {
 
 // TestMountRejectsGuestReservedAndSymlinkPaths reproduces a mount the CLI
 // accepts offline but the guest cannot create: the path is reserved for the
-// guest itself or lies below a symlink in the image. The mount must be
-// rejected before desired intent is written, or the root cannot start again.
+// guest itself, lies below a regular file, or is not a directory. The mount
+// must be rejected before desired intent is written, or the root cannot start
+// again.
 func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
-	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/lib64/w2", "/bin/w2", "/var/run/w2", "/var/spool/mail", "/var/spool/mail/w2", "/usr/local/man/w2", "/usr/lib/ssl/certs/w2", "/usr/share/perl/5.38/w2"} {
+	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/run/blip-collect/w2", "/etc/mtab/x"} {
 		t.Run(path, func(t *testing.T) {
 			h := newHarness(t, readyState("home"), readyState("data"))
 			code, _, errOut := h.run("", "mount", "data:"+path, "--root", "home")
@@ -1577,71 +1578,20 @@ func TestMountRejectsOverlongPaths(t *testing.T) {
 	}
 }
 
-// TestMountRejectsMailSpoolSymlink reproduces the base image's
-// /var/spool/mail -> ../mail directory symlink. Both a running root and an
-// offline root must reject the path at preflight, before creating a state or
-// writing desired intent. Otherwise the next execution fails while creating
-// the mount point in the guest, and the root never starts again.
-func TestMountRejectsMailSpoolSymlink(t *testing.T) {
-	const guestErr = "/var/spool/mail is a symlink or not a directory"
-	for _, live := range []bool{false, true} {
-		name := "offline"
-		if live {
-			name = "live"
-		}
-		t.Run(name, func(t *testing.T) {
-			var root *v1alpha1.BlipState
-			objs := []client.Object{readyState("data")}
-			if live {
-				b := runningBlip("agent")
-				root = readyState(b.Spec.State)
-				objs = append(objs, b, root)
-			} else {
-				root = readyState("home")
-				objs = append(objs, root)
-			}
-			h := newHarness(t, objs...)
-			if live {
-				// Model the guest's dynamic rejection: without a
-				// preflight the mount becomes durable intent and the
-				// root fails on every later execution.
-				h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
-			}
-			for _, path := range []string{"/var/spool/mail", "/var/spool/mail/w3"} {
-				code, _, errOut := h.run("", "mount", "data:"+path, "--root", root.Name)
-				if code != 1 || !strings.Contains(errOut, "symlink in the image") {
-					t.Fatalf("mount %s: code %d: %s", path, code, errOut)
-				}
-				if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
-					t.Fatalf("mount %s left desired intent: %+v", path, mounts)
-				}
-			}
-			// --new must reject before creating the state it would mount.
-			code, _, errOut := h.run("", "mount", "--new", "spool:/var/spool/mail/w3", "--root", root.Name)
-			if code != 1 || !strings.Contains(errOut, "symlink in the image") {
-				t.Fatalf("--new code %d: %s", code, errOut)
-			}
-			if !stateNotFound(t, h, "spool") {
-				t.Fatal("rejected --new left state spool behind")
-			}
-			if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
-				t.Fatalf("rejected --new left desired intent: %+v", mounts)
-			}
-		})
-	}
-}
-
-// TestMountRejectsBaseImageDirectorySymlinks reproduces paths that are
-// directory symlinks in the shipped dev/base image but are not usr-merge
-// aliases: /usr/share/doc/gcc, /usr/share/doc/libatomic1,
-// /usr/share/doc/git/contrib/hooks and the versioned perl tree under
-// /usr/lib/<triplet>. The guest cannot create a mount point below them, so an
-// offline mount must not create a state or write intent that poisons the root.
-func TestMountRejectsBaseImageDirectorySymlinks(t *testing.T) {
+// TestMountAcceptsBaseImageDirectorySymlinks reproduces the dev/base image's
+// directory symlinks: usr-merge aliases and per-package /usr/share/doc
+// entries. The guest resolves them inside the root, as Linux mount does, so
+// both a running and a stopped root must accept these paths instead of
+// writing intent that fails the next execution.
+func TestMountAcceptsBaseImageDirectorySymlinks(t *testing.T) {
 	for _, path := range []string{
+		"/bin/w3",
+		"/var/spool/mail",
+		"/var/spool/mail/w3",
 		"/usr/share/doc/gcc/x",
 		"/usr/share/doc/libatomic1/x",
 		"/usr/share/doc/git/contrib/hooks/x",
+		"/usr/share/doc/gcc-13/probe",
 		"/usr/lib/x86_64-linux-gnu/perl/5.38/x",
 	} {
 		t.Run(path, func(t *testing.T) {
@@ -1661,25 +1611,33 @@ func TestMountRejectsBaseImageDirectorySymlinks(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					h := newHarness(t, objs...)
 					code, _, errOut := h.run("", "mount", "data:"+path, "--root", root.Name)
-					if code != 1 || !strings.Contains(errOut, "symlink in the image") {
+					if code != 0 {
 						t.Fatalf("mount %s: code %d: %s", path, code, errOut)
 					}
-					if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
-						t.Fatalf("mount %s left desired intent: %+v", path, mounts)
-					}
-					code, _, errOut = h.run("", "mount", "--new", "leak:"+path, "--root", root.Name)
-					if code != 1 || !strings.Contains(errOut, "symlink in the image") {
-						t.Fatalf("--new %s: code %d: %s", path, code, errOut)
-					}
-					if !stateNotFound(t, h, "leak") {
-						t.Fatalf("rejected --new %s left its state behind", path)
-					}
-					if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
-						t.Fatalf("rejected --new %s left desired intent: %+v", path, mounts)
+					mounts := h.state(root.Name).Spec.Mounts
+					if len(mounts) != 1 || mounts[0].Path != path {
+						t.Fatalf("mount %s not written as desired intent: %+v", path, mounts)
 					}
 				})
 			}
 		})
+	}
+}
+
+// TestMountAcceptsNewBelowBaseImageDirectorySymlink covers the offline --new
+// path that previously leaked a committed state and durable intent: a mount
+// below /usr/share/doc/gcc-13 is valid because the guest resolves the symlink
+// to its directory target inside the root.
+func TestMountAcceptsNewBelowBaseImageDirectorySymlink(t *testing.T) {
+	h := newHarness(t, readyState("home"))
+	code, _, errOut := h.run("", "mount", "--new", "doc:/usr/share/doc/gcc-13/probe", "--root", "home")
+	if code != 0 {
+		t.Fatalf("--new code %d: %s", code, errOut)
+	}
+	h.state("doc")
+	mounts := h.state("home").Spec.Mounts
+	if len(mounts) != 1 || mounts[0].State != "doc" || mounts[0].Path != "/usr/share/doc/gcc-13/probe" {
+		t.Fatalf("accepted --new did not write desired intent: %+v", mounts)
 	}
 }
 
@@ -1759,6 +1717,9 @@ func TestMountGuestRejectedPathRollsBack(t *testing.T) {
 				if code != 1 || !strings.Contains(errOut, guestErr) || !strings.Contains(errOut, "desired mount was removed") {
 					t.Fatalf("--new code %d: %s", code, errOut)
 				}
+				if strings.Contains(errOut, "remains applied") {
+					t.Fatalf("--new rollback message contradicts itself: %s", errOut)
+				}
 				if !stateNotFound(t, h, "leak") {
 					t.Fatal("rejected --new left state leak behind")
 				}
@@ -1766,6 +1727,9 @@ func TestMountGuestRejectedPathRollsBack(t *testing.T) {
 				code, _, errOut := h.run("", "mount", "data:/usr/bin/env/x", "--root", root.Name)
 				if code != 1 || !strings.Contains(errOut, guestErr) || !strings.Contains(errOut, "desired mount was removed") {
 					t.Fatalf("mount code %d: %s", code, errOut)
+				}
+				if strings.Contains(errOut, "remains applied") {
+					t.Fatalf("rollback message contradicts itself: %s", errOut)
 				}
 			}
 			mounts := h.state(root.Name).Spec.Mounts
