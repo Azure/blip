@@ -142,7 +142,15 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	historyRunes := 0
 	for _, h := range req.History {
-		historyRunes += utf8.RuneCountInString(h.Content)
+		n := utf8.RuneCountInString(h.Content)
+		// Reject an oversized entry instead of cutting it down later: a
+		// client should not be told its transcript is valid and then have
+		// most of an entry silently dropped before the model sees it.
+		if n > maxMessageRunes {
+			http.Error(w, fmt.Sprintf("history message is too long: %d characters, limit %d", n, maxMessageRunes), http.StatusBadRequest)
+			return
+		}
+		historyRunes += n
 	}
 	if historyRunes > maxHistoryRunes {
 		http.Error(w, fmt.Sprintf("history is too long: %d characters, limit %d", historyRunes, maxHistoryRunes), http.StatusBadRequest)
@@ -260,7 +268,7 @@ func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
 		if h.Role != "user" && h.Role != "assistant" {
 			continue
 		}
-		messages = append(messages, Message{Role: h.Role, Content: truncateRunes(h.Content, 8000)})
+		messages = append(messages, Message{Role: h.Role, Content: h.Content})
 	}
 	messages = append(messages, Message{Role: "user", Content: req.Message})
 	tools := []Tool{
