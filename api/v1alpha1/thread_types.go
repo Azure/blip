@@ -125,7 +125,7 @@ type ThreadTask struct {
 	// Attributes are coordinator-owned conventions such as state, after, or
 	// pr. The engine never interprets them.
 	// +kubebuilder:validation:MaxProperties=16
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() <= 63) && self.all(k, v, v.size() <= 256)",message="attribute keys are at most 63 and values at most 256 characters"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() <= 63 && self[k].size() <= 256)",message="attribute keys are at most 63 and values at most 256 characters"
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// +kubebuilder:validation:MaxLength=256
 	Note    string       `json:"note,omitempty"`
@@ -191,7 +191,7 @@ type BlipTurnSpec struct {
 	// Attributes carry structured fields from the producer. The coordinator
 	// reads them; the engine does not.
 	// +kubebuilder:validation:MaxProperties=16
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() <= 63) && self.all(k, v, v.size() <= 256)",message="attribute keys are at most 63 and values at most 256 characters"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() <= 63 && self[k].size() <= 256)",message="attribute keys are at most 63 and values at most 256 characters"
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Text is the bounded human-readable payload.
 	// +kubebuilder:validation:MaxLength=2048

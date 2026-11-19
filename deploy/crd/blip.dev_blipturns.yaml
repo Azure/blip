@@ -68,8 +68,7 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: attribute keys are at most 63 and values at most 256 characters
-                  rule: self.all(k, k.size() <= 63) && self.all(k, v, v.size() <=
-                    256)
+                  rule: self.all(k, k.size() <= 63 && self[k].size() <= 256)
               author:
                 description: TurnAuthor identifies who produced a turn.
                 properties:
