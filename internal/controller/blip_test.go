@@ -555,6 +555,8 @@ func TestBlipValidationAndWaiting(t *testing.T) {
 		{"NUL byte", "home", []v1.Mount{{State: "data", Path: "/a\x00b"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"reserved path", "home", []v1.Mount{{State: "data", Path: "/proc"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"image file", "home", []v1.Mount{{State: "data", Path: "/etc/passwd"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"below image file", "home", []v1.Mount{{State: "data", Path: "/etc/timezone/data"}}, v1.BlipFailed, ReasonInvalidSpec},
+		{"below usr-lib os-release", "home", []v1.Mount{{State: "data", Path: "/usr/lib/os-release/data"}}, v1.BlipFailed, ReasonInvalidSpec},
 		{"empty state", "", nil, v1.BlipFailed, ReasonInvalidSpec},
 		{"missing state", "nope", nil, v1.BlipPending, ReasonStateNotFound},
 		{"uncommitted state", "fresh", nil, v1.BlipPending, ReasonStateNotReady},

@@ -33,6 +33,17 @@ func TestValidate(t *testing.T) {
 		{"/etc/mtab/x", false},
 		{"/etc/os-release/x", false},
 		{"/etc/hostname", false},
+		// /etc/timezone, /etc/shells, and /usr/lib/os-release are regular
+		// files in the dev image; a mount below one poisons the root until
+		// it is removed.
+		{"/etc/timezone", false},
+		{"/etc/timezone/x", false},
+		{"/etc/shells", false},
+		{"/etc/shells/x", false},
+		{"/usr/lib/os-release", false},
+		{"/usr/lib/os-release/x", false},
+		// The usr-merge spelling reaches the same regular file.
+		{"/lib/os-release/x", false},
 		// /etc/ld.so.cache and the stable base-system files are regular
 		// files in the dev image, so nothing can be mounted at or below
 		// them offline.

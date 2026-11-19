@@ -99,8 +99,9 @@ var GuestFiles = []string{"/etc/hosts", "/etc/resolv.conf"}
 var ImageFiles = []string{
 	"/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow",
 	"/etc/hostname", "/etc/hostid", "/etc/machine-id",
-	"/etc/os-release", "/etc/debian_version", "/etc/nsswitch.conf",
-	"/etc/subuid", "/etc/subgid",
+	"/etc/os-release", "/usr/lib/os-release", "/etc/debian_version",
+	"/etc/nsswitch.conf", "/etc/subuid", "/etc/subgid",
+	"/etc/timezone", "/etc/shells",
 	// The dynamic loader's cache and configuration are regular files in the
 	// Ubuntu/Debian dev image, as are these stable base-system files. This
 	// stays a short list of files every image ships, not every package

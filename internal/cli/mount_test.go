@@ -1835,6 +1835,8 @@ func TestMountRejectsBaseImageFilesOffline(t *testing.T) {
 		"/etc/ld.so.conf/x", "/etc/bash.bashrc/x", "/etc/environment/x",
 		"/etc/profile/x", "/etc/inputrc/x", "/etc/login.defs/x",
 		"/etc/host.conf/x", "/etc/gai.conf/x",
+		"/etc/timezone/x", "/etc/shells/x", "/usr/lib/os-release/x",
+		"/lib/os-release/x",
 	} {
 		t.Run(path, func(t *testing.T) {
 			h := newHarness(t, readyState("home"), readyState("data"))
