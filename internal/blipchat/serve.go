@@ -46,12 +46,17 @@ const (
 	timerBudget = promptBudget / 8
 	// timerNotePromptBudget bounds one timer note in the prompt by bytes.
 	timerNotePromptBudget = 128
-	// maxTurnPromptBytes bounds one rendered turn line. At most one such line
-	// may be forced in over the turn budget to keep the newest turn visible.
-	maxTurnPromptBytes = 2048
-	// turnPromptReserve keeps room for that forced line and the omission
-	// notices the turn renderer may add around it.
-	turnPromptReserve = maxTurnPromptBytes + 1 + 256
+	// maxTurnPromptBytes bounds one rendered turn line. A legal turn text is
+	// at most 2048 code points, which is ~8192 bytes for four-byte runes, so
+	// the cap leaves room for a legal turn's framing instead of silently
+	// cutting a legal turn at 2048 bytes. At most one such line may be forced
+	// in over the turn budget to keep the newest turn visible.
+	maxTurnPromptBytes = 8192 + 1024
+	// turnPromptReserve keeps room for the omission notices the turn renderer
+	// may add around the newest line. A forced line is bounded separately by
+	// maxTurnPromptBytes, and the fixed sections (board, summary, timers) plus
+	// one such line still fit promptBudget.
+	turnPromptReserve = 2048 + 1 + 256
 	// stalledPromptBackoff delays a thread whose pending turns cannot be
 	// rendered within promptBudget at all. Without it the same unrenderable
 	// input would return to shouldStep every tick.
@@ -625,6 +630,7 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 const (
 	truncatedSummaryNotice = "(summary truncated to fit the prompt budget)\n"
 	truncatedTimerNotice   = "(timer notes truncated to fit the prompt budget)\n"
+	turnTruncatedNotice    = " [turn truncated]"
 	timerLineOverhead      = len("- 2006-01-02T15:04:05Z: \n")
 )
 
@@ -848,7 +854,11 @@ func boardTurns(b *strings.Builder, turns []v1.BlipTurn, budget int) int64 {
 	for i := range turns {
 		line := renderTurn(&turns[i])
 		if len(line) > maxTurnPromptBytes {
-			line = truncateBytes(line, maxTurnPromptBytes)
+			// A CRD-legal text is at most 2048 code points (~8 KiB as
+			// UTF-8), so this only triggers for a turn padded with other
+			// large fields. Say so instead of presenting a clipped quote as
+			// the whole turn.
+			line = truncateBytes(line, maxTurnPromptBytes-len(turnTruncatedNotice)) + turnTruncatedNotice
 		}
 		lines[i] = line + "\n"
 	}
@@ -934,18 +944,44 @@ func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, b
 			out[i] = lines[i]
 		}
 		if remaining := budget - prefix; remaining > 0 {
-			s, _ := suffixTurns(lines[keepEnd+1:], remaining)
+			s, _ := suffixTurnsWithin(lines[keepEnd+1:], remaining)
 			for i := s + keepEnd + 1; i < len(turns); i++ {
 				rendered[i] = true
 				out[i] = lines[i]
 			}
+		}
+	} else if len(lines[keepEnd]) > budget/2 {
+		// The wake turn line alone consumes most of the turn budget. Show the
+		// whole contiguous prefix through it as summaries so the short
+		// excerpts stay visible, then use whatever remains for newer turns.
+		notice := fmt.Sprintf("(%d turns summarized to fit the prompt budget)\n", keepEnd+1)
+		if summaries, ok := summarizeTurns(turns[:keepEnd+1], budget-len(notice)); ok {
+			out[0] = notice + summaries
+			for i := 0; i <= keepEnd; i++ {
+				rendered[i] = true
+			}
+			if remaining := budget - len(notice) - len(summaries); remaining > 0 {
+				s, _ := suffixTurnsWithin(lines[keepEnd+1:], remaining)
+				for i := s + keepEnd + 1; i < len(turns); i++ {
+					rendered[i] = true
+					out[i] = lines[i]
+				}
+			}
+		} else {
+			n, text := boundedTurnPrefix(turns, budget)
+			if n == 0 || !prefixHasWake(turns[:n]) {
+				return 0
+			}
+			b.WriteString(text)
+			return turns[n-1].Status.Seq
 		}
 	} else {
 		// The context before the wake turn is itself over budget. Show it as
 		// compact summaries so the contiguous prefix through the wake turn
 		// can be consumed without dropping its input; the wake turn itself
 		// stays in full and the newest suffix uses whatever room remains.
-		notice, summaries := "", ""
+		notice := ""
+		summaries := ""
 		ok := true
 		if keepEnd > 0 {
 			notice = fmt.Sprintf("(%d older turns summarized)\n", keepEnd)
@@ -962,7 +998,7 @@ func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, b
 			out[keepEnd] = lines[keepEnd]
 			remaining := budget - len(notice) - len(summaries) - len(lines[keepEnd])
 			if remaining > 0 {
-				s, _ := suffixTurns(lines[keepEnd+1:], remaining)
+				s, _ := suffixTurnsWithin(lines[keepEnd+1:], remaining)
 				for i := s + keepEnd + 1; i < len(turns); i++ {
 					rendered[i] = true
 					out[i] = lines[i]
@@ -1081,6 +1117,28 @@ func suffixTurns(lines []string, budget int) (int, int) {
 	}
 	if start == len(lines) && len(lines) > 0 {
 		start = len(lines) - 1
+	}
+	return start, used
+}
+
+// suffixTurnsWithin returns the index where the newest suffix of lines that
+// fits budget begins, along with the bytes it uses. Unlike suffixTurns it never
+// forces an over-budget line: callers use it when the prefix has already spent
+// the budget and an unaffordable newest line would overrun the prompt.
+func suffixTurnsWithin(lines []string, budget int) (int, int) {
+	start := len(lines)
+	used := 0
+	for start > 0 {
+		i := start - 1
+		notice := 0
+		if i > 0 {
+			notice = len(fmt.Sprintf("(%d older turns summarized)\n", i))
+		}
+		if used+len(lines[i])+notice > budget {
+			break
+		}
+		used += len(lines[i])
+		start = i
 	}
 	return start, used
 }
