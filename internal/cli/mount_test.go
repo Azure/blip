@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -287,6 +288,35 @@ func TestMountGoneStateWhileWaitingRollsBackAndRetries(t *testing.T) {
 				t.Fatalf("retry did not restore mount: %+v", s.Spec.Mounts)
 			}
 		})
+	}
+}
+
+// TestWaitMountDeletionCauseBeatsStopped covers a writable mount whose source
+// is deleted during the wait. The controller stops the writer with a
+// StateNotFound message before the CLI sees a stopped Blip, so the deletion
+// check must win over the generic "stopped" error; mountState then rolls back
+// only the intent this command added.
+func TestWaitMountDeletionCauseBeatsStopped(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	// The controller stops the writer and records why before the stopped
+	// Blip is visible to the CLI. The deletion cause must win over the
+	// generic stop error so waitMount returns a rollback-able error.
+	b.Spec.Stop = true
+	b.Status.Reason = "StateNotFound"
+	b.Status.Message = `mount state "data" is being deleted; stopping before the workspace is removed`
+	a := mountTestApp(t, b, root, readyState("data"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := a.waitMount(ctx, b, "data", "/data", true, 0, "")
+	if err == nil || !strings.Contains(err.Error(), "is being deleted") {
+		t.Fatalf("waitMount returned %v, want the deletion cause", err)
+	}
+	var gone *mountStateGoneError
+	if !errors.As(err, &gone) {
+		t.Fatalf("waitMount returned %T, want a rollback-able deletion error", err)
 	}
 }
 
@@ -985,6 +1015,95 @@ func TestMountNewReadOnly(t *testing.T) {
 	}
 }
 
+// TestMountRemoveFreesPathInSameCommand reproduces a combined move or
+// replacement that is legal after the requested removals: mounting a state
+// at the path freed by --rm must validate against the final topology instead
+// of rejecting the path that this same invocation is about to free.
+func TestMountRemoveFreesPathInSameCommand(t *testing.T) {
+	t.Run("move existing mount", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{
+			{State: "a", Path: "/a"},
+			{State: "b", Path: "/b"},
+		}
+		h := newHarness(t, root, readyState("a"), readyState("b"))
+		code, out, errOut := h.run("", "mount", "a:/b", "--rm", "b", "--root", "home")
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		mustContain(t, out, "state a mounted on root state home at /b")
+		mounts := h.state("home").Spec.Mounts
+		if len(mounts) != 1 || mounts[0].State != "a" || mounts[0].Path != "/b" {
+			t.Fatalf("final mounts %+v, want only a at /b", mounts)
+		}
+	})
+
+	t.Run("replace with new state", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "b", Path: "/b"}}
+		h := newHarness(t, root, readyState("a"), readyState("b"))
+		code, out, errOut := h.run("", "mount", "--new", "d:/b", "--rm", "b", "--root", "home")
+		if code != 0 {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		mustContain(t, out, "state d mounted on root state home at /b")
+		mounts := h.state("home").Spec.Mounts
+		if len(mounts) != 1 || mounts[0].State != "d" || mounts[0].Path != "/b" {
+			t.Fatalf("final mounts %+v, want only d at /b", mounts)
+		}
+		if s := h.state("d"); s.Status.Committed == nil {
+			t.Fatal("new state has no commit")
+		}
+	})
+}
+
+// TestMountRejectsTerminatingRoot reproduces a root state that is being
+// deleted: no mount can ever run there, so the command must reject before
+// writing intent or creating and committing a --new state.
+func TestMountRejectsTerminatingRoot(t *testing.T) {
+	newRoot := func() *v1alpha1.BlipState {
+		root := readyState("home")
+		now := metav1.Now()
+		root.Finalizers = []string{"test"}
+		root.DeletionTimestamp = &now
+		return root
+	}
+	t.Run("add", func(t *testing.T) {
+		h := newHarness(t, newRoot(), readyState("data"), readyState("base"))
+		for _, arg := range []string{"data:/data", "base:/y:ro"} {
+			code, _, errOut := h.run("", "mount", arg, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, `state "home" is being deleted`) {
+				t.Fatalf("mount %s: code %d: %s", arg, code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("mount %s left desired intent: %+v", arg, mounts)
+			}
+		}
+	})
+	t.Run("new", func(t *testing.T) {
+		h := newHarness(t, newRoot(), readyState("base"))
+		code, _, errOut := h.run("", "mount", "--new", "leak:/t4:rw", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `state "home" is being deleted`) {
+			t.Fatalf("--new code %d: %s", code, errOut)
+		}
+		if !stateNotFound(t, h, "leak") {
+			t.Fatal("terminating root left the new state behind")
+		}
+	})
+	t.Run("remove still allowed", func(t *testing.T) {
+		root := newRoot()
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+		h := newHarness(t, root, readyState("data"))
+		code, _, errOut := h.run("", "mount", "--rm", "data", "--root", "home")
+		if code != 0 {
+			t.Fatalf("--rm code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("--rm left desired intent: %+v", mounts)
+		}
+	})
+}
+
 func TestMountRejectsDuplicateMounts(t *testing.T) {
 	t.Run("duplicate state", func(t *testing.T) {
 		h := newHarness(t, readyState("home"), readyState("data"))
@@ -1507,6 +1626,151 @@ func TestMountRejectsMailSpoolSymlink(t *testing.T) {
 			}
 			if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
 				t.Fatalf("rejected --new left desired intent: %+v", mounts)
+			}
+		})
+	}
+}
+
+// TestMountRejectsBaseImageDirectorySymlinks reproduces paths that are
+// directory symlinks in the shipped dev/base image but are not usr-merge
+// aliases: /usr/share/doc/gcc, /usr/share/doc/libatomic1,
+// /usr/share/doc/git/contrib/hooks and the versioned perl tree under
+// /usr/lib/<triplet>. The guest cannot create a mount point below them, so an
+// offline mount must not create a state or write intent that poisons the root.
+func TestMountRejectsBaseImageDirectorySymlinks(t *testing.T) {
+	for _, path := range []string{
+		"/usr/share/doc/gcc/x",
+		"/usr/share/doc/libatomic1/x",
+		"/usr/share/doc/git/contrib/hooks/x",
+		"/usr/lib/x86_64-linux-gnu/perl/5.38/x",
+	} {
+		t.Run(path, func(t *testing.T) {
+			for _, live := range []bool{false, true} {
+				name := "offline"
+				var root *v1alpha1.BlipState
+				objs := []client.Object{readyState("data")}
+				if live {
+					name = "live"
+					b := runningBlip("agent")
+					root = readyState(b.Spec.State)
+					objs = append(objs, b, root)
+				} else {
+					root = readyState("home")
+					objs = append(objs, root)
+				}
+				t.Run(name, func(t *testing.T) {
+					h := newHarness(t, objs...)
+					code, _, errOut := h.run("", "mount", "data:"+path, "--root", root.Name)
+					if code != 1 || !strings.Contains(errOut, "symlink in the image") {
+						t.Fatalf("mount %s: code %d: %s", path, code, errOut)
+					}
+					if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+						t.Fatalf("mount %s left desired intent: %+v", path, mounts)
+					}
+					code, _, errOut = h.run("", "mount", "--new", "leak:"+path, "--root", root.Name)
+					if code != 1 || !strings.Contains(errOut, "symlink in the image") {
+						t.Fatalf("--new %s: code %d: %s", path, code, errOut)
+					}
+					if !stateNotFound(t, h, "leak") {
+						t.Fatalf("rejected --new %s left its state behind", path)
+					}
+					if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+						t.Fatalf("rejected --new %s left desired intent: %+v", path, mounts)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestMountRejectsBaseImageFilesOffline covers the offline half of a mount
+// below a regular base-image file (/etc/passwd/x): the guest reports "is a
+// symlink or not a directory" on the next execution, so the CLI must not
+// report success or create a --new state for it.
+func TestMountRejectsBaseImageFilesOffline(t *testing.T) {
+	for _, path := range []string{"/etc/passwd/x", "/etc/group/x"} {
+		t.Run(path, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", "mount", "data:"+path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "in the base image") {
+				t.Fatalf("mount %s: code %d: %s", path, code, errOut)
+			}
+			code, _, errOut = h.run("", "mount", "--new", "leak:"+path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "in the base image") {
+				t.Fatalf("--new %s: code %d: %s", path, code, errOut)
+			}
+			if !stateNotFound(t, h, "leak") {
+				t.Fatal("rejected --new left its state behind")
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected mount left desired intent: %+v", mounts)
+			}
+		})
+	}
+}
+
+// TestMountRejectsGuestManagedFiles reproduces mounting over /etc/hosts or
+// /etc/resolv.conf: the guest bind-mounts those regular files before user
+// mounts, so a filesystem mount point there can never attach. Preflight must
+// reject it before writing intent or creating a --new state.
+func TestMountRejectsGuestManagedFiles(t *testing.T) {
+	for _, path := range []string{"/etc/hosts", "/etc/resolv.conf", "/etc/hosts/x"} {
+		t.Run(path, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"), readyState("base"))
+			for _, arg := range []string{"data:" + path, "base:" + path + ":ro"} {
+				code, _, errOut := h.run("", "mount", arg, "--root", "home")
+				if code != 1 || !strings.Contains(errOut, "guest-managed file") {
+					t.Fatalf("mount %s: code %d: %s", arg, code, errOut)
+				}
+			}
+			code, _, errOut := h.run("", "mount", "--new", "leak:"+path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "guest-managed file") {
+				t.Fatalf("--new code %d: %s", code, errOut)
+			}
+			if !stateNotFound(t, h, "leak") {
+				t.Fatal("rejected --new left its state behind")
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected mount left desired intent: %+v", mounts)
+			}
+		})
+	}
+}
+
+// TestMountGuestRejectedPathRollsBack reproduces the guest refusing a mount
+// point the CLI could not preflight (a path below a regular file). A running
+// root must not keep the desired mount or, for --new, the state that was
+// created for a mount that can never attach.
+func TestMountGuestRejectedPathRollsBack(t *testing.T) {
+	const guestErr = "/usr/bin/env is a symlink or not a directory"
+	for _, created := range []bool{false, true} {
+		name := "existing state"
+		if created {
+			name = "new state"
+		}
+		t.Run(name, func(t *testing.T) {
+			b := runningBlip("agent")
+			root := readyState(b.Spec.State)
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "keep", Path: "/keep"}}
+			h := newHarness(t, b, root, readyState("keep"), readyState("data"))
+			h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
+			if created {
+				code, _, errOut := h.run("", "mount", "--new", "leak:/usr/bin/env/x", "--root", root.Name)
+				if code != 1 || !strings.Contains(errOut, guestErr) || !strings.Contains(errOut, "desired mount was removed") {
+					t.Fatalf("--new code %d: %s", code, errOut)
+				}
+				if !stateNotFound(t, h, "leak") {
+					t.Fatal("rejected --new left state leak behind")
+				}
+			} else {
+				code, _, errOut := h.run("", "mount", "data:/usr/bin/env/x", "--root", root.Name)
+				if code != 1 || !strings.Contains(errOut, guestErr) || !strings.Contains(errOut, "desired mount was removed") {
+					t.Fatalf("mount code %d: %s", code, errOut)
+				}
+			}
+			mounts := h.state(root.Name).Spec.Mounts
+			if len(mounts) != 1 || mounts[0].State != "keep" || mounts[0].Path != "/keep" {
+				t.Fatalf("rejected mount left desired intent: %+v", mounts)
 			}
 		})
 	}

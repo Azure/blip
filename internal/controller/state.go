@@ -40,6 +40,15 @@ const (
 	// repair replicates it once a usable node can read it. This keeps a drain
 	// from wedging the Blip and both finalizers forever.
 	drainSaveFallback = 5 * time.Minute
+	// replicaErrorFallback bounds how long a save waits for a replica that
+	// keeps reporting an error and does not hold the sealed commit. A
+	// node-local storage failure can make every fetch retry fail (for
+	// example an orphan device that answers create with "Device or resource
+	// busy"), and a healthy node is never replaced as a failed replica.
+	// After this bound the state commits with the nodes that hold the
+	// version; repair replicates it once the node can fetch again. This
+	// keeps a stuck save, its Blip, and both finalizers from waiting forever.
+	replicaErrorFallback = 5 * time.Minute
 	// maxSeals is the API limit for BlipState.status.seals.
 	maxSeals = 32
 	// recentSeals is how many seal results are kept even when no Blip
@@ -723,6 +732,28 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 			})
 		}
 	}
+	var fallback string
+	if p.Generation > 1 {
+		dropped, lost := resolveFailedReplicas(st, cl, p)
+		switch {
+		case lost:
+			// No node at all still holds the sealed version, so waiting can
+			// never make the save succeed. Fail the attachment's seal so the
+			// Blip reports a failed save instead of hanging forever.
+			if p.AttachmentID != "" {
+				sr := v1.SealResult{AttachmentID: p.AttachmentID,
+					Error: fmt.Sprintf("pending generation %d lost: no node holds commit %s", p.Generation, p.CommitID)}
+				if err := r.recordSeal(ctx, st, sr); err != nil {
+					return "", err
+				}
+			}
+			s.Pending = nil
+			s.LastError = ""
+			return fmt.Sprintf("pending generation %d lost: no node holds %s", p.Generation, p.CommitID), nil
+		case len(dropped) > 0:
+			fallback = fmt.Sprintf("saved generation %d with fewer replicas: %s", p.Generation, strings.Join(dropped, "; "))
+		}
+	}
 	var waiting, errs []string
 	for _, n := range p.Replicas {
 		if !cl.holds(st, n, p.CommitID) {
@@ -763,7 +794,59 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 	s.Placements = p.Replicas
 	s.Pending = nil
 	s.LastError = ""
-	return "", nil
+	return fallback, nil
+}
+
+// resolveFailedReplicas drops replicas that have reported an error past
+// replicaErrorFallback without holding the sealed commit, as long as a usable
+// node still holds it. It returns one "node: error" string per dropped replica.
+// Such a replica may never fetch (for example a permanent node-local device
+// failure); waiting for it would wedge the save, the Blip, and the state
+// finalizer. Repair re-adds the placement and retries the fetch once the node
+// can serve it.
+//
+// lost reports that a replica error outlived the bound while no node at all
+// (including a draining or unhealthy one) holds the commit: the save can never
+// complete and must fail instead of waiting forever.
+func resolveFailedReplicas(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) (dropped []string, lost bool) {
+	if p.Since == nil || cl.now.Sub(p.Since.Time) < replicaErrorFallback {
+		return nil, false
+	}
+	errs := map[string]string{}
+	for _, o := range st.Status.Nodes {
+		if o.Error != "" && (o.Node == p.SourceNode || slices.Contains(p.Replicas, o.Node)) {
+			errs[o.Node] = o.Error
+		}
+	}
+	if len(errs) == 0 {
+		return nil, false
+	}
+	if !servingSource(st, cl, p) && usableHolder(st, cl, p, p.Replicas) == "" {
+		return nil, !saveHeld(st, cl, p)
+	}
+	for _, n := range p.Replicas {
+		if !cl.holds(st, n, p.CommitID) && errs[n] != "" {
+			dropped = append(dropped, fmt.Sprintf("%s: %s", n, errs[n]))
+		}
+	}
+	p.Replicas = slices.DeleteFunc(p.Replicas, func(n string) bool {
+		return !cl.holds(st, n, p.CommitID) && errs[n] != ""
+	})
+	return dropped, false
+}
+
+// saveHeld reports whether any replica or the source still holds the pending
+// commit, whether or not that node is currently usable.
+func saveHeld(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
+	if cl.holds(st, p.SourceNode, p.CommitID) {
+		return true
+	}
+	for _, n := range p.Replicas {
+		if cl.holds(st, n, p.CommitID) {
+			return true
+		}
+	}
+	return false
 }
 
 // initialSourceSettled reports whether the source of an initial version has

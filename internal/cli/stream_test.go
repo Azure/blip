@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -135,5 +136,114 @@ func TestStreamTTYForwardsSignalsAndRestoresTerminal(t *testing.T) {
 	}
 	if st.Lflag&unix.ICANON == 0 || st.Lflag&unix.ECHO == 0 {
 		t.Fatalf("terminal left raw: lflag=%#x, want ICANON and ECHO", st.Lflag)
+	}
+}
+
+// The guest cannot be assumed to act on a forwarded signal: an interactive
+// shell ignores SIGTERM. The client must still stop within a bounded grace
+// after forwarding, or a supervisor ("timeout", systemd, CI) can only SIGKILL
+// it and leave a real terminal in raw mode.
+func TestStreamTTYSignalIgnoredByGuestDetaches(t *testing.T) {
+	master, slave := openTestPTY(t)
+	_ = master
+
+	// Register before stream starts so the test process survives outlasting
+	// any SIGTERM that arrives before forwardSignals installs its handler.
+	own := make(chan os.Signal, 16)
+	signal.Notify(own, syscall.SIGTERM)
+	defer signal.Stop(own)
+
+	signals := make(chan string, 8)
+	disconnected := make(chan struct{}, 1)
+	guest := &fakeguest.Guest{Run: func(s *fakeguest.Session) wire.Exit {
+		for ev := range s.Events {
+			if ev.Signal != "" {
+				select {
+				case signals <- ev.Signal:
+				default:
+				}
+			}
+			if ev.Disconnected {
+				select {
+				case disconnected <- struct{}{}:
+				default:
+				}
+				return wire.Exit{}
+			}
+		}
+		return wire.Exit{}
+	}}
+	client := &session.Client{Connect: guest.Connect}
+	s, err := client.Open(context.Background(), "ns", "pod", wire.Open{
+		Mode: wire.OpenExec, Argv: []string{"bash"}, TTY: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	a := &app{env: &Env{
+		In: slave, Out: io.Discard, Err: io.Discard, Terminal: true,
+		// A stream that errors consults the Blip lifecycle. These tests have
+		// no API server, so report it unreachable and keep the failure local.
+		Connect: func(KubeFlags) (*Clients, error) { return nil, errors.New("no API server in test") },
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.stream(ctx, s, streamOpts{blip: "test"}) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if st, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS); err == nil && st.Lflag&unix.ICANON == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream never made the terminal raw")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Give forwardSignals a moment to install its channel once the stream is
+	// under way. Retrying below still covers the remaining race.
+	time.Sleep(20 * time.Millisecond)
+
+	forwarded := false
+	for !forwarded {
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		select {
+		case sig := <-signals:
+			if sig != "TERM" {
+				t.Fatalf("guest received signal %q, want TERM", sig)
+			}
+			forwarded = true
+		case <-time.After(20 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("SIGTERM was not forwarded to the TTY session")
+		}
+	}
+
+	select {
+	case <-disconnected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream never detached after the guest ignored the signal")
+	}
+
+	select {
+	case err := <-done:
+		var exit *ExitError
+		if !errors.As(err, &exit) || exit.Code != 128+int(unix.SIGTERM) {
+			t.Fatalf("stream returned %v, want exit status %d", err, 128+int(unix.SIGTERM))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream did not return after forwarding a signal the guest ignored")
+	}
+
+	st, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Lflag&unix.ICANON == 0 || st.Lflag&unix.ECHO == 0 {
+		t.Fatalf("terminal left raw after detach: lflag=%#x, want ICANON and ECHO", st.Lflag)
 	}
 }

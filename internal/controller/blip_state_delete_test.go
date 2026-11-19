@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/podapi"
@@ -182,6 +183,62 @@ func TestPendingMatchingRootUIDStarts(t *testing.T) {
 // TestDirectlyDeletedWritableMountFailsRunningBlip mirrors the root case for a
 // writable mount whose state is durable (no owner references). Saving must not
 // mark the doomed mount Mounted and report success for its discarded save.
+// TestDirectlyDeletedReadOnlyMountStopsRunningBlip covers a read-only
+// attachment pinning a deleting state forever. The platform can hot-remove a
+// read-only disk, so the reader must be stopped with a clear reason instead of
+// silently staying Running while the state's finalizer waits for it.
+func TestDirectlyDeletedReadOnlyMountStopsRunningBlip(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.readyState("data", "n1")
+	b := e.startBlip("job", "n1", withRoot("home"), e.withMount("data", "/data", false))
+	m := mountOf(b, "data")
+	if m == nil || m.Writable || m.AttachmentID == "" {
+		t.Fatalf("no attached read-only mount: %+v", b.Status.Mounts)
+	}
+	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseRunning, Mounts: []podapi.DiskStatus{{
+		ID: m.AttachmentID, State: "data", Phase: podapi.DiskMounted,
+	}}})
+	e.run(e.blip, ns, "job")
+	if m = mountOf(e.getBlip("job"), "data"); m == nil || m.Phase != v1.MountMounted {
+		t.Fatalf("read-only mount did not attach: %+v", e.getBlip("job").Status.Mounts)
+	}
+
+	// Deleting the source is blocked by the attachment until the reader
+	// lets go.
+	e.must(e.c.Delete(e.ctx, e.getState("data")))
+	e.run(e.state, ns, "data")
+	if st := e.getState("data"); !strings.Contains(st.Status.Message, "blip job") || len(st.Finalizers) == 0 {
+		t.Fatalf("deletion not blocked by the reader: %+v", st.Status)
+	}
+
+	// The reader is told and stopped instead of remaining silently Running.
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	if !b.Spec.Stop {
+		t.Fatalf("reader kept a deleted read-only mount: %+v", b.Status)
+	}
+	if b.Annotations[v1.AnnotationStopReason] != reasonStateDeleting {
+		t.Fatalf("stop reason %q, want %q", b.Annotations[v1.AnnotationStopReason], reasonStateDeleting)
+	}
+	if !strings.Contains(b.Status.Message, "being deleted") {
+		t.Fatalf("no deletion message: %+v", b.Status)
+	}
+
+	// The node applies the stop; the read-only attachment no longer blocks
+	// the state's finalizer.
+	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
+	e.saveWriter("home", newID())
+	e.run(e.blip, ns, "job")
+	expectPhase(t, e.getBlip("job"), v1.BlipSucceeded, ReasonStopped)
+	e.run(e.state, ns, "data")
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "data"}, &v1.BlipState{}); err == nil {
+		t.Fatal("state not deleted after the read-only reader stopped")
+	}
+}
+
 func TestDirectlyDeletedWritableMountFailsRunningBlip(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1")

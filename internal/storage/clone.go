@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -86,6 +87,13 @@ func (s *Store) FetchCommit(ctx context.Context, stateUID, commitID string, src 
 		releaseOnce(&src)
 		return nil
 	}
+	// Retry a fetch whose cleanup failed after the original attempt. Recovery
+	// does the same at startup, but a running node would otherwise refuse the
+	// ID forever and never retry the fetch.
+	if err := s.retryUnfinished(commitID); err != nil {
+		releaseOnce(&src)
+		return err
+	}
 	base, err := s.cloneBase(&src)
 	if err != nil {
 		releaseOnce(&src)
@@ -97,6 +105,15 @@ func (s *Store) FetchCommit(ctx context.Context, stateUID, commitID string, src 
 	rec := &record{
 		ID: commitID, Kind: KindCommit, StateUID: stateUID, Base: src.Base, Size: src.SizeBytes,
 		Clone: &cloneInfo{MetaSize: cloneMetaSize(src.SizeBytes), Source: src.Device, SourceSize: src.SizeBytes, RemoteID: src.ID},
+	}
+	// The destination, clone metadata, and clone target of a fetch are named
+	// from the commit ID alone. A fetch interrupted after creating them (and
+	// after its record was dropped) would make every later attempt fail with
+	// "Device or resource busy". No record owns the ID now, so they are ours
+	// to remove.
+	if err := s.clearFetchDevices(s.layout(rec)); err != nil {
+		releaseOnce(&src)
+		return err
 	}
 	if _, err := s.begin(rec, 2); err != nil {
 		releaseOnce(&src)
@@ -112,6 +129,83 @@ func (s *Store) FetchCommit(ctx context.Context, stateUID, commitID string, src 
 		return err
 	}
 	return s.completeClone(rec, phaseReady)
+}
+
+// retryUnfinished rolls back a commit record left behind by an operation
+// whose own rollback failed. The caller holds the commit's key lock, so no
+// operation can own the record now; applying the same rollback as recovery
+// lets a new attempt begin instead of failing forever with "already exists".
+// A detaching record has not durably accepted deletion, so it is not torn
+// down here.
+func (s *Store) retryUnfinished(id string) error {
+	s.mu.Lock()
+	r, ok := s.vols[id]
+	var kind Kind
+	var phase string
+	if ok {
+		kind, phase = r.Kind, r.Phase
+	}
+	s.mu.Unlock()
+	switch {
+	case !ok:
+		return nil
+	case phase == phaseCreating || phase == phaseDeleting:
+		if kind != KindCommit {
+			return fmt.Errorf("%w: %s is a %s", ErrInUse, id, kind)
+		}
+		return s.rollback(r)
+	case phase == phaseDetaching:
+		return fmt.Errorf("%w: %s is being deleted", ErrInUse, id)
+	default:
+		return fmt.Errorf("%w: %s is %s", ErrInUse, id, phase)
+	}
+}
+
+// clearFetchDevices removes devices left by an interrupted fetch of the
+// commit named by l. The caller holds the commit's key lock and found no
+// record for it, so these names cannot belong to a live volume. The thin IDs
+// are freed too, so a permanent create failure does not also leak pool space.
+func (s *Store) clearFetchDevices(l layout) error {
+	var thins []uint32
+	for _, name := range []string{l.thin, l.meta} {
+		if !s.deviceExists(name) {
+			continue // missing: no thin ID to free
+		}
+		table, err := s.deviceTable(name)
+		if err != nil {
+			continue
+		}
+		if id := thinIDOf(table); id != 0 {
+			thins = append(thins, id)
+		}
+	}
+	for _, name := range []string{l.fetch, l.thin, l.meta} {
+		if err := s.deviceRemove(name); err != nil {
+			return fmt.Errorf("storage: remove stale fetch device %s: %w", name, err)
+		}
+	}
+	for _, id := range thins {
+		// The devices are already gone. A refusal here only delays reclaiming
+		// an unreferenced thin ID, so it must not fail the fetch itself.
+		if err := s.deleteThin(id); err != nil {
+			logf("delete stale fetch thin %d: %v", id, err)
+		}
+	}
+	return nil
+}
+
+// thinIDOf returns the thin device ID of a thin table, or 0.
+func thinIDOf(table string) uint32 {
+	for _, line := range strings.Split(strings.TrimSpace(table), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 || f[2] != "thin" {
+			continue
+		}
+		if id, err := strconv.ParseUint(f[4], 10, 32); err == nil {
+			return uint32(id)
+		}
+	}
+	return 0
 }
 
 func (s *Store) fetch(ctx context.Context, rec, base *record, regions []Region, progress func(done, total int64)) error {

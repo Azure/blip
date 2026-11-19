@@ -643,6 +643,133 @@ func TestDrainingSaveFallbackClearsFinalizer(t *testing.T) {
 	}
 }
 
+// TestSaveFallsBackAfterReplicaErrorBound covers a save that cannot complete
+// because a healthy replica keeps reporting a fetch error (for example a
+// node-local device problem that makes every retry fail with "Device or
+// resource busy"). Waiting forever would wedge the save, the Blip, and both
+// finalizers; after replicaErrorFallback the state commits with the node that
+// holds the version and repair can replicate it later.
+func TestSaveFallsBackAfterReplicaErrorBound(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.readyState("s", "n1", "n2")
+	const saved = "failing-replica-save"
+	since := metav1.NewTime(e.now)
+	st := e.getState("s")
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID: saved, Generation: 2, SourceNode: "n1",
+		AttachmentID: "save", Replicas: []string{"n1", "n2"}, Since: &since,
+	}
+	e.must(e.c.Status().Update(e.ctx, st))
+	e.hold("s", saved, "n1")
+	e.report("s", "n2", func(o *v1.NodeObservation) {
+		o.Error = "fetch blip-n2-c: device-mapper: create ioctl failed: Device or resource busy"
+	})
+
+	if res := e.run(e.state, ns, "s"); res.RequeueAfter <= 0 {
+		t.Fatal("pending save scheduled no wake-up before its fallback bound")
+	}
+	if st = e.getState("s"); st.Status.Pending == nil || st.Status.Committed.ID == saved {
+		t.Fatalf("save committed before the replica error bound: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.LastError, "resource busy") {
+		t.Fatalf("lastError lost the fetch error: %q", st.Status.LastError)
+	}
+
+	e.now = e.now.Add(replicaErrorFallback + time.Second)
+	e.heartbeat()
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if st.Status.Pending != nil || st.Status.Committed == nil || st.Status.Committed.ID != saved {
+		t.Fatalf("save did not fall back after %s: %+v", replicaErrorFallback, st.Status)
+	}
+	if !slices.Equal(st.Status.Placements, []string{"n1"}) {
+		t.Fatalf("fallback placements %v, want the holder", st.Status.Placements)
+	}
+	if !strings.Contains(st.Status.Message, "fewer replicas") || !strings.Contains(st.Status.Message, "resource busy") {
+		t.Fatalf("fallback did not explain the dropped replica: %q", st.Status.Message)
+	}
+}
+
+// TestReplicaErrorFallbackFailsLostSave checks the safe side: when no node at
+// all holds the sealed version, the bound fails the save instead of committing
+// data that does not exist or waiting forever.
+func TestReplicaErrorFallbackFailsLostSave(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.readyState("s", "n1", "n2")
+	since := metav1.NewTime(e.now.Add(-replicaErrorFallback - time.Second))
+	st := e.getState("s")
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID: "unheld-save", Generation: 2, SourceNode: "n1",
+		AttachmentID: "save", Replicas: []string{"n1", "n2"}, Since: &since,
+	}
+	e.must(e.c.Status().Update(e.ctx, st))
+	e.report("s", "n1", func(o *v1.NodeObservation) { o.Error = "cannot seal" })
+	e.report("s", "n2", func(o *v1.NodeObservation) { o.Error = "cannot fetch" })
+
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if st.Status.Committed.ID == "unheld-save" {
+		t.Fatalf("committed a save no node holds: %+v", st.Status)
+	}
+	if st.Status.Pending != nil {
+		t.Fatalf("lost save still waiting: %+v", st.Status.Pending)
+	}
+	found := false
+	for _, sr := range st.Status.Seals {
+		if sr.AttachmentID == "save" && strings.Contains(sr.Error, "no node holds") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("lost save did not fail its seal: %+v", st.Status.Seals)
+	}
+}
+
+// TestReplicaErrorFallbackClearsFinalizer checks the end-to-end unblock: once
+// the bounded fallback resolves the attachment, deleting the Blip removes its
+// finalizer instead of waiting forever on the stuck save.
+func TestReplicaErrorFallbackClearsFinalizer(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.readyState("s", "n1", "n2")
+	const saved = "failing-finalizer-save"
+	since := metav1.NewTime(e.now.Add(-replicaErrorFallback - time.Second))
+	st := e.getState("s")
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID: saved, Generation: 2, SourceNode: "n1",
+		AttachmentID: "save", Replicas: []string{"n1", "n2"}, Since: &since,
+	}
+	st.Status.Seals = []v1.SealResult{{AttachmentID: "save", CommitID: saved}}
+	e.must(e.c.Status().Update(e.ctx, st))
+	e.hold("s", saved, "n1")
+	e.report("s", "n2", func(o *v1.NodeObservation) { o.Error = "fetch: Device or resource busy" })
+
+	code := int32(0)
+	e.newBlip("b", withRoot("s"))
+	b := e.getBlip("b")
+	b.Finalizers = []string{v1.Finalizer}
+	b.Status.Phase = v1.BlipSaving
+	b.Status.RootAttachmentID = "save"
+	b.Status.ExitCode = &code
+	e.must(e.c.Update(e.ctx, b))
+	e.must(e.c.Status().Update(e.ctx, b))
+	e.must(e.c.Delete(e.ctx, b))
+
+	e.run(e.state, ns, "s")
+	if st = e.getState("s"); st.Status.Pending != nil || st.Status.Committed.ID != saved {
+		t.Fatalf("state did not resolve the save: %+v", st.Status)
+	}
+	e.run(e.blip, ns, "b")
+	b = &v1.Blip{}
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "b"}, b); err == nil {
+		if len(b.Finalizers) != 0 {
+			t.Fatalf("stuck save kept the Blip finalizer: %v", b.Finalizers)
+		}
+	}
+}
+
 // TestInitialVersionCommitsWithLostReplica covers the same node loss for a
 // generation-1 build: the survivors build from empty and can commit without
 // the node that disappeared.

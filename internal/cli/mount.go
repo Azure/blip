@@ -138,9 +138,17 @@ func mountPathConflict(root string, mounts []v1alpha1.Mount, state, mountPath st
 
 // validateMountPlan validates the complete mount set the CLI is about to write,
 // including earlier requests from the same invocation, before any state is
-// created or the root is edited.
-func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error {
-	mounts := append([]v1alpha1.Mount(nil), root.Spec.Mounts...)
+// created or the root is edited. removed holds the states this invocation will
+// unmount before the adds, so their current entries do not participate in the
+// final topology. allowMove permits an add for a state that is already mounted
+// at another path to replace that path in the same command.
+func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest, removed map[string]bool, allowMove bool) error {
+	mounts := make([]v1alpha1.Mount, 0, len(root.Spec.Mounts))
+	for _, m := range root.Spec.Mounts {
+		if !removed[m.State] {
+			mounts = append(mounts, m)
+		}
+	}
 	for _, req := range requests {
 		if err := mountpath.Validate(req.path); err != nil {
 			return err
@@ -150,7 +158,22 @@ func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error 
 		}
 		if m := findSpecMount(mounts, req.state); m != nil {
 			if m.Path != req.path {
-				return fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", req.state, root.Name, m.Path)
+				if !allowMove {
+					return fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", req.state, root.Name, m.Path)
+				}
+				// The new path must be free before the old entry is
+				// replaced, so check the remaining topology without it.
+				for i := range mounts {
+					if mounts[i].State == req.state {
+						mounts = append(mounts[:i], mounts[i+1:]...)
+						break
+					}
+				}
+				if err := mountPathConflict(root.Name, mounts, req.state, req.path); err != nil {
+					return err
+				}
+				mounts = append(mounts, v1alpha1.Mount{State: req.state, Path: req.path, Writable: req.writable})
+				continue
 			}
 			m.Writable = req.writable
 			continue
@@ -164,6 +187,13 @@ func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error 
 }
 
 func (a *app) mountState(ctx context.Context, state, root, mountPath string, target *bool) error {
+	return a.mountStatePlanned(ctx, state, root, mountPath, target, false)
+}
+
+// mountStatePlanned mounts state, optionally moving an existing mount to a new
+// path when the same invocation also removes mounts. The move is validated
+// against the final topology by validateMountPlan before this edit.
+func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath string, target *bool, move bool) error {
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return fmt.Errorf("invalid path %q: must be a clean absolute path other than /", mountPath)
 	}
@@ -172,6 +202,13 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 	}
 	if state == root {
 		return errors.New("a root state cannot mount itself")
+	}
+	r, err := a.getState(ctx, root)
+	if err != nil {
+		return err
+	}
+	if r.DeletionTimestamp != nil {
+		return fmt.Errorf("state %q is being deleted", a.short(root))
 	}
 	source, err := a.getState(ctx, state)
 	if err != nil {
@@ -186,12 +223,26 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 	var want, demoting, added bool
 	var oldAttachment string
 	s, err := a.editMountsWaitingStale(ctx, root, state, func(s *v1alpha1.BlipState) (string, error) {
+		if s.DeletionTimestamp != nil {
+			// The root started deleting while this command waited to
+			// edit it. Do not add intent that can never run.
+			return "", fmt.Errorf("state %q is being deleted", a.short(root))
+		}
 		want, demoting, added = false, false, false
 		oldAttachment = ""
 		m := findSpecMount(s.Spec.Mounts, state)
 		if m != nil {
 			if m.Path != mountPath {
-				return "", fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", state, root, m.Path)
+				if !move {
+					return "", fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", state, root, m.Path)
+				}
+				// Replace the path in place. The controller unmounts the
+				// old attachment and mounts the new path; waitMount below
+				// waits for the status entry to move too.
+				if err := mountPathConflict(root, s.Spec.Mounts, state, mountPath); err != nil {
+					return "", err
+				}
+				m.Path = mountPath
 			}
 			want = m.Writable
 			// Adoption of a collect mount must finish its pending reattach.
@@ -258,10 +309,12 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 			}
 		}
 		var gone *mountStateGoneError
-		if added && errors.As(err, &gone) {
-			// The state disappeared while this command waited. Remove only
-			// the desired mount this command just added; a mount that was
-			// already in the root belongs to someone else.
+		var rejected *mountRejectedError
+		if added && (errors.As(err, &gone) || errors.As(err, &rejected)) {
+			// The state disappeared or the guest rejected the mount point
+			// while this command waited. Remove only the desired mount this
+			// command just added; a mount that was already in the root
+			// belongs to someone else.
 			if rerr := a.rollbackAddedMount(ctx, root, state, mountPath, want); rerr != nil {
 				fmt.Fprintf(a.env.Err, "warning: could not remove desired mount of state %s from root state %s: %v\n", a.short(state), a.short(root), rerr)
 			} else {
@@ -353,6 +406,21 @@ type mountStateGoneError struct{ msg string }
 
 func (e *mountStateGoneError) Error() string { return e.msg }
 
+// mountRejectedError marks a mount the guest refused to create, usually
+// because an ancestor of the mount point is a symlink or a regular file.
+// Retrying cannot help, so mountState rolls back the desired mount it added
+// instead of leaving a root that can never start.
+type mountRejectedError struct{ msg string }
+
+func (e *mountRejectedError) Error() string { return e.msg }
+
+// mountPointRejected reports the guest's fixed error for a mount point it
+// cannot create. Only this class is rolled back: a transient attach failure
+// (no space, device gone) may still be worth keeping as desired intent.
+func mountPointRejected(msg string) bool {
+	return strings.Contains(msg, "is a symlink or not a directory")
+}
+
 // mountBusy reports the part of a top-level Blip status message that says the
 // wanted state is already written by another Blip. The controller records a
 // writable mount rejected for that reason on the Blip itself, not as a mount
@@ -436,8 +504,18 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 	// will advance the committed generation.
 	demoted := false
 	return a.waitBlip(ctx, writer.Name, func(b *v1alpha1.Blip) (bool, error) {
-		if b == nil || b.UID != writer.UID || b.Spec.State != writer.Spec.State || v1alpha1.Finished(b) ||
-			b.Spec.Stop || b.DeletionTimestamp != nil || b.Status.Phase == v1alpha1.BlipSaving {
+		if b == nil || b.UID != writer.UID || b.Spec.State != writer.Spec.State {
+			return false, fmt.Errorf("blip %q stopped before the mount completed; desired mount remains on root state %q", writer.Name, writer.Spec.State)
+		}
+		// A terminating or missing source never gets an attachment. The
+		// controller reports it as a wait on the Blip, so waiting for a
+		// status entry would poll forever and leave the root poisoned. A
+		// deleted writable source also stops the Blip, so this must run
+		// before the generic stop check to keep the rollback cause.
+		if gone := mountStateGone(b.Status.Message, state); gone != "" {
+			return false, &mountStateGoneError{msg: fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, gone)}
+		}
+		if v1alpha1.Finished(b) || b.Spec.Stop || b.DeletionTimestamp != nil || b.Status.Phase == v1alpha1.BlipSaving {
 			return false, fmt.Errorf("blip %q stopped before the mount completed; desired mount remains on root state %q", writer.Name, writer.Spec.State)
 		}
 		root, err := a.getState(ctx, writer.Spec.State)
@@ -452,12 +530,6 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			return false, fmt.Errorf("mount of state %q changed concurrently", state)
 		}
 		m := findMount(b.Status.Mounts, state)
-		// A terminating or missing source never gets an attachment. The
-		// controller reports it as a wait on the Blip, so waiting for a
-		// status entry would poll forever and leave the root poisoned.
-		if gone := mountStateGone(b.Status.Message, state); gone != "" {
-			return false, &mountStateGoneError{msg: fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, gone)}
-		}
 		if m == nil || m.Path != mountPath {
 			// A writable mount can be rejected before any status entry
 			// exists: the controller leaves the reason on the Blip. Report
@@ -479,7 +551,11 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			if strings.Contains(m.Message, "busy") {
 				return false, fmt.Errorf("could not switch state %q on blip %q: processes are still using %s; desired mount remains applied", state, b.Name, mountPath)
 			}
-			return false, fmt.Errorf("mount of state %q on blip %q failed: %s; desired mount remains applied", state, b.Name, m.Message)
+			msg := fmt.Sprintf("mount of state %q on blip %q failed: %s; desired mount remains applied", state, b.Name, m.Message)
+			if mountPointRejected(m.Message) {
+				return false, &mountRejectedError{msg: msg}
+			}
+			return false, errors.New(msg)
 		}
 		if m.Phase == v1alpha1.MountMounted && !m.Switching && m.Writable != want && m.Message != "" &&
 			!strings.HasPrefix(m.Message, "waiting to switch to writable") {
@@ -798,8 +874,33 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	if err != nil {
 		return err
 	}
-	if err := validateMountPlan(root, requests); err != nil {
+	if root.DeletionTimestamp != nil && (len(args) > 0 || len(f.create) > 0) {
+		// A terminating root can never execute again. Reject before
+		// creating a state or writing intent that no run can use. A
+		// removal-only command stays legal so a reader can still detach
+		// and release the state's finalizer.
+		return fmt.Errorf("state %q is being deleted", a.short(f.root))
+	}
+	removed := make(map[string]bool, len(f.remove))
+	for _, arg := range f.remove {
+		state, err := a.removalState(ctx, arg, root)
+		if err != nil {
+			return err
+		}
+		removed[state] = true
+	}
+	// A move is only implicit when the invocation also frees mount paths;
+	// a plain add at a second path still tells the user to unmount first.
+	move := len(removed) > 0
+	if err := validateMountPlan(root, requests, removed, move); err != nil {
 		return err
+	}
+	// Removals run first so the final topology validated above is the one
+	// the adds are applied to.
+	for _, state := range f.remove {
+		if err := a.unmountArg(ctx, state, f.root); err != nil {
+			return err
+		}
 	}
 	for _, n := range news {
 		if err := a.newMountedState(ctx, n.spec, f, replicasSet); err != nil {
@@ -807,12 +908,7 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		}
 	}
 	for _, add := range adds {
-		if err := a.mountState(ctx, add.state, f.root, add.path, add.writable); err != nil {
-			return err
-		}
-	}
-	for _, state := range f.remove {
-		if err := a.unmountArg(ctx, state, f.root); err != nil {
+		if err := a.mountStatePlanned(ctx, add.state, f.root, add.path, add.writable, move); err != nil {
 			return err
 		}
 	}
@@ -908,7 +1004,10 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	if err != nil {
 		return err
 	}
-	if err := validateMountPlan(root, []mountRequest{{state: name, path: mountPath, writable: writable}}); err != nil {
+	if root.DeletionTimestamp != nil {
+		return fmt.Errorf("state %q is being deleted", a.short(f.root))
+	}
+	if err := validateMountPlan(root, []mountRequest{{state: name, path: mountPath, writable: writable}}, nil, false); err != nil {
 		return err
 	}
 	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace}}
@@ -948,6 +1047,16 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	if _, err := a.waitStateCommitted(ctx, name); err != nil {
 		a.removeCreatedStates(ctx, built)
 		return err
+	}
+	// The root may have started deleting while the new state committed. It
+	// can never run this mount, so remove what this command created instead
+	// of leaving an orphan behind.
+	if root, err := a.getState(ctx, f.root); err != nil {
+		a.removeCreatedStates(ctx, built)
+		return err
+	} else if root.DeletionTimestamp != nil {
+		a.removeCreatedStates(ctx, built)
+		return fmt.Errorf("state %q is being deleted", a.short(f.root))
 	}
 	if err := a.mountState(ctx, name, f.root, mountPath, &writable); err != nil {
 		// A mount that became desired intent before failing is referenced by
@@ -1027,13 +1136,10 @@ func (a *app) listMounts(ctx context.Context, root string) error {
 	return nil
 }
 
-// unmountArg removes a mount, accepting an owner-local name or the qualified
-// name that is actually in the root's spec.
-func (a *app) unmountArg(ctx context.Context, arg, root string) error {
-	s, err := a.getState(ctx, root)
-	if err != nil {
-		return err
-	}
+// removalState resolves a --rm argument to the state name used by the root's
+// spec, accepting an owner-local name or the qualified name that is actually
+// in it.
+func (a *app) removalState(ctx context.Context, arg string, s *v1alpha1.BlipState) (string, error) {
 	state := a.full(arg)
 	if state != arg && findSpecMount(s.Spec.Mounts, state) == nil {
 		if findSpecMount(s.Spec.Mounts, arg) != nil {
@@ -1041,12 +1147,26 @@ func (a *app) unmountArg(ctx context.Context, arg, root string) error {
 		} else {
 			b, err := a.rootWriter(ctx, s)
 			if err != nil {
-				return err
+				return "", err
 			}
 			if b != nil && findMount(b.Status.Mounts, state) == nil && findMount(b.Status.Mounts, arg) != nil {
 				state = arg
 			}
 		}
+	}
+	return state, nil
+}
+
+// unmountArg removes a mount, accepting an owner-local name or the qualified
+// name that is actually in the root's spec.
+func (a *app) unmountArg(ctx context.Context, arg, root string) error {
+	s, err := a.getState(ctx, root)
+	if err != nil {
+		return err
+	}
+	state, err := a.removalState(ctx, arg, s)
+	if err != nil {
+		return err
 	}
 	return a.unmountState(ctx, state, root)
 }
