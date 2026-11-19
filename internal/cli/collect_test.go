@@ -478,6 +478,62 @@ func TestCopyTreeAtomicOnFailure(t *testing.T) {
 	assertNoTempFiles(t, base)
 }
 
+// Collect must not turn a sparse source into a dense destination.
+func TestCopyFilePreservesSparseHoles(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "sparse")
+	f, err := os.Create(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const size = int64(16 << 20)
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("start"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("end"), size-3); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(src, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Blocks*512 > 1<<20 {
+		t.Skipf("filesystem did not make the source sparse (%d allocated bytes)", st.Blocks*512)
+	}
+
+	dst := filepath.Join(dir, "dst")
+	if err := copyPath(context.Background(), src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Stat(dst, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Size != size {
+		t.Fatalf("size = %d, want %d", st.Size, size)
+	}
+	if allocated := int64(st.Blocks) * 512; allocated >= size/2 {
+		t.Fatalf("destination is dense: %d allocated bytes for a %d byte sparse file", allocated, size)
+	}
+	out, err := os.Open(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	buf := make([]byte, 5)
+	if _, err := out.ReadAt(buf, 0); err != nil || string(buf) != "start" {
+		t.Fatalf("start = %q %v", buf, err)
+	}
+	if _, err := out.ReadAt(buf[:3], size-3); err != nil || string(buf[:3]) != "end" {
+		t.Fatalf("end = %q %v", buf[:3], err)
+	}
+}
+
 // assertNoTempFiles rejects staging paths left behind by a failed copy.
 func assertNoTempFiles(t *testing.T, dir string) {
 	t.Helper()

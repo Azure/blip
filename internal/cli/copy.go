@@ -2,11 +2,14 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 func copyPath(ctx context.Context, src, dst string) error {
@@ -367,7 +370,7 @@ func copyFile(ctx context.Context, src, dst string, info os.FileInfo) error {
 			os.Remove(tmp)
 		}
 	}()
-	_, cerr := io.Copy(out, ctxReader{ctx: ctx, r: in})
+	cerr := copyFileData(ctx, in, out, info.Size())
 	if cerr == nil {
 		cerr = out.Sync()
 	}
@@ -388,6 +391,88 @@ func copyFile(ctx context.Context, src, dst string, info os.FileInfo) error {
 	}
 	done = true
 	return nil
+}
+
+// copyFileData copies size bytes while leaving holes as holes. Filesystems
+// without SEEK_DATA/SEEK_HOLE fall back to a plain copy.
+func copyFileData(ctx context.Context, in, out *os.File, size int64) error {
+	ok, err := copySparse(ctx, in, out, size)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
+	if _, err := in.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := out.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err = io.Copy(out, ctxReader{ctx: ctx, r: in})
+	return err
+}
+
+// copySparse copies only the data extents reported by SEEK_DATA/SEEK_HOLE and
+// ends with a truncate so the apparent size matches even when the tail is a
+// hole. It reports false if the filesystem does not support hole seeking.
+func copySparse(ctx context.Context, in, out *os.File, size int64) (bool, error) {
+	offset := int64(0)
+	for offset < size {
+		data, err := in.Seek(offset, unix.SEEK_DATA)
+		if err != nil {
+			if errors.Is(err, unix.ENXIO) {
+				break // no data at or after offset: the rest is a hole
+			}
+			if unsupportedSeek(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if data < offset {
+			data = offset
+		}
+		if data >= size {
+			break
+		}
+		hole, err := in.Seek(data, unix.SEEK_HOLE)
+		if err != nil {
+			if errors.Is(err, unix.ENXIO) {
+				hole = size
+			} else if unsupportedSeek(err) {
+				return false, nil
+			} else {
+				return false, err
+			}
+		}
+		if hole > size {
+			hole = size
+		}
+		if hole <= data {
+			hole = size // do not loop or lose data on strange answers
+		}
+		if _, err := in.Seek(data, io.SeekStart); err != nil {
+			return false, err
+		}
+		if _, err := out.Seek(data, io.SeekStart); err != nil {
+			return false, err
+		}
+		if _, err := io.CopyN(out, ctxReader{ctx: ctx, r: in}, hole-data); err != nil {
+			return false, err
+		}
+		offset = hole
+	}
+	if err := out.Truncate(size); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func unsupportedSeek(err error) bool {
+	return errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP)
 }
 
 // ctxReader stops a copy when its context is canceled.
