@@ -93,6 +93,22 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 	if err != nil {
 		return err
 	}
+	// Validate --collect before choosing the target set. A malformed or empty
+	// operation must not look like a successful gather that found nothing to
+	// do, and outside a blip the dedicated error must win over the missing
+	// target error.
+	if len(f.collect) > 0 {
+		if a.self == nil {
+			return errors.New("--collect copies into the workspace of the blip this command runs in, so it only works inside one; gather with --keep to keep the blip and its workspace")
+		}
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		if _, err := parseCollectOps(f.collect, cwd); err != nil {
+			return err
+		}
+	}
 	// labels.Parse treats whitespace as a selector that matches everything,
 	// and an unset shell variable is easy to pass by accident.
 	selector := strings.TrimSpace(f.selector)
@@ -133,9 +149,6 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 			}
 			sel = sel.Add(*req)
 		}
-	}
-	if len(f.collect) > 0 && a.self == nil {
-		return errors.New("--collect copies into the workspace of the blip this command runs in, so it only works inside one; gather with --keep to keep the blip and its workspace")
 	}
 	targets, err := a.gatherTargets(ctx, c, names, sel)
 	if err != nil {

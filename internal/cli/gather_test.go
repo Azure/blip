@@ -240,6 +240,41 @@ func TestGatherOutsideBlipNeedsNames(t *testing.T) {
 	}
 }
 
+// Outside a blip, --collect is the primary mistake: the documented
+// collect-only-inside error must win over the missing-target error.
+func TestGatherOutsideBlipWithCollect(t *testing.T) {
+	for _, op := range []string{"garbage", "a:b"} {
+		h := newHarness(t)
+		code, _, errOut := h.run("", "gather", "--collect", op)
+		if code != 1 || !strings.Contains(errOut, "only works inside one") {
+			t.Fatalf("--collect %q: code %d stderr %q", op, code, errOut)
+		}
+		if strings.Contains(errOut, "needs blip names") {
+			t.Fatalf("--collect %q: reported the missing-target error: %q", op, errOut)
+		}
+	}
+}
+
+// --collect must be validated before the target set is resolved. Inside a
+// blip with no forks, malformed or empty operations used to exit 0 with
+// "no blips to gather".
+func TestGatherValidatesCollectWithoutTargets(t *testing.T) {
+	for _, op := range []string{"", " ", "garbage", "a:b:c:d"} {
+		h := newHarness(t, ownedBlip("alice.box", "alice.home"))
+		h.self = "alice.box"
+		code, out, errOut := h.run("", "gather", "--collect", op)
+		if code != 1 || !strings.Contains(errOut, "invalid operation") {
+			t.Fatalf("--collect %q: code %d out %q stderr %q", op, code, out, errOut)
+		}
+		if strings.Contains(out, "no blips to gather") {
+			t.Fatalf("--collect %q: reported an empty gather: %q", op, out)
+		}
+		if h.gone("alice.box") {
+			t.Fatalf("--collect %q: gathered the caller", op)
+		}
+	}
+}
+
 // A blank shell variable expands to whitespace, which labels.Parse treats as
 // "select everything". Outside a blip it must be rejected.
 func TestGatherRejectsWhitespaceSelector(t *testing.T) {
