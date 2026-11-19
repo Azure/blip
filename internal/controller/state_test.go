@@ -1079,6 +1079,10 @@ func TestStateDeletionBlockedByBlip(t *testing.T) {
 	e.saveWriter(b.Spec.State, newID())
 	e.run(e.blip, ns, "b")
 	expectPhase(t, e.getBlip("b"), v1.BlipSucceeded, "")
+	root := e.getState(b.Spec.State)
+	root.Spec.Mounts = nil
+	root.Generation++
+	e.must(e.c.Update(e.ctx, root))
 	e.run(e.state, ns, "s")
 	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "s"}, &v1.BlipState{}); err == nil {
 		t.Fatal("state not deleted after the blip finished")
@@ -1234,6 +1238,10 @@ func TestPendingBlipWithMountBlocksStateDeletion(t *testing.T) {
 	if len(b.Status.Mounts) != 0 {
 		t.Fatalf("pending blip kept its mounts: %+v", b.Status.Mounts)
 	}
+	root := e.getState(b.Spec.State)
+	root.Spec.Mounts = nil
+	root.Generation++
+	e.must(e.c.Update(e.ctx, root))
 	e.run(e.state, ns, "s")
 	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "s"}, &v1.BlipState{}); err == nil {
 		t.Fatal("state not deleted after the pending blip failed")

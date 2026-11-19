@@ -233,6 +233,10 @@ func TestDirectlyDeletedReadOnlyMountStopsRunningBlip(t *testing.T) {
 	e.saveWriter("home", newID())
 	e.run(e.blip, ns, "job")
 	expectPhase(t, e.getBlip("job"), v1.BlipSucceeded, ReasonStopped)
+	root := e.getState(b.Spec.State)
+	root.Spec.Mounts = nil
+	root.Generation++
+	e.must(e.c.Update(e.ctx, root))
 	e.run(e.state, ns, "data")
 	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "data"}, &v1.BlipState{}); err == nil {
 		t.Fatal("state not deleted after the read-only reader stopped")

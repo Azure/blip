@@ -125,9 +125,13 @@ func TestBorrowedWritableMountDeletionFailsRunningBlip(t *testing.T) {
 		t.Fatalf("deleted mount not reported as failed: %+v", bb.Status.Mounts)
 	}
 
-	// The node stops the VM and seals the doomed mount; the terminating
-	// state's finalizer must then clear instead of waiting forever.
+	// The node stops the VM and seals the doomed mount; once the root no
+	// longer names the state, its finalizer must clear.
 	e.seal("data", "n1", v1.SealResult{AttachmentID: mountID, CommitID: newID()})
+	root := e.getState("home")
+	root.Spec.Mounts = nil
+	root.Generation++
+	e.must(e.c.Update(e.ctx, root))
 	e.run(e.state, ns, "data")
 	st := &v1.BlipState{}
 	err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "data"}, st)
@@ -162,6 +166,10 @@ func TestTerminatingWritableMountDoesNotWedgeOwnerDeletion(t *testing.T) {
 	e.run(e.blip, ns, "bb")
 	expectPhase(t, e.getBlip("bb"), v1.BlipFailed, ReasonSaveFailed)
 	e.seal("data", "n1", v1.SealResult{AttachmentID: mountID, CommitID: newID()})
+	root := e.getState("home")
+	root.Spec.Mounts = nil
+	root.Generation++
+	e.must(e.c.Update(e.ctx, root))
 	e.run(e.state, ns, "data")
 	st := &v1.BlipState{}
 	err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "data"}, st)

@@ -1331,16 +1331,30 @@ func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState
 		}
 		out = append(out, "blip "+b.Name)
 	}
-	var copies v1.BlipStateList
-	if err := r.deletionCopiesReader().List(ctx, &copies, client.InNamespace(st.Namespace)); err != nil {
+	var states v1.BlipStateList
+	if err := r.deletionCopiesReader().List(ctx, &states, client.InNamespace(st.Namespace)); err != nil {
 		return nil, err
 	}
-	for _, c := range copies.Items {
+	for _, c := range states.Items {
 		if c.Name == st.Name || c.Spec.CopyFrom != st.Name {
 			continue
 		}
 		if copyBlocksDeletion(&c, st) {
 			out = append(out, "copy "+c.Name)
+		}
+	}
+	for _, root := range states.Items {
+		if root.Name == st.Name || root.DeletionTimestamp != nil {
+			continue
+		}
+		for _, m := range root.Spec.Mounts {
+			if m.State == st.Name && m.BlipUID == "" {
+				// A persistent mount reference outlives every execution. A
+				// dangling name makes the root unable to fork or start, so
+				// block deletion like a live writer or an unfinished copy.
+				out = append(out, fmt.Sprintf("mount in root state %q (unmount it first)", root.Name))
+				break
+			}
 		}
 	}
 	return out, nil
