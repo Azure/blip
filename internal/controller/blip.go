@@ -864,6 +864,20 @@ func (r *BlipReconciler) usableState(ctx context.Context, ns, name string) (*v1.
 		return nil, "", "", err
 	case st.DeletionTimestamp != nil:
 		return nil, reasonStateDeleting, fmt.Sprintf("state %q is being deleted", name), nil
+	case st.Status.Committed == nil && st.Status.Phase == v1.StateFailed && st.Status.Pending != nil:
+		// The state controller keeps a retrying initial commit pending while
+		// surfacing phase=Failed (state.go pending()). That commit can still land,
+		// and workspace.CheckSource plus state.initialize() already treat the
+		// same shape as recoverable. Wait instead of failing the Blip; the
+		// Blip's pending timeout bounds how long it waits.
+		detail := st.Status.Message
+		if detail == "" {
+			detail = st.Status.LastError
+		}
+		if detail == "" {
+			detail = "initial version failed"
+		}
+		return st, ReasonStateNotReady, fmt.Sprintf("state %q failed but is still retrying its pending commit: %s", name, detail), nil
 	case st.Status.Committed == nil && st.Status.Phase == v1.StateFailed:
 		return nil, ReasonStateFailed, fmt.Sprintf("state %q failed: %s", name, st.Status.Message), nil
 	case st.Status.Committed == nil:

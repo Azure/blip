@@ -8,12 +8,12 @@ import (
 )
 
 // stateFailure returns why a state cannot commit, or "" while it can still
-// make progress. A Failed state is terminal even if a stale pending commit is
-// still recorded: the controller may keep retrying that commit, but a client
-// must not wait forever for a state whose immutable provisioning can never
-// succeed (for example an image larger than --size).
+// make progress. A Failed state that still has a pending commit is retrying:
+// the controller keeps status.pending set because that commit can still land,
+// and workspace.CheckSource and state.initialize() wait for exactly this shape.
+// Only a Failed state with no pending commit is terminal.
 func stateFailure(s *v1alpha1.BlipState) string {
-	if s.Status.Phase != v1alpha1.StateFailed {
+	if s.Status.Phase != v1alpha1.StateFailed || s.Status.Pending != nil {
 		return ""
 	}
 	return stateFailureMessage(s)
@@ -21,7 +21,8 @@ func stateFailure(s *v1alpha1.BlipState) string {
 
 // usableStateFailure returns why an existing state cannot be used as a run
 // source or root. A state with a committed version remains usable even if its
-// initialization history left a failed phase behind.
+// initialization history left a failed phase behind. A failed state that still
+// has a pending commit is usable too: that commit can still land.
 func usableStateFailure(s *v1alpha1.BlipState) string {
 	if s.Status.Committed != nil {
 		return ""

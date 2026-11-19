@@ -1487,15 +1487,34 @@ func TestMountNewSurfacesStateFailure(t *testing.T) {
 	}
 }
 
-// TestMountNewFailsTerminalInitialVersion: a Failed initial version can retain
-// a pending commit while the controller keeps retrying. Mount must not wait
-// forever for such a state, and must roll back the state it created.
+// TestMountNewWaitsForFailedPendingState: a Failed initial version that still
+// has its retryable pending commit can recover, so mount --new waits for the
+// commit instead of reporting a failure the state controller will fix.
+func TestMountNewWaitsForFailedPendingState(t *testing.T) {
+	h := newHarness(t, readyState("home"))
+	h.ctrl.set(func(c *fakeController) {
+		c.stateFail = "initial version failed: fetch: device busy"
+		c.stateFailPending = true
+	})
+	code, _, errOut := h.run("", "mount", "--new", "recovered:/data", "--root", "home")
+	if code != 0 {
+		t.Fatalf("mount failed on a retryable state: code %d: %s", code, errOut)
+	}
+	if st := h.state("recovered"); st.Status.Pending != nil || st.Status.Committed == nil {
+		t.Fatalf("recovered state did not commit: %+v", st.Status)
+	}
+	if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].State != "recovered" {
+		t.Fatalf("recovered state was not mounted: %+v", mounts)
+	}
+}
+
+// TestMountNewFailsTerminalInitialVersion: a Failed initial version with no
+// pending commit cannot recover. Mount must fail fast and roll back the state
+// it created.
 func TestMountNewFailsTerminalInitialVersion(t *testing.T) {
 	h := newHarness(t, readyState("home"))
 	h.ctrl.set(func(c *fakeController) {
 		c.stateFail = "initial version failed: retrying"
-		c.stateFailPending = true
-		c.stateFailStuck = true
 	})
 	start := time.Now()
 	code, _, errOut := h.run("", "mount", "--new", "stuck:/data", "--root", "home")
