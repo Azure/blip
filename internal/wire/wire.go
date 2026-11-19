@@ -12,9 +12,6 @@
 // APIPort is a host listener for credential-free Kubernetes API streams from
 // the guest. The runtime authenticates those requests on the host side.
 //
-// GatewayPort is a host listener for streams from the guest to a configured
-// cluster gateway. The sidecar adds the gateway credential on the host side.
-//
 // The guest accepts connections only from the host CID (2). Anyone who can
 // reach the Cloud Hypervisor vsock socket already controls the VM, so there
 // is no further authentication.
@@ -39,7 +36,6 @@ const (
 	ControlPort        = 1024
 	SessionPort        = 1025
 	APIPort     uint32 = 1026
-	GatewayPort uint32 = 1027
 	// MaxFrame bounds one frame payload.
 	MaxFrame = 1 << 20
 )
@@ -56,6 +52,7 @@ const (
 	TExit          Type = 6 // Exit: primary command exited; guest is shutting down
 	TShutdownDone  Type = 7 // ShutdownDone: sent right before power off
 	TFreezeResult  Type = 8 // FreezeResult: answers Freeze and Thaw, or reports a timed-out thaw
+	TReport        Type = 9 // Report: a bounded progress/result string from the guest
 
 	// Control: host -> guest
 	TClaim    Type = 20 // Claim
@@ -89,6 +86,17 @@ type Hello struct {
 	Mounts  []string `json:"mounts,omitempty"` // IDs of mounted disks
 	Frozen  []string `json:"frozen,omitempty"` // IDs of frozen disks
 	Exit    *Exit    `json:"exit,omitempty"`
+	// Report is the last report the guest accepted, so a reconnecting
+	// runtime does not lose it.
+	Report *Report `json:"report,omitempty"`
+}
+
+// Report is one bounded string a workload submitted to the guest's loopback
+// report endpoint. Seq increases by one for every accepted report.
+type Report struct {
+	Seq  uint64    `json:"seq"`
+	Text string    `json:"text"`
+	Time time.Time `json:"time"`
 }
 
 type Claim struct {

@@ -91,9 +91,6 @@ func startProxy(t *testing.T, cfg Config) *runningProxy {
 		p.stop(t)
 	})
 	sockets := []string{cfg.SocketPath}
-	if cfg.Gateway != nil {
-		sockets = append(sockets, cfg.Gateway.SocketPath)
-	}
 	deadline := time.After(5 * time.Second)
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()

@@ -177,10 +177,14 @@ func TestDurableSaveFlow(t *testing.T) {
 	}
 
 	// Mirror the runtime.
-	e.observe(pod.Name, podapi.Observed{Phase: podapi.PhaseRunning, ClaimID: w.AttachmentID, Sessions: 2})
+	e.observe(pod.Name, podapi.Observed{Phase: podapi.PhaseRunning, ClaimID: w.AttachmentID, Sessions: 2,
+		Report: &podapi.Report{Seq: 1, Text: "halfway"}})
 	e.run(e.blip, ns, "dev")
 	if b = e.getBlip("dev"); b.Status.Sessions != 2 {
 		t.Errorf("sessions %d", b.Status.Sessions)
+	}
+	if r := b.Status.Report; r == nil || r.Seq != 1 || r.Text != "halfway" {
+		t.Fatalf("report %+v", r)
 	}
 	e.observe(pod.Name, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Code: 0, Reason: "Completed"}})
 	e.run(e.blip, ns, "dev")
@@ -188,6 +192,9 @@ func TestDurableSaveFlow(t *testing.T) {
 	expectPhase(t, b, v1.BlipSaving, "Completed")
 	if b.Status.ExitCode == nil || *b.Status.ExitCode != 0 || e.podGone(pod.Name) {
 		t.Fatalf("saving status %+v", b.Status)
+	}
+	if r := b.Status.Report; r == nil || r.Seq != 1 {
+		t.Fatalf("report was not retained after exit: %+v", r)
 	}
 
 	// Seal, replicate, commit.

@@ -44,23 +44,10 @@ type Config struct {
 	// not scoped (compatibility for direct local runs and unit tests).
 	PodName      string
 	PodNamespace string
-	// Gateway, when non-nil, adds a second listener that proxies to a fixed
-	// cluster gateway and injects its own projected service account token.
-	Gateway *GatewayConfig
-}
-
-// GatewayConfig configures the guest-to-gateway HTTPS proxy.
-type GatewayConfig struct {
-	SocketPath string
-	Address    string // host:port
-	ServerName string // optional TLS server name; default host part of Address
-	CAFile     string // optional; empty means system roots
-	TokenFile  string
 }
 
 // ConfigFromEnv uses the in-cluster API endpoint and explicitly projected
-// service account files. BLIP_DIR defaults to /run/blip. The gateway listener
-// is enabled when BLIP_GATEWAY_ADDRESS is non-empty.
+// service account files. BLIP_DIR defaults to /run/blip.
 func ConfigFromEnv() (Config, error) {
 	host := os.Getenv("KUBERNETES_SERVICE_HOST")
 	port := os.Getenv("KUBERNETES_SERVICE_PORT")
@@ -86,19 +73,6 @@ func ConfigFromEnv() (Config, error) {
 	if cfg.PodName != "" && (!validPodIdentity(cfg.PodName) || !validPodIdentity(cfg.PodNamespace)) {
 		return Config{}, errors.New("invalid POD_NAME or POD_NAMESPACE")
 	}
-	if gatewayAddress := os.Getenv("BLIP_GATEWAY_ADDRESS"); gatewayAddress != "" {
-		gatewayToken := os.Getenv("BLIP_GATEWAY_TOKEN_FILE")
-		if gatewayToken == "" {
-			return Config{}, errors.New("gateway address is set but BLIP_GATEWAY_TOKEN_FILE is empty")
-		}
-		cfg.Gateway = &GatewayConfig{
-			SocketPath: podapi.VsockListenerPath(dir, wire.GatewayPort),
-			Address:    gatewayAddress,
-			ServerName: os.Getenv("BLIP_GATEWAY_SERVER_NAME"),
-			CAFile:     os.Getenv("BLIP_GATEWAY_CA_FILE"),
-			TokenFile:  gatewayToken,
-		}
-	}
 	return cfg, nil
 }
 
@@ -114,78 +88,45 @@ func apiAddress(host, port string) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
-// Run serves cfg.SocketPath, and cfg.Gateway.SocketPath when a gateway is
-// configured, with mode 0600. Cancellation stops new requests, cancels
-// upstream requests, and closes all streams, including hijacked upgrade
-// connections. A normal context cancellation returns nil.
+// Run serves cfg.SocketPath with mode 0600. Cancellation stops new requests,
+// cancels upstream requests, and closes all streams, including hijacked
+// upgrade connections. A normal context cancellation returns nil.
 func Run(ctx context.Context, cfg Config) error {
 	if ctx.Err() != nil {
 		return nil
-	}
-	type listenerConfig struct {
-		socket  string
-		handler http.Handler
 	}
 	proxy, transport, err := newProxy(cfg)
 	if err != nil {
 		return err
 	}
 	defer transport.CloseIdleConnections()
-	listeners := []listenerConfig{{socket: cfg.SocketPath, handler: proxy}}
-	if cfg.Gateway != nil {
-		gatewayProxy, gatewayTransport, err := newGatewayProxy(*cfg.Gateway)
-		if err != nil {
-			return err
-		}
-		defer gatewayTransport.CloseIdleConnections()
-		listeners = append(listeners, listenerConfig{socket: cfg.Gateway.SocketPath, handler: gatewayProxy})
-	}
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	servers := make([]*proxyServer, 0, len(listeners))
-	for _, listener := range listeners {
-		server, err := newProxyServer(serveCtx, listener.socket, listener.handler)
-		if err != nil {
-			for _, started := range servers {
-				started.close()
-			}
-			return err
-		}
-		servers = append(servers, server)
+	server, err := newProxyServer(serveCtx, cfg.SocketPath, proxy)
+	if err != nil {
+		return err
 	}
-	defer func() {
-		for _, server := range servers {
-			server.close()
-		}
-	}()
-	done := make(chan error, len(servers))
-	for _, server := range servers {
-		go func(server *proxyServer) { done <- server.server.Serve(server.tracked) }(server)
-	}
+	defer server.close()
+	done := make(chan error, 1)
+	go func() { done <- server.server.Serve(server.tracked) }()
 	var firstErr error
 	cancelled := false
 	select {
 	case firstErr = <-done:
+		// Serve returned on its own; cancel handlers so watches also end.
+		cancel()
 	case <-ctx.Done():
 		cancelled = true
 	}
-	// Stop both listeners when either one fails and cancel handlers so that
-	// watches and upstream upgrades on the healthy listener also end.
-	cancel()
-	for _, server := range servers {
-		server.shutdown()
-	}
-	received := 0
-	if !cancelled {
-		received = 1
-	}
-	for ; received < len(servers); received++ {
-		if err := <-done; firstErr == nil && err != nil {
-			firstErr = err
-		}
-	}
+	server.shutdown()
 	if cancelled {
 		return nil
+	}
+	if firstErr == nil {
+		select {
+		case firstErr = <-done:
+		default:
+		}
 	}
 	return firstErr
 }
@@ -228,18 +169,15 @@ func (s *proxyServer) close() {
 	s.cleanup()
 }
 
-// upstreamOptions describes a fixed HTTPS upstream. Both the Kubernetes API
-// proxy and the gateway proxy use it so their transport, rewrite, token and
-// error behavior cannot drift apart.
+// upstreamOptions describes a fixed HTTPS upstream.
 type upstreamOptions struct {
-	address     string // validated host:port
-	serverName  string // TLS SNI; empty means the URL host
-	hostHeader  string // outbound Host header
-	caFile      string
-	caLabel     string // error text for CA read/parse failures
-	systemRoots bool   // use system roots when caFile is empty
-	tokenFile   string
-	errorBody   string
+	address    string // validated host:port
+	serverName string // TLS SNI; empty means the URL host
+	hostHeader string // outbound Host header
+	caFile     string
+	caLabel    string // error text for CA read/parse failures
+	tokenFile  string
+	errorBody  string
 }
 
 func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
@@ -272,59 +210,8 @@ func newProxy(cfg Config) (http.Handler, *http.Transport, error) {
 	return handler, transport, nil
 }
 
-func newGatewayProxy(cfg GatewayConfig) (http.Handler, *http.Transport, error) {
-	host, port, err := net.SplitHostPort(cfg.Address)
-	if err != nil {
-		return nil, nil, errors.New("invalid gateway address")
-	}
-	address, err := apiAddress(host, port)
-	if err != nil {
-		return nil, nil, err
-	}
-	serverName := cfg.ServerName
-	if serverName == "" {
-		serverName = host
-	}
-	if err := validateServerName(serverName); err != nil {
-		return nil, nil, err
-	}
-	return newUpstreamProxy(upstreamOptions{
-		address:     address,
-		serverName:  serverName,
-		hostHeader:  gatewayHostHeader(serverName, port),
-		caFile:      cfg.CAFile,
-		caLabel:     "gateway CA",
-		systemRoots: true,
-		tokenFile:   cfg.TokenFile,
-		errorBody:   "gateway unavailable",
-	})
-}
-
-func validateServerName(name string) error {
-	if name == "" || strings.ContainsAny(name, "/\\@?#[]") || (strings.Contains(name, ":") && net.ParseIP(name) == nil) {
-		return errors.New("invalid gateway server name")
-	}
-	for _, r := range name {
-		if r <= ' ' || r > '~' {
-			return errors.New("invalid gateway server name")
-		}
-	}
-	return nil
-}
-
-func gatewayHostHeader(serverName, port string) string {
-	host := serverName
-	if ip := net.ParseIP(serverName); ip != nil && ip.To4() == nil {
-		host = "[" + serverName + "]"
-	}
-	if port == "443" {
-		return host
-	}
-	return net.JoinHostPort(serverName, port)
-}
-
 func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error) {
-	roots, err := certPool(cfg.caFile, cfg.caLabel, cfg.systemRoots)
+	roots, err := certPool(cfg.caFile, cfg.caLabel)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -381,15 +268,7 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error
 	return handler, transport, nil
 }
 
-func certPool(caFile, label string, systemRoots bool) (*x509.CertPool, error) {
-	if caFile == "" && systemRoots {
-		roots, err := x509.SystemCertPool()
-		if err != nil || roots == nil {
-			// A nil or unreadable system pool is still a safe, empty trust store.
-			return x509.NewCertPool(), nil
-		}
-		return roots, nil
-	}
+func certPool(caFile, label string) (*x509.CertPool, error) {
 	ca, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", label, err)

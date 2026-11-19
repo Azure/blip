@@ -472,6 +472,25 @@ spec:
                 type: string
               reason:
                 type: string
+              report:
+                description: |-
+                  Report is the last report the workload submitted through
+                  BLIP_REPORT_URL. It is retained after the pod is gone.
+                properties:
+                  seq:
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  text:
+                    maxLength: 1024
+                    type: string
+                  time:
+                    format: date-time
+                    type: string
+                required:
+                - seq
+                - text
+                type: object
               rootAttachmentID:
                 description: RootAttachmentID is the writer attachment of a durable
                   root.

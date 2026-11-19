@@ -112,8 +112,7 @@ Pod as node-local, replicated, encrypted block storage.
 ### API (`blip.dev/v1alpha1`)
 
 - **`BlipPool`** — VM shape (CPUs, memory), `warmCount`/`maxCount`, node selector,
-  service account, egress policy, and an optional fixed-upstream HTTPS gateway
-  proxy sidecar. This gateway is a network proxy, not a login service.
+  service account, and egress policy.
 - **`BlipState`** — one durable ext4 filesystem. Provisioning is immutable:
   `image` (OCI image converted to ext4), `copyFrom`, `size`, `replicas` (default
   3), `nodeSelector`. `mounts` and `runtime` persist across executions.
@@ -184,18 +183,17 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
   internet plus cluster DNS and denies private/LAN ranges and metadata.
 - Writes complete `desired.json`/`observed.json` snapshots and reconciles guest
   claims, mounts, freeze requests, and shutdown.
-- The `api-proxy` native sidecar holds the projected service-account token (and
-  the pool gateway's optional token) and proxies the guest's loopback ports 8001
-  (Kubernetes API) and 8002 (the pool's HTTPS gateway proxy) over vsock to
-  HTTPS upstreams. It strips caller identity headers and scopes reads to the
+- The `api-proxy` native sidecar holds the projected service-account token and
+  proxies the guest's loopback port 8001 (Kubernetes API) over vsock to the
+  HTTPS API server. It strips caller identity headers and scopes reads to the
   Blip's owner.
 
 ### Guest (`blip-guest`)
 
 - PID 1 in the initramfs: reads its config disk, mounts pseudo-filesystems, loads
   modules, configures `eth0` over rtnetlink, and serves the framed vsock
-  protocol on port 1024 (control) and 1025 (sessions), with loopback relays to
-  the API proxy and the pool gateway proxy.
+  protocol on port 1024 (control) and 1025 (sessions), with a loopback relay
+  to the API proxy and a report endpoint on 127.0.0.1:8002.
 - Claims the root ext4 filesystem, chroots into it, resolves users/groups from
   the image's `/etc/passwd` and `/etc/group`, runs processes in a cgroup, and
   supports PTYs, multiple command sessions, signals, and window resize. Each
@@ -203,6 +201,10 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 - Uses `FIFREEZE`/`FITHAW` with a 90s auto-thaw for live snapshots.
 - Writes `/run/blip/kubeconfig` pointing at the loopback API proxy; the proxy
   injects the real token, so no credential enters the workload filesystem.
+- Serves a report endpoint on `127.0.0.1:8002`, exposed to the command as
+  `BLIP_REPORT_URL`. A workload POSTs up to 1 KiB of UTF-8 text and receives
+  `{"seq": n}`; the text becomes `status.report` on the Blip and survives the
+  pod. Reports are spaced at least 10 seconds apart and are never coalesced.
 
 ### CLI
 

@@ -214,6 +214,9 @@ func (a *app) gatherOne(ctx context.Context, c *Clients, b *v1alpha1.Blip, f *ga
 		line += " " + b.Status.FinishTime.Sub(b.Status.StartTime.Time).Round(time.Second).String()
 	}
 	fmt.Fprintln(a.env.Out, line)
+	if b.Status.Report != nil {
+		fmt.Fprintf(a.env.Out, "  report: %s\n", strings.ReplaceAll(b.Status.Report.Text, "\n", " "))
+	}
 
 	var errs []error
 	retained := false

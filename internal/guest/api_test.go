@@ -182,26 +182,6 @@ func TestGatewayForwarderStream(t *testing.T) {
 	}
 }
 
-func TestGatewayForwarderFailureBlocksClaim(t *testing.T) {
-	g := &Guest{}
-	claim := wire.Claim{ID: "root"}
-	if err := g.doClaim(claim); err != errNotInit {
-		t.Fatalf("claim without gateway = %v, want %v", err, errNotInit)
-	}
-	p, err := startForwarder("gateway", 0, func() (apiStream, error) { return nil, errors.New("unused") })
-	if err != nil {
-		t.Fatal(err)
-	}
-	g.gateway = p
-	p.Close()
-	if err := g.doClaim(claim); err == nil || !strings.Contains(err.Error(), "gateway forwarding is unavailable") {
-		t.Fatalf("claim with closed gateway = %v", err)
-	}
-	if g.claim != nil {
-		t.Fatal("claim accepted without a working gateway listener")
-	}
-}
-
 func TestAPIForwarderCloseInterruptsStreams(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {

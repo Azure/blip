@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/Azure/blip/internal/atomicfile"
 	"github.com/Azure/blip/internal/netpolicy"
@@ -48,6 +49,14 @@ const (
 	// connect and write "CONNECT <port>\n" to reach a guest port.
 	VsockSocket = "vsock/vsock.sock"
 	APISocket   = "ch-api.sock"
+
+	// ReportEnv names the guest loopback report endpoint. A workload POSTs
+	// bounded UTF-8 text here to publish progress into Blip status.
+	ReportEnv = "BLIP_REPORT_URL"
+	// ReportURL is the fixed guest loopback report endpoint.
+	ReportURL = "http://127.0.0.1:8002/report"
+	// MaxReportBytes bounds one report body.
+	MaxReportBytes = 1024
 )
 
 // Desired is written by the node agent.
@@ -138,6 +147,16 @@ type Observed struct {
 	Error string `json:"error,omitempty"`
 	// Frozen lists the disk IDs from Desired.Freeze that are frozen now.
 	Frozen []string `json:"frozen,omitempty"`
+	// Report is the last report the workload submitted through the guest's
+	// loopback report endpoint.
+	Report *Report `json:"report,omitempty"`
+}
+
+// Report is a bounded string a workload submitted while it ran.
+type Report struct {
+	Seq  uint64    `json:"seq"`
+	Text string    `json:"text"`
+	Time time.Time `json:"time"`
 }
 
 type DiskStatus struct {

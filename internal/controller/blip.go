@@ -840,6 +840,10 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Res
 	}
 	b.Status.Sessions = int32(obs.Sessions)
 	b.Status.Message = obs.Error
+	if obs.Report != nil && (b.Status.Report == nil || int64(obs.Report.Seq) > b.Status.Report.Seq) {
+		t := metav1.NewTime(obs.Report.Time)
+		b.Status.Report = &v1.BlipReport{Seq: int64(obs.Report.Seq), Text: obs.Report.Text, Time: &t}
+	}
 	if obs.Exit != nil {
 		if obs.Exit.Reason != ReasonStopped {
 			code := int32(obs.Exit.Code)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,7 +46,9 @@ type Guest struct {
 	reaper        *reaper
 	kubeNamespace string
 	api           *apiForwarder
-	gateway       *apiForwarder
+	reporter      *reporter
+	reportServer  *http.Server
+	shutdownCh    chan struct{}
 
 	// startProcess replaces startProc in tests, which run outside the guest
 	// and cannot chroot or start a workload. Production leaves it nil.
@@ -81,14 +84,15 @@ type mount struct {
 
 func newGuest(root, cgroup string) *Guest {
 	g := &Guest{
-		root:     root,
-		cgroup:   cgroup,
-		cgroupFD: -1,
-		reaper:   newReaper(),
-		mounts:   map[string]*mount{},
-		frozen:   map[string]*frozenFS{},
-		sessions: map[string]*session{},
-		openIDs:  map[string]*openRecord{},
+		root:       root,
+		cgroup:     cgroup,
+		cgroupFD:   -1,
+		reaper:     newReaper(),
+		mounts:     map[string]*mount{},
+		frozen:     map[string]*frozenFS{},
+		sessions:   map[string]*session{},
+		openIDs:    map[string]*openRecord{},
+		shutdownCh: make(chan struct{}),
 	}
 	if fd, err := unix.Open(cgroup, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0); err == nil {
 		g.cgroupFD = fd
@@ -128,12 +132,9 @@ func Main() {
 			powerOff()
 		}
 	}
-	if cfg.GatewayLoopbackPort > 0 {
-		g.gateway, err = startForwarder("gateway", cfg.GatewayLoopbackPort, dialHost(wire.GatewayPort))
-		if err != nil {
-			log.Printf("listen gateway: %v", err)
-			powerOff()
-		}
+	if err := g.startReporter(); err != nil {
+		log.Printf("listen report endpoint: %v", err)
+		powerOff()
 	}
 	ctl, err := listenVsock(wire.ControlPort)
 	if err != nil {
@@ -172,6 +173,7 @@ func (g *Guest) helloLocked() wire.Hello {
 	}
 	sort.Strings(h.Mounts)
 	h.Frozen = g.frozenIDs()
+	h.Report = g.lastReportLocked()
 	return h
 }
 
@@ -310,9 +312,6 @@ func (g *Guest) doClaim(m wire.Claim) error {
 	}
 	if g.kubeNamespace != "" && (g.api == nil || !g.api.ready()) {
 		return errors.New("Kubernetes API forwarding is unavailable")
-	}
-	if g.gateway != nil && !g.gateway.ready() {
-		return errors.New("gateway forwarding is unavailable")
 	}
 	if !isInit() {
 		return errNotInit
@@ -526,6 +525,9 @@ func (g *Guest) shutdown() {
 		return
 	}
 	g.stopping = true
+	if g.shutdownCh != nil {
+		close(g.shutdownCh)
+	}
 	// Held output pumps must not keep a process blocked when the VM is
 	// going away; stopWork below would otherwise wait on a process that
 	// cannot write its output anywhere.
@@ -539,11 +541,9 @@ func (g *Guest) shutdown() {
 	g.mu.Unlock()
 	log.Printf("shutting down")
 	stopWork(g.cgroup, stopGrace)
+	g.stopReporter()
 	if g.api != nil {
 		g.api.Close()
-	}
-	if g.gateway != nil {
-		g.gateway.Close()
 	}
 	g.mu.Lock()
 	err := g.unmountAllLocked()

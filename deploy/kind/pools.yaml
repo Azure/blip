@@ -32,12 +32,3 @@ spec:
   warmCount: 2
   nodeSelector:
     blip.dev/node-pool: default
-  # Optional fixed-upstream HTTPS proxy from the guest loopback to a cluster
-  # gateway. Requires serviceAccountName. When caConfigMap is omitted, the
-  # system trust store verifies the gateway.
-  # gateway:
-  #   address: envoy.envoy-gateway-system.svc:443
-  #   serverName: gateway.example.com
-  #   caConfigMap: gateway-ca
-  #   audience: blip-gateway
-  #   loopbackPort: 8002

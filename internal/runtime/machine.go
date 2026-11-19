@@ -30,6 +30,7 @@ type Machine struct {
 	order                                      []string
 	sessions                                   int
 	exit                                       *podapi.Exit
+	report                                     *podapi.Report
 	errMsg                                     string
 	sigterm, shutdownSent, shutdownDone        bool
 	stopSince                                  time.Time
@@ -223,6 +224,9 @@ func (m *Machine) control(now time.Time, typ wire.Type, payload []byte) []Effect
 		if h.Exit != nil {
 			m.recordExit(now, *h.Exit)
 		}
+		if h.Report != nil && (m.report == nil || h.Report.Seq > m.report.Seq) {
+			m.report = &podapi.Report{Seq: h.Report.Seq, Text: h.Report.Text, Time: h.Report.Time}
+		}
 		if h.ClaimID != "" {
 			m.claimID, m.rootInVM = h.ClaimID, true
 		}
@@ -314,6 +318,11 @@ func (m *Machine) control(now time.Time, typ wire.Type, payload []byte) []Effect
 		var ex wire.Exit
 		if wire.Decode(payload, &ex) == nil {
 			m.recordExit(now, ex)
+		}
+	case wire.TReport:
+		var r wire.Report
+		if wire.Decode(payload, &r) == nil && r.Text != "" && (m.report == nil || r.Seq > m.report.Seq) {
+			m.report = &podapi.Report{Seq: r.Seq, Text: r.Text, Time: now}
 		}
 	case wire.TShutdownDone:
 		var sd wire.ShutdownDone
@@ -529,6 +538,7 @@ func (m *Machine) Reconcile(now time.Time) []Effect {
 			e := m.disks[mount.ID]
 			e.waiting, e.waitType, e.waitSince = true, wire.TMountResult, now
 		}
+		m.report = nil
 		effects = append(effects, m.send(wire.TClaim, wire.Claim{
 			ID: c.Root.ID, Serial: diskSerial(c.Root), Hostname: c.BlipName,
 			Command: append([]string(nil), c.Command...), TTY: c.TTY, Env: append([]string(nil), c.Env...), WorkingDir: c.WorkingDir,
@@ -747,6 +757,10 @@ func (m *Machine) Observed() podapi.Observed {
 	if m.exit != nil {
 		ex := *m.exit
 		o.Exit = &ex
+	}
+	if m.report != nil {
+		r := *m.report
+		o.Report = &r
 	}
 	for _, id := range m.desired.Freeze {
 		if m.frozen[id] {

@@ -30,8 +30,6 @@ type Config struct {
 	Options  []string `json:"options,omitempty"` // resolv.conf options, e.g. ndots:5
 	// KubeNamespace enables the credential-free loopback Kubernetes API.
 	KubeNamespace string `json:"kubeNamespace,omitempty"`
-	// GatewayLoopbackPort enables the loopback forwarder to the gateway proxy.
-	GatewayLoopbackPort int `json:"gatewayLoopbackPort,omitempty"`
 }
 
 // EncodeConfig returns the config disk image for c.

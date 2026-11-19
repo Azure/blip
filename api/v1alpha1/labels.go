@@ -3,7 +3,7 @@ package v1alpha1
 import "strings"
 
 // Labels, annotations, and the finalizer shared by every component. Everything
-// the controller, node agent, CLI, and gateway agree on lives here so a rename
+// the controller, node agent, and CLI agree on lives here so a rename
 // cannot drift between packages.
 const (
 	LabelPool             = "blip.dev/pool"

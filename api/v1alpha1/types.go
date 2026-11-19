@@ -36,8 +36,6 @@ func init() {
 
 // BlipPoolSpec describes a VM shape and how many warm VMs to keep. Pools are
 // image independent: a warm VM has no root disk until it is claimed.
-//
-// +kubebuilder:validation:XValidation:rule="!has(self.gateway) || (has(self.serviceAccountName) && size(self.serviceAccountName) > 0)",message="gateway requires serviceAccountName"
 type BlipPoolSpec struct {
 	// +kubebuilder:validation:Enum=kvm
 	// +kubebuilder:default=kvm
@@ -69,51 +67,6 @@ type BlipPoolSpec struct {
 	// non-public ranges denied, and cluster DNS (kube-dns) allowed. An
 	// explicitly empty policy denies all egress. Changes apply to running blips.
 	Network *NetworkPolicy `json:"network,omitempty"`
-	// Gateway configures a fixed-upstream HTTPS proxy from the guest loopback
-	// to a cluster gateway. It requires ServiceAccountName. The gateway
-	// credential never enters the guest.
-	Gateway *GatewaySpec `json:"gateway,omitempty"`
-}
-
-// GatewaySpec configures a gateway reachable from the pod network.
-//
-// +kubebuilder:validation:XValidation:rule="!has(self.loopbackPort) || self.loopbackPort != 8001",message="8001 is reserved for the Kubernetes API proxy"
-type GatewaySpec struct {
-	// Address is the gateway host and port, for example
-	// envoy.envoy-gateway-system.svc:443. It is dialed from the sidecar's pod
-	// network namespace. The host is a DNS name, an IPv4 address, or a
-	// bracketed IPv6 address; the port must be between 1 and 65535. Schemes,
-	// paths, user info, and whitespace are rejected.
-	// +kubebuilder:validation:MinLength=3
-	// +kubebuilder:validation:MaxLength=259
-	// +kubebuilder:validation:Pattern=`^(\[[0-9A-Fa-f:.]+\]|([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*[.]?):([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$`
-	Address string `json:"address"`
-	// ServerName is the TLS server name used for verification and SNI. It
-	// defaults to the host part of Address. It must be a DNS name or an IP
-	// address, without a scheme, port, path, or brackets. Set it when Address
-	// is an IP or the certificate name differs from the dialed host.
-	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:XValidation:rule="size(self) == 0 || isIP(self) || self.matches('^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*[.]?$')",message="serverName must be a DNS name or IP address"
-	ServerName string `json:"serverName,omitempty"`
-	// CAConfigMap names a ConfigMap in the pool namespace with a ca.crt key.
-	// When omitted, the system trust store verifies the gateway.
-	CAConfigMap string `json:"caConfigMap,omitempty"`
-	// Audience is the audience of the projected gateway token. The gateway
-	// should validate this audience. Kubernetes API server audiences are
-	// rejected: a gateway token with one of them would authenticate to the API
-	// server. Non-API audiences are allowed. Custom API audiences remain the
-	// cluster admin's responsibility, so do not add them here.
-	// +kubebuilder:default=blip-gateway
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=1024
-	// +kubebuilder:validation:XValidation:rule="!self.trim().lowerAscii().matches('^(https?://)?kubernetes[.]default[.]svc([.]cluster[.]local)?[.]?(:[0-9]+)?/?$')",message="audience must not be a Kubernetes API server audience"
-	Audience string `json:"audience,omitempty"`
-	// LoopbackPort is the guest loopback TCP port for this gateway. 8001 is
-	// reserved for the Kubernetes API proxy.
-	// +kubebuilder:default=8002
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=65535
-	LoopbackPort int32 `json:"loopbackPort,omitempty"`
 }
 
 type BlipPoolStatus struct {
@@ -570,6 +523,19 @@ type BlipStatus struct {
 	// boots a VM pinned to that node so the Blip does not start on a
 	// remote clone.
 	Locality *Locality `json:"locality,omitempty"`
+	// Report is the last report the workload submitted through
+	// BLIP_REPORT_URL. It is retained after the pod is gone.
+	Report *BlipReport `json:"report,omitempty"`
+}
+
+// BlipReport is one bounded progress or result string published by a
+// workload. Seq increases for every accepted report and never decreases.
+type BlipReport struct {
+	// +kubebuilder:validation:Minimum=1
+	Seq int64 `json:"seq"`
+	// +kubebuilder:validation:MaxLength=1024
+	Text string       `json:"text"`
+	Time *metav1.Time `json:"time,omitempty"`
 }
 
 // Locality records the node a pending Blip prefers and whether it still
