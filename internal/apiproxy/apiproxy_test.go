@@ -277,6 +277,9 @@ func TestIdentityHeadersAndTokenRotation(t *testing.T) {
 			"Authorization", "Proxy-Authorization", "Impersonate-User", "Impersonate-Group", "Impersonate-Uid",
 			"Impersonate-Extra-Scopes", "Impersonate-Extra-A%2fb", "X-Remote-User", "X-Remote-Group", "X-Remote-Extra-Scopes",
 			"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-Port", "X-Real-IP", "Via",
+			"X-Auth-Request-User", "X-Auth-Request-Groups", "Remote-User", "Remote-Groups", "Remote-Email",
+			"Tailscale-User-Login", "Tailscale-User-Name", "Cf-Access-Authenticated-User-Email",
+			"Cf-Access-Jwt-Assertion", "X-Authentik-Username", "X-Ssl-Client-S-Dn", "Client-Cert", "X-Pomerium-Jwt-Assertion",
 		} {
 			req.Header.Set(key, "caller-controlled")
 		}

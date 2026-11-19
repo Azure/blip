@@ -308,13 +308,46 @@ func certPool(caFile, label string, systemRoots bool) (*x509.CertPool, error) {
 	return roots, nil
 }
 
+// identityHeaderPrefixes are headers through which an authenticating front
+// proxy asserts the caller's identity. The sidecar is the only proxy allowed
+// to speak for the workload, so none of these caller values may reach an
+// upstream: an upstream that trusts them would act as the caller.
+var identityHeaderPrefixes = []string{
+	"impersonate-",
+	"x-remote-",
+	"x-forwarded-",
+	"x-auth-request-", // oauth2-proxy / ingress-nginx auth_request
+	"remote-",         // Remote-User and friends from reverse proxies
+	"tailscale-user-", // Tailscale serve identity headers
+	"cf-access-authenticated-user-",
+	"cf-access-jwt-assertion",
+	"x-authentik-",  // authentik proxy outpost
+	"x-ssl-client-", // client-certificate assertions
+	"client-cert",
+	"x-pomerium-",
+}
+
+// identityHeaders are caller identity headers with fixed names.
+var identityHeaders = map[string]struct{}{
+	"authorization":       {},
+	"proxy-authorization": {},
+	"forwarded":           {},
+	"via":                 {},
+	"x-real-ip":           {},
+}
+
 func stripIdentity(headers http.Header) {
 	for key := range headers {
 		name := strings.ToLower(key)
-		if name == "authorization" || name == "proxy-authorization" ||
-			strings.HasPrefix(name, "impersonate-") || strings.HasPrefix(name, "x-remote-") ||
-			name == "forwarded" || name == "via" || name == "x-real-ip" || strings.HasPrefix(name, "x-forwarded-") {
+		if _, ok := identityHeaders[name]; ok {
 			delete(headers, key)
+			continue
+		}
+		for _, prefix := range identityHeaderPrefixes {
+			if strings.HasPrefix(name, prefix) {
+				delete(headers, key)
+				break
+			}
 		}
 	}
 }
