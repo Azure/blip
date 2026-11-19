@@ -272,7 +272,7 @@ func TestMountPathCRDRules(t *testing.T) {
 	if rule := ruleFor(t, path.XValidations, "path must have at most 255 components"); rule != componentCap {
 		t.Errorf("mount path component cap rule %q, want %q", rule, componentCap)
 	}
-	const reserved = "!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect'].exists(r, self.path == r || self.path.startsWith(r + '/') || r.startsWith(self.path + '/')) || (self.path.startsWith('/run/blip-collect/') && self.path.split('/').size() == 4 && has(self.blipUID) && self.blipUID != '' && (!has(self.writable) || !self.writable))"
+	const reserved = "!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect', '/var/run/blip', '/var/run/blip-collect'].exists(r, self.path == r || self.path.startsWith(r + '/') || r.startsWith(self.path + '/')) || (self.path.startsWith('/run/blip-collect/') && self.path.split('/').size() == 4 && has(self.blipUID) && self.blipUID != '' && (!has(self.writable) || !self.writable))"
 	if rule := ruleFor(t, mounts.Items.XValidations, "path must not be at, below, or above a guest-reserved path, except a read-only temporary collect mount"); rule != reserved {
 		t.Errorf("mount path reserved rule %q, want %q", rule, reserved)
 	}

@@ -209,14 +209,14 @@ func TestMountSourceDeletedBeforeEditLeavesNoIntent(t *testing.T) {
 			root, data := readyState("home"), readyState("data")
 			data.UID = "uid-old"
 			a := mountTestApp(t, root, data)
-			reads := 0
+			sourceReads := 0
 			a.c.Kube = interceptor.NewClient(a.c.Kube, interceptor.Funcs{
 				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if _, ok := obj.(*v1alpha1.BlipState); ok && key.Name == root.Name {
-						reads++
-						if reads == 3 {
-							// The third read is updateState's atomic
-							// re-read; the source vanishes in that window.
+					if _, ok := obj.(*v1alpha1.BlipState); ok && key.Name == data.Name {
+						sourceReads++
+						if sourceReads == 3 {
+							// mountSourceChanged's re-check races with a
+							// deletion of the source.
 							if err := c.Delete(ctx, data); err != nil {
 								return err
 							}
