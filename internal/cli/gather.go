@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -92,11 +93,22 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		fmt.Fprintln(a.env.Out, "no blips to gather")
 		return nil
 	}
+	var followWG sync.WaitGroup
+	followDone := map[string]chan struct{}{}
+	var followCancel context.CancelFunc
 	if f.follow {
-		fctx, cancel := context.WithCancel(ctx)
-		defer cancel()
+		var fctx context.Context
+		fctx, followCancel = context.WithCancel(ctx)
+		defer followCancel()
 		for _, b := range targets {
-			go a.follow(fctx, b.Name)
+			ch := make(chan struct{})
+			followDone[b.Name] = ch
+			followWG.Add(1)
+			go func(name string, ch chan struct{}) {
+				defer followWG.Done()
+				defer close(ch)
+				a.follow(fctx, name)
+			}(b.Name, ch)
 		}
 	}
 
@@ -107,6 +119,24 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		defer cancel()
 	}
 	done, errs := a.awaitTargets(waitCtx, f, targets)
+	if f.follow {
+		// Drain finished blips' replay before deleting them, then stop the
+		// followers still attached to running blips.
+		finished := make(map[string]bool, len(done))
+		for _, b := range done {
+			finished[b.Name] = true
+		}
+		for _, b := range targets {
+			if !finished[b.Name] {
+				continue
+			}
+			if ch, ok := followDone[b.Name]; ok {
+				<-ch
+			}
+		}
+		followCancel()
+		followWG.Wait()
+	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Name < done[j].Name })
 	for _, b := range done {
 		if err := a.gatherOne(ctx, c, b, f); err != nil {
@@ -250,25 +280,35 @@ func (a *app) gatherOne(ctx context.Context, c *Clients, b *v1alpha1.Blip, f *ga
 }
 
 // follow streams a blip's primary output until it exits, prefixing each line
-// with the blip's short name. Followers never block the command.
+// with the blip's short name. A blip that finished before the follower
+// attached still replays its retained output while its VM pod exists.
+// Followers never block the command; gather drains them before deleting.
 func (a *app) follow(ctx context.Context, name string) {
-	if _, err := a.waitRunning(ctx, name); err != nil {
-		return
-	}
-	b, err := a.getBlip(ctx, name)
-	if err != nil || v1alpha1.Finished(b) {
-		return
-	}
-	pod, err := podFor(b)
+	b, err := a.waitRunning(ctx, name)
 	if err != nil {
+		return
+	}
+	// The blip may have finished between the wait and the get below. A
+	// finished primary session stays replayable as long as the pod exists.
+	if b, err = a.getBlip(ctx, name); err != nil {
+		return
+	}
+	short := a.short(name)
+	pod := b.Status.Pod
+	if pod == "" {
+		if v1alpha1.Finished(b) {
+			a.progress("%s: output is no longer available (the VM pod is gone)", short)
+		}
 		return
 	}
 	s, err := a.openRetrying(ctx, name, pod, wire.Open{Mode: wire.OpenAttach, Session: wire.PrimarySession, Follow: true}, true)
 	if err != nil {
+		if v1alpha1.Finished(b) && ctx.Err() == nil {
+			a.progress("%s: output is no longer available: %v", short, err)
+		}
 		return
 	}
 	defer s.Close()
-	short := a.short(name)
 	out := &prefixWriter{out: a.env.Out, prefix: short + "|"}
 	errw := &prefixWriter{out: a.env.Err, prefix: short + "|"}
 	_, _ = s.Copy(out, errw, func(m string) { a.progress("%s: %s", short, m) })

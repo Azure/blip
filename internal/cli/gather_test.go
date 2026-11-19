@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/session/fakeguest"
+	"github.com/Azure/blip/internal/wire"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -162,5 +164,46 @@ func TestGatherCollectNeedsBlip(t *testing.T) {
 	code, _, errOut := h.run("", "gather", "w1", "--collect", "/out:./out")
 	if code != 1 || !strings.Contains(errOut, "only works inside") {
 		t.Fatalf("code %d: %s", code, errOut)
+	}
+}
+
+// A command can finish before gather starts following it. The guest keeps the
+// primary session's replay until the pod goes away, so gather must attach even
+// when the blip is already Succeeded.
+func TestGatherFollowReplaysFastFinishedBlip(t *testing.T) {
+	h := newHarness(t, finishedBlip("fast1", v1alpha1.BlipSucceeded, 0))
+	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
+		s.Stdout("FASTOUT1\n")
+		return wire.Exit{}
+	}
+	code, out, errOut := h.run("", "gather", "fast1", "--follow")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "FASTOUT1", "blip/fast1 Succeeded (exit 0)")
+	if !h.gone("fast1") {
+		t.Fatal("blip kept")
+	}
+	opens := h.guest.Opens()
+	if len(opens) != 1 || opens[0].Open.Mode != wire.OpenAttach ||
+		opens[0].Open.Session != wire.PrimarySession || !opens[0].Open.Follow {
+		t.Fatalf("opens = %+v", opens)
+	}
+}
+
+// When the pod is gone there is nothing left to replay; say so instead of
+// silently printing only the status line.
+func TestGatherFollowSaysFinishedOutputIsGone(t *testing.T) {
+	b := finishedBlip("gone", v1alpha1.BlipSucceeded, 0)
+	b.Status.Pod = ""
+	h := newHarness(t, b)
+	code, out, errOut := h.run("", "gather", "gone", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/gone Succeeded (exit 0)")
+	mustContain(t, errOut, "output is no longer available")
+	if !h.gone("gone") {
+		t.Fatal("blip kept")
 	}
 }
