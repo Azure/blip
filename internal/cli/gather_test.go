@@ -446,6 +446,43 @@ func TestGatherAllowsDistinctFilesIntoExistingDirectory(t *testing.T) {
 	}
 }
 
+// A file collected onto an existing directory is stored under its basename,
+// so a destination nested below that directory is not necessarily covered by
+// it. Model the effective write paths instead of the declared destinations:
+// a/file lands on out2/file and b/file on out2/sub/b.txt, which do not
+// collide.
+func TestGatherAllowsNestedFileDestinationUnderFileDestination(t *testing.T) {
+	root := withCollectMountRoot(t)
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/tree/a/file", "AAA\n", 0o644)
+	writeCollectFile(t, root, "alice.w1", "/home/dev/tree/b/file", "BBB\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.MkdirAll(filepath.Join(dir, "out2/sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := h.run("", "gather", "w1",
+		"--collect", "/home/dev/tree/a/file:./out2",
+		"--collect", "/home/dev/tree/b/file:./out2/sub/b.txt")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if got := readFile(t, filepath.Join(dir, "out2/file")); got != "AAA\n" {
+		t.Fatalf("out2/file = %q", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "out2/sub/b.txt")); got != "BBB\n" {
+		t.Fatalf("out2/sub/b.txt = %q", got)
+	}
+	if !h.gone("alice.w1") {
+		t.Fatal("blip kept")
+	}
+}
+
 func TestGatherCollectNeedsBlip(t *testing.T) {
 	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
 	code, _, errOut := h.run("", "gather", "w1", "--collect", "/out:./out")

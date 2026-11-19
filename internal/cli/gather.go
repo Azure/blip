@@ -178,7 +178,8 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 // operations share the caller's repository, so a branch name is a destination
 // too. The sources are not mounted yet, so this check cannot tell a file
 // source from a directory source; collect re-checks the effective writes
-// against the mounted sources before copying anything.
+// against the mounted sources before copying anything. Operations of the same
+// blip are left to collect, which can compare their effective paths exactly.
 func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) error {
 	if len(raw) == 0 {
 		return nil
@@ -188,7 +189,7 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 		return err
 	}
 	type use struct {
-		blip, source, dest, branch string
+		id, blip, source, dest, branch string
 	}
 	var seen, seenGit []use
 	for _, b := range done {
@@ -201,7 +202,7 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 			// The per-blip collect reports parse errors with its name.
 			continue
 		}
-		blip := a.short(b.Name)
+		blipID, blip := b.Name, a.short(b.Name)
 		for _, op := range parsed {
 			if op.git {
 				// Every git operation fetches into the caller's repository,
@@ -213,7 +214,7 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 						return fmt.Errorf("collect destination branch %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct BRANCH", op.branch, prev.blip, prev.source, blip, op.source)
 					}
 				}
-				seenGit = append(seenGit, use{blip: blip, source: op.source, branch: op.branch})
+				seenGit = append(seenGit, use{id: blipID, blip: blip, source: op.source, branch: op.branch})
 				continue
 			}
 			dst, err := resolvePath(op.dest)
@@ -226,6 +227,16 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 			}
 			dst = filepath.Clean(dst)
 			for _, prev := range seen {
+				// collect applies all of one blip's operations together and
+				// models each effective write after the sources are mounted,
+				// so it accepts distinct file paths under one destination
+				// and rejects a real collision before the first copy. Only
+				// operations from different blips need this conservative
+				// pre-mount comparison: an earlier blip has already been
+				// collected and deleted when a later one is checked.
+				if prev.id == blipID {
+					continue
+				}
 				if prev.dest == dst {
 					// Distinct basenames can share a destination. The
 					// gather check runs before any state is mounted, so it
@@ -244,7 +255,7 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 					return fmt.Errorf("collect destinations %s for blip %s (%s) and %s for blip %s (%s) overlap; add {name} or give each blip a distinct DEST", prev.dest, prev.blip, prev.source, dst, blip, op.source)
 				}
 			}
-			seen = append(seen, use{blip: blip, source: op.source, dest: dst})
+			seen = append(seen, use{id: blipID, blip: blip, source: op.source, dest: dst})
 		}
 	}
 	return nil
