@@ -431,6 +431,75 @@ func TestGatherRejectsDuplicateCollectDestinations(t *testing.T) {
 	}
 }
 
+// A destination that does not exist yet is created by the first blip, so two
+// blips writing different basenames there still collide: the first creates
+// DEST as a file and the second replaces it. gather must reject the pair
+// before either blip is collected or deleted.
+func TestGatherRejectsCrossBlipNewFileDestination(t *testing.T) {
+	root := withCollectMountRoot(t)
+	w1 := ownedBlip("alice.w1", "alice.w1")
+	w1.Status.Phase = v1alpha1.BlipSucceeded
+	w2 := ownedBlip("alice.w2", "alice.w2")
+	w2.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t,
+		ownedBlip("alice.box", "alice.home"), w1, w2,
+		readyState("alice.w1"), readyState("alice.w2"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/src/w1.txt", "ONE\n", 0o644)
+	writeCollectFile(t, root, "alice.w2", "/home/dev/src/w2.txt", "TWO\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	code, _, errOut := h.run("", "gather", "w1", "w2", "--collect", "/home/dev/src/{name}.txt:./out")
+	if code != 1 {
+		t.Fatalf("code %d, want 1: %s", code, errOut)
+	}
+	mustContain(t, errOut, "destination", "w1", "w2")
+	if _, err := os.Stat(filepath.Join(dir, "out")); !os.IsNotExist(err) {
+		t.Fatalf("a destination was written despite the collision: %v", err)
+	}
+	if h.gone("alice.w1") || h.gone("alice.w2") {
+		t.Fatal("blips were deleted despite the collision")
+	}
+}
+
+// An existing destination directory gives each file its own basename child,
+// so two blips collecting distinct files there do not collide.
+func TestGatherAllowsCrossBlipDistinctFilesIntoExistingDirectory(t *testing.T) {
+	root := withCollectMountRoot(t)
+	w1 := ownedBlip("alice.w1", "alice.w1")
+	w1.Status.Phase = v1alpha1.BlipSucceeded
+	w2 := ownedBlip("alice.w2", "alice.w2")
+	w2.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t,
+		ownedBlip("alice.box", "alice.home"), w1, w2,
+		readyState("alice.w1"), readyState("alice.w2"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/src/w1.txt", "ONE\n", 0o644)
+	writeCollectFile(t, root, "alice.w2", "/home/dev/src/w2.txt", "TWO\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir("out", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := h.run("", "gather", "w1", "w2", "--collect", "/home/dev/src/{name}.txt:./out")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if got := readFile(t, filepath.Join(dir, "out/w1.txt")); got != "ONE\n" {
+		t.Fatalf("w1.txt = %q", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "out/w2.txt")); got != "TWO\n" {
+		t.Fatalf("w2.txt = %q", got)
+	}
+	if !h.gone("alice.w1") || !h.gone("alice.w2") {
+		t.Fatal("blips kept")
+	}
+}
+
 // A file collected onto an existing directory is stored under its basename,
 // so a destination that looks distinct can be the same file. gather must
 // reject the pair before copying instead of letting the second overwrite the

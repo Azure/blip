@@ -244,12 +244,13 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 					continue
 				}
 				if prev.dest == dst {
-					// Distinct basenames can share a destination. The
-					// gather check runs before any state is mounted, so it
-					// cannot tell whether a source is a directory; collect
-					// re-checks the mounted sources in order and rejects a
-					// directory merge that would overwrite a sibling.
-					if filepath.Base(prev.source) != filepath.Base(op.source) {
+					// A file copied onto an existing directory is stored
+					// under its basename, so distinct basenames can share
+					// it. A destination that does not exist yet is created
+					// by the first operation: a file op makes DEST itself a
+					// file and a later file op replaces it, whatever the
+					// basenames, so only an existing directory is safe.
+					if filepath.Base(prev.source) != filepath.Base(op.source) && isExistingDir(dst) {
 						continue
 					}
 					return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, blip, op.source)
@@ -275,6 +276,14 @@ func (a *app) ownerSelector(selector string) string {
 		return selector
 	}
 	return selector + "," + v1alpha1.LabelOwner + "=" + a.owner
+}
+
+// isExistingDir reports whether path is already a directory. A destination
+// that does not exist (or is a file) is created or replaced by the first
+// operation that targets it.
+func isExistingDir(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
 }
 
 // gatherTargets resolves the blips named on the command line and the ones that
