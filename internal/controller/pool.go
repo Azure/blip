@@ -309,6 +309,12 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// a node is usable for health/placement purposes when it is an
 	// enrolled, incarnated, healthy BlipNode that is not draining.
 	usable := func(node string) bool { return node == "" || cl.usable(node, nil) }
+	// schedulable additionally checks that one of this pool's VM pods can
+	// actually land on the node: the pool selector, cordon, and taints.
+	// Preferring a "hot" node that the scheduler rejects only churns spares.
+	schedulable := func(node string) bool {
+		return node == "" || cl.schedulable(node, poolSelector(pool), pool.Spec.Tolerations)
+	}
 	// avoid holds every enrolled node a new VM must not use. A generic
 	// replacement is otherwise free to land on the dead node it replaces.
 	avoid := cl.avoidNodes()
@@ -459,7 +465,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 				}
 			} else {
 				status.Claimed++
-				if p.DeletionTimestamp == nil && p.Spec.NodeName != "" && usable(p.Spec.NodeName) {
+				if p.DeletionTimestamp == nil && p.Spec.NodeName != "" && schedulable(p.Spec.NodeName) {
 					hot[p.Spec.NodeName]++
 				}
 			}
@@ -628,7 +634,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			// the pool: maxCount is no reason to keep a spare on an idle
 			// node. Without this a warmCount==maxCount pool can never follow
 			// the node that runs VMs.
-			if node == "" {
+			if node == "" || !schedulable(node) {
 				break
 			}
 			if err := del(p); err != nil {

@@ -72,6 +72,37 @@ func (c *cluster) usable(name string, selector map[string]string) bool {
 	return labels.SelectorFromSet(selector).Matches(labels.Set(k.Labels))
 }
 
+// schedulable reports whether the scheduler could place a pod with selector and
+// tolerations on the node. usable checks enrollment and health, but not the
+// pod's selector, cordon, or taints, so a node can be usable while every pod
+// this pool builds is rejected there.
+func (c *cluster) schedulable(name string, selector map[string]string, tolerations []corev1.Toleration) bool {
+	if !c.usable(name, selector) {
+		return false
+	}
+	k := c.k8s[name]
+	if k.Spec.Unschedulable {
+		return false
+	}
+	for i := range k.Spec.Taints {
+		taint := k.Spec.Taints[i]
+		if taint.Effect != corev1.TaintEffectNoSchedule && taint.Effect != corev1.TaintEffectNoExecute {
+			continue
+		}
+		tolerated := false
+		for j := range tolerations {
+			if tolerations[j].ToleratesTaint(&taint) {
+				tolerated = true
+				break
+			}
+		}
+		if !tolerated {
+			return false
+		}
+	}
+	return true
+}
+
 // bad reports whether replicas on the node must be replaced.
 func (c *cluster) bad(name string) bool {
 	bn, k := c.nodes[name], c.k8s[name]
