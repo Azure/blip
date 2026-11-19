@@ -38,6 +38,9 @@ const (
 	// recentSeals is how many seal results are kept even when no Blip
 	// references them.
 	recentSeals = 8
+	// maxCopyChain bounds the copyFrom walk used to detect cycles. A real
+	// chain is far shorter; an unbounded one cannot make progress anyway.
+	maxCopyChain = 32
 )
 
 // StateReconciler drives BlipState versions: initial version, commits,
@@ -361,6 +364,54 @@ func joinMessages(msgs []string) string {
 	return strings.Join(out, "; ")
 }
 
+// copyChainCycle reports a self or cyclic copyFrom chain, or "" when the
+// chain is acyclic. A source with a committed version can serve a copy even
+// if its own provisioning history is cyclic, so the walk stops there.
+func (r *StateReconciler) copyChainCycle(ctx context.Context, st *v1.BlipState) (string, error) {
+	seen := map[string]bool{st.Name: true}
+	path := []string{st.Name}
+	name := st.Spec.CopyFrom
+	for depth := 0; name != ""; depth++ {
+		if depth >= maxCopyChain {
+			return fmt.Sprintf("copy source chain from %q is deeper than %d states", st.Name, maxCopyChain), nil
+		}
+		if seen[name] {
+			path = append(path, name)
+			return "copy source cycle: " + strings.Join(path, " -> "), nil
+		}
+		src := &v1.BlipState{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: st.Namespace, Name: name}, src)
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		seen[name] = true
+		path = append(path, name)
+		if src.Status.Committed != nil {
+			return "", nil
+		}
+		name = src.Spec.CopyFrom
+	}
+	return "", nil
+}
+
+// copySourceFailure reports why a copy source that has not committed cannot
+// serve, or "" while the copy should keep waiting for it.
+func copySourceFailure(src *v1.BlipState) string {
+	if src.Status.Phase != v1.StateFailed {
+		return ""
+	}
+	if src.Status.Message != "" {
+		return src.Status.Message
+	}
+	if src.Status.LastError != "" {
+		return src.Status.LastError
+	}
+	return "initialization failed"
+}
+
 // initialize resolves the source and plans the initial version.
 func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *cluster) (msg string, retry bool, err error) {
 	s := &st.Status
@@ -370,6 +421,20 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 	if st.Spec.Size != nil && st.Spec.Size.Sign() <= 0 {
 		s.Phase = v1.StateFailed
 		return fmt.Sprintf("size %s must be greater than 0", st.Spec.Size.String()), false, nil
+	}
+	if st.Spec.CopyFrom == st.Name {
+		s.Phase = v1.StateFailed
+		s.CopiedFrom = nil
+		s.Pending = nil
+		return fmt.Sprintf("copy source %q is the state itself", st.Name), false, nil
+	}
+	if cycle, err := r.copyChainCycle(ctx, st); err != nil {
+		return "", false, err
+	} else if cycle != "" {
+		s.Phase = v1.StateFailed
+		s.CopiedFrom = nil
+		s.Pending = nil
+		return cycle, false, nil
 	}
 	var minSize int64
 	var prefer []string
@@ -414,6 +479,9 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 			switch {
 			case src.DeletionTimestamp != nil:
 				return fmt.Sprintf("copy source %q is being deleted", src.Name), false, nil
+			case src.Status.Committed == nil && src.Status.Phase == v1.StateFailed:
+				s.Phase = v1.StateFailed
+				return fmt.Sprintf("copy source %q failed: %s", src.Name, copySourceFailure(src)), false, nil
 			case src.Status.Committed == nil:
 				return fmt.Sprintf("waiting for copy source %q to commit", src.Name), false, nil
 			case src.Status.Pending != nil:

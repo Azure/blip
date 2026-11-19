@@ -93,6 +93,88 @@ func TestStateInitialization(t *testing.T) {
 	}
 }
 
+func TestStateCopyFromSelfFails(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newState("self", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "self"
+		st.Spec.Replicas = 1
+	})
+	e.run(e.state, ns, "self")
+	st := e.getState("self")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil || st.Status.CopiedFrom != nil {
+		t.Fatalf("self copy not rejected: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "state itself") {
+		t.Fatalf("message %q does not explain the self copy", st.Status.Message)
+	}
+}
+
+func TestStateCopyCycleFails(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newState("a", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "b"
+		st.Spec.Replicas = 1
+	})
+	e.newState("b", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "a"
+		st.Spec.Replicas = 1
+	})
+	for _, name := range []string{"a", "b"} {
+		e.run(e.state, ns, name)
+		st := e.getState(name)
+		if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil || st.Status.CopiedFrom != nil {
+			t.Fatalf("copy cycle at %s not rejected: %+v", name, st.Status)
+		}
+		if !strings.Contains(st.Status.Message, "copy source cycle") {
+			t.Fatalf("message %q does not explain the cycle", st.Status.Message)
+		}
+	}
+}
+
+func TestStateCopyFromFailedSourceFails(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.create(&v1.BlipState{
+		ObjectMeta: metav1.ObjectMeta{Name: "src", Namespace: ns, Generation: 1},
+		Spec:       v1.BlipStateSpec{Replicas: 1},
+		Status: v1.BlipStateStatus{
+			Phase:   v1.StateFailed,
+			Message: "storage: disk broke",
+		},
+	})
+	e.newState("cp", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "src"
+		st.Spec.Replicas = 1
+	})
+	e.run(e.state, ns, "cp")
+	st := e.getState("cp")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("copy of failed source not rejected: %+v", st.Status)
+	}
+	for _, want := range []string{`copy source "src" failed`, "disk broke"} {
+		if !strings.Contains(st.Status.Message, want) {
+			t.Fatalf("message %q does not contain %q", st.Status.Message, want)
+		}
+	}
+}
+
+func TestStateAcyclicCopyWaits(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newState("base", func(st *v1.BlipState) { st.Spec.Replicas = 1 })
+	e.newState("cp", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "base"
+		st.Spec.Replicas = 1
+	})
+	e.run(e.state, ns, "cp")
+	st := e.getState("cp")
+	if st.Status.Phase != v1.StatePending || st.Status.Pending != nil || !strings.Contains(st.Status.Message, `waiting for copy source "base" to commit`) {
+		t.Fatalf("acyclic copy did not wait for its source: %+v", st.Status)
+	}
+}
+
 func TestCopySizeValidation(t *testing.T) {
 	const sourceSize = 10 << 30
 	srcSize := resource.MustParse("10Gi")
