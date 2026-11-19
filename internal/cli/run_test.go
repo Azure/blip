@@ -269,6 +269,30 @@ func TestRunKeepLeavesWorkspaceOwnedByNobody(t *testing.T) {
 	}
 }
 
+func TestRunKeepOwnsForkCopiesByRoot(t *testing.T) {
+	home := readyState("alice.home")
+	home.Spec.Mounts = []v1alpha1.Mount{{State: "alice.data", Path: "/data", Writable: true}}
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), home, readyState("alice.data"))
+	h.self = "alice.box"
+	if code, _, errOut := h.run("", "run", "--name", "w1", "--keep", "--ttl", "0", "--timeout", "0", "--", "true"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	root := h.state("alice.w1")
+	if len(root.OwnerReferences) != 0 {
+		t.Fatalf("durable root owner references %+v", root.OwnerReferences)
+	}
+	if len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0].State == "alice.data" {
+		t.Fatalf("fork mounts %+v", root.Spec.Mounts)
+	}
+	// The root owns its hidden copy, so deleting the root (the documented
+	// cleanup of a --keep workspace) also removes the copy.
+	child := h.state(root.Spec.Mounts[0].State)
+	refs := child.OwnerReferences
+	if len(refs) != 1 || refs[0].Kind != "BlipState" || refs[0].Name != "alice.w1" || refs[0].UID != root.UID {
+		t.Fatalf("copy owner references %+v", refs)
+	}
+}
+
 func TestRunLabelsAndNameCollision(t *testing.T) {
 	h := newHarness(t, readyState("base"))
 	if code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--label", "team=a", "--", "true"); code != 0 {
