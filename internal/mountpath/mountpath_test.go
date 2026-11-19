@@ -33,6 +33,19 @@ func TestValidate(t *testing.T) {
 		{"/etc/mtab/x", false},
 		{"/etc/os-release/x", false},
 		{"/etc/hostname", false},
+		// /etc/ld.so.cache and the stable base-system files are regular
+		// files in the dev image, so nothing can be mounted at or below
+		// them offline.
+		{"/etc/ld.so.cache", false},
+		{"/etc/ld.so.cache/x", false},
+		{"/etc/ld.so.conf/x", false},
+		{"/etc/bash.bashrc/x", false},
+		{"/etc/environment/x", false},
+		{"/etc/profile/x", false},
+		{"/etc/inputrc/x", false},
+		{"/etc/login.defs/x", false},
+		{"/etc/host.conf/x", false},
+		{"/etc/gai.conf/x", false},
 		// /var/run is the standard alias of /run, so a path below it that
 		// resolves into a reserved tree must be rejected offline. The alias
 		// itself resolves to /run, an ancestor of /run/blip, and the legal

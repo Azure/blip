@@ -147,7 +147,10 @@ spec:
                           ''/etc/group'', ''/etc/shadow'', ''/etc/gshadow'', ''/etc/hostname'',
                           ''/etc/hostid'', ''/etc/machine-id'', ''/etc/os-release'',
                           ''/etc/debian_version'', ''/etc/nsswitch.conf'', ''/etc/subuid'',
-                          ''/etc/subgid'', ''/etc/mtab''].exists(f, self == f || self.startsWith(f
+                          ''/etc/subgid'', ''/etc/ld.so.cache'', ''/etc/ld.so.conf'',
+                          ''/etc/bash.bashrc'', ''/etc/environment'', ''/etc/profile'',
+                          ''/etc/inputrc'', ''/etc/login.defs'', ''/etc/host.conf'',
+                          ''/etc/gai.conf'', ''/etc/mtab''].exists(f, self == f || self.startsWith(f
                           + ''/''))'
                     state:
                       description: State names a BlipState in the blip's namespace.

@@ -1660,7 +1660,12 @@ func TestMountAcceptsNewBelowBaseImageDirectorySymlink(t *testing.T) {
 // symlink or not a directory" on the next execution, so the CLI must not
 // report success or create a --new state for it.
 func TestMountRejectsBaseImageFilesOffline(t *testing.T) {
-	for _, path := range []string{"/etc/passwd/x", "/etc/group/x"} {
+	for _, path := range []string{
+		"/etc/passwd/x", "/etc/group/x", "/etc/ld.so.cache/x",
+		"/etc/ld.so.conf/x", "/etc/bash.bashrc/x", "/etc/environment/x",
+		"/etc/profile/x", "/etc/inputrc/x", "/etc/login.defs/x",
+		"/etc/host.conf/x", "/etc/gai.conf/x",
+	} {
 		t.Run(path, func(t *testing.T) {
 			h := newHarness(t, readyState("home"), readyState("data"))
 			code, _, errOut := h.run("", "mount", "data:"+path, "--root", "home")

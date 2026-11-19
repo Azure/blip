@@ -69,6 +69,14 @@ var ImageFiles = []string{
 	"/etc/hostname", "/etc/hostid", "/etc/machine-id",
 	"/etc/os-release", "/etc/debian_version", "/etc/nsswitch.conf",
 	"/etc/subuid", "/etc/subgid",
+	// The dynamic loader's cache and configuration are regular files in the
+	// Ubuntu/Debian dev image, as are these stable base-system files. This
+	// stays a short list of files every image ships, not every package
+	// file; image-specific and package-specific regular files remain a
+	// guest-side check.
+	"/etc/ld.so.cache", "/etc/ld.so.conf",
+	"/etc/bash.bashrc", "/etc/environment", "/etc/profile",
+	"/etc/inputrc", "/etc/login.defs", "/etc/host.conf", "/etc/gai.conf",
 	// /etc/mtab is a symlink to the proc mount table.
 	"/etc/mtab",
 }
