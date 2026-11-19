@@ -37,6 +37,10 @@ func (v *view) networkFor(pod *corev1.Pod, b *v1alpha1.Blip) (*network.Policy, e
 		poolPolicy = network.Default()
 	}
 	policySpec := b.Spec.Network
+	// The second layer is labelled by the object an operator must edit. A
+	// Blip without its own spec.network inherits the root state's policy, so
+	// a compile failure there is not a Blip network error.
+	blipLayer := "blip network"
 	if policySpec == nil {
 		root := v.stateByName[b.Namespace+"/"+b.Spec.State]
 		if root == nil {
@@ -44,9 +48,12 @@ func (v *view) networkFor(pod *corev1.Pod, b *v1alpha1.Blip) (*network.Policy, e
 		}
 		if root.Spec.Runtime != nil {
 			policySpec = root.Spec.Runtime.Network
+			if policySpec != nil {
+				blipLayer = "state network"
+			}
 		}
 	}
-	policy, err := network.Compile(b.Namespace, poolPolicy, policySpec, v.destinations)
+	policy, err := network.CompileNamed(b.Namespace, poolPolicy, policySpec, v.destinations, blipLayer)
 	if err != nil {
 		return denyNetwork(), err
 	}

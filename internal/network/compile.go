@@ -22,6 +22,13 @@ import (
 // The returned revision depends only on canonical compiled rules, not object
 // ordering or resource versions. Invalid input returns an empty, denying policy.
 func Compile(namespace string, pool, blip *v1alpha1.NetworkPolicy, destinations Destinations) (Policy, error) {
+	return CompileNamed(namespace, pool, blip, destinations, "blip network")
+}
+
+// CompileNamed is Compile with a diagnostic name for the Blip layer. The node
+// agent passes "state network" when the policy is inherited from a BlipState,
+// so an operator edits the object that actually holds the invalid rules.
+func CompileNamed(namespace string, pool, blip *v1alpha1.NetworkPolicy, destinations Destinations, blipLayer string) (Policy, error) {
 	c := compiler{namespace: namespace, destinations: destinations,
 		namespaceLabels: make(map[string]labels.Set), serviceSlices: make(map[string][]discoveryv1.EndpointSlice)}
 	for _, ns := range destinations.Namespaces {
@@ -39,7 +46,7 @@ func Compile(namespace string, pool, blip *v1alpha1.NetworkPolicy, destinations 
 	if blip != nil {
 		blipRules, err := c.layer(blip)
 		if err != nil {
-			return Policy{}, fmt.Errorf("blip network: %w", err)
+			return Policy{}, fmt.Errorf("%s: %w", blipLayer, err)
 		}
 		policy.Layers = append(policy.Layers, blipRules)
 	}

@@ -82,6 +82,41 @@ func TestNetworkPolicyBeforeRootReady(t *testing.T) {
 	}
 }
 
+// TestInheritedStateNetworkErrorNamesState guards the diagnostic for an
+// invalid policy inherited from spec.runtime.network: the Blip has no
+// spec.network, so the error must point at the state rather than claim the
+// Blip network is invalid.
+func TestInheritedStateNetworkErrorNamesState(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		blip  bool
+		label string
+	}{
+		{"inherited state", false, "state network"},
+		{"blip override", true, "blip network"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newView()
+			b, _ := durableBlip(v)
+			v.states[0].Spec.Runtime = &v1alpha1.RuntimeDefaults{Network: allowCIDR("invalid")}
+			if tt.blip {
+				b.Spec.Network = allowCIDR("invalid")
+			}
+			v.index()
+			_, err := v.networkFor(v.pods[pkey("p")], b)
+			if err == nil {
+				t.Fatal("invalid network policy was accepted")
+			}
+			if !strings.Contains(err.Error(), tt.label+":") {
+				t.Errorf("error %q does not name %q", err, tt.label)
+			}
+			if other := "blip network"; tt.label != other && strings.Contains(err.Error(), other) {
+				t.Errorf("error %q wrongly blames the Blip network", err)
+			}
+		})
+	}
+}
+
 func TestNetworkPolicyFailureRevokesGrantsAndPreservesDisks(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	v1alpha1 "github.com/Azure/blip/api/v1alpha1"
@@ -260,6 +261,24 @@ func TestInvalidDestinationAddressFailsClosed(t *testing.T) {
 	got, err := Compile("apps", policyFor(v1alpha1.NetworkPeer{PodSelector: &metav1.LabelSelector{}}), nil, Destinations{Pods: []corev1.Pod{pod("apps", "db", "not-an-ip")}})
 	if err == nil || len(got.Layers) != 0 {
 		t.Fatalf("invalid PodIP returned %+v, %v", got, err)
+	}
+}
+
+// TestCompileNamedLabelsPolicyLayer keeps a compile failure attributed to the
+// object that holds the invalid rules. A Blip that inherits spec.runtime.network
+// from its state must not report a "blip network" error.
+func TestCompileNamedLabelsPolicyLayer(t *testing.T) {
+	invalid := policyFor(v1alpha1.NetworkPeer{PodSelector: &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: "Bogus"}},
+	}})
+	for _, label := range []string{"blip network", "state network"} {
+		got, err := CompileNamed("apps", nil, invalid, Destinations{}, label)
+		if err == nil || len(got.Layers) != 0 {
+			t.Fatalf("%s: invalid policy returned %+v, %v", label, got, err)
+		}
+		if !strings.HasPrefix(err.Error(), label+": egress[0].to[0]: podSelector:") {
+			t.Errorf("%s: error %q does not name the layer", label, err)
+		}
 	}
 }
 
