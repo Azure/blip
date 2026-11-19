@@ -1,7 +1,6 @@
 package apiproxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -46,14 +45,6 @@ type identity struct {
 	namespace string
 	// owner is the Blip's owner label, or adminOwner for an unlabelled Blip.
 	owner string
-	// thread is the Blip's thread, but only when the thread owner hash
-	// matches owner. A caller cannot widen its scope by labelling its Blip
-	// with another project's thread name.
-	thread string
-	// threadUID is the live incarnation of thread. Turns and their labels
-	// survive a delete/recreate of the thread, so reads are also pinned to
-	// this UID and never return the previous incarnation's history.
-	threadUID string
 	// claimed is false until the controller has claimed this pod for a Blip.
 	claimed bool
 }
@@ -62,14 +53,10 @@ type identity struct {
 // covers.
 type scopeRequest struct {
 	namespace   string
-	resource    string // pods, blips, blipstates, blipthreads or blipturns
+	resource    string // pods, blips or blipstates
 	name        string // empty for a list or watch
 	subresource string
 	list        bool
-	// watch marks a legacy /watch/ collection path, whose query does not
-	// carry the watch parameter. A normal list becomes a watch with any
-	// query value the API server decodes as true.
-	watch bool
 }
 
 type scopeAction int
@@ -98,9 +85,6 @@ const (
 //     administrator-owned and private. Scoped lists select the caller's owner
 //     label, so shared bases do not appear in a restricted owner's list or
 //     watch even though a GET by name works.
-//   - VM pods created from a template older than this scope have no
-//     POD_NAME/POD_NAMESPACE and keep the previous unscoped behavior until
-//     their pool recreates them.
 type ownerScope struct {
 	namespace  string
 	podName    string
@@ -183,15 +167,7 @@ func (s *ownerScope) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		// A blipthreads watch is scoped by metadata.name, which survives a
-		// delete/recreate. Filter the stream by incarnation as well so a
-		// guest created for the previous thread never receives the recreated
-		// object's UID, spec, or status.
-		var out http.ResponseWriter = w
-		if req.resource == "blipthreads" && id.threadUID != "" && isWatch(r, req) {
-			out = &threadWatchWriter{ResponseWriter: w, uid: id.threadUID}
-		}
-		s.next.ServeHTTP(out, next)
+		s.next.ServeHTTP(w, next)
 		return
 	}
 	allowed, status, err := s.allowed(r.Context(), id, req)
@@ -248,41 +224,7 @@ func (s *ownerScope) identity(ctx context.Context) (identity, error) {
 	if owner == "" {
 		owner = adminOwner
 	}
-	// Threads and their turns carry the most sensitive text in the system.
-	// The Blip's thread label is self-asserted (a guest may patch its own
-	// Blip), so only trust it when the thread's derived owner equals the
-	// Blip's owner. Otherwise the caller has no thread scope at all.
-	thread := blip.Metadata.Annotations[v1.AnnotationThread]
-	if thread == "" {
-		thread = blip.Metadata.Labels[v1.LabelThread]
-	}
-	id := identity{namespace: s.namespace, owner: owner, claimed: true}
-	if thread == "" || owner == adminOwner || v1.ThreadOwner(s.namespace, thread) != owner {
-		return id, nil
-	}
-	// Pin the scope to the thread incarnation the Blip was created for. A
-	// deleted and recreated thread keeps its name, so a label alone would
-	// expose the previous incarnation's turns until the pruner removes them.
-	obj, status, err := s.object(ctx, "/apis/blip.dev/v1alpha1/namespaces/"+url.PathEscape(s.namespace)+"/blipthreads/"+url.PathEscape(thread))
-	if err != nil {
-		return identity{}, err
-	}
-	if status != http.StatusOK {
-		if status == http.StatusNotFound || status == http.StatusForbidden {
-			// The thread is gone; its history is not the caller's to read.
-			return id, nil
-		}
-		return identity{}, fmt.Errorf("read own thread: status %d", status)
-	}
-	if obj.Metadata.UID == "" {
-		return id, nil
-	}
-	if pinned := blip.Metadata.Annotations[v1.AnnotationThreadUID]; pinned != "" && pinned != obj.Metadata.UID {
-		// This Blip belongs to an earlier incarnation of the thread.
-		return id, nil
-	}
-	id.thread, id.threadUID = thread, obj.Metadata.UID
-	return id, nil
+	return identity{namespace: s.namespace, owner: owner, claimed: true}, nil
 }
 
 // allowed reports whether id may read req.name, and the status to return when
@@ -292,7 +234,7 @@ func (s *ownerScope) allowed(ctx context.Context, id identity, req scopeRequest)
 	switch req.resource {
 	case "pods":
 		path = "/api/v1/namespaces/" + url.PathEscape(s.namespace) + "/pods/" + url.PathEscape(req.name)
-	case "blips", "blipstates", "blipthreads", "blipturns":
+	case "blips", "blipstates":
 		path = "/apis/blip.dev/v1alpha1/namespaces/" + url.PathEscape(s.namespace) + "/" + req.resource + "/" + url.PathEscape(req.name)
 	default:
 		return false, http.StatusNotFound, nil
@@ -312,28 +254,6 @@ func (s *ownerScope) allowed(ctx context.Context, id identity, req scopeRequest)
 	case "pods":
 		// Warm and unknown pods have no owner label and are never exposed.
 		return owner != "" && owner == id.owner, http.StatusNotFound, nil
-	case "blipthreads":
-		// A claimed VM sees only its own project's thread. Threads are not
-		// owner-labelled, so the name derived from the caller's Blip is the
-		// binding; an owner-labelled thread is also private to that owner.
-		if id.thread != "" && req.name == id.thread {
-			return true, http.StatusNotFound, nil
-		}
-		return owner != "" && owner == id.owner, http.StatusNotFound, nil
-	case "blipturns":
-		// Turns are scoped by the authoritative spec.thread and the thread
-		// incarnation. Labels are producer-written, and admission rejects a
-		// pod-bound turn whose thread or owner label disagrees with
-		// spec.thread; a legacy or forged object must not gain access through
-		// them here. A turn from the previous incarnation of a recreated
-		// thread carries the old UID and stays hidden.
-		if id.thread == "" || id.threadUID == "" || obj.Spec.Thread != id.thread {
-			return false, http.StatusNotFound, nil
-		}
-		if uid := obj.turnThreadUID(); uid != "" && uid != id.threadUID {
-			return false, http.StatusNotFound, nil
-		}
-		return true, http.StatusNotFound, nil
 	default:
 		// Owner-labelled objects are private. Only an unlabelled image
 		// state is a shared base: the controller and mount policy treat an
@@ -347,115 +267,9 @@ func (s *ownerScope) allowed(ctx context.Context, id identity, req scopeRequest)
 }
 
 // scopedList adds the selector that confines a list or watch to the caller's
-// objects. Threads and turns are scoped to the caller's project; a caller
-// without a project has no access to them at all.
+// objects.
 func scopedList(r *http.Request, id identity, resource string) (*http.Request, bool) {
-	switch resource {
-	case "blipthreads":
-		if id.thread == "" {
-			return nil, false
-		}
-		return withFieldSelector(r, "metadata.name", id.thread), true
-	case "blipturns":
-		if id.thread == "" || id.threadUID == "" {
-			return nil, false
-		}
-		// The thread label alone is name-derived and survives a
-		// delete/recreate. The UID label is stamped on every new turn and
-		// backfilled for turns of the current incarnation, so the previous
-		// incarnation's turns (and a same-named short thread's turns) cannot
-		// reach the new guest.
-		next := withLabelSelector(r, v1.LabelThread, v1.ThreadLabel(id.thread))
-		return withLabelSelector(next, v1.LabelThreadUID, id.threadUID), true
-	default:
-		return withOwnerSelector(r, id.owner), true
-	}
-}
-
-// isWatch reports whether a scoped collection request is a watch: either a
-// legacy /watch/ collection path or a ?watch query the API server decodes as
-// true. It mirrors runtime.Convert_Slice_string_To_bool, which the API server
-// uses for ListOptions: a present watch parameter is true unless its first
-// value is exactly "0" or case-insensitively "false". Accepting only "true"
-// here would let watch=1, watch=yes, or a bare ?watch skip the scoped watch
-// filters while the API server still streams.
-func isWatch(r *http.Request, req scopeRequest) bool {
-	if req.watch {
-		return true
-	}
-	values := r.URL.Query()["watch"]
-	switch {
-	case len(values) == 0:
-		return false
-	case values[0] == "0", strings.EqualFold(values[0], "false"):
-		return false
-	default:
-		return true
-	}
-}
-
-// threadWatchWriter forwards only blipthreads watch events for the thread
-// incarnation the guest was created for. A watch is scoped by metadata.name,
-// and a deleted and recreated thread keeps that name, so without this check
-// the replacement object (new UID, charter, systemPrompt, status) would reach
-// the previous incarnation's guest. BOOKMARK and ERROR events carry no
-// object scope and pass through.
-//
-// Events are newline-delimited JSON. A line split across writes is buffered
-// until its newline arrives; Flush only pushes the already-forwarded lines so
-// watches keep streaming.
-type threadWatchWriter struct {
-	http.ResponseWriter
-	uid     string
-	pending []byte
-}
-
-func (w *threadWatchWriter) Write(p []byte) (int, error) {
-	w.pending = append(w.pending, p...)
-	for {
-		i := bytes.IndexByte(w.pending, '\n')
-		if i < 0 {
-			break
-		}
-		line := w.pending[:i+1]
-		w.pending = w.pending[i+1:]
-		if !keepThreadWatchEvent(line, w.uid) {
-			continue
-		}
-		if _, err := w.ResponseWriter.Write(line); err != nil {
-			return 0, err
-		}
-	}
-	return len(p), nil
-}
-
-func (w *threadWatchWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// keepThreadWatchEvent decides whether one watch event belongs to uid. An
-// unparseable line is dropped: a thread watch must fail closed rather than
-// forward an object whose incarnation cannot be checked.
-func keepThreadWatchEvent(line []byte, uid string) bool {
-	var event struct {
-		Type   string `json:"type"`
-		Object struct {
-			Metadata struct {
-				UID string `json:"uid"`
-			} `json:"metadata"`
-		} `json:"object"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(line), &event); err != nil {
-		return false
-	}
-	switch event.Type {
-	case "BOOKMARK", "ERROR":
-		return true
-	default:
-		return event.Object.Metadata.UID == uid
-	}
+	return withOwnerSelector(r, id.owner), true
 }
 
 // objectMeta is the small part of an object the scope may inspect.
@@ -469,23 +283,8 @@ type objectMeta struct {
 	Spec struct {
 		// Image distinguishes a shared read-only base from an ownerless
 		// writable state, which stays private.
-		Image  string `json:"image"`
-		Thread string `json:"thread"`
+		Image string `json:"image"`
 	} `json:"spec"`
-	Status struct {
-		// ThreadUID is the incarnation that sequenced a turn.
-		ThreadUID string `json:"threadUID"`
-	} `json:"status"`
-}
-
-// turnThreadUID returns the incarnation recorded on a turn, preferring the
-// label (stamped at creation for new turns) over status (stamped by the
-// sequencer). An empty result means the turn predates incarnation tracking.
-func (o objectMeta) turnThreadUID() string {
-	if uid := o.Metadata.Labels[v1.LabelThreadUID]; uid != "" {
-		return uid
-	}
-	return o.Status.ThreadUID
 }
 
 // object performs a trusted GET of path. Only metadata is retained.
@@ -523,12 +322,6 @@ func withLabelSelector(r *http.Request, key, value string) *http.Request {
 	return withSelector(r, "labelSelector", key, value)
 }
 
-// withFieldSelector merges one equality field requirement into an existing
-// field selector.
-func withFieldSelector(r *http.Request, key, value string) *http.Request {
-	return withSelector(r, "fieldSelector", key, value)
-}
-
 func withSelector(r *http.Request, query, key, value string) *http.Request {
 	out := r.Clone(r.Context())
 	q := out.URL.Query()
@@ -555,7 +348,13 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 	}
 	seg := strings.Split(strings.TrimPrefix(p, "/"), "/")
 	scopedResource := func(s string) bool {
-		return s == "pods" || s == "blips" || s == "blipstates" || s == "blipthreads" || s == "blipturns"
+		return s == "pods" || s == "blips" || s == "blipstates"
+	}
+	// Thread and turn objects no longer exist, but stale objects may remain
+	// from an older cluster. They stay invisible: every route naming them is
+	// denied rather than forwarded unscoped.
+	deniedResource := func(s string) bool {
+		return s == "blipthreads" || s == "blipturns"
 	}
 	// Singular names and short names are real Kubernetes aliases for a scoped
 	// resource. The parser only understands the canonical plural routes, so
@@ -570,7 +369,7 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 	}
 	namesScopedResource := func(parts []string) bool {
 		for _, s := range parts {
-			if scopedResource(s) || aliasResource(s) {
+			if scopedResource(s) || deniedResource(s) || aliasResource(s) {
 				return true
 			}
 		}
@@ -600,7 +399,7 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 			if scopedResource(seg[4]) {
 				return namespaced(4)
 			}
-			if aliasResource(seg[4]) {
+			if deniedResource(seg[4]) || aliasResource(seg[4]) {
 				return scopeRequest{}, scopedDeny
 			}
 		}
@@ -610,9 +409,7 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		// naming a scoped resource is denied rather than forwarded unscoped.
 		if len(seg) > 2 && seg[2] == "watch" {
 			if len(seg) == 6 && seg[3] == "namespaces" && scopedResource(seg[5]) {
-				req, action := namespaced(5)
-				req.watch = true
-				return req, action
+				return namespaced(5)
 			}
 			if namesScopedResource(seg[3:]) {
 				return scopeRequest{}, scopedDeny
@@ -621,7 +418,7 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		}
 		// /api/v1/pods (all namespaces), an alias, or another shape naming a
 		// scoped resource.
-		if len(seg) >= 3 && (seg[2] == "pods" || aliasResource(seg[2])) {
+		if len(seg) >= 3 && (seg[2] == "pods" || deniedResource(seg[2]) || aliasResource(seg[2])) {
 			return scopeRequest{}, scopedDeny
 		}
 		return scopeRequest{}, passThrough
@@ -631,7 +428,7 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 			if scopedResource(seg[5]) {
 				return namespaced(5)
 			}
-			if aliasResource(seg[5]) {
+			if deniedResource(seg[5]) || aliasResource(seg[5]) {
 				return scopeRequest{}, scopedDeny
 			}
 		}
@@ -640,9 +437,7 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		// the list. Unknown watch shapes naming a scoped resource are denied.
 		if len(seg) > 3 && seg[3] == "watch" {
 			if len(seg) == 7 && seg[4] == "namespaces" && scopedResource(seg[6]) {
-				req, action := namespaced(6)
-				req.watch = true
-				return req, action
+				return namespaced(6)
 			}
 			if namesScopedResource(seg[4:]) {
 				return scopeRequest{}, scopedDeny
@@ -650,7 +445,7 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		}
 		// /apis/blip.dev/v1alpha1/blips (all namespaces), an alias, or
 		// another shape naming a scoped resource.
-		if len(seg) >= 4 && (scopedResource(seg[3]) || aliasResource(seg[3])) {
+		if len(seg) >= 4 && (scopedResource(seg[3]) || deniedResource(seg[3]) || aliasResource(seg[3])) {
 			return scopeRequest{}, scopedDeny
 		}
 	}

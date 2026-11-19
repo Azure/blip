@@ -59,7 +59,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cpio e2fsprogs kmod openssl xz-utils zstd
+            cpio e2fsprogs kmod xz-utils zstd
 
       - name: Install Cloud Hypervisor
         run: |
@@ -102,10 +102,10 @@ jobs:
           kubectl --context kind-blip-dev get nodes -o wide >e2e-logs/nodes.txt 2>&1 || true
           kubectl --context kind-blip-dev get all -A -o wide >e2e-logs/all.txt 2>&1 || true
           kubectl --context kind-blip-dev get blips,blipstates -A -o yaml >e2e-logs/blips.yaml 2>&1 || true
-          kubectl --context kind-blip-dev get blipnodes,blippools,blipthreads,blipturns -A -o yaml >e2e-logs/blip-api.yaml 2>&1 || true
+          kubectl --context kind-blip-dev get blipnodes,blippools -A -o yaml >e2e-logs/blip-api.yaml 2>&1 || true
           kubectl --context kind-blip-dev get events -A --sort-by=.lastTimestamp >e2e-logs/events.txt 2>&1 || true
 
-          for ns in blip-system e2ea e2eb default; do
+          for ns in blip-system default; do
             kubectl --context kind-blip-dev -n "$ns" describe pods \
               >"e2e-logs/${ns}-pods.txt" 2>&1 || true
             kubectl --context kind-blip-dev -n "$ns" logs \

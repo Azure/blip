@@ -482,7 +482,7 @@ func TestSimulationPoolDeleteLosesToClaim(t *testing.T) {
 	s.newPool("default", 0, 0)
 	s.readyState("root", "n1", "n2")
 	s.warm("warm-a", "n1")
-	s.must(syncVMOwners(s.ctx, s.c, ns))
+	s.must(syncVMOwners(s.ctx, s.c, ns, nil))
 	s.deliver()
 	interleaved := false
 	s.api.before = func(verb string, obj client.Object) {
@@ -604,7 +604,7 @@ func TestSimulationPoolClockAndListOrder(t *testing.T) {
 	s := newControllerSimulation(t)
 	s.newPool("default", 1, 0)
 	// Establish the owner table before freezing the cache.
-	s.must(syncVMOwners(s.ctx, s.c, ns))
+	s.must(syncVMOwners(s.ctx, s.c, ns, nil))
 	s.deliver()
 	s.step("pool", "default")
 	if pods := s.pods(); len(pods) != 1 || pods[0].Name != "default-00001" {

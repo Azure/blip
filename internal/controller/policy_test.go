@@ -25,7 +25,6 @@ import (
 	"sigs.k8s.io/yaml"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
-	"github.com/Azure/blip/internal/podapi"
 )
 
 // loadVMOwnerPolicy compiles deploy/base/vm-owner-policy.yaml the way the
@@ -138,28 +137,6 @@ func readPolicyDocs(t *testing.T, path string) ([]*admissionv1.ValidatingAdmissi
 	return policies, bindings
 }
 
-// loadPolicy compiles one policy from a multi-document policy file the way the
-// API server's validating admission policy plugin does.
-func loadPolicy(t *testing.T, file, name string) validating.Validator {
-	t.Helper()
-	policies, bindings := readPolicyDocs(t, file)
-	policy := findPolicy(t, policies, name)
-	var found int
-	for _, b := range bindings {
-		if b.Spec.PolicyName != name {
-			continue
-		}
-		found++
-		if len(b.Spec.ValidationActions) != 1 || b.Spec.ValidationActions[0] != admissionv1.Deny {
-			t.Fatalf("policy %v binding actions %v", name, b.Spec.ValidationActions)
-		}
-	}
-	if found != 1 {
-		t.Fatalf("policy %v has %d bindings", name, found)
-	}
-	return compilePolicy(t, policy, false)
-}
-
 func findPolicy(t *testing.T, policies []*admissionv1.ValidatingAdmissionPolicy, name string) *admissionv1.ValidatingAdmissionPolicy {
 	t.Helper()
 	for _, p := range policies {
@@ -171,67 +148,6 @@ func findPolicy(t *testing.T, policies []*admissionv1.ValidatingAdmissionPolicy,
 	return nil
 }
 
-// compilePolicy compiles one policy the way the API server's validating
-// admission policy plugin does.
-func compilePolicy(t *testing.T, policy *admissionv1.ValidatingAdmissionPolicy, hasParams bool) validating.Validator {
-	t.Helper()
-	env, err := plugincel.NewCompositionEnv(plugincel.VariablesTypeName, environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion(), true))
-	if err != nil {
-		t.Fatal(err)
-	}
-	compiler := plugincel.NewCompositedCompilerFromTemplate(env)
-	opts := plugincel.OptionalVariableDeclarations{StrictCost: true, HasParams: hasParams}
-	var vars []plugincel.NamedExpressionAccessor
-	for _, v := range policy.Spec.Variables {
-		vars = append(vars, &validating.Variable{Name: v.Name, Expression: v.Expression})
-	}
-	compiler.CompileAndStoreVariables(vars, opts, environment.StoredExpressions)
-	var match, checks, messages []plugincel.ExpressionAccessor
-	for i := range policy.Spec.MatchConditions {
-		match = append(match, (*matchconditions.MatchCondition)(&policy.Spec.MatchConditions[i]))
-	}
-	for _, v := range policy.Spec.Validations {
-		checks = append(checks, &validating.ValidationCondition{Expression: v.Expression, Message: v.Message, Reason: v.Reason})
-		messages = append(messages, &validating.MessageExpressionCondition{MessageExpression: v.MessageExpression})
-	}
-	msgOpts := opts
-	msgOpts.HasAuthorizer = false
-	return validating.NewValidator(
-		compiler.CompileCondition(checks, opts, environment.StoredExpressions),
-		matchconditions.NewMatcher(compiler.CompileCondition(match, opts, environment.StoredExpressions), policy.Spec.FailurePolicy, "policy", "validate", policy.Name),
-		compiler.CompileCondition(nil, opts, environment.StoredExpressions),
-		compiler.CompileCondition(messages, msgOpts, environment.StoredExpressions),
-		policy.Spec.FailurePolicy,
-	)
-}
-
-// loadTurnPolicy compiles the turn author and project ownership policies in
-// deploy/base/turn-policy.yaml. The stream status policies in the same file
-// (blip-turn-status, blip-thread-status) are loaded individually with
-// loadPolicy.
-func loadTurnPolicy(t *testing.T) (validating.Validator, validating.Validator) {
-	t.Helper()
-	policies, bindings := readPolicyDocs(t, "../../deploy/base/turn-policy.yaml")
-	author := findPolicy(t, policies, "blip-turn-author")
-	owner := findPolicy(t, policies, "blip-turn-owner")
-	byPolicy := map[string]*admissionv1.ValidatingAdmissionPolicyBinding{}
-	for _, b := range bindings {
-		byPolicy[b.Spec.PolicyName] = b
-	}
-	for _, name := range []string{"blip-turn-author", "blip-turn-owner"} {
-		b := byPolicy[name]
-		if b == nil || len(b.Spec.ValidationActions) != 1 || b.Spec.ValidationActions[0] != admissionv1.Deny {
-			t.Fatalf("binding for %s = %v", name, b)
-		}
-	}
-	if ref := byPolicy["blip-turn-owner"].Spec.ParamRef; ref == nil ||
-		ref.Name != VMOwnersConfigMap || ref.ParameterNotFoundAction == nil ||
-		*ref.ParameterNotFoundAction != admissionv1.DenyAction {
-		t.Fatalf("turn owner binding params = %v", byPolicy["blip-turn-owner"].Spec.ParamRef)
-	}
-	return compilePolicy(t, author, false), compilePolicy(t, owner, true)
-}
-
 type policyRequest struct {
 	user      user.Info
 	op        admission.Operation
@@ -239,7 +155,7 @@ type policyRequest struct {
 	name      string
 	object    map[string]any
 	oldObject map[string]any
-	connect   runtime.Object // CONNECT options; default: a blip session exec
+	connect   runtime.Object // CONNECT options; default: an exec shell
 }
 
 func vmUser(sa, pod string) user.Info {
@@ -274,47 +190,18 @@ func stateObj(name, owner, copyFrom string, mutate ...func(map[string]any)) map[
 	return o
 }
 
-func threadObj(name, charter string) map[string]any {
-	return map[string]any{
-		"apiVersion": "blip.dev/v1alpha1",
-		"kind":       "BlipThread",
-		"metadata":   map[string]any{"name": name, "namespace": ns},
-		"spec":       map[string]any{"pool": "default", "charter": charter},
-	}
-}
-
-// sessionExec is the exec internal/session opens for a blip session.
-func sessionExec() *corev1.PodExecOptions {
-	return &corev1.PodExecOptions{Stdin: true, Stdout: true, Container: podapi.VMContainer, Command: []string{"blip-runtime", "bridge", "1025"}}
-}
-
 func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map[string]string) (bool, string) {
 	t.Helper()
 	gvr := schema.GroupVersionResource{Group: "blip.dev", Version: "v1alpha1", Resource: p.resource}
 	gvk := schema.GroupVersionKind{Group: "blip.dev", Version: "v1alpha1", Kind: "Blip"}
 	sub := ""
 	if res, s, ok := strings.Cut(p.resource, "/"); ok {
-		if res == "blipturns" || res == "blipthreads" {
-			kind := "BlipTurn"
-			if res == "blipthreads" {
-				kind = "BlipThread"
-			}
-			gvr = schema.GroupVersionResource{Group: "blip.dev", Version: "v1alpha1", Resource: res}
-			gvk = schema.GroupVersionKind{Group: "blip.dev", Version: "v1alpha1", Kind: kind}
-		} else {
-			gvr = schema.GroupVersionResource{Version: "v1", Resource: res}
-			gvk = schema.GroupVersionKind{Version: "v1", Kind: "PodExecOptions"}
-		}
+		gvr = schema.GroupVersionResource{Version: "v1", Resource: res}
+		gvk = schema.GroupVersionKind{Version: "v1", Kind: "PodExecOptions"}
 		sub = s
 	}
 	if p.resource == "blipstates" {
 		gvk.Kind = "BlipState"
-	}
-	if strings.HasPrefix(p.resource, "blipturns") {
-		gvk.Kind = "BlipTurn"
-	}
-	if p.resource == "blipthreads" {
-		gvk.Kind = "BlipThread"
 	}
 	var obj, old runtime.Object
 	if p.object != nil {
@@ -328,7 +215,7 @@ func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map
 		// subresource as the object.
 		obj = p.connect
 		if obj == nil {
-			obj = sessionExec()
+			obj = &corev1.PodExecOptions{Stdin: true, Stdout: true, Container: "vm", Command: []string{"sh"}}
 		}
 		gvk.Kind = map[string]string{"exec": "PodExecOptions", "attach": "PodAttachOptions", "portforward": "PodPortForwardOptions", "proxy": "PodProxyOptions"}[sub]
 	}
@@ -395,8 +282,6 @@ func TestVMOwnerPolicy(t *testing.T) {
 	}
 	withPool := func(p string) func(map[string]any) { return func(spec map[string]any) { spec["pool"] = p } }
 	withSecret := func(spec map[string]any) { spec["imagePullSecrets"] = []any{map[string]any{"name": "creds"}} }
-	shell := &corev1.PodExecOptions{Container: "vm", Command: []string{"sh"}}
-	bridgeIn := func(c string) *corev1.PodExecOptions { o := sessionExec(); o.Container = c; return o }
 	stateWithSecret := stateObj(o+".s", o, "")
 	stateWithSecret["spec"] = map[string]any{"image": "reg/img", "imagePullSecrets": []any{map[string]any{"name": "creds"}}}
 
@@ -412,15 +297,12 @@ func TestVMOwnerPolicy(t *testing.T) {
 		{"other namespace service account", policyRequest{user: &user.DefaultInfo{Name: "system:serviceaccount:other:vm", Extra: map[string][]string{"authentication.kubernetes.io/pod-name": {"p"}}}, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "")}, true, ""},
 		{"vacant VM denied", policyRequest{user: vacant, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o)}, false, "not claimed"},
 		{"unrestricted owner", policyRequest{user: admin, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "", withState("b"))}, true, ""},
-		{"unrestricted owner exec", policyRequest{user: admin, op: admission.Connect, resource: "pods/exec", name: "default-other"}, true, ""},
+		{"non-VM user exec", policyRequest{user: &user.DefaultInfo{Name: "alice"}, op: admission.Connect, resource: "pods/exec", name: "default-other"}, true, ""},
+		{"unrestricted owner exec", policyRequest{user: admin, op: admission.Connect, resource: "pods/exec", name: "default-other"}, false, "may not connect"},
 		{"own blip", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withState(o+".root"))}, true, ""},
 		{"own blip update", policyRequest{user: mine, op: admission.Update, resource: "blips", name: o + ".a", object: blipObj(o+".a", o), oldObject: blipObj(o+".a", o)}, true, ""},
 		{"own blip status", policyRequest{user: mine, op: admission.Update, resource: "blips/status", name: o + ".a", object: blipObj(o+".a", o), oldObject: blipObj(o+".a", o)}, false, "may not change status"},
 		{"own state status", policyRequest{user: mine, op: admission.Update, resource: "blipstates/status", name: o + ".s", object: stateObj(o+".s", o, ""), oldObject: stateObj(o+".s", o, "")}, false, "may not change status"},
-		{"restricted creates thread", policyRequest{user: mine, op: admission.Create, resource: "blipthreads", name: "proj", object: threadObj("proj", "mine")}, false, "thread specs"},
-		{"restricted updates thread", policyRequest{user: mine, op: admission.Update, resource: "blipthreads", name: "victim", object: threadObj("victim", "pwned"), oldObject: threadObj("victim", "original")}, false, "thread specs"},
-		{"restricted deletes thread", policyRequest{user: mine, op: admission.Delete, resource: "blipthreads", name: "victim", oldObject: threadObj("victim", "original")}, false, "thread specs"},
-		{"unrestricted updates thread", policyRequest{user: admin, op: admission.Update, resource: "blipthreads", name: "proj", object: threadObj("proj", "new"), oldObject: threadObj("proj", "old")}, true, ""},
 		{"own state", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o + ".s", object: stateObj(o+".s", o, o+".base")}, true, ""},
 		{"missing label", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", "")}, false, "must label"},
 		{"wrong label", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", x)}, false, "must label"},
@@ -450,19 +332,12 @@ func TestVMOwnerPolicy(t *testing.T) {
 		{"blip pull secrets", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withSecret)}, false, "imagePullSecrets"},
 		{"state pull secrets", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: o + ".s", object: stateWithSecret}, false, "imagePullSecrets"},
 		{"unrestricted pull secrets", policyRequest{user: admin, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "", withSecret)}, true, ""},
-		{"exec own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/exec", name: "default-mine"}, true, ""},
-		{"shell in own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/exec", name: "default-mine", connect: shell}, false, "blip sessions"},
-		{"bridge in other container", policyRequest{user: mine, op: admission.Connect, resource: "pods/exec", name: "default-mine", connect: bridgeIn("sidecar")}, false, "blip sessions"},
-		{"bridge in default container", policyRequest{user: mine, op: admission.Connect, resource: "pods/exec", name: "default-mine", connect: bridgeIn("")}, false, "blip sessions"},
-		{"unrestricted shell", policyRequest{user: admin, op: admission.Connect, resource: "pods/exec", name: "default-other", connect: shell}, false, "blip sessions"},
-		{"attach own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/attach", name: "default-mine", connect: &corev1.PodAttachOptions{Container: "vm", Stdin: true}}, false, "blip sessions"},
-		{"unrestricted port-forward", policyRequest{user: admin, op: admission.Connect, resource: "pods/portforward", name: "default-other", connect: &corev1.PodPortForwardOptions{Ports: []int32{22}}}, false, "blip sessions"},
-		{"proxy to own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/proxy", name: "default-mine", connect: &corev1.PodProxyOptions{Path: "/"}}, false, "blip sessions"},
-		{"unrestricted proxy", policyRequest{user: admin, op: admission.Connect, resource: "pods/proxy", name: "default-other", connect: &corev1.PodProxyOptions{Path: "/"}}, false, "blip sessions"},
-		{"attach other's pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/attach", name: "default-other", connect: &corev1.PodAttachOptions{Container: "vm"}}, false, "blip sessions"},
-		{"exec other's pod", policyRequest{user: other, op: admission.Connect, resource: "pods/exec", name: "default-mine"}, false, "connect"},
-		{"exec unrestricted pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/exec", name: "default-admin"}, false, "connect"},
-		{"exec non-VM pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/exec", name: "gateway"}, false, "connect"},
+		{"exec own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/exec", name: "default-mine"}, false, "may not connect"},
+		{"exec other's pod", policyRequest{user: other, op: admission.Connect, resource: "pods/exec", name: "default-mine"}, false, "may not connect"},
+		{"exec non-VM pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/exec", name: "gateway"}, false, "may not connect"},
+		{"attach own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/attach", name: "default-mine", connect: &corev1.PodAttachOptions{Container: "vm", Stdin: true}}, false, "may not connect"},
+		{"port-forward own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/portforward", name: "default-mine", connect: &corev1.PodPortForwardOptions{Ports: []int32{22}}}, false, "may not connect"},
+		{"proxy to own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/proxy", name: "default-mine", connect: &corev1.PodProxyOptions{Path: "/"}}, false, "may not connect"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			allow, msg := tc.req.evaluate(t, v, params)
@@ -505,7 +380,7 @@ func TestVMOwnerPolicy(t *testing.T) {
 	}
 }
 
-// withLabels adds labels to an object built by turnObj/namedTurn.
+// withLabels adds labels to an object built by blipObj/stateObj.
 func withLabels(o map[string]any, labels map[string]string) map[string]any {
 	meta := o["metadata"].(map[string]any)
 	existing, _ := meta["labels"].(map[string]any)
@@ -515,46 +390,6 @@ func withLabels(o map[string]any, labels map[string]string) map[string]any {
 	}
 	for k, v := range labels {
 		existing[k] = v
-	}
-	return o
-}
-
-// withThreadLabel sets (or clears, when thread is empty) the blip.dev/thread
-// label on an object built by blipObj/stateObj.
-func withThreadLabel(o map[string]any, thread string) map[string]any {
-	meta := o["metadata"].(map[string]any)
-	labels, _ := meta["labels"].(map[string]any)
-	if labels == nil {
-		labels = map[string]any{}
-		meta["labels"] = labels
-	}
-	if thread == "" {
-		delete(labels, v1.LabelThread)
-		return o
-	}
-	labels[v1.LabelThread] = thread
-	return o
-}
-
-// withAnnotations adds annotations to an object built by blipObj/stateObj.
-func withAnnotations(o map[string]any, annotations map[string]string) map[string]any {
-	meta := o["metadata"].(map[string]any)
-	existing, _ := meta["annotations"].(map[string]any)
-	if existing == nil {
-		existing = map[string]any{}
-		meta["annotations"] = existing
-	}
-	for k, v := range annotations {
-		existing[k] = v
-	}
-	return o
-}
-
-func withoutAnnotation(o map[string]any, key string) map[string]any {
-	if meta, ok := o["metadata"].(map[string]any); ok {
-		if annotations, ok := meta["annotations"].(map[string]any); ok {
-			delete(annotations, key)
-		}
 	}
 	return o
 }
@@ -572,179 +407,6 @@ func withFinalizers(o map[string]any, finalizers ...string) map[string]any {
 	}
 	meta["finalizers"] = fs
 	return o
-}
-
-// A restricted VM may patch its own Blip. The thread incarnation annotations
-// are what the API proxy and blipchat trust to pin a Blip to one thread
-// incarnation, so they must not move after creation: removing the pin lets a
-// stale Blip fall back to the current thread, and rewriting it grants access
-// to a recreated thread's turns. Administrator-owned VMs and non-VM callers
-// (controller, blipchat) stay unrestricted.
-func TestVMOwnerPolicyPinsThreadIncarnationAnnotations(t *testing.T) {
-	v := loadVMOwnerPolicy(t)
-	const owner = "u-0123456789abcdef0123456789abcdef"
-	params := map[string]string{"sa.vm": "default", "default-mine": owner, "default-admin": "-"}
-	mine, admin := vmUser("vm", "default-mine"), vmUser("vm", "default-admin")
-	controller := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blip-controller"}
-	tagged := func(uid string) map[string]any {
-		return withAnnotations(blipObj(owner+".a", owner), map[string]string{
-			v1.AnnotationThread:    "proj",
-			v1.AnnotationThreadUID: uid,
-		})
-	}
-
-	for _, tc := range []struct {
-		name  string
-		user  user.Info
-		obj   map[string]any
-		old   map[string]any
-		allow bool
-		msg   string
-	}{
-		{"restricted keeps the pin", mine, tagged("thread-1"), tagged("thread-1"), true, ""},
-		{"restricted removes the pin", mine,
-			withoutAnnotation(tagged("thread-1"), v1.AnnotationThreadUID), tagged("thread-1"), false, "incarnation annotation"},
-		{"restricted rewrites the pin", mine, tagged("thread-2"), tagged("thread-1"), false, "incarnation annotation"},
-		{"restricted adds a pin when absent", mine, tagged("thread-1"), blipObj(owner+".a", owner), false, "incarnation annotation"},
-		{"restricted removes the thread name", mine,
-			withoutAnnotation(tagged("thread-1"), v1.AnnotationThread), tagged("thread-1"), false, "incarnation annotation"},
-		{"restricted changes another annotation", mine,
-			withAnnotations(tagged("thread-1"), map[string]string{"note": "new"}),
-			withAnnotations(tagged("thread-1"), map[string]string{"note": "old"}), true, ""},
-		{"admin rewrites the pin", admin, tagged("thread-2"), tagged("thread-1"), true, ""},
-		{"admin removes the pin", admin, withoutAnnotation(tagged("thread-1"), v1.AnnotationThreadUID), tagged("thread-1"), true, ""},
-		{"controller rewrites the pin", controller, tagged("thread-2"), tagged("thread-1"), true, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: tc.user, op: admission.Update, resource: "blips", name: owner + ".a", object: tc.obj, oldObject: tc.old}
-			allow, msg := req.evaluate(t, v, params)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-
-	// A restricted CREATE must not introduce a pin either: absent stays absent.
-	create := policyRequest{user: mine, op: admission.Create, resource: "blips", name: owner + ".a", object: tagged("thread-1")}
-	if allow, msg := create.evaluate(t, v, params); allow {
-		t.Fatalf("restricted create added an incarnation pin: %s", msg)
-	}
-}
-
-// A restricted VM may attach its Blip only to a thread of its own project.
-// The thread owner is the blip-vm-owners "thread.<name>" entry, so a forged
-// blip.dev/thread label cannot steer blipchat turns into another project.
-func TestVMOwnerPolicyThreadLabel(t *testing.T) {
-	v := loadVMOwnerPolicy(t)
-	project := v1.ThreadOwner(ns, "proj")
-	victim := v1.ThreadOwner(ns, "victim")
-	params := map[string]string{
-		"sa.vm":         "default",
-		"default-mine":  project,
-		"default-user":  "u-0123456789abcdef0123456789abcdef",
-		"default-admin": "-",
-		"thread.proj":   project,
-		"thread.victim": victim,
-	}
-	mine, userVM, admin := vmUser("vm", "default-mine"), vmUser("vm", "default-user"), vmUser("vm", "default-admin")
-	own := withThreadLabel(blipObj(project+".a", project), "proj")
-	noThread := blipObj(project+".a", project)
-	foreign := withThreadLabel(blipObj(project+".a", project), "victim")
-	unknown := withThreadLabel(blipObj(project+".a", project), "missing")
-
-	for _, tc := range []struct {
-		name  string
-		req   policyRequest
-		allow bool
-		msg   string
-	}{
-		{"own thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: own}, false, "thread-labelled blips are created by an administrator"},
-		{"no thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: noThread}, true, ""},
-		{"foreign thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: foreign}, false, "thread"},
-		{"unknown thread", policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: unknown}, false, "thread"},
-		{"user-owned VM foreign thread", policyRequest{user: userVM, op: admission.Create, resource: "blips", name: "u-0123456789abcdef0123456789abcdef.a",
-			object: withThreadLabel(blipObj("u-0123456789abcdef0123456789abcdef.a", "u-0123456789abcdef0123456789abcdef"), "proj")}, false, "thread"},
-		{"keep own thread", policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: own, oldObject: own}, true, ""},
-		{"add foreign thread", policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: foreign, oldObject: noThread}, false, "thread"},
-		{"change to foreign thread", policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: foreign, oldObject: own}, false, "thread"},
-		{"remove own thread", policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: noThread, oldObject: own}, false, "thread"},
-		{"unrestricted foreign thread", policyRequest{user: admin, op: admission.Create, resource: "blips", name: "a", object: withThreadLabel(blipObj("a", ""), "victim")}, true, ""},
-		{"non-VM foreign thread", policyRequest{user: &user.DefaultInfo{Name: "alice"}, op: admission.Create, resource: "blips", name: "a", object: withThreadLabel(blipObj("a", ""), "victim")}, true, ""},
-		{"state thread label is not a blip", policyRequest{user: mine, op: admission.Create, resource: "blipstates", name: project + ".s",
-			object: withThreadLabel(stateObj(project+".s", project, ""), "victim")}, true, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			allow, msg := tc.req.evaluate(t, v, params)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-}
-
-// A restricted VM must not attach a thread to a new Blip. The API proxy
-// treats a missing incarnation pin as "the current thread incarnation", so a
-// leftover VM from a deleted thread could otherwise create a thread-labelled
-// Blip with no pin and read the recreated thread's history. In-guest
-// `blip run` propagates neither the label nor the annotations, while blipchat
-// and administrator-owned VMs remain unrestricted.
-func TestVMOwnerPolicyRestrictedCreateCannotAttachThread(t *testing.T) {
-	v := loadVMOwnerPolicy(t)
-	project := v1.ThreadOwner(ns, "proj")
-	params := map[string]string{
-		"sa.vm":         "default",
-		"default-mine":  project,
-		"default-admin": "-",
-		"thread.proj":   project,
-	}
-	mine, admin := vmUser("vm", "default-mine"), vmUser("vm", "default-admin")
-	blipchat := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blipchat"}
-	tagged := func(label bool, annotations map[string]string) map[string]any {
-		obj := blipObj(project+".a", project)
-		if label {
-			obj = withThreadLabel(obj, "proj")
-		}
-		if len(annotations) > 0 {
-			obj = withAnnotations(obj, annotations)
-		}
-		return obj
-	}
-	pin := map[string]string{
-		v1.AnnotationThread:    "proj",
-		v1.AnnotationThreadUID: "thread-inc",
-	}
-
-	for _, tc := range []struct {
-		name  string
-		user  user.Info
-		obj   map[string]any
-		objNm string
-		allow bool
-		msg   string
-	}{
-		{"restricted create with thread label", mine, tagged(true, nil), project + ".a", false, "attach a thread"},
-		{"restricted create with thread label and pin", mine, tagged(true, pin), project + ".a", false, "attach a thread"},
-		{"restricted create with uid annotation only", mine, tagged(false, map[string]string{v1.AnnotationThreadUID: "thread-inc"}), project + ".a", false, "incarnation annotation"},
-		{"restricted create with name annotation only", mine, tagged(false, map[string]string{v1.AnnotationThread: "proj"}), project + ".a", false, "incarnation annotation"},
-		{"restricted create without a thread", mine, tagged(false, nil), project + ".a", true, ""},
-		{"unrestricted VM create with thread label and pin", admin, withThreadLabel(withAnnotations(blipObj("a", ""), pin), "proj"), "a", true, ""},
-		{"blipchat create with thread label and pin", blipchat, withThreadLabel(withAnnotations(blipObj("a", ""), pin), "proj"), "a", true, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: tc.user, op: admission.Create, resource: "blips", name: tc.objNm, object: tc.obj}
-			allow, msg := req.evaluate(t, v, params)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-
-	// Patching an existing thread-labelled own Blip stays allowed.
-	old := withThreadLabel(withAnnotations(blipObj(project+".a", project), pin), "proj")
-	if allow, msg := (policyRequest{user: mine, op: admission.Update, resource: "blips",
-		name: project + ".a", object: old, oldObject: old}).evaluate(t, v, params); !allow {
-		t.Fatalf("update of an existing thread-labelled Blip was denied: %s", msg)
-	}
 }
 
 func ownerReference(name string, mutate ...func(map[string]any)) map[string]any {
@@ -890,145 +552,6 @@ func TestVMOwnerPolicyInheritedOwnerReference(t *testing.T) {
 	}
 }
 
-func turnObj(authorKind, authorName string) map[string]any {
-	return turnFor("project", authorKind, authorName)
-}
-
-func turnFor(thread, authorKind, authorName string) map[string]any {
-	return namedTurn("turn", thread, authorKind, authorName)
-}
-
-func namedTurn(name, thread, authorKind, authorName string) map[string]any {
-	return map[string]any{
-		"apiVersion": "blip.dev/v1alpha1",
-		"kind":       "BlipTurn",
-		"metadata":   map[string]any{"name": name, "namespace": ns},
-		"spec": map[string]any{
-			"thread": thread,
-			"author": map[string]any{"kind": authorKind, "name": authorName},
-		},
-	}
-}
-
-// Only blipchat (the sequencer) may write turn status, so a stray status
-// credential cannot forge or reorder a turn's sequence number.
-func TestTurnStatusPolicy(t *testing.T) {
-	v := loadPolicy(t, "../../deploy/base/turn-policy.yaml", "blip-turn-status")
-	status := func(seq any) map[string]any {
-		obj := turnObj("User", "alice")
-		obj["status"] = map[string]any{"seq": seq}
-		return obj
-	}
-	blipchat := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blipchat"}
-	other := &user.DefaultInfo{Name: "system:serviceaccount:hunt-p6-chat:blip-agent"}
-
-	for _, tc := range []struct {
-		name  string
-		user  user.Info
-		op    admission.Operation
-		obj   map[string]any
-		old   map[string]any
-		allow bool
-		msg   string
-	}{
-		{"blipchat writes turn status", blipchat, admission.Update, status(int64(1)), status(nil), true, ""},
-		{"blipchat updates turn status again", blipchat, admission.Update, status(int64(2)), status(int64(1)), true, ""},
-		{"producer cannot set seq", other, admission.Update, status(int64(4242)), status(nil), false, "only blipchat"},
-		{"producer cannot change seq", other, admission.Update, status(int64(4242)), status(int64(1)), false, "only blipchat"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns/status", name: "turn", object: tc.obj, oldObject: tc.old}
-			allow, msg := req.evaluate(t, v, nil)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-}
-
-// Only blipchat (the coordinator) may write thread status, so a stray status
-// credential cannot forge a summary, reset paused state, or reorder a
-// thread's lastSeq.
-func TestThreadStatusPolicy(t *testing.T) {
-	v := loadPolicy(t, "../../deploy/base/turn-policy.yaml", "blip-thread-status")
-	status := func(summary any) map[string]any {
-		obj := threadObj("proj", "charter")
-		obj["status"] = map[string]any{"summary": summary}
-		return obj
-	}
-	blipchat := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blipchat"}
-	other := &user.DefaultInfo{Name: "system:serviceaccount:hunt-p6-chat:blip-agent"}
-
-	for _, tc := range []struct {
-		name  string
-		user  user.Info
-		op    admission.Operation
-		obj   map[string]any
-		old   map[string]any
-		allow bool
-		msg   string
-	}{
-		{"blipchat writes thread status", blipchat, admission.Update, status("ok"), status(nil), true, ""},
-		{"blipchat updates thread status again", blipchat, admission.Update, status("done"), status("ok"), true, ""},
-		{"producer cannot set thread status", other, admission.Update, status("pwned"), status(nil), false, "only blipchat"},
-		{"producer cannot change thread status", other, admission.Update, status("pwned"), status("ok"), false, "only blipchat"},
-		{"plain administrator cannot change thread status", &user.DefaultInfo{Name: "alice"}, admission.Update, status("pwned"), status("ok"), false, "only blipchat"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: tc.user, op: tc.op, resource: "blipthreads/status", name: "proj", object: tc.obj, oldObject: tc.old}
-			allow, msg := req.evaluate(t, v, nil)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-}
-
-func TestTurnAuthorPolicy(t *testing.T) {
-	v, _ := loadTurnPolicy(t)
-	const blipchat = "system:serviceaccount:blip-system:blipchat"
-	other := func(sa string) user.Info {
-		return &user.DefaultInfo{Name: "system:serviceaccount:hunt-p6-chat:" + sa}
-	}
-
-	ci := "system:serviceaccount:hunt-p6-chat:ci"
-	for _, tc := range []struct {
-		name  string
-		user  user.Info
-		op    admission.Operation
-		obj   map[string]any
-		old   map[string]any
-		allow bool
-		msg   string
-	}{
-		{"blipchat authors a user turn", &user.DefaultInfo{Name: blipchat}, admission.Create, turnObj("User", "ceo@example.com"), nil, true, ""},
-		{"blipchat authors a system turn", &user.DefaultInfo{Name: blipchat}, admission.Create, turnObj("System", "blipchat"), nil, true, ""},
-		{"blipchat may use a watcher name", &user.DefaultInfo{Name: blipchat}, admission.Create, namedTurn("blip-uid-fin", "project", "Blip", "blip-a"), nil, true, ""},
-		{"foreign blipchat cannot impersonate a user", other("blipchat"), admission.Create, turnObj("User", "ceo@example.com"), nil, false, "must set author.kind=ServiceAccount"},
-		{"foreign blipchat cannot impersonate a service account", other("blipchat"), admission.Create, turnObj("ServiceAccount", "system:serviceaccount:blip-system:blipchat"), nil, false, "must set author.kind=ServiceAccount"},
-		{"lookalike blipchat cannot impersonate a user", &user.DefaultInfo{Name: blipchat + "2"}, admission.Create, turnObj("User", "ceo@example.com"), nil, false, "must set author.kind=ServiceAccount"},
-		{"other service account names itself", other("ci"), admission.Create, turnObj("ServiceAccount", ci), nil, true, ""},
-		{"other service account may use its own name", other("ci"), admission.Create, namedTurn("ci-turn", "project", "ServiceAccount", ci), nil, true, ""},
-		{"other service account cannot impersonate a user", other("ci"), admission.Create, turnObj("User", "ceo@example.com"), nil, false, "must set author.kind=ServiceAccount"},
-		{"other service account cannot impersonate another account", other("ci"), admission.Create, turnObj("ServiceAccount", blipchat), nil, false, "must set author.kind=ServiceAccount"},
-		{"plain user cannot author a turn", &user.DefaultInfo{Name: "alice"}, admission.Create, turnObj("User", "alice"), nil, false, "must set author.kind=ServiceAccount"},
-		{"service account cannot squat a report turn", other("ci"), admission.Create, namedTurn("blip-uid-r1", "project", "ServiceAccount", ci), nil, false, "reserved"},
-		{"service account cannot squat a finish turn", other("ci"), admission.Create, namedTurn("blip-uid-fin", "project", "ServiceAccount", ci), nil, false, "reserved"},
-		{"service account cannot squat a coordinator turn", other("ci"), admission.Create, namedTurn("coord-p-uid-1-0", "project", "ServiceAccount", ci), nil, false, "reserved"},
-		{"pod-bound producer cannot delete a turn", vmUser("vm", "default-mine"), admission.Delete, nil, turnObj("ServiceAccount", ci), false, "immutable history"},
-		{"pod-bound producer cannot relabel a turn", vmUser("vm", "default-mine"), admission.Update, turnObj("ServiceAccount", ci), turnObj("ServiceAccount", ci), false, "immutable history"},
-		{"blipchat may delete a turn", &user.DefaultInfo{Name: blipchat}, admission.Delete, nil, turnObj("User", "ceo@example.com"), true, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns", name: "turn", object: tc.obj, oldObject: tc.old}
-			allow, msg := req.evaluate(t, v, nil)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-}
-
 // A restricted VM may not add a finalizer to its Blip or state. Retention and
 // namespace cleanup only call Delete, so a foreign finalizer would survive the
 // controller removing blip.dev/finalizer and leave the object Terminating
@@ -1093,260 +616,6 @@ func TestVMOwnerPolicyFinalizers(t *testing.T) {
 	}
 }
 
-// A pod-bound producer must not make a turn undeletable: it cannot update or
-// delete the turn afterwards, and retention only calls Delete, so a finalizer
-// would leave it Terminating forever. blipchat and other producers keep their
-// existing abilities.
-func TestTurnAuthorPolicyFinalizers(t *testing.T) {
-	v, _ := loadTurnPolicy(t)
-	const blipchat = "system:serviceaccount:blip-system:blipchat"
-	self := "system:serviceaccount:" + ns + ":vm"
-	turn := func(fs ...string) map[string]any {
-		return withFinalizers(turnFor("proj", "ServiceAccount", self), fs...)
-	}
-
-	for _, tc := range []struct {
-		name  string
-		user  user.Info
-		op    admission.Operation
-		obj   map[string]any
-		old   map[string]any
-		allow bool
-		msg   string
-	}{
-		{"pod-bound create with finalizer", vmUser("vm", "default-mine"), admission.Create, turn("evil"), nil, false, "finalizer"},
-		{"pod-bound create without finalizer", vmUser("vm", "default-mine"), admission.Create, turn(), nil, true, ""},
-		{"pod-bound update adds a finalizer", vmUser("vm", "default-mine"), admission.Update, turn("evil"), turn(), false, "immutable history"},
-		{"pod-bound update keeps an inherited finalizer", vmUser("vm", "default-mine"), admission.Update, turn("evil"), turn("evil"), false, "immutable history"},
-		{"blipchat create with finalizer", &user.DefaultInfo{Name: blipchat}, admission.Create, turn("evil"), nil, true, ""},
-		{"blipchat update with finalizer", &user.DefaultInfo{Name: blipchat}, admission.Update, turn("evil"), turn(), true, ""},
-		{"non-pod producer create with finalizer", &user.DefaultInfo{Name: "system:serviceaccount:" + ns + ":ci"}, admission.Create,
-			withFinalizers(turnFor("proj", "ServiceAccount", "system:serviceaccount:"+ns+":ci"), "evil"), nil, true, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns", name: "turn", object: tc.obj, oldObject: tc.old}
-			allow, msg := req.evaluate(t, v, nil)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-}
-
-// A pod-bound producer must not attach ownerReferences to a turn. A foreign or
-// blocking reference outlives the producer and can stall retention, which only
-// calls Delete; Blips and states already reject them. blipchat and non-pod
-// producers keep their existing abilities.
-func TestTurnAuthorPolicyOwnerReferences(t *testing.T) {
-	v, _ := loadTurnPolicy(t)
-	const blipchat = "system:serviceaccount:blip-system:blipchat"
-	self := "system:serviceaccount:" + ns + ":vm"
-	threadRef := func(name, kind string, mutate ...func(map[string]any)) map[string]any {
-		return ownerReference(name, append([]func(map[string]any){func(ref map[string]any) { ref["kind"] = kind }}, mutate...)...)
-	}
-	turn := func(refs ...map[string]any) map[string]any {
-		o := turnFor("proj", "ServiceAccount", self)
-		if len(refs) > 0 {
-			o = withOwnerReferences(o, refs...)
-		}
-		return o
-	}
-
-	for _, tc := range []struct {
-		name  string
-		user  user.Info
-		op    admission.Operation
-		obj   map[string]any
-		old   map[string]any
-		allow bool
-		msg   string
-	}{
-		{"pod-bound create without refs", vmUser("vm", "default-mine"), admission.Create, turn(), nil, true, ""},
-		{"pod-bound create with own thread ref", vmUser("vm", "default-mine"), admission.Create,
-			turn(threadRef("proj", "BlipThread")), nil, false, "ownerReferences"},
-		{"pod-bound create with foreign ref", vmUser("vm", "default-mine"), admission.Create,
-			turn(threadRef("other-project.parent", "Blip")), nil, false, "ownerReferences"},
-		{"pod-bound create with blocking own ref", vmUser("vm", "default-mine"), admission.Create,
-			turn(threadRef("proj", "BlipThread", func(ref map[string]any) { ref["blockOwnerDeletion"] = true })), nil, false, "ownerReferences"},
-		{"pod-bound update adds a ref", vmUser("vm", "default-mine"), admission.Update,
-			turn(threadRef("proj", "BlipThread")), turn(), false, "immutable history"},
-		{"blipchat create with a ref", &user.DefaultInfo{Name: blipchat}, admission.Create,
-			withOwnerReferences(turnFor("proj", "User", "ceo@example.com"), ownerReference("proj", func(ref map[string]any) { ref["kind"] = "BlipThread" })), nil, true, ""},
-		{"non-pod producer create with a ref", &user.DefaultInfo{Name: self}, admission.Create,
-			turn(threadRef("proj", "BlipThread")), nil, true, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns", name: "turn", object: tc.obj, oldObject: tc.old}
-			allow, msg := req.evaluate(t, v, nil)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-}
-
-// TestTurnOwnerPolicy guards the project binding for pod-bound turn
-// producers: a VM may only write to the thread whose derived owner owns it.
-func TestTurnOwnerPolicy(t *testing.T) {
-	_, v := loadTurnPolicy(t)
-	const blipchat = "system:serviceaccount:blip-system:blipchat"
-	self := "system:serviceaccount:" + ns + ":vm"
-	project := v1.ThreadOwner(ns, "proj")
-	victim := v1.ThreadOwner(ns, "victim")
-	long := "long-" + strings.Repeat("x", 70)
-	longLabel := v1.ThreadLabel(long)
-	longOwner := v1.ThreadOwner(ns, long)
-	params := map[string]string{
-		"sa.vm":                    "default",
-		"vm-pod":                   project + " incarnation-proj",
-		"long-pod":                 longOwner + " incarnation-long",
-		"admin-pod":                "-",
-		"thread.proj":              project,
-		"thread.victim":            victim,
-		"thread." + long:           longOwner,
-		"thread-hash." + longLabel: longOwner,
-		"thread-inc." + project:    "incarnation-proj",
-		"thread-inc." + victim:     "incarnation-victim",
-		"thread-inc." + longOwner:  "incarnation-long",
-	}
-	labeled := func(thread, threadLabel, ownerLabel string) map[string]any {
-		o := turnFor(thread, "ServiceAccount", self)
-		labels := map[string]string{}
-		if threadLabel != "" {
-			labels[v1.LabelThread] = threadLabel
-		}
-		if ownerLabel != "" {
-			labels[v1.LabelOwner] = ownerLabel
-		}
-		return withLabels(o, labels)
-	}
-
-	for _, tc := range []struct {
-		name  string
-		user  user.Info
-		obj   map[string]any
-		allow bool
-		msg   string
-	}{
-		{"own project", vmUser("vm", "vm-pod"), turnFor("proj", "ServiceAccount", self), true, ""},
-		{"own project with matching labels", vmUser("vm", "vm-pod"), labeled("proj", "proj", project), true, ""},
-		{"other project", vmUser("vm", "vm-pod"), turnFor("victim", "ServiceAccount", self), false, "does not own thread"},
-		{"other project in label", vmUser("vm", "vm-pod"), labeled("proj", "victim", ""), false, "must name the thread"},
-		{"other owner in label", vmUser("vm", "vm-pod"), labeled("proj", "proj", victim), false, "must be the owner"},
-		{"unknown thread", vmUser("vm", "vm-pod"), turnFor("missing", "ServiceAccount", self), false, "no recorded owner"},
-		{"long thread hashed label", vmUser("vm", "long-pod"), labeled(long, longLabel, longOwner), true, ""},
-		{"long thread with another thread's label", vmUser("vm", "long-pod"), labeled(long, "victim", longOwner), false, "must name the thread"},
-		{"unclaimed pod", vmUser("vm", "vacant"), turnFor("proj", "ServiceAccount", self), false, "may only author"},
-		{"unrestricted VM", vmUser("vm", "admin-pod"), turnFor("victim", "ServiceAccount", self), true, ""},
-		{"non-pod producer is left to the author policy", &user.DefaultInfo{Name: blipchat}, turnFor("victim", "User", "ceo@example.com"), true, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: tc.user, op: admission.Create, resource: "blipturns", name: "turn", object: tc.obj}
-			allow, msg := req.evaluate(t, v, params)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-}
-
-// A direct turn has no thread UID of its own. The controller records the
-// current incarnation under thread-inc.<owner> and the claimed pod's entry
-// carries the incarnation its Blip was created for, so a token from before a
-// delete/recreate cannot write into the new project.
-func TestTurnOwnerPolicyPinsProducerIncarnation(t *testing.T) {
-	_, v := loadTurnPolicy(t)
-	self := "system:serviceaccount:" + ns + ":vm"
-	project := v1.ThreadOwner(ns, "proj")
-	params := map[string]string{
-		"sa.vm":                 "default",
-		"old-pod":               project + " old-incarnation",
-		"new-pod":               project + " new-incarnation",
-		"admin-pod":             "-",
-		"thread.proj":           project,
-		"thread-inc." + project: "new-incarnation",
-	}
-	for _, tc := range []struct {
-		name  string
-		pod   string
-		allow bool
-		msg   string
-	}{
-		{"producer from the previous incarnation", "old-pod", false, "current incarnation"},
-		{"producer created for the current incarnation", "new-pod", true, ""},
-		{"unrestricted VM", "admin-pod", true, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{
-				user: vmUser("vm", tc.pod), op: admission.Create, resource: "blipturns",
-				name: "turn", object: turnFor("proj", "ServiceAccount", self),
-			}
-			allow, msg := req.evaluate(t, v, params)
-			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
-				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
-			}
-		})
-	}
-
-	// A table that predates incarnation tracking has no thread-inc entry and
-	// must not silently accept the producer.
-	delete(params, "thread-inc."+project)
-	req := policyRequest{
-		user: vmUser("vm", "new-pod"), op: admission.Create, resource: "blipturns",
-		name: "turn", object: turnFor("proj", "ServiceAccount", self),
-	}
-	if allow, msg := req.evaluate(t, v, params); allow {
-		t.Fatalf("turn create allowed without a recorded thread incarnation: %s", msg)
-	}
-}
-
-// blip-vm-owner restricts pod-bound tokens to service accounts of the request
-// namespace. blip-turn-owner must do the same: a token from another namespace
-// may reuse a pod name that happens to exist in this namespace's owner table.
-func TestTurnOwnerPolicyForeignNamespacePodTokenIgnored(t *testing.T) {
-	_, v := loadTurnPolicy(t)
-	self := "system:serviceaccount:" + ns + ":vm"
-	project := v1.ThreadOwner(ns, "proj")
-	victim := v1.ThreadOwner(ns, "victim")
-	params := map[string]string{
-		"sa.vm":                 "default",
-		"vm-pod":                project + " incarnation-proj",
-		"thread.proj":           project,
-		"thread.victim":         victim,
-		"thread-inc." + project: "incarnation-proj",
-		"thread-inc." + victim:  "incarnation-victim",
-	}
-	foreign := &user.DefaultInfo{
-		Name:  "system:serviceaccount:other:vm",
-		Extra: map[string][]string{"authentication.kubernetes.io/pod-name": {"vm-pod"}},
-	}
-	req := policyRequest{user: foreign, op: admission.Create, resource: "blipturns", name: "turn",
-		object: turnFor("victim", "ServiceAccount", self)}
-	if allow, msg := req.evaluate(t, v, params); !allow {
-		t.Fatalf("foreign-namespace pod token was matched by the policy: %s", msg)
-	}
-	// The same pod name in the request namespace is still bound to its project.
-	if allow, msg := (policyRequest{user: vmUser("vm", "vm-pod"), op: admission.Create, resource: "blipturns",
-		name: "turn", object: turnFor("victim", "ServiceAccount", self)}).evaluate(t, v, params); allow {
-		t.Fatalf("same-namespace pod token escaped its project: %s", msg)
-	}
-}
-
-// A CREATE must fail closed when the owner table is absent. The binding uses
-// parameterNotFoundAction Deny (checked in loadTurnPolicy); even a validator
-// run with no params must not treat the caller as unbound.
-func TestTurnOwnerPolicyMissingTableDenies(t *testing.T) {
-	_, v := loadTurnPolicy(t)
-	self := "system:serviceaccount:" + ns + ":vm"
-	req := policyRequest{
-		user: vmUser("vm", "vm-pod"), op: admission.Create, resource: "blipturns",
-		name: "turn", object: turnFor("proj", "ServiceAccount", self),
-	}
-	if allow, msg := req.evaluate(t, v, nil); allow {
-		t.Fatalf("turn create allowed without the owner table: %s", msg)
-	}
-}
-
 // The policy rules and every binding that covers them must agree. A resource
 // present in the policy but missing from the binding is silently unrestricted,
 // and a CONNECT subresource present in only one place is a hole.
@@ -1368,11 +637,6 @@ func TestVMOwnerPolicyBindingCoverage(t *testing.T) {
 		return hasResource(rules, resource, admissionv1.Create) ||
 			hasResource(rules, resource, admissionv1.Update)
 	}
-	for _, resource := range []string{"blipthreads", "blipthreads/status"} {
-		if !has(policy.Spec.MatchConstraints.ResourceRules, resource) {
-			t.Errorf("policy does not cover %s", resource)
-		}
-	}
 	if !hasResource(policy.Spec.MatchConstraints.ResourceRules, "pods/proxy", admissionv1.Connect) {
 		t.Error("policy does not cover pods/proxy CONNECT")
 	}
@@ -1384,105 +648,5 @@ func TestVMOwnerPolicyBindingCoverage(t *testing.T) {
 		if has(rules, "pods/exec") && !hasResource(rules, "pods/proxy", admissionv1.Connect) {
 			t.Errorf("binding %s covers exec but not proxy", b.Name)
 		}
-		if (has(rules, "blips") || has(rules, "blipstates")) && !has(rules, "blipthreads") {
-			t.Errorf("binding %s covers blips/states but not threads", b.Name)
-		}
-	}
-}
-
-// The blip.dev/thread label is ThreadLabel(name), which is hashed for names
-// longer than a label value. The table therefore has to publish the owner
-// under the hashed label too, not only under the raw thread name.
-func TestVMOwnerPolicyLongThreadLabel(t *testing.T) {
-	v := loadVMOwnerPolicy(t)
-	long := strings.Repeat("long-thread-", 8)
-	victim := strings.Repeat("other-thread-", 8)
-	if len(long) <= 63 || len(victim) <= 63 {
-		t.Fatalf("test thread names are not long: %q %q", long, victim)
-	}
-	project := v1.ThreadOwner(ns, long)
-	victimOwner := v1.ThreadOwner(ns, victim)
-	label, victimLabel := v1.ThreadLabel(long), v1.ThreadLabel(victim)
-	params := map[string]string{
-		"sa.vm":                      "default",
-		"default-mine":               project,
-		"default-admin":              "-",
-		"thread." + long:             project, // spec.thread key read by blip-turn-owner
-		"thread-hash." + label:       project, // label key read by blip-vm-owner
-		"thread." + victim:           victimOwner,
-		"thread-hash." + victimLabel: victimOwner,
-		"thread." + victimLabel:      victimOwner + "-short", // a same-named short thread must not grant the long label
-	}
-	mine := vmUser("vm", "default-mine")
-	own := withThreadLabel(blipObj(project+".a", project), label)
-	foreign := withThreadLabel(blipObj(project+".a", project), victimLabel)
-	unknown := withThreadLabel(blipObj(project+".a", project), v1.ThreadLabel("missing-thread"))
-	unlabelled := blipObj(project+".a", project)
-
-	for _, tc := range []struct {
-		name  string
-		obj   map[string]any
-		allow bool
-	}{
-		{"own hashed thread", own, true},
-		{"foreign hashed thread", foreign, false},
-		{"unknown hashed thread", unknown, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// A restricted VM may not attach a thread on CREATE, so the label
-			// lookup is exercised by attaching it to an existing own Blip.
-			req := policyRequest{user: mine, op: admission.Update, resource: "blips", name: project + ".a", object: tc.obj, oldObject: unlabelled}
-			allow, msg := req.evaluate(t, v, params)
-			if allow != tc.allow || (!tc.allow && !strings.Contains(msg, "thread")) {
-				t.Fatalf("allow %v (%q), want %v", allow, msg, tc.allow)
-			}
-		})
-	}
-}
-
-// A short thread may legally be named exactly like another thread's hashed
-// label. The owner table keeps the two entries under different prefixes, and
-// each producer may use its own label: neither lookup shadows the other.
-func TestVMOwnerPolicyThreadHashDoesNotShadowShortName(t *testing.T) {
-	v := loadVMOwnerPolicy(t)
-	long := "project-" + strings.Repeat("z", 70)
-	short := v1.ThreadLabel(long)
-	if len(short) != 63 || len(long) <= 63 {
-		t.Fatalf("test names: short %q (%d), long %q (%d)", short, len(short), long, len(long))
-	}
-	longOwner, shortOwner := v1.ThreadOwner(ns, long), v1.ThreadOwner(ns, short)
-	const other = "p-0000000000000000"
-	params := map[string]string{
-		"sa.vm":                "default",
-		"long-pod":             longOwner,
-		"short-pod":            shortOwner,
-		"thread." + long:       longOwner,
-		"thread-hash." + short: longOwner,
-		"thread." + short:      shortOwner,
-		"thread.other":         other,
-	}
-	for _, tc := range []struct {
-		name  string
-		user  user.Info
-		owner string
-		label string
-		allow bool
-	}{
-		{"long thread uses its hashed label", vmUser("vm", "long-pod"), longOwner, short, true},
-		{"short thread uses its raw name", vmUser("vm", "short-pod"), shortOwner, short, true},
-		{"long thread may not use another thread", vmUser("vm", "long-pod"), longOwner, "other", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			obj := withThreadLabel(blipObj(tc.owner+".a", tc.owner), tc.label)
-			// Attach the label on UPDATE: CREATE with a thread label is denied
-			// for every restricted VM, which would hide the resolution under
-			// test.
-			old := blipObj(tc.owner+".a", tc.owner)
-			req := policyRequest{user: tc.user, op: admission.Update, resource: "blips", name: tc.owner + ".a", object: obj, oldObject: old}
-			allow, msg := req.evaluate(t, v, params)
-			if allow != tc.allow || (!tc.allow && !strings.Contains(msg, "thread")) {
-				t.Fatalf("allow %v (%q), want %v", allow, msg, tc.allow)
-			}
-		})
 	}
 }

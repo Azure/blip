@@ -3,12 +3,10 @@ package controller
 import (
 	"context"
 	"maps"
-	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -121,19 +119,19 @@ func TestVMOwnersSharedBases(t *testing.T) {
 		s.Labels = map[string]string{v1.LabelOwner: testOwner}
 	})
 	e.newState("workspace", func(s *v1.BlipState) { s.Spec.CopyFrom = "base-dev" })
-	e.must(syncVMOwners(e.ctx, e.c, ns))
+	e.must(syncVMOwners(e.ctx, e.c, ns, nil))
 	if got := e.owners()[ownersBasesKey]; got != "base-dev base-tools" {
 		t.Fatalf("shared bases = %q", got)
 	}
 	e.must(e.c.Delete(e.ctx, e.getState("base-tools")))
-	e.must(syncVMOwners(e.ctx, e.c, ns))
+	e.must(syncVMOwners(e.ctx, e.c, ns, nil))
 	if got := e.owners()[ownersBasesKey]; got != "base-dev" {
 		t.Fatalf("shared bases after deletion = %q", got)
 	}
 	base := e.getState("base-dev")
 	base.Labels = map[string]string{v1.LabelOwner: testOwner}
 	e.must(e.c.Update(e.ctx, base))
-	e.must(syncVMOwners(e.ctx, e.c, ns))
+	e.must(syncVMOwners(e.ctx, e.c, ns, nil))
 	if _, ok := e.owners()[ownersBasesKey]; ok {
 		t.Fatal("private base remains shared")
 	}
@@ -250,7 +248,6 @@ func TestPodServiceAccount(t *testing.T) {
 	e := newEnv(t)
 	pool := &v1.BlipPool{ObjectMeta: metadata("default"), Spec: v1.BlipPoolSpec{ServiceAccountName: "vm"}}
 	base := e.pool.podFor(pool, "default-vm")
-	enabled, disabled := true, false
 	for _, tt := range []struct {
 		name   string
 		mutate func(*corev1.Pod)
@@ -258,18 +255,7 @@ func TestPodServiceAccount(t *testing.T) {
 	}{
 		{"projected proxy token", func(*corev1.Pod) {}, "vm"},
 		{"default account", func(p *corev1.Pod) { p.Spec.ServiceAccountName = "" }, "default"},
-		{"legacy automount", func(p *corev1.Pod) {
-			p.Spec.AutomountServiceAccountToken = &enabled
-			p.Spec.InitContainers = nil
-			p.Spec.Volumes = nil
-		}, "vm"},
-		{"legacy implicit automount", func(p *corev1.Pod) {
-			p.Spec.AutomountServiceAccountToken = nil
-			p.Spec.InitContainers = nil
-			p.Spec.Volumes = nil
-		}, "vm"},
-		{"automount disabled without proxy", func(p *corev1.Pod) {
-			p.Spec.AutomountServiceAccountToken = &disabled
+		{"no proxy", func(p *corev1.Pod) {
 			p.Spec.InitContainers = nil
 		}, ""},
 		{"unmounted projection", func(p *corev1.Pod) { p.Spec.InitContainers[0].VolumeMounts = nil }, ""},
@@ -292,51 +278,36 @@ func TestPodServiceAccount(t *testing.T) {
 }
 
 // Pool edits or deletion must not remove restrictions on a still-live pod's
-// account. This covers both old automounted tokens and new proxy projections.
+// account.
 func TestVMOwnersRetainsLivePodAccounts(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		name := "proxy"
-		if legacy {
-			name = "legacy"
-		}
-		t.Run(name, func(t *testing.T) {
-			e := newEnv(t)
-			e.newPool("default", 0, 0)
-			pool := e.getPool("default")
-			oldPool := pool.DeepCopy()
-			oldPool.Spec.ServiceAccountName = "old"
-			p := e.pool.podFor(oldPool, "default-old")
-			if legacy {
-				enabled := true
-				p.Spec.AutomountServiceAccountToken = &enabled
-				p.Spec.InitContainers = nil
-				p.Spec.Volumes = p.Spec.Volumes[:1]
-				p.Spec.Containers[0].VolumeMounts = p.Spec.Containers[0].VolumeMounts[:1]
-			}
-			e.newBlip("owned", withOwner(testOwner))
-			b := e.getBlip("owned")
-			p.Labels[v1.LabelBlipUID] = string(b.UID)
-			p.Annotations[v1.AnnotationBlip] = b.Name
-			e.create(p)
-			e.must(setVMOwner(e.ctx, e.c, p, b))
-			if got, want := e.owners(), map[string]string{"sa.old": "", p.Name: testOwner}; !maps.Equal(got, want) {
-				t.Fatalf("claim did not record old pod's account: %v, want %v", got, want)
-			}
-			e.must(syncVMOwners(e.ctx, e.c, ns))
-			if got, want := e.owners(), map[string]string{"sa.vm": "default", "sa.old": "", p.Name: testOwner}; !maps.Equal(got, want) {
-				t.Fatalf("account changed before old pod exited: %v, want %v", got, want)
-			}
-			e.must(e.c.Delete(e.ctx, pool))
-			e.must(syncVMOwners(e.ctx, e.c, ns))
-			if got, want := e.owners(), map[string]string{"sa.old": "", p.Name: testOwner}; !maps.Equal(got, want) {
-				t.Fatalf("live pod account lost with pool: %v, want %v", got, want)
-			}
-			e.must(e.c.Delete(e.ctx, p))
-			e.must(syncVMOwners(e.ctx, e.c, ns))
-			if got := e.owners(); len(got) != 0 {
-				t.Errorf("deleted pod left owner/account entries: %v", got)
-			}
-		})
+	e := newEnv(t)
+	e.newPool("default", 0, 0)
+	pool := e.getPool("default")
+	oldPool := pool.DeepCopy()
+	oldPool.Spec.ServiceAccountName = "old"
+	p := e.pool.podFor(oldPool, "default-old")
+	e.newBlip("owned", withOwner(testOwner))
+	b := e.getBlip("owned")
+	p.Labels[v1.LabelBlipUID] = string(b.UID)
+	p.Annotations[v1.AnnotationBlip] = b.Name
+	e.create(p)
+	e.must(setVMOwner(e.ctx, e.c, p, b))
+	if got, want := e.owners(), map[string]string{"sa.old": "", p.Name: testOwner}; !maps.Equal(got, want) {
+		t.Fatalf("claim did not record old pod's account: %v, want %v", got, want)
+	}
+	e.must(syncVMOwners(e.ctx, e.c, ns, nil))
+	if got, want := e.owners(), map[string]string{"sa.vm": "default", "sa.old": "", p.Name: testOwner}; !maps.Equal(got, want) {
+		t.Fatalf("account changed before old pod exited: %v, want %v", got, want)
+	}
+	e.must(e.c.Delete(e.ctx, pool))
+	e.must(syncVMOwners(e.ctx, e.c, ns, nil))
+	if got, want := e.owners(), map[string]string{"sa.old": "", p.Name: testOwner}; !maps.Equal(got, want) {
+		t.Fatalf("live pod account lost with pool: %v, want %v", got, want)
+	}
+	e.must(e.c.Delete(e.ctx, p))
+	e.must(syncVMOwners(e.ctx, e.c, ns, nil))
+	if got := e.owners(); len(got) != 0 {
+		t.Errorf("deleted pod left owner/account entries: %v", got)
 	}
 }
 
@@ -376,61 +347,4 @@ func TestPodOwnerLabelTracksBlip(t *testing.T) {
 	setOwner("u-other")
 	// Removing the owner makes the Blip unrestricted again.
 	setOwner("")
-}
-
-// Threads are published with their project owner hash so the turn policy can
-// bind a pod-bound producer to its own thread without trusting turn labels.
-func TestVMOwnersThreadOwners(t *testing.T) {
-	e := newEnv(t)
-	e.newPool("default", 0, 0)
-	thread := &v1.BlipThread{
-		ObjectMeta: metav1.ObjectMeta{Name: "proj", Namespace: ns},
-		Spec:       v1.BlipThreadSpec{Pool: "default"},
-	}
-	e.create(thread)
-	e.must(syncVMOwners(e.ctx, e.c, ns))
-	if got, want := e.owners()["thread.proj"], v1.ThreadOwner(ns, "proj"); got != want {
-		t.Fatalf("thread owner key = %q, want %q", got, want)
-	}
-	if err := e.c.Delete(e.ctx, thread); err != nil {
-		t.Fatal(err)
-	}
-	e.must(syncVMOwners(e.ctx, e.c, ns))
-	if got, ok := e.owners()["thread.proj"]; ok {
-		t.Fatalf("deleted thread left owner key %q", got)
-	}
-}
-
-// A long thread name cannot be a label value, so blip.dev/thread carries
-// ThreadLabel(name). The table must publish that key too; otherwise a
-// restricted VM cannot attach its Blip to its own long-named thread.
-func TestVMOwnersThreadOwnersLongName(t *testing.T) {
-	e := newEnv(t)
-	e.newPool("default", 0, 0)
-	long := strings.Repeat("thread-", 12)
-	if len(long) <= 63 {
-		t.Fatalf("test thread name %q is not long", long)
-	}
-	thread := &v1.BlipThread{
-		ObjectMeta: metav1.ObjectMeta{Name: long, Namespace: ns},
-		Spec:       v1.BlipThreadSpec{Pool: "default"},
-	}
-	e.create(thread)
-	e.must(syncVMOwners(e.ctx, e.c, ns))
-	owner := v1.ThreadOwner(ns, long)
-	keys := []string{"thread." + long, ownersThreadHashPrefix + v1.ThreadLabel(long)}
-	for _, key := range keys {
-		if got := e.owners()[key]; got != owner {
-			t.Errorf("thread owner key %q = %q, want %q", key, got, owner)
-		}
-	}
-	if err := e.c.Delete(e.ctx, thread); err != nil {
-		t.Fatal(err)
-	}
-	e.must(syncVMOwners(e.ctx, e.c, ns))
-	for _, key := range keys {
-		if got, ok := e.owners()[key]; ok {
-			t.Errorf("deleted thread left owner key %q = %q", key, got)
-		}
-	}
 }

@@ -21,25 +21,6 @@ const (
 	// short name is hashed under a prefix that cannot be a legal Blip name;
 	// AnnotationParent keeps the full name.
 	LabelParent = "blip.dev/parent"
-	// LabelThread marks blips and other objects owned by a BlipThread. Its
-	// value is ThreadLabel(name), because Kubernetes labels are at most 63
-	// characters but BlipThread names may be longer.
-	LabelThread = "blip.dev/thread"
-	// LabelThreadUID pins a turn to the BlipThread incarnation that produced
-	// it. A deleted and recreated thread keeps its name and thread label but
-	// gets a new UID, so the proxy can select only the current incarnation's
-	// turns instead of returning stale history from the previous one.
-	LabelThreadUID = "blip.dev/thread-uid"
-	// AnnotationThread carries the full BlipThread name when LabelThread is
-	// hashed for a long name.
-	AnnotationThread = "blip.dev/thread-name"
-	// AnnotationThreadUID pins a Blip and its BlipState to the incarnation of
-	// the BlipThread that created them. Labels are name-derived and survive a
-	// delete/recreate of the thread, so the UID is what tells two incarnations
-	// of the same name apart.
-	AnnotationThreadUID = "blip.dev/thread-uid"
-	// LabelTask marks a blip as work for one ThreadTask.
-	LabelTask = "blip.dev/task"
 
 	// AnnotationParent is the full short name of the blip a fork was started
 	// from, including names too long for LabelParent's hash.
@@ -59,15 +40,6 @@ const (
 	// AnnotationStopReason records why the controller set spec.stop, for the
 	// client to report when it gathers the blip.
 	AnnotationStopReason = "blip.dev/stop-reason"
-	// AnnotationPrunedReportSeq records the highest report sequence whose
-	// deterministic watcher turn retention has deleted. The watcher
-	// deduplicates by turn name, so without this tombstone it would recreate
-	// the pruned turn from the Blip's unchanged status and deliver stale
-	// input to the coordinator again.
-	AnnotationPrunedReportSeq = "blip.dev/pruned-report-seq"
-	// AnnotationPrunedFinished marks a deleted finished-phase turn. It stops
-	// the watcher from recreating that deterministic turn after retention.
-	AnnotationPrunedFinished = "blip.dev/pruned-finished"
 
 	Finalizer = "blip.dev/finalizer"
 )
@@ -91,36 +63,6 @@ func ParentLabel(name string) string {
 	}
 	sum := sha256.Sum256([]byte(name))
 	return parentLabelHash + hex.EncodeToString(sum[:])[:56]
-}
-
-// threadLabelHash is the reserved prefix of a hashed ThreadLabel. An
-// underscore is legal in a Kubernetes label value but not in a DNS-1123
-// BlipThread name, so a hashed label can never equal a literal thread name.
-// Without that separation, a short thread named exactly another thread's
-// 63-character hash shared its blip.dev/thread label and the API proxy mixed
-// both projects' turns.
-const threadLabelHash = "thread_"
-
-// ThreadLabel is the LabelThread value for a BlipThread name. Kubernetes label
-// values are at most 63 characters: names that fit are used as-is so existing
-// selectors keep working, and longer names become a stable 63-character hash
-// under the reserved thread_ prefix. AnnotationThread always carries the full
-// name.
-func ThreadLabel(name string) string {
-	if len(name) <= 63 {
-		return name
-	}
-	sum := sha256.Sum256([]byte(name))
-	return threadLabelHash + hex.EncodeToString(sum[:])[:56]
-}
-
-// ThreadOwner is the blip.dev/owner label of the blips and states a
-// BlipThread creates. It is derived from the thread's namespace and name, so
-// it is stable and cannot collide with the u- owners derived from user
-// identities.
-func ThreadOwner(namespace, name string) string {
-	sum := sha256.Sum256([]byte(namespace + "/" + name))
-	return "p-" + hex.EncodeToString(sum[:8])
 }
 
 // OwnerPrefix is the prefix of every object name scoped to owner.

@@ -41,7 +41,9 @@ func testConfig(t *testing.T, upstream *httptest.Server) Config {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := Config{
-		SocketPath: filepath.Join(dir, "vsock", "api.sock"),
+		SocketPath:   filepath.Join(dir, "vsock", "api.sock"),
+		PodName:      "test-pod",
+		PodNamespace: "test-ns",
 		API: &API{
 			Address:   strings.TrimPrefix(upstream.URL, "https://"),
 			TokenFile: filepath.Join(dir, "token"),
@@ -192,6 +194,14 @@ func TestConfigFromEnv(t *testing.T) {
 		t.Fatal("accepted a config with no API or endpoints")
 	}
 
+	// The Kubernetes API route requires the trusted pod identity; it must not
+	// silently run unscoped.
+	t.Setenv("BLIP_KUBE_API", "1")
+	if _, err := ConfigFromEnv(); err == nil {
+		t.Fatal("accepted the API route without a pod identity")
+	}
+	t.Setenv("BLIP_KUBE_API", "")
+
 	// A JSON endpoint list alone is valid.
 	t.Setenv("BLIP_ENDPOINTS", `[{"name":"payments","url":"https://payments.example:8443","tokenFile":"/t","caFile":"/c"}]`)
 	cfg, err = ConfigFromEnv()
@@ -206,6 +216,8 @@ func TestConfigFromEnv(t *testing.T) {
 	// IPv6 API address and custom directory.
 	t.Setenv("BLIP_ENDPOINTS", "")
 	t.Setenv("BLIP_KUBE_API", "1")
+	t.Setenv("POD_NAME", "vm-0")
+	t.Setenv("POD_NAMESPACE", "blip-sandbox")
 	t.Setenv("BLIP_DIR", "/custom")
 	t.Setenv("KUBERNETES_SERVICE_HOST", "fd00::1")
 	cfg, err = ConfigFromEnv()
@@ -279,7 +291,7 @@ func TestIdentityHeadersAndTokenRotation(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		req, err := http.NewRequest(http.MethodGet, "http://kube-apiserver/api/v1/pods", nil)
+		req, err := http.NewRequest(http.MethodGet, "http://kube-apiserver/version", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -335,7 +347,7 @@ func TestFixedTargetAndOrdinaryMethods(t *testing.T) {
 	cfg := testConfig(t, upstream)
 	p := startProxy(t, cfg)
 	for _, method := range []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} {
-		req, err := http.NewRequest(method, "http://attacker.invalid/api/v1/pods/name/exec?command=sh&command=-c", strings.NewReader("body"))
+		req, err := http.NewRequest(method, "http://attacker.invalid/apis/apps/v1/namespaces/ns/deployments/name/exec?command=sh&command=-c", strings.NewReader("body"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -346,7 +358,7 @@ func TestFixedTargetAndOrdinaryMethods(t *testing.T) {
 		}
 		_ = responseBody(t, resp)
 		got := <-observed
-		if got.method != method || got.host != cfg.API.Address || got.body != "body" || got.uri != "/api/v1/pods/name/exec?command=sh&command=-c" {
+		if got.method != method || got.host != cfg.API.Address || got.body != "body" || got.uri != "/apis/apps/v1/namespaces/ns/deployments/name/exec?command=sh&command=-c" {
 			t.Errorf("unexpected upstream request: %+v", got)
 		}
 	}
@@ -417,7 +429,7 @@ func TestNoEnvironmentProxyOrRedirectFollowing(t *testing.T) {
 	// Avoid localhost's implicit exemption in http.ProxyFromEnvironment.
 	// The test certificate covers example.com; the dialer stands in for DNS.
 	cfg.API.Address = "example.com:443"
-	handler, transport, err := newAPIProxy(cfg.API, "", "")
+	handler, transport, err := newAPIProxy(cfg.API, cfg.PodName, cfg.PodNamespace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,7 +537,7 @@ func TestStreamingWatchAndShutdown(t *testing.T) {
 	})
 	cfg := testConfig(t, upstream)
 	p := startProxy(t, cfg)
-	resp, err := p.client.Get("http://kube-apiserver/api/v1/pods?watch=true")
+	resp, err := p.client.Get("http://kube-apiserver/apis/apps/v1/namespaces/ns/deployments?watch=true")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,7 +637,7 @@ func TestUpgradeAndShutdown(t *testing.T) {
 			}
 			defer conn.Close()
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-			_, _ = fmt.Fprintf(conn, "GET /api/v1/pods/p/exec HTTP/1.1\r\nHost: kube-apiserver\r\nConnection: Upgrade, Authorization\r\nUpgrade: %s\r\nAuthorization: attacker\r\n\r\n", protocol)
+			_, _ = fmt.Fprintf(conn, "GET /apis/apps/v1/namespaces/ns/deployments/p/exec HTTP/1.1\r\nHost: kube-apiserver\r\nConnection: Upgrade, Authorization\r\nUpgrade: %s\r\nAuthorization: attacker\r\n\r\n", protocol)
 			reader := bufio.NewReader(conn)
 			resp, err := http.ReadResponse(reader, nil)
 			if err != nil {
@@ -692,7 +704,7 @@ func TestUpgradeBackendHalfClose(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.WriteString(conn, "GET /api/v1/pods/p/exec HTTP/1.1\r\nHost: kube-apiserver\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(conn, "GET /apis/apps/v1/namespaces/ns/deployments/p/exec HTTP/1.1\r\nHost: kube-apiserver\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	reader := bufio.NewReader(conn)
@@ -853,7 +865,7 @@ func TestClientCloseCancelsUpstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := fmt.Fprintf(conn, "GET /api/v1/pods?watch=true HTTP/1.1\r\nHost: kube-apiserver\r\n\r\n"); err != nil {
+	if _, err := fmt.Fprintf(conn, "GET /apis/apps/v1/namespaces/ns/deployments?watch=true HTTP/1.1\r\nHost: kube-apiserver\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
@@ -903,7 +915,7 @@ func TestClientHalfCloseThenCloseCancelsUpstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := fmt.Fprintf(conn, "GET /api/v1/pods?watch=true HTTP/1.1\r\nHost: kube-apiserver\r\n\r\n"); err != nil {
+	if _, err := fmt.Fprintf(conn, "GET /apis/apps/v1/namespaces/ns/deployments?watch=true HTTP/1.1\r\nHost: kube-apiserver\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
@@ -972,7 +984,9 @@ func TestProjectedCARotationAndRemoval(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := Config{
-		SocketPath: filepath.Join(dir, "vsock", "api.sock"),
+		SocketPath:   filepath.Join(dir, "vsock", "api.sock"),
+		PodName:      "test-pod",
+		PodNamespace: "test-ns",
 		API: &API{
 			Address:   listener.Addr().String(),
 			TokenFile: filepath.Join(dir, "token"),

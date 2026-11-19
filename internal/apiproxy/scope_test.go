@@ -6,15 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
-	"time"
-
-	"k8s.io/apimachinery/pkg/util/validation"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -27,8 +23,6 @@ type fakeObject struct {
 	UID         string
 	Labels      map[string]string
 	Annotations map[string]string
-	Thread      string
-	ThreadUID   string
 	Secret      string
 	Image       string
 }
@@ -46,17 +40,11 @@ func (o fakeObject) value(kind string) map[string]any {
 	if o.Image != "" {
 		spec["image"] = o.Image
 	}
-	if o.Thread != "" {
-		spec["thread"] = o.Thread
-	}
 	if o.Secret != "" {
 		spec["env"] = []any{map[string]any{"name": "SECRET", "value": o.Secret}}
 	}
 	if len(spec) > 0 {
 		out["spec"] = spec
-	}
-	if o.ThreadUID != "" {
-		out["status"] = map[string]any{"threadUID": o.ThreadUID}
 	}
 	return out
 }
@@ -69,17 +57,13 @@ type fakeKube struct {
 	pods     map[string]fakeObject
 	blips    map[string]fakeObject
 	states   map[string]fakeObject
-	threads  map[string]fakeObject
-	turns    map[string]fakeObject
 }
 
 func newFakeKube() *fakeKube {
 	return &fakeKube{
-		pods:    map[string]fakeObject{},
-		blips:   map[string]fakeObject{},
-		states:  map[string]fakeObject{},
-		threads: map[string]fakeObject{},
-		turns:   map[string]fakeObject{},
+		pods:   map[string]fakeObject{},
+		blips:  map[string]fakeObject{},
+		states: map[string]fakeObject{},
 	}
 }
 
@@ -116,7 +100,7 @@ func resourceFromPath(namespace, path string) (resource, name string, list bool)
 	}
 	if len(seg) >= 3 && seg[0] == "apis" && seg[1] == "blip.dev" && len(seg) >= 6 &&
 		seg[3] == "namespaces" && seg[4] == namespace &&
-		(seg[5] == "blips" || seg[5] == "blipstates" || seg[5] == "blipthreads" || seg[5] == "blipturns") {
+		(seg[5] == "blips" || seg[5] == "blipstates") {
 		if len(seg) == 6 {
 			return seg[5], "", true
 		}
@@ -173,10 +157,6 @@ func (f *fakeKube) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		objects, kind = f.blips, "Blip"
 	case "blipstates":
 		objects, kind = f.states, "BlipState"
-	case "blipthreads":
-		objects, kind = f.threads, "BlipThread"
-	case "blipturns":
-		objects, kind = f.turns, "BlipTurn"
 	default:
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, "{}")
@@ -250,38 +230,6 @@ func scopedFixture() *fakeKube {
 	kube.states["bob.home"] = fakeObject{Name: "bob.home", UID: "state-bob", Labels: map[string]string{v1.LabelOwner: "bob"}}
 	kube.states["shared-base"] = fakeObject{Name: "shared-base", UID: "state-base", Image: "reg/base:v1"}
 	kube.states["legacy-copy"] = fakeObject{Name: "legacy-copy", UID: "state-legacy"}
-	kube.pods["proj-vm"] = fakeObject{
-		Name: "proj-vm", UID: "pod-proj",
-		Labels:      map[string]string{v1.LabelOwner: v1.ThreadOwner(scopeNamespace, "alice-proj"), v1.LabelBlipUID: "uid-proj"},
-		Annotations: map[string]string{v1.AnnotationBlip: "proj.a"},
-	}
-	kube.blips["proj.a"] = fakeObject{
-		Name: "proj.a", UID: "uid-proj",
-		Labels:      map[string]string{v1.LabelOwner: v1.ThreadOwner(scopeNamespace, "alice-proj"), v1.LabelThread: "alice-proj"},
-		Annotations: map[string]string{v1.AnnotationThread: "alice-proj", v1.AnnotationThreadUID: "thread-alice"},
-	}
-	kube.threads["alice-proj"] = fakeObject{Name: "alice-proj", UID: "thread-alice"}
-	kube.threads["bob-proj"] = fakeObject{Name: "bob-proj", UID: "thread-bob"}
-	kube.threads["admin-proj"] = fakeObject{Name: "admin-proj", UID: "thread-admin"}
-	kube.turns["alice-turn"] = fakeObject{
-		Name: "alice-turn", UID: "turn-alice", Thread: "alice-proj", ThreadUID: "thread-alice",
-		Labels: map[string]string{v1.LabelThread: "alice-proj", v1.LabelThreadUID: "thread-alice", v1.LabelOwner: v1.ThreadOwner(scopeNamespace, "alice-proj")},
-	}
-	kube.turns["unlabelled-alice-turn"] = fakeObject{Name: "unlabelled-alice-turn", UID: "turn-old", Thread: "alice-proj"}
-	kube.turns["bob-turn"] = fakeObject{
-		Name: "bob-turn", UID: "turn-bob", Thread: "bob-proj", ThreadUID: "thread-bob",
-		Labels: map[string]string{v1.LabelThread: "bob-proj", v1.LabelThreadUID: "thread-bob", v1.LabelOwner: v1.ThreadOwner(scopeNamespace, "bob-proj")},
-	}
-	kube.turns["admin-turn"] = fakeObject{
-		Name: "admin-turn", UID: "turn-admin", Thread: "admin-proj", ThreadUID: "thread-admin",
-		Labels: map[string]string{v1.LabelThread: "admin-proj", v1.LabelThreadUID: "thread-admin", v1.LabelOwner: v1.ThreadOwner(scopeNamespace, "admin-proj")},
-	}
-	// A producer can set blip.dev/owner, so a forged owner label matching
-	// alice must not expose a turn whose spec.thread belongs to bob.
-	kube.turns["forged-owner-turn"] = fakeObject{
-		Name: "forged-owner-turn", UID: "turn-forged", Thread: "bob-proj",
-		Labels: map[string]string{v1.LabelThread: "bob-proj", v1.LabelThreadUID: "thread-bob", v1.LabelOwner: v1.ThreadOwner(scopeNamespace, "alice-proj")},
-	}
 	return kube
 }
 
@@ -391,74 +339,12 @@ func TestOwnerScopeHidesOtherOwners(t *testing.T) {
 	}
 }
 
-func TestOwnerScopeScopesThreadsAndTurns(t *testing.T) {
-	kube := scopedFixture()
-	p := startScoped(t, kube, "proj-vm")
-
-	// The project's own thread and turns are readable.
-	if status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads/alice-proj"); status != http.StatusOK {
-		t.Fatalf("own thread status = %d, body %q", status, body)
-	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads/bob-proj"); status != http.StatusNotFound {
-		t.Fatalf("other owner's thread status = %d", status)
-	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads/admin-proj"); status != http.StatusNotFound {
-		t.Fatalf("administrator thread status = %d", status)
-	}
-	status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads")
-	if status != http.StatusOK || !strings.Contains(body, "alice-proj") {
-		t.Fatalf("own thread list status = %d, body %q", status, body)
-	}
-	if strings.Contains(body, "bob-proj") || strings.Contains(body, "admin-proj") {
-		t.Fatalf("thread list leaked another project: %q", body)
-	}
-	if got := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads").Get("fieldSelector"); got != "metadata.name=alice-proj" {
-		t.Fatalf("thread list field selector = %q", got)
-	}
-
-	if status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/alice-turn"); status != http.StatusOK {
-		t.Fatalf("own turn status = %d, body %q", status, body)
-	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/bob-turn"); status != http.StatusNotFound {
-		t.Fatalf("other owner's turn status = %d", status)
-	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/forged-owner-turn"); status != http.StatusNotFound {
-		t.Fatalf("forged owner label exposed another thread's turn: status = %d", status)
-	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/unlabelled-alice-turn"); status != http.StatusOK {
-		t.Fatalf("own turn without labels status = %d", status)
-	}
-	status, body = proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns")
-	if status != http.StatusOK || !strings.Contains(body, "alice-turn") {
-		t.Fatalf("own turn list status = %d, body %q", status, body)
-	}
-	if strings.Contains(body, "bob-turn") || strings.Contains(body, "admin-turn") || strings.Contains(body, "unlabelled-alice-turn") {
-		t.Fatalf("turn list leaked another project or unlabelled turn: %q", body)
-	}
-	if got := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns").Get("labelSelector"); got != v1.LabelThread+"=alice-proj,"+v1.LabelThreadUID+"=thread-alice" {
-		t.Fatalf("turn list label selector = %q", got)
-	}
-
-	// All-namespace and legacy watch paths are denied for both resources.
-	for _, path := range []string{
-		"/apis/blip.dev/v1alpha1/blipthreads",
-		"/apis/blip.dev/v1alpha1/blipturns",
-		"/apis/blip.dev/v1alpha1/watch/blipthreads",
-		"/apis/blip.dev/v1alpha1/watch/blipturns",
-	} {
-		if status, _ := proxyGet(t, p, path); status != http.StatusForbidden {
-			t.Errorf("%s status = %d, want 403", path, status)
-		}
-	}
-}
-
 // TestOwnerScopeNamespacedWatchPaths is the regression test for the legacy
 // namespaced watch routes. They must be scoped exactly like the corresponding
 // list; forwarding them unscoped leaked every owner's objects in the namespace.
 func TestOwnerScopeNamespacedWatchPaths(t *testing.T) {
 	kube := scopedFixture()
-	owner := v1.ThreadOwner(scopeNamespace, "alice-proj")
-	p := startScoped(t, kube, "proj-vm")
+	p := startScoped(t, kube, "alice-vm")
 
 	for _, tc := range []struct {
 		name     string
@@ -470,28 +356,18 @@ func TestOwnerScopeNamespacedWatchPaths(t *testing.T) {
 	}{
 		{
 			name: "pods", path: "/api/v1/watch/namespaces/blip-sandbox/pods",
-			query: "labelSelector", selector: v1.LabelOwner + "=" + owner,
-			want: []string{"proj-vm"}, not: []string{"alice-vm", "bob-vm", "warm-vm"},
+			query: "labelSelector", selector: v1.LabelOwner + "=alice",
+			want: []string{"alice-vm"}, not: []string{"bob-vm", "warm-vm"},
 		},
 		{
 			name: "blips", path: "/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blips",
-			query: "labelSelector", selector: v1.LabelOwner + "=" + owner,
-			want: []string{"proj.a"}, not: []string{"alice.a", "bob.b", "admin.a"},
+			query: "labelSelector", selector: v1.LabelOwner + "=alice",
+			want: []string{"alice.a"}, not: []string{"bob.b", "admin.a"},
 		},
 		{
 			name: "blipstates", path: "/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blipstates",
-			query: "labelSelector", selector: v1.LabelOwner + "=" + owner,
-			not: []string{"alice.home", "bob.home", "shared-base", "legacy-copy"},
-		},
-		{
-			name: "blipthreads", path: "/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blipthreads",
-			query: "fieldSelector", selector: "metadata.name=alice-proj",
-			want: []string{"alice-proj"}, not: []string{"bob-proj", "admin-proj"},
-		},
-		{
-			name: "blipturns", path: "/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blipturns",
-			query: "labelSelector", selector: v1.LabelThread + "=alice-proj," + v1.LabelThreadUID + "=thread-alice",
-			want: []string{"alice-turn"}, not: []string{"bob-turn", "admin-turn", "unlabelled-alice-turn"},
+			query: "labelSelector", selector: v1.LabelOwner + "=alice",
+			want: []string{"alice.home"}, not: []string{"bob.home", "shared-base", "legacy-copy"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -515,19 +391,6 @@ func TestOwnerScopeNamespacedWatchPaths(t *testing.T) {
 		})
 	}
 
-	// The latent core-API pod watch is scoped to a user-owned VM as well.
-	p = startScoped(t, kube, "alice-vm")
-	status, body := proxyGet(t, p, "/api/v1/watch/namespaces/blip-sandbox/pods?watch=true")
-	if status != http.StatusOK {
-		t.Fatalf("alice pod watch status = %d, body %q", status, body)
-	}
-	if got := kube.lastQuery(t, "/api/v1/watch/namespaces/blip-sandbox/pods").Get("labelSelector"); got != v1.LabelOwner+"=alice" {
-		t.Errorf("alice pod watch selector = %q", got)
-	}
-	if !strings.Contains(body, "alice-vm") || strings.Contains(body, "bob-vm") || strings.Contains(body, "warm-vm") {
-		t.Errorf("alice pod watch leaked pods: %s", body)
-	}
-
 	// Unknown watch shapes naming a scoped resource, and other namespaces,
 	// are denied rather than forwarded unscoped.
 	for _, path := range []string{
@@ -536,8 +399,6 @@ func TestOwnerScopeNamespacedWatchPaths(t *testing.T) {
 		"/api/v1/watch/namespaces/other/pods",
 		"/apis/blip.dev/v1alpha1/watch/blips",
 		"/apis/blip.dev/v1alpha1/watch/blipstates",
-		"/apis/blip.dev/v1alpha1/watch/blipthreads",
-		"/apis/blip.dev/v1alpha1/watch/blipturns",
 		"/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blips/bob.b",
 		"/apis/blip.dev/v1alpha1/watch/namespaces/other/blips",
 	} {
@@ -547,162 +408,36 @@ func TestOwnerScopeNamespacedWatchPaths(t *testing.T) {
 	}
 }
 
-// A long thread name is hashed into the thread label. The proxy must recover
-// the full name from the annotation so its owner binding and turn selector
-// still work.
-func TestOwnerScopeHashedThreadLabel(t *testing.T) {
+// The thread and turn API is gone, but stale objects may still exist from an
+// older cluster. They must stay invisible for every path spelling.
+func TestOwnerScopeDeniesThreadsAndTurns(t *testing.T) {
 	kube := scopedFixture()
-	thread := "alice-" + strings.Repeat("x", 70)
-	owner := v1.ThreadOwner(scopeNamespace, thread)
-	kube.pods["long-vm"] = fakeObject{
-		Name: "long-vm", UID: "pod-long",
-		Labels:      map[string]string{v1.LabelOwner: owner, v1.LabelBlipUID: "uid-long"},
-		Annotations: map[string]string{v1.AnnotationBlip: "long.a"},
-	}
-	kube.blips["long.a"] = fakeObject{
-		Name: "long.a", UID: "uid-long",
-		Labels:      map[string]string{v1.LabelOwner: owner, v1.LabelThread: v1.ThreadLabel(thread)},
-		Annotations: map[string]string{v1.AnnotationThread: thread, v1.AnnotationThreadUID: "thread-long"},
-	}
-	kube.threads[thread] = fakeObject{Name: thread, UID: "thread-long"}
-	kube.turns["long-turn"] = fakeObject{
-		Name: "long-turn", UID: "turn-long", Thread: thread, ThreadUID: "thread-long",
-		Labels: map[string]string{v1.LabelThread: v1.ThreadLabel(thread), v1.LabelThreadUID: "thread-long", v1.LabelOwner: owner},
-	}
-	// A legal short thread name that resembles the old name-derived hash must
-	// not share the long thread's label or reach its guest.
-	short := "thread-" + strings.Repeat("b", 56)
-	if problems := validation.IsDNS1123Subdomain(short); len(problems) != 0 {
-		t.Fatalf("short thread name %q is invalid: %v", short, problems)
-	}
-	shortOwner := v1.ThreadOwner(scopeNamespace, short)
-	kube.threads[short] = fakeObject{Name: short, UID: "thread-short"}
-	kube.turns["short-turn"] = fakeObject{
-		Name: "short-turn", UID: "turn-short", Thread: short, ThreadUID: "thread-short",
-		Labels: map[string]string{v1.LabelThread: short, v1.LabelThreadUID: "thread-short", v1.LabelOwner: shortOwner},
-	}
-	p := startScoped(t, kube, "long-vm")
-	if status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads/"+thread); status != http.StatusOK {
-		t.Fatalf("long thread status = %d, body %q", status, body)
-	}
-	status, body := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns")
-	if status != http.StatusOK || !strings.Contains(body, "long-turn") {
-		t.Fatalf("long turn list status = %d, body %q", status, body)
-	}
-	if strings.Contains(body, "short-turn") {
-		t.Fatalf("long turn list leaked a same-named short thread's turn: %q", body)
-	}
-	if got := kube.lastQuery(t, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns").Get("labelSelector"); got != v1.LabelThread+"="+v1.ThreadLabel(thread)+","+v1.LabelThreadUID+"=thread-long" {
-		t.Fatalf("long turn list label selector = %q", got)
-	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/short-turn"); status != http.StatusNotFound {
-		t.Fatalf("short thread's turn status = %d, want 404", status)
-	}
-}
+	p := startScoped(t, kube, "alice-vm")
 
-// A thread delete/recreate keeps its name and thread label but gets a new UID.
-// Old-incarnation turns must not be listable, watchable, or retrievable by the
-// new guest until a periodic prune removes them.
-func TestOwnerScopeTurnScopingPinsIncarnation(t *testing.T) {
-	kube := scopedFixture()
-	owner := v1.ThreadOwner(scopeNamespace, "alice-proj")
-	kube.turns["old-incarnation-turn"] = fakeObject{
-		Name: "old-incarnation-turn", UID: "turn-old", Thread: "alice-proj", ThreadUID: "thread-old",
-		Labels: map[string]string{v1.LabelThread: "alice-proj", v1.LabelThreadUID: "thread-old", v1.LabelOwner: owner},
-	}
-	// A legacy turn with no label is still readable by name when its recorded
-	// status UID is the current incarnation.
-	kube.turns["legacy-current-turn"] = fakeObject{
-		Name: "legacy-current-turn", UID: "turn-legacy", Thread: "alice-proj", ThreadUID: "thread-alice",
-		Labels: map[string]string{v1.LabelThread: "alice-proj", v1.LabelOwner: owner},
-	}
-	p := startScoped(t, kube, "proj-vm")
-
-	for _, path := range []string{
-		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns",
-		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns?watch=true",
-	} {
-		status, body := proxyGet(t, p, path)
-		if status != http.StatusOK {
-			t.Fatalf("%s status = %d, body %q", path, status, body)
-		}
-		if strings.Contains(body, "old-incarnation-turn") {
-			t.Errorf("%s leaked the previous incarnation's turn: %s", path, body)
-		}
-		if !strings.Contains(body, "alice-turn") {
-			t.Errorf("%s missing the current turn: %s", path, body)
-		}
-	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/old-incarnation-turn"); status != http.StatusNotFound {
-		t.Errorf("old-incarnation turn status = %d, want 404", status)
-	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/legacy-current-turn"); status != http.StatusOK {
-		t.Errorf("legacy current-incarnation turn status = %d, want 200", status)
-	}
-}
-
-// A Blip pinned to an earlier incarnation of a recreated thread has no thread
-// scope, even though the name-derived labels and owner still match.
-func TestOwnerScopeStaleIncarnationBlipHasNoThreadScope(t *testing.T) {
-	kube := scopedFixture()
-	kube.blips["proj.a"] = fakeObject{
-		Name: "proj.a", UID: "uid-proj",
-		Labels:      map[string]string{v1.LabelOwner: v1.ThreadOwner(scopeNamespace, "alice-proj"), v1.LabelThread: "alice-proj"},
-		Annotations: map[string]string{v1.AnnotationThread: "alice-proj", v1.AnnotationThreadUID: "thread-old"},
-	}
-	p := startScoped(t, kube, "proj-vm")
 	for _, path := range []string{
 		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads",
+		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads/old-thread",
 		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns",
+		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/old-turn",
+		"/apis/blip.dev/v1alpha1/blipthreads",
+		"/apis/blip.dev/v1alpha1/blipturns",
+		"/apis/blip.dev/v1alpha1/watch/blipthreads",
+		"/apis/blip.dev/v1alpha1/watch/blipturns",
+		"/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blipthreads",
+		"/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blipturns",
+		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthread/old-thread",
+		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturn/old-turn",
 	} {
 		if status, _ := proxyGet(t, p, path); status != http.StatusForbidden {
-			t.Errorf("%s status = %d, want 403 for a stale incarnation", path, status)
+			t.Errorf("%s status = %d, want 403", path, status)
 		}
 	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/alice-turn"); status != http.StatusNotFound {
-		t.Errorf("stale incarnation turn status = %d, want 404", status)
-	}
-}
-
-// A VM whose Blip carries another project's thread name (or no thread at all)
-// gets no access to thread history. The thread label alone is not trusted:
-// its derived owner must match the Blip's owner label.
-func TestOwnerScopeThreadLabelIsBoundToOwner(t *testing.T) {
-	kube := scopedFixture()
-	kube.pods["forged-vm"] = fakeObject{
-		Name: "forged-vm", UID: "pod-forged",
-		Labels:      map[string]string{v1.LabelOwner: "alice", v1.LabelThread: "bob-proj", v1.LabelBlipUID: "uid-forged"},
-		Annotations: map[string]string{v1.AnnotationBlip: "forged.a"},
-	}
-	kube.blips["forged.a"] = fakeObject{
-		Name: "forged.a", UID: "uid-forged",
-		Labels: map[string]string{v1.LabelOwner: "alice", v1.LabelThread: "bob-proj"},
-	}
-	p := startScoped(t, kube, "forged-vm")
-	for _, path := range []string{
-		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads/bob-proj",
-		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns/bob-turn",
-	} {
-		if status, _ := proxyGet(t, p, path); status != http.StatusNotFound {
-			t.Errorf("forged thread label %s status = %d, want 404", path, status)
+	for _, path := range pathsFor(kube) {
+		for _, resource := range []string{"/blipthreads", "/blipturns", "/blipthread/", "/blipturn/"} {
+			if strings.Contains(path, resource) {
+				t.Errorf("stale thread/turn path reached the upstream: %q", path)
+			}
 		}
-	}
-	for _, path := range []string{
-		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads",
-		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns",
-	} {
-		if status, _ := proxyGet(t, p, path); status != http.StatusForbidden {
-			t.Errorf("%s status = %d, want 403 for a caller without a thread", path, status)
-		}
-	}
-
-	// A user-owned VM with no thread also reads no thread history.
-	p = startScoped(t, kube, "alice-vm")
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads/alice-proj"); status != http.StatusNotFound {
-		t.Errorf("threadless VM thread status = %d, want 404", status)
-	}
-	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturns"); status != http.StatusForbidden {
-		t.Errorf("threadless VM turn list status = %d, want 403", status)
 	}
 }
 
@@ -721,6 +456,7 @@ func TestParseScopePathDeniesResourceAliases(t *testing.T) {
 		{"po alias", "/api/v1/namespaces/blip-sandbox/po/alice-vm", scopedDeny, "", ""},
 		{"blip alias", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blip/alice.a", scopedDeny, "", ""},
 		{"blipthread alias", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthread/alice-proj", scopedDeny, "", ""},
+		{"blipturn alias", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipturn/old-turn", scopedDeny, "", ""},
 		{"blipstate alias", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipstate/alice.home", scopedDeny, "", ""},
 		{"bst short name", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/bst/alice.home", scopedDeny, "", ""},
 		{"all-namespace pod alias", "/api/v1/pod", scopedDeny, "", ""},
@@ -896,194 +632,6 @@ func TestOwnerScopeWatchStreams(t *testing.T) {
 	p.stop(t)
 	if _, err := reader.ReadByte(); err == nil {
 		t.Fatal("watch stream stayed open after shutdown")
-	}
-}
-
-// A blipthreads watch is scoped by name, and a recreated thread keeps its
-// name. The stream must keep delivering the incarnation the guest was created
-// for and drop the replacement object, including its new UID and spec.
-func TestOwnerScopeThreadWatchPinsIncarnation(t *testing.T) {
-	kube := scopedFixture()
-	oldEvent := `{"type":"ADDED","object":{"metadata":{"name":"alice-proj","uid":"thread-alice"},"spec":{"charter":"OLD_CHARTER"}}}`
-	newEvent := `{"type":"ADDED","object":{"metadata":{"name":"alice-proj","uid":"thread-recreated"},"spec":{"charter":"NEW_INC_SECRET"}}}`
-	bookmark := `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"9"}}}`
-	upstream := tlsUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("watch") != "true" {
-			kube.ServeHTTP(w, r)
-			return
-		}
-		kube.record(r)
-		w.Header().Set("Content-Type", "application/json")
-		flush := w.(http.Flusher)
-		// Split the first line across writes: the filter must buffer it until
-		// the newline arrives rather than forward a partial JSON object.
-		half := len(oldEvent) / 2
-		_, _ = io.WriteString(w, oldEvent[:half])
-		flush.Flush()
-		time.Sleep(10 * time.Millisecond)
-		_, _ = io.WriteString(w, oldEvent[half:]+"\n")
-		flush.Flush()
-		_, _ = io.WriteString(w, newEvent+"\n")
-		flush.Flush()
-		_, _ = io.WriteString(w, bookmark+"\n")
-		flush.Flush()
-		<-r.Context().Done()
-	})
-	cfg := testConfig(t, upstream)
-	cfg.PodName, cfg.PodNamespace = "proj-vm", scopeNamespace
-	p := startProxy(t, cfg)
-
-	resp, err := p.client.Get("http://kube-apiserver/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads?watch=true")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	reader := bufio.NewReader(resp.Body)
-	var got []string
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("read watch: %v (got %q)", err, strings.Join(got, ""))
-		}
-		got = append(got, line)
-		if strings.Contains(line, "BOOKMARK") {
-			break
-		}
-	}
-	if len(got) != 2 {
-		t.Fatalf("guest events = %q, want the old incarnation and the bookmark", got)
-	}
-	if !strings.Contains(got[0], `"uid":"thread-alice"`) || !strings.Contains(got[0], "OLD_CHARTER") {
-		t.Fatalf("first event = %q", got[0])
-	}
-	stream := strings.Join(got, "")
-	if strings.Contains(stream, "thread-recreated") || strings.Contains(stream, "NEW_INC_SECRET") {
-		t.Fatalf("recreated thread leaked: %q", got)
-	}
-}
-
-// A recreated thread's ADDED event must be filtered for every watch spelling
-// the API server accepts, not only watch=true. A persistent ?watch=1 request
-// was previously treated as a list, so the replacement incarnation streamed to
-// the guest of the previous incarnation.
-func TestOwnerScopeThreadWatchFiltersEveryWatchSpelling(t *testing.T) {
-	kube := scopedFixture()
-	oldEvent := `{"type":"ADDED","object":{"metadata":{"name":"alice-proj","uid":"thread-alice"},"spec":{"charter":"OLD_CHARTER"}}}`
-	newEvent := `{"type":"ADDED","object":{"metadata":{"name":"alice-proj","uid":"thread-recreated"},"spec":{"charter":"NEW_INC_SECRET"}}}`
-	bookmark := `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"9"}}}`
-	upstream := tlsUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		// Identity and thread lookups are by name; only the collection request
-		// is a watch stream here.
-		if r.URL.Path != "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads" {
-			kube.ServeHTTP(w, r)
-			return
-		}
-		kube.record(r)
-		w.Header().Set("Content-Type", "application/json")
-		flush := w.(http.Flusher)
-		for _, event := range []string{oldEvent, newEvent, bookmark} {
-			_, _ = io.WriteString(w, event+"\n")
-			flush.Flush()
-		}
-		<-r.Context().Done()
-	})
-	cfg := testConfig(t, upstream)
-	cfg.PodName, cfg.PodNamespace = "proj-vm", scopeNamespace
-	p := startProxy(t, cfg)
-
-	for _, query := range []string{"watch=1", "watch=true"} {
-		t.Run(query, func(t *testing.T) {
-			resp, err := p.client.Get("http://kube-apiserver/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads?" + query)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer resp.Body.Close()
-			reader := bufio.NewReader(resp.Body)
-			var got []string
-			for {
-				line, err := reader.ReadString('\n')
-				if err != nil {
-					t.Fatalf("read watch: %v (got %q)", err, strings.Join(got, ""))
-				}
-				got = append(got, line)
-				if strings.Contains(line, "BOOKMARK") {
-					break
-				}
-			}
-			stream := strings.Join(got, "")
-			// The pinned incarnation is allowed through for both spellings.
-			if !strings.Contains(stream, `"uid":"thread-alice"`) || !strings.Contains(stream, "OLD_CHARTER") {
-				t.Fatalf("guest did not receive the pinned incarnation: %q", got)
-			}
-			if strings.Contains(stream, "thread-recreated") || strings.Contains(stream, "NEW_INC_SECRET") {
-				t.Fatalf("recreated thread leaked with %s: %q", query, got)
-			}
-			if len(got) != 2 {
-				t.Fatalf("guest events = %q, want the old incarnation and the bookmark", got)
-			}
-		})
-	}
-}
-
-func TestThreadWatchWriterBuffersPartialLines(t *testing.T) {
-	line := `{"type":"ADDED","object":{"metadata":{"uid":"thread-alice"}}}`
-	recreated := `{"type":"ADDED","object":{"metadata":{"uid":"thread-recreated"}}}`
-	rec := httptest.NewRecorder()
-	w := &threadWatchWriter{ResponseWriter: rec, uid: "thread-alice"}
-	half := len(line) / 2
-	if n, err := w.Write([]byte(line[:half])); err != nil || n != half {
-		t.Fatalf("write partial: n=%d err=%v", n, err)
-	}
-	if rec.Body.Len() != 0 {
-		t.Fatalf("partial line forwarded: %q", rec.Body.String())
-	}
-	if _, err := w.Write([]byte(line[half:] + "\n" + recreated + "\n")); err != nil {
-		t.Fatal(err)
-	}
-	if got := rec.Body.String(); got != line+"\n" {
-		t.Fatalf("filtered stream = %q, want %q", got, line+"\n")
-	}
-}
-
-// The API server decodes ?watch like runtime.Convert_Slice_string_To_bool: a
-// present parameter is true unless its first value is "0" or "false"
-// (case-insensitive). The scope check must select the watch filters for every
-// spelling the API server treats as a watch.
-func TestIsWatchMatchesAPIServerDecoding(t *testing.T) {
-	tests := []struct {
-		name  string
-		query string
-		watch bool // legacy /watch/ path marker
-		want  bool
-	}{
-		{name: "absent", query: "", want: false},
-		{name: "empty", query: "watch=", want: true},
-		{name: "bare", query: "watch", want: true},
-		{name: "one", query: "watch=1", want: true},
-		{name: "zero", query: "watch=0", want: false},
-		{name: "true", query: "watch=true", want: true},
-		{name: "TRUE", query: "watch=TRUE", want: true},
-		{name: "false", query: "watch=false", want: false},
-		{name: "False", query: "watch=False", want: false},
-		{name: "FALSE", query: "watch=FALSE", want: false},
-		{name: "yes", query: "watch=yes", want: true},
-		{name: "no", query: "watch=no", want: true},
-		{name: "trailing space", query: "watch=true%20", want: true},
-		{name: "leading zero", query: "watch=00", want: true},
-		{name: "first value wins", query: "watch=1&watch=0", want: true},
-		{name: "first value is false", query: "watch=0&watch=1", want: false},
-		{name: "other parameters", query: "watch=1&resourceVersion=7", want: true},
-		{name: "legacy path ignores query", query: "watch=0", watch: true, want: true},
-		{name: "legacy path absent", query: "", watch: true, want: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodGet, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads", nil)
-			r.URL.RawQuery = tt.query
-			if got := isWatch(r, scopeRequest{watch: tt.watch}); got != tt.want {
-				t.Errorf("isWatch(query %q, legacy %v) = %v, want %v", tt.query, tt.watch, got, tt.want)
-			}
-		})
 	}
 }
 

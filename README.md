@@ -126,22 +126,10 @@ Pod as node-local, replicated, encrypted block storage.
   3), `nodeSelector`. `mounts` and `runtime` persist across executions.
   Image states are read-only templates held by every eligible node.
 - **`Blip`** — one VM lifetime: root `state`, one required command, env, workdir,
-  user, TTY, `stop` flag, `activeDeadlineSeconds` and `ttlSecondsAfterFinished`
+  user, `stop` flag, `activeDeadlineSeconds` and `ttlSecondsAfterFinished`
   expiry, and per-execution network narrowing.
 - **`BlipNode`** — cluster-scoped node inventory: endpoint, hypervisors,
   incarnation, heartbeat, drain and safe-to-remove state.
-- **`BlipThread`** — one project's long-running coordinator. Administrators
-  write the system prompt, charter, pool, base state, concurrency cap, model,
-  daily token budget, heartbeat, and retention. An empty system prompt uses
-  blipchat's built-in coordinator prompt; the charter is always appended.
-  Blipchat writes status: turn sequence, rolling summary, timers, task board,
-  token spend, and pause state.
-- **`BlipTurn`** — one event in a thread: a user message, a blip report, a
-  finished blip, or a coordinator step. Turns are immutable, carry a bounded
-  text and free-form attributes, and blipchat stamps `status.seq` to put all
-  turns in one order. In-cluster producers create turns; the API server
-  validates that only the `blip-system/blipchat` service account may author a
-  turn as someone else, and every other producer names its own service account.
 
 Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 `BlipState` status; each node agent server-side-applies only its own
@@ -310,6 +298,8 @@ The HTTP API is under `/api`, and `/` serves a dependency-free single-page UI:
 
 - `GET /api/sessions?namespace=NS` lists chat states with title, running
   state, generation, and ACP session id.
+- `GET /api/profiles?namespace=NS` lists the available profiles with name,
+  title, pool, and whether each is the default.
 - `POST /api/sessions {namespace, profile, title, base?}` creates a state
   (copying `base` when given) and starts generation 1.
 - `GET /api/sessions/NAME?namespace=NS` returns details and the in-memory
@@ -348,9 +338,9 @@ heartbeat, so a quiet agent does not look like a stalled handler.
   records), and `send` writes stdin. Both use the aggregated stream API, so they
   work while the command runs (with `-f`) and after its pod is gone, as long as
   the state retains its trajectory. `gather -f` is a thin wrapper over `logs
-  -f`; there is no serial-console scraping and no `status.output` tail.
-- `exec` no longer exists. A blip runs exactly one command; start another blip
-  on the same state to run a second command, and fork from it for parallel work.
+  -f`.
+- A blip runs exactly one command; start another blip on the same state to run
+  a second command, and fork from it for parallel work.
 - Every blip's stdin, stdout, stderr, and exit are recorded in a trajectory ring
   at a fixed offset inside the state's volume, after the ext4 filesystem. The
   ring defaults to 64 MiB (`BlipState.spec.streamSize`) and overwrites its
@@ -368,8 +358,8 @@ heartbeat, so a quiet agent does not look like a stalled handler.
   owning Blip is deleted.
 - `spec.activeDeadlineSeconds` stops a command that has run too long, as if
   `spec.stop` were set. `blip run` sets it from `--timeout`.
-- `blip-controller` is its own image; the node agent, VM runtime, and dev
-  sandbox are separate images.
+- `blip-controller`, the node agent, the VM runtime, and blipchat are separate
+  images.
 
 ## Local development
 

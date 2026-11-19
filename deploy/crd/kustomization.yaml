@@ -5,5 +5,3 @@ resources:
   - blip.dev_blippools.yaml
   - blip.dev_blips.yaml
   - blip.dev_blipstates.yaml
-  - blip.dev_blipthreads.yaml
-  - blip.dev_blipturns.yaml

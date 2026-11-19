@@ -384,7 +384,7 @@ func TestPoolPodSpec(t *testing.T) {
 			env[v.Name] = v.ValueFrom.FieldRef.FieldPath
 		}
 	}
-	want := map[string]string{"BLIP_CPUS": "4", "BLIP_MEMORY_MB": "8192", "BLIP_HYPERVISOR": "kvm", "POD_NAME": "metadata.name", "POD_NAMESPACE": "metadata.namespace", "BLIP_KUBE_NAMESPACE": "metadata.namespace"}
+	want := map[string]string{"BLIP_CPUS": "4", "BLIP_MEMORY_MB": "8192", "BLIP_KUBE_NAMESPACE": "metadata.namespace"}
 	for k, v := range want {
 		if env[k] != v {
 			t.Errorf("env %s=%q, want %q", k, env[k], v)

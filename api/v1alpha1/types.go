@@ -28,8 +28,7 @@ var (
 
 func init() {
 	SchemeBuilder.Register(&Blip{}, &BlipList{}, &BlipState{}, &BlipStateList{},
-		&BlipPool{}, &BlipPoolList{}, &BlipNode{}, &BlipNodeList{},
-		&BlipThread{}, &BlipThreadList{}, &BlipTurn{}, &BlipTurnList{})
+		&BlipPool{}, &BlipPoolList{}, &BlipNode{}, &BlipNodeList{})
 }
 
 // ---------------------------------------------------------------------------
@@ -231,9 +230,6 @@ type BlipStateSpec struct {
 
 // DefaultStreamSize is the default trajectory ring size.
 const DefaultStreamSize int64 = 64 << 20
-
-// MaxStreamSizeBytes is the largest accepted trajectory ring.
-const MaxStreamSizeBytes int64 = 1 << 30
 
 // MaxStateSizeBytes is the largest filesystem size a BlipState accepts. It
 // must be small enough that a node can provision it: an accepted state that
@@ -492,7 +488,7 @@ type NetworkPort struct {
 // exception is a read-only temporary collect mount, scoped to one blip, at
 // exactly one level below the reserved collect root.
 //
-// +kubebuilder:validation:XValidation:rule="!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect', '/var/run/blip', '/var/run/blip-collect'].exists(r, self.path == r || self.path.startsWith(r + '/') || r.startsWith(self.path + '/')) || (self.path.startsWith('/run/blip-collect/') && self.path.split('/').size() == 4 && has(self.blipUID) && self.blipUID != ” && (!has(self.writable) || !self.writable))",message="path must not be at, below, or above a guest-reserved path, except a read-only temporary collect mount"
+// +kubebuilder:validation:XValidation:rule="!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect', '/var/run/blip', '/var/run/blip-collect'].exists(r, self.path == r || self.path.startsWith(r + '/') || r.startsWith(self.path + '/')) || (self.path.startsWith('/run/blip-collect/') && self.path.split('/').size() == 4 && has(self.blipUID) && self.blipUID != '' && (!has(self.writable) || !self.writable))",message="path must not be at, below, or above a guest-reserved path, except a read-only temporary collect mount"
 type Mount struct {
 	// State names a BlipState in the blip's namespace.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`

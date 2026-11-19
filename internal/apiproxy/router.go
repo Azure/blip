@@ -149,8 +149,8 @@ func validHostName(name string) bool {
 }
 
 func newAPIProxy(api *API, podName, podNamespace string) (http.Handler, *http.Transport, error) {
-	if (podName == "") != (podNamespace == "") {
-		return nil, nil, errors.New("API proxy pod identity is incomplete")
+	if podName == "" || podNamespace == "" {
+		return nil, nil, errors.New("API proxy pod identity is required")
 	}
 	host, port, err := net.SplitHostPort(api.Address)
 	if err != nil {
@@ -172,13 +172,11 @@ func newAPIProxy(api *API, podName, podNamespace string) (http.Handler, *http.Tr
 	if err != nil {
 		return nil, nil, err
 	}
-	if podName != "" {
-		scopeCfg := Config{API: api, PodName: podName, PodNamespace: podNamespace}
-		// The scope client must share the CA-aware transport, not the base
-		// one, so its identity reads drop idle connections when the projected
-		// CA rotates or is revoked.
-		handler = newOwnerScope(scopeCfg, ca, handler)
-	}
+	scopeCfg := Config{API: api, PodName: podName, PodNamespace: podNamespace}
+	// The scope client must share the CA-aware transport, not the base one,
+	// so its identity reads drop idle connections when the projected CA
+	// rotates or is revoked.
+	handler = newOwnerScope(scopeCfg, ca, handler)
 	return handler, transport, nil
 }
 

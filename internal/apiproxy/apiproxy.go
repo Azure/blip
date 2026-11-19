@@ -85,8 +85,7 @@ type Config struct {
 	Endpoints []Endpoint
 	// PodName and PodNamespace identify this API proxy's own pod. They come
 	// from the downward API, never from the guest, and let the proxy derive
-	// the owner it acts for. When both are empty, Kubernetes object reads are
-	// not scoped (compatibility for direct local runs and unit tests).
+	// the owner it acts for. Both are required whenever API is set.
 	PodName      string
 	PodNamespace string
 }
@@ -117,6 +116,9 @@ func ConfigFromEnv() (Config, error) {
 		address, err := apiAddress(host, port)
 		if err != nil {
 			return Config{}, err
+		}
+		if cfg.PodName == "" {
+			return Config{}, errors.New("POD_NAME and POD_NAMESPACE are required for the Kubernetes API route")
 		}
 		cfg.API = &API{
 			Address:   address,

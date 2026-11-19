@@ -8,11 +8,9 @@ import (
 	"time"
 )
 
-// limitNamespace and limitPodName make the limit test take the same owner-scope
-// path as the deployed sidecar. testConfig deliberately leaves the pod
-// identity empty, because many other tests exercise unscoped pass-through
-// routes; this test opts in and holds scoped watch streams, so every admitted
-// request performs its two identity GETs before it starts holding a slot.
+// limitNamespace and limitPodName make the limit test hold scoped watch
+// streams, so every admitted request performs its two identity GETs before it
+// starts holding a slot.
 const (
 	limitNamespace = "test-ns"
 	limitPodName   = "test-pod"

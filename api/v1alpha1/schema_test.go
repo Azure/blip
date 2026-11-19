@@ -594,123 +594,6 @@ func TestBlipPoolReservedEndpointNames(t *testing.T) {
 	}
 }
 
-// TestBlipTurnSchemaCaps guards the bounded turn payload: the engine renders
-// every turn into a coordinator step, so text and attributes must stay small.
-func TestBlipTurnSchemaCaps(t *testing.T) {
-	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipturns.yaml")
-	if got := spec.Properties["text"].MaxLength; got != 2048 {
-		t.Errorf("spec.text maxLength = %d, want 2048", got)
-	}
-	if got := spec.Properties["subjects"].MaxLength; got != 0 {
-		t.Errorf("spec.subjects unexpectedly has maxLength %d", got)
-	}
-	if got := spec.Properties["subjects"].MaxItems; got != 8 {
-		t.Errorf("spec.subjects maxItems = %d, want 8", got)
-	}
-	if !slices.Contains(spec.Required, "author") || !slices.Contains(spec.Required, "thread") {
-		t.Errorf("spec required = %v, want author and thread", spec.Required)
-	}
-	ruleFor(t, spec.Properties["attributes"].XValidations, "attribute keys are at most 63 and values at most 256 characters")
-}
-
-// TestBlipTurnThreadNamePattern guards that spec.thread can only name a
-// BlipThread. Without the pattern an ordinary typo (a trailing space) created
-// a turn that no thread could ever claim.
-func TestBlipTurnThreadNamePattern(t *testing.T) {
-	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipturns.yaml")
-	thread, ok := spec.Properties["thread"]
-	if !ok {
-		t.Fatal("generated CRD has no spec.thread property")
-	}
-	re, err := regexp.Compile(thread.Pattern)
-	if err != nil {
-		t.Fatalf("compile thread pattern %q: %v", thread.Pattern, err)
-	}
-	for _, good := range []string{"project", "a.b", "a-1", "team.chat-2"} {
-		if !re.MatchString(good) {
-			t.Errorf("thread name %q rejected", good)
-		}
-	}
-	for _, bad := range []string{"", "project ", " project", "Project", "proj_ect", "a..b", "-a"} {
-		if re.MatchString(bad) {
-			t.Errorf("thread name %q accepted", bad)
-		}
-	}
-
-	validate := admissionValidator(t, "blipturns")
-	if errs := validate(`{"spec":{"thread":"project ","author":{"kind":"ServiceAccount","name":"ci"}}}`, ""); len(errs) == 0 {
-		t.Error("admitted a turn whose thread name cannot exist")
-	}
-	if errs := validate(`{"spec":{"thread":"project","author":{"kind":"ServiceAccount","name":"ci"}}}`, ""); len(errs) != 0 {
-		t.Fatal(errs.ToAggregate())
-	}
-}
-
-// TestBlipTurnInReplyToBounds guards that a direct producer cannot name a
-// reply sequence the coordinator tool cannot represent: inReplyTo is decoded
-// from a JSON number, which is only exact up to 2^53-1.
-func TestBlipTurnInReplyToBounds(t *testing.T) {
-	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipturns.yaml")
-	reply, ok := spec.Properties["inReplyTo"]
-	if !ok {
-		t.Fatal("generated CRD has no spec.inReplyTo property")
-	}
-	if reply.Minimum != 0 {
-		t.Errorf("spec.inReplyTo minimum = %d, want 0", reply.Minimum)
-	}
-	if reply.Maximum != MaxTurnInReplyTo {
-		t.Errorf("spec.inReplyTo maximum = %d, want %d", reply.Maximum, MaxTurnInReplyTo)
-	}
-
-	validate := admissionValidator(t, "blipturns")
-	turn := func(seq int64) string {
-		return fmt.Sprintf(`{"spec":{"thread":"project","author":{"kind":"User","name":"alice"},"inReplyTo":%d}}`, seq)
-	}
-	if errs := validate(turn(MaxTurnInReplyTo), ""); len(errs) != 0 {
-		t.Errorf("rejected inReplyTo at the maximum: %v", errs.ToAggregate())
-	}
-	if errs := validate(turn(MaxTurnInReplyTo+1), ""); len(errs) == 0 {
-		t.Error("admitted inReplyTo above the maximum")
-	}
-	if errs := validate(turn(-1), ""); len(errs) == 0 {
-		t.Error("admitted a negative inReplyTo")
-	}
-}
-
-// TestBlipTurnStatusSeqRules guards the defense-in-depth validation on
-// status.seq: a status writer can no longer move an already sequenced turn.
-func TestBlipTurnStatusSeqRules(t *testing.T) {
-	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipturns.yaml")
-	seq, ok := status.Properties["seq"]
-	if !ok {
-		t.Fatal("generated CRD has no status.seq property")
-	}
-	if seq.Minimum != 0 {
-		t.Errorf("status.seq minimum = %d, want 0", seq.Minimum)
-	}
-	const rule = "!oldSelf.hasValue() || self == oldSelf.value()"
-	if got := ruleFor(t, seq.XValidations, "seq is immutable once set"); got != rule {
-		t.Errorf("status.seq rule %q, want %q", got, rule)
-	}
-
-	validate := admissionValidator(t, "blipturns")
-	turn := func(seq int64) string {
-		return fmt.Sprintf(`{"spec":{"thread":"project","author":{"kind":"User","name":"alice"}},"status":{"seq":%d}}`, seq)
-	}
-	if errs := validate(turn(1), ""); len(errs) != 0 {
-		t.Errorf("rejected the first sequence assignment: %v", errs.ToAggregate())
-	}
-	if errs := validate(turn(1), turn(1)); len(errs) != 0 {
-		t.Errorf("rejected rewriting the same sequence: %v", errs.ToAggregate())
-	}
-	if errs := validate(turn(4242), turn(1)); len(errs) == 0 {
-		t.Error("admitted a sequence rewrite")
-	}
-	if errs := validate(turn(-1), ""); len(errs) == 0 {
-		t.Error("admitted a negative sequence")
-	}
-}
-
 // TestBlipStatusPhaseAdmission guards that a status writer cannot store a
 // phase no reconcile path understands. Such a phase used to wedge deletion.
 func TestBlipStatusPhaseAdmission(t *testing.T) {
@@ -800,125 +683,6 @@ func TestBlipMountPhaseAdmission(t *testing.T) {
 	}
 }
 
-// TestBlipTurnImmutable guards that a producer cannot rewrite history.
-func TestBlipTurnImmutable(t *testing.T) {
-	data, err := os.ReadFile("../../deploy/crd/blip.dev_blipturns.yaml")
-	if err != nil {
-		t.Fatalf("read generated CRD: %v", err)
-	}
-	if !strings.Contains(string(data), "self.spec == oldSelf.spec") {
-		t.Error("BlipTurn CRD does not make spec immutable")
-	}
-}
-
-// TestBlipThreadDurationRules guards admission of every duration in
-// BlipThread.spec. The typed client decodes metav1.Duration while watching
-// threads, so one malformed value used to break the informer for every thread
-// and stall blipchat in all namespaces.
-func TestBlipThreadDurationRules(t *testing.T) {
-	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipthreads.yaml")
-	retention, ok := spec.Properties["retention"]
-	if !ok {
-		t.Fatal("generated CRD has no spec.retention property")
-	}
-	const want = "duration(self) >= duration('0s')"
-	for _, tc := range []struct {
-		field   crdSchema
-		message string
-	}{
-		{spec.Properties["heartbeat"], "heartbeat must be a non-negative duration"},
-		{retention.Properties["turns"], "retention.turns must be a non-negative duration"},
-		{retention.Properties["closedTasks"], "retention.closedTasks must be a non-negative duration"},
-	} {
-		if got := ruleFor(t, tc.field.XValidations, tc.message); got != want {
-			t.Errorf("%s rule %q, want %q", tc.message, got, want)
-		}
-	}
-
-	validate := admissionValidator(t, "blipthreads")
-	for _, object := range []string{
-		`{"spec":{"pool":"p","heartbeat":"not-a-duration"}}`,
-		`{"spec":{"pool":"p","heartbeat":"-1s"}}`,
-		`{"spec":{"pool":"p","retention":{"turns":"bogus"}}}`,
-		`{"spec":{"pool":"p","retention":{"turns":"-1h"}}}`,
-		`{"spec":{"pool":"p","retention":{"closedTasks":"bogus"}}}`,
-		`{"spec":{"pool":"p","retention":{"closedTasks":"-5m"}}}`,
-	} {
-		if errs := validate(object, ""); len(errs) == 0 {
-			t.Errorf("admitted thread with an invalid duration: %s", object)
-		}
-	}
-	for _, object := range []string{
-		`{"spec":{"pool":"p"}}`,
-		`{"spec":{"pool":"p","heartbeat":"0s"}}`,
-		`{"spec":{"pool":"p","heartbeat":"30m"}}`,
-		`{"spec":{"pool":"p","retention":{"turns":"168h","closedTasks":"72h"}}}`,
-	} {
-		if errs := validate(object, ""); len(errs) != 0 {
-			t.Errorf("rejected thread with a valid duration: %s: %v", object, errs.ToAggregate())
-		}
-	}
-}
-
-// TestBlipThreadSpecRequired guards that every thread has a spec. Without the
-// root requirement Kubernetes accepts an object with no spec at all and skips
-// the nested required fields, so required spec.pool could be bypassed.
-func TestBlipThreadSpecRequired(t *testing.T) {
-	root := loadCRDRoot(t, "../../deploy/crd/blip.dev_blipthreads.yaml")
-	if !slices.Contains(root.Required, "spec") {
-		t.Errorf("BlipThread schema required = %v, want spec", root.Required)
-	}
-	validate := admissionValidator(t, "blipthreads")
-	for _, object := range []string{
-		`{}`,
-		`{"metadata":{"name":"thread"}}`,
-		`{"spec":{}}`,
-		`{"spec":{"retention":{}}}`,
-	} {
-		if errs := validate(object, ""); len(errs) == 0 {
-			t.Errorf("admitted thread without spec.pool: %s", object)
-		}
-	}
-	for _, object := range []string{
-		`{"spec":{"pool":"p"}}`,
-		`{"spec":{"pool":"p","heartbeat":"30m"}}`,
-	} {
-		if errs := validate(object, ""); len(errs) != 0 {
-			t.Errorf("rejected thread with a valid spec: %s: %v", object, errs.ToAggregate())
-		}
-	}
-}
-
-// TestBlipThreadTaskIDPattern guards that task ids are safe to use as labels.
-func TestBlipThreadTaskIDPattern(t *testing.T) {
-	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipthreads.yaml")
-	tasks, ok := status.Properties["tasks"]
-	if !ok || tasks.Items == nil {
-		t.Fatal("generated CRD has no status.tasks schema")
-	}
-	id, ok := tasks.Items.Properties["id"]
-	if !ok {
-		t.Fatal("generated CRD has no status.tasks[].id schema")
-	}
-	re, err := regexp.Compile(id.Pattern)
-	if err != nil {
-		t.Fatalf("compile task id pattern: %v", err)
-	}
-	for _, good := range []string{"t1", "auth-2", "a"} {
-		if !re.MatchString(good) {
-			t.Errorf("task id %q rejected", good)
-		}
-	}
-	for _, bad := range []string{"T1", "a_b", "-a", "a-"} {
-		if re.MatchString(bad) {
-			t.Errorf("task id %q accepted", bad)
-		}
-	}
-	if id.MaxLength != 16 {
-		t.Errorf("task id maxLength = %d, want 16", id.MaxLength)
-	}
-}
-
 // schemaAt walks a generated CRD schema to a property path.
 func schemaAt(t *testing.T, root crdSchema, path ...string) crdSchema {
 	t.Helper()
@@ -957,9 +721,6 @@ func TestInt32FieldsBounded(t *testing.T) {
 		{crd: "blippools", root: root("blippools"), path: []string{"status", "ready"}, min: 0},
 		{crd: "blippools", root: root("blippools"), path: []string{"status", "vacant"}, min: 0},
 		{crd: "blippools", root: root("blippools"), path: []string{"status", "claimed"}, min: 0},
-		{crd: "blipthreads", root: root("blipthreads"), path: []string{"spec", "maxRunning"}, min: 1},
-		{crd: "blipthreads", root: root("blipthreads"), path: []string{"spec", "retention", "keepTurns"}, min: 0},
-		{crd: "blipthreads", root: root("blipthreads"), path: []string{"spec", "retention", "maxTasks"}, min: 0},
 	} {
 		field := schemaAt(t, tc.root(t), tc.path...)
 		if field.Maximum != maxInt32 {
@@ -972,7 +733,7 @@ func TestInt32FieldsBounded(t *testing.T) {
 }
 
 // ownerTableDNSName returns a valid DNS-subdomain name of exactly n
-// characters, as a BlipThread name or service account name would be.
+// characters, as a service account name would be.
 func ownerTableDNSName(n int) string {
 	var s string
 	for len(s) < n {
@@ -982,34 +743,6 @@ func ownerTableDNSName(n int) string {
 		s += strings.Repeat("a", min(63, n-len(s)))
 	}
 	return s
-}
-
-// TestBlipThreadNameFitsOwnerTable guards that admission rejects a thread
-// name that cannot be stored as a 253-character ConfigMap key. An accepted
-// 247-character name used to invalidate the whole blip-vm-owners patch and
-// stop every pool in the namespace from reconciling.
-func TestBlipThreadNameFitsOwnerTable(t *testing.T) {
-	root := loadCRDRoot(t, "../../deploy/crd/blip.dev_blipthreads.yaml")
-	const want = "!has(self.metadata) || !has(self.metadata.name) || self.metadata.name.size() <= 246"
-	if got := ruleFor(t, root.XValidations, "thread names must be at most 246 characters to fit the VM owner table"); got != want {
-		t.Errorf("thread name rule %q, want %q", got, want)
-	}
-
-	validate := admissionValidator(t, "blipthreads")
-	for _, n := range []int{1, 63, 64, 246} {
-		name := ownerTableDNSName(n)
-		object := fmt.Sprintf(`{"metadata":{"name":%q},"spec":{"pool":"p"}}`, name)
-		if errs := validate(object, ""); len(errs) != 0 {
-			t.Errorf("rejected %d-character thread name: %v", n, errs.ToAggregate())
-		}
-	}
-	for _, n := range []int{247, 253} {
-		name := ownerTableDNSName(n)
-		object := fmt.Sprintf(`{"metadata":{"name":%q},"spec":{"pool":"p"}}`, name)
-		if errs := validate(object, ""); len(errs) == 0 {
-			t.Errorf("admitted %d-character thread name %q", n, name)
-		}
-	}
 }
 
 // TestInt32AdmissionBoundaries proves admission rejects one past int32 max and
@@ -1037,17 +770,6 @@ func TestInt32AdmissionBoundaries(t *testing.T) {
 		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"blip.dev/node-pool":"default"},"%s":%d}}`, field, tooBig)
 		if errs := pool(object, ""); len(errs) == 0 {
 			t.Errorf("admitted out-of-range pool spec.%s", field)
-		}
-	}
-
-	thread := admissionValidator(t, "blipthreads")
-	for _, object := range []string{
-		fmt.Sprintf(`{"spec":{"pool":"p","maxRunning":%d}}`, tooBig),
-		fmt.Sprintf(`{"spec":{"pool":"p","retention":{"keepTurns":%d}}}`, tooBig),
-		fmt.Sprintf(`{"spec":{"pool":"p","retention":{"maxTasks":%d}}}`, tooBig),
-	} {
-		if errs := thread(object, ""); len(errs) == 0 {
-			t.Errorf("admitted out-of-range thread field: %s", object)
 		}
 	}
 }
@@ -1109,71 +831,9 @@ func TestBlipPoolMemoryMustBePositive(t *testing.T) {
 	}
 }
 
-// TestBlipTurnStatusSeqCannotBeCleared guards immutability when a status writer
-// removes seq instead of changing it. With a rule on the property alone, the
-// rule is not evaluated for an absent field: seq: null was accepted and the
-// sequencer stamped a later sequence, moving the turn forward in history.
-func TestBlipTurnStatusSeqCannotBeCleared(t *testing.T) {
-	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipturns.yaml")
-	ruleFor(t, status.XValidations, "seq is immutable once set")
-
-	validate := admissionValidator(t, "blipturns")
-	seq := func(value string) string {
-		return fmt.Sprintf(`{"spec":{"thread":"project","author":{"kind":"User","name":"alice"}},"status":%s}`, value)
-	}
-	first := seq(`{"seq":3}`)
-	if errs := validate(first, ""); len(errs) != 0 {
-		t.Fatalf("rejected the first sequence assignment: %v", errs.ToAggregate())
-	}
-	if errs := validate(first, first); len(errs) != 0 {
-		t.Fatalf("rejected an unchanged sequence: %v", errs.ToAggregate())
-	}
-	for _, cleared := range []string{seq(`{}`), seq(`{"seq":null}`)} {
-		if errs := validate(cleared, first); len(errs) == 0 {
-			t.Errorf("admitted clearing an assigned sequence: %s", cleared)
-		}
-	}
-	if errs := validate(seq(`{"seq":4}`), first); len(errs) == 0 {
-		t.Error("admitted a sequence rewrite")
-	}
-	// A turn that was never sequenced can still be created and remain unset.
-	if errs := validate(seq(`{}`), ""); len(errs) != 0 {
-		t.Errorf("rejected an unsequenced turn: %v", errs.ToAggregate())
-	}
-}
-
-// A turn written before sequencing (for example when it was orphaned) must
-// still be able to receive its first sequence when the thread appears. The
-// rule only protects an already assigned sequence.
-func TestBlipTurnSequenceCanBeSetAfterOrphanMarker(t *testing.T) {
-	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipturns.yaml")
-	ruleFor(t, status.XValidations, "seq is immutable once set")
-
-	validate := admissionValidator(t, "blipturns")
-	turn := func(status string) string {
-		return fmt.Sprintf(`{"spec":{"thread":"project","author":{"kind":"User","name":"alice"}},"status":%s}`, status)
-	}
-	orphaned := turn(`{"orphanedAt":"2026-01-01T00:00:00Z"}`)
-	sequenced := turn(`{"orphanedAt":"2026-01-01T00:00:00Z","seq":1,"threadUID":"uid","acceptedTime":"2026-01-01T00:01:00Z"}`)
-	if errs := validate(sequenced, orphaned); len(errs) != 0 {
-		t.Fatalf("rejected sequencing a previously orphaned turn: %v", errs.ToAggregate())
-	}
-	// Any status write made before sequencing has the same shape.
-	if errs := validate(turn(`{"seq":1}`), turn(`{"threadUID":"uid"}`)); len(errs) != 0 {
-		t.Errorf("rejected the first sequence after another status write: %v", errs.ToAggregate())
-	}
-	if errs := validate(turn(`{"seq":2}`), sequenced); len(errs) == 0 {
-		t.Error("admitted changing an assigned sequence")
-	}
-	if errs := validate(turn(`{"orphanedAt":"2026-01-01T00:00:00Z"}`), sequenced); len(errs) == 0 {
-		t.Error("admitted clearing an assigned sequence")
-	}
-}
-
-// TestReferenceNamesValidated guards that pool and base references look like
-// Kubernetes object names. Names with '/', spaces, or underscores can never
-// exist, so failing at admission avoids a pending Blip or a later coordinator
-// step failure. Empty base retains its documented default semantics.
+// TestReferenceNamesValidated guards that pool references look like Kubernetes
+// object names. Names with '/', spaces, or underscores can never exist, so
+// failing at admission avoids a Blip that waits forever for a VM.
 func TestReferenceNamesValidated(t *testing.T) {
 	blip := admissionValidator(t, "blips")
 	for _, pool := range []string{"Bad/Pool", "Bad Pool", "Bad_Pool", ""} {
@@ -1186,27 +846,6 @@ func TestReferenceNamesValidated(t *testing.T) {
 		object := fmt.Sprintf(`{"spec":{"pool":%q,"state":"root","command":["true"]}}`, pool)
 		if errs := blip(object, ""); len(errs) != 0 {
 			t.Errorf("rejected valid blip pool %q: %v", pool, errs.ToAggregate())
-		}
-	}
-
-	thread := admissionValidator(t, "blipthreads")
-	for _, spec := range []string{
-		`{"pool":"Bad/Pool"}`,
-		`{"pool":"Bad Pool"}`,
-		`{"pool":"p","base":"Bad_State"}`,
-		`{"pool":"p","base":"Bad/State"}`,
-	} {
-		if errs := thread(`{"spec":`+spec+`}`, ""); len(errs) == 0 {
-			t.Errorf("admitted thread spec %s", spec)
-		}
-	}
-	for _, spec := range []string{
-		`{"pool":"default"}`,
-		`{"pool":"pool-1","base":""}`,
-		`{"pool":"pool.one","base":"project.base"}`,
-	} {
-		if errs := thread(`{"spec":`+spec+`}`, ""); len(errs) != 0 {
-			t.Errorf("rejected valid thread spec %s: %v", spec, errs.ToAggregate())
 		}
 	}
 }
@@ -1285,30 +924,6 @@ func TestBlipPoolServiceAccountNameFitsOwnerTable(t *testing.T) {
 	object := fmt.Sprintf(`{"spec":{"nodeSelector":{"a":"b"},"serviceAccountName":%q}}`, name)
 	if errs := validate(object, ""); len(errs) == 0 {
 		t.Errorf("admitted 251-character service account name %q", name)
-	}
-}
-
-// TestBlipTurnThreadFitsOwnerTable guards that a turn cannot name a thread
-// that admission now rejects. The turn-owner policy looks up the raw
-// "thread.<name>" key, which does not fit for these names.
-func TestBlipTurnThreadFitsOwnerTable(t *testing.T) {
-	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipturns.yaml")
-	thread, ok := spec.Properties["thread"]
-	if !ok {
-		t.Fatal("generated CRD has no spec.thread property")
-	}
-	if thread.MaxLength != 246 {
-		t.Errorf("spec.thread maxLength = %d, want 246", thread.MaxLength)
-	}
-	validate := admissionValidator(t, "blipturns")
-	turn := func(name string) string {
-		return fmt.Sprintf(`{"spec":{"thread":%q,"author":{"kind":"ServiceAccount","name":"ci"}}}`, name)
-	}
-	if errs := validate(turn(ownerTableDNSName(246)), ""); len(errs) != 0 {
-		t.Errorf("rejected 246-character thread: %v", errs.ToAggregate())
-	}
-	if errs := validate(turn(ownerTableDNSName(247)), ""); len(errs) == 0 {
-		t.Error("admitted a turn for a 247-character thread")
 	}
 }
 

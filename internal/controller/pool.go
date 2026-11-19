@@ -22,12 +22,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -205,10 +203,6 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return []reconcile.Request{req(o.GetNamespace(), poolName(o.(*v1.Blip)))}
 		})).
 		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.namespacePools)).
-		// Thread creation and deletion changes the turn-owner table. Status
-		// updates from blipchat do not, so ignore them.
-		Watches(&v1.BlipThread{}, handler.EnqueueRequestsFromMapFunc(r.namespacePools),
-			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// A stale heartbeat is a status-only change, and an agent that dies
 		// sends no event at all; reconcile also requeues itself while a node
 		// it uses is still healthy (see nextCrossing).
@@ -239,8 +233,8 @@ func (r *PoolReconciler) caReader() client.Reader {
 	return r.Client
 }
 
-// State imports and deletions, and thread changes, refresh the authorization
-// table even when no Blip currently waits for a VM.
+// State imports and deletions refresh the authorization table even when no
+// Blip currently waits for a VM.
 func (r *PoolReconciler) namespacePools(ctx context.Context, o client.Object) []reconcile.Request {
 	return r.poolRequests(ctx, o.GetNamespace())
 }
@@ -264,7 +258,7 @@ func (r *PoolReconciler) poolRequests(ctx context.Context, namespace string) []r
 }
 
 func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (reconcile.Result, error) {
-	if err := syncVMOwnersEvents(ctx, r.Client, rq.Namespace, r.Recorder); err != nil {
+	if err := syncVMOwners(ctx, r.Client, rq.Namespace, r.Recorder); err != nil {
 		return reconcile.Result{}, err
 	}
 	pool := &v1.BlipPool{}
@@ -1131,7 +1125,7 @@ func (r *PoolReconciler) blockNode(pool types.NamespacedName, node string, until
 
 // podFor builds a VM pod (see the README's implementation outline).
 func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
-	cpus, memory, hypervisor := poolShape(pool)
+	cpus, memory, _ := poolShape(pool)
 	request := memory.DeepCopy()
 	request.Add(vmRequestOverhead)
 	limit := memory.DeepCopy()
@@ -1166,9 +1160,6 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 				Env: []corev1.EnvVar{
 					{Name: "BLIP_CPUS", Value: strconv.Itoa(int(cpus))},
 					{Name: "BLIP_MEMORY_MB", Value: strconv.FormatInt(memory.Value()>>20, 10)},
-					{Name: "BLIP_HYPERVISOR", Value: hypervisor},
-					fieldEnv("POD_NAME", "metadata.name"),
-					fieldEnv("POD_NAMESPACE", "metadata.namespace"),
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
@@ -1237,8 +1228,9 @@ func addAPIProxy(pod *corev1.Pod, pool *v1.BlipPool, image string) {
 	enabled, disabled := true, false
 	restart := corev1.ContainerRestartPolicyAlways
 	mode := int32(0644)
-	// Kubelet makes the emptyDir writable by the non-root proxy. The proxy
-	// shares only sockets with the runtime, never the hostPath pod directory.
+	// Kubelet does not apply FSGroup to the hostPath vsock volume; the
+	// privileged runtime creates the socket directory for the non-root proxy.
+	// The pod FSGroup remains for the projected credential volumes.
 	pod.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: &uid}
 	// A native sidecar starts before the VM and stops after it exits, without
 	// keeping the pod alive. Guest API connections retry until it is listening.

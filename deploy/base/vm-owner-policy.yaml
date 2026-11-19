@@ -2,58 +2,35 @@
 # ConfigMap blip-vm-owners in every namespace with a BlipPool:
 #   sa.<service account>: <pools>  every VM service account, with the
 #                                  space-separated pools that use it
-#   <vm pod>: <owner>[ <uid>]      each claimed VM pod; "-" means unrestricted.
-#                                  The optional UID is the thread incarnation
-#                                  its Blip was created for.
-#   thread.<thread>: <owner>       each thread's project owner hash, keyed by
-#                                  the raw thread name used in spec.thread
-#   thread-hash.<label>: <owner>   the same, keyed by the ThreadLabel a
-#                                  blip.dev/thread label carries when the
-#                                  thread name is too long for a label value
-#   thread-inc.<owner>: <uid>      the current incarnation of that project's
-#                                  thread, used to reject turns from a producer
-#                                  created for a deleted thread
+#   <vm pod>: <owner>              each claimed VM pod; "-" means unrestricted.
 #   bases: <states>                space-separated shared, ownerless image states
-# A caller authenticated with a pod-bound token of a VM service account may
-# only connect to pods with `blip-runtime bridge 1025` in container vm (a blip
-# session; no other exec, attach, proxy, or port-forward). A restricted owner may
-# only do so into VM pods of the same owner, and may only create, change,
-# and delete blips and states named "<owner>.<name>" and labelled
-# blip.dev/owner=<owner> (before and after the change) that reference only
-# such states (or copy/read-only mount shared bases), set no imagePullSecrets,
-# and create blips only in pools of its own service account. Thread specs are
-# administrator-owned: a restricted VM may read its own thread through the
-# API proxy but may not create, change or delete threads. The thread
-# incarnation annotations on a Blip (blip.dev/thread-uid, blip.dev/thread-name,
-# and blip.dev/thread) are write-once: a restricted owner may neither add,
-# rewrite, nor remove them, because the API proxy and blipchat trust them when
-# pinning reads and writes to a thread incarnation. A restricted VM may not
-# attach a thread to a new Blip at all, by label or annotation: a Blip created
-# from a leftover VM of a deleted thread would otherwise carry the thread name
-# without its incarnation, and the proxy would adopt the recreated thread's
-# current UID. Legitimate in-guest `blip run` does not propagate thread labels;
-# blipchat and the controller are not restricted. Every new or changed
-# ownerReference it sets must name an object of the same owner: fork blips may
-# only be owned by blips, and states may be owned by such blips or by another
-# state (a durable fork's hidden children are owned by their root state). An
-# ownerReference inherited unchanged from the privileged creator (for example
-# the parent of a fork) is exempt, so a restricted child can still update
-# itself. Finalizers are likewise write-once for a restricted owner: it may
-# keep finalizers already on the stored object and remove them, but may not
-# add any, so an attacker cannot leave its Blip or state Terminating after the
-# controller removes blip.dev/finalizer. Every pod-bound token of the request
-# namespace is treated as a VM and must have a claimed pod entry: a table
-# that is non-empty but lacks the caller's sa.<sa> or pod key fails closed
-# instead of skipping every check. A missing key is never treated as
-# unrestricted for a claimed VM, because such a sync or cache gap would bypass
-# every check. A VM pod without an entry
-# (vacant, unknown, or absent from a partial table) is denied. Only a claimed
-# pod recorded as "-" is unrestricted. Service account keys are pruned only
-# once no pool or VM pod uses the account, and a missing table denies all blip
-# and state changes made with pod-bound tokens. The namespace match condition
-# keeps the controller and blipchat (which act from blip-system) and non-pod
-# users out of this policy. Grant VM service accounts RBAC only in their own
-# namespace: the table is per namespace.
+# A caller authenticated with a pod-bound token of a VM service account may not
+# exec, attach, proxy, or port-forward to any pod. A restricted owner may only
+# create, change, and delete blips and states named "<owner>.<name>" and
+# labelled blip.dev/owner=<owner> (before and after the change) that reference
+# only such states (or copy/read-only mount shared bases), set no
+# imagePullSecrets, and create blips only in pools of its own service account.
+# Every new or changed ownerReference it sets must name an object of the same
+# owner: fork blips may only be owned by blips, and states may be owned by such
+# blips or by another state (a durable fork's hidden children are owned by
+# their root state). An ownerReference inherited unchanged from the privileged
+# creator (for example the parent of a fork) is exempt, so a restricted child
+# can still update itself. Finalizers are likewise write-once for a restricted
+# owner: it may keep finalizers already on the stored object and remove them,
+# but may not add any, so an attacker cannot leave its Blip or state
+# Terminating after the controller removes blip.dev/finalizer. Every pod-bound
+# token of the request namespace is treated as a VM and must have a claimed pod
+# entry: a table that is non-empty but lacks the caller's sa.<sa> or pod key
+# fails closed instead of skipping every check. A missing key is never treated
+# as unrestricted for a claimed VM, because such a sync or cache gap would
+# bypass every check. A VM pod without an entry (vacant, unknown, or absent
+# from a partial table) is denied. Only a claimed pod recorded as "-" is
+# unrestricted. Service account keys are pruned only once no pool or VM pod
+# uses the account, and a missing table denies all blip and state changes made
+# with pod-bound tokens. The namespace match condition keeps the controller and
+# blipchat (which act from blip-system) and non-pod users out of this policy.
+# Grant VM service accounts RBAC only in their own namespace: the table is per
+# namespace.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -67,7 +44,7 @@ spec:
     resourceRules:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
-        resources: [blips, blips/status, blipstates, blipstates/status, blipthreads, blipthreads/status]
+        resources: [blips, blips/status, blipstates, blipstates/status]
         operations: [CREATE, UPDATE, DELETE]
       - apiGroups: [""]
         apiVersions: [v1]
@@ -94,9 +71,8 @@ spec:
     # (which act from blip-system) and non-pod users out of this policy.
     - name: vm
       expression: "true"
-    # A claimed pod's value is "<owner>" or "<owner> <thread UID>"; the
-    # incarnation is used by blip-turn-owner, while this policy only needs the
-    # owner field.
+    # A claimed pod's entry starts with its owner; legacy entries may carry a
+    # trailing field, which is ignored.
     - name: podEntry
       expression: >-
         variables.callerPod in variables.data ?
@@ -117,42 +93,6 @@ spec:
         string(variables.data['sa.' + variables.callerSA]).split(' ') : []
     - name: bases
       expression: "'bases' in variables.data ? string(variables.data['bases']).split(' ') : []"
-    # A blip.dev/thread label decides which project's history a Blip's reports
-    # are appended to. The label is self-asserted by the VM, so a restricted
-    # owner may only set it to a thread it owns. Label values are
-    # ThreadLabel(name): the raw name when it fits a label, otherwise a hash
-    # recorded under "thread-hash.<label>". The hashed form has a reserved
-    # prefix that is not a legal thread name, so a short thread can never carry
-    # another thread's hash. Both encodings are still checked so objects from
-    # before that split keep working.
-    - name: thread
-      expression: >-
-        (request.operation == 'CREATE' || request.operation == 'UPDATE') &&
-        has(object.metadata.labels) && 'blip.dev/thread' in object.metadata.labels ?
-        string(object.metadata.labels['blip.dev/thread']) : ''
-    - name: oldThread
-      expression: >-
-        request.operation == 'UPDATE' && has(oldObject.metadata.labels) &&
-        'blip.dev/thread' in oldObject.metadata.labels ?
-        string(oldObject.metadata.labels['blip.dev/thread']) : ''
-    # The thread incarnation pin is trusted by the in-guest API proxy and by
-    # blipchat: changing it to the current thread UID grants reads and writes
-    # of that thread's turns, and removing it makes the proxy fall back to the
-    # current incarnation. A restricted VM may patch its own Blip, so these
-    # annotations are write-once and must be identical to oldObject: absent
-    # stays absent, and a value may not be added, changed, or removed.
-    # blip.dev/thread-name is the full-name companion of the blip.dev/thread
-    # label for long thread names; the label itself is pinned below.
-    - name: pinnedAnnotations
-      expression: "['blip.dev/thread-uid', 'blip.dev/thread-name', 'blip.dev/thread']"
-    - name: newAnnotations
-      expression: >-
-        variables.writes && has(object.metadata.annotations) ?
-        object.metadata.annotations : {}
-    - name: oldAnnotations
-      expression: >-
-        request.operation == 'UPDATE' && has(oldObject.metadata.annotations) ?
-        oldObject.metadata.annotations : {}
     # A child forked from a different-owner or unrestricted Blip inherits the
     # ownerReference its privileged creator set. An UPDATE by the child's own
     # VM leaves that reference untouched, so the prefix rule must exempt
@@ -162,13 +102,12 @@ spec:
       expression: >-
         request.operation == 'UPDATE' && has(oldObject.metadata.ownerReferences) ?
         oldObject.metadata.ownerReferences : []
-    # Finalizers make an object undeletable. blipchat's retention and namespace
-    # cleanup only call Delete, so a foreign finalizer left on a Blip or state
-    # keeps it Terminating forever after the controller removes its own
-    # blip.dev/finalizer. A restricted VM may therefore only carry finalizers
-    # that were already on the stored object: additions on CREATE (no
-    # oldObject) and UPDATE are denied, while unchanged inherited finalizers
-    # and removals stay allowed for normal patches and cleanup.
+    # Finalizers make an object undeletable. A foreign finalizer left on a Blip
+    # or state keeps it Terminating forever after the controller removes its
+    # own blip.dev/finalizer. A restricted VM may therefore only carry
+    # finalizers that were already on the stored object: additions on CREATE
+    # (no oldObject) and UPDATE are denied, while unchanged inherited
+    # finalizers and removals stay allowed for normal patches and cleanup.
     - name: finalizers
       expression: >-
         variables.writes && has(object.metadata.finalizers) ?
@@ -189,28 +128,13 @@ spec:
       messageExpression: >-
         'owner ' + variables.owner + ' may not change status; only the controller writes it'
       reason: Forbidden
-    # A thread's spec is administrator-owned and blipchat is the only writer
-    # of its status. A restricted VM token may not create, relabel, rewrite or
-    # delete a thread: its charter, system prompt, pool and base decide what
-    # the project's coordinator runs next.
-    - expression: "variables.owner == '-' || request.resource.resource != 'blipthreads'"
+    # VM tokens may not exec, attach, proxy, or port-forward to pods. The
+    # in-guest API talks to the Kubernetes API directly; there is no pod exec
+    # path.
+    - expression: "!variables.vm || request.operation != 'CONNECT'"
       messageExpression: >-
-        'thread specs are administrator-owned; VM service account ' + variables.callerSA + ' may not change them'
-      reason: Forbidden
-    - expression: >-
-        !variables.vm || request.operation != 'CONNECT' ||
-        (request.subResource == 'exec' && has(object.container) && object.container == 'vm' &&
-        object.command == ['blip-runtime', 'bridge', '1025'])
-      messageExpression: >-
-        'VM pods may only open blip sessions (exec blip-runtime bridge 1025 in container vm), not ' +
-        request.subResource + ' into ' + request.name
-      reason: Forbidden
-    - expression: >-
-        !variables.restricted || request.operation != 'CONNECT' ||
-        (request.name in variables.data &&
-        string(variables.data[request.name]).split(' ')[0] == variables.owner)
-      messageExpression: >-
-        'owner ' + variables.owner + ' may only connect to VM pods of its own blips, not ' + request.name
+        'VM pod ' + variables.callerPod + ' may not connect to pods (' +
+        request.subResource + ' into ' + request.name + ')'
       reason: Forbidden
     - expression: >-
         !variables.restricted || request.operation != 'DELETE' ||
@@ -238,53 +162,10 @@ spec:
       messageExpression: >-
         'owner ' + variables.owner + ' must label its objects blip.dev/owner=' + variables.owner
       reason: Forbidden
-    # An attacker must not steer its reports into another project's thread by
-    # relabelling its own Blip. The label may only name a thread of the same
-    # owner, and an unchanged label stays valid when the thread is gone.
-    - expression: >-
-        !variables.restricted || !variables.writes || request.resource.resource != 'blips' ||
-        variables.thread == variables.oldThread ||
-        (variables.thread != '' &&
-        ((('thread.' + variables.thread) in variables.data &&
-        string(variables.data['thread.' + variables.thread]) == variables.owner) ||
-        (('thread-hash.' + variables.thread) in variables.data &&
-        string(variables.data['thread-hash.' + variables.thread]) == variables.owner)))
-      messageExpression: >-
-        'owner ' + variables.owner + ' may only attach blip.dev/thread labels of its own threads'
-      reason: Forbidden
-    # A Blip's thread is chosen by its creator, never by the VM it starts. A
-    # restricted VM may patch an existing thread-labelled Blip (including
-    # keeping or changing to another own thread, as checked above) but must not
-    # attach a thread to a new one. Such a Blip has no incarnation pin, and the
-    # API proxy treats an absent pin as the current incarnation, so a leftover
-    # VM of a deleted thread could otherwise read the recreated thread. The
-    # incarnation annotations are denied on CREATE by the write-once rule
-    # below; this denies the label too. In-guest `blip run` sets neither, and
-    # blipchat and the controller (not restricted) still create them.
-    - expression: >-
-        !variables.restricted || request.operation != 'CREATE' ||
-        request.resource.resource != 'blips' || variables.thread == ''
-      messageExpression: >-
-        'owner ' + variables.owner + ' may not attach a thread to a new blip; thread-labelled blips are created by an administrator'
-      reason: Forbidden
-    # The incarnation annotation must not move after creation. An unchanged
-    # value stays valid even when the thread is gone (so status/cleanup
-    # patches still work); adding, rewriting, or removing it is a scope
-    # escalation. Controller, blipchat, and administrator-owned VMs are not
-    # restricted and remain unaffected.
-    - expression: >-
-        !variables.restricted || !variables.writes || request.resource.resource != 'blips' ||
-        variables.pinnedAnnotations.all(k,
-          (!(k in variables.newAnnotations) && !(k in variables.oldAnnotations)) ||
-          ((k in variables.newAnnotations) && (k in variables.oldAnnotations) &&
-          variables.newAnnotations[k] == variables.oldAnnotations[k]))
-      messageExpression: >-
-        'owner ' + variables.owner + ' may not add, change, or remove a thread incarnation annotation'
-      reason: Forbidden
-    # Restricted VMs may only write blips and states (thread writes are denied
-    # above), so this covers every object they can make undeletable. Controller,
-    # blipchat, and administrator-owned VMs are not restricted and remain
-    # unaffected, including the controller's own finalizer removal.
+    # Restricted VMs may only write blips and states, so this covers every
+    # object they can make undeletable. Controller, blipchat, and
+    # administrator-owned VMs are not restricted and remain unaffected,
+    # including the controller's own finalizer removal.
     - expression: >-
         !variables.restricted || !variables.writes ||
         variables.finalizers.all(f, f in variables.oldFinalizers)
@@ -356,7 +237,7 @@ spec:
     resourceRules:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
-        resources: [blips, blips/status, blipstates, blipstates/status, blipthreads, blipthreads/status]
+        resources: [blips, blips/status, blipstates, blipstates/status]
         operations: [UPDATE, DELETE]
 ---
 # New objects stay fail-secure: no table means no creation.
@@ -374,10 +255,11 @@ spec:
     resourceRules:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
-        resources: [blips, blips/status, blipstates, blipstates/status, blipthreads, blipthreads/status]
+        resources: [blips, blips/status, blipstates, blipstates/status]
         operations: [CREATE]
 ---
-# Namespaces without blips keep pod exec working for their own workloads.
+# Namespaces without a blip-vm-owners table keep pod exec working for their
+# own workloads; claimed VM pods are denied by the policy.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:

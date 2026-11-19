@@ -123,6 +123,17 @@ func serveHandler(handler http.Handler, req *http.Request) *httptest.ResponseRec
 func TestRouterRoutesAPIHost(t *testing.T) {
 	observed := make(chan observedRequest, 2)
 	upstream := tlsUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/namespaces/test-ns/pods/test-pod":
+			_, _ = io.WriteString(w, `{"metadata":{"name":"test-pod",`+
+				`"annotations":{"blip.dev/blip":"owner.blip"},`+
+				`"labels":{"blip.dev/blip-uid":"uid-test"}}}`)
+			return
+		case "/apis/blip.dev/v1alpha1/namespaces/test-ns/blips/owner.blip":
+			_, _ = io.WriteString(w, `{"metadata":{"name":"owner.blip","uid":"uid-test",`+
+				`"labels":{"blip.dev/owner":"owner"}}}`)
+			return
+		}
 		observed <- observedRequest{method: r.Method, host: r.Host, uri: r.RequestURI, auth: r.Header.Get("Authorization")}
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -134,14 +145,16 @@ func TestRouterRoutesAPIHost(t *testing.T) {
 	defer closeTransports(transports)
 
 	for _, host := range []string{"kube-apiserver", "KUBE-APISERVER.:80"} {
-		req := httptest.NewRequest(http.MethodGet, "http://kube-apiserver/api/v1/pods?watch=true", nil)
+		req := httptest.NewRequest(http.MethodGet, "http://kube-apiserver/api/v1/namespaces/test-ns/pods?watch=true", nil)
 		req.Host = host
 		recorder := serveHandler(handler, req)
 		if recorder.Code != http.StatusNoContent {
 			t.Fatalf("Host %q: status = %d body=%q", host, recorder.Code, recorder.Body.String())
 		}
 		got := <-observed
-		if got.host != cfg.API.Address || got.auth != "Bearer projected-secret" || got.uri != "/api/v1/pods?watch=true" {
+		if got.host != cfg.API.Address || got.auth != "Bearer projected-secret" ||
+			!strings.HasPrefix(got.uri, "/api/v1/namespaces/test-ns/pods?") ||
+			!strings.Contains(got.uri, "watch=true") || !strings.Contains(got.uri, "labelSelector=") {
 			t.Errorf("Host %q: upstream request = %+v", host, got)
 		}
 	}
@@ -298,7 +311,7 @@ func TestRouterConfigErrors(t *testing.T) {
 	for name, cfg := range map[string]Config{
 		"empty":      {},
 		"bad-scheme": {Endpoints: []Endpoint{{Name: "a", URL: "http://localhost"}}},
-		"bad-api":    {API: &API{Address: "not-an-address"}},
+		"bad-api":    {API: &API{Address: "not-an-address"}, PodName: "p", PodNamespace: "ns"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if handler, transports, err := newRouter(cfg); err == nil {

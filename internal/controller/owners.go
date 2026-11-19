@@ -22,33 +22,16 @@ import (
 // ValidatingAdmissionPolicy (deploy/base/vm-owner-policy.yaml). Keys are
 // "sa.<service account>" for every VM service account, with the sorted,
 // space-separated names of the pools using it, and "<pod>" with the owner of
-// each claimed VM pod ("-" for an unrestricted Blip, or "<owner> <thread UID>"
-// when the Blip belongs to a thread). "thread.<name>" maps a thread to the
-// owner hash of its project for turn producers, and "thread-inc.<owner>" maps
-// that project to the current incarnation's UID so a producer created for an
-// earlier incarnation cannot write turns into the recreated thread. Labels are
-// hashed for names longer than a label value, and live under their own
-// "thread-hash.<ThreadLabel(name)>" prefix so a hashed label can never
-// overwrite the raw entry of a short thread. ThreadLabel's hashed form uses a
-// reserved thread_ prefix that is not a legal thread name, so the two encodings
-// cannot denote the same label either. A name too long for a ConfigMap key is
-// omitted: the missing entry keeps its VMs restricted. "bases" lists the
-// ownerless imported states available for shared read-only use and copying.
+// each claimed VM pod ("-" for an unrestricted Blip). A name too long for a
+// ConfigMap key is omitted: the missing entry keeps its VMs restricted.
+// "bases" lists the ownerless imported states available for shared read-only
+// use and copying.
 const VMOwnersConfigMap = "blip-vm-owners"
 
 const (
-	ownersSAPrefix     = "sa."
-	ownersThreadPrefix = "thread."
-	// ownersThreadHashPrefix holds owners keyed by ThreadLabel(name) for
-	// names too long for a label. Keeping it separate from the raw-name
-	// keys makes the encoding unambiguous.
-	ownersThreadHashPrefix = "thread-hash."
-	// ownersThreadIncPrefix maps a thread's project owner to the UID of its
-	// current incarnation. The owner hash is short and stable, so this key
-	// fits even for thread names too long for "thread-inc.<name>".
-	ownersThreadIncPrefix = "thread-inc."
-	ownersBasesKey        = "bases"
-	ownerAny              = "-"
+	ownersSAPrefix = "sa."
+	ownersBasesKey = "bases"
+	ownerAny       = "-"
 )
 
 // ownersKey returns the table key for prefix+name and whether it is a valid
@@ -78,44 +61,20 @@ func blipOwner(b *v1.Blip) string {
 	return b.Labels[v1.LabelOwner]
 }
 
-// threadIncarnation is the thread UID a Blip was created for, or "" when the
-// Blip is not bound to a thread incarnation. The owner check makes the
-// annotation trustworthy: a VM may patch its own Blip, but it cannot make a
-// thread of another project its own.
-func threadIncarnation(b *v1.Blip) string {
-	thread := b.Annotations[v1.AnnotationThread]
-	if thread == "" {
-		thread = b.Labels[v1.LabelThread]
-	}
-	uid := b.Annotations[v1.AnnotationThreadUID]
-	owner := blipOwner(b)
-	if thread == "" || uid == "" || owner == "" || v1.ThreadOwner(b.Namespace, thread) != owner {
-		return ""
-	}
-	return uid
-}
-
 // ownerEntry is the admission table value for a Blip's claimed pod: its owner,
-// followed by the thread incarnation when it was created for a thread. The
-// turn policy compares the second field with thread-inc.<owner> so a pod from
-// the previous incarnation of a recreated thread cannot write to the new one.
+// or ownerAny for an unrestricted Blip.
 func ownerEntry(b *v1.Blip) string {
-	o := blipOwner(b)
-	if o == "" {
-		return ownerAny
+	if o := blipOwner(b); o != "" {
+		return o
 	}
-	if uid := threadIncarnation(b); uid != "" {
-		return o + " " + uid
-	}
-	return o
+	return ownerAny
 }
 
 // podServiceAccount is the account whose token pod holds, or "" if it has
-// none.
+// none. Every VM pod disables automount; only the API proxy's explicit token
+// projection authenticates as the service account.
 func podServiceAccount(p *corev1.Pod) string {
-	// Legacy VMs automounted their token. New VMs disable automount but
-	// their API sidecar still authenticates as this pod's service account.
-	if a := p.Spec.AutomountServiceAccountToken; a != nil && !*a && !hasAPIProxyToken(p) {
+	if !hasAPIProxyToken(p) {
 		return ""
 	}
 	if p.Spec.ServiceAccountName == "" {
@@ -239,25 +198,18 @@ func restoreVMOwner(ctx context.Context, c client.Client, live client.Reader, ns
 }
 
 // syncVMOwners reconciles the table of ns with the cluster: every pool and
-// VM pod service account is listed with its pools, claimed pods carry their Blip's owner,
-// every thread carries its project's owner hash, and entries of deleted pods
-// and threads are removed. A namespace with a pool always has the table, empty
-// if no pool names a service account. Vacant pods keep any entry: the cache
-// may not show a claim yet, and the claim path overwrites the entry before the
-// next claim.
+// VM pod service account is listed with its pools, claimed pods carry their
+// Blip's owner, and entries of deleted pods are removed. A namespace with a
+// pool always has the table, empty if no pool names a service account. Vacant
+// pods keep any entry: the cache may not show a claim yet, and the claim path
+// overwrites the entry before the next claim.
 //
-// A name too long for a ConfigMap key (a legal BlipThread name can be, and a
-// pool service account name is not bounded by the API) is skipped rather than
-// making the whole patch invalid: one such object must not stop every pool in
-// the namespace from reconciling. Skipping is fail-closed because the
-// admission policy cannot match the missing entry.
-func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
-	return syncVMOwnersEvents(ctx, c, ns, nil)
-}
-
-// syncVMOwnersEvents is syncVMOwners with an optional recorder for Events
-// about owner-table keys that cannot be represented.
-func syncVMOwnersEvents(ctx context.Context, c client.Client, ns string, recorder record.EventRecorder) error {
+// A name too long for a ConfigMap key (a pool service account name is not
+// bounded by the API) is skipped rather than making the whole patch invalid:
+// one such object must not stop every pool in the namespace from reconciling.
+// Skipping is fail-closed because the admission policy cannot match the
+// missing entry. The optional recorder publishes an Event for such a key.
+func syncVMOwners(ctx context.Context, c client.Client, ns string, recorder record.EventRecorder) error {
 	var pools v1.BlipPoolList
 	if err := c.List(ctx, &pools, client.InNamespace(ns)); err != nil {
 		return err
@@ -297,35 +249,6 @@ func syncVMOwnersEvents(ctx context.Context, c client.Client, ns string, recorde
 	if len(bases) > 0 {
 		slices.Sort(bases)
 		want[ownersBasesKey] = strings.Join(bases, " ")
-	}
-	// Thread ownership lets the turn policy bind a pod-bound producer to its
-	// own project without trusting labels on the turn. Raw thread names
-	// (spec.thread on a turn) live under "thread.<name>"; a label that had to
-	// be hashed for length lives under "thread-hash.<label>". The separate
-	// prefix means a long thread's hash cannot collide with a short thread.
-	// The current incarnation lives under "thread-inc.<owner>"; a claimed pod
-	// entry carries the incarnation its Blip was created for, so a pod from a
-	// deleted thread cannot write turns into the recreated one. A raw name too
-	// long for a ConfigMap key is omitted; the hashed key still authorizes
-	// Blips, and turns for it fail closed at admission.
-	var threads v1.BlipThreadList
-	if err := c.List(ctx, &threads, client.InNamespace(ns)); err != nil {
-		return err
-	}
-	for i := range threads.Items {
-		name := threads.Items[i].Name
-		owner := v1.ThreadOwner(ns, name)
-		if label := v1.ThreadLabel(name); label != name {
-			want[ownersThreadHashPrefix+label] = owner
-		}
-		if key, ok := ownersKey(ownersThreadPrefix, name); ok {
-			want[key] = owner
-		} else {
-			warnUnrepresentableOwnerKey(recorder, &threads.Items[i], ownersThreadPrefix, name)
-		}
-		if uid := string(threads.Items[i].UID); uid != "" {
-			want[ownersThreadIncPrefix+owner] = uid
-		}
 	}
 	exists := map[string]bool{}
 	for i := range pods.Items {
@@ -371,8 +294,7 @@ func syncVMOwnersEvents(ctx context.Context, c client.Client, ns string, recorde
 	// uses it; pod-bound tokens die with their pod, so no VM token is left
 	// unrestricted.
 	for k := range cm.Data {
-		if _, ok := want[k]; !ok && (strings.HasPrefix(k, ownersSAPrefix) ||
-			strings.HasPrefix(k, ownersThreadIncPrefix) || !exists[k]) {
+		if _, ok := want[k]; !ok && (strings.HasPrefix(k, ownersSAPrefix) || !exists[k]) {
 			patch[k] = nil
 		}
 	}
