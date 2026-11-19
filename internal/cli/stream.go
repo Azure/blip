@@ -72,7 +72,12 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 		}
 		go a.forwardResize(ctx, s)
 	}
-	if !tty && a.env.Terminal {
+	// Forward termination signals in every mode, including a TTY session. A
+	// TTY client makes the terminal raw, so its process no longer dies from
+	// SIGTERM/SIGHUP by default and would leave both the remote command and
+	// the local terminal behind. Interactive Ctrl-C still arrives as a stdin
+	// byte in raw mode and is delivered by the guest's terminal.
+	if tty || a.env.Terminal {
 		go forwardSignals(ctx, s)
 	}
 
