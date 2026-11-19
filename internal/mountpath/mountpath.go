@@ -74,6 +74,13 @@ const (
 	// PathMax is Linux PATH_MAX (4096 bytes) including the terminating NUL,
 	// so the longest usable path string is PathMax-1 bytes.
 	PathMax = 4096
+	// GuestRoot is where the guest mounts the durable root. A mount path is
+	// resolved through this prefix, so it counts against PATH_MAX.
+	GuestRoot = "/mnt/root"
+	// MaxPath is the longest mount path the guest can resolve. The kernel
+	// path in the guest is GuestRoot plus the mount path, and no Linux path
+	// (including the terminating NUL) may exceed PathMax bytes.
+	MaxPath = PathMax - 1 - len(GuestRoot)
 	// MaxComponents bounds how many components a mount path may have. Linux
 	// allows more in PATH_MAX, but the CRD's per-component byte check has to
 	// fit the API server's CEL cost budget; 255 components is far beyond any
@@ -132,17 +139,17 @@ func CollectMountPath(p string) bool {
 
 // ValidateLength reports why p is too long or otherwise unusable as a Linux
 // filesystem path. Every component must fit NAME_MAX and the whole path must
-// leave room for the terminating NUL within PATH_MAX, or no guest can create
-// the mount point. ASCII control characters (including NUL) cannot be part of
-// a syscall path.
+// leave room for the terminating NUL within PATH_MAX after the guest root
+// prefix, or the guest cannot resolve the mount point. ASCII control
+// characters (including NUL) cannot be part of a syscall path.
 func ValidateLength(p string) error {
 	for i := 0; i < len(p); i++ {
 		if p[i] < 0x20 || p[i] == 0x7f {
 			return fmt.Errorf("mount path contains a control character at byte %d", i)
 		}
 	}
-	if len(p) >= PathMax {
-		return fmt.Errorf("mount path is %d bytes, exceeding the Linux PATH_MAX limit of %d bytes", len(p), PathMax-1)
+	if len(p) > MaxPath {
+		return fmt.Errorf("mount path is %d bytes, exceeding the %d-byte limit for a guest mount point (Linux PATH_MAX %d minus the %d-byte guest root prefix %s)", len(p), MaxPath, PathMax, len(GuestRoot), GuestRoot)
 	}
 	components := 0
 	for _, c := range strings.Split(p, "/") {

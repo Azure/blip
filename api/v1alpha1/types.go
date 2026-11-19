@@ -483,18 +483,19 @@ type Mount struct {
 	State string `json:"state"`
 	// Path is an absolute path inside the guest root. It must be clean: no
 	// trailing slash, repeated slash, or . and .. segments. It must also be
-	// creatable by the Linux guest: shorter than PATH_MAX bytes, with every
-	// component within NAME_MAX bytes, and not a reserved, guest-managed, or
-	// non-directory image path. These mirror internal/mountpath so kubectl
+	// creatable by the Linux guest: at most 4086 bytes, the Linux PATH_MAX
+	// limit less the guest root prefix, with every component within NAME_MAX
+	// bytes, and not a reserved, guest-managed, or non-directory image path.
+	// These mirror internal/mountpath so kubectl
 	// apply cannot write intent that every later Blip on the root will fail
 	// to mount. Admission also caps the component count so the per-component
 	// byte check stays within the API server's CEL cost budget. A temporary
 	// collect mount (read-only and scoped to one blip) is the one allowed
 	// exception below the reserved collect root.
 	// +kubebuilder:validation:Pattern=`^/[^/]+(/[^/]+)*$`
-	// +kubebuilder:validation:MaxLength=4096
+	// +kubebuilder:validation:MaxLength=4086
 	// +kubebuilder:validation:XValidation:rule="!self.split('/').exists(s, s == '.' || s == '..')",message="path must not contain . or .. segments"
-	// +kubebuilder:validation:XValidation:rule="bytes(self).size() < 4096",message="path must be shorter than 4096 bytes, the Linux PATH_MAX limit"
+	// +kubebuilder:validation:XValidation:rule="bytes(self).size() <= 4086",message="path must be at most 4086 bytes: Linux PATH_MAX less the guest root prefix"
 	// +kubebuilder:validation:XValidation:rule="self.split('/').size() <= 256",message="path must have at most 255 components"
 	// +kubebuilder:validation:XValidation:rule="self.split('/', 256).all(s, bytes(s).size() <= 255)",message="path components must be at most 255 bytes, the Linux NAME_MAX limit"
 	// +kubebuilder:validation:XValidation:rule="!self.matches('[\\\\x00-\\\\x1f\\\\x7f]')",message="path must not contain control characters"

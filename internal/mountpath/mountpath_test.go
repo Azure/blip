@@ -130,16 +130,21 @@ func TestValidate(t *testing.T) {
 
 // TestValidateLinuxPathLimits reproduces mounts the CLI accepted offline but
 // no Linux guest can create: a component over NAME_MAX (255 bytes) or a full
-// path at PATH_MAX (4096 bytes, including the terminating NUL).
+// path that does not fit PATH_MAX (4096 bytes including the terminating NUL)
+// once the guest's root prefix is prepended.
 func TestValidateLinuxPathLimits(t *testing.T) {
 	longComponent := func(n int) string {
 		return "/" + strings.Repeat("a", n)
 	}
 	safeNested := "/" + strings.Repeat("abcdefghij/", 20) + strings.Repeat("c", 255)
-	pathAtMax := "/" + strings.Repeat(strings.Repeat("b", NameMax)+"/", 15) + strings.Repeat("b", 253) + "/c"
-	if len(pathAtMax) != PathMax {
-		t.Fatalf("test path is %d bytes, want PATH_MAX %d", len(pathAtMax), PathMax)
+	pathAtMax := "/" + strings.Repeat(strings.Repeat("b", NameMax)+"/", 15) + strings.Repeat("b", 243) + "/c"
+	if len(pathAtMax) != MaxPath {
+		t.Fatalf("test path is %d bytes, want %d", len(pathAtMax), MaxPath)
 	}
+	if len(pathAtMax)+len(GuestRoot)+1 != PathMax {
+		t.Fatalf("guest path with root prefix is %d bytes, want PATH_MAX %d", len(pathAtMax)+len(GuestRoot)+1, PathMax)
+	}
+	pathOver := pathAtMax + "c"
 	componentsAtMax := "/" + strings.Repeat("c/", MaxComponents-1) + "c"
 	componentsOver := "/" + strings.Repeat("c/", MaxComponents) + "c"
 	for _, tc := range []struct {
@@ -155,7 +160,8 @@ func TestValidateLinuxPathLimits(t *testing.T) {
 		{"multibyte name_max at", "/" + strings.Repeat("é", 127), true},
 		{"components at max", componentsAtMax, true},
 		{"components over max", componentsOver, false},
-		{"path at limit", pathAtMax, false},
+		{"path at guest limit", pathAtMax, true},
+		{"path over guest limit", pathOver, false},
 		{"safe long nested path", safeNested, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

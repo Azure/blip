@@ -13,13 +13,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Azure/blip/internal/mountpath"
 	"github.com/Azure/blip/internal/wire"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	// rootDir is where the claimed root filesystem is mounted.
-	rootDir = "/mnt/root"
+	// rootDir is where the claimed root filesystem is mounted. It is part of
+	// the mount-path PATH_MAX budget, so the preflight shares this value.
+	rootDir = mountpath.GuestRoot
 	// workCgroup holds every workload process.
 	workCgroup = "/sys/fs/cgroup/work"
 	// stopGrace is how long processes get between SIGTERM and cgroup.kill.

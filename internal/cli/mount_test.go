@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/mountpath"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1844,6 +1845,9 @@ func TestMountRejectsOverlongPaths(t *testing.T) {
 	}{
 		{"300 byte component", "/" + strings.Repeat("a", 300)},
 		{"260 byte component", "/" + strings.Repeat("b", 260)},
+		// 4087 bytes is one over the limit left by PATH_MAX after the
+		// guest's /mnt/root prefix.
+		{"path over guest PATH_MAX", "/" + strings.Repeat(strings.Repeat("c", mountpath.NameMax)+"/", 15) + strings.Repeat("c", 244) + "/c"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, readyState("home"), readyState("data"))
@@ -1878,6 +1882,20 @@ func TestMountRejectsOverlongPaths(t *testing.T) {
 	}
 	if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].Path != safe {
 		t.Fatalf("legitimate long path not written: %+v", mounts)
+	}
+
+	// The guest resolves /mnt/root plus this path within PATH_MAX.
+	atLimit := "/" + strings.Repeat(strings.Repeat("d", mountpath.NameMax)+"/", 15) + strings.Repeat("d", 243) + "/c"
+	if len(atLimit) != mountpath.MaxPath {
+		t.Fatalf("test path is %d bytes, want %d", len(atLimit), mountpath.MaxPath)
+	}
+	h = newHarness(t, readyState("home"), readyState("data"))
+	code, _, errOut = h.run("", "mount", "data:"+atLimit, "--root", "home")
+	if code != 0 {
+		t.Fatalf("path at guest limit rejected: %d %s", code, errOut)
+	}
+	if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].Path != atLimit {
+		t.Fatalf("path at guest limit not written: %+v", mounts)
 	}
 }
 

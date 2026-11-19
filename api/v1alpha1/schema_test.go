@@ -252,9 +252,14 @@ func TestMountPathCRDRules(t *testing.T) {
 		t.Errorf("mount path pattern %q, want %q", path.Pattern, pathPattern)
 	}
 	// CEL cost estimation needs a bound on the string length; without it the
-	// split/exists rule blows the per-object admission budget.
-	if path.MaxLength != 4096 {
-		t.Errorf("mount path maxLength %d, want 4096", path.MaxLength)
+	// split/exists rule blows the per-object admission budget. The bound is
+	// the longest path the guest can resolve under its root prefix.
+	if path.MaxLength != int64(mountpath.MaxPath) {
+		t.Errorf("mount path maxLength %d, want %d", path.MaxLength, mountpath.MaxPath)
+	}
+	const length = "bytes(self).size() <= 4086"
+	if rule := ruleFor(t, path.XValidations, "path must be at most 4086 bytes: Linux PATH_MAX less the guest root prefix"); rule != length {
+		t.Errorf("mount path length rule %q, want %q", rule, length)
 	}
 	const segments = "!self.split('/').exists(s, s == '.' || s == '..')"
 	if rule := ruleFor(t, path.XValidations, "path must not contain . or .. segments"); rule != segments {
@@ -324,9 +329,13 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 		}
 		return `{"spec":{"mounts":[{"state":"data","path":` + string(raw) + `}]}}`
 	}
-	pathAtLimit := "/" + strings.Repeat(strings.Repeat("b", mountpath.NameMax)+"/", 15) + strings.Repeat("b", 254)
-	if len(pathAtLimit) != mountpath.PathMax-1 {
-		t.Fatalf("test path is %d bytes, want %d", len(pathAtLimit), mountpath.PathMax-1)
+	pathAtLimit := "/" + strings.Repeat(strings.Repeat("b", mountpath.NameMax)+"/", 15) + strings.Repeat("b", 245)
+	if len(pathAtLimit) != mountpath.MaxPath {
+		t.Fatalf("test path is %d bytes, want %d", len(pathAtLimit), mountpath.MaxPath)
+	}
+	pathOver := "/" + strings.Repeat(strings.Repeat("b", mountpath.NameMax)+"/", 15) + strings.Repeat("b", 244) + "/c"
+	if len(pathOver) != mountpath.MaxPath+1 {
+		t.Fatalf("test path is %d bytes, want %d", len(pathOver), mountpath.MaxPath+1)
 	}
 	componentsAtMax := "/" + strings.Repeat("c/", mountpath.MaxComponents-1) + "c"
 	componentsOver := "/" + strings.Repeat("c/", mountpath.MaxComponents) + "c"
@@ -351,6 +360,7 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 		"/" + strings.Repeat("é", 128),
 		"/" + strings.Repeat("é", 3000),
 		componentsOver,
+		pathOver,
 		"/" + strings.Repeat("a", mountpath.PathMax-1),
 		"/a\x00b",
 		"/a\tb",
