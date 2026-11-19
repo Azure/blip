@@ -24,11 +24,12 @@
 # and create blips only in pools of its own service account. Thread specs are
 # administrator-owned: a restricted VM may read its own thread through the
 # API proxy but may not create, change or delete threads. Every new or changed
-# ownerReference it sets must name a Blip of the same owner: fork blips may
-# only be owned by blips of the same owner, and states may only be owned by
-# such blips. An ownerReference inherited unchanged from the privileged
-# creator (for example the parent of a fork) is exempt, so a restricted
-# child can still update itself. Every pod-bound token of the request
+# ownerReference it sets must name an object of the same owner: fork blips may
+# only be owned by blips, and states may be owned by such blips or by another
+# state (a durable fork's hidden children are owned by their root state). An
+# ownerReference inherited unchanged from the privileged creator (for example
+# the parent of a fork) is exempt, so a restricted child can still update
+# itself. Every pod-bound token of the request
 # namespace is treated as a VM and must have a claimed pod entry: a table
 # that is non-empty but lacks the caller's sa.<sa> or pod key fails closed
 # instead of skipping every check. A missing key is never treated as
@@ -210,12 +211,13 @@ spec:
         !variables.restricted || !variables.writes ||
         !has(object.metadata.ownerReferences) ||
         object.metadata.ownerReferences.all(o,
-          o.apiVersion == 'blip.dev/v1alpha1' && o.kind == 'Blip' &&
+          o.apiVersion == 'blip.dev/v1alpha1' &&
+          (o.kind == 'Blip' || (o.kind == 'BlipState' && request.resource.resource == 'blipstates')) &&
           (!has(o.controller) || o.controller != true) &&
           (!has(o.blockOwnerDeletion) || o.blockOwnerDeletion != true) &&
           (o.name.startsWith(variables.prefix) || o in variables.oldOwnerReferences))
       messageExpression: >-
-        'owner ' + variables.owner + ' may only set ownerReferences to blips named ' + variables.prefix + '*'
+        'owner ' + variables.owner + ' may only set ownerReferences to blips or states named ' + variables.prefix + '*'
       reason: Forbidden
     - expression: >-
         !variables.restricted || !variables.writes || request.resource.resource != 'blips' || !has(object.spec) ||
