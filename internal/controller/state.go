@@ -556,11 +556,29 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 	}
 
 	nodes := cl.choose(replicas(st), st.Spec.NodeSelector, prefer, nil)
+	size := resource.NewQuantity(s.SizeBytes, resource.BinarySI)
+	if s.CopiedFrom != nil && s.CopiedFrom.AttachmentID == "" && s.SizeBytes > 0 {
+		// A committed copy source is only a preferred read source; the copy
+		// itself can live on any node with room. Skip nodes that cannot hold
+		// it instead of failing while another target still fits.
+		var full []string
+		for _, n := range cl.names {
+			if cl.usable(n, st.Spec.NodeSelector) && cl.nodes[n].Status.FreeBytes < s.SizeBytes {
+				full = append(full, n)
+			}
+		}
+		if len(full) > 0 {
+			nodes = cl.choose(replicas(st), st.Spec.NodeSelector, prefer, full)
+			if len(nodes) == 0 {
+				s.Phase = v1.StateFailed
+				return fmt.Sprintf("state needs %s per replica but no eligible node has enough free space", size.String()), false, nil
+			}
+		}
+	}
 	if len(nodes) == 0 {
 		return "no healthy node can hold the state", false, nil
 	}
 	if s.SizeBytes > 0 {
-		size := resource.NewQuantity(s.SizeBytes, resource.BinarySI)
 		for _, n := range nodes {
 			if free := cl.nodes[n].Status.FreeBytes; free < s.SizeBytes {
 				s.Phase = v1.StateFailed

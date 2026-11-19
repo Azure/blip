@@ -407,6 +407,45 @@ func TestCopySizeValidation(t *testing.T) {
 	}
 }
 
+// TestCopySkipsFullPreferredSourceNode covers a copy whose preferred source
+// node is now too full for the copy. The source is only a read source, so the
+// copy must use another target that fits instead of failing terminally.
+func TestCopySkipsFullPreferredSourceNode(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2", "n3")
+	size := resource.MustParse("20Gi")
+	e.newState("src", func(st *v1.BlipState) {
+		st.Spec.Replicas = 2
+		st.Spec.Size = &size
+	})
+	e.run(e.state, ns, "src")
+	src := e.getState("src")
+	e.hold("src", src.Status.Pending.CommitID, src.Status.Pending.Replicas...)
+	e.run(e.state, ns, "src")
+	src = e.getState("src")
+	if src.Status.Phase != v1.StateReady || !slices.Contains(src.Status.Placements, "n1") {
+		t.Fatalf("source not ready on n1: %+v", src.Status)
+	}
+
+	bn := &v1.BlipNode{}
+	e.must(e.c.Get(e.ctx, types.NamespacedName{Name: "n1"}, bn))
+	bn.Status.FreeBytes = 1 << 30
+	e.must(e.c.Status().Update(e.ctx, bn))
+
+	e.newState("cp", func(st *v1.BlipState) {
+		st.Spec.CopyFrom = "src"
+		st.Spec.Replicas = 2
+	})
+	e.run(e.state, ns, "cp")
+	cp := e.getState("cp")
+	if cp.Status.Phase == v1.StateFailed || cp.Status.Pending == nil {
+		t.Fatalf("copy failed on a full preferred source: %+v", cp.Status)
+	}
+	if !slices.Equal(cp.Status.Pending.Replicas, []string{"n2", "n3"}) {
+		t.Fatalf("copy targets %v, want the nodes with room", cp.Status.Pending.Replicas)
+	}
+}
+
 func TestInitialReplicaWaitsForSource(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2")
