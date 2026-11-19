@@ -225,7 +225,7 @@ func TestRouterRoutesEndpointHost(t *testing.T) {
 
 	// Unknown or invalid hosts are rejected before any upstream contact.
 	before := requests.Load()
-	for _, host := range []string{"payments:8080", "payments:443", "unknown", "a.b", "", "[::1]:80"} {
+	for _, host := range []string{"payments:8080", "payments:443", "unknown", "a.b", "", "[::1]:80", "payments..", "payments:80.", "payments..:80"} {
 		req := httptest.NewRequest(http.MethodGet, "http://payments/resource", nil)
 		req.Host = host
 		recorder := serveHandler(handler, req)
@@ -263,10 +263,23 @@ func TestNormalizeHost(t *testing.T) {
 		{"payments:443", "", false},
 		{"payments:", "", false},
 		{"", "", false},
-		{"[::1]", "", false},
-		{"[::1]:80", "", false},
+		{"[::1]", "::1", true},
+		{"[::1]:80", "::1", true},
+		{"[::1]:443", "", false},
+		{"[::1", "", false},
 		{"::1", "", false},
 		{"a.b", "a.b", true},
+		// Malformed authorities: more than one trailing dot, a dot after the
+		// port, a leading-zero port, and invalid DNS labels.
+		{"payments..", "", false},
+		{"payments:80.", "", false},
+		{"payments..:80", "", false},
+		{"payments:080", "", false},
+		{"payments:8a", "", false},
+		{"pay-ments", "pay-ments", true},
+		{"-payments", "", false},
+		{"payments-", "", false},
+		{"pay_ments", "", false},
 	} {
 		name, ok := normalizeHost(test.host)
 		if name != test.name || ok != test.ok {
