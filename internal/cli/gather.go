@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
@@ -110,15 +111,33 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		}
 		selector = v1alpha1.LabelParent + "=" + v1alpha1.ParentLabel(a.short(a.self.Name))
 	}
-	// Inside an owner-scoped blip, every selector is intersected with the
-	// caller's owner. An explicit selector is constrained rather than
-	// rejected, so one that names another owner matches nothing and can never
-	// list or delete that owner's blips.
-	selector = a.ownerSelector(selector)
+	var sel labels.Selector
+	if selector != "" {
+		// Parse the selector as the user wrote it, so an error never quotes
+		// the internal owner term added below.
+		sel, err = labels.Parse(selector)
+		if err != nil {
+			return fmt.Errorf("invalid --selector %q: %w", selector, err)
+		}
+		if sel.Empty() {
+			return fmt.Errorf("invalid --selector %q: it selects every blip", selector)
+		}
+		// Inside an owner-scoped blip, every selector is intersected with the
+		// caller's owner. An explicit selector is constrained rather than
+		// rejected, so one that names another owner matches nothing and can
+		// never list or delete that owner's blips.
+		if a.owner != "" {
+			req, err := labels.NewRequirement(v1alpha1.LabelOwner, selection.Equals, []string{a.owner})
+			if err != nil {
+				return err
+			}
+			sel = sel.Add(*req)
+		}
+	}
 	if len(f.collect) > 0 && a.self == nil {
 		return errors.New("--collect copies into the workspace of the blip this command runs in, so it only works inside one; gather with --keep to keep the blip and its workspace")
 	}
-	targets, err := a.gatherTargets(ctx, c, names, selector)
+	targets, err := a.gatherTargets(ctx, c, names, sel)
 	if err != nil {
 		return err
 	}
@@ -345,16 +364,6 @@ func (a *app) checkCollectMountedWrites(ctx context.Context, done []*v1alpha1.Bl
 	return checkCollectWrites(all, mounts)
 }
 
-// ownerSelector narrows a label selector to the caller's owner when the
-// command runs inside an owner-scoped blip. Ownerless callers, including
-// admins, keep the selector unchanged.
-func (a *app) ownerSelector(selector string) string {
-	if selector == "" || a.owner == "" {
-		return selector
-	}
-	return selector + "," + v1alpha1.LabelOwner + "=" + a.owner
-}
-
 // isExistingDir reports whether path is already a directory. A destination
 // that does not exist (or is a file) is created or replaced by the first
 // operation that targets it.
@@ -364,8 +373,8 @@ func isExistingDir(path string) bool {
 }
 
 // gatherTargets resolves the blips named on the command line and the ones that
-// match selector, in a stable order.
-func (a *app) gatherTargets(ctx context.Context, c *Clients, names []string, selector string) ([]*v1alpha1.Blip, error) {
+// match sel, in a stable order.
+func (a *app) gatherTargets(ctx context.Context, c *Clients, names []string, sel labels.Selector) ([]*v1alpha1.Blip, error) {
 	seen := map[string]bool{}
 	var out []*v1alpha1.Blip
 	add := func(b *v1alpha1.Blip) {
@@ -393,14 +402,7 @@ func (a *app) gatherTargets(ctx context.Context, c *Clients, names []string, sel
 		}
 		add(b)
 	}
-	if selector != "" {
-		sel, err := labels.Parse(selector)
-		if err != nil {
-			return nil, fmt.Errorf("invalid --selector %q: %w", selector, err)
-		}
-		if sel.Empty() {
-			return nil, fmt.Errorf("invalid --selector %q: it selects every blip", selector)
-		}
+	if sel != nil {
 		var list v1alpha1.BlipList
 		if err := c.Kube.List(ctx, &list, client.InNamespace(c.Namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
 			return nil, err

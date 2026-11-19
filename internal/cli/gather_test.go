@@ -180,6 +180,22 @@ func TestGatherSelectorCannotCrossOwner(t *testing.T) {
 	}
 }
 
+// A parse error must quote the selector the user wrote, without the internal
+// owner term gather adds to constrain it.
+func TestGatherSelectorErrorOmitsOwnerSuffix(t *testing.T) {
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"))
+	h.self = "alice.box"
+	for _, sel := range []string{"a=b,", "foo in ("} {
+		code, _, errOut := h.run("", "gather", "--selector", sel)
+		if code != 1 || !strings.Contains(errOut, `invalid --selector "`+sel+`"`) {
+			t.Fatalf("selector %q: code %d: %s", sel, code, errOut)
+		}
+		if strings.Contains(errOut, v1alpha1.LabelOwner) {
+			t.Fatalf("selector %q error quotes the internal owner term: %s", sel, errOut)
+		}
+	}
+}
+
 // A caller without an owner (admin or an unowned blip) is unchanged: no owner
 // constraint is added to its default or explicit selectors.
 func TestGatherOwnerlessCallerUnchanged(t *testing.T) {
