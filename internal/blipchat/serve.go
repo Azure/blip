@@ -604,6 +604,18 @@ func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
 
 // prune deletes consumed turns past retention and old closed tasks.
 func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
+	// The Steps list snapshot can be minutes old when an earlier step in the
+	// same tick ran long. If the name was deleted and recreated, this pass
+	// belongs to an incarnation that no longer exists: sweeping with the old
+	// UID would delete the new thread's turns and restore its old board.
+	live, err := s.currentThread(ctx, thread)
+	if err != nil {
+		if apierrors.IsNotFound(err) || errors.Is(err, errStaleIncarnation) {
+			return nil
+		}
+		return err
+	}
+	*thread = *live
 	now := timeNow()
 	// Turns sequenced by a previous incarnation of a recreated thread are
 	// not history of this one. Delete them regardless of age or sequence.
@@ -676,8 +688,8 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 		keptTasks = append(keptTasks[:oldest], keptTasks[oldest+1:]...)
 	}
 	if len(keptTasks) != len(thread.Status.Tasks) {
-		current := &v1.BlipThread{}
-		if err := s.Get(ctx, client.ObjectKeyFromObject(thread), current); err != nil {
+		current, err := s.currentThread(ctx, thread)
+		if err != nil {
 			return err
 		}
 		current.Status.Tasks = keptTasks

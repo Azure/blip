@@ -133,3 +133,40 @@ func TestCreateTurnInRejectsRecreatedThread(t *testing.T) {
 		t.Fatal("turn was created for a different incarnation")
 	}
 }
+
+// prune() receives a thread object from the Steps list snapshot. If the name
+// was deleted and recreated since that snapshot, the pass must skip rather
+// than delete the new incarnation's turns or restore its old board.
+func TestPruneSkipsRecreatedThreadIncarnation(t *testing.T) {
+	oldUpdated := metav1.NewTime(timeNow().Add(-100 * time.Hour))
+	stale := testThread()
+	stale.UID = types.UID("old-incarnation")
+	stale.Status.Tasks = []v1.ThreadTask{{ID: "oldtask", Title: "old", Open: false, Updated: &oldUpdated}}
+
+	recreated := testThread()
+	recreated.UID = types.UID("new-incarnation")
+	recreated.Status.Tasks = []v1.ThreadTask{{ID: "newtask", Title: "new", Open: true}}
+	fresh := metav1.NewTime(timeNow())
+	newTurn := testTurn("new-turn", "proj")
+	newTurn.Status.Seq = 1
+	newTurn.Status.ThreadUID = "new-incarnation"
+	newTurn.Status.AcceptedTime = &fresh
+	newTurn.Spec.Wake = v1.WakeNone
+
+	c := testClient(t, recreated, newTurn)
+	s := &Server{Client: c}
+	if err := s.prune(context.Background(), stale); err != nil {
+		t.Fatalf("prune of a replaced incarnation: %v", err)
+	}
+	var turn v1.BlipTurn
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "new-turn"}, &turn); err != nil {
+		t.Errorf("stale prune deleted the new incarnation's turn: %v", err)
+	}
+	var thread v1.BlipThread
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "proj"}, &thread); err != nil {
+		t.Fatal(err)
+	}
+	if len(thread.Status.Tasks) != 1 || thread.Status.Tasks[0].ID != "newtask" {
+		t.Errorf("stale prune overwrote the new board with %+v", thread.Status.Tasks)
+	}
+}
