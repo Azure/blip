@@ -171,6 +171,22 @@ func (s *Sequencer) sequence(ctx context.Context, thread *v1.BlipThread, turn *v
 	if err := s.ensureTurnLabels(ctx, thread, turn); err != nil {
 		return err
 	}
+	// The label patch decodes the API server response into turn, so it also
+	// refreshes a status.seq a peer wrote while the patch was in flight. That
+	// fresh resourceVersion would let our status write succeed and resequence
+	// an already sealed turn. Re-read after labeling and never overwrite an
+	// assigned sequence: it is immutable, and the peer's write is success.
+	var refreshed v1.BlipTurn
+	if err := s.liveReader().Get(ctx, client.ObjectKeyFromObject(turn), &refreshed); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if refreshed.Status.Seq != 0 {
+		return nil
+	}
+	if !turnBelongsToThread(&refreshed, thread) {
+		return nil
+	}
+	*turn = refreshed
 	seq, err := s.reserveSeq(ctx, thread)
 	if err != nil {
 		return err
