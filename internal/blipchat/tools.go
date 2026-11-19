@@ -117,8 +117,15 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 				return "", fmt.Errorf("task %q already exists", id)
 			}
 		}
-		if len(s.tasks) >= 200 {
-			return "", fmt.Errorf("task board is full")
+		if len(s.tasks) >= taskBoardLimit {
+			// The create cap equals the default retention cap, so without
+			// evicting here a board of recently closed tasks would reject
+			// every create until the age rule frees a slot. Drop the oldest
+			// closed task, matching what prune would do with headroom, and
+			// never touch open work.
+			if !s.evictOldestClosed() {
+				return "", fmt.Errorf("task board is full")
+			}
 		}
 		attrs := map[string]string{}
 		if raw, ok := args["attributes"].(map[string]any); ok {
@@ -255,6 +262,28 @@ func (s *step) task(id string) *v1.ThreadTask {
 		}
 	}
 	return nil
+}
+
+// taskBoardLimit is the CRD's MaxItems for thread.status.tasks.
+const taskBoardLimit = 200
+
+// evictOldestClosed drops the closed task prune would remove first. It
+// reports false when every task is open.
+func (s *step) evictOldestClosed() bool {
+	oldest := -1
+	for i, t := range s.tasks {
+		if t.Open {
+			continue
+		}
+		if oldest < 0 || closedTaskOlder(t, s.tasks[oldest]) {
+			oldest = i
+		}
+	}
+	if oldest < 0 {
+		return false
+	}
+	s.tasks = append(s.tasks[:oldest], s.tasks[oldest+1:]...)
+	return true
 }
 
 // startedTask records the objects one start_task call created. A step that is
