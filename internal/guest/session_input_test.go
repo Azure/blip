@@ -774,6 +774,37 @@ func TestTTYRawEOFAfterStartupDelay(t *testing.T) {
 	}
 }
 
+// TestTTYEOFLateCanonicalReader covers a client that sends its input and EOF
+// before the command starts reading. After ttyEOFTimeout the guest queues the
+// fallback marker; for an unterminated last line that marker only releases the
+// partial line, so a second one must follow or a reader that starts at 6-8 s
+// blocks forever. The other cases are the trailing-newline and complete-line
+// controls, which need the same single-marker behavior as before.
+func TestTTYEOFLateCanonicalReader(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"partial-line", "partial-no-newline"},
+		{"trailing-newline", "hello\n"},
+		{"partial-after-complete-lines", "alpha\nbeta"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := startTTYReader(t, "stty -echo; sleep 8; cat; echo DONE=$?")
+			r.feed(t, tc.input)
+			out := r.waitFor(t, "DONE=")
+			assertNoNUL(t, out)
+			want := tc.input + "DONE=0\n"
+			if out != want {
+				t.Fatalf("output = %q, want %q", out, want)
+			}
+		})
+	}
+}
+
 // TestTTYCanonicalEOFIsPrompt verifies that a canonical reader whose stdin
 // already ended gets EOF without paying a fixed startup-settle delay. It also
 // covers the partial-line case, which needs a second marker after the first

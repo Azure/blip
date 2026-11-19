@@ -110,10 +110,11 @@ const (
 	// keeps reading after end of input, so it is not stopped and resumed
 	// forever.
 	ttyEOFDeliveries = 8
-	// ttyEOFTimeout bounds the wait for a command that never waits on its
-	// terminal in a way the guest can observe (for example one waiting in
-	// epoll). It must exceed any startup delay after which a program may
-	// still switch to raw mode.
+	// ttyEOFTimeout bounds the wait before a fallback marker is queued for a
+	// command that never waits on its terminal in a way the guest can observe
+	// (for example one waiting in epoll). A delayed canonical reader still
+	// gets EOF because the fallback queues a second marker for an
+	// unterminated last line.
 	ttyEOFTimeout = 5 * time.Second
 	// ttyEOFSettle is the fallback wait when /proc cannot report the
 	// command's state. The guest behaves as it did before the state check:
@@ -460,7 +461,12 @@ func (s *session) pumpInput() {
 		}
 		s.inCond.Broadcast()
 		s.inMu.Unlock()
+		wrote := false
+		var last byte
 		for _, b := range queue {
+			if len(b) > 0 {
+				wrote, last = true, b[len(b)-1]
+			}
 			s.writeInput(b)
 		}
 		s.inMu.Lock()
@@ -468,7 +474,7 @@ func (s *session) pumpInput() {
 		s.inCond.Broadcast()
 		s.inMu.Unlock()
 		if eof {
-			s.endInput()
+			s.endInput(wrote, last)
 			// Stdin stays closed: input a later client sends cannot be
 			// delivered, and queueing it would only block the frame loop.
 			s.closeInput()
@@ -509,7 +515,7 @@ func (s *session) writeInput(b []byte) {
 	}
 }
 
-func (s *session) endInput() {
+func (s *session) endInput(wrote bool, last byte) {
 	p := s.proc
 	if p == nil {
 		return
@@ -518,7 +524,7 @@ func (s *session) endInput() {
 		_ = p.stdin.Close()
 		return
 	}
-	s.endTTYInput(p.tty)
+	s.endTTYInput(p.tty, wrote && last != '\n')
 }
 
 // endTTYInput delivers end of input to a terminal session. Closing the master
@@ -539,7 +545,11 @@ func (s *session) endInput() {
 // A VEOF is queued only while the process group is stopped, so a read that was
 // blocked in raw mode restarts with the terminal canonical and observes EOF
 // instead of the marker as data.
-func (s *session) endTTYInput(master *os.File) {
+//
+// partial reports that the stream ended in the middle of a canonical line. A
+// marker then only releases that line, so the timed fallback below has to
+// queue a second one for the read that follows.
+func (s *session) endTTYInput(master *os.File, partial bool) {
 	// Hold our own descriptor: the process reaper closes the session's master
 	// as soon as the command exits. Writing to a closed descriptor could hit a
 	// reused fd, and the duplicate keeps the PTY object alive while EOF is
@@ -589,9 +599,19 @@ func (s *session) endTTYInput(master *os.File) {
 		}
 		// A command that waits in some other way (epoll, wait) may still
 		// need EOF, but it cannot be relied on to consume a marker before a
-		// later raw-mode switch. Queue one after the bound and stop.
+		// later raw-mode switch. Queue one after the bound and stop. If the
+		// last line was unterminated, the first marker only releases that
+		// line: queue the second one that actually ends the stream, so a
+		// command that starts reading after the bound still sees EOF.
 		if time.Since(started) >= ttyEOFTimeout {
 			s.deliverTTYEOF(f)
+			deliveries++
+			if partial && deliveries < ttyEOFDeliveries && !s.processDone() {
+				time.Sleep(ttyEOFGap)
+				if !s.processDone() {
+					s.deliverTTYEOF(f)
+				}
+			}
 			return
 		}
 		time.Sleep(ttyEOFPoll)
