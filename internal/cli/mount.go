@@ -103,6 +103,63 @@ func (a *app) rootWriter(ctx context.Context, root *v1alpha1.BlipState) (*v1alph
 	return b, nil
 }
 
+// mountRequest is one desired mount addition, validated before anything is
+// created or written.
+type mountRequest struct {
+	state    string
+	path     string
+	writable bool
+}
+
+// mountPathsOverlap reports whether either path contains the other. It mirrors
+// the controller's topology rule; a root with an overlapping set is rejected on
+// every execution.
+func mountPathsOverlap(a, b string) bool {
+	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+// mountPathConflict checks mountPath against the other states already in the
+// root's mount set. Same-state entries are handled by the caller so a mode
+// change or an idempotent re-add stays valid.
+func mountPathConflict(root string, mounts []v1alpha1.Mount, state, mountPath string) error {
+	for _, other := range mounts {
+		if other.State == state {
+			continue
+		}
+		if other.Path == mountPath {
+			return fmt.Errorf("root state %q already has state %q mounted at %s", root, other.State, mountPath)
+		}
+		if mountPathsOverlap(other.Path, mountPath) {
+			return fmt.Errorf("mount %s: path %s overlaps mount %s at %s", state, mountPath, other.State, other.Path)
+		}
+	}
+	return nil
+}
+
+// validateMountPlan validates the complete mount set the CLI is about to write,
+// including earlier requests from the same invocation, before any state is
+// created or the root is edited.
+func validateMountPlan(root *v1alpha1.BlipState, requests []mountRequest) error {
+	mounts := append([]v1alpha1.Mount(nil), root.Spec.Mounts...)
+	for _, req := range requests {
+		if req.state == root.Name {
+			return errors.New("a root state cannot mount itself")
+		}
+		if m := findSpecMount(mounts, req.state); m != nil {
+			if m.Path != req.path {
+				return fmt.Errorf("state %q is already mounted on root state %q at %s; unmount it first", req.state, root.Name, m.Path)
+			}
+			m.Writable = req.writable
+			continue
+		}
+		if err := mountPathConflict(root.Name, mounts, req.state, req.path); err != nil {
+			return err
+		}
+		mounts = append(mounts, v1alpha1.Mount{State: req.state, Path: req.path, Writable: req.writable})
+	}
+	return nil
+}
+
 func (a *app) mountState(ctx context.Context, state, root, mountPath string, target *bool) error {
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return fmt.Errorf("invalid path %q: must be a clean absolute path other than /", mountPath)
@@ -561,6 +618,15 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	if err != nil {
 		return err
 	}
+	// Validate the target before creating anything: a rejected mount must not
+	// leave behind a committed state that the user has to delete by hand.
+	root, err := a.getState(ctx, f.root)
+	if err != nil {
+		return err
+	}
+	if err := validateMountPlan(root, []mountRequest{{state: name, path: mountPath, writable: writable}}); err != nil {
+		return err
+	}
 	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace}}
 	if replicasSet {
 		st.Spec.Replicas = f.replicas
@@ -594,9 +660,49 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 		return err
 	}
 	if _, err := a.waitStateCommitted(ctx, name); err != nil {
+		a.removeCreatedState(ctx, st)
 		return err
 	}
-	return a.mountState(ctx, name, f.root, mountPath, &writable)
+	if err := a.mountState(ctx, name, f.root, mountPath, &writable); err != nil {
+		// A mount that became desired intent before failing is referenced by
+		// the root, so its state is not an orphan and must stay. Any other
+		// failure leaves the newly created state unused.
+		if !a.mountApplied(ctx, f.root, name, mountPath) {
+			a.removeCreatedState(ctx, st)
+		}
+		return err
+	}
+	return nil
+}
+
+// mountApplied reports whether the root's desired topology already references
+// the mount.
+func (a *app) mountApplied(ctx context.Context, root, state, mountPath string) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	s, err := a.getState(ctx, root)
+	if err != nil {
+		return false
+	}
+	m := findSpecMount(s.Spec.Mounts, state)
+	return m != nil && m.Path == mountPath
+}
+
+// removeCreatedState best-effort deletes a state this command created when its
+// mount never became desired intent. Cleanup must not hide the original error.
+func (a *app) removeCreatedState(ctx context.Context, st *v1alpha1.BlipState) {
+	c, err := a.clients()
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	opts := &client.DeleteOptions{}
+	if st.UID != "" {
+		uid := st.UID
+		opts.Preconditions = &metav1.Preconditions{UID: &uid}
+	}
+	_ = c.Kube.Delete(ctx, st, opts)
 }
 
 func (a *app) listMounts(ctx context.Context, root string) error {

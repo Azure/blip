@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -603,6 +604,45 @@ func TestMountNewRejectsExisting(t *testing.T) {
 	code, _, errOut := h.run("", "mount", "--new", "taken:/data", "--root", "home")
 	if code != 1 || !strings.Contains(errOut, `state "taken" already exists`) {
 		t.Fatalf("code %d: %s", code, errOut)
+	}
+}
+
+func stateNotFound(t *testing.T, h *harness, name string) bool {
+	t.Helper()
+	var s v1alpha1.BlipState
+	err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &s)
+	return apierrors.IsNotFound(err)
+}
+
+// TestMountNewDoesNotLeakStateOnPathConflict reproduces a root that already
+// has /shared mounted: --new must reject before creating the state, and a retry
+// with the same name at a free path must succeed.
+func TestMountNewDoesNotLeakStateOnPathConflict(t *testing.T) {
+	root := readyState("home")
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "m2", Path: "/shared"}}
+	h := newHarness(t, root, readyState("m2"))
+	code, _, errOut := h.run("", "mount", "--new", "leakrepro:/shared:rw", "--size", "1Gi", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `root state "home" already has state "m2" mounted at /shared`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !stateNotFound(t, h, "leakrepro") {
+		t.Fatal("rejected --new left state leakrepro behind")
+	}
+	code, out, errOut := h.run("", "mount", "--new", "leakrepro:/free:rw", "--size", "1Gi", "--root", "home")
+	if code != 0 {
+		t.Fatalf("retry code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state leakrepro mounted")
+}
+
+func TestMountNewDoesNotLeakStateWhenRootMissing(t *testing.T) {
+	h := newHarness(t)
+	code, _, errOut := h.run("", "mount", "--new", "leakrepro:/shared:rw", "--size", "1Gi", "--root", "missing")
+	if code != 1 || !strings.Contains(errOut, `state "missing" not found`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !stateNotFound(t, h, "leakrepro") {
+		t.Fatal("rejected --new left state leakrepro behind")
 	}
 }
 
