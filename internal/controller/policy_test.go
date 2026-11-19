@@ -207,8 +207,10 @@ func compilePolicy(t *testing.T, policy *admissionv1.ValidatingAdmissionPolicy, 
 	)
 }
 
-// loadTurnPolicy compiles both policies in deploy/base/turn-policy.yaml: the
-// author identity check and the project ownership check.
+// loadTurnPolicy compiles the turn author and project ownership policies in
+// deploy/base/turn-policy.yaml. The stream status policies in the same file
+// (blip-turn-status, blip-thread-status) are loaded individually with
+// loadPolicy.
 func loadTurnPolicy(t *testing.T) (validating.Validator, validating.Validator) {
 	t.Helper()
 	policies, bindings := readPolicyDocs(t, "../../deploy/base/turn-policy.yaml")
@@ -294,9 +296,13 @@ func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map
 	gvk := schema.GroupVersionKind{Group: "blip.dev", Version: "v1alpha1", Kind: "Blip"}
 	sub := ""
 	if res, s, ok := strings.Cut(p.resource, "/"); ok {
-		if res == "blipturns" {
+		if res == "blipturns" || res == "blipthreads" {
+			kind := "BlipTurn"
+			if res == "blipthreads" {
+				kind = "BlipThread"
+			}
 			gvr = schema.GroupVersionResource{Group: "blip.dev", Version: "v1alpha1", Resource: res}
-			gvk = schema.GroupVersionKind{Group: "blip.dev", Version: "v1alpha1", Kind: "BlipTurn"}
+			gvk = schema.GroupVersionKind{Group: "blip.dev", Version: "v1alpha1", Kind: kind}
 		} else {
 			gvr = schema.GroupVersionResource{Version: "v1", Resource: res}
 			gvk = schema.GroupVersionKind{Version: "v1", Kind: "PodExecOptions"}
@@ -854,6 +860,44 @@ func TestTurnStatusPolicy(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns/status", name: "turn", object: tc.obj, oldObject: tc.old}
+			allow, msg := req.evaluate(t, v, nil)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+}
+
+// Only blipchat (the coordinator) may write thread status, so a stray status
+// credential cannot forge a summary, reset paused state, or reorder a
+// thread's lastSeq.
+func TestThreadStatusPolicy(t *testing.T) {
+	v := loadPolicy(t, "../../deploy/base/turn-policy.yaml", "blip-thread-status")
+	status := func(summary any) map[string]any {
+		obj := threadObj("proj", "charter")
+		obj["status"] = map[string]any{"summary": summary}
+		return obj
+	}
+	blipchat := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blipchat"}
+	other := &user.DefaultInfo{Name: "system:serviceaccount:hunt-p6-chat:blip-agent"}
+
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		op    admission.Operation
+		obj   map[string]any
+		old   map[string]any
+		allow bool
+		msg   string
+	}{
+		{"blipchat writes thread status", blipchat, admission.Update, status("ok"), status(nil), true, ""},
+		{"blipchat updates thread status again", blipchat, admission.Update, status("done"), status("ok"), true, ""},
+		{"producer cannot set thread status", other, admission.Update, status("pwned"), status(nil), false, "only blipchat"},
+		{"producer cannot change thread status", other, admission.Update, status("pwned"), status("ok"), false, "only blipchat"},
+		{"plain administrator cannot change thread status", &user.DefaultInfo{Name: "alice"}, admission.Update, status("pwned"), status("ok"), false, "only blipchat"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{user: tc.user, op: tc.op, resource: "blipthreads/status", name: "proj", object: tc.obj, oldObject: tc.old}
 			allow, msg := req.evaluate(t, v, nil)
 			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
 				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)

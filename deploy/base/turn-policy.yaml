@@ -117,6 +117,39 @@ spec:
   policyName: blip-turn-status
   validationActions: [Deny]
 ---
+# A thread's status is the coordinator's summary of its work and orders turns
+# (lastSeq). Only the coordinator in blipchat writes it; allowing any other
+# holder of blipthreads/status to write could hide tasks, reset paused state,
+# or reorder the thread. This mirrors blip-turn-status as defense in depth
+# behind RBAC, and also stops an administrator with a broad token from
+# accidentally forging thread status.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-thread-status
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: ["*"]
+        resources: [blipthreads/status]
+        operations: [UPDATE]
+  validations:
+    - expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:blip-system:blipchat'
+      message: only blipchat may write thread status
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-thread-status
+spec:
+  policyName: blip-thread-status
+  validationActions: [Deny]
+---
 # Pod-bound producers may only author turns for their own project. The
 # controller maintains thread.<name>: <owner> in blip-vm-owners; the caller's
 # pod entry must carry the same owner. blipchat and unrestricted VMs are not
