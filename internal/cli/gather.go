@@ -53,7 +53,8 @@ collected, and a warning is printed when a worktree has them. Two operations
 that expand to the same destination are rejected instead of overwriting each
 other; {name} keeps each blip's destination distinct.
 --collect only works inside a blip, because it copies into the caller's
-workspace; use --keep and collect with kubectl elsewhere.
+workspace. Outside a blip, gather with --keep to keep the blip and its
+workspace for later inspection.
 
 A blip whose command failed, or whose results could not be collected, is kept
 for inspection; its TTL (1h for forks by default) still deletes it. Successful
@@ -104,7 +105,7 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 	// list or delete that owner's blips.
 	selector = a.ownerSelector(selector)
 	if len(f.collect) > 0 && a.self == nil {
-		return errors.New("--collect copies into the workspace of the blip this command runs in, so it only works inside one; gather with --keep and collect with kubectl elsewhere")
+		return errors.New("--collect copies into the workspace of the blip this command runs in, so it only works inside one; gather with --keep to keep the blip and its workspace")
 	}
 	targets, err := a.gatherTargets(ctx, c, names, selector)
 	if err != nil {

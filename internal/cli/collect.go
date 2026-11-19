@@ -50,7 +50,7 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 		return errors.New("collect only works inside a blip")
 	}
 	if name == a.self.Name {
-		return fmt.Errorf("cannot collect from %s, the blip running this collect; use a fork (blip run --fork)", a.short(name))
+		return fmt.Errorf("cannot collect from %s, the blip running this collect; start a fork with blip run --from / and collect from that", a.short(name))
 	}
 	b, err := a.getBlip(ctx, name)
 	if err != nil {

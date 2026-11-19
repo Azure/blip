@@ -77,7 +77,7 @@ they finish, so an abandoned fork cannot leak its workspace.`,
 		},
 	}
 	fl := cmd.Flags()
-	fl.StringVar(&f.name, "name", "", "blip name (default <caller>-<random>)")
+	fl.StringVar(&f.name, "name", "", "blip name (default <caller>-<random> inside a blip, run-<random> otherwise)")
 	fl.StringVar(&f.from, "from", "", "copy workspace SRC into a new one (inside a blip, / is the caller's root)")
 	fl.StringVar(&f.state, "state", "", "run in existing workspace WS")
 	fl.StringVar(&f.pool, "pool", "", "VM pool (default \"default\"; inside a blip, the caller's pool)")
