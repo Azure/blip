@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
@@ -163,7 +164,8 @@ func randSuffix(n int) string {
 	return string(b)
 }
 
-// labelFlags applies user labels, refusing the reserved blip.dev namespace.
+// labelFlags applies user labels, refusing the reserved blip.dev namespace
+// and validating keys and values before the Blip reaches the API server.
 func labelFlags(b *v1alpha1.Blip, values []string) error {
 	for _, value := range values {
 		k, v, ok := strings.Cut(value, "=")
@@ -172,6 +174,12 @@ func labelFlags(b *v1alpha1.Blip, values []string) error {
 		}
 		if strings.HasPrefix(k, "blip.dev/") {
 			return fmt.Errorf("invalid --label %q: the blip.dev/ prefix is reserved", k)
+		}
+		if problems := validation.IsQualifiedName(k); len(problems) > 0 {
+			return fmt.Errorf("invalid --label %q: %s", k, strings.Join(problems, "; "))
+		}
+		if problems := validation.IsValidLabelValue(v); len(problems) > 0 {
+			return fmt.Errorf("invalid --label %q: invalid value: %s", k, strings.Join(problems, "; "))
 		}
 		if b.Labels == nil {
 			b.Labels = map[string]string{}

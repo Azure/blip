@@ -441,6 +441,44 @@ func TestRunLabelsAndNameCollision(t *testing.T) {
 	}
 }
 
+// --label keys and values are preflighted so an invalid label reports a short
+// CLI error instead of the API server's raw metadata.labels message. Nothing
+// may be created for a rejected request.
+func TestRunRejectsInvalidLabels(t *testing.T) {
+	cases := []struct {
+		name  string
+		label string
+		want  string
+	}{
+		{"key", "bad key=x", "name part"},
+		{"long value", "team=" + strings.Repeat("v", 64), "must be no more than 63 characters"},
+		{"value", "team=bad value", "a valid label must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("base"))
+			var creates int
+			h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				creates++
+				return c.Create(ctx, obj, opts...)
+			}})
+			code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--label", tc.label, "--", "true")
+			if code != 1 || !strings.Contains(errOut, "invalid --label") || !strings.Contains(errOut, tc.want) {
+				t.Fatalf("label %q: code %d stderr %q; want %q", tc.label, code, errOut, tc.want)
+			}
+			if strings.Contains(errOut, "metadata.labels") || strings.Contains(errOut, "Blip.blip.dev") {
+				t.Fatalf("label %q leaked the API error: %q", tc.label, errOut)
+			}
+			if creates != 0 {
+				t.Fatalf("%d Create calls despite the invalid label", creates)
+			}
+			if !h.gone("worker") {
+				t.Fatal("invalid label created a blip")
+			}
+		})
+	}
+}
+
 func TestRunSurfacesForkStateFailure(t *testing.T) {
 	h := newHarness(t, readyState("base"))
 	h.ctrl.set(func(c *fakeController) { c.stateFail = "no space left" })
