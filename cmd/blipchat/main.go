@@ -37,6 +37,7 @@ func main() {
 	var agentCommand string
 	var heartbeat, debounce string
 	flag.StringVar(&cfg.Listen, "listen", ":8080", "chat HTTP listen address")
+	flag.StringVar(&cfg.HealthListen, "health-listen", ":8081", "health probe HTTP listen address")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
 	flag.StringVar(&cfg.BaseURL, "llm-base-url", "", "OpenAI-compatible API root, for example https://llm.example/v1")
 	flag.StringVar(&cfg.APIKey, "llm-api-key", os.Getenv("BLIP_LLM_API_KEY"), "optional API key for the LLM endpoint")
@@ -85,8 +86,10 @@ func run(cfg blipchat.Config, leaderElect bool) error {
 		LeaderElection:                leaderElect,
 		LeaderElectionID:              "blipchat.blip.dev",
 		LeaderElectionReleaseOnCancel: true,
-		HealthProbeBindAddress:        "0",
-		Metrics:                       metricsserver.Options{BindAddress: "0"},
+		// blipchat serves its own probe server on --health-listen with the
+		// manager's pre-cache runnable group, so the built-in one is unused.
+		HealthProbeBindAddress: "0",
+		Metrics:                metricsserver.Options{BindAddress: "0"},
 	})
 	if err != nil {
 		return err

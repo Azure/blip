@@ -98,14 +98,19 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            - name: health
+              containerPort: 8081
+          # Probes use the pre-cache health server: liveness answers during a
+          # slow initial informer sync, and readiness stays 503 until the
+          # cache is synced and the chat server can start.
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 8080
+              port: 8081
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8080
+              port: 8081
           resources:
             requests:
               cpu: 50m

@@ -33,6 +33,10 @@ type Config struct {
 	MaxToolCalls int
 	// Listen is the chat HTTP listen address.
 	Listen string
+	// HealthListen is the health probe listen address. It is separate from
+	// Listen so liveness can answer while the informer cache syncs, before the
+	// chat server (which needs the cache) starts.
+	HealthListen string
 	// HTTPClient is used for LLM requests. Its Timeout bounds one call; a
 	// chat round is further bounded by ChatRoundTimeout and the whole chat
 	// request by ChatTimeout.
@@ -72,6 +76,9 @@ func (c *Config) defaults() {
 	}
 	if c.Listen == "" {
 		c.Listen = ":8080"
+	}
+	if c.HealthListen == "" {
+		c.HealthListen = ":8081"
 	}
 	if c.HTTPClient == nil {
 		c.HTTPClient = &http.Client{Timeout: 5 * time.Minute}

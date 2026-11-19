@@ -7,7 +7,9 @@ import (
 	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -38,7 +40,24 @@ func Setup(ctx context.Context, mgr ctrl.Manager, cfg Config) error {
 	if err := mgr.Add(&stepsRunnable{s: s}); err != nil {
 		return err
 	}
+	if err := s.addHealthServer(mgr); err != nil {
+		return err
+	}
 	return mgr.Add(&httpRunnable{s: s})
+}
+
+// addHealthServer registers the probe-only server. manager.Server is started
+// by controller-runtime's HTTPServers group before it waits for the informer
+// cache, so liveness answers during a slow or failed initial sync. The chat
+// server stays in the post-cache Others group and remains unavailable until
+// its dependencies (including the cache) are ready.
+func (s *Server) addHealthServer(mgr ctrl.Manager) error {
+	shutdown := healthShutdownTimeout
+	return mgr.Add(&manager.Server{
+		Name:            "health",
+		Server:          newHealthServer(s.Config.HealthListen, s.healthHandler()),
+		ShutdownTimeout: &shutdown,
+	})
 }
 
 // stepsRunnable runs coordinator steps only on the elected leader.
@@ -64,11 +83,14 @@ func (r *httpRunnable) NeedLeaderElection() bool { return false }
 // tool call committed a turn. It is also the LLM client's per-call timeout so
 // one slow completion is not cut off by the transport.
 const (
-	readHeaderTimeout = 10 * time.Second
-	readTimeout       = 30 * time.Second
-	writeTimeout      = 5 * time.Minute
-	idleTimeout       = 60 * time.Second
-	maxHeaderBytes    = 16 << 10
+	readHeaderTimeout       = 10 * time.Second
+	readTimeout             = 30 * time.Second
+	writeTimeout            = 5 * time.Minute
+	idleTimeout             = 60 * time.Second
+	maxHeaderBytes          = 16 << 10
+	healthShutdownTimeout   = 10 * time.Second
+	healthWriteTimeout      = 10 * time.Second
+	healthReadHeaderTimeout = 5 * time.Second
 )
 
 func newChatServer(addr string, handler http.Handler) *http.Server {
@@ -83,17 +105,36 @@ func newChatServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
+func newHealthServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: healthReadHeaderTimeout,
+		ReadTimeout:       healthReadHeaderTimeout,
+		WriteTimeout:      healthWriteTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
+}
+
 func (r *httpRunnable) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
-	mux.HandleFunc("/readyz", r.readyz)
+	mux.HandleFunc("/readyz", readyz(r.s.Cache))
 	mux.Handle("/chat", &Chat{Server: r.s})
 	return mux
 }
 
+func (s *Server) healthHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("/readyz", readyz(s.Cache))
+	return mux
+}
+
 // healthz is liveness only: the process can answer HTTP. Readiness is
-// separate so a wedged informer cache removes the pod from the Service
-// without triggering a restart loop.
+// separate so an informer cache that is still syncing keeps the pod out of
+// the Service instead of triggering a restart loop.
 func healthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -104,22 +145,24 @@ func healthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-func (r *httpRunnable) readyz(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodGet && req.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if r.s.Cache != nil {
-		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
-		defer cancel()
-		if !r.s.Cache.WaitForCacheSync(ctx) {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
+func readyz(c cache.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet && req.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if c != nil {
+			ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
+			defer cancel()
+			if !c.WaitForCacheSync(ctx) {
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
 }
 
 func (r *httpRunnable) Start(ctx context.Context) error {
