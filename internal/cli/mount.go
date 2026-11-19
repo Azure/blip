@@ -187,10 +187,10 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 				oldAttachment = u.PreviousAttachment
 			}
 		} else {
-			for _, other := range s.Spec.Mounts {
-				if other.Path == mountPath {
-					return "", fmt.Errorf("root state %q already has state %q mounted at %s", root, other.State, mountPath)
-				}
+			// Re-check against the latest root: the CLI preflight can race
+			// with another writer, and direct callers skip it.
+			if err := mountPathConflict(root, s.Spec.Mounts, state, mountPath); err != nil {
+				return "", err
 			}
 			writer, err := a.rootWriter(ctx, s)
 			if err != nil {
@@ -502,6 +502,15 @@ type mountFlags struct {
 	replicas int32
 }
 
+// newMount is a scoped --new request, parsed before any state exists so the
+// whole command can be validated first.
+type newMount struct {
+	spec     string
+	name     string
+	path     string
+	writable bool
+}
+
 func (a *app) mountCommand() *cobra.Command {
 	f := &mountFlags{}
 	cmd := &cobra.Command{
@@ -570,21 +579,55 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	if len(args) == 0 && len(f.remove) == 0 && len(f.create) == 0 {
 		return a.listMounts(ctx, f.root)
 	}
-	for _, spec := range f.create {
-		if err := a.newMountedState(ctx, spec, f, replicasSet); err != nil {
-			return err
-		}
+	news, err := a.prepareNewMounts(f, replicasSet)
+	if err != nil {
+		return err
 	}
+	requests := make([]mountRequest, 0, len(news)+len(args))
+	created := map[string]bool{}
+	for _, n := range news {
+		requests = append(requests, mountRequest{state: n.name, path: n.path, writable: n.writable})
+		created[n.name] = true
+	}
+	type addition struct {
+		state    string
+		path     string
+		writable *bool
+	}
+	adds := make([]addition, 0, len(args))
 	for _, arg := range args {
 		state, mountPath, writable, err := parseMountSpec(arg)
 		if err != nil {
 			return err
 		}
-		source, err := a.resolveState(ctx, state)
+		name, err := a.mountSource(ctx, state, created)
 		if err != nil {
 			return err
 		}
-		if err := a.mountState(ctx, source.Name, f.root, mountPath, writable); err != nil {
+		want := false
+		if writable != nil {
+			want = *writable
+		}
+		requests = append(requests, mountRequest{state: name, path: mountPath, writable: want})
+		adds = append(adds, addition{state: name, path: mountPath, writable: writable})
+	}
+	// Validate the complete topology before creating states or editing the
+	// root, so a rejected command leaves neither a partial mount set nor an
+	// orphan state behind.
+	root, err := a.getState(ctx, f.root)
+	if err != nil {
+		return err
+	}
+	if err := validateMountPlan(root, requests); err != nil {
+		return err
+	}
+	for _, n := range news {
+		if err := a.newMountedState(ctx, n.spec, f, replicasSet); err != nil {
+			return err
+		}
+	}
+	for _, add := range adds {
+		if err := a.mountState(ctx, add.state, f.root, add.path, add.writable); err != nil {
 			return err
 		}
 	}
@@ -594,6 +637,44 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 		}
 	}
 	return nil
+}
+
+// prepareNewMounts parses and scopes every --new request before any state is
+// created. newMountedState validates each one again against the current root.
+func (a *app) prepareNewMounts(f *mountFlags, replicasSet bool) ([]newMount, error) {
+	if replicasSet && (f.replicas < 1 || f.replicas > 3) {
+		return nil, errors.New("--replicas must be between 1 and 3")
+	}
+	news := make([]newMount, 0, len(f.create))
+	for _, spec := range f.create {
+		name, mountPath, mode, err := parseMountSpec(spec)
+		if err != nil {
+			return nil, err
+		}
+		writable := true
+		if mode != nil {
+			writable = *mode
+		}
+		if err := a.scope(&name); err != nil {
+			return nil, err
+		}
+		news = append(news, newMount{spec: spec, name: name, path: mountPath, writable: writable})
+	}
+	return news, nil
+}
+
+// mountSource resolves an existing state named by a mount argument. A state
+// created earlier in the same command has no object yet, so its planned name is
+// accepted instead.
+func (a *app) mountSource(ctx context.Context, name string, created map[string]bool) (string, error) {
+	if full := a.full(name); created[full] {
+		return full, nil
+	}
+	src, err := a.resolveState(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	return src.Name, nil
 }
 
 // newMountedState creates a state and mounts it on the root. An empty state

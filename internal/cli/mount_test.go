@@ -646,6 +646,60 @@ func TestMountNewDoesNotLeakStateWhenRootMissing(t *testing.T) {
 	}
 }
 
+// TestMountRejectsOverlappingPaths checks the CLI preflight for the topology
+// the controller rejects with InvalidSpec: duplicate and nested mount paths.
+func TestMountRejectsOverlappingPaths(t *testing.T) {
+	t.Run("new nested under existing", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "m2", Path: "/data"}}
+		h := newHarness(t, root, readyState("m2"))
+		code, _, errOut := h.run("", "mount", "--new", "nest2:/data/sub:rw", "--size", "256Mi", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `mount nest2: path /data/sub overlaps mount m2 at /data`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if !stateNotFound(t, h, "nest2") {
+			t.Fatal("rejected --new left state nest2 behind")
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].Path != "/data" {
+			t.Fatalf("mounts changed: %+v", mounts)
+		}
+	})
+	t.Run("existing nested under new", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "m2", Path: "/data/sub"}}
+		h := newHarness(t, root, readyState("m2"), readyState("nest2"))
+		code, _, errOut := h.run("", "mount", "nest2:/data", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `mount nest2: path /data overlaps mount m2 at /data/sub`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].State != "m2" {
+			t.Fatalf("mounts changed: %+v", mounts)
+		}
+	})
+	t.Run("add nested under existing", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "m2", Path: "/data"}}
+		h := newHarness(t, root, readyState("m2"), readyState("nest2"))
+		code, _, errOut := h.run("", "mount", "nest2:/data/sub:rw", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, "overlaps") {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].State != "m2" {
+			t.Fatalf("mounts changed: %+v", mounts)
+		}
+	})
+	t.Run("batch validated before first write", func(t *testing.T) {
+		h := newHarness(t, readyState("home"), readyState("a"), readyState("b"))
+		code, _, errOut := h.run("", "mount", "a:/data", "b:/data/sub", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, "overlaps") {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("partially applied batch: %+v", mounts)
+		}
+	})
+}
+
 func TestMountNewSurfacesStateFailure(t *testing.T) {
 	h := newHarness(t, readyState("home"))
 	h.ctrl.set(func(c *fakeController) { c.stateFail = "no space left" })
