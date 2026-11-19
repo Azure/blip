@@ -161,16 +161,18 @@ type proc struct {
 // workdirInRoot returns dir as an absolute path inside the workload root.
 // os.StartProcess resolves ProcAttr.Dir relative to the guest init's cwd,
 // which is outside the root after chroot, so a relative workdir has to be
-// anchored at the root first. path.Clean clamps ".." at "/", so a workdir can
-// never escape the root.
+// anchored at the root first. The path is deliberately not cleaned: chdir(2)
+// follows symlinks before resolving "..", so cleaning "/tmp/link/../other"
+// lexically would enter a different directory than the caller asked for. ".."
+// still cannot escape the root because the process's root is the chroot.
 func workdirInRoot(dir string) string {
 	if dir == "" {
 		return "/"
 	}
 	if !path.IsAbs(dir) {
-		dir = "/" + dir
+		return "/" + dir
 	}
-	return path.Clean(dir)
+	return dir
 }
 
 // checkDirAccess verifies that the target account can search every component

@@ -59,19 +59,60 @@ func TestWorkdirInRoot(t *testing.T) {
 		{"", "/"},
 		{"/", "/"},
 		{"/tmp", "/tmp"},
-		{"/tmp/", "/tmp"},
-		{"/tmp/../etc", "/etc"},
+		// Paths are not cleaned: the kernel resolves ".." after following
+		// symlinks, which is not the same as collapsing the string.
+		{"/tmp/", "/tmp/"},
+		{"/tmp/../etc", "/tmp/../etc"},
+		{"/tmp/link/../other", "/tmp/link/../other"},
+		// A relative workdir is anchored at the root; ".." is clamped there
+		// by the chroot, not by the string.
 		{"tmp", "/tmp"},
-		{"tmp/", "/tmp"},
-		{"./tmp", "/tmp"},
-		{"a/../tmp", "/tmp"},
-		{"../etc", "/etc"},
-		{"../../../etc", "/etc"},
-		{"..", "/"},
+		{"tmp/", "/tmp/"},
+		{"./tmp", "/./tmp"},
+		{"a/../tmp", "/a/../tmp"},
+		{"../etc", "/../etc"},
+		{"../../../etc", "/../../../etc"},
+		{"..", "/.."},
 	} {
 		if got := workdirInRoot(tc.dir); got != tc.want {
 			t.Errorf("workdirInRoot(%q) = %q, want %q", tc.dir, got, tc.want)
 		}
+	}
+}
+
+// ".." after a symlink must be resolved by the kernel. Lexical cleaning sent
+// /tmp/devlink/../other to /tmp/other instead of the symlink target's parent.
+func TestWorkdirResolvesDotDotAfterSymlink(t *testing.T) {
+	root := testRoot(t)
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"home/dev", "home/other", "tmp"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("/home/dev", filepath.Join(root, "tmp/devlink")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveInRoot(root, "/tmp/devlink/../other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/home/other" {
+		t.Fatalf("resolved workdir = %q, want /home/other", got)
+	}
+
+	// Starting must accept the kernel-resolved directory even though it does
+	// not exist when the path is collapsed lexically.
+	g := testGuest(t)
+	g.root = root
+	_, _, err = g.startProc(procSpec{argv: []string{"/bin/sh"}, dir: "/tmp/devlink/../other"}, nil)
+	if err == nil {
+		t.Fatal("starting a missing executable succeeded")
+	}
+	if strings.Contains(err.Error(), "chdir") {
+		t.Fatalf("kernel-faithful workdir was rejected: %v", err)
 	}
 }
 
