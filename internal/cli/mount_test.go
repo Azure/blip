@@ -1740,6 +1740,120 @@ func TestMountGuestRejectedPathRollsBack(t *testing.T) {
 	}
 }
 
+// TestMountPointRejectedClassifiesTerminalGuestErrors covers every fixed
+// message class that means the guest can never create the mount point, and
+// checks that transient attach and save failures are not mistaken for one.
+func TestMountPointRejectedClassifiesTerminalGuestErrors(t *testing.T) {
+	for _, msg := range []string{
+		"/usr/bin/env is a symlink or not a directory",
+		"/home/dev/proc-link/x is a symlink",
+		"mkdir /home/dev/proc-link/x: not a directory",
+		"mount path /home/dev/blip-link/x resolves to /run/blip/x, which the guest reserves",
+		"mount path /bad overlaps /run/blip",
+		"mount path /bad resolves to /",
+	} {
+		if !mountPointRejected(msg) {
+			t.Errorf("terminal guest error not classified as rejected: %q", msg)
+		}
+	}
+	for _, msg := range []string{
+		"save failed: no space left on device",
+		"save of state data failed: device or resource busy",
+		"switch failed: timed out",
+		"attach failed: no space left on device",
+		"processes are still using /data",
+	} {
+		if mountPointRejected(msg) {
+			t.Errorf("transient failure classified as a rejected mount point: %q", msg)
+		}
+	}
+}
+
+// TestMountTerminalGuestRejectionsRollBack covers the three rollback paths for
+// every permanent guest rejection: a live add, a --new state, and a move. The
+// same-state move is covered by TestMountRemoveThenRejectedAddRestoresMount.
+func TestMountTerminalGuestRejectionsRollBack(t *testing.T) {
+	for _, tc := range []struct{ name, msg string }{
+		{"symlink", "/usr/bin/env is a symlink or not a directory"},
+		{"not directory", "mkdir /home/dev/proc-link/x: not a directory"},
+		{"guest reserves", "mount path /home/dev/blip-link/x resolves to /run/blip/x, which the guest reserves"},
+		{"overlap", "mount path /bad overlaps /run/blip"},
+		{"mount path", "mount path /bad resolves to /"},
+	} {
+		t.Run(tc.name+"/add", func(t *testing.T) {
+			b := runningBlip("agent")
+			root := readyState(b.Spec.State)
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "keep", Path: "/keep"}}
+			h := newHarness(t, b, root, readyState("keep"), readyState("data"))
+			h.ctrl.set(func(c *fakeController) { c.mountFail = tc.msg })
+
+			code, _, errOut := h.run("", "mount", "data:/bad", "--root", root.Name)
+			if code != 1 || !strings.Contains(errOut, tc.msg) || !strings.Contains(errOut, "desired mount was removed") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if strings.Contains(errOut, "remains applied") {
+				t.Fatalf("rollback message contradicts itself: %s", errOut)
+			}
+			mounts := h.state(root.Name).Spec.Mounts
+			if len(mounts) != 1 || mounts[0].State != "keep" || mounts[0].Path != "/keep" {
+				t.Fatalf("rejected add left desired intent: %+v", mounts)
+			}
+		})
+
+		t.Run(tc.name+"/new", func(t *testing.T) {
+			b := runningBlip("agent")
+			root := readyState(b.Spec.State)
+			h := newHarness(t, b, root)
+			h.ctrl.set(func(c *fakeController) { c.mountFail = tc.msg })
+
+			code, _, errOut := h.run("", "mount", "--new", "leak:/bad:rw", "--root", root.Name)
+			if code != 1 || !strings.Contains(errOut, tc.msg) || !strings.Contains(errOut, "desired mount was removed") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if !stateNotFound(t, h, "leak") {
+				t.Fatal("rejected --new left state leak behind")
+			}
+			if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected --new left desired intent: %+v", mounts)
+			}
+		})
+
+		t.Run(tc.name+"/move", func(t *testing.T) {
+			b := runningBlip("agent")
+			root := readyState(b.Spec.State)
+			root.Spec.Mounts = []v1alpha1.Mount{
+				{State: "data", Path: "/data"},
+				{State: "keep", Path: "/keep"},
+			}
+			b.Status.Mounts = []v1alpha1.MountStatus{
+				{State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "data-attachment"},
+				{State: "keep", Path: "/keep", Phase: v1alpha1.MountMounted, AttachmentID: "keep-attachment"},
+			}
+			h := newHarness(t, b, root, readyState("data"), readyState("keep"))
+			h.ctrl.set(func(c *fakeController) { c.mountFail = tc.msg })
+
+			code, _, errOut := h.run("", "mount", "data:/bad", "--rm", "keep", "--root", root.Name)
+			if code != 1 || !strings.Contains(errOut, tc.msg) {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if strings.Contains(errOut, "desired mount remains applied") {
+				t.Fatalf("rejected move claims the mount remains applied: %s", errOut)
+			}
+			mustContain(t, errOut, "previous mount", "/data", "was restored")
+			mounts := h.state(root.Name).Spec.Mounts
+			if len(mounts) != 2 {
+				t.Fatalf("rejected move lost mounts: %+v", mounts)
+			}
+			if m := findSpecMount(mounts, "data"); m == nil || m.Path != "/data" {
+				t.Fatalf("rejected move did not restore /data: %+v", mounts)
+			}
+			if m := findSpecMount(mounts, "keep"); m == nil || m.Path != "/keep" {
+				t.Fatalf("removed mount was not restored: %+v", mounts)
+			}
+		})
+	}
+}
+
 // TestMountMoveRejectedRestoresPreviousPath reproduces a move whose new path
 // the guest rejects. The old path must be restored, or every later execution
 // of the root fails at the rejected path.
@@ -1784,28 +1898,37 @@ func TestMountMoveRejectedRestoresPreviousPath(t *testing.T) {
 // has already been applied, so the original mount must be restored instead of
 // silently lost.
 func TestMountRemoveThenRejectedAddRestoresMount(t *testing.T) {
-	const guestErr = "/usr/bin/env is a symlink or not a directory"
-	b := runningBlip("agent")
-	root := readyState(b.Spec.State)
-	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
-	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
-	b.Status.Mounts = []v1alpha1.MountStatus{{
-		State: "data", Path: "/data", Writable: true, Phase: v1alpha1.MountMounted, AttachmentID: "data-attachment",
-	}}
-	h := newHarness(t, b, root, readyState("data"))
-	h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
+	for _, tc := range []struct{ name, msg string }{
+		{"symlink", "/usr/bin/env is a symlink or not a directory"},
+		{"not directory", "mkdir /home/dev/proc-link/x: not a directory"},
+		{"guest reserves", "mount path /home/dev/blip-link/x resolves to /run/blip/x, which the guest reserves"},
+		{"overlap", "mount path /bad overlaps /run/blip"},
+		{"mount path", "mount path /bad resolves to /"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBlip("agent")
+			root := readyState(b.Spec.State)
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+			b.Status.Mounts = []v1alpha1.MountStatus{{
+				State: "data", Path: "/data", Writable: true, Phase: v1alpha1.MountMounted, AttachmentID: "data-attachment",
+			}}
+			h := newHarness(t, b, root, readyState("data"))
+			h.ctrl.set(func(c *fakeController) { c.mountFail = tc.msg })
 
-	code, _, errOut := h.run("", "mount", "--rm", "data", "data:/usr/bin/env/x", "--root", root.Name)
-	if code != 1 || !strings.Contains(errOut, guestErr) {
-		t.Fatalf("code %d: %s", code, errOut)
-	}
-	if strings.Contains(errOut, "desired mount remains applied") {
-		t.Fatalf("rejected add claims the mount remains applied: %s", errOut)
-	}
-	mustContain(t, errOut, "were restored")
-	mounts := h.state(root.Name).Spec.Mounts
-	if len(mounts) != 1 || mounts[0] != (v1alpha1.Mount{State: "data", Path: "/data", Writable: true}) {
-		t.Fatalf("original mount was lost: %+v", mounts)
+			code, _, errOut := h.run("", "mount", "--rm", "data", "data:/bad", "--root", root.Name)
+			if code != 1 || !strings.Contains(errOut, tc.msg) {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if strings.Contains(errOut, "desired mount remains applied") {
+				t.Fatalf("rejected add claims the mount remains applied: %s", errOut)
+			}
+			mustContain(t, errOut, "were restored")
+			mounts := h.state(root.Name).Spec.Mounts
+			if len(mounts) != 1 || mounts[0] != (v1alpha1.Mount{State: "data", Path: "/data", Writable: true}) {
+				t.Fatalf("original mount was lost: %+v", mounts)
+			}
+		})
 	}
 }
 

@@ -487,19 +487,44 @@ func (a *app) mountSourceGone(ctx context.Context, state string) string {
 	return ""
 }
 
-// mountRejectedError marks a mount the guest refused to create, usually
-// because an ancestor of the mount point is a symlink to a file or a regular
-// file. Retrying cannot help, so mountState rolls back the desired mount it
-// added instead of leaving a root that can never start.
+// mountRejectedError marks a mount the guest or controller refused for a
+// permanent reason, such as an ancestor of the mount point being a symlink to
+// a file, a regular file, or a reserved guest path. Retrying cannot help, so
+// mountState rolls back the desired mount it added instead of leaving a root
+// that can never start.
 type mountRejectedError struct{ msg string }
 
 func (e *mountRejectedError) Error() string { return e.msg }
 
-// mountPointRejected reports the guest's fixed error for a mount point it
-// cannot create. Only this class is rolled back: a transient attach failure
-// (no space, device gone) may still be worth keeping as desired intent.
+// mountPointRejected reports a fixed guest error for a mount point it cannot
+// create. These are terminal: the guest's own path and target checks produced
+// them, so retrying with the same durable root cannot succeed. Attach and save
+// failures (no space, device errors, busy mounts, transport timeouts) may still
+// be worth keeping as desired intent, so they are excluded first.
 func mountPointRejected(msg string) bool {
-	return strings.Contains(msg, "is a symlink or not a directory")
+	for _, prefix := range []string{"save failed:", "save of state ", "switch failed:"} {
+		if strings.HasPrefix(msg, prefix) {
+			return false
+		}
+	}
+	for _, transient := range []string{
+		"processes are still using", "no space", "input/output", "i/o",
+		"device or resource busy", "deadline", "timed out", "timeout",
+		"connection", "transport",
+	} {
+		if strings.Contains(msg, transient) {
+			return false
+		}
+	}
+	for _, permanent := range []string{
+		"is a symlink", "not a directory", "guest reserves", "overlaps",
+		"mount path",
+	} {
+		if strings.Contains(msg, permanent) {
+			return true
+		}
+	}
+	return false
 }
 
 // mountBusy reports the part of a top-level Blip status message that says the
