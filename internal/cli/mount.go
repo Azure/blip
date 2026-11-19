@@ -235,6 +235,15 @@ func (a *app) mountState(ctx context.Context, state, root, mountPath string, tar
 		generation = source.Status.Committed.Generation
 	}
 	if err := a.waitMount(ctx, b, state, mountPath, want, generation, oldAttachment); err != nil {
+		var refused *mountRefused
+		if errors.As(err, &refused) {
+			// The controller declined the mode change and will keep the
+			// mount as it is. Do not leave desired intent claiming a mode
+			// that can never converge.
+			if rerr := a.restoreMountMode(ctx, root, state, mountPath, want, refused.writable); rerr != nil {
+				fmt.Fprintf(a.env.Err, "warning: could not restore desired mode of state %s: %v\n", a.short(state), rerr)
+			}
+		}
 		return err
 	}
 	fmt.Fprintf(a.env.Out, "state %s mounted on blip %s at %s (%s)\n", a.short(state), a.short(b.Name), mountPath, modeName(want))
@@ -308,6 +317,33 @@ func mountBusy(msg, state string) string {
 	return ""
 }
 
+// mountRefused reports that the controller declined to change an existing
+// mount's mode. The mount keeps its current mode, so the caller restores
+// desired intent to match it.
+type mountRefused struct {
+	msg      string
+	writable bool
+}
+
+func (e *mountRefused) Error() string { return e.msg }
+
+// restoreMountMode reverts a refused mode change when desired intent still
+// matches what this command wrote; a concurrent edit wins.
+func (a *app) restoreMountMode(ctx context.Context, root, state, mountPath string, want, actual bool) error {
+	_, err := a.updateState(ctx, root, func(s *v1alpha1.BlipState) error {
+		m := findSpecMount(s.Spec.Mounts, state)
+		if m == nil || m.Path != mountPath || m.Writable != want || m.BlipUID != "" {
+			return errUnchanged
+		}
+		m.Writable = actual
+		return nil
+	})
+	if errors.Is(err, errUnchanged) {
+		return nil
+	}
+	return err
+}
+
 // waitMount observes the runtime attachment without editing desired intent.
 // oldAttachment identifies a previous mount that was still visible when the
 // desired mount was re-added, and must not be accepted as the new attachment.
@@ -353,6 +389,17 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 				return false, fmt.Errorf("could not switch state %q on blip %q: processes are still using %s; desired mount remains applied", state, b.Name, mountPath)
 			}
 			return false, fmt.Errorf("mount of state %q on blip %q failed: %s; desired mount remains applied", state, b.Name, m.Message)
+		}
+		if m.Phase == v1alpha1.MountMounted && !m.Switching && m.Writable != want && m.Message != "" &&
+			!strings.HasPrefix(m.Message, "waiting to switch to writable") {
+			// preparePromote refusals are reported on the still-mounted
+			// entry with Switching=false: the old mount stays up and no
+			// switch will start. Treat that as final instead of waiting
+			// for a mode change that can never happen.
+			return false, &mountRefused{
+				msg:      fmt.Sprintf("mount of state %q on blip %q failed: %s; desired mount restored", state, b.Name, m.Message),
+				writable: m.Writable,
+			}
 		}
 		if m.Phase == v1alpha1.MountMounted && !m.Switching && m.Writable == want {
 			// Read-only mounts get a fresh ID; writable mounts can reuse their

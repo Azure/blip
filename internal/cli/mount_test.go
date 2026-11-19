@@ -371,6 +371,90 @@ func TestMountWritableUnrelatedMessageKeepsWaiting(t *testing.T) {
 	}
 }
 
+// TestMountPromotionRefusalFailsFast reproduces a promotion the controller
+// refuses: a stale read-only mount or a state whose writer is held by another
+// Blip. The refusal is reported on the still-mounted read-only entry with
+// Switching=false, so the wait must treat it as final and restore the desired
+// mode instead of polling forever for a switch that will never start.
+func TestMountPromotionRefusalFailsFast(t *testing.T) {
+	for _, tc := range []struct{ name, msg string }{
+		{"newer version", `cannot switch to writable: state "data" has a newer version; unmount and mount it again`},
+		{"writer busy", `cannot switch to writable: state "data" is in use by blip other`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBlip("writer")
+			root := readyState(b.Spec.State)
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+			b.Status.Mounts = []v1alpha1.MountStatus{{
+				State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "attachment",
+			}}
+			a := mountTestApp(t, b, root, readyState("data"))
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			writable := true
+			done := make(chan error, 1)
+			go func() { done <- a.mountState(ctx, "data", root.Name, "/data", &writable) }()
+			waitForCond(t, func() bool {
+				s, err := a.getState(ctx, root.Name)
+				return err == nil && len(s.Spec.Mounts) == 1 && s.Spec.Mounts[0].Writable
+			})
+
+			cur, err := a.getBlip(ctx, b.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cur.Status.Mounts = []v1alpha1.MountStatus{{
+				State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "attachment", Message: tc.msg,
+			}}
+			if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "cannot switch to writable") {
+					t.Fatalf("refused promotion returned %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("refused promotion kept waiting")
+			}
+			s, err := a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].Writable {
+				t.Fatalf("desired mode not restored: %+v", s.Spec.Mounts)
+			}
+		})
+	}
+}
+
+// TestWaitMountKeepsWaitingForTransientPromotionMessage makes sure the retrying
+// "waiting to switch" message is not mistaken for a final refusal.
+func TestWaitMountKeepsWaitingForTransientPromotionMessage(t *testing.T) {
+	b := runningBlip("writer")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "attachment",
+		Message: `waiting to switch to writable: state "data" is saving a new version`,
+	}}
+	a := mountTestApp(t, b, root)
+	a.env.ProgressDelay = 0
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.waitMount(ctx, b, "data", "/data", true, 0, "") }()
+	select {
+	case err := <-done:
+		t.Fatalf("transient promotion message treated as final: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // TestWaitMountIgnoresRevivedAttachment reproduces the back-to-back collect
 // race: the pre-add status is Unmounting with the old attachment, and the
 // controller revives that same attachment to Mounted after the spec returns.
