@@ -127,6 +127,45 @@ func TestOpenOversizedRequestIsTooLarge(t *testing.T) {
 	}
 }
 
+// Invalid UTF-8 would be silently rewritten to U+FFFD by encoding/json. The
+// client rejects it before connecting so a command never runs with different
+// arguments or environment than the caller supplied.
+func TestOpenRejectsInvalidUTF8BeforeSending(t *testing.T) {
+	bad := string([]byte{0xff, 0xfe, 'A'})
+	for _, tc := range []struct {
+		name string
+		o    wire.Open
+		want string
+	}{
+		{"argv", wire.Open{Mode: wire.OpenExec, Argv: []string{"true", bad}}, "argv[1]"},
+		{"env", wire.Open{Mode: wire.OpenExec, Argv: []string{"true"}, Env: []string{"BAD=" + bad}}, "env[0]"},
+		{"workdir", wire.Open{Mode: wire.OpenExec, Argv: []string{"true"}, WorkingDir: "/tmp/" + bad}, "workingDir"},
+		{"user", wire.Open{Mode: wire.OpenExec, Argv: []string{"true"}, User: bad}, "user"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var request bytes.Buffer
+			connected := false
+			c := &session.Client{Connect: func(context.Context, string, string) (io.ReadWriteCloser, error) {
+				connected = true
+				return &recordingConn{request: &request, closed: new(bool)}, nil
+			}}
+			_, err := c.Open(context.Background(), "ns", "p", tc.o)
+			if !errors.Is(err, session.ErrInvalidUTF8) {
+				t.Fatalf("err = %v, want ErrInvalidUTF8", err)
+			}
+			if errors.Is(err, session.ErrUnreachable) || errors.Is(err, session.ErrRequestTooLarge) {
+				t.Fatalf("invalid UTF-8 misclassified: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "UTF-8") {
+				t.Fatalf("error does not name the field: %v", err)
+			}
+			if connected || request.Len() != 0 {
+				t.Fatalf("connected=%v wrote=%d bytes; want rejection before send", connected, request.Len())
+			}
+		})
+	}
+}
+
 // recordingConn records the request bytes and whether the client closed it.
 type recordingConn struct {
 	request *bytes.Buffer

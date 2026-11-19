@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/Azure/blip/internal/wire"
 )
@@ -22,6 +23,35 @@ var ErrUnreachable = errors.New("the VM is not reachable; it may have stopped or
 // It is a local validation error: nothing was sent, so retrying cannot help
 // and the VM cannot be at fault.
 var ErrRequestTooLarge = errors.New("request too large")
+
+// ErrInvalidUTF8 means one of an Open's user-supplied strings is not valid
+// UTF-8. JSON would silently replace the bad bytes with U+FFFD, so the client
+// rejects the request instead of running a command with different arguments,
+// environment, working directory or user than the caller asked for.
+var ErrInvalidUTF8 = errors.New("session open requires valid UTF-8")
+
+// validateOpen rejects strings that JSON cannot carry without changing them.
+// It runs before a connection is made, so a malformed request is a local
+// validation error and not a VM lifecycle failure.
+func validateOpen(o wire.Open) error {
+	for i, s := range o.Argv {
+		if !utf8.ValidString(s) {
+			return fmt.Errorf("%w: argv[%d] contains invalid UTF-8", ErrInvalidUTF8, i)
+		}
+	}
+	for i, s := range o.Env {
+		if !utf8.ValidString(s) {
+			return fmt.Errorf("%w: env[%d] contains invalid UTF-8", ErrInvalidUTF8, i)
+		}
+	}
+	if !utf8.ValidString(o.WorkingDir) {
+		return fmt.Errorf("%w: workingDir contains invalid UTF-8", ErrInvalidUTF8)
+	}
+	if !utf8.ValidString(o.User) {
+		return fmt.Errorf("%w: user contains invalid UTF-8", ErrInvalidUTF8)
+	}
+	return nil
+}
 
 // Connector opens a byte stream to the guest session port of a VM pod. The
 // stream lives until it is closed or ctx is done. Callers that must still
@@ -39,6 +69,9 @@ type Client struct {
 // attaches to a session it already started instead of running the command
 // again. An empty OpenID preserves the old behavior for existing clients.
 func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (*Session, error) {
+	if err := validateOpen(o); err != nil {
+		return nil, err
+	}
 	rwc, err := c.Connect(ctx, namespace, pod)
 	if err != nil {
 		return nil, err
