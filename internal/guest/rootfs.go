@@ -27,6 +27,9 @@ func checkMountPath(p string, existing []string) error {
 	if p == "/" {
 		return errors.New("mount path must not be /")
 	}
+	if err := mountpath.ValidateLength(p); err != nil {
+		return err
+	}
 	for _, e := range existing {
 		if overlaps(p, e) {
 			return fmt.Errorf("mount path %s overlaps %s", p, e)

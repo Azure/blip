@@ -1,6 +1,9 @@
 package mountpath
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidate(t *testing.T) {
 	for _, tc := range []struct {
@@ -49,6 +52,39 @@ func TestValidate(t *testing.T) {
 		if (err == nil) != tc.ok {
 			t.Errorf("Validate(%q) = %v, want ok=%v", tc.path, err, tc.ok)
 		}
+	}
+}
+
+// TestValidateLinuxPathLimits reproduces mounts the CLI accepted offline but
+// no Linux guest can create: a component over NAME_MAX (255 bytes) or a full
+// path at PATH_MAX (4096 bytes, including the terminating NUL).
+func TestValidateLinuxPathLimits(t *testing.T) {
+	longComponent := func(n int) string {
+		return "/" + strings.Repeat("a", n)
+	}
+	safeNested := "/" + strings.Repeat("abcdefghij/", 20) + strings.Repeat("c", 255)
+	pathAtMax := "/" + strings.Repeat(strings.Repeat("b", NameMax)+"/", 15) + strings.Repeat("b", 253) + "/c"
+	if len(pathAtMax) != PathMax {
+		t.Fatalf("test path is %d bytes, want PATH_MAX %d", len(pathAtMax), PathMax)
+	}
+	for _, tc := range []struct {
+		name string
+		path string
+		ok   bool
+	}{
+		{"name_max over by one", longComponent(NameMax + 1), false},
+		{"300 byte component", longComponent(300), false},
+		{"260 byte component", longComponent(260), false},
+		{"exact name_max component", longComponent(NameMax), true},
+		{"path at limit", pathAtMax, false},
+		{"safe long nested path", safeNested, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Validate(tc.path)
+			if (err == nil) != tc.ok {
+				t.Errorf("Validate(%d-byte path) = %v, want ok=%v", len(tc.path), err, tc.ok)
+			}
+		})
 	}
 }
 

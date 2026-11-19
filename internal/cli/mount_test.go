@@ -1390,6 +1390,55 @@ func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
 	}
 }
 
+// TestMountRejectsOverlongPaths reproduces mounts the CLI accepted offline but
+// no Linux guest can create. A component over NAME_MAX (255 bytes) or a path at
+// PATH_MAX makes the guest fail while creating the mount point; if the intent
+// is written the durable root cannot start again. Reject before creating a
+// state (--new) or writing desired intent.
+func TestMountRejectsOverlongPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"300 byte component", "/" + strings.Repeat("a", 300)},
+		{"260 byte component", "/" + strings.Repeat("b", 260)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", "mount", "data:"+tc.path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "mount path") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected mount written as desired intent: %+v", mounts)
+			}
+
+			// A rejected path must not leave a newly created state behind.
+			code, _, errOut = h.run("", "mount", "--new", "long:"+tc.path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "mount path") {
+				t.Fatalf("--new code %d: %s", code, errOut)
+			}
+			if !stateNotFound(t, h, "long") {
+				t.Fatal("rejected --new left state long behind")
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected --new left desired intent: %+v", mounts)
+			}
+		})
+	}
+
+	// Safe long nested paths stay legal.
+	h := newHarness(t, readyState("home"), readyState("data"))
+	safe := "/" + strings.Repeat("abcdefghij/", 20) + strings.Repeat("c", 255)
+	code, _, errOut := h.run("", "mount", "data:"+safe, "--root", "home")
+	if code != 0 {
+		t.Fatalf("legitimate long nested path rejected: %d %s", code, errOut)
+	}
+	if mounts := h.state("home").Spec.Mounts; len(mounts) != 1 || mounts[0].Path != safe {
+		t.Fatalf("legitimate long path not written: %+v", mounts)
+	}
+}
+
 // TestMountRejectsMailSpoolSymlink reproduces the base image's
 // /var/spool/mail -> ../mail directory symlink. Both a running root and an
 // offline root must reject the path at preflight, before creating a state or
