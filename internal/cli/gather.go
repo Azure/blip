@@ -302,6 +302,9 @@ func (a *app) gatherTargets(ctx context.Context, c *Clients, names []string, sel
 		if err := a.scope(&name); err != nil {
 			return nil, err
 		}
+		if err := a.validateName("blip", name); err != nil {
+			return nil, err
+		}
 		b, err := a.getBlip(ctx, name)
 		if err != nil {
 			return nil, err

@@ -14,7 +14,6 @@ import (
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
@@ -34,6 +33,7 @@ type runFlags struct {
 	env, labels               []string
 	timeout, ttl              time.Duration
 	timeoutSet, ttlSet        bool
+	nameSet                   bool
 	keep                      bool
 }
 
@@ -67,6 +67,7 @@ they finish, so an abandoned fork cannot leak its workspace.`,
 			}
 			f.timeoutSet = cmd.Flags().Changed("timeout")
 			f.ttlSet = cmd.Flags().Changed("ttl")
+			f.nameSet = cmd.Flags().Changed("name")
 			// A run that is interrupted before it returns must not leave a
 			// VM behind, so turn the signal into cancellation instead of
 			// letting the default handler kill the process.
@@ -205,7 +206,7 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 		return err
 	}
 	name := f.name
-	if name == "" {
+	if name == "" && !f.nameSet {
 		name = a.forkName()
 	}
 	if err := a.scope(&name); err != nil {
@@ -213,8 +214,9 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	}
 	// Blip is a Kubernetes object, so its name is a DNS subdomain of at most
 	// 253 characters. Reject an impossible name before creating a workspace.
-	if problems := validation.IsDNS1123Subdomain(name); len(problems) > 0 {
-		return fmt.Errorf("invalid blip name %q: %s", a.short(name), strings.Join(problems, "; "))
+	// An explicitly empty --name is a mistake, not a request to generate one.
+	if err := a.validateName("blip", name); err != nil {
+		return err
 	}
 	env, err := parseEnv(f.env)
 	if err != nil {

@@ -224,6 +224,42 @@ func TestExecSignalExitCode(t *testing.T) {
 	}
 }
 
+// Every command that takes an object name rejects an impossible one with the
+// same short message instead of leaking client-go or API-server validation.
+func TestInvalidNamesAreRejectedBeforeAPI(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"run", "--name", "", "--from", "base", "--", "true"}, `invalid blip name ""`},
+		{[]string{"gather", ""}, `invalid blip name ""`},
+		{[]string{"exec", "", "--", "true"}, `invalid blip name ""`},
+	} {
+		code, _, errOut := h.run("", tc.args...)
+		if code != 1 || !strings.Contains(errOut, tc.want) {
+			t.Errorf("%v: code %d stderr %q", tc.args, code, errOut)
+		}
+		for _, raw := range []string{"resource name may not be empty", "metadata.name"} {
+			if strings.Contains(errOut, raw) {
+				t.Errorf("%v leaked raw API error %q: %s", tc.args, raw, errOut)
+			}
+		}
+	}
+	var blips v1alpha1.BlipList
+	if err := h.kube.List(context.Background(), &blips, client.InNamespace(ns)); err != nil {
+		t.Fatal(err)
+	}
+	if len(blips.Items) != 0 {
+		t.Errorf("invalid names created blips: %v", blips.Items)
+	}
+
+	code, _, errOut := h.run("", "gather", "missing")
+	if code != 1 || !strings.Contains(errOut, `blip "missing" not found in namespace "ns"`) {
+		t.Fatalf("code %d stderr %q", code, errOut)
+	}
+}
+
 func TestExecOnFinishedOrMissingBlipIsFriendly(t *testing.T) {
 	b := runningBlip("agent")
 	b.Status.Phase, b.Status.Pod = v1alpha1.BlipSucceeded, ""

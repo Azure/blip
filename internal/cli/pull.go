@@ -48,7 +48,13 @@ func (a *app) pull(ctx context.Context, name, image string, f *pullFlags) error 
 	if err := a.scope(&name); err != nil {
 		return err
 	}
-	c, _ := a.clients()
+	if err := a.validateName("state", name); err != nil {
+		return err
+	}
+	c, err := a.clients()
+	if err != nil {
+		return err
+	}
 	st := &v1alpha1.BlipState{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace},
 		Spec:       v1alpha1.BlipStateSpec{Image: image},
@@ -77,7 +83,7 @@ func (a *app) pull(ctx context.Context, name, image string, f *pullFlags) error 
 		fmt.Fprintf(a.env.Out, "blipstate/%s created\n", a.short(name))
 		return nil
 	}
-	st, err := a.waitStateCommitted(ctx, name)
+	st, err = a.waitStateCommitted(ctx, name)
 	if err != nil {
 		return err
 	}

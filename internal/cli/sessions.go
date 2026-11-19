@@ -240,6 +240,9 @@ open a login shell, with a terminal when the local side has one.`,
 			if err := a.scope(&args[0]); err != nil {
 				return err
 			}
+			if err := a.validateName("blip", args[0]); err != nil {
+				return err
+			}
 			pod, err := a.runningPod(cmd.Context(), args[0])
 			if err != nil {
 				return err

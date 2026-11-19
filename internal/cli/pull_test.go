@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
 )
@@ -31,6 +34,28 @@ func TestPullDetachAndFailure(t *testing.T) {
 	code, _, errOut = h.run("", "pull", "broken", "registry/dev:v1")
 	if code != 1 || !strings.Contains(errOut, "pull denied") || h.state("broken").Status.Phase != v1alpha1.StateFailed {
 		t.Fatalf("code %d: %s", code, errOut)
+	}
+}
+
+func TestPullRejectsInvalidNames(t *testing.T) {
+	h := newHarness(t)
+	for _, name := range []string{"", " ", strings.Repeat("s", 254)} {
+		code, _, errOut := h.run("", "pull", name, "registry/dev:v1", "-d")
+		if code != 1 || !strings.Contains(errOut, "invalid state name") {
+			t.Errorf("%q: code %d stderr %q", name, code, errOut)
+		}
+		for _, raw := range []string{"metadata.name", "Required value"} {
+			if strings.Contains(errOut, raw) {
+				t.Errorf("%q leaked raw API error %q: %s", name, raw, errOut)
+			}
+		}
+	}
+	var states v1alpha1.BlipStateList
+	if err := h.kube.List(context.Background(), &states, client.InNamespace(ns)); err != nil {
+		t.Fatal(err)
+	}
+	if len(states.Items) != 0 {
+		t.Errorf("invalid names created states: %v", states.Items)
 	}
 }
 

@@ -7,10 +7,24 @@ import (
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
 )
+
+// validateName rejects a name that can never be a Kubernetes object name with
+// the same short message every command uses. Without it, an empty or malformed
+// name reaches client-go or the API server and leaks a raw validation error.
+func (a *app) validateName(kind, name string) error {
+	if name == "" {
+		return fmt.Errorf("invalid %s name %q: must not be empty", kind, name)
+	}
+	if problems := validation.IsDNS1123Subdomain(name); len(problems) > 0 {
+		return fmt.Errorf("invalid %s name %q: %s", kind, a.short(name), strings.Join(problems, "; "))
+	}
+	return nil
+}
 
 // get fetches the named object into obj. It returns the API error unchanged, so
 // callers can fall back or ignore NotFound before reporting it with notFound.
