@@ -1,11 +1,85 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/podapi"
 )
+
+// dynamicPendingMount starts a running Blip and adds a writable mount at
+// runtime, returning the Pending status entry and its attachment ID. It is
+// not part of the VM claim (InClaim false), so the guest may never have
+// attached it.
+func dynamicPendingMount(t *testing.T) (*env, *v1.Blip, *v1.MountStatus, string) {
+	t.Helper()
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.newPool("default", 0, 0)
+	e.readyState("data", "n1", "n2")
+	e.startBlip("git", "n1", e.withImage("reg/img:v1"))
+	e.updateRoot("git", func(b *v1.BlipState) {
+		b.Spec.Mounts = []v1.Mount{{State: "data", Path: "/data", Writable: true}}
+	})
+	e.run(e.blip, ns, "git")
+	b := e.getBlip("git")
+	m := mountOf(b, "data")
+	if m == nil || m.Phase != v1.MountPending || !m.Writable || m.InClaim {
+		t.Fatalf("setup: want a pending, non-claim writable mount, got %+v", m)
+	}
+	return e, b, m, m.AttachmentID
+}
+
+// TestRemovedNeverAttachedWritableMountDeletingState covers w6-09 F1: a
+// dynamic writable mount is still Pending (never observed attached, not in
+// the VM claim) when its source state is deleted and the CLI rolls the desired
+// entry back. The pre-acquired writer is enough for the deleting-state check
+// to force-fail the whole execution with SaveFailed even though nothing was
+// ever mounted and the topology was restored. The rollback must instead
+// release the writer and drop the entry like any other never-attached mount.
+func TestRemovedNeverAttachedWritableMountDeletingState(t *testing.T) {
+	e, _, _, oldAttachment := dynamicPendingMount(t)
+	e.must(e.c.Delete(e.ctx, e.getState("data")))
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts = nil })
+	e.run(e.blip, ns, "git")
+
+	b := e.getBlip("git")
+	if b.Status.Phase == v1.BlipFailed && b.Status.Reason == ReasonSaveFailed {
+		t.Errorf("never-attached rolled-back mount failed the execution: phase=%s reason=%s message=%q mount=%+v",
+			b.Status.Phase, b.Status.Reason, b.Status.Message, mountOf(b, "data"))
+	}
+	if m := mountOf(b, "data"); m != nil {
+		t.Errorf("never-attached rolled-back mount still reported: %+v", m)
+	}
+	if w := e.getState("data").Status.Writer; w != nil && w.AttachmentID == oldAttachment {
+		t.Errorf("never-attached writable mount still holds writer %s", oldAttachment)
+	}
+}
+
+// TestRemovedNeverAttachedWritableMountRollbackControl is the control for
+// TestRemovedNeverAttachedWritableMountDeletingState: the identical rollback
+// without deleting the source must leave the running command alone. It proves
+// the release path itself is correct, so only the deleting-state check can
+// turn the rollback into a failed save.
+func TestRemovedNeverAttachedWritableMountRollbackControl(t *testing.T) {
+	e, _, _, oldAttachment := dynamicPendingMount(t)
+	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts = nil })
+	for range 3 {
+		e.run(e.blip, ns, "git")
+	}
+	b := e.getBlip("git")
+	expectPhase(t, b, v1.BlipRunning, "")
+	if m := mountOf(b, "data"); m != nil {
+		t.Errorf("control: rolled-back never-attached mount still reported: %+v", m)
+	}
+	if strings.Contains(b.Status.Message, "save was discarded") {
+		t.Errorf("control: unexpected discarded save: %q", b.Status.Message)
+	}
+	if w := e.getState("data").Status.Writer; w != nil && w.AttachmentID == oldAttachment {
+		t.Errorf("control: never-attached writable mount still holds writer %s", oldAttachment)
+	}
+}
 
 // TestRemovedNeverAttachedWritableMountIsDropped covers C3: changing or
 // removing a writable mount before the node ever observed its disk must drop

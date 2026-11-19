@@ -187,7 +187,16 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 		// A failed save stays visible even after its mount leaves the spec;
 		// a mount that merely never attached is forgotten with it.
 		saveFailure := strings.HasPrefix(m.Message, "save failed:")
-		if m.Writable && !stop {
+		neverAttached := diskNeverAttached(obs, m.AttachmentID)
+		// A writable mount only risks losing data if the guest could have
+		// reached the disk: it belongs to the accepted claim, was last
+		// observed attached, or is still desired by the topology. A dynamic
+		// mount that never attached and whose desired entry was rolled back
+		// has nothing to save; the never-attached release below drops it.
+		// Failing it here would kill an otherwise unaffected command for a
+		// save that cannot exist.
+		inUse := m.InClaim || m.Phase == v1.MountMounted || same || !neverAttached
+		if m.Writable && !stop && inUse {
 			// attachment treats a deleting state as resolved so its
 			// finalizers cannot deadlock with this Blip. Never let an
 			// already-attached mount keep writing into it (and keep the
@@ -218,7 +227,6 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 			m.Switching, m.Message = false, ""
 		}
 		d, seen := disks[m.AttachmentID]
-		neverAttached := diskNeverAttached(obs, m.AttachmentID)
 		if (m.Phase == v1.MountPending || m.Phase == v1.MountFailed && !saveFailure) &&
 			m.Writable && neverAttached && !same && !stop && !m.Switching {
 			// The writable mount never attached (no disk, or only an
