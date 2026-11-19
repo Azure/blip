@@ -622,6 +622,9 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 				s.ImageConfig = src.Status.ImageConfig.DeepCopy()
 			}
 			minSize = src.Status.SizeBytes
+			if s.StreamSize == 0 && (st.Spec.StreamSize == nil || st.Spec.StreamSize.IsZero()) {
+				s.StreamSize = src.Status.StreamSize
+			}
 		}
 		prefer = s.CopiedFrom.Nodes
 	}
@@ -629,6 +632,13 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 		s.Phase = v1.StateFailed
 		return fmt.Sprintf("size %s is smaller than copy source %q (%s)",
 			st.Spec.Size.String(), st.Spec.CopyFrom, resource.NewQuantity(minSize, resource.BinarySI).String()), false, nil
+	}
+	if s.StreamSize == 0 {
+		if st.Spec.StreamSize != nil && !st.Spec.StreamSize.IsZero() {
+			s.StreamSize = st.Spec.StreamSize.Value()
+		} else {
+			s.StreamSize = v1.DefaultStreamSize
+		}
 	}
 	if s.SizeBytes == 0 {
 		s.SizeBytes = defaultStateSize
@@ -1218,9 +1228,6 @@ func (r *StateReconciler) writer(ctx context.Context, st *v1.BlipState, cl *clus
 			nodes := cl.choose(replicas(st), st.Spec.NodeSelector, prefer, nil)
 			if len(nodes) == 0 {
 				nodes = []string{w.Node}
-			}
-			if sr.SizeBytes > 0 {
-				s.SizeBytes = sr.SizeBytes
 			}
 			s.Pending = &v1.PendingCommit{
 				CommitID:     sr.CommitID,

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,19 +25,12 @@ const (
 	workCgroup = "/sys/fs/cgroup/work"
 	// stopGrace is how long processes get between SIGTERM and cgroup.kill.
 	stopGrace = 10 * time.Second
-	// exitAttachTimeout bounds how long a finished primary keeps its replay
-	// for a caller that is expected to attach.
-	exitAttachTimeout = 30 * time.Second
-	// exitDeliveryTimeout bounds delivery of the exit status to an attached
-	// caller; a client that stops reading cannot hold the guest up.
-	exitDeliveryTimeout = 30 * time.Second
+	// exitGrace is how long a finished primary waits for the stdio writer to
+	// flush its last output and exit status before the VM shuts down.
+	exitGrace = time.Second
+	// exitOutputMax bounds the output kept with a failed exit status.
+	exitOutputMax = 1024
 )
-
-// waitForClientTimeout bounds how long a primary command's output pumps stay
-// held waiting for the caller. If the client never arrives, the command must
-// still run instead of filling its output pipe forever. It is a variable so
-// tests can shorten it.
-var waitForClientTimeout = 60 * time.Second
 
 // Guest is the state of the VM's init process.
 type Guest struct {
@@ -49,8 +41,7 @@ type Guest struct {
 	kubeNamespace string
 	endpoints     []string
 	proxy         *apiForwarder
-	reporter      *reporter
-	reportServer  *http.Server
+	stdio         *stdio
 	shutdownCh    chan struct{}
 
 	// startProcess replaces startProc in tests, which run outside the guest
@@ -58,19 +49,16 @@ type Guest struct {
 	startProcess func(procSpec, []string) (*proc, []string, error)
 	filesystem   *filesystemEffects
 
-	mu        sync.Mutex
-	ctl       *controlConn
-	ctlFile   io.ReadWriteCloser
-	ctlGone   chan struct{} // closed when ctl disconnects
-	claim     *wire.Claim
-	rootDev   string
-	mounts    map[string]*mount // auxiliary mounts by ID
-	sessions  map[string]*session
-	openIDs   map[string]*openRecord // exec opens by client OpenID
-	openOrder []string               // completed OpenIDs, oldest first
-	clients   int
-	exit      *wire.Exit
-	stopping  bool
+	mu       sync.Mutex
+	ctl      *controlConn
+	ctlFile  io.ReadWriteCloser
+	ctlGone  chan struct{} // closed when ctl disconnects
+	claim    *wire.Claim
+	rootDev  string
+	mounts   map[string]*mount // auxiliary mounts by ID
+	primary  bool              // the primary command has been started
+	exit     *wire.Exit
+	stopping bool
 
 	// fmu guards frozen. It is taken after mu, never before, and nothing
 	// that can block on a frozen filesystem runs under it, so the
@@ -93,8 +81,7 @@ func newGuest(root, cgroup string) *Guest {
 		reaper:     newReaper(),
 		mounts:     map[string]*mount{},
 		frozen:     map[string]*frozenFS{},
-		sessions:   map[string]*session{},
-		openIDs:    map[string]*openRecord{},
+		stdio:      newStdio(),
 		shutdownCh: make(chan struct{}),
 	}
 	if fd, err := unix.Open(cgroup, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0); err == nil {
@@ -139,21 +126,17 @@ func Main() {
 			powerOff()
 		}
 	}
-	if err := g.startReporter(); err != nil {
-		log.Printf("listen report endpoint: %v", err)
-		powerOff()
-	}
 	ctl, err := listenVsock(wire.ControlPort)
 	if err != nil {
 		log.Printf("listen control port: %v", err)
 		powerOff()
 	}
-	sess, err := listenVsock(wire.SessionPort)
+	stdio, err := listenVsock(wire.StdioPort)
 	if err != nil {
-		log.Printf("listen session port: %v", err)
+		log.Printf("listen stdio port: %v", err)
 		powerOff()
 	}
-	go g.accept(sess, g.serveSession)
+	go g.accept(stdio, g.serveStdio)
 	log.Printf("ready")
 	g.accept(ctl, g.serveControl)
 	powerOff()
@@ -183,7 +166,7 @@ func (g *Guest) accept(lfd int, serve func(io.ReadWriteCloser)) {
 			log.Printf("accept: %v", err)
 			return
 		}
-		// Descriptor exhaustion is temporary: the report server and other
+		// Descriptor exhaustion is temporary: closed stdio and control
 		// connections release descriptors, so keep the listener armed.
 		log.Printf("accept: %v; retrying in %v", err, delay)
 		time.Sleep(delay)
@@ -211,7 +194,6 @@ func (g *Guest) helloLocked() wire.Hello {
 	}
 	sort.Strings(h.Mounts)
 	h.Frozen = g.frozenIDs()
-	h.Report = g.lastReportLocked()
 	return h
 }
 
@@ -227,15 +209,11 @@ func (g *Guest) serveControl(f io.ReadWriteCloser) {
 	old := g.ctlFile
 	g.ctl, g.ctlFile, g.ctlGone = c, f, gone
 	hello := g.helloLocked()
-	status := wire.Status{Sessions: g.clients}
 	g.mu.Unlock()
 	if old != nil {
 		old.Close()
 	}
 	err := c.writeLocked(wire.THello, hello)
-	if err == nil {
-		err = c.writeLocked(wire.TStatus, status)
-	}
 	c.mu.Unlock()
 	defer func() {
 		g.mu.Lock()
@@ -326,14 +304,6 @@ func (g *Guest) send(t wire.Type, v any) {
 			log.Printf("control write: %v", err)
 		}
 	}
-}
-
-func (g *Guest) addClients(n int) {
-	g.mu.Lock()
-	g.clients += n
-	st := wire.Status{Sessions: g.clients}
-	g.mu.Unlock()
-	g.send(wire.TStatus, st)
 }
 
 func (g *Guest) doClaim(m wire.Claim) error {
@@ -447,12 +417,10 @@ func hostsFile(hostname, kubeNamespace string, endpoints []string) string {
 	return b.String()
 }
 
-// blipHosts resolves the guest's fixed HTTP names: the report server on
-// 127.0.2.1 and, when there is anything for the sidecar to route, the sidecar
-// proxy on 127.0.2.2.
+// blipHosts resolves the guest's fixed HTTP names, when there is anything for
+// the sidecar to route, through the proxy on 127.0.2.2.
 func blipHosts(kubeNamespace string, endpoints []string) string {
 	var b strings.Builder
-	b.WriteString("127.0.2.1 blip\n")
 	names := endpoints
 	if kubeNamespace != "" {
 		names = append([]string{"kube-apiserver"}, endpoints...)
@@ -510,83 +478,107 @@ func (g *Guest) bindFileLocked(p string) error {
 func (g *Guest) startPrimary() {
 	g.mu.Lock()
 	claim := g.claim
-	_, started := g.sessions[wire.PrimarySession]
-	g.mu.Unlock()
-	if claim == nil || started {
+	if claim == nil || g.primary {
+		g.mu.Unlock()
 		return
 	}
-	// A non-interactive primary command has no client that could close its
-	// stdin, so give it EOF; a TTY session stays interactive through its
-	// terminal. Exec sessions are unaffected: their client sends EOF.
-	spec := procSpec{
-		argv: claim.Command, dir: claim.WorkingDir, user: claim.User, tty: claim.TTY,
-		stdinEOF: !claim.TTY,
+	g.primary = true
+	g.mu.Unlock()
+
+	start := g.startProc
+	if g.startProcess != nil {
+		start = g.startProcess
 	}
-	hold := claim.WaitForClient
-	s, err := g.startSession(wire.PrimarySession, spec, claim.Env, hold)
+	p, _, err := start(procSpec{argv: claim.Command, dir: claim.WorkingDir, user: claim.User}, claim.Env)
 	if err != nil {
 		log.Printf("start primary: %v", err)
-		g.failedSession(wire.PrimarySession, claim.Command, err)
+		g.failPrimary(err)
 		return
 	}
-	if hold {
-		// A client that never arrives must not leave the command blocked on
-		// its output pipe forever.
-		time.AfterFunc(waitForClientTimeout, s.releasePumps)
+	g.stdio.setStdin(p.stdin)
+	var pumps sync.WaitGroup
+	pump := func(f *os.File, t wire.Type) {
+		pumps.Add(1)
+		go func() {
+			defer pumps.Done()
+			if f == nil {
+				return
+			}
+			buf := make([]byte, 32<<10)
+			for {
+				n, err := f.Read(buf)
+				if n > 0 {
+					// The read buffer is reused; the retained output must
+					// own its bytes until the connection has drained them.
+					g.stdio.append(t, append([]byte(nil), buf[:n]...))
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
 	}
+	pump(p.stdout, wire.TStdout)
+	pump(p.stderr, wire.TStderr)
+	go func() {
+		ws := <-p.wait
+		// The process cannot write any more, but bytes may still be in the
+		// pipes. Give the pumps a moment to drain them; background children
+		// may keep a pipe open, so do not wait forever.
+		done := make(chan struct{})
+		go func() { pumps.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		p.close()
+		g.stdio.closeStdin()
+		code, sig := exitOf(ws)
+		ex := wire.Exit{Code: code, Signal: sig}
+		g.mu.Lock()
+		if g.stopping {
+			ex.Reason = wire.ReasonStopped
+		}
+		g.mu.Unlock()
+		g.primaryExited(ex)
+	}()
 }
 
-// failPrimary records a primary command that could not start.
+// failPrimary records a primary command that could not start. The error is
+// delivered on stderr and the exit status keeps the conventional 126/127.
 func (g *Guest) failPrimary(err error) {
 	g.mu.Lock()
 	claim := g.claim
-	_, started := g.sessions[wire.PrimarySession]
 	g.mu.Unlock()
-	if claim == nil || started {
+	if claim == nil {
 		log.Printf("claim: %v", err)
 		return
 	}
-	g.failedSession(wire.PrimarySession, claim.Command, err)
+	g.stdio.append(wire.TStderr, []byte(boundErrorText(err.Error())+"\n"))
+	g.primaryExited(wire.Exit{Code: startExitCode(err)})
 }
 
-// sessionExited ends a command blip when its primary command exits.
-func (g *Guest) sessionExited(s *session) {
-	if s.id != wire.PrimarySession {
-		return
+// primaryExited records the primary command's exit status. The control port
+// learns about it immediately; the stdio writer gets a short grace to flush
+// the last output and the exit status before the guest shuts down.
+func (g *Guest) primaryExited(ex wire.Exit) {
+	if ex.Reason == "" {
+		ex.Reason = wire.ReasonCompleted
 	}
 	g.mu.Lock()
 	if g.stopping || g.exit != nil {
 		g.mu.Unlock()
 		return
 	}
-	waitForClient := g.claim != nil && g.claim.WaitForClient
-	st := s.status
-	st.Reason = wire.ReasonCompleted
-	if st.Code != 0 || st.Signal != "" {
-		st.Output = s.tail(exitOutputMax)
+	if ex.Code != 0 || ex.Signal != "" {
+		ex.Output = g.stdio.tail(exitOutputMax)
 	}
-	g.exit = &st
+	g.exit = &ex
 	g.mu.Unlock()
-	log.Printf("primary exited: code %d %s", st.Code, st.Signal)
-	g.send(wire.TExit, st)
-	go func() {
-		s.mu.Lock()
-		clients := s.clients
-		s.mu.Unlock()
-		switch {
-		case clients > 0:
-			// An attached caller is still reading the final output and exit
-			// status. Keep the replay until it has both.
-			s.waitDelivered(0, exitDeliveryTimeout)
-		case waitForClient:
-			// The caller is expected to attach. Keep the replay for it, but
-			// only for a bounded time: a client that never comes must not
-			// hold the VM open.
-			s.waitDelivered(exitAttachTimeout, exitDeliveryTimeout)
-		}
-		// No client is attached and none is expected: shut down now.
-		g.shutdown()
-	}()
+	g.stdio.setExit(ex)
+	log.Printf("primary exited: code %d %s", ex.Code, ex.Signal)
+	g.send(wire.TExit, ex)
+	time.AfterFunc(exitGrace, g.shutdown)
 }
 
 func cgroupEmpty(cg string) bool {
@@ -594,7 +586,7 @@ func cgroupEmpty(cg string) bool {
 	return err == nil && len(strings.TrimSpace(string(b))) == 0
 }
 
-// shutdown stops all work, unmounts everything, reports, and powers off.
+// shutdown stops all work, unmounts everything, and powers off.
 func (g *Guest) shutdown() {
 	g.mu.Lock()
 	if g.stopping {
@@ -605,20 +597,16 @@ func (g *Guest) shutdown() {
 	if g.shutdownCh != nil {
 		close(g.shutdownCh)
 	}
-	// Held output pumps must not keep a process blocked when the VM is
-	// going away; stopWork below would otherwise wait on a process that
-	// cannot write its output anywhere.
-	for _, s := range g.sessions {
-		s.releasePumps()
-	}
 	// Frozen filesystems would block the workload's exit and the unmounts.
 	if err := g.thawAll(); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
 	g.mu.Unlock()
 	log.Printf("shutting down")
+	// A pump blocked on a full output buffer, or a connection blocked in a
+	// write, must not keep stopWork waiting.
+	g.stdio.close()
 	stopWork(g.cgroup, stopGrace)
-	g.stopReporter()
 	if g.proxy != nil {
 		g.proxy.Close()
 	}

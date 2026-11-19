@@ -21,7 +21,7 @@ func TestProductionCoreBoundaries(t *testing.T) {
 		"node/planner.go",
 		"runtime/machine.go",
 		"runtime/snapshot.go",
-		"guest/session_lifecycle.go",
+		// guest stdio is exercised by internal/guest tests.
 	} {
 		t.Run(name, func(t *testing.T) {
 			set := token.NewFileSet()

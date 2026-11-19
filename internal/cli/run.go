@@ -20,7 +20,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
-	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/workspace"
 )
 
@@ -40,6 +39,7 @@ type runFlags struct {
 	nameSet                   bool
 	fromSet, stateSet         bool
 	keep                      bool
+	interactive               bool
 }
 
 func (a *app) runCommand() *cobra.Command {
@@ -48,8 +48,10 @@ func (a *app) runCommand() *cobra.Command {
 		Use:   "run [flags] -- CMD [ARG...]",
 		Short: "Start a command in a new blip and return its name",
 		Long: `Create a blip that runs one command and return as soon as its workspace is
-ready, printing the blip's name. Use blip gather to wait for it, collect its
-results, and delete it.
+ready, printing the blip's name. By default run also closes the command's
+stdin, so a one-shot command never waits for input. Use --interactive to leave
+stdin open and feed it with blip send. Use blip logs to read output, and blip
+gather to wait for the blip, collect its results, and delete it.
 
 Inside a blip, run defaults to --from /: a copy of the caller's own root,
 including its working directory, uncommitted changes, and the effects of
@@ -63,8 +65,9 @@ Forks started inside a blip stop after --timeout and are deleted --ttl after
 they finish, so an abandoned fork cannot leak its workspace.`,
 		Example: `  blip run -- sh -c "make test"
   blip run --name fix-lint -- sh -c "git switch -c fix-lint && ./lint.sh"
+  blip logs --follow worker-1
   blip gather --collect "git:/home/dev/src:{name}" --wait 30m
-  blip run --name dev --from base -- sleep infinity`,
+  blip run --name chat --interactive --state ws -- cat`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := a.rejectAmbiguousCommandFlags(cmd, 0, "blip run [flags] -- CMD [ARG...]"); err != nil {
@@ -95,6 +98,7 @@ they finish, so an abandoned fork cannot leak its workspace.`,
 	fl.DurationVar(&f.timeout, "timeout", 0, "stop the blip after this long (default 2h inside a blip; 0 disables)")
 	fl.DurationVar(&f.ttl, "ttl", 0, "delete the blip this long after it finishes (default 1h inside a blip; 0 disables)")
 	fl.BoolVar(&f.keep, "keep", false, "leave the new workspace in place after the blip is deleted")
+	fl.BoolVar(&f.interactive, "interactive", false, "leave stdin open so blip send can feed the command")
 	return cmd
 }
 
@@ -216,19 +220,36 @@ func wholeSeconds(flag string, d time.Duration, max int64) error {
 	return nil
 }
 
+var errInvalidUTF8 = errors.New("run requires valid UTF-8")
+
 // validateRun rejects a run request whose strings JSON would silently rewrite.
-// argv, workingDir and user follow the same rules as a session Open; env is
-// checked as name/value pairs so the error names the invalid part.
+// env is checked as name/value pairs so the error names the invalid part.
 func validateRun(command []string, env []v1alpha1.EnvVar, workdir, user string) error {
 	for i, e := range env {
 		if !utf8.ValidString(e.Name) {
-			return fmt.Errorf("%w: env[%d] name contains invalid UTF-8", session.ErrInvalidUTF8, i)
+			return fmt.Errorf("%w: env[%d] name contains invalid UTF-8", errInvalidUTF8, i)
 		}
 		if !utf8.ValidString(e.Value) {
-			return fmt.Errorf("%w: env[%d] value contains invalid UTF-8", session.ErrInvalidUTF8, i)
+			return fmt.Errorf("%w: env[%d] value contains invalid UTF-8", errInvalidUTF8, i)
 		}
 	}
-	return session.ValidateStrings(command, envStrings(env), workdir, user)
+	for i, s := range command {
+		if !utf8.ValidString(s) {
+			return fmt.Errorf("%w: argv[%d] contains invalid UTF-8", errInvalidUTF8, i)
+		}
+	}
+	for i, s := range envStrings(env) {
+		if !utf8.ValidString(s) {
+			return fmt.Errorf("%w: env[%d] contains invalid UTF-8", errInvalidUTF8, i)
+		}
+	}
+	if !utf8.ValidString(workdir) {
+		return fmt.Errorf("%w: workingDir contains invalid UTF-8", errInvalidUTF8)
+	}
+	if !utf8.ValidString(user) {
+		return fmt.Errorf("%w: user contains invalid UTF-8", errInvalidUTF8)
+	}
+	return nil
 }
 
 func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
@@ -296,7 +317,7 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	// The inherited directory is local, not a flag, so it is validated after
 	// the caller's blip is known but still before the Blip is created.
 	if workdir != f.workdir && !utf8.ValidString(workdir) {
-		return fmt.Errorf("%w: workingDir contains invalid UTF-8", session.ErrInvalidUTF8)
+		return fmt.Errorf("%w: workingDir contains invalid UTF-8", errInvalidUTF8)
 	}
 	b := &v1alpha1.Blip{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace},
@@ -446,6 +467,12 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 			err = errors.Join(err, fmt.Errorf("remove blip %q: %w", a.short(name), delErr))
 		}
 		return err
+	}
+	// A blip is a one-shot command executor. Close its stdin as soon as it
+	// exists unless the caller asked to feed it with blip send. The guest may
+	// not be connected yet; closeStdin retries briefly and gives up quietly.
+	if !f.interactive {
+		a.closeStdin(ctx, streamTarget{namespace: c.Namespace, state: b.Spec.State, blip: b.Name})
 	}
 	fmt.Fprintln(a.env.Out, a.short(b.Name))
 	return nil

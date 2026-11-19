@@ -58,7 +58,7 @@ config=$(k get blipstate "$P-workspace" -o jsonpath='{.spec.mounts}{.spec.runtim
 
 step "run the workspace, then delete the execution; its states remain"
 blip run --name "$P-agent" --state "$P-workspace" -- sleep infinity
-blip exec "$P-agent" -- sh -ec '
+blip run --from "$P-agent" -- sh -ec '
   test "$DURABLE_WORKSPACE" = kept
   test "$PWD" = /work
   test "$(id -u):$(id -g)" = 0:0
@@ -78,7 +78,7 @@ test "$(k get blipstate "$P-workspace" -o jsonpath='{.spec.mounts}{.spec.runtime
 
 step "a differently named execution restores files, topology, and runtime defaults"
 blip run --name "$P-resumed" --state "$P-workspace" -- sleep infinity
-blip exec "$P-resumed" -- sh -ec '
+blip run --from "$P-resumed" -- sh -ec '
   test "$(cat /root/kept.txt)" = root-kept
   test "$(cat /work/kept.txt)" = rw-kept
   test "$DURABLE_WORKSPACE" = kept
@@ -100,7 +100,7 @@ wait_state "$P-workspace"
 
 step "fork concurrently inside a blip and gather branches, files, and logs"
 blip run --name "$P-collector" --from "$P-base" -- sleep infinity
-blip exec "$P-collector" -e FORK_MAX="$FORK_MAX" -e W="$P" -- bash -ec '
+blip run --from "$P-collector" -e FORK_MAX="$FORK_MAX" -e W="$P" -- bash -ec '
   set -euo pipefail
   git config --global user.email a@example.com
   git config --global user.name a
@@ -118,7 +118,7 @@ blip exec "$P-collector" -e FORK_MAX="$FORK_MAX" -e W="$P" -- bash -ec '
   # A follower sees the output of a command that is still running.
   blip run --name "$W-slow" --from / -w "$PWD" -- sh -c "sleep 2; echo slow-output"
   blip gather "$W-slow" -f > slow.log
-  grep -q "slow| slow-output" slow.log
+  grep -q "slow-output" slow.log
   # A server-side deadline stops a fork nobody waits for forever.
   blip run --name "$W-stopped" --timeout 2s --from / -w "$PWD" -- sh -c "git switch -qc stopped && sleep 100"
   blip gather "$W-stopped" --collect "git:$PWD:stopped" > stopped.out

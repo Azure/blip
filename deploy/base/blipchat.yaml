@@ -4,50 +4,34 @@ metadata:
   name: blipchat
   namespace: blip-system
 ---
-# blipchat is a stateless coordinator: it serves the chat API and mutates
-# turns, threads and blips on behalf of users, so it needs write access to
-# those resources but never owns storage.
+# blipchat creates one BlipState per chat and one Blip per generation. It
+# reads pod status for the session list and writes the stdin/stdout of a chat
+# through the aggregated stream API. It never owns a BlipThread or BlipTurn.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: blipchat
 rules:
   - apiGroups: [blip.dev]
-    resources: [blipturns]
+    resources: [blipstates]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [blip.dev]
-    resources: [blipturns/status]
-    verbs: [get, update, patch]
-  # A thread's spec is administrator-owned: blipchat reads it and only writes
-  # status. Granting update or patch on the resource would let a compromised
-  # coordinator rewrite every project's charter, system prompt, pool and base.
-  - apiGroups: [blip.dev]
-    resources: [blipthreads]
-    verbs: [get, list, watch]
-  - apiGroups: [blip.dev]
-    resources: [blipthreads/status]
-    verbs: [get, update, patch]
   - apiGroups: [blip.dev]
     resources: [blips]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [blip.dev]
-    resources: [blipstates]
-    verbs: [get, list, watch, create]
-  - apiGroups: [blip.dev]
-    resources: [blippools]
-    verbs: [get, list, watch]
-  # Inspects pods to report sandbox health for a turn; exec is used to probe a
-  # guest when the pod API cannot answer.
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch]
-  - apiGroups: [""]
-    resources: [pods/exec]
-    verbs: [create, get]
-  # Leader election lease for the active coordinator replica.
-  - apiGroups: [coordination.k8s.io]
-    resources: [leases]
-    verbs: [get, list, watch, create, update, patch, delete]
+  # The stream API authorizes resource requests (blipstreams/log and
+  # blipstreams/stdin) through SubjectAccessReview; the non-resource rule
+  # covers discovery and any handler that authorizes the raw path.
+  - apiGroups: [stream.blip.dev]
+    resources: [blipstreams, blipstreams/log]
+    verbs: [get]
+  - apiGroups: [stream.blip.dev]
+    resources: [blipstreams, blipstreams/stdin]
+    verbs: [create]
+  - nonResourceURLs: ["/apis/stream.blip.dev/*"]
+    verbs: [get, post]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -57,6 +41,32 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: blipchat
+subjects:
+  - kind: ServiceAccount
+    name: blipchat
+    namespace: blip-system
+---
+# Profiles live next to the deployment. A missing ConfigMap is allowed: the
+# built-in default profile remains available.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blipchat-profiles
+  namespace: blip-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blipchat-profiles
+  namespace: blip-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blipchat-profiles
 subjects:
   - kind: ServiceAccount
     name: blipchat
@@ -87,36 +97,30 @@ spec:
         - name: blipchat
           image: ghcr.io/azure/blipchat:latest
           imagePullPolicy: IfNotPresent
-          # blipchat talks to the guest LLM through an OpenAI-compatible proxy.
-          # The default points at an intentionally unresolvable host: an
-          # operator must replace --llm-base-url with their own proxy endpoint
-          # in an overlay before chat turns can complete.
           args:
-            - --leader-elect
             - --listen=:8080
-            - --llm-base-url=http://llm.invalid/v1
+            - --namespace=default
+            - --profiles-configmap=blip-system/blip-chat-profiles
+            - --auto-approve=always
+            - --default-pool=default
+            - --log-level=info
           ports:
             - name: http
               containerPort: 8080
-            - name: health
-              containerPort: 8081
-          # Probes use the pre-cache health server: liveness answers during a
-          # slow initial informer sync, and readiness stays 503 until the
-          # cache is synced and the chat server can start.
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 8081
+              port: http
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8081
+              port: http
           resources:
             requests:
               cpu: 50m
-              memory: 128Mi
+              memory: 64Mi
             limits:
-              memory: 512Mi
+              memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -137,16 +141,3 @@ spec:
     - name: http
       port: 80
       targetPort: 8080
----
-# Example: cap the number of turns a single project namespace may retain.
-# Apply this per project namespace (NOT cluster-wide); adjust the name and
-# namespace, then add it to that project's kustomization.
-#
-# apiVersion: v1
-# kind: ResourceQuota
-# metadata:
-#   name: blip-turns
-#   namespace: project-example
-# spec:
-#   hard:
-#     count/blipturns: "2000"

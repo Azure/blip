@@ -144,6 +144,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/export", s.handleExport)
 	mux.HandleFunc("POST /v1/release", s.handleRelease)
 	mux.HandleFunc("POST /v1/leases/{id}/renew", s.handleRenew)
+	mux.HandleFunc("GET /v1/stream/log", s.handleStreamLog)
+	mux.HandleFunc("POST /v1/stream/stdin", s.handleStreamStdin)
 	return mux
 }
 

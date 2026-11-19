@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -27,7 +26,6 @@ import (
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/podapi"
-	"github.com/Azure/blip/internal/wire"
 )
 
 // loadVMOwnerPolicy compiles deploy/base/vm-owner-policy.yaml the way the
@@ -287,7 +285,7 @@ func threadObj(name, charter string) map[string]any {
 
 // sessionExec is the exec internal/session opens for a blip session.
 func sessionExec() *corev1.PodExecOptions {
-	return &corev1.PodExecOptions{Stdin: true, Stdout: true, Container: podapi.VMContainer, Command: []string{"blip-runtime", "bridge", strconv.Itoa(wire.SessionPort)}}
+	return &corev1.PodExecOptions{Stdin: true, Stdout: true, Container: podapi.VMContainer, Command: []string{"blip-runtime", "bridge", "1025"}}
 }
 
 func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map[string]string) (bool, string) {

@@ -11,27 +11,22 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
-	"github.com/Azure/blip/internal/session"
 )
 
 // Env is the command's environment. Tests replace Connect with fakes.
 type Env struct {
-	In  io.Reader
-	Out io.Writer
-	Err io.Writer
-	// Terminal enables raw mode, resize and signal forwarding when In is a
-	// terminal.
-	Terminal bool
-	Connect  func(KubeFlags) (*Clients, error)
+	In      io.Reader
+	Out     io.Writer
+	Err     io.Writer
+	Connect func(KubeFlags) (*Clients, error)
 	// ProgressDelay holds progress lines back so fast operations stay
 	// quiet.
 	ProgressDelay time.Duration
@@ -58,12 +53,11 @@ type KubeFlags struct {
 // Clients are the API clients a command uses.
 type Clients struct {
 	Kube      client.WithWatch
-	Sessions  *session.Client
+	Stream    streamAPI
 	Namespace string
-	// Logs streams the serial console of a VM pod. It is the fallback for
-	// a command that finished before a follower could attach to its replay
-	// ring.
-	Logs func(context.Context, string) (io.ReadCloser, error)
+	// REST reaches aggregated APIs. Its base path is empty, so AbsPath
+	// addresses /apis/stream.blip.dev/... directly.
+	REST rest.Interface
 }
 
 // ExitError makes the process exit with Code without printing anything.
@@ -81,7 +75,7 @@ func init() {
 
 // DefaultEnv uses the process's stdio and kubeconfig.
 func DefaultEnv() *Env {
-	return &Env{In: os.Stdin, Out: os.Stdout, Err: os.Stderr, Terminal: true, Connect: connect, ProgressDelay: time.Second,
+	return &Env{In: os.Stdin, Out: os.Stdout, Err: os.Stderr, Connect: connect, ProgressDelay: time.Second,
 		NamespaceFile: "/run/blip/namespace", NameFile: "/run/blip/name", Hostname: os.Hostname}
 }
 
@@ -107,18 +101,24 @@ func connect(f KubeFlags) (*Clients, error) {
 	if err != nil {
 		return nil, err
 	}
-	sessions, err := session.NewClient(cfg)
+	// A generated client's REST client prefixes its group version (/api/v1
+	// for core), and the discovery client adds a request timeout. Build an
+	// unversioned client with an empty base path so AbsPath reaches the
+	// aggregated stream API unchanged.
+	streamConfig := *cfg
+	streamConfig.APIPath = ""
+	streamConfig.GroupVersion = nil
+	streamConfig.NegotiatedSerializer = clientgoscheme.Codecs.WithoutConversion()
+	restClient, err := rest.UnversionedRESTClientFor(&streamConfig)
 	if err != nil {
 		return nil, err
 	}
-	clientset, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-	logs := func(ctx context.Context, pod string) (io.ReadCloser, error) {
-		return clientset.CoreV1().Pods(ns).GetLogs(pod, &corev1.PodLogOptions{Container: "vm"}).Stream(ctx)
-	}
-	return &Clients{Kube: kube, Sessions: sessions, Namespace: ns, Logs: logs}, nil
+	return &Clients{
+		Kube:      kube,
+		Stream:    &streamClient{rest: restClient},
+		Namespace: ns,
+		REST:      restClient,
+	}, nil
 }
 
 type app struct {
@@ -256,12 +256,11 @@ func NewCommand(env *Env) *cobra.Command {
 		Short:       "Run fast VM sandboxes with durable state on Kubernetes",
 		Long: `Run fast VM sandboxes with durable state on Kubernetes.
 
-These commands cover what kubectl cannot do: starting blips, gathering their
-results, exec in a running blip, mounts, and importing container images as
-shared bases. Use kubectl for everything else:
+These commands cover what kubectl cannot do: starting one-shot blips, following
+their output and stdin through the stream API, gathering results, mounts, and
+importing container images as shared bases. Use kubectl for everything else:
   kubectl get blips,blipstates
   kubectl apply -f state.yaml  # advanced state fields
-  kubectl patch blip NAME --type=merge -p '{"spec":{"stop":true}}'
   kubectl delete blip NAME`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -275,7 +274,8 @@ shared bases. Use kubectl for everything else:
 	pf.StringVar(&a.flags.Context, "context", "", "kubeconfig context to use")
 	pf.StringVarP(&a.flags.Namespace, "namespace", "n", "", "namespace (default from kubeconfig)")
 	root.AddCommand(
-		a.runCommand(), a.gatherCommand(), a.execCommand(), a.mountCommand(), a.pullCommand(),
+		a.runCommand(), a.gatherCommand(), a.logsCommand(), a.sendCommand(),
+		a.stopCommand(), a.mountCommand(), a.pullCommand(),
 	)
 	return root
 }

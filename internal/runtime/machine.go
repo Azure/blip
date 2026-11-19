@@ -28,9 +28,7 @@ type Machine struct {
 	rootAdding                                 uint64
 	disks                                      map[string]*disk
 	order                                      []string
-	sessions                                   int
 	exit                                       *podapi.Exit
-	report                                     *podapi.Report
 	errMsg                                     string
 	sigterm, shutdownSent, shutdownDone        bool
 	stopSince                                  time.Time
@@ -224,9 +222,6 @@ func (m *Machine) control(now time.Time, typ wire.Type, payload []byte) []Effect
 		if h.Exit != nil {
 			m.recordExit(now, *h.Exit)
 		}
-		if h.Report != nil && (m.report == nil || h.Report.Seq > m.report.Seq) {
-			m.report = &podapi.Report{Seq: h.Report.Seq, Text: h.Report.Text, Time: h.Report.Time}
-		}
 		if h.ClaimID != "" {
 			m.claimID, m.rootInVM = h.ClaimID, true
 		}
@@ -309,20 +304,10 @@ func (m *Machine) control(now time.Time, typ wire.Type, payload []byte) []Effect
 		if res.Error != "" && !res.Frozen {
 			m.freezeSkip[res.ID] = true
 		}
-	case wire.TStatus:
-		var st wire.Status
-		if wire.Decode(payload, &st) == nil {
-			m.sessions = st.Sessions
-		}
 	case wire.TExit:
 		var ex wire.Exit
 		if wire.Decode(payload, &ex) == nil {
 			m.recordExit(now, ex)
-		}
-	case wire.TReport:
-		var r wire.Report
-		if wire.Decode(payload, &r) == nil && r.Text != "" && (m.report == nil || r.Seq > m.report.Seq) {
-			m.report = &podapi.Report{Seq: r.Seq, Text: r.Text, Time: now}
 		}
 	case wire.TShutdownDone:
 		var sd wire.ShutdownDone
@@ -342,7 +327,14 @@ func (m *Machine) recordExit(now time.Time, ex wire.Exit) {
 	if m.exit != nil {
 		return
 	}
-	m.exit = &podapi.Exit{Code: ex.Code, Signal: ex.Signal, Reason: ex.Reason, Output: ex.Output}
+	reason := ex.Reason
+	if m.stopRequested() && reason == wire.ReasonCompleted {
+		reason = wire.ReasonStopped
+		if m.desired.StopReason != "" {
+			reason = m.desired.StopReason
+		}
+	}
+	m.exit = &podapi.Exit{Code: ex.Code, Signal: ex.Signal, Reason: reason, Output: ex.Output}
 	if m.stopSince.IsZero() {
 		m.stopSince = now
 	}
@@ -538,11 +530,10 @@ func (m *Machine) Reconcile(now time.Time) []Effect {
 			e := m.disks[mount.ID]
 			e.waiting, e.waitType, e.waitSince = true, wire.TMountResult, now
 		}
-		m.report = nil
 		effects = append(effects, m.send(wire.TClaim, wire.Claim{
 			ID: c.Root.ID, Serial: diskSerial(c.Root), Hostname: c.BlipName,
-			Command: append([]string(nil), c.Command...), TTY: c.TTY, Env: append([]string(nil), c.Env...), WorkingDir: c.WorkingDir,
-			User: c.User, WaitForClient: c.WaitForClient, Mounts: mounts,
+			Command: append([]string(nil), c.Command...), Env: append([]string(nil), c.Env...), WorkingDir: c.WorkingDir,
+			User: c.User, Mounts: mounts,
 		}))
 		m.claimWaiting, m.claimSince = true, now
 		return effects
@@ -753,14 +744,10 @@ func (m *Machine) phase() string {
 
 // Observed returns a detached snapshot suitable for the pod API or a trace.
 func (m *Machine) Observed() podapi.Observed {
-	o := podapi.Observed{Phase: m.phase(), ClaimID: m.claimID, Sessions: m.sessions, Error: m.errMsg, NetworkRevision: m.networkRevision, NetworkError: m.networkError}
+	o := podapi.Observed{Phase: m.phase(), ClaimID: m.claimID, Error: m.errMsg, NetworkRevision: m.networkRevision, NetworkError: m.networkError}
 	if m.exit != nil {
 		ex := *m.exit
 		o.Exit = &ex
-	}
-	if m.report != nil {
-		r := *m.report
-		o.Report = &r
 	}
 	for _, id := range m.desired.Freeze {
 		if m.frozen[id] {

@@ -83,6 +83,9 @@ type ServerConfig struct {
 	Peers     *Registry
 	Authorize Authorizer
 	DataDir   string // lease persistence
+	// Stream serves the trajectory/stdin routes. It is optional; without it
+	// the stream routes report that the service is unavailable.
+	Stream StreamTarget
 	// Optional instance dependencies; production defaults use the kernel,
 	// fsync-backed lease file, cryptographic lease IDs, and real time.
 	Target          ExportTarget

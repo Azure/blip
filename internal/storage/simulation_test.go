@@ -429,7 +429,7 @@ func (x *storageSimulation) working() *record {
 
 func (x *storageSimulation) cloning() *record {
 	x.image()
-	r := &record{ID: "clone", Kind: KindWorking, Base: "image", Size: 8 * blockSize, Layered: true,
+	r := &record{ID: "clone", Kind: KindWorking, Base: "image", Size: 8 * blockSize, FSBytes: 8 * blockSize, Layered: true,
 		Clone: &cloneInfo{MetaSize: blockSize, Source: "/remote/source", SourceSize: 8 * blockSize, RemoteID: "remote/lease"}}
 	if _, err := x.s.begin(r, 2); err != nil {
 		x.t.Fatal(err)
@@ -583,7 +583,7 @@ func TestStorageSimulationCrashMatrix(t *testing.T) {
 		}},
 		"snapshot-active": {setup: func(x *storageSimulation) { x.working() }, run: func(x *storageSimulation) error {
 			origin := x.s.vols["working"]
-			r := &record{ID: "new", Kind: KindCommit, Size: origin.Size}
+			r := &record{ID: "new", Kind: KindCommit, Size: origin.Size, FSBytes: origin.fsBytes()}
 			if _, err := x.s.begin(r, 1); err != nil {
 				return err
 			}
@@ -661,7 +661,7 @@ func TestStorageSimulationHydrationAndSnapshotContent(t *testing.T) {
 			t.Fatalf("block %d: %q != %q", block, got, want[block])
 		}
 	}
-	snapshot := &record{ID: "snapshot", Kind: KindCommit, Size: r.Size}
+	snapshot := &record{ID: "snapshot", Kind: KindCommit, Size: r.Size, FSBytes: r.fsBytes()}
 	if _, err := x.s.begin(snapshot, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -935,7 +935,7 @@ func TestFetchReplacesOrphanedDevices(t *testing.T) {
 func TestFetchRetriesUnfinishedRecord(t *testing.T) {
 	x := newStorageSimulation(t)
 	x.s.cloneWait = fetchHydration(x)
-	rec := &record{ID: "new", Kind: KindCommit, Size: 8 * blockSize,
+	rec := &record{ID: "new", Kind: KindCommit, Size: 8 * blockSize, FSBytes: 8 * blockSize,
 		Clone: &cloneInfo{MetaSize: blockSize, Source: "/remote/source", SourceSize: 8 * blockSize}}
 	if _, err := x.s.begin(rec, 2); err != nil {
 		t.Fatal(err)

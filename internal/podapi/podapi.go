@@ -44,11 +44,12 @@ const (
 	// FileMode is the mode of every document written by WriteJSON. The node
 	// agent and the runtime both run as root on the node.
 	FileMode os.FileMode = 0o600
-	// VsockSocket is the Cloud Hypervisor vsock unix socket. Clients
+	// VsockSocket is the Cloud Hypervisor vsock unix socket, below the pod
+	// directory. The directory is bind-mounted into the API-proxy sidecar so
+	// both the hypervisor and the sidecar can create sockets in it. Clients
 	// connect and write "CONNECT <port>\n" to reach a guest port.
-	VsockSocket = "vsock/vsock.sock"
+	VsockSocket = "sock/vsock.sock"
 	APISocket   = "ch-api.sock"
-
 )
 
 // Desired is written by the node agent.

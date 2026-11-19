@@ -60,6 +60,13 @@ func mknodDevice(path, device string) error {
 }
 
 func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
+	// compute planned from an indexed copy; build the same lookups here for
+	// the stream and idle decisions.
+	v.index()
+	// Open trajectory writers for accepted claims before desired.json is
+	// written, and stop a running command whose idle timeout expired.
+	a.reconcileStreams(ctx, v)
+	a.applyIdle(v, p)
 	for _, key := range sortedKeys(p.desired) {
 		d := p.desired[key]
 		path := filepath.Join(a.podDirFor(key), podapi.DesiredFile)
@@ -391,6 +398,13 @@ func (a *Agent) prepare(ctx context.Context, v *view, pr prepare) error {
 }
 
 func (a *Agent) seal(ctx context.Context, s seal) error {
+	// The ring's device must be closed before a snapshot: storage.Seal fails
+	// with ErrInUse while anything still has the plaintext device open.
+	if a.streams != nil {
+		if err := a.streams.closeWriter(s.attachmentID); err != nil {
+			return fmt.Errorf("close stream writer %s: %w", s.attachmentID, err)
+		}
+	}
 	size, err := a.store.Seal(ctx, s.attachmentID, s.commitID)
 	if err == nil {
 		slog.Info("sealed", "attachment", s.attachmentID, "commit", s.commitID, "size", size)
@@ -442,6 +456,13 @@ func (a *Agent) liveCopy(ctx context.Context, lc liveCopy) error {
 			return nil
 		}
 		return err
+	}
+	// The ring is written from the host into the same device. Persist it
+	// before the frozen filesystem is snapshotted.
+	if a.streams != nil {
+		if err := a.streams.flushWriter(lc.attachmentID); err != nil {
+			return fmt.Errorf("flush stream writer %s: %w", lc.attachmentID, err)
+		}
 	}
 	size, err := a.store.LiveCopy(ctx, lc.attachmentID, lc.commitID, lc.stateUID)
 	if err != nil {

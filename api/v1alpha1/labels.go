@@ -69,13 +69,6 @@ const (
 	// the watcher from recreating that deterministic turn after retention.
 	AnnotationPrunedFinished = "blip.dev/pruned-finished"
 
-	// AnnotationWaitForClient on a Blip asks the guest to hold the primary
-	// command's output until a client attaches. A Blip created directly
-	// through the API may omit it, and then the command starts itself.
-	// `blip gather -f` attaches to a command that is already running, so the
-	// CLI does not set it.
-	AnnotationWaitForClient = "blip.dev/wait-for-client"
-
 	Finalizer = "blip.dev/finalizer"
 )
 

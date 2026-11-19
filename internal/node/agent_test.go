@@ -162,6 +162,26 @@ func (f *fakeStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeStore) Device(id string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.volumes[id]
+	if !ok {
+		return "", storage.ErrNotFound
+	}
+	if v.Device == "" {
+		v.Device = "/dev/fake/" + id
+		f.volumes[id] = v
+	}
+	return v.Device, nil
+}
+
+func (f *fakeStore) OpenView(ctx context.Context, stateUID, commitID, viewID string) (string, error) {
+	return "", storage.ErrNotFound
+}
+
+func (f *fakeStore) CloseView(viewID string) error { return nil }
+
 // gatedLiveCopyStore holds each live copy inside LiveCopy so a test can
 // interleave two copies deterministically.
 type gatedLiveCopyStore struct {

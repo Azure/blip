@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blip Chat</title>
+<style>
+  :root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif; }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; background: #f5f5f4; color: #1c1917; }
+  aside { width: 300px; display: flex; flex-direction: column; border-right: 1px solid #d6d3d1; background: #fff; }
+  aside header { padding: 12px; border-bottom: 1px solid #d6d3d1; display: flex; gap: 8px; }
+  aside header input { min-width: 0; flex: 1; }
+  #sessions { list-style: none; margin: 0; padding: 6px; overflow: auto; flex: 1; }
+  #sessions li { padding: 9px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 2px; }
+  #sessions li:hover { background: #f5f5f4; }
+  #sessions li.active { background: #e7e5e4; }
+  #sessions b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #sessions small { color: #78716c; }
+  main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  main header { padding: 10px 16px; border-bottom: 1px solid #d6d3d1; display: flex; align-items: center; gap: 10px; background: #fff; }
+  main header h1 { font-size: 17px; margin: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #e7e5e4; color: #57534e; }
+  #status.running { background: #dcfce7; color: #166534; }
+  #transcript { flex: 1; overflow: auto; padding: 18px; }
+  .msg { max-width: 780px; margin: 0 auto 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { background: #2563eb; color: #fff; padding: 9px 12px; border-radius: 12px 12px 4px 12px; width: fit-content; margin-right: 0; }
+  .msg.agent { padding: 2px 0; }
+  .msg.system, .msg.tool { color: #78716c; font-size: 13px; }
+  .msg.error { color: #b91c1c; }
+  .msg.thought { color: #78716c; font-size: 13px; font-style: italic; }
+  form#composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #d6d3d1; background: #fff; }
+  form#composer textarea { flex: 1; resize: none; height: 52px; padding: 9px; font: inherit; border: 1px solid #d6d3d1; border-radius: 8px; }
+  button, input, select { font: inherit; }
+  button { border: 1px solid #d6d3d1; background: #fff; border-radius: 8px; padding: 6px 11px; cursor: pointer; }
+  button.primary { background: #1c1917; border-color: #1c1917; color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  dialog { border: 0; border-radius: 12px; padding: 18px; width: min(420px, 92vw); box-shadow: 0 12px 40px #0004; }
+  dialog h2 { margin: 0 0 12px; font-size: 18px; }
+  dialog label { display: block; font-size: 13px; color: #57534e; margin: 10px 0 4px; }
+  dialog input, dialog select { width: 100%; padding: 7px; border: 1px solid #d6d3d1; border-radius: 7px; }
+  dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  #empty { color: #78716c; text-align: center; margin-top: 18vh; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #1c1917; color: #fff; padding: 8px 14px; border-radius: 8px; display: none; max-width: 90vw; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1c1917; color: #e7e5e4; }
+    aside, main header, form#composer, button, input, select { background: #292524; color: #e7e5e4; }
+    aside, main header, form#composer { border-color: #44403c; }
+    #sessions li:hover { background: #292524; }
+    #sessions li.active { background: #44403c; }
+    input, select, textarea, button { border-color: #57534e; }
+    button.primary { background: #e7e5e4; color: #1c1917; }
+    #status { background: #44403c; color: #d6d3d1; }
+    #status.running { background: #14532d; color: #dcfce7; }
+    dialog { background: #292524; color: #e7e5e4; }
+  }
+</style>
+</head>
+<body>
+<aside>
+  <header>
+    <input id="ns" value="default" aria-label="Namespace" title="Namespace">
+    <button id="new" class="primary">New</button>
+  </header>
+  <ul id="sessions"></ul>
+</aside>
+<main>
+  <header>
+    <h1 id="title">Blip Chat</h1>
+    <span id="status">idle</span>
+    <button id="cancel" disabled>Cancel</button>
+    <button id="stop" disabled>Stop</button>
+  </header>
+  <div id="transcript"><div id="empty">Select a chat or create one.</div></div>
+  <form id="composer">
+    <textarea id="text" placeholder="Message the agent" disabled></textarea>
+    <button class="primary" id="send" disabled>Send</button>
+  </form>
+</main>
+<dialog id="create">
+  <form id="create-form">
+    <h2>New chat</h2>
+    <label>Title <input id="new-title" placeholder="Debug the flaky e2e" maxlength="200"></label>
+    <label>Profile <select id="new-profile"></select></label>
+    <label>Base state (optional) <input id="new-base" placeholder="a BlipState to copy"></label>
+    <div class="actions">
+      <button type="button" id="create-cancel">Cancel</button>
+      <button class="primary" id="create-ok">Create</button>
+    </div>
+  </form>
+</dialog>
+<div id="toast"></div>
+<script>
+const state = { ns: "default", current: null, source: null, offset: 0, profiles: [] };
+const $ = (id) => document.getElementById(id);
+
+function toast(message) {
+  const t = $("toast");
+  t.textContent = message;
+  t.style.display = "block";
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { t.style.display = "none"; }, 5000);
+}
+
+async function api(path, options) {
+  options = options || {};
+  const url = new URL(path, location.origin);
+  if (!url.searchParams.has("namespace")) url.searchParams.set("namespace", state.ns);
+  const init = { method: options.method || "GET", headers: {} };
+  if (options.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(options.body);
+  }
+  const res = await fetch(url, init);
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) throw new Error((data && data.error) || res.status + " " + res.statusText);
+  return data;
+}
+
+function clearTranscript() {
+  $("transcript").innerHTML = "";
+}
+
+function addMessage(role, text, tag) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.dataset.role = role;
+  div.dataset.chunk = tag === "chunk" ? "1" : "0";
+  div.textContent = text;
+  $("transcript").appendChild(div);
+  div.scrollIntoView({ block: "end" });
+  return div;
+}
+
+function appendChunk(role, text) {
+  if (!text) return;
+  const nodes = $("transcript").children;
+  const last = nodes[nodes.length - 1];
+  if (last && last.dataset.role === role && last.dataset.chunk === "1") {
+    last.textContent += text;
+    last.scrollIntoView({ block: "end" });
+    return;
+  }
+  addMessage(role, text, "chunk");
+}
+
+function setStatus(phase, running, detail) {
+  const el = $("status");
+  el.textContent = running ? "running" : (phase || "idle");
+  el.className = running ? "running" : "";
+  el.title = detail || "";
+}
+
+function textOf(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(textOf).join("");
+  return content.text || "";
+}
+
+function renderACP(msg) {
+  if (!msg || typeof msg !== "object") return;
+  if (msg.method === "session/update") {
+    const u = (msg.params && (msg.params.update || msg.params)) || {};
+    switch (u.sessionUpdate) {
+      case "agent_message_chunk": appendChunk("agent", textOf(u.content)); return;
+      case "agent_thought_chunk": appendChunk("thought", textOf(u.content)); return;
+      case "user_message_chunk": appendChunk("user", textOf(u.content)); return;
+      case "tool_call": addMessage("tool", "tool: " + (u.title || u.toolCallId || "call")); return;
+      case "tool_call_update":
+        if (u.status) addMessage("tool", "tool: " + u.status + (u.title ? " " + u.title : ""));
+        return;
+      case "plan":
+        (u.entries || []).forEach((e) => addMessage("tool", "plan: " + (e.content || e.status || "")));
+        return;
+      case "available_commands_update": return;
+    }
+  }
+  if (msg.method === "blip/output") {
+    const p = msg.params || {};
+    addMessage("system", (p.stream || "output") + ": " + (p.text || ""));
+    return;
+  }
+  if (msg.method === "session/request_permission") {
+    addMessage("tool", "permission requested: " + ((msg.params && msg.params.toolCall && msg.params.toolCall.title) || "tool"));
+    return;
+  }
+  if (msg.error) {
+    addMessage("error", "error: " + (msg.error.message || JSON.stringify(msg.error)));
+    return;
+  }
+  if (msg.result && typeof msg.result === "object" && msg.result.stopReason) {
+    addMessage("system", "turn complete: " + msg.result.stopReason);
+  }
+}
+
+function handleEvent(ev) {
+  if (typeof ev.offset === "number") state.offset = ev.offset;
+  if (ev.type === "acp") renderACP(ev.message);
+  else if (ev.type === "status" && ev.status) setStatus(ev.status.phase, ev.status.running, ev.status.detail);
+  else if (ev.type === "gap") addMessage("system", "older events were trimmed; reopening the chat reloads the transcript");
+}
+
+function closeEvents() {
+  if (state.source) state.source.close();
+  state.source = null;
+}
+
+function openEvents() {
+  closeEvents();
+  if (!state.current) return;
+  const url = "/api/sessions/" + encodeURIComponent(state.current) +
+    "/events?namespace=" + encodeURIComponent(state.ns) + "&offset=" + state.offset;
+  const source = new EventSource(url);
+  state.source = source;
+  source.onmessage = (m) => {
+    try { handleEvent(JSON.parse(m.data)); } catch (err) { console.error(err); }
+  };
+  source.onerror = () => { setStatus("reconnecting", false, "event stream"); };
+}
+
+async function openSession(name) {
+  state.current = name;
+  state.offset = 0;
+  closeEvents();
+  try {
+    const d = await api("/api/sessions/" + encodeURIComponent(name));
+    $("title").textContent = d.title || name;
+    setStatus(d.phase, d.running, "generation " + (d.generation || 0));
+    clearTranscript();
+    (d.transcript || []).forEach(renderACP);
+    if (!(d.transcript || []).length) addMessage("system", "No transcript in this process yet.");
+    state.offset = d.offset || 0;
+    $("text").disabled = false;
+    $("send").disabled = false;
+    $("cancel").disabled = false;
+    $("stop").disabled = false;
+    openEvents();
+    markActive();
+  } catch (err) { toast(err.message); }
+}
+
+function markActive() {
+  document.querySelectorAll("#sessions li").forEach((li) => {
+    li.classList.toggle("active", li.dataset.name === state.current);
+  });
+}
+
+async function loadSessions() {
+  state.ns = $("ns").value.trim() || "default";
+  try {
+    const sessions = await api("/api/sessions");
+    const list = $("sessions");
+    list.innerHTML = "";
+    sessions.forEach((s) => {
+      const li = document.createElement("li");
+      li.dataset.name = s.name;
+      const b = document.createElement("b");
+      b.textContent = s.title || s.name;
+      const small = document.createElement("small");
+      small.textContent = (s.running ? "running" : (s.phase || "idle")) + " · " + s.profile;
+      li.appendChild(b);
+      li.appendChild(small);
+      li.onclick = () => openSession(s.name);
+      list.appendChild(li);
+    });
+    markActive();
+  } catch (err) { toast(err.message); }
+}
+
+async function loadProfiles() {
+  try {
+    state.profiles = await api("/api/profiles");
+    const select = $("new-profile");
+    select.innerHTML = "";
+    state.profiles.forEach((p) => {
+      const o = document.createElement("option");
+      o.value = p.name;
+      o.textContent = p.title + (p.default ? " (default)" : "");
+      select.appendChild(o);
+    });
+  } catch (err) { toast(err.message); }
+}
+
+async function send() {
+  const text = $("text").value.trim();
+  if (!text || !state.current) return;
+  $("text").value = "";
+  try {
+    await api("/api/sessions/" + encodeURIComponent(state.current) + "/message", { method: "POST", body: { text } });
+    appendChunk("user", text);
+  } catch (err) { toast(err.message); }
+}
+
+$("ns").addEventListener("change", () => { closeEvents(); state.current = null; clearTranscript(); loadSessions().then(loadProfiles); });
+$("new").onclick = () => { $("new-title").value = ""; $("create").showModal(); };
+$("create-cancel").onclick = () => $("create").close();
+$("create-form").onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const created = await api("/api/sessions", {
+      method: "POST",
+      body: {
+        namespace: state.ns,
+        title: $("new-title").value,
+        profile: $("new-profile").value,
+        base: $("new-base").value.trim()
+      }
+    });
+    $("create").close();
+    await loadSessions();
+    await openSession(created.name);
+  } catch (err) { toast(err.message); }
+};
+$("composer").onsubmit = (e) => { e.preventDefault(); send(); };
+$("text").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("cancel").onclick = async () => {
+  if (!state.current) return;
+  try { await api("/api/sessions/" + encodeURIComponent(state.current) + "/cancel", { method: "POST", body: {} }); }
+  catch (err) { toast(err.message); }
+};
+$("stop").onclick = async () => {
+  if (!state.current) return;
+  try { await api("/api/sessions/" + encodeURIComponent(state.current) + "/stop", { method: "POST", body: {} }); }
+  catch (err) { toast(err.message); }
+};
+
+loadSessions().then(loadProfiles);
+</script>
+</body>
+</html>

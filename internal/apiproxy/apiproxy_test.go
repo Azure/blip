@@ -164,7 +164,7 @@ func TestConfigFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.API == nil || cfg.API.Address != "10.96.0.1:443" || cfg.SocketPath != "/run/blip/vsock/vsock.sock_1027" ||
+	if cfg.API == nil || cfg.API.Address != "10.96.0.1:443" || cfg.SocketPath != "/run/blip/sock/vsock.sock_1027" ||
 		cfg.API.TokenFile != serviceAccountDir+"/token" || cfg.API.CAFile != serviceAccountDir+"/ca.crt" ||
 		cfg.PodName != "vm-0" || cfg.PodNamespace != "blip-sandbox" || len(cfg.Endpoints) != 0 {
 		t.Fatalf("unexpected config: %+v", cfg)
@@ -209,7 +209,7 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("BLIP_DIR", "/custom")
 	t.Setenv("KUBERNETES_SERVICE_HOST", "fd00::1")
 	cfg, err = ConfigFromEnv()
-	if err != nil || cfg.API.Address != "[fd00::1]:443" || cfg.SocketPath != "/custom/vsock/vsock.sock_1027" {
+	if err != nil || cfg.API.Address != "[fd00::1]:443" || cfg.SocketPath != "/custom/sock/vsock.sock_1027" {
 		t.Fatalf("IPv6/custom config: %+v, %v", cfg, err)
 	}
 	for _, test := range []struct{ host, port string }{

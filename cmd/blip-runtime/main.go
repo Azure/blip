@@ -1,8 +1,7 @@
 // Command blip-runtime runs one blip VM inside a VM pod.
 //
-//	blip-runtime              supervise Cloud Hypervisor (see the README's implementation outline)
-//	blip-runtime bridge PORT  relay stdin/stdout to a guest vsock port
-//	blip-runtime api-proxy    serve the VM-only HTTP proxy for the API and endpoints
+//	blip-runtime            supervise Cloud Hypervisor (see the README)
+//	blip-runtime api-proxy  serve the VM-only HTTP proxy for the API and endpoints
 package main
 
 import (
@@ -11,7 +10,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 
 	"github.com/Azure/blip/internal/apiproxy"
@@ -34,18 +32,8 @@ func main() {
 		return
 	}
 	o := runtime.OptionsFromEnv()
-	if len(os.Args) == 3 && os.Args[1] == "bridge" {
-		port, err := strconv.ParseUint(os.Args[2], 10, 32)
-		if err != nil {
-			log.Fatalf("bad port %q", os.Args[2])
-		}
-		if err := runtime.Bridge(o, uint32(port)); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
 	if len(os.Args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: blip-runtime [bridge PORT | api-proxy]")
+		fmt.Fprintln(os.Stderr, "usage: blip-runtime [api-proxy]")
 		os.Exit(2)
 	}
 	if err := runtime.Run(o); err != nil {

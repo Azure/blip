@@ -7,12 +7,18 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 
 	"golang.org/x/sys/unix"
 )
 
-func mkfsExt4(ctx context.Context, dev string) error {
-	_, err := runInContext(ctx, "", nil, "mkfs.ext4", "-q", "-F", "-m", "0", "-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1", dev)
+func mkfsExt4(ctx context.Context, dev string, fsBytes int64) error {
+	blocks := fsBytes / 4096
+	if blocks <= 0 {
+		return fmt.Errorf("storage: invalid filesystem size %d", fsBytes)
+	}
+	_, err := runInContext(ctx, "", nil, "mkfs.ext4", "-q", "-F", "-m", "0", "-b", "4096",
+		"-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1", dev, strconv.FormatInt(blocks, 10))
 	return err
 }
 
@@ -22,9 +28,13 @@ func mkfsExt4(ctx context.Context, dev string) error {
 // E2FSPROGS_FAKE_TIME, unlike SOURCE_DATE_EPOCH, does not clamp file times.
 var fixedTimeEnv = []string{"E2FSPROGS_FAKE_TIME=1735689600", "E2FSCK_TIME=1735689600"}
 
-// growExt4 grows the filesystem on dev to fill the device. With reproducible
-// set, the result depends only on the input bytes and the device size.
-func growExt4(ctx context.Context, dev string, reproducible bool) error {
+// growExt4 grows the filesystem on dev to fsBytes. With reproducible set, the
+// result depends only on the input bytes and the filesystem size.
+func growExt4(ctx context.Context, dev string, fsBytes int64, reproducible bool) error {
+	blocks := fsBytes / 4096
+	if blocks <= 0 {
+		return fmt.Errorf("storage: invalid filesystem size %d", fsBytes)
+	}
 	var env []string
 	if reproducible {
 		env = fixedTimeEnv
@@ -36,7 +46,7 @@ func growExt4(ctx context.Context, dev string, reproducible bool) error {
 			return err
 		}
 	}
-	_, err := runInContext(ctx, "", env, "resize2fs", dev)
+	_, err := runInContext(ctx, "", env, "resize2fs", dev, strconv.FormatInt(blocks, 10))
 	return err
 }
 

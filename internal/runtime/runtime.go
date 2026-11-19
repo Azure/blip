@@ -396,11 +396,10 @@ func (r *runtime) boot() (*podNet, error) {
 	if err := podapi.EnsureDir(r.o.Dir); err != nil {
 		return nil, err
 	}
-	// The vsock directory is an emptyDir shared with the non-root API-proxy
-	// sidecar, which binds vsock.sock_<port> there (kubelet fsGroup makes it
-	// group-writable). Leave its mode alone; only the CH-owned socket is
-	// restricted below.
-	if err := os.MkdirAll(filepath.Dir(r.o.path(podapi.VsockSocket)), 0o755); err != nil {
+	// The socket directory is bind-mounted into the non-root API-proxy sidecar,
+	// which binds vsock.sock_<port> there. It must be writable by that user;
+	// the enclosing pod directory stays root-only.
+	if err := os.MkdirAll(filepath.Dir(r.o.path(podapi.VsockSocket)), 0o777); err != nil {
 		return nil, err
 	}
 	for _, s := range []string{podapi.APISocket, podapi.VsockSocket} {

@@ -16,16 +16,16 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch, create, update, patch, delete]
-  # Preserve the tail of a finished command before deleting its pod.
-  - apiGroups: [""]
-    resources: [pods/log]
-    verbs: [get]
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch, patch]
+  # The stream API's serving certificate Secret and APIService.
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, list]
+    verbs: [get, list, watch, create, update]
+  - apiGroups: [apiregistration.k8s.io]
+    resources: [apiservices]
+    verbs: [get, list, watch, create, update]
   # The blip-vm-owners table of the blip-vm-owner admission policy.
   - apiGroups: [""]
     resources: [configmaps]

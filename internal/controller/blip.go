@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -42,6 +41,7 @@ const (
 	ReasonPrepareFailed = "PrepareFailed"
 	ReasonStartTimeout  = "StartTimeout"
 	ReasonStopped       = "Stopped"
+	ReasonIdle          = "Idle"
 	ReasonCompleted     = "Completed"
 	ReasonError         = "Error"
 	ReasonPodLost       = "PodLost"
@@ -263,90 +263,6 @@ func (r *BlipReconciler) flush(ctx context.Context, b, base *v1.Blip) error {
 	return nil
 }
 
-// podOutput reads the serial console of a VM pod and returns the tail of the
-// lines the guest mirrored from the command, without boot noise. It is best
-// effort: a missing log or a read error simply leaves the output empty.
-func (r *BlipReconciler) podOutput(ctx context.Context, namespace, pod string) (string, bool) {
-	if r.Config.PodLogs == nil {
-		return "", false
-	}
-	rc, err := r.Config.PodLogs(ctx, namespace, pod)
-	if err != nil {
-		return "", false
-	}
-	defer rc.Close()
-	var lines []string
-	total := 0
-	truncated := false
-	sc := bufio.NewScanner(rc)
-	sc.Buffer(make([]byte, 64<<10), 1<<20)
-	for sc.Scan() {
-		line, ok := strings.CutPrefix(sc.Text(), "blip: ")
-		if !ok {
-			continue
-		}
-		lines = append(lines, line)
-		total += len(line) + 1
-		for total > maxRetainedOutput && len(lines) > 1 {
-			total -= len(lines[0]) + 1
-			lines = lines[1:]
-			truncated = true
-		}
-	}
-	if len(lines) == 0 {
-		return "", false
-	}
-	return retainTail(lines, truncated), true
-}
-
-// retainTail joins the newest whole lines that fit in maxRetainedOutput. When
-// earlier lines were removed it reserves room for outputTruncated and prefixes
-// it, so a consumer can tell the head is missing. Only a line longer than the
-// bound is split.
-func retainTail(lines []string, truncated bool) string {
-	limit := maxRetainedOutput
-	if truncated {
-		limit -= len(outputTruncated)
-	}
-	total := 0
-	for _, line := range lines {
-		total += len(line) + 1
-	}
-	start := 0
-	// Always keep the newest line, even when it alone exceeds the bound; the
-	// byte-level cut below preserves its tail rather than losing all output.
-	for total > limit && len(lines)-start > 1 {
-		total -= len(lines[start]) + 1
-		start++
-	}
-	out := strings.Join(lines[start:], "\n")
-	if len(out) > 0 {
-		out += "\n"
-	}
-	if truncated {
-		out = outputTruncated + out
-	}
-	if len(out) > maxRetainedOutput {
-		// A single line exceeded the bound; keep its most recent bytes and
-		// start at a line boundary when one is left.
-		cut := len(out) - (maxRetainedOutput - len(outputTruncated))
-		// Start at the next line boundary when that leaves output behind;
-		// an overlong line's final newline must not discard its whole tail.
-		if i := strings.IndexByte(out[cut:], '\n'); i >= 0 && i+1 < len(out)-cut {
-			cut += i + 1
-		}
-		out = outputTruncated + out[cut:]
-	}
-	return out
-}
-
-// maxRetainedOutput bounds the command output copied from the serial console
-// into Blip status. The full output is in the pod log until it is deleted;
-// this tail is what survives.
-const maxRetainedOutput = 64 << 10
-
-const outputTruncated = "[earlier output was truncated]\n"
-
 // cleanup preserves the tail of a finished command, deletes its pod, and
 // removes the finalizer once the Blip is being deleted.
 func (r *BlipReconciler) cleanup(ctx context.Context, b *v1.Blip) error {
@@ -355,13 +271,6 @@ func (r *BlipReconciler) cleanup(ctx context.Context, b *v1.Blip) error {
 		pod := &corev1.Pod{}
 		err = r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.Pod}, pod)
 		if err == nil && string(pod.UID) == b.Status.PodUID && pod.DeletionTimestamp == nil {
-			if out, ok := r.podOutput(ctx, b.Namespace, pod.Name); ok && b.Status.Output == "" {
-				base := b.DeepCopy()
-				b.Status.Output = out
-				if err = patchStatus(ctx, r.Client, b, base); err != nil {
-					return err
-				}
-			}
 			err = r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID})
 		}
 	}
@@ -1222,7 +1131,6 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 	if err := r.ensureWriterPods(ctx, b); err != nil {
 		return reconcile.Result{}, err
 	}
-	b.Status.Sessions = int32(obs.Sessions)
 	// Mirror the observation error, but never erase the cause recorded when
 	// the controller stopped this Blip. A stop caused by a deleted state (or
 	// any other controller reason) must survive the following reconciles,
@@ -1231,12 +1139,8 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 	if obs.Error != "" || !stopping(b) || b.Annotations[v1.AnnotationStopReason] == "" {
 		b.Status.Message = obs.Error
 	}
-	if obs.Report != nil && (b.Status.Report == nil || int64(obs.Report.Seq) > b.Status.Report.Seq) {
-		t := metav1.NewTime(obs.Report.Time)
-		b.Status.Report = &v1.BlipReport{Seq: int64(obs.Report.Seq), Text: obs.Report.Text, Time: &t}
-	}
 	if obs.Exit != nil {
-		if obs.Exit.Reason != ReasonStopped {
+		if obs.Exit.Reason != ReasonStopped && obs.Exit.Reason != ReasonIdle {
 			code := int32(obs.Exit.Code)
 			b.Status.ExitCode = &code
 		}
@@ -1360,7 +1264,6 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 		}
 	}
 	b.Status.Mounts = mounts
-	b.Status.Sessions = 0
 	b.Status.Phase = v1.BlipSaving
 	return reconcile.Result{}, nil
 }
@@ -1369,7 +1272,7 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 // exit reason when the runtime did not report one.
 func (r *BlipReconciler) fenced(b *v1.Blip, pod *corev1.Pod, obs *podapi.Observed) (bool, time.Duration) {
 	setReason := func(reason, msg string) {
-		if b.Status.ExitCode == nil && b.Status.Reason != ReasonStopped {
+		if b.Status.ExitCode == nil && b.Status.Reason != ReasonStopped && b.Status.Reason != ReasonIdle {
 			b.Status.Reason = reason
 			if msg != "" {
 				b.Status.Message = msg
@@ -1540,7 +1443,7 @@ func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
 		return nil
 	}
 	code := b.Status.ExitCode
-	if code != nil && *code == 0 || b.Status.Reason == ReasonStopped {
+	if code != nil && *code == 0 || b.Status.Reason == ReasonStopped || b.Status.Reason == ReasonIdle {
 		r.finish(b, v1.BlipSucceeded, b.Status.Reason, b.Status.Message)
 		return nil
 	}

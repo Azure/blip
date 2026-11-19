@@ -209,6 +209,10 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
   related ICMP errors (including PMTUD) remain allowed.
 - Writes complete `desired.json`/`observed.json` snapshots and reconciles guest
   claims, mounts, freeze requests, and shutdown.
+- The vsock socket lives in the pod directory (`sock/vsock.sock`), so the node
+  agent dials the guest's stdio port directly. A bind-mounted `sock`
+  subdirectory lets the non-root API-proxy sidecar share the same socket
+  directory without access to the rest of the pod directory.
 - The `api-proxy` native sidecar holds projected service-account tokens and
   proxies the guest's loopback HTTP names over vsock. It routes by `Host`
   header: `kube-apiserver` goes to the API server with reads scoped to the
@@ -226,79 +230,136 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 
 - PID 1 in the initramfs: reads its config disk, mounts pseudo-filesystems, loads
   modules, configures `eth0` over rtnetlink, and serves the framed vsock
-  protocol on port 1024 (control) and 1025 (sessions). A second loopback
-  listener on `127.0.2.2:80` raw-forwards to the API-proxy sidecar, and
-  `/etc/hosts` maps `kube-apiserver` and the pool's endpoint names to it.
+  protocol on port 1024 (control) and 1026 (stdio). A loopback listener on
+  `127.0.2.2:80` raw-forwards to the API-proxy sidecar, and `/etc/hosts` maps
+  `kube-apiserver` and the pool's endpoint names to it.
 - Claims the root ext4 filesystem, chroots into it, resolves users/groups from
-  the image's `/etc/passwd` and `/etc/group`, runs processes in a cgroup, and
-  supports PTYs, multiple command sessions, signals, and window resize. Each
-  session keeps a 1 MiB output replay ring.
+  the image's `/etc/passwd` and `/etc/group`, runs the one required command in a
+  cgroup, and wires its stdin/stdout/stderr to the stdio port. There is no
+  exec, no TTY, and no second command. The guest buffers the last 256 KiB of
+  each output stream so a reconnecting node agent resumes from byte offsets
+  instead of losing output.
 - Uses `FIFREEZE`/`FITHAW` with a 90s auto-thaw for live snapshots.
 - Writes `/run/blip/kubeconfig` pointing at `http://kube-apiserver`; the proxy
   injects the real token, so no credential enters the workload filesystem.
-- Serves a report endpoint at `http://blip/report` (`127.0.2.1:80`), exposed to
-  the command as `BLIP_REPORT_URL`. A workload POSTs up to 1 KiB of UTF-8 text
-  and receives `{"seq": n}`; the text becomes `status.report` on the Blip and
-  survives the pod. Reports are spaced at least 10 seconds apart and are never
-  coalesced.
 
-### Coordinator (`blipchat`, `cmd/blipchat` and `internal/blipchat`)
+### Stream API (`internal/streamapi`)
 
-Blipchat is a stateless Deployment with one elected leader. The leader
-sequences turns, turns blip reports and finished blips into turns, and runs
-coordinator steps; every replica serves the engineer chat. Steps are driven by
-`wake=Now` turns, a short debounce for `wake=Batch`, status timers, and a
-heartbeat while tasks are open. A step reads its system prompt (the thread's
-`spec.systemPrompt`, or the built-in default) and charter, a compact task board,
-the rolling summary and new turns, may call asynchronous tools (start, exec
-and stop blips; manage tasks and timers), and then writes its turns and
-one status update. One worker per thread serializes status writes. The model
-is any OpenAI-compatible endpoint selected with `--llm-base-url`; the chat
-front end authenticates users and blipchat reads the identity from
-`X-Forwarded-User`. The chat is stateless: the browser sends its transcript and
-`POST /chat?namespace=NS` names the thread (a valid DNS-1123 namespace label;
-the default is `default`).
+Node agents serve an aggregated API for trajectories at
+`stream.blip.dev/v1alpha1`:
+
+```
+GET  /apis/stream.blip.dev/v1alpha1/namespaces/NS/blipstreams/STATE/log?offset=N&follow=true&raw=false
+POST /apis/stream.blip.dev/v1alpha1/namespaces/NS/blipstreams/STATE/stdin?eof=true
+```
+
+The log is newline-delimited JSON (`o` offset, `g` generation, `t` type,
+`d` base64 data); `raw=1` emits only stdout bytes. The node agent owns the
+ring: it records stdin before forwarding it to the guest, records output as it
+arrives, and closes the device before a seal. Reads of a running blip come from
+the writer's node; reads of a stopped blip come from a committed placement
+through a short-lived read-only view, so the API keeps working after the pod is
+gone. Requests for another node's writer are forwarded over the existing peer
+mTLS mesh. Authentication uses the kube-apiserver front-proxy identity
+headers, and authorization is a delegated SubjectAccessReview on
+`blipstreams/log` (get) or `blipstreams/stdin` (create). Node agents listen on
+port 7891. If the front-proxy CA is not present on workers, the listener trusts
+`X-Remote-User`; anyone who can reach port 7891 could then impersonate a user.
+Restrict that port to the control plane (a host firewall, or a cluster that
+makes the front-proxy CA available) before exposing a cluster beyond a trusted
+team. The controller creates
+the serving certificate Secret and the `v1alpha1.stream.blip.dev` APIService;
+node agents load the certificate from that Secret.
+
+### Chat (`blipchat`, `cmd/blipchat` and `internal/blipchat`)
+
+Blipchat is a small, stateless web app for talking to ACP agents that run in
+blips. A chat session is a `BlipState` with the label
+`chat.blip.dev/session=true`. The state's trajectory ring is the conversation:
+forking the state with `spec.copyFrom` gives the new chat the parent's history,
+and each turn's stdin/stdout is recorded there. The title, profile, ACP session
+id, and last read log offset live in annotations
+(`chat.blip.dev/title`, `chat.blip.dev/profile`, `chat.blip.dev/acp-session`,
+`chat.blip.dev/offset`).
+
+A turn starts a Blip named `<state>-g<generation>` in the same namespace with
+`spec.state` set to the chat state, the profile's command, env, pool, and idle
+timeout (default one hour). Blipchat reads the aggregated stream API
+(`/apis/stream.blip.dev/v1alpha1/namespaces/NS/blipstreams/STATE`) to write raw
+stdin and to follow the NDJSON trajectory log. A `409` means no agent is
+running: blipchat starts the next generation, waits for it to reach `Running`,
+sends ACP `initialize`, then `session/load` (or `session/resume` when the agent
+advertises it) with the stored id, and retries the prompt. ACP is JSON-RPC 2.0
+over newline-delimited stdin/stdout; blipchat implements `initialize`,
+`session/new`, `session/load`, `session/resume`, `session/prompt`,
+`session/cancel`, `session/update`, and `session/request_permission`. When a
+prompt response arrives and no other request is pending, blipchat sends
+`stdin?eof=true`; the agent exits and the blip stops and saves the state. The
+next message starts a new generation.
+
+Profiles are read from the `blip-chat-profiles` ConfigMap (override with
+`--profiles-configmap NAMESPACE/NAME`) and optionally `--profiles-file`. Each
+key is a profile name whose JSON value is
+`{"pool":"default","command":["npx","-y","@zed-industries/claude-code-acp"],
+"env":{"K":"V"},"idleTimeoutSeconds":3600,"title":"Claude Code"}`. The example
+command is documentation, not a bundled install: use a base state whose
+filesystem already has the agent, or configure another profile. The built-in
+`default` profile uses that command and `--default-pool`.
+
+The HTTP API is under `/api`, and `/` serves a dependency-free single-page UI:
+
+- `GET /api/sessions?namespace=NS` lists chat states with title, running
+  state, generation, and ACP session id.
+- `POST /api/sessions {namespace, profile, title, base?}` creates a state
+  (copying `base` when given) and starts generation 1.
+- `GET /api/sessions/NAME?namespace=NS` returns details and the in-memory
+  transcript tail.
+- `GET /api/sessions/NAME/events?namespace=NS&offset=N` is SSE. Events are
+  `{type:"acp",message:{...}}`, `{type:"status",status:{...}}`, and
+  `{type:"gap"}`.
+- `POST /api/sessions/NAME/message {text}` prompts or steers the agent,
+  restarting it when stopped. `.../cancel` sends ACP `session/cancel`, and
+  `.../stop` patches `spec.stop` on the current blip.
+- `GET /healthz` and `GET /readyz` are probes.
 
 **Trust boundary:** blipchat has no authentication of its own. It believes
 `X-Forwarded-User` from any caller and authorizes the namespace in the query
 string with its own cluster-wide credentials. It must only be reachable through
 a front end that authenticates users, overwrites `X-Forwarded-User`, and
 restricts which namespaces each user may reach (a NetworkPolicy or an
-authenticating proxy). Do not expose the Service directly. Requests with zero
-or multiple `X-Forwarded-User` headers are rejected.
+authenticating proxy). Do not expose the Service directly. Every `/api` request
+must carry exactly one non-empty `X-Forwarded-User` header, and a namespace
+must be a valid DNS label. Requests with zero or multiple headers get `401`;
+an invalid namespace gets `400`.
 
-The chat endpoint requires `Content-Type: application/json` and answers `415`
-otherwise; form and `text/plain` bodies are not parsed. A cross-origin JSON
-fetch therefore needs a CORS preflight, which the chat endpoint does not
-answer. The chat endpoint accepts at most 1 MiB of JSON, an 8000-character
-message, 40 history messages, and 32000 characters of total history; larger
-requests get `400`. A chat request has a 4-minute overall budget, at most 8
-model rounds, and 2 minutes per round; when a budget expires the handler
-returns `504` before the server's 5-minute write timeout closes the connection.
-The HTTP server bounds read, write, and idle time and closes unused keep-alive
-connections, so a slow client cannot pin a handler. Chat inspection
-is read-only:
-running blips accept a small allowlist (`git status|log|diff|show`, `ls`,
-`cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `pwd`) and finished blips
-report their last report.
+The HTTP server bounds header, read, and idle time and caps request bodies at
+1 MiB. SSE clears the write deadline for its own connection and uses a 20-second
+heartbeat, so a quiet agent does not look like a stalled handler.
 
 ### CLI
 
 - `kubectl-blip run` creates a Blip and returns its name as soon as its
   workspace snapshot is committed; `gather` waits for blips, reports their exit
-  codes, collects files and git commits, and deletes them. `exec` runs
-  additional commands in a running Blip, `mount` manages states and mounts, and
-  `pull` imports images. It reaches a VM through Kubernetes pod exec
-  (`blip-runtime bridge 1025`, WebSocket with SPDY fallback), then the framed
-  vsock protocol.
-- `gather -f` tails a running command's output, and the guest mirrors the
-  primary command's output to the VM serial console, so `kubectl logs` shows it
-  too. A running session keeps at most the 1 MiB replay ring. A command that
-  finished before the follower attached cannot replay from that ring; instead
-  it is replayed from the serial-console mirror or the controller's 64 KiB
-  `status.output` tail, whichever is more complete. Those tails combine stdout
-  and stderr, so the replay is written to stderr. If both tails are truncated,
-  `gather -f` warns that earlier output is no longer available.
+  codes, collects files and git commits, and deletes them. `mount` manages
+  states and mounts, `pull` imports images, and `stop` stops a running blip.
+  `run` closes the command's stdin once the blip exists unless `--interactive`
+  is set.
+- `logs` prints a command's trajectory (stdout, stderr, stdin, and lifecycle
+  records), and `send` writes stdin. Both use the aggregated stream API, so they
+  work while the command runs (with `-f`) and after its pod is gone, as long as
+  the state retains its trajectory. `gather -f` is a thin wrapper over `logs
+  -f`; there is no serial-console scraping and no `status.output` tail.
+- `exec` no longer exists. A blip runs exactly one command; start another blip
+  on the same state to run a second command, and fork from it for parallel work.
+- Every blip's stdin, stdout, stderr, and exit are recorded in a trajectory ring
+  at a fixed offset inside the state's volume, after the ext4 filesystem. The
+  ring defaults to 64 MiB (`BlipState.spec.streamSize`) and overwrites its
+  oldest whole records when full, so a chatty agent never blocks. Because the
+  ring is part of the state, forking a state copies the conversation history.
+- `spec.idleTimeoutSeconds` stops a command that has been silent for that long.
+  The node agent enforces it; the blip saves its root and finishes as
+  succeeded with reason `Idle`. Batch commands rely on
+  `spec.activeDeadlineSeconds` instead.
 - A finished Blip is kept as Succeeded or Failed so its status and exit code
   remain visible, and `gather` reports the command's exit code. The controller
   deletes a Blip `spec.ttlSecondsAfterFinished` after it finishes and
@@ -315,9 +376,9 @@ report their last report.
 `hack/kind-up.sh` builds and installs a local kind cluster and prints connection
 examples. `hack/e2e.sh` runs the end-to-end scenarios in `hack/e2e/` against that
 cluster. They cover the CLI lifecycle, durable workspaces, mounts, concurrent
-forks, workload reports, the endpoint proxy, in-guest Kubernetes access,
-network policy, state serialization and finalizers, cluster scheduling, and the
-blipchat coordinator with a fake LLM. The slow drain and node-restart scenarios
+forks, trajectories and stdin, the endpoint proxy, in-guest Kubernetes access,
+network policy, state serialization and finalizers, cluster scheduling, and a
+blipchat HTTP smoke test. The slow drain and node-restart scenarios
 run only with `BLIP_E2E_RESILIENCE=1` (nightly in CI). Set `BLIP_E2E_SCENARIOS`
 to a space-separated list of scenario number prefixes (for example `20 40`) to
 run a subset while developing. Tear the cluster down with `hack/kind-down.sh`

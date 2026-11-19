@@ -981,7 +981,7 @@ func TestWaitMountWaitsForDemotedCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cur.Status.Sessions++
+	cur.Status.Message = "tick"
 	if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
 		t.Fatal(err)
 	}

@@ -811,6 +811,12 @@ spec:
               sizeBytes:
                 format: int64
                 type: integer
+              streamSize:
+                description: |-
+                  StreamSize is the effective trajectory ring size, resolved at
+                  initialization from the spec or the copy source.
+                format: int64
+                type: integer
               unplaceableSince:
                 description: |-
                   UnplaceableSince is when a copy first found no node matching its

@@ -7,6 +7,8 @@
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 package main
 
 import (
@@ -41,9 +43,11 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	var (
-		dataDir  string
-		poolSize string
-		insecure []string
+		dataDir        string
+		poolSize       string
+		insecure       []string
+		streamListen   string
+		streamClientCA string
 	)
 	cmd := &cobra.Command{
 		Use:          "blip-node",
@@ -88,6 +92,7 @@ func rootCmd() *cobra.Command {
 			}
 			cfg.Peers = peer.NewRegistry()
 			cfg.PeerClient = peer.NewClient(cfg.Identity, cfg.Peers, key)
+			cfg.Stream = node.StreamConfig{Listen: streamListen, Namespace: namespace, ClientCA: streamClientCA}
 			defer cfg.PeerClient.Close()
 			st, err := storage.Open(ctx, storage.Config{
 				DataDir:       dataDir,
@@ -107,5 +112,7 @@ func rootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dataDir, "data-dir", podapi.DataDir, "node data directory")
 	cmd.Flags().StringVar(&poolSize, "pool-size", "40Gi", "size of the thin pool data file")
 	cmd.Flags().StringSliceVar(&insecure, "insecure-registry", nil, "registries to reach over plain HTTP")
+	cmd.Flags().StringVar(&streamListen, "stream-listen", ":7891", "aggregated stream API listen address (empty disables)")
+	cmd.Flags().StringVar(&streamClientCA, "stream-client-ca", "/var/run/blip-auth/front-proxy-ca.crt", "optional front-proxy client CA")
 	return cmd
 }

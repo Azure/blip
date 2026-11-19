@@ -951,7 +951,6 @@ func TestInt32FieldsBounded(t *testing.T) {
 	for _, tc := range []int32Field{
 		{crd: "blips", root: root("blips"), path: []string{"spec", "ttlSecondsAfterFinished"}, min: 0},
 		{crd: "blips", root: root("blips"), path: []string{"status", "exitCode"}, min: 0},
-		{crd: "blips", root: root("blips"), path: []string{"status", "sessions"}, min: 0},
 		{crd: "blippools", root: root("blippools"), path: []string{"spec", "cpus"}, min: 1},
 		{crd: "blippools", root: root("blippools"), path: []string{"spec", "warmCount"}, min: 0},
 		{crd: "blippools", root: root("blippools"), path: []string{"spec", "maxCount"}, min: 0},
@@ -1024,7 +1023,6 @@ func TestInt32AdmissionBoundaries(t *testing.T) {
 	}{
 		{"ttl", fmt.Sprintf(`{"spec":{"state":"root","command":["true"],"ttlSecondsAfterFinished":%d}}`, tooBig)},
 		{"exitCode", fmt.Sprintf(`{"spec":{"state":"root","command":["true"]},"status":{"exitCode":%d}}`, tooBig)},
-		{"sessions", fmt.Sprintf(`{"spec":{"state":"root","command":["true"]},"status":{"sessions":%d}}`, tooBig)},
 	} {
 		if errs := blip(tc.object, ""); len(errs) == 0 {
 			t.Errorf("admitted out-of-range blip %s", tc.name)

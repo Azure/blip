@@ -55,25 +55,25 @@ test -z "$(k get blipstate "$P-mroot" -o jsonpath='{.spec.mounts[?(@.path=="/bas
 
 step "mount from inside a blip defaults --root to its own root state"
 blip run --name "$P-mparent" --state "$P-mroot" -- sleep infinity
-blip exec "$P-mparent" -- blip mount --new "$P-inside:/inside:rw"
+blip run --from "$P-mparent" -- blip mount --new "$P-inside:/inside:rw"
 expect_ok_grep "inner mount is in the parent's listing" \
-	"$P-inside:/inside (writable)" blip exec "$P-mparent" -- blip mount
+	"$P-inside:/inside (writable)" blip run --from "$P-mparent" -- blip mount
 test "$(k get blipstate "$P-mroot" -o jsonpath='{.spec.mounts[?(@.path=="/inside")].state}')" = "$P-inside"
 test "$(k get blipstate "$P-mroot" -o jsonpath='{.spec.mounts[?(@.path=="/inside")].writable}')" = true
 test "$(blip_field "$P-mparent" '{.status.mounts[?(@.path=="/inside")].state}')" = "$P-inside"
 test "$(blip_field "$P-mparent" '{.status.mounts[?(@.path=="/inside")].writable}')" = true
 
 step "a writable auxiliary mount is private to a fork"
-blip exec "$P-mparent" -- sh -ec 'printf parent-data > /aux/parent.txt; sync'
-child=$(blip exec "$P-mparent" -- blip run --name "$P-mchild" --from / -- sleep infinity)
+blip run --from "$P-mparent" -- sh -ec 'printf parent-data > /aux/parent.txt; sync'
+child=$(blip run --from "$P-mparent" -- blip run --name "$P-mchild" --from / -- sleep infinity)
 test "$child" = "$P-mchild"
-blip exec "$child" -- sh -ec '
+blip run --from "$child" -- sh -ec '
 	test "$(cat /aux/parent.txt)" = parent-data
 	printf child-only > /aux/child-only
 	sync
 '
-blip exec "$P-mparent" -- test ! -e /aux/child-only
-blip exec "$child" -- sh -ec '
+blip run --from "$P-mparent" -- test ! -e /aux/child-only
+blip run --from "$child" -- sh -ec '
 	test -x /base/bin/sh
 	if ( printf blocked > /base/blocked ) 2>/dev/null; then
 		echo "write to read-only /base succeeded" >&2
@@ -83,16 +83,16 @@ blip exec "$child" -- sh -ec '
 k delete blip "$child" >/dev/null
 wait_blip_gone "$child"
 wait_state_gone "$P-mchild"
-blip exec "$P-mparent" -- sh -ec '
+blip run --from "$P-mparent" -- sh -ec '
 	test "$(cat /aux/parent.txt)" = parent-data
 	test ! -e /aux/child-only
 '
 
 # Collect while /aux is still mounted; the next step removes it from the root.
 step "collect from a fork's aux mount with {name} substitution"
-outchild=$(blip exec "$P-mparent" -- blip run --name "$P-mout" --from / -- sh -ec 'printf collected-from-aux > /aux/out')
+outchild=$(blip run --from "$P-mparent" -- blip run --name "$P-mout" --from / -- sh -ec 'printf collected-from-aux > /aux/out')
 test "$outchild" = "$P-mout"
-blip exec "$P-mparent" -e CHILD="$P-mout" -- bash -ec '
+blip run --from "$P-mparent" -e CHILD="$P-mout" -- bash -ec '
 	cd /root
 	blip gather "$CHILD" --collect "/aux/out:./{name}.out"
 	test "$(cat "./$CHILD.out")" = collected-from-aux
@@ -115,14 +115,14 @@ blip mount --new "$P-mcopy:/copy:rw" --from "$P-base" --root "$P-mroot"
 test "$(k get blipstate "$P-mcopy" -o jsonpath='{.spec.copyFrom}')" = "$P-base"
 test "$(k get blipstate "$P-mcopy" -o jsonpath='{.metadata.uid}')" != \
 	"$(k get blipstate "$P-base" -o jsonpath='{.metadata.uid}')"
-blip exec "$P-mparent" -- sh -ec '
+blip run --from "$P-mparent" -- sh -ec '
 	test -x /copy/bin/sh
 	printf copy-only > /copy/mcopy-only
 '
 blip mount --rm "$P-mcopy" --root "$P-mroot"
 wait_state "$P-mcopy"
 blip mount "$P-mcopy:/copy-check:ro" --root "$P-mroot"
-blip exec "$P-mparent" -- sh -ec '
+blip run --from "$P-mparent" -- sh -ec '
 	test "$(cat /copy-check/mcopy-only)" = copy-only
 	test ! -e /base/mcopy-only
 '

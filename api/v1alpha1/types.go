@@ -360,12 +360,15 @@ type BlipStateStatus struct {
 	// ImageConfig is the container image metadata resolved when the state
 	// was created. It is copied into copies and remains valid after the
 	// original image or source state is gone.
-	ImageConfig *ImageConfig   `json:"imageConfig,omitempty"`
-	CopiedFrom  *CopySource    `json:"copiedFrom,omitempty"`
-	SizeBytes   int64          `json:"sizeBytes,omitempty"`
-	Committed   *Commit        `json:"committed,omitempty"`
-	Writer      *Writer        `json:"writer,omitempty"`
-	Pending     *PendingCommit `json:"pending,omitempty"`
+	ImageConfig *ImageConfig `json:"imageConfig,omitempty"`
+	CopiedFrom  *CopySource  `json:"copiedFrom,omitempty"`
+	SizeBytes   int64        `json:"sizeBytes,omitempty"`
+	// StreamSize is the effective trajectory ring size, resolved at
+	// initialization from the spec or the copy source.
+	StreamSize int64          `json:"streamSize,omitempty"`
+	Committed  *Commit        `json:"committed,omitempty"`
+	Writer     *Writer        `json:"writer,omitempty"`
+	Pending    *PendingCommit `json:"pending,omitempty"`
 	// Seals records the outcome of ended writer attachments, keyed by
 	// attachment ID. The controller keeps entries long enough for the Blip
 	// that wrote them to observe the result, so a later save cannot hide an
@@ -489,7 +492,7 @@ type NetworkPort struct {
 // exception is a read-only temporary collect mount, scoped to one blip, at
 // exactly one level below the reserved collect root.
 //
-// +kubebuilder:validation:XValidation:rule="!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect', '/var/run/blip', '/var/run/blip-collect'].exists(r, self.path == r || self.path.startsWith(r + '/') || r.startsWith(self.path + '/')) || (self.path.startsWith('/run/blip-collect/') && self.path.split('/').size() == 4 && has(self.blipUID) && self.blipUID != '' && (!has(self.writable) || !self.writable))",message="path must not be at, below, or above a guest-reserved path, except a read-only temporary collect mount"
+// +kubebuilder:validation:XValidation:rule="!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect', '/var/run/blip', '/var/run/blip-collect'].exists(r, self.path == r || self.path.startsWith(r + '/') || r.startsWith(self.path + '/')) || (self.path.startsWith('/run/blip-collect/') && self.path.split('/').size() == 4 && has(self.blipUID) && self.blipUID != ” && (!has(self.writable) || !self.writable))",message="path must not be at, below, or above a guest-reserved path, except a read-only temporary collect mount"
 type Mount struct {
 	// State names a BlipState in the blip's namespace.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`

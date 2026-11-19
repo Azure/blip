@@ -289,7 +289,7 @@ func (d resumeFailure) Apply(e deviceEffect) error {
 func TestRecoveryResumesOriginsBeforeActivation(t *testing.T) {
 	x := newStorageSimulation(t)
 	origin := x.working()
-	dest := &record{ID: "z-snapshot", Kind: KindCommit, Size: origin.Size}
+	dest := &record{ID: "z-snapshot", Kind: KindCommit, Size: origin.Size, FSBytes: origin.fsBytes()}
 	if _, err := x.s.begin(dest, 1); err != nil {
 		t.Fatal(err)
 	}

@@ -47,7 +47,7 @@ EOF
 
 step "probe the endpoint proxy from inside a blip"
 test "$(blip run --name "$P-ep" --pool "$P-endpoint" --from "$P-base" -- sleep infinity)" = "$P-ep"
-expect_ok_grep "endpoint proxy" "endpoint-ok" blip exec "$P-ep" -- sh -ec '
+expect_ok_grep "endpoint proxy" "endpoint-ok" blip run --from "$P-ep" -- sh -ec '
 	set -eu
 	# The guest name resolves through 127.0.2.2; the sidecar adds the CA and
 	# forwards /version to the unauthenticated API server route.
@@ -80,14 +80,14 @@ wait_for 120 "pool $P-endpoint pods to be removed" is_30_pool_pods_gone "$P-endp
 step "run a top-level blip and check unrestricted in-guest Kubernetes access"
 test "$(blip run --name "$P-top" --from "$P-base" -- sleep infinity)" = "$P-top"
 expect_ok_grep "top-level blip lists blips" "$P-top" \
-	blip exec "$P-top" -- kubectl get blips -o name
+	blip run --from "$P-top" -- kubectl get blips -o name
 
 step "create a child inside the parent and give it a restricted owner"
 # A top-level blip has no owner label, so a child started from it is
 # unrestricted too. Name the child under an owner prefix and label both it
 # and its root state after the fork has committed; the controller then
 # records that owner for the child's VM token and keeps the state usable.
-child=$(blip exec "$P-top" -- blip run --name "$P-owner.child" --from / -- sleep infinity)
+child=$(blip run --from "$P-top" -- blip run --name "$P-owner.child" --from / -- sleep infinity)
 test "$child" = "$P-owner.child"
 wait_blip_phase "$child" Running
 pod=$(blip_pod "$child")
@@ -105,7 +105,7 @@ wait_for 120 "owner table entry for $pod" is_30_owner "$pod" "$P-owner"
 sleep 2
 
 step "verify the child's owner-scoped reads and writes"
-expect_ok_grep "owner-scoped child" "child-scope-ok" blip exec "$child" \
+expect_ok_grep "owner-scoped child" "child-scope-ok" blip run --from "$child" \
 	-e CHILD="$child" -e BASE="$P-base" -e ROOT="$P-top" -e OWNER="$P-owner" \
 	-- bash -ec '
 	set -eu
@@ -151,7 +151,7 @@ wait_state_gone "$P-top"
 
 step "run a blip on the default pool and check its egress policy"
 test "$(blip run --name "$P-netpol" --from "$P-base" -- sleep infinity)" = "$P-netpol"
-expect_ok_grep "default egress policy" "netpol-default-ok" blip exec "$P-netpol" -- bash -ec '
+expect_ok_grep "default egress policy" "netpol-default-ok" blip run --from "$P-netpol" -- bash -ec '
 	set -eu
 	# Cluster DNS is allowed; private ranges and metadata are not; the
 	# public 443 probe is the only outside dependency and is retried.
@@ -174,7 +174,7 @@ expect_ok_grep "default egress policy" "netpol-default-ok" blip exec "$P-netpol"
 
 step "deny all egress on the running blip"
 k patch blip "$P-netpol" --type merge -p '{"spec":{"network":{}}}' >/dev/null
-expect_ok_grep "denied egress policy" "netpol-denied-ok" blip exec "$P-netpol" -- bash -ec '
+expect_ok_grep "denied egress policy" "netpol-denied-ok" blip run --from "$P-netpol" -- bash -ec '
 	set -eu
 	# The runtime applies the new policy to the running VM; poll until the
 	# public request is denied, then check DNS and private ranges too.

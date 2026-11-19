@@ -103,7 +103,7 @@ const (
 	apiProxyName             = "api-proxy"
 	apiTokenVolume           = "api-token"
 	serviceAccountPath       = "/var/run/secrets/kubernetes.io/serviceaccount"
-	vsockMountPath           = podapi.MountPath + "/vsock"
+	vsockMountPath           = podapi.MountPath + "/sock"
 	apiProxyUID        int64 = 65532
 
 	endpointMountRoot       = "/var/run/blip/endpoints"
@@ -1192,8 +1192,11 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 					Type: &hostPathType,
 				}},
 			}, {
-				Name:         "vsock",
-				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				Name: "vsock",
+				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+					Path: podapi.PodDir(pool.Namespace, name) + "/sock",
+					Type: &hostPathType,
+				}},
 			}},
 		},
 	}

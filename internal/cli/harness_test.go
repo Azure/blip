@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,22 +20,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/Azure/blip/api/v1alpha1"
-	"github.com/Azure/blip/internal/session"
-	"github.com/Azure/blip/internal/session/fakeguest"
 )
 
 const ns = "ns"
 
 type harness struct {
-	t     *testing.T
-	kube  client.WithWatch
-	guest *fakeguest.Guest
-	ctrl  *fakeController
-	// connect overrides the fake guest connector when set, so tests can
-	// inject transport failures.
-	connect session.Connector
-	// logs overrides the VM serial-console reader.
-	logs func(context.Context, string) (io.ReadCloser, error)
+	t      *testing.T
+	kube   client.WithWatch
+	ctrl   *fakeController
+	stream *fakeStream
 	// self is the blip the CLI runs in, if any.
 	self string
 }
@@ -74,11 +68,68 @@ func newHarness(t *testing.T, objs ...client.Object) *harness {
 		objs = append(objs, &v1alpha1.BlipPool{ObjectMeta: metav1.ObjectMeta{Name: pool, Namespace: ns}})
 	}
 	kube := fake.NewClientBuilder().WithScheme(Scheme).WithStatusSubresource(&v1alpha1.Blip{}, &v1alpha1.BlipState{}).WithObjects(objs...).Build()
-	h := &harness{t: t, kube: kube, guest: &fakeguest.Guest{}, ctrl: &fakeController{kube: kube, exited: map[string]int32{}}}
+	h := &harness{t: t, kube: kube, stream: &fakeStream{}, ctrl: &fakeController{kube: kube, exited: map[string]int32{}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go h.ctrl.loop(ctx)
 	return h
+}
+
+// streamCall is one request the CLI made to the fake stream API.
+type streamCall struct {
+	namespace, state string
+	offset           int64
+	follow           bool
+	data             []byte
+	eof              bool
+}
+
+// fakeStream records stream API calls and replays per-state NDJSON records.
+type fakeStream struct {
+	mu       sync.Mutex
+	logs     []streamCall
+	stdins   []streamCall
+	records  map[string][]streamRecord
+	logErr   error
+	stdinErr error
+}
+
+func (f *fakeStream) Log(ctx context.Context, namespace, state string, offset int64, follow bool) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logs = append(f.logs, streamCall{namespace: namespace, state: state, offset: offset, follow: follow})
+	if f.logErr != nil {
+		return nil, f.logErr
+	}
+	var b bytes.Buffer
+	for _, rec := range f.records[state] {
+		data, _ := json.Marshal(rec)
+		b.Write(data)
+		b.WriteByte('\n')
+	}
+	return io.NopCloser(&b), nil
+}
+
+func (f *fakeStream) Stdin(ctx context.Context, namespace, state string, data []byte, eof bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stdins = append(f.stdins, streamCall{namespace: namespace, state: state, data: append([]byte(nil), data...), eof: eof})
+	return f.stdinErr
+}
+
+func (f *fakeStream) record(state string, recs ...streamRecord) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.records == nil {
+		f.records = map[string][]streamRecord{}
+	}
+	f.records[state] = append(f.records[state], recs...)
+}
+
+func (f *fakeStream) calls() ([]streamCall, []streamCall) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]streamCall(nil), f.logs...), append([]streamCall(nil), f.stdins...)
 }
 
 // run executes the CLI and returns its exit code, stdout and stderr.
@@ -93,12 +144,8 @@ func (h *harness) run(stdin string, args ...string) (int, string, string) {
 }
 
 func (h *harness) env(in io.Reader, out, errOut io.Writer) *Env {
-	connect := session.Connector(h.guest.Connect)
-	if h.connect != nil {
-		connect = h.connect
-	}
 	env := &Env{In: in, Out: out, Err: errOut, Connect: func(KubeFlags) (*Clients, error) {
-		return &Clients{Kube: h.kube, Sessions: &session.Client{Connect: connect}, Namespace: ns, Logs: h.logs}, nil
+		return &Clients{Kube: h.kube, Stream: h.stream, Namespace: ns}, nil
 	}}
 	if h.self != "" {
 		env.NamespaceFile = filepath.Join(h.t.TempDir(), "namespace")

@@ -19,7 +19,8 @@ func (s *Store) OpenExport(id, leaseID string) (string, error) {
 		return "", err
 	}
 	defer s.unhold(id)
-	rec := &record{ID: xid, Kind: kindExport, Base: id, StateUID: src.StateUID, Size: src.Size}
+	rec := &record{ID: xid, Kind: kindExport, Base: id, StateUID: src.StateUID,
+		Size: src.Size, StreamSize: src.StreamSize, FSBytes: src.fsBytes()}
 	if _, err := s.begin(rec, 1); err != nil {
 		return "", err
 	}

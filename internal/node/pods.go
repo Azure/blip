@@ -81,7 +81,13 @@ func desiredFor(v *view, p *plan, pod *corev1.Pod, dir *podDir) (podapi.Desired,
 		prev.Network = denyNetwork()
 		return prev, nil, "network policy: claiming Blip not found"
 	}
-	d := podapi.Desired{Stop: prev.Stop || b.Spec.Stop || b.DeletionTimestamp != nil}
+	d := podapi.Desired{Stop: prev.Stop || b.Spec.Stop || b.DeletionTimestamp != nil, StopReason: prev.StopReason}
+	// Keep an agent-set reason (for example Idle) across passes: desiredFor is
+	// a pure planner and does not decide idle stops, but must not erase the
+	// reason already written for one.
+	if d.Stop && prev.StopReason != "" {
+		d.StopReason = prev.StopReason
+	}
 	// Publish policy independently of root preparation, including live
 	// revocations while a disk import or mount is still in progress.
 	var networkErr error
@@ -229,12 +235,10 @@ func disk(id string, readOnly bool) podapi.Disk {
 
 func claimFor(b *v1alpha1.Blip, root podapi.Disk, cfg *image.Config, defaults *v1alpha1.RuntimeDefaults) *podapi.Claim {
 	c := &podapi.Claim{
-		BlipName:      b.Name,
-		BlipUID:       string(b.UID),
-		Root:          root,
-		Command:       b.Spec.Command,
-		TTY:           b.Spec.TTY,
-		WaitForClient: b.Annotations[v1alpha1.AnnotationWaitForClient] == "true",
+		BlipName: b.Name,
+		BlipUID:  string(b.UID),
+		Root:     root,
+		Command:  b.Spec.Command,
 	}
 	if cfg != nil {
 		c.Env = append(c.Env, cfg.Env...)
@@ -299,6 +303,7 @@ func (v *view) ensure(podKey string, dir *podDir, a attach) (bool, *prepare) {
 		pr.req.StateUID = string(a.state.UID)
 		if !a.readOnly {
 			pr.req.SizeBytes = a.state.Status.SizeBytes
+			pr.req.StreamSize = stateStreamSize(a.state)
 		}
 	}
 	switch {

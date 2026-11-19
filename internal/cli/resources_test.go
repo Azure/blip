@@ -84,7 +84,7 @@ func TestOwnerScopedNamesReportFullCheckedName(t *testing.T) {
 		{"pull", "state", []string{"pull", long, "registry/dev:v1", "-d"}},
 		{"gather", "blip", []string{"gather", long}},
 		{"run", "blip", []string{"run", "--name", long, "--from", "base", "--", "true"}},
-		{"exec", "blip", []string{"exec", long, "--", "true"}},
+		{"logs", "blip", []string{"logs", long}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			code, _, errOut := h.run("", tc.args...)

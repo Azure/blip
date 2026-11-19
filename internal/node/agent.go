@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	toolscache "k8s.io/client-go/tools/cache"
@@ -44,6 +45,18 @@ type Config struct {
 	Identity   *peer.Identity
 	Peers      *peer.Registry
 	PeerClient *peer.Client
+	// Stream configures the aggregated stream API server. Listen empty
+	// disables it.
+	Stream StreamConfig
+}
+
+// StreamConfig configures the node's stream API listener.
+type StreamConfig struct {
+	Listen    string
+	Namespace string
+	// ClientCA optionally verifies the API server's front-proxy client
+	// certificate.
+	ClientCA string
 }
 
 const (
@@ -61,16 +74,17 @@ const (
 
 // Agent is the node agent.
 type Agent struct {
-	cfg    Config
-	client client.Client // reads come from the informer cache
-	live   client.Reader // uncached reads
-	store  Store
-	open   func(ctx context.Context, node string, req peer.ExportRequest) (storage.Remote, error)
-	pull   func(ctx context.Context, ref string, secrets []registryauth.PullSecret, dir string) (image.Config, string, error)
-	mknod  func(path, device string) error
-	pinned func(commitID string) bool
-	peers  func([]peer.Peer) error // update the firewall after publishing trust
-	wake   chan struct{}
+	cfg     Config
+	client  client.Client // reads come from the informer cache
+	live    client.Reader // uncached reads
+	store   Store
+	open    func(ctx context.Context, node string, req peer.ExportRequest) (storage.Remote, error)
+	pull    func(ctx context.Context, ref string, secrets []registryauth.PullSecret, dir string) (image.Config, string, error)
+	mknod   func(path, device string) error
+	pinned  func(commitID string) bool
+	peers   func([]peer.Peer) error // update the firewall after publishing trust
+	wake    chan struct{}
+	streams *streamManager
 
 	mu           sync.Mutex
 	workers      sync.WaitGroup
@@ -119,6 +133,8 @@ func newAgent(cfg Config, c client.Client, live client.Reader, st Store) *Agent 
 	}
 	a.pull = a.pullImage
 	a.open = cfg.PeerClient.Open
+	a.streams = newStreamManager(st, cfg.PeerClient, cfg.NodeName,
+		func(key string) string { return podDirFor(cfg.DataDir, key) }, live)
 	return a
 }
 
@@ -176,6 +192,13 @@ func Run(ctx context.Context, cfg Config, restCfg *rest.Config, st *storage.Stor
 		cancel()
 		a.workers.Wait()
 	}()
+	if cfg.Stream.Listen != "" {
+		cs, err := kubernetes.NewForConfig(restCfg)
+		if err != nil {
+			return fmt.Errorf("stream api client: %w", err)
+		}
+		go a.serveStreamAPI(ctx, live, cs, cfg)
+	}
 	if err := a.registerNode(ctx); err != nil {
 		return err
 	}
@@ -231,6 +254,7 @@ func Run(ctx context.Context, cfg Config, restCfg *rest.Config, st *storage.Stor
 		Peers:     cfg.Peers,
 		Authorize: a.authorize,
 		DataDir:   cfg.DataDir,
+		Stream:    a,
 	})
 	if err != nil {
 		return fmt.Errorf("export server: %w", err)
@@ -245,6 +269,9 @@ func Run(ctx context.Context, cfg Config, restCfg *rest.Config, st *storage.Stor
 	defer func() {
 		cancel()
 		<-serverDone // Drain export handlers before the caller closes storage.
+		if a.streams != nil {
+			a.streams.closeAll()
+		}
 	}()
 	go a.watchPodDirs(ctx)
 	slog.Info("node agent running", "node", cfg.NodeName, "endpoint", cfg.HostIP, "incarnation", st.Incarnation())

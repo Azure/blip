@@ -20,7 +20,6 @@ func TestControlReconnectReplacesBlockedHello(t *testing.T) {
 		start := time.Now()
 		c := controlPair(t, g)
 		readFrame(t, c, wire.THello, &wire.Hello{})
-		readFrame(t, c, wire.TStatus, &wire.Status{})
 		<-done
 		if time.Since(start) != 0 {
 			t.Fatal("reconnect waited for the old Hello write timeout")
@@ -33,7 +32,6 @@ func TestControlBlockedShutdownReportIsBounded(t *testing.T) {
 		g := &Guest{}
 		c := controlPair(t, g)
 		readFrame(t, c, wire.THello, &wire.Hello{})
-		readFrame(t, c, wire.TStatus, &wire.Status{})
 		start := time.Now()
 		g.shutdown() // Host never reads ShutdownDone.
 		if elapsed := time.Since(start); elapsed > controlWriteTimeout+2*time.Second {

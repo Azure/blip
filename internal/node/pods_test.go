@@ -98,22 +98,6 @@ func TestDurableRootClaim(t *testing.T) {
 	}
 }
 
-// A caller that will attach marks the Blip, and the claim must carry that to
-// the guest. A detached run has no annotation and starts at once.
-func TestClaimCarriesWaitForClient(t *testing.T) {
-	v := newView()
-	b, d := durableBlip(v)
-	readyDev(v, d, storage.Volume{ID: "r1", StateUID: "uid-root"}, 7)
-	if c := compute(v).desired[pkey("p")].Claim; c == nil || c.WaitForClient {
-		t.Fatalf("claim without the annotation = %+v", c)
-	}
-
-	b.Annotations = map[string]string{v1alpha1.AnnotationWaitForClient: "true"}
-	if c := compute(v).desired[pkey("p")].Claim; c == nil || !c.WaitForClient {
-		t.Fatalf("claim with the annotation = %+v", c)
-	}
-}
-
 func TestRuntimeDefaultsPrecedence(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

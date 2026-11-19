@@ -10,7 +10,7 @@ spec:
   # endpoints:
   #   - name: whoami
   #     url: https://whoami.example.com
-  #     audience: blip-gateway
+  #     audience: blip-controller
   # Direct egress is denied unless explicitly allowed. The tokenless
   # Kubernetes API endpoint is separate from these rules. Explicit CIDRs,
   # including 0.0.0.0/0, do not inherit the default policy's exclusions, so

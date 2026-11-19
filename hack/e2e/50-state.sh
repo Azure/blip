@@ -176,9 +176,9 @@ wait_state_gone "$P-gkeep" 60
 step "bare gather inside a blip gathers its own children"
 blip run --name "$P-gparent" --from "$P-base" -- sleep infinity
 wait_blip_phase "$P-gparent" Running
-blip exec "$P-gparent" -- blip run --name "$P-gchild1" --from / -- sh -c 'echo child1'
-blip exec "$P-gparent" -- blip run --name "$P-gchild2" --from / -- sh -c 'sleep 2; echo child2'
-blip exec "$P-gparent" -- blip gather >"$work/gather-children.out"
+blip run --from "$P-gparent" -- blip run --name "$P-gchild1" --from / -- sh -c 'echo child1'
+blip run --from "$P-gparent" -- blip run --name "$P-gchild2" --from / -- sh -c 'sleep 2; echo child2'
+blip run --from "$P-gparent" -- blip gather >"$work/gather-children.out"
 grep -q "blip/$P-gchild1 Succeeded" "$work/gather-children.out"
 grep -q "blip/$P-gchild2 Succeeded" "$work/gather-children.out"
 wait_blip_gone "$P-gchild1" 120
@@ -213,7 +213,7 @@ step "spec.stop finishes the blip, saves the root, and preserves files"
 new_root_50 "$P-stop"
 blip run --name "$P-stopw" --state "$P-stop" -- sleep infinity
 wait_blip_phase "$P-stopw" Running
-blip exec "$P-stopw" -u 0:0 -- sh -ec 'echo persisted > /root/stop.txt; sync'
+blip run --from "$P-stopw" -u 0:0 -- sh -ec 'echo persisted > /root/stop.txt; sync'
 k patch blip "$P-stopw" --type merge -p '{"spec":{"stop":true}}' >/dev/null
 wait_blip_phase "$P-stopw" Succeeded 180
 wait_state "$P-stop" 120
@@ -221,7 +221,7 @@ k delete blip "$P-stopw" >/dev/null
 wait_blip_gone "$P-stopw" 60
 blip run --name "$P-stopc" --state "$P-stop" -- sleep infinity
 wait_blip_phase "$P-stopc" Running
-test "$(blip exec "$P-stopc" -u 0:0 -- cat /root/stop.txt)" = persisted
+test "$(blip run --from "$P-stopc" -u 0:0 -- cat /root/stop.txt)" = persisted
 k delete blip "$P-stopc" >/dev/null
 wait_blip_gone "$P-stopc" 60
 wait_state "$P-stop" 120

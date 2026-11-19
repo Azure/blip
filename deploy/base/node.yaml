@@ -36,6 +36,12 @@ rules:
   - apiGroups: ["", events.k8s.io]
     resources: [events]
     verbs: [create, patch]
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -116,6 +122,9 @@ spec:
               readOnly: true
             - name: configfs
               mountPath: /sys/kernel/config
+            - name: front-proxy-ca
+              mountPath: /var/run/blip-auth
+              readOnly: true
       volumes:
         - name: data
           hostPath:
@@ -134,3 +143,25 @@ spec:
           hostPath:
             path: /sys/kernel/config
             type: Directory
+        # The front-proxy CA verifies the API server's client certificate.
+        # It is absent on some distributions; the listener then trusts the
+        # X-Remote-User headers and must not be directly reachable.
+        - name: front-proxy-ca
+          hostPath:
+            path: /etc/kubernetes/pki
+            type: DirectoryOrCreate
+---
+# The aggregated API server runs on every node agent (hostNetwork), so the
+# Service selects the DaemonSet pods and forwards to their host port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: blip-stream
+  namespace: blip-system
+spec:
+  selector:
+    app.kubernetes.io/name: blip-node
+  ports:
+    - name: https
+      port: 7891
+      targetPort: 7891

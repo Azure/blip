@@ -1,12 +1,9 @@
 package cli
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,14 +11,12 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
-	"github.com/Azure/blip/internal/wire"
 )
 
 type gatherFlags struct {
@@ -177,26 +172,23 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 	if f.follow {
 		var fctx context.Context
 		// Followers share the wait deadline, so an expired --wait also stops
-		// their retained-output replay instead of delaying the drain.
+		// their retained-trajectory read instead of delaying the drain.
 		fctx, followCancel = context.WithCancel(waitCtx)
 		defer followCancel()
 		for i, b := range targets {
 			ch := make(chan struct{})
 			followDone[i] = ch
-			go func(name string, ch chan struct{}) {
+			go func(b *v1alpha1.Blip, ch chan struct{}) {
 				defer close(ch)
-				a.follow(fctx, name)
-			}(b.Name, ch)
+				a.follow(fctx, b)
+			}(b, ch)
 		}
 	}
 
 	done, errs := a.awaitTargets(waitCtx, f, targets)
 	if f.follow {
-		// Drain finished blips' replay before deleting them, then stop the
-		// followers still attached to running blips. A replay write to a local
-		// consumer that stopped reading cannot be cancelled, so stop waiting
-		// at the wait deadline: --wait bounds the whole gather, not just the
-		// watch.
+		// Drain finished blips' retained trajectory before deleting them,
+		// then stop followers of blips that are still running.
 		finished := make(map[string]bool, len(done))
 		for _, b := range done {
 			finished[b.Name] = true
@@ -569,9 +561,6 @@ func (a *app) gatherOne(ctx context.Context, c *Clients, b *v1alpha1.Blip, f *ga
 		line += " " + b.Status.FinishTime.Sub(b.Status.StartTime.Time).Round(time.Second).String()
 	}
 	fmt.Fprintln(a.env.Out, line)
-	if b.Status.Report != nil {
-		fmt.Fprintf(a.env.Out, "  report: %s\n", strings.ReplaceAll(b.Status.Report.Text, "\n", " "))
-	}
 
 	var errs []error
 	retained := false
@@ -601,438 +590,28 @@ func (a *app) gatherOne(ctx context.Context, c *Clients, b *v1alpha1.Blip, f *ga
 	return errors.Join(errs...)
 }
 
-// follow streams a blip's primary output until it exits, prefixing each line
-// with the blip's short name. A blip that finished before the follower
-// attached still replays its retained output while its VM pod exists.
-// Followers never block the command; gather drains them before deleting.
-func (a *app) follow(ctx context.Context, name string) {
-	b, err := a.waitRunning(ctx, name)
-	if err != nil {
+// follow streams a blip's trajectory until it finishes. The aggregated stream
+// API replays retained records, so a follower that attached late still sees the
+// output after the VM pod is gone.
+func (a *app) follow(ctx context.Context, b *v1alpha1.Blip) {
+	if b.Spec.State == "" {
 		return
 	}
-	// The blip may have finished between the wait and the get below. A
-	// finished primary session stays replayable as long as the pod exists.
-	if b, err = a.getBlip(ctx, name); err != nil {
-		return
-	}
-	short := a.short(name)
-	ending := v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving
-	pod := b.Status.Pod
-	if pod == "" {
-		if ending {
-			// A Blip that finished before claiming a VM never ran a
-			// command, so no status.output can ever arrive. Do not wait
-			// out the retained-output poll for it.
-			if b.Status.Output == "" && b.Status.StartTime == nil {
-				return
-			}
-			if !a.printRetained(ctx, name, short) && !a.endedWithoutOutput(ctx, name) {
-				a.progressCtx(ctx, "%s: output is no longer available (the VM pod is gone)", short)
-			}
-		}
-		return
-	}
-	s, err := a.openRetrying(ctx, name, pod, wire.Open{Mode: wire.OpenAttach, Session: wire.PrimarySession, Follow: true}, true)
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		// The replay ring died with the VM. The guest still mirrored the
-		// command to the serial console, and the controller retains the tail
-		// in status. Try both even when our cached view still says Running:
-		// the pod can disappear between the wait and this attach.
-		ending = ending || a.blipEnding(ctx, name)
-		if ending {
-			if a.replayFinished(ctx, name, short, pod, attachFailWait, true) {
-				return
-			}
-		} else if a.replayLogs(ctx, pod, short) {
-			return
-		}
-		if ctx.Err() != nil {
-			return
-		}
-		if !ending && a.printRetainedFor(ctx, name, short, attachFailWait) {
-			return
-		}
-		if ctx.Err() != nil {
-			return
-		}
-		// The controller can still report Running for an already-exited
-		// command. Re-check before warning: losing an empty stream is not a
-		// failure, but a real attach failure for a running Blip still is.
-		if a.endedWithoutOutput(ctx, name) {
-			return
-		}
-		if ending {
-			a.progressCtx(ctx, "%s: output is no longer available: %v", short, err)
-			return
-		}
-		a.progressCtx(ctx, "%s: could not follow output: %v", short, err)
-		return
-	}
-	defer s.Close()
-	out := &prefixWriter{out: a.env.Out, prefix: short + "|"}
-	errw := &prefixWriter{out: a.env.Err, prefix: short + "|"}
-	_, copyErr := s.Copy(out, errw, func(m string) { a.progressCtx(ctx, "%s: %s", short, m) })
-	out.flush()
-	errw.flush()
-	if copyErr != nil {
-		// The live stream ended before the guest delivered TExited, so the
-		// bytes above are only a prefix. A follower that stops reading while
-		// the command finishes is cut off when the guest closes the finished
-		// primary session at its delivery deadline; the controller's retained
-		// status.output still has the tail. Do not warn when gather itself
-		// stopped the follower (ctx is done), for example after --wait or --any.
-		if ctx.Err() == nil {
-			a.replayTruncatedOutput(ctx, name, short, pod, ending || a.blipEnding(ctx, name))
-		}
-		return
-	}
-	if !out.wrote && !errw.wrote && (ending || a.blipEnding(ctx, name)) {
-		if !a.replayFinished(ctx, name, short, pod, retainedOutputWait, false) && !a.endedWithoutOutput(ctx, name) {
-			a.progressCtx(ctx, "%s: output is no longer available", short)
-		}
+	short := a.short(b.Name)
+	w := &recordWriter{out: a.env.Out, err: a.env.Err, label: short}
+	target := streamTarget{namespace: b.Namespace, state: b.Spec.State, blip: b.Name}
+	err := a.readStream(ctx, target, 0, true, w, func(ctx context.Context) bool {
+		return a.blipDone(ctx, b.Name)
+	})
+	if err != nil && ctx.Err() == nil {
+		a.progress("%s: could not follow output: %v", short, err)
 	}
 }
 
-// truncatedOutputWait bounds how long a follower waits for the controller to
-// publish status.output after its live stream was cut off. The controller
-// writes the output before it deletes the VM pod, so this only covers client
-// staleness.
-var truncatedOutputWait = 3 * time.Second
-
-// attachFailWait bounds how long a follower waits for retained output after a
-// failed attach before deciding that the Blip is still running or that its
-// output is gone.
-var attachFailWait = 3 * time.Second
-
-// replayTruncatedOutput reports that a followed stream ended before the
-// command's exit status arrived and, when the blip is finishing, prints the
-// output the controller retained in status. Line-oriented prefixing cannot
-// resume mid-stream, so the retained print repeats any lines the follower
-// already saw. A blip that is still running may have more output, but nothing
-// available to print now, so the follower only warns.
-func (a *app) replayTruncatedOutput(ctx context.Context, name, short, pod string, ended bool) {
-	if !ended {
-		a.progressCtx(ctx, "%s: output stream ended before the command exited; output above may be incomplete", short)
-		return
-	}
-	if a.replayFinished(ctx, name, short, pod, truncatedOutputWait, false) {
-		a.progressCtx(ctx, "%s: output stream ended before the command exited; replayed the retained output (lines above may repeat)", short)
-		return
-	}
-	a.progressCtx(ctx, "%s: output stream ended before the command exited; the rest of the output is no longer available", short)
-}
-
-// blipEnding reports whether the blip is saving or finished now. A follower
-// may attach while the command is running and learn only later that the
-// session ended without delivering output.
-func (a *app) blipEnding(ctx context.Context, name string) bool {
+// blipDone reports that a followed blip is finished. Saving is not done: the
+// root state still has to commit, and the committed trajectory is retained
+// after the pod is gone.
+func (a *app) blipDone(ctx context.Context, name string) bool {
 	b, err := a.getBlip(ctx, name)
-	return err == nil && (v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving)
-}
-
-// endedWithoutOutput reports that the blip is finished and produced no
-// output. Losing an empty stream is not a failure, so followers should not
-// warn that output is unavailable.
-func (a *app) endedWithoutOutput(ctx context.Context, name string) bool {
-	b, err := a.getBlip(ctx, name)
-	if err != nil {
-		return false
-	}
-	return (v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving) && b.Status.Output == ""
-}
-
-// outputFinal reports that a finished, empty-output blip can no longer
-// publish retained output because the VM pod that would hold it is gone. The
-// controller writes status.output before it deletes the pod, so this is safe
-// even when the client's cached view lags. While the pod still exists the
-// follower keeps polling: the controller may not have published the output
-// yet.
-func (a *app) outputFinal(ctx context.Context, name, pod string) bool {
-	b, err := a.getBlip(ctx, name)
-	if err != nil || b.Status.Pod != pod || b.Status.Output != "" ||
-		!(v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving) {
-		return false
-	}
-	c, err := a.clients()
-	if err != nil {
-		return false
-	}
-	p := &corev1.Pod{}
-	err = c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: pod}, p)
-	return apierrors.IsNotFound(err) || (err == nil && p.DeletionTimestamp != nil)
-}
-
-// retainedOutputWait bounds how long gather waits for the controller to
-// publish status.output after the VM pod is gone. The controller patches the
-// output before deleting the pod, but the client's view can lag behind a fast
-// completion, and a fixed short wait used to give up silently.
-var retainedOutputWait = 15 * time.Second
-
-// printRetained prints the command output the controller saved in Blip status
-// before deleting the VM pod. The controller and a finishing Blip race the
-// follower, so poll for the status write until retainedOutputWait expires. It
-// returns whether it printed anything.
-func (a *app) printRetained(ctx context.Context, name, short string) bool {
-	return a.printRetainedFor(ctx, name, short, retainedOutputWait)
-}
-
-// printRetainedFor is printRetained with a caller-selected grace period.
-func (a *app) printRetainedFor(ctx context.Context, name, short string, wait time.Duration) bool {
-	out, ok := a.retainedOutputFor(ctx, name, wait)
-	if !ok {
-		return false
-	}
-	return a.printCombined(ctx, short, out)
-}
-
-// retainedOutputFor polls status.output until the controller publishes it or
-// wait expires. It returns the retained output and whether any was found.
-func (a *app) retainedOutputFor(ctx context.Context, name string, wait time.Duration) (string, bool) {
-	c, err := a.clients()
-	if err != nil {
-		return "", false
-	}
-	deadline := time.Now().Add(wait)
-	for {
-		b := &v1alpha1.Blip{}
-		err := c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: name}, b)
-		switch {
-		case err == nil && b.Status.Output != "":
-			return b.Status.Output, true
-		case apierrors.IsNotFound(err):
-			// The Blip is gone, so no later status write can arrive.
-			return "", false
-		case ctx.Err() != nil || !time.Now().Before(deadline):
-			return "", false
-		}
-		select {
-		case <-ctx.Done():
-			return "", false
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-}
-
-// serialOutput reads the command output preserved on the VM serial console.
-// The guest prefixes mirrored output with "blip: ", which separates it from
-// kernel and runtime boot messages. It returns the combined stdout/stderr
-// text and whether the console was readable at all.
-func (a *app) serialOutput(ctx context.Context, pod string) (string, bool) {
-	c, err := a.clients()
-	if err != nil || c.Logs == nil {
-		return "", false
-	}
-	rc, err := c.Logs(ctx, pod)
-	if err != nil {
-		return "", false
-	}
-	defer rc.Close()
-	var b strings.Builder
-	sc := bufio.NewScanner(rc)
-	sc.Buffer(make([]byte, 64<<10), 1<<20)
-	for sc.Scan() {
-		if line, ok := strings.CutPrefix(sc.Text(), "blip: "); ok {
-			b.WriteString(line)
-			b.WriteByte('\n')
-		}
-	}
-	return b.String(), true
-}
-
-// replayLogs prints the command output preserved on the VM serial console.
-// The mirror combines stdout and stderr without a stream tag, so the output
-// goes to stderr rather than pretending it is the command's stdout. It
-// returns whether it printed anything.
-func (a *app) replayLogs(ctx context.Context, pod, short string) bool {
-	out, ok := a.serialOutput(ctx, pod)
-	if !ok {
-		return false
-	}
-	return a.printCombined(ctx, short, out)
-}
-
-// statusOutputTruncated is the controller's marker for a status tail whose
-// head was dropped to fit the retention bound.
-const statusOutputTruncated = "[earlier output was truncated]"
-
-// droppedLinesMarker reports the guest console's in-band notice that lines
-// were dropped from its bounded queue.
-func droppedLinesMarker(line string) bool {
-	count, ok := strings.CutSuffix(strings.TrimSpace(line), " output lines dropped")
-	if !ok || count == "" {
-		return false
-	}
-	for _, r := range count {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func outputTruncated(out string) bool {
-	if strings.Contains(out, statusOutputTruncated) {
-		return true
-	}
-	for _, line := range strings.Split(out, "\n") {
-		if droppedLinesMarker(line) {
-			return true
-		}
-	}
-	return false
-}
-
-// bestRetained chooses one complete tail without printing both. status.output
-// is the controller's stable copy; the serial console is a fallback when its
-// replay is more complete. A truncated source only wins when the other source
-// is missing or also truncated.
-func bestRetained(status string, hasStatus bool, serial string, hasSerial bool) (string, bool) {
-	switch {
-	case !hasStatus && !hasSerial:
-		return "", false
-	case !hasStatus:
-		return serial, outputTruncated(serial)
-	case !hasSerial:
-		return status, outputTruncated(status)
-	}
-	statusTruncated, serialTruncated := outputTruncated(status), outputTruncated(serial)
-	switch {
-	case statusTruncated && !serialTruncated:
-		return serial, false
-	case serialTruncated && !statusTruncated:
-		return status, false
-	}
-	// Both sources are either complete or truncated. Never concatenate them:
-	// prefer the longer tail, and status.output on a tie because it is the
-	// controller's authoritative retention.
-	if len(serial) > len(status) {
-		return serial, statusTruncated
-	}
-	return status, serialTruncated
-}
-
-// replayFinished prints the best retained output for a Blip that is finished
-// or saving. A command that finished before the follower attached may have
-// left only a bounded serial window; the controller's status.output is the
-// authoritative tail and may be more complete. It returns whether it printed
-// anything and warns only when every available source is truncated.
-func (a *app) replayFinished(ctx context.Context, name, short, pod string, wait time.Duration, final bool) bool {
-	status, hasStatus := a.retainedOutputFor(ctx, name, 0)
-	serial, hasSerial := a.serialOutput(ctx, pod)
-	if !hasStatus && (serial == "" || outputTruncated(serial)) {
-		// The serial replay is empty or incomplete, so wait briefly for the
-		// controller to publish a more complete status tail. When the attach
-		// already failed, a finished empty-output Blip whose pod is gone
-		// cannot publish anything later, so do not spend the grace on it.
-		if final && a.outputFinal(ctx, name, pod) {
-			return false
-		}
-		status, hasStatus = a.retainedOutputFor(ctx, name, wait)
-	}
-	out, truncated := bestRetained(status, hasStatus, serial, hasSerial)
-	if out == "" {
-		return false
-	}
-	if !a.printCombined(ctx, short, out) {
-		return false
-	}
-	if truncated {
-		a.progressCtx(ctx, "%s: output is truncated; only the retained tail is available", short)
-	}
-	return true
-}
-
-// printCombined writes stdout+stderr output that cannot be split again to
-// stderr with the blip prefix. It returns whether it wrote anything. The whole
-// replay is one write so a stalled consumer can be abandoned at the wait
-// deadline without leaving a partly prefixed block behind.
-func (a *app) printCombined(ctx context.Context, short, out string) bool {
-	if out == "" {
-		return false
-	}
-	var b bytes.Buffer
-	w := &prefixWriter{out: &b, prefix: short + "|"}
-	_, _ = w.Write([]byte(out))
-	w.flush()
-	if !w.wrote {
-		return false
-	}
-	return writeCtx(ctx, a.env.Err, b.Bytes())
-}
-
-// writeCtx writes p to w and reports whether the write completed before ctx
-// was done. A local write cannot be cancelled: a consumer that stopped
-// reading keeps the goroutine blocked. The caller abandons that write instead
-// of making --wait unbounded.
-func writeCtx(ctx context.Context, w io.Writer, p []byte) bool {
-	if ctx.Err() != nil {
-		return false
-	}
-	done := make(chan struct{})
-	go func() {
-		_, _ = w.Write(p)
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-ctx.Done():
-		// A write that completed at the same moment still counts.
-		select {
-		case <-done:
-			return true
-		default:
-			return false
-		}
-	}
-}
-
-// progressCtx is progress for a follower: a progress line must not keep
-// gather past its wait deadline when the local consumer stalls.
-func (a *app) progressCtx(ctx context.Context, format string, args ...any) {
-	writeCtx(ctx, a.env.Err, []byte(fmt.Sprintf(format+"\n", args...)))
-}
-
-// prefixWriter turns arbitrary output chunks into whole prefixed lines. Each
-// line is one Write to out, so concurrent followers do not interleave inside a
-// line.
-type prefixWriter struct {
-	out    io.Writer
-	prefix string
-	buf    []byte
-	wrote  bool
-}
-
-const prefixLineMax = 64 << 10
-
-func (w *prefixWriter) Write(p []byte) (int, error) {
-	w.buf = append(w.buf, p...)
-	for {
-		i := bytes.IndexByte(w.buf, '\n')
-		if i < 0 {
-			break
-		}
-		w.emit(w.buf[:i])
-		w.buf = w.buf[i+1:]
-	}
-	if len(w.buf) > prefixLineMax {
-		w.emit(w.buf)
-		w.buf = w.buf[:0]
-	}
-	return len(p), nil
-}
-
-func (w *prefixWriter) emit(line []byte) {
-	fmt.Fprintf(w.out, "%s %s\n", w.prefix, strings.TrimSuffix(string(line), "\r"))
-	w.wrote = true
-}
-
-func (w *prefixWriter) flush() {
-	if len(w.buf) > 0 {
-		w.emit(w.buf)
-		w.buf = w.buf[:0]
-	}
+	return err == nil && v1alpha1.Finished(b)
 }

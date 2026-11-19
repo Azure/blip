@@ -16,7 +16,7 @@ test:
 # Production-machine simulations and their concurrent adapters. Ordinary
 # `make test` also runs these tests; this target adds the race detector.
 test-sim:
-	go test -race ./internal/sim ./internal/simlive ./internal/simapp ./internal/atomicfile ./internal/storage ./internal/peer ./internal/nvme ./internal/node ./internal/controller ./internal/runtime ./internal/guest ./internal/session ./internal/wire ./internal/podapi
+	go test -race ./internal/sim ./internal/simlive ./internal/simapp ./internal/atomicfile ./internal/storage ./internal/peer ./internal/nvme ./internal/node ./internal/controller ./internal/runtime ./internal/guest ./internal/wire ./internal/podapi
 
 guest:
 	hack/guest/build.sh

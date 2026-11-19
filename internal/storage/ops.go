@@ -16,7 +16,8 @@ func (s *Store) CreateImage(ctx context.Context, id string, sizeBytes int64, fil
 	if _, err := s.lookup(id); err == nil {
 		return nil
 	}
-	rec := &record{ID: id, Kind: KindImage, Size: roundUp(sizeBytes, blockSize)}
+	size := roundUp(sizeBytes, blockSize)
+	rec := &record{ID: id, Kind: KindImage, Size: size, FSBytes: size}
 	if _, err := s.begin(rec, 1); err != nil {
 		return err
 	}
@@ -45,8 +46,10 @@ func (s *Store) CreateCommit(ctx context.Context, req CreateCommit) error {
 		}
 		return nil
 	}
-	rec := &record{ID: req.CommitID, Kind: KindCommit, StateUID: req.StateUID, Size: roundUp(req.SizeBytes, blockSize)}
+	rec := &record{ID: req.CommitID, Kind: KindCommit, StateUID: req.StateUID, StreamSize: req.StreamSize}
+	fsSize := roundUp(req.SizeBytes, blockSize)
 	var src *record
+	var srcSize int64
 	if id := req.FromImage + req.FromCommit; id != "" {
 		kind := KindImage
 		if req.FromCommit != "" {
@@ -59,12 +62,21 @@ func (s *Store) CreateCommit(ctx context.Context, req CreateCommit) error {
 		}
 		defer s.unhold(id)
 		rec.Base = id
-		if req.FromImage != "" && rec.Size > 0 && src.Size > rec.Size {
-			return fmt.Errorf("storage: image %s needs %d bytes, more than the requested %d", id, src.Size, req.SizeBytes)
+		srcSize = src.Size
+		srcFS := src.fsBytes()
+		if req.FromImage != "" && fsSize > 0 && srcFS > fsSize {
+			return fmt.Errorf("storage: image %s needs %d bytes, more than the requested %d", id, srcFS, req.SizeBytes)
 		}
-		rec.Size = max(rec.Size, src.Size)
-	} else if rec.Size == 0 {
+		fsSize = max(fsSize, srcFS)
+	}
+	if fsSize == 0 {
 		return errors.New("storage: empty commit needs a size")
+	}
+	rec.FSBytes = fsSize
+	if req.StreamSize > 0 {
+		rec.Size = VolumeBytes(fsSize, req.StreamSize)
+	} else {
+		rec.Size = max(fsSize, srcSize)
 	}
 	if _, err := s.begin(rec, 1); err != nil {
 		return err
@@ -142,9 +154,15 @@ func (s *Store) CreateWorking(ctx context.Context, req CreateWorking) (string, e
 		return "", err
 	}
 	defer s.unhold(id)
+	fsSize := max(roundUp(req.SizeBytes, blockSize), src.fsBytes())
 	rec := &record{
 		ID: req.AttachmentID, Kind: KindWorking, StateUID: req.StateUID, Base: id,
-		Size: max(roundUp(req.SizeBytes, blockSize), src.Size), ReadOnly: req.ReadOnly,
+		StreamSize: req.StreamSize, FSBytes: fsSize, ReadOnly: req.ReadOnly,
+	}
+	if req.StreamSize > 0 {
+		rec.Size = VolumeBytes(fsSize, req.StreamSize)
+	} else {
+		rec.Size = max(fsSize, src.Size)
 	}
 	if _, err := s.begin(rec, 1); err != nil {
 		return "", err
@@ -233,7 +251,8 @@ func (s *Store) Seal(ctx context.Context, attachmentID, commitID string) (int64,
 	if err := s.runOperation([]deviceEffect{{Kind: eCheckClosed, Name: name}, {Kind: eCheckClean, Name: name}, {Kind: eFlush, Name: name}}, nil); err != nil {
 		return 0, err
 	}
-	rec := &record{ID: commitID, Kind: KindCommit, StateUID: w.StateUID, Base: w.Base, Size: w.Size}
+	rec := &record{ID: commitID, Kind: KindCommit, StateUID: w.StateUID, Base: w.Base,
+		Size: w.Size, StreamSize: w.StreamSize, FSBytes: w.fsBytes()}
 	if _, err := s.begin(rec, 1); err != nil {
 		return 0, err
 	}
@@ -271,7 +290,8 @@ func (s *Store) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID s
 	if err := s.runOperation([]deviceEffect{{Kind: eFlush, Name: s.plainName(w)}}, nil); err != nil {
 		return 0, err
 	}
-	rec := &record{ID: commitID, Kind: KindCommit, StateUID: stateUID, Base: w.Base, Size: w.Size}
+	rec := &record{ID: commitID, Kind: KindCommit, StateUID: stateUID, Base: w.Base,
+		Size: w.Size, StreamSize: w.StreamSize, FSBytes: w.fsBytes()}
 	if _, err := s.begin(rec, 1); err != nil {
 		return 0, err
 	}

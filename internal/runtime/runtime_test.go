@@ -162,12 +162,12 @@ func TestClaimMountUnmountLifecycle(t *testing.T) {
 	}
 
 	root := podapi.Disk{ID: "00000000000000aa", Serial: "00000000000000aa", Device: "/dev/root"}
-	r.desired = podapi.Desired{Claim: &podapi.Claim{BlipName: "b", Root: root, Command: []string{"true"}, WaitForClient: true}}
+	r.desired = podapi.Desired{Claim: &podapi.Claim{BlipName: "b", Root: root, Command: []string{"true"}}}
 	r.reconcile()
 	r.writeObserved()
 	var claim wire.Claim
 	g.expect(wire.TClaim, &claim)
-	if claim.ID != root.ID || claim.Hostname != "b" || !claim.WaitForClient {
+	if claim.ID != root.ID || claim.Hostname != "b" {
 		t.Fatalf("claim %+v", claim)
 	}
 	if d := ch.disk(root.ID); d == nil || d["pci_segment"].(float64) != 1 || d["serial"] != root.ID || d["readonly"] != false {
@@ -407,7 +407,7 @@ func TestChArgs(t *testing.T) {
 		"--platform num_pci_segments=2",
 		"serial=blip-config",
 		"readonly=on",
-		"--vsock cid=3,socket=/run/blip/vsock/vsock.sock",
+		"--vsock cid=3,socket=/run/blip/sock/vsock.sock",
 		"--serial tty",
 		"--net tap=tap0,mac=aa:bb:cc:dd:ee:ff",
 	} {
@@ -537,7 +537,7 @@ func TestWaitSocketChmodsExistingSocket(t *testing.T) {
 }
 
 func TestWaitSocketWaitsForCreation(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "vsock", "vsock.sock")
+	path := filepath.Join(t.TempDir(), "sock", "vsock.sock")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}

@@ -693,23 +693,3 @@ func TestMachineSeededAdversarialSchedules(t *testing.T) {
 		}
 	}
 }
-
-func TestMachineReportSequenceAndHelloResync(t *testing.T) {
-	s := newLifecycleSimulation(t)
-	at := time.Unix(50, 0).UTC()
-	s.control(wire.TReport, wire.Report{Seq: 2, Text: "done", Time: at})
-	got := s.m.Observed().Report
-	if got == nil || got.Seq != 2 || got.Text != "done" || !got.Time.Equal(s.clock.now) {
-		t.Fatalf("report %+v", got)
-	}
-	// Sequence numbers never go backwards.
-	s.control(wire.TReport, wire.Report{Seq: 1, Text: "old"})
-	if got := s.m.Observed().Report; got.Seq != 2 {
-		t.Fatalf("stale report replaced the newer one: %+v", got)
-	}
-	// A reconnecting guest replays its last report in Hello.
-	s.control(wire.THello, wire.Hello{Version: wire.Version, Report: &wire.Report{Seq: 3, Text: "resumed", Time: at}})
-	if got := s.m.Observed().Report; got.Seq != 3 || got.Text != "resumed" {
-		t.Fatalf("hello report %+v", got)
-	}
-}

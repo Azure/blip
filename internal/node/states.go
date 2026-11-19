@@ -107,7 +107,7 @@ func planBuild(v *view, p *plan, s *v1alpha1.BlipState) bool {
 	if v.busy[commitID] {
 		return true
 	}
-	req := storage.CreateCommit{StateUID: string(s.UID), CommitID: commitID, SizeBytes: s.Status.SizeBytes}
+	req := storage.CreateCommit{StateUID: string(s.UID), CommitID: commitID, SizeBytes: s.Status.SizeBytes, StreamSize: stateStreamSize(s)}
 	switch {
 	case s.Status.ImageDigest != "":
 		id, err := image.DigestOf(s.Status.ImageDigest)

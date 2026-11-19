@@ -12,6 +12,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Azure/blip/internal/stream"
 )
 
 // hydration tracks a background clone watcher.
@@ -37,10 +39,34 @@ func (s *Store) createRemoteWorking(ctx context.Context, req CreateWorking) (str
 	if base != nil {
 		defer s.unhold(base.ID)
 	}
+	// Remote.SizeBytes covers the whole remote volume, including its ring. The
+	// destination filesystem only needs to reach the remote filesystem. A
+	// new-style remote keeps its filesystem below stream.Offset, so a requested
+	// size is authoritative there.
+	fsSize := roundUp(req.SizeBytes, blockSize)
+	grow := false
+	if req.StreamSize > 0 {
+		switch {
+		case fsSize == 0:
+			fsSize = min(src.SizeBytes, stream.Offset)
+		case src.SizeBytes > stream.Offset:
+			grow = true
+		default:
+			grow = fsSize > src.SizeBytes
+		}
+	} else {
+		fsSize = max(fsSize, src.SizeBytes)
+		grow = fsSize > src.SizeBytes
+	}
 	rec := &record{
 		ID: req.AttachmentID, Kind: KindWorking, StateUID: req.StateUID, Base: src.Base,
-		Size: max(roundUp(req.SizeBytes, blockSize), src.SizeBytes), ReadOnly: req.ReadOnly, Layered: true,
+		StreamSize: req.StreamSize, FSBytes: fsSize, ReadOnly: req.ReadOnly, Layered: true,
 		Clone: &cloneInfo{MetaSize: cloneMetaSize(src.SizeBytes), Source: src.Device, SourceSize: src.SizeBytes, RemoteID: src.ID},
+	}
+	if req.StreamSize > 0 {
+		rec.Size = VolumeBytes(fsSize, req.StreamSize)
+	} else {
+		rec.Size = fsSize
 	}
 	if _, err := s.begin(rec, 2); err != nil {
 		releaseOnce(src)
@@ -51,9 +77,9 @@ func (s *Store) createRemoteWorking(ctx context.Context, req CreateWorking) (str
 	s.mu.Unlock()
 	top := s.topName(rec)
 	err = s.setupClone(rec, base, top, src.Regions)
-	if err == nil && rec.Size > src.SizeBytes {
+	if err == nil && grow {
 		err = s.withPlain(rec, false, func(string) error {
-			return s.runOperation([]deviceEffect{{Kind: eGrow, Name: s.plainName(rec)}}, nil)
+			return s.runOperation([]deviceEffect{{Kind: eGrow, Name: s.plainName(rec), Size: rec.FSBytes}}, nil)
 		})
 	}
 	if err == nil {
@@ -104,7 +130,8 @@ func (s *Store) FetchCommit(ctx context.Context, stateUID, commitID string, src 
 	}
 	rec := &record{
 		ID: commitID, Kind: KindCommit, StateUID: stateUID, Base: src.Base, Size: src.SizeBytes,
-		Clone: &cloneInfo{MetaSize: cloneMetaSize(src.SizeBytes), Source: src.Device, SourceSize: src.SizeBytes, RemoteID: src.ID},
+		FSBytes: min(src.SizeBytes, stream.Offset),
+		Clone:   &cloneInfo{MetaSize: cloneMetaSize(src.SizeBytes), Source: src.Device, SourceSize: src.SizeBytes, RemoteID: src.ID},
 	}
 	// The destination, clone metadata, and clone target of a fetch are named
 	// from the commit ID alone. A fetch interrupted after creating them (and

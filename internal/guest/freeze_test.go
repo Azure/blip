@@ -48,7 +48,6 @@ func freezeGuest(t *testing.T) (*Guest, *fakeFreezer) {
 		rootDev:    "/dev/null",
 		mounts:     map[string]*mount{"m": {id: "m", path: "/data", target: filepath.Join(root, "data")}},
 		frozen:     map[string]*frozenFS{},
-		sessions:   map[string]*session{},
 		filesystem: &filesystemEffects{sync: func(string) {}, freeze: f.freeze},
 	}
 	t.Cleanup(func() { _ = g.thawAll() })
@@ -139,7 +138,6 @@ func TestFreezeAutoThawAndResync(t *testing.T) {
 		c := controlPair(t, g)
 		var h wire.Hello
 		readFrame(t, c, wire.THello, &h)
-		readFrame(t, c, wire.TStatus, &wire.Status{})
 		if err := c.WriteJSON(wire.TFreeze, wire.Freeze{ID: "m"}); err != nil {
 			t.Fatal(err)
 		}
@@ -155,7 +153,6 @@ func TestFreezeAutoThawAndResync(t *testing.T) {
 		if len(h.Frozen) != 1 || h.Frozen[0] != "m" {
 			t.Fatalf("hello %+v", h)
 		}
-		readFrame(t, c, wire.TStatus, &wire.Status{})
 
 		time.Sleep(freezeTimeout)
 		res = wire.FreezeResult{}

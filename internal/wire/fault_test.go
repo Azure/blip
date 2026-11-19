@@ -25,7 +25,7 @@ func (s fragmentedStream) Read(p []byte) (int, error) {
 func TestConnFragmentationAndEveryTruncation(t *testing.T) {
 	var data bytes.Buffer
 	w := NewConn(&data)
-	if err := w.WriteJSON(TOpen, Open{Mode: OpenExec, OpenID: "retry", Argv: []string{"once"}}); err != nil {
+	if err := w.WriteJSON(TStdioResume, StdioResume{Out: 7, Err: 8}); err != nil {
 		t.Fatal(err)
 	}
 	encoded := append([]byte(nil), data.Bytes()...)
@@ -44,8 +44,8 @@ func TestConnFragmentationAndEveryTruncation(t *testing.T) {
 					}
 					continue
 				}
-				var open Open
-				if err != nil || typ != TOpen || Decode(payload, &open) != nil || open.OpenID != "retry" {
+				var resume StdioResume
+				if err != nil || typ != TStdioResume || Decode(payload, &resume) != nil || resume.Out != 7 || resume.Err != 8 {
 					t.Fatalf("fragmented complete frame: type=%d payload=%q err=%v", typ, payload, err)
 				}
 			}
@@ -57,7 +57,7 @@ func TestConnFragmentationAndEveryTruncation(t *testing.T) {
 // transport failure; nothing reaches the peer.
 func TestConnOversizedWriteIsTypedAndWritesNothing(t *testing.T) {
 	var buf bytes.Buffer
-	err := NewConn(&buf).Write(TOpen, make([]byte, MaxFrame+1))
+	err := NewConn(&buf).Write(TStdin, make([]byte, MaxFrame+1))
 	var sizeErr *FrameSizeError
 	if !errors.Is(err, ErrFrameTooLarge) || !errors.As(err, &sizeErr) || sizeErr.Size != MaxFrame+1 {
 		t.Fatalf("err = %v, want FrameSizeError(%d)", err, MaxFrame+1)
@@ -122,7 +122,7 @@ func TestConnWriteFailurePoisonsFraming(t *testing.T) {
 	if err := c.Write(TStdin, []byte("partial")); !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("first write: %v", err)
 	}
-	if err := c.WriteJSON(TSignal, Signal{Name: "INT"}); !errors.Is(err, io.ErrShortWrite) {
+	if err := c.WriteJSON(TStdin, []byte("x")); !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("continued writing into a truncated frame: %v", err)
 	}
 	if w.Len() != 3 {
@@ -191,7 +191,7 @@ func TestConnCoalescedFramesOwnPayload(t *testing.T) {
 func FuzzConnRead(f *testing.F) {
 	f.Add([]byte{byte(TStdin), 0, 0, 0, 3, 'a', 'b', 'c'})
 	f.Add([]byte{byte(TFreeze), 255, 255, 255, 255})
-	f.Add([]byte{byte(TOpen), 0, 0, 0, 1, '{'})
+	f.Add([]byte{byte(TStdin), 0, 0, 0, 1, '{'})
 	f.Fuzz(func(t *testing.T, input []byte) {
 		c := NewConn(fragmentedStream{bytes.NewReader(input), io.Discard, 3})
 		_, payload, err := c.Read()

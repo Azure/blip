@@ -101,7 +101,7 @@ func (m *Machine) Key() string {
 		"claimID": m.claimID, "claimWaiting": m.claimWaiting,
 		"claimSince": m.claimSince, "claimRetryAt": m.claimRetryAt,
 		"rootInVM": m.rootInVM, "rootDisk": m.rootDisk, "rootAdding": m.rootAdding,
-		"disks": disks, "order": m.order, "sessions": m.sessions, "exit": m.exit,
+		"disks": disks, "order": m.order, "exit": m.exit,
 		"errMsg": m.errMsg, "sigterm": m.sigterm, "shutdownSent": m.shutdownSent,
 		"shutdownDone": m.shutdownDone, "stopSince": m.stopSince,
 		"exited": m.exited, "killSent": m.killSent,

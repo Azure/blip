@@ -155,9 +155,9 @@ func applyDeviceEffectContext(ctx context.Context, e deviceEffect) error {
 		_, err := dmsetup("mknodes", e.Name)
 		return err
 	case eFormat:
-		return mkfsExt4(ctx, mapperPath(e.Name))
+		return mkfsExt4(ctx, mapperPath(e.Name), e.Size)
 	case eGrow:
-		return growExt4(ctx, mapperPath(e.Name), e.Reproducible)
+		return growExt4(ctx, mapperPath(e.Name), e.Size, e.Reproducible)
 	case eDiscard:
 		return discardOutside(mapperPath(e.Name), e.Regions, e.Size)
 	case eMessage:
@@ -231,7 +231,7 @@ func createPlan(l layout, r, src *record, image bool) []deviceEffect {
 	}
 	steps := []deviceEffect{e}
 	working := r.Kind == KindWorking
-	grow := src != nil && r.Size > src.Size
+	grow := src != nil && r.fsBytes() > src.fsBytes()
 	if !image && !working && src != nil && !grow {
 		return steps
 	}
@@ -241,7 +241,7 @@ func createPlan(l layout, r, src *record, image bool) []deviceEffect {
 		return append(steps, deviceEffect{Kind: eCreate, Name: l.plain, Table: l.crypt, ReadOnly: r.ReadOnly})
 	}
 	steps = append(steps, deviceEffect{Kind: eCreate, Name: l.plain, Table: l.crypt})
-	body := deviceEffect{Kind: eFormat, Name: l.plain}
+	body := deviceEffect{Kind: eFormat, Name: l.plain, Size: r.fsBytes()}
 	if image {
 		body.Kind = eFill
 	} else if grow {

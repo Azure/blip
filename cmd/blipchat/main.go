@@ -1,79 +1,79 @@
-// Command blipchat is the project coordinator: it sequences turns, turns blip
-// reports into turns, runs coordinator steps against an OpenAI-compatible
-// model, and serves the engineer chat.
+// Command blipchat is a stateless, team-scoped chat UI for ACP agents running
+// in blips. A chat is a BlipState; each turn runs a Blip whose stdin/stdout is
+// the state's trajectory ring.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/blipchat"
 )
 
-// +kubebuilder:rbac:groups=blip.dev,resources=blipturns,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blip.dev,resources=blipturns/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blip.dev,resources=blipthreads,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=blip.dev,resources=blipthreads/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blip.dev,resources=blips,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blip.dev,resources=blipstates,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups=blip.dev,resources=blippools,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create;get
-// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
-
 func main() {
-	var cfg blipchat.Config
-	var leaderElect bool
-	var agentCommand string
-	var heartbeat, debounce string
-	flag.StringVar(&cfg.Listen, "listen", ":8080", "chat HTTP listen address")
-	flag.StringVar(&cfg.HealthListen, "health-listen", ":8081", "health probe HTTP listen address")
-	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
-	flag.StringVar(&cfg.BaseURL, "llm-base-url", "", "OpenAI-compatible API root, for example https://llm.example/v1")
-	flag.StringVar(&cfg.APIKey, "llm-api-key", os.Getenv("BLIP_LLM_API_KEY"), "optional API key for the LLM endpoint")
-	flag.StringVar(&cfg.Model, "model", "", "default model when a thread does not set spec.model")
-	flag.StringVar(&agentCommand, "agent-command", "blip-pi", "command that runs one task; the prompt is appended")
-	flag.StringVar(&debounce, "debounce", "5s", "how long Batch turns wait before a step")
-	flag.StringVar(&heartbeat, "heartbeat", "30m", "default heartbeat while tasks are open")
-	flag.Int64Var(&cfg.StepTokenLimit, "step-token-limit", 60000, "tokens one step may spend")
-	flag.IntVar(&cfg.MaxToolCalls, "max-tool-calls", 20, "tool calls one step may make")
-	opts := zap.Options{}
-	opts.BindFlags(flag.CommandLine)
+	var (
+		listen       string
+		namespace    string
+		profilesCM   string
+		profilesFile string
+		autoApprove  string
+		defaultPool  string
+		logLevel     string
+	)
+	flag.StringVar(&listen, "listen", ":8080", "HTTP listen address")
+	flag.StringVar(&namespace, "namespace", "default", "default session namespace")
+	flag.StringVar(&profilesCM, "profiles-configmap", "", "profiles ConfigMap as NAME or NAMESPACE/NAME (default <namespace>/blip-chat-profiles)")
+	flag.StringVar(&profilesFile, "profiles-file", "", "optional JSON profiles file")
+	flag.StringVar(&autoApprove, "auto-approve", "always", "permission policy: always (allow once) or never")
+	flag.StringVar(&defaultPool, "default-pool", "default", "pool used by profiles that do not name one")
+	flag.StringVar(&logLevel, "log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	var err error
-	if cfg.Debounce, err = time.ParseDuration(debounce); err != nil {
-		fail("--debounce: " + err.Error())
+	level, err := parseLevel(logLevel)
+	if err != nil {
+		fail(err.Error())
 	}
-	if cfg.Heartbeat, err = time.ParseDuration(heartbeat); err != nil {
-		fail("--heartbeat: " + err.Error())
-	}
-	cfg.AgentCommand = strings.Fields(agentCommand)
-	if cfg.BaseURL == "" {
-		fail("--llm-base-url is required")
-	}
-	if err := run(cfg, leaderElect); err != nil {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	if err := run(listen, namespace, profilesCM, profilesFile, autoApprove, defaultPool); err != nil {
 		fail(err.Error())
 	}
 }
 
-func fail(message string) {
-	fmt.Fprintln(os.Stderr, "blipchat:", message)
-	os.Exit(1)
+func parseLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info", "":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("--log-level: unknown level %q", s)
+	}
 }
 
-func run(cfg blipchat.Config, leaderElect bool) error {
+func run(listen, namespace, profilesCM, profilesFile, autoApprove, defaultPool string) error {
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		return err
+	}
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		return err
@@ -81,22 +81,67 @@ func run(cfg blipchat.Config, leaderElect bool) error {
 	if err := v1.AddToScheme(scheme); err != nil {
 		return err
 	}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                        scheme,
-		LeaderElection:                leaderElect,
-		LeaderElectionID:              "blipchat.blip.dev",
-		LeaderElectionReleaseOnCancel: true,
-		// blipchat serves its own probe server on --health-listen with the
-		// manager's pre-cache runnable group, so the built-in one is unused.
-		HealthProbeBindAddress: "0",
-		Metrics:                metricsserver.Options{BindAddress: "0"},
+	kc, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if profilesCM == "" {
+		profilesCM = namespace + "/blip-chat-profiles"
+	}
+	profiles, err := blipchat.LoadProfiles(ctx, kc, namespace, profilesCM, profilesFile, defaultPool)
+	if err != nil {
+		return err
+	}
+	wire, err := blipchat.NewWire(cfg)
+	if err != nil {
+		return err
+	}
+	srv, err := blipchat.New(blipchat.Options{
+		Namespace:   namespace,
+		Profiles:    profiles,
+		DefaultPool: defaultPool,
+		AutoApprove: autoApprove,
+		Cluster:     blipchat.NewKube(kc),
+		Wire:        wire,
+		Log:         slog.Default(),
 	})
 	if err != nil {
 		return err
 	}
-	ctx := ctrl.SetupSignalHandler()
-	if err := blipchat.Setup(ctx, mgr, cfg); err != nil {
-		return err
+	srv.Start(ctx)
+	defer srv.Close()
+
+	httpServer := &http.Server{
+		Addr:              listen,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
-	return mgr.Start(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		slog.Info("listening", "address", listen, "namespace", namespace)
+		errCh <- httpServer.ListenAndServe()
+	}()
+	select {
+	case <-ctx.Done():
+	case err := <-errCh:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
+	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return httpServer.Shutdown(shutdown)
+}
+
+func fail(message string) {
+	fmt.Fprintln(os.Stderr, "blipchat:", message)
+	os.Exit(1)
 }

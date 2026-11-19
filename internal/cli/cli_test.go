@@ -12,8 +12,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
-	"github.com/Azure/blip/internal/session/fakeguest"
-	"github.com/Azure/blip/internal/wire"
 )
 
 // isBlipGone reports whether the blip no longer exists. Garbage collection is
@@ -42,12 +40,12 @@ func TestRunCreatesBlipAndReturnsName(t *testing.T) {
 	if strings.TrimSpace(out) != "worker-1" {
 		t.Fatalf("output %q", out)
 	}
-	if opens := h.guest.Opens(); len(opens) != 0 {
-		t.Fatalf("run attached to the blip: %+v", opens)
+	if _, stdins := h.stream.calls(); len(stdins) != 1 || !stdins[0].eof || stdins[0].state != "workspace" {
+		t.Fatalf("run did not close stdin: %+v", stdins)
 	}
 	b := h.blip("worker-1")
 	s := b.Spec
-	if s.State != "workspace" || s.Pool != "big" || s.WorkingDir != "/work/repo" || s.User != "dev" || s.TTY {
+	if s.State != "workspace" || s.Pool != "big" || s.WorkingDir != "/work/repo" || s.User != "dev" {
 		t.Fatalf("spec = %+v", s)
 	}
 	if strings.Join(s.Command, "|") != "sh|-lc|make test" || len(s.Env) != 1 || s.Env[0] != (v1alpha1.EnvVar{Name: "A", Value: "B"}) {
@@ -147,20 +145,13 @@ func TestRunRejectsBadFlags(t *testing.T) {
 
 func TestRunReturnsNameWithoutAttaching(t *testing.T) {
 	h := newHarness(t, readyState("base"))
-	ran := false
-	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
-		ran = true
-		s.Stdout("hello\n")
-		s.Stderr("oops\n")
-		return wire.Exit{Code: 3}
-	}
 	code, out, errOut := h.run("", "run", "--name", "job", "--from", "base", "--", "false")
 	// run neither streams the command's output nor returns its exit code.
 	if code != 0 || out != "job\n" || errOut != "" {
 		t.Fatalf("code %d out %q err %q", code, out, errOut)
 	}
-	if ran || len(h.guest.Opens()) != 0 {
-		t.Fatalf("run attached to the command: opens %+v", h.guest.Opens())
+	if logs, _ := h.stream.calls(); len(logs) != 0 {
+		t.Fatalf("run read the stream: %+v", logs)
 	}
 	b := h.blip("job")
 	if b.Spec.State != "job" || strings.Join(b.Spec.Command, " ") != "false" {
@@ -176,126 +167,6 @@ func TestRunReturnsNameWithoutAttaching(t *testing.T) {
 	}
 }
 
-func TestExecForwardsStdinAndExitCode(t *testing.T) {
-	h := newHarness(t, runningBlip("agent"))
-	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
-		s.Stdout(strings.ToUpper(s.ReadAll()))
-		return wire.Exit{Code: 5}
-	}
-	code, out, _ := h.run("data", "exec", "agent", "-w", "/work", "-u", "root", "-e", "X=1", "--", "tr", "a-z", "A-Z")
-	if code != 5 || out != "DATA" {
-		t.Fatalf("code %d out %q", code, out)
-	}
-	o := h.guest.Opens()[0]
-	if o.Pod != "pod-agent" || o.Open.Mode != wire.OpenExec || strings.Join(o.Open.Argv, " ") != "tr a-z A-Z" ||
-		o.Open.WorkingDir != "/work" || o.Open.User != "root" || o.Open.Env[0] != "X=1" || o.Open.TTY {
-		t.Fatalf("open = %+v", o)
-	}
-}
-
-func TestExecWithoutCommandOpensLoginShell(t *testing.T) {
-	h := newHarness(t, runningBlip("agent"))
-	h.guest.Run = func(s *fakeguest.Session) wire.Exit { return wire.Exit{} }
-	if code, _, errOut := h.run("", "exec", "agent", "-u", "dev"); code != 0 {
-		t.Fatalf("code %d: %s", code, errOut)
-	}
-	if code, _, errOut := h.run("", "exec", "agent", "-t"); code != 0 {
-		t.Fatalf("code %d: %s", code, errOut)
-	}
-	opens := h.guest.Opens()
-	if o := opens[0].Open; o.Mode != wire.OpenExec || len(o.Argv) != 0 || o.User != "dev" || o.TTY {
-		t.Fatalf("open = %+v", o)
-	}
-	if o := opens[1].Open; !o.TTY {
-		t.Fatalf("-t did not request a terminal: %+v", o)
-	}
-}
-
-// A command that cannot start returns the conventional status, not exit 1:
-// 127 when it is missing and 126 when it exists but cannot be executed. The
-// explanation stays on stderr.
-func TestExecStartFailureExitCode(t *testing.T) {
-	for _, tc := range []struct {
-		code int
-		msg  string
-	}{
-		{127, "nosuchcmd: command not found"},
-		{126, "start /etc/passwd: fork/exec /etc/passwd: permission denied"},
-	} {
-		h := newHarness(t, runningBlip("agent"))
-		h.guest.OpenError = tc.msg
-		h.guest.OpenCode = tc.code
-		code, _, errOut := h.run("", "exec", "agent", "--", "x")
-		if code != tc.code || !strings.Contains(errOut, tc.msg) {
-			t.Fatalf("code %d err %q, want %d containing %q", code, errOut, tc.code, tc.msg)
-		}
-	}
-}
-
-// exec has the same silent-flag problem after the blip name and command.
-func TestExecRejectsFlagsAfterCommandWithoutDash(t *testing.T) {
-	h := newHarness(t, runningBlip("agent"))
-	code, _, errOut := h.run("", "exec", "agent", "echo", "-n", "hi")
-	if code != 1 || !strings.Contains(errOut, `flag "-n"`) || !strings.Contains(errOut, "put -- before the command") {
-		t.Fatalf("code %d: %s", code, errOut)
-	}
-	if opens := h.guest.Opens(); len(opens) != 0 {
-		t.Fatalf("exec opened a session: %+v", opens)
-	}
-}
-
-// An explicit -- still passes flag-looking command arguments through.
-func TestExecPassesFlagLikeArgsAfterDash(t *testing.T) {
-	h := newHarness(t, runningBlip("agent"))
-	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
-		s.Stdout(strings.Join(s.Open.Argv, " "))
-		return wire.Exit{}
-	}
-	code, out, errOut := h.run("", "exec", "agent", "--", "echo", "-n", "hi")
-	if code != 0 || out != "echo -n hi" {
-		t.Fatalf("code %d out %q err %q", code, out, errOut)
-	}
-}
-
-// pflag accepts an attached value for a boolean shorthand. Without --, the
-// guard must reject that form just like a bare flag because the command would
-// otherwise lose the argument.
-func TestExecRejectsBooleanShorthandValueAfterCommandWithoutDash(t *testing.T) {
-	for _, flag := range []string{"-t=false", "-t=0", "-T=true"} {
-		h := newHarness(t, runningBlip("agent"))
-		code, _, errOut := h.run("", "exec", "agent", "echo", flag)
-		if code != 1 || !strings.Contains(errOut, `flag "`+flag+`"`) || !strings.Contains(errOut, "put -- before the command") {
-			t.Errorf("%s: code %d: %s", flag, code, errOut)
-		}
-		if opens := h.guest.Opens(); len(opens) != 0 {
-			t.Errorf("%s: exec opened a session: %+v", flag, opens)
-		}
-	}
-}
-
-// After --, the same boolean-looking arguments belong to the command.
-func TestExecPassesBooleanShorthandValueAfterDash(t *testing.T) {
-	for _, flag := range []string{"-t=false", "-t=0", "-T=true"} {
-		h := newHarness(t, runningBlip("agent"))
-		h.guest.Run = func(s *fakeguest.Session) wire.Exit {
-			s.Stdout(strings.Join(s.Open.Argv, " "))
-			return wire.Exit{}
-		}
-		code, out, errOut := h.run("", "exec", "agent", "--", "echo", flag)
-		if code != 0 || out != "echo "+flag {
-			t.Errorf("%s: code %d out %q err %q", flag, code, out, errOut)
-		}
-	}
-}
-
-func TestExecSignalExitCode(t *testing.T) {
-	h := newHarness(t, runningBlip("agent"))
-	h.guest.Run = func(s *fakeguest.Session) wire.Exit { return wire.Exit{Signal: "KILL"} }
-	if code, _, _ := h.run("", "exec", "agent", "--", "sleep", "1"); code != 137 {
-		t.Fatalf("code %d", code)
-	}
-}
-
 // Every command that takes an object name rejects an impossible one with the
 // same short message instead of leaking client-go or API-server validation.
 func TestInvalidNamesAreRejectedBeforeAPI(t *testing.T) {
@@ -306,7 +177,6 @@ func TestInvalidNamesAreRejectedBeforeAPI(t *testing.T) {
 	}{
 		{[]string{"run", "--name", "", "--from", "base", "--", "true"}, `invalid blip name ""`},
 		{[]string{"gather", ""}, `invalid blip name ""`},
-		{[]string{"exec", "", "--", "true"}, `invalid blip name ""`},
 	} {
 		code, _, errOut := h.run("", tc.args...)
 		if code != 1 || !strings.Contains(errOut, tc.want) {
@@ -329,20 +199,6 @@ func TestInvalidNamesAreRejectedBeforeAPI(t *testing.T) {
 	code, _, errOut := h.run("", "gather", "missing")
 	if code != 1 || !strings.Contains(errOut, `blip "missing" not found in namespace "ns"`) {
 		t.Fatalf("code %d stderr %q", code, errOut)
-	}
-}
-
-func TestExecOnFinishedOrMissingBlipIsFriendly(t *testing.T) {
-	b := runningBlip("agent")
-	b.Status.Phase, b.Status.Pod = v1alpha1.BlipSucceeded, ""
-	h := newHarness(t, b)
-	code, _, errOut := h.run("", "exec", "agent", "--", "true")
-	if code != 1 || !strings.Contains(errOut, `blip "agent" has finished (Succeeded)`) {
-		t.Fatalf("code %d err %q", code, errOut)
-	}
-	code, _, errOut = h.run("", "exec", "missing", "--", "true")
-	if code != 1 || !strings.Contains(errOut, `blip "missing" not found`) {
-		t.Fatalf("code %d err %q", code, errOut)
 	}
 }
 
@@ -610,7 +466,6 @@ func TestGitWorkflow(t *testing.T) {
 	h.apply(repo)
 	steps := [][]string{
 		{"mount", "repo:/work:rw", "--root", "agent-root"},
-		{"exec", "agent", "--", "sh", "-lc", "git clone https://example.com/repo /work/repo"},
 		{"mount", "--rm", "repo", "--root", "agent-root"},
 	}
 	for _, args := range steps {

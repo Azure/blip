@@ -20,6 +20,8 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
+
+	"github.com/Azure/blip/internal/stream"
 )
 
 const (
@@ -46,19 +48,21 @@ var (
 // completion checkpoint their intent before touching the kernel, so Open can
 // roll back or finish them.
 type record struct {
-	ID       string     `json:"id"`
-	Kind     Kind       `json:"kind"`
-	StateUID string     `json:"stateUID,omitempty"`
-	Base     string     `json:"base,omitempty"`
-	Thin     uint32     `json:"thin"`
-	Size     int64      `json:"size"`
-	ReadOnly bool       `json:"readOnly,omitempty"`
-	Pins     []string   `json:"pins,omitempty"`
-	Phase    string     `json:"phase"`
-	Layered  bool       `json:"layered,omitempty"` // top device over a separate thin device (remote working volumes)
-	Clone    *cloneInfo `json:"clone,omitempty"`   // remote data still hydrating
-	Failed   string     `json:"failed,omitempty"`
-	Digest   string     `json:"digest,omitempty"` // content digest, computed on first use (see Digest)
+	ID         string     `json:"id"`
+	Kind       Kind       `json:"kind"`
+	StateUID   string     `json:"stateUID,omitempty"`
+	Base       string     `json:"base,omitempty"`
+	Thin       uint32     `json:"thin"`
+	Size       int64      `json:"size"`
+	StreamSize int64      `json:"streamSize,omitempty"`
+	FSBytes    int64      `json:"fsBytes,omitempty"`
+	ReadOnly   bool       `json:"readOnly,omitempty"`
+	Pins       []string   `json:"pins,omitempty"`
+	Phase      string     `json:"phase"`
+	Layered    bool       `json:"layered,omitempty"` // top device over a separate thin device (remote working volumes)
+	Clone      *cloneInfo `json:"clone,omitempty"`   // remote data still hydrating
+	Failed     string     `json:"failed,omitempty"`
+	Digest     string     `json:"digest,omitempty"` // content digest, computed on first use (see Digest)
 
 	// TeardownMetaThin keeps the clone metadata thin ID of an abandoned
 	// hydration. Clone is cleared when a failed delete gives up on the clone,
@@ -217,6 +221,11 @@ func (s *Store) load() error {
 			var r record
 			if err := json.Unmarshal(v, &r); err != nil {
 				return fmt.Errorf("volume %s: %w", k, err)
+			}
+			if r.FSBytes == 0 {
+				// Records written before the trajectory ring existed used the
+				// whole device as the filesystem.
+				r.FSBytes = r.Size
 			}
 			s.vols[r.ID] = &r
 			return nil
@@ -1211,6 +1220,27 @@ func randHex(n int) string {
 }
 
 func logf(format string, args ...any) { log.Printf("storage: "+format, args...) }
+
+// fsBytes is the filesystem size of a volume. Older records without FSBytes
+// used the whole device.
+func (r *record) fsBytes() int64 {
+	if r.FSBytes > 0 {
+		return r.FSBytes
+	}
+	return r.Size
+}
+
+// VolumeBytes returns the total device size of a volume whose filesystem is
+// fsSize bytes and whose trajectory ring is streamSize bytes. The ring sits at
+// the fixed stream.Offset, after any filesystem. A zero streamSize keeps the
+// old layout: the filesystem fills the device.
+func VolumeBytes(fsSize, streamSize int64) int64 {
+	fsSize = roundUp(fsSize, blockSize)
+	if streamSize <= 0 {
+		return fsSize
+	}
+	return roundUp(max(fsSize, stream.Offset)+streamSize, blockSize)
+}
 
 // roundUp rounds n up to a multiple of to. It saturates at the largest
 // representable block-aligned value instead of overflowing to a negative

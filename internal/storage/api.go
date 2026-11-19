@@ -82,7 +82,8 @@ type CreateCommit struct {
 	CommitID   string
 	FromImage  string // image digest; filesystem grown to SizeBytes
 	FromCommit string // local commit ID (copy)
-	SizeBytes  int64
+	SizeBytes  int64  // filesystem size
+	StreamSize int64  // trajectory ring size; 0 = no ring
 }
 
 // CreateWorking asks for a writable (or read-only) working volume.
@@ -94,6 +95,7 @@ type CreateWorking struct {
 	FromCommit   string // local commit
 	Remote       *Remote
 	SizeBytes    int64 // grow filesystem to this size if larger than the source (0 = keep)
+	StreamSize   int64 // trajectory ring size; 0 = no ring
 	ReadOnly     bool
 }
 

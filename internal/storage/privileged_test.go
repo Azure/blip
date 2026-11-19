@@ -465,7 +465,7 @@ func TestPrivilegedRestart(t *testing.T) {
 	incarn := s.Incarnation()
 
 	// An operation interrupted by a crash.
-	crash := &record{ID: "b000000000000002", Kind: KindWorking, Size: 32 << 20}
+	crash := &record{ID: "b000000000000002", Kind: KindWorking, Size: 32 << 20, FSBytes: 32 << 20}
 	if _, err := s.begin(crash, 1); err != nil {
 		t.Fatal(err)
 	}

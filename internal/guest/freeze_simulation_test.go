@@ -89,7 +89,6 @@ func TestFreezeExpiresWhileResultBackpressured(t *testing.T) {
 		go g.serveControl(guest)
 		c := wire.NewConn(host)
 		readFrame(t, c, wire.THello, &wire.Hello{})
-		readFrame(t, c, wire.TStatus, &wire.Status{})
 		if err := c.WriteJSON(wire.TFreeze, wire.Freeze{ID: "m"}); err != nil {
 			t.Fatal(err)
 		}
@@ -109,7 +108,6 @@ func TestFreezeExpiresWhileResultBackpressured(t *testing.T) {
 		c = controlPair(t, g)
 		var hello wire.Hello
 		readFrame(t, c, wire.THello, &hello)
-		readFrame(t, c, wire.TStatus, &wire.Status{})
 		if len(hello.Frozen) != 0 {
 			t.Fatalf("reconnect resurrected expired freeze: %+v", hello)
 		}
@@ -229,7 +227,6 @@ func TestFreezeFailuresAndMalformedControlFrames(t *testing.T) {
 		}
 		c := controlPair(t, g)
 		readFrame(t, c, wire.THello, &wire.Hello{})
-		readFrame(t, c, wire.TStatus, &wire.Status{})
 		request := func(typ wire.Type, payload []byte) wire.FreezeResult {
 			t.Helper()
 			if err := c.Write(typ, payload); err != nil {

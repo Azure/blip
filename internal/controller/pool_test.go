@@ -430,12 +430,12 @@ func TestPoolPodCredentials(t *testing.T) {
 				if v.Projected != nil || v.Secret != nil || m.MountPath == serviceAccountPath {
 					t.Errorf("runtime has a credential mount: %+v", m)
 				}
-				if m.MountPath == "/run/blip/vsock" && !m.ReadOnly && v.EmptyDir != nil {
+				if m.MountPath == "/run/blip/sock" && !m.ReadOnly && v.HostPath != nil {
 					shared = m.Name
 				}
 			}
 			if shared == "" {
-				t.Fatal("runtime has no shared vsock emptyDir")
+				t.Fatal("runtime has no shared socket directory")
 			}
 			namespaceEnv := false
 			for _, env := range vm.Env {
@@ -510,8 +510,8 @@ func TestPoolPodCredentials(t *testing.T) {
 			for _, m := range proxy.VolumeMounts {
 				v := volumes[m.Name]
 				switch m.MountPath {
-				case "/run/blip/vsock":
-					if m.Name != shared || m.ReadOnly || v.EmptyDir == nil {
+				case "/run/blip/sock":
+					if m.Name != shared || m.ReadOnly || v.HostPath == nil || !strings.HasSuffix(v.HostPath.Path, "/sock") {
 						t.Errorf("proxy socket mount is not shared: %+v", m)
 					}
 				case serviceAccountPath:
@@ -522,7 +522,7 @@ func TestPoolPodCredentials(t *testing.T) {
 				default:
 					t.Errorf("unexpected proxy mount: %+v", m)
 				}
-				if v.HostPath != nil {
+				if v.HostPath != nil && m.MountPath != "/run/blip/sock" {
 					t.Errorf("proxy can access the host pod directory: %+v", m)
 				}
 			}

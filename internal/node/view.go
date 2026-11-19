@@ -64,6 +64,11 @@ type Store interface {
 	LiveCopy(ctx context.Context, attachmentID, commitID, stateUID string) (int64, error)
 	Delete(ctx context.Context, id string) error
 	Digest(ctx context.Context, id string) (string, error)
+	// Device returns the plaintext device path of a working volume.
+	Device(id string) (string, error)
+	// OpenView publishes a read-only view of a commit; CloseView releases it.
+	OpenView(ctx context.Context, stateUID, commitID, viewID string) (string, error)
+	CloseView(viewID string) error
 }
 
 // SealCommitID is the commit ID a seal of attachmentID produces. Deriving it

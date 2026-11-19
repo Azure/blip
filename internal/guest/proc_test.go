@@ -1,56 +1,13 @@
 package guest
 
 import (
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
-
-	"github.com/Azure/blip/internal/podapi"
 )
-
-// A non-interactive primary command must see end of input immediately. It used
-// to get a pipe whose write end stayed open until exit, so `cat` (and any
-// other read) waited forever because no primary client ever sends EOF.
-func TestProcStdinEOF(t *testing.T) {
-	child, parent, err := procStdin(true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer child.Close()
-	defer parent.Close()
-	if n, err := parent.Write([]byte("discarded")); err != nil || n == 0 {
-		t.Fatalf("writing to the discarded stdin: %d, %v", n, err)
-	}
-	buf := make([]byte, 1)
-	if n, err := child.Read(buf); n != 0 || err != io.EOF {
-		t.Fatalf("reading primary stdin = %d, %v; want 0, EOF", n, err)
-	}
-}
-
-// Exec sessions keep a pipe so their client can upload stdin and forward its
-// own end of input.
-func TestProcStdinPipe(t *testing.T) {
-	child, parent, err := procStdin(false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer child.Close()
-	if _, err := parent.Write([]byte("hi")); err != nil {
-		t.Fatal(err)
-	}
-	parent.Close()
-	buf := make([]byte, 2)
-	if n, err := io.ReadFull(child, buf); err != nil || string(buf) != "hi" {
-		t.Fatalf("read = %q, %v", buf[:n], err)
-	}
-	if n, err := child.Read(buf); n != 0 || err != io.EOF {
-		t.Fatalf("after EOF: %d, %v", n, err)
-	}
-}
 
 func TestWorkdirInRoot(t *testing.T) {
 	for _, tc := range []struct {
@@ -302,41 +259,6 @@ func TestCheckDirAccessChecksComponentsRemovedByDotDot(t *testing.T) {
 	}
 	if code := startExitCode(err); code != 126 {
 		t.Fatalf("startProc exit code = %d, want 126", code)
-	}
-}
-
-// TestProcEnvReservedValuesCannotBeOverridden keeps a caller's exec -e from
-// redirecting the guest-owned report endpoint. The reserved value must appear
-// exactly once and win over both the claim environment and the session's
-// environment, while ordinary variables still follow the usual last-wins rule.
-func TestProcEnvReservedValuesCannotBeOverridden(t *testing.T) {
-	acct := &account{name: "root", home: "/root", shell: "/bin/sh"}
-	for _, tc := range []struct {
-		name    string
-		base    []string
-		session []string
-	}{
-		{"session override", nil, []string{podapi.ReportEnv + "=http://127.0.0.1:1"}},
-		{"claim and session override", []string{podapi.ReportEnv + "=http://claim.invalid"}, []string{podapi.ReportEnv + "=http://127.0.0.1:1"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			env := (&Guest{}).procEnv(acct, procSpec{env: append(tc.session, "A=session")}, append(tc.base, "A=claim"))
-			var report, values []string
-			for _, entry := range env {
-				if v, ok := strings.CutPrefix(entry, podapi.ReportEnv+"="); ok {
-					report = append(report, v)
-				}
-				if v, ok := strings.CutPrefix(entry, "A="); ok {
-					values = append(values, v)
-				}
-			}
-			if len(report) != 1 || report[0] != podapi.ReportURL {
-				t.Fatalf("%s entries = %v, want one %q", podapi.ReportEnv, report, podapi.ReportURL)
-			}
-			if len(values) != 1 || values[0] != "session" {
-				t.Fatalf("ordinary variable A = %v, want one %q", values, "session")
-			}
-		})
 	}
 }
 

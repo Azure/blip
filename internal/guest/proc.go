@@ -11,17 +11,16 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/Azure/blip/internal/podapi"
 )
 
 // startError is a failure before the command ran, carrying the conventional
 // shell status: 127 when the command was not found and 126 when it exists but
 // cannot be executed (EACCES, ENOEXEC, a bad workdir, or another start-time
-// configuration failure). Without it every primary start failure reported 127,
-// and exec reported a plain error indistinguishable from a command exiting 1.
+// configuration failure). Without it every start failure reported 127, which
+// is indistinguishable from a command that ran and exited 1.
 type startError struct {
 	code int
 	err  error
@@ -110,51 +109,20 @@ func (r *reaper) start(argv0 string, argv []string, attr *os.ProcAttr) (int, <-c
 	return pid, ch, nil
 }
 
-// procSpec describes a workload process.
+// procSpec describes the primary workload command.
 type procSpec struct {
 	argv []string // empty: login shell
 	env  []string
 	dir  string
 	user string
-	tty  bool
-	rows uint16
-	cols uint16
-	// stdinEOF gives a non-TTY process an immediately closed stdin instead
-	// of a pipe that stays open for its whole lifetime. The primary command
-	// has no client that could feed it or send EOF, so without this `cat`
-	// waits forever. Exec sessions keep the pipe: their client uploads stdin
-	// and forwards its own end of input.
-	stdinEOF bool
-}
-
-// procStdin returns the child's stdin and the parent-side writer. For a
-// non-interactive primary command both are /dev/null, so reads see EOF and
-// stdin a client sends is discarded instead of blocking. Otherwise the child
-// reads from a pipe whose write end the session owns.
-func procStdin(stdinEOF bool) (child, parent *os.File, err error) {
-	if stdinEOF {
-		child, err = os.Open(os.DevNull)
-		if err != nil {
-			return nil, nil, err
-		}
-		parent, err = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-		if err != nil {
-			child.Close()
-			return nil, nil, err
-		}
-		return child, parent, nil
-	}
-	child, parent, err = os.Pipe()
-	return child, parent, err
 }
 
 // proc is a running workload process and the host side of its stdio.
 type proc struct {
 	pid    int
 	wait   <-chan unix.WaitStatus
-	tty    *os.File // PTY master when tty
-	stdin  *os.File // pipe when !tty
-	stdout *os.File
+	stdin  *os.File // pipe the guest writes to
+	stdout *os.File // pipe the guest reads from
 	stderr *os.File
 }
 
@@ -296,8 +264,9 @@ func canAccess(fi os.FileInfo, acct *account, owner, group, other os.FileMode) b
 	}
 }
 
-// startProc starts a process chrooted in the root filesystem, as the
-// requested user, in the work cgroup, in a new session.
+// startProc starts the primary command chrooted in the root filesystem, as
+// the requested user, in the work cgroup. Its stdin and both output streams
+// are pipes owned by the guest.
 func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	acct, err := lookupAccount(g.root, s.user)
 	if err != nil {
@@ -350,37 +319,31 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	attr := &syscall.SysProcAttr{
 		Chroot:     g.root,
 		Credential: &syscall.Credential{Uid: acct.uid, Gid: acct.gid, Groups: acct.groups},
-		Setsid:     true,
 	}
 	if g.cgroupFD >= 0 {
 		attr.UseCgroupFD = true
 		attr.CgroupFD = g.cgroupFD
 	}
-	if s.tty {
-		master, slave, err := openPTY()
-		if err != nil {
-			return nil, nil, startFail(126, err)
-		}
-		_ = slave.Chown(int(acct.uid), int(acct.gid))
-		rows, cols := s.rows, s.cols
-		if rows == 0 || cols == 0 {
-			rows, cols = 24, 80
-		}
-		setWinsize(master, rows, cols)
-		p.tty = master
-		child = []*os.File{slave, slave, slave}
-		attr.Setctty = true
-		attr.Ctty = 0
-	} else {
-		inR, inW, err := procStdin(s.stdinEOF)
-		if err != nil {
-			return nil, nil, startFail(126, err)
-		}
-		outR, outW, _ := os.Pipe()
-		errR, errW, _ := os.Pipe()
-		p.stdin, p.stdout, p.stderr = inW, outR, errR
-		child = []*os.File{inR, outW, errW}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		return nil, nil, startFail(126, err)
 	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		inR.Close()
+		inW.Close()
+		return nil, nil, startFail(126, err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		inR.Close()
+		inW.Close()
+		outR.Close()
+		outW.Close()
+		return nil, nil, startFail(126, err)
+	}
+	p.stdin, p.stdout, p.stderr = inW, outR, errR
+	child = []*os.File{inR, outW, errW}
 	pid, wait, err := g.reaper.start(argv0, argv, &os.ProcAttr{Dir: dir, Env: env, Files: child, Sys: attr})
 	for _, f := range child {
 		f.Close()
@@ -393,8 +356,8 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 	return p, argv, nil
 }
 
-// procEnv supplies the same defaults to the primary command and later exec
-// sessions, regardless of their user. Explicit workload values take priority.
+// procEnv supplies the defaults for the primary command, regardless of its
+// user. Explicit workload values take priority.
 func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
 	env := []string{
 		"PATH=" + defaultPath,
@@ -402,9 +365,6 @@ func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
 		"USER=" + acct.name,
 		"LOGNAME=" + acct.name,
 		"SHELL=" + acct.shell,
-	}
-	if s.tty {
-		env = append(env, "TERM=xterm-256color")
 	}
 	if g.kubeNamespace != "" {
 		env = append(env, "KUBECONFIG="+kubeconfigPath)
@@ -416,10 +376,10 @@ func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
 		noProxy = append(noProxy, "kube-apiserver")
 	}
 	noProxy = append(noProxy, g.endpoints...)
-	// Reserved variables are applied after every caller-supplied list, so an
-	// exec caller's -e (s.env) cannot redirect a guest-owned service or drop
-	// the guest-local proxy bypass.
-	return mergeEnv(env, base, s.env, reservedEnv(), proxyEnv(noProxy, base, s.env))
+	// The proxy bypass is applied after every caller-supplied list, so a
+	// workload proxy setting can add names but can never proxy a
+	// guest-local one.
+	return mergeEnv(env, base, s.env, proxyEnv(noProxy, base, s.env))
 }
 
 // proxyEnv merges the guest-local names with a workload's NO_PROXY/no_proxy
@@ -454,52 +414,12 @@ func proxyEnv(reserved []string, lists ...[]string) []string {
 	return []string{"NO_PROXY=" + merged, "no_proxy=" + merged}
 }
 
-// reservedEnv is the environment the guest owns. Callers, including exec -e,
-// may not override it: BLIP_REPORT_URL must always point at the guest's
-// loopback report endpoint.
-func reservedEnv() []string {
-	return []string{podapi.ReportEnv + "=" + podapi.ReportURL}
-}
-
 func (p *proc) close() {
-	for _, f := range []*os.File{p.tty, p.stdin, p.stdout, p.stderr} {
+	for _, f := range []*os.File{p.stdin, p.stdout, p.stderr} {
 		if f != nil {
 			f.Close()
 		}
 	}
-}
-
-func openPTY() (*os.File, *os.File, error) {
-	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	// Fd() would switch the master to blocking mode; use the raw conn.
-	var n int
-	err = withFD(master, func(fd int) error {
-		if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPTLCK, 0); err != nil {
-			return err
-		}
-		var err error
-		n, err = unix.IoctlGetInt(fd, unix.TIOCGPTN)
-		return err
-	})
-	if err != nil {
-		master.Close()
-		return nil, nil, err
-	}
-	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR|unix.O_NOCTTY, 0)
-	if err != nil {
-		master.Close()
-		return nil, nil, err
-	}
-	return master, slave, nil
-}
-
-func setWinsize(f *os.File, rows, cols uint16) {
-	_ = withFD(f, func(fd int) error {
-		return unix.IoctlSetWinsize(fd, unix.TIOCSWINSZ, &unix.Winsize{Row: rows, Col: cols})
-	})
 }
 
 func withFD(f *os.File, fn func(fd int) error) error {
@@ -530,13 +450,23 @@ func signalName(s unix.Signal) string {
 	return fmt.Sprint(int(s))
 }
 
-func parseSignal(name string) (unix.Signal, error) {
-	if len(name) < 3 || name[:3] != "SIG" {
-		name = "SIG" + name
+// maxErrorText bounds start error text kept for the host. A single client
+// argument can be enormous and JSON escapes control bytes, so the stderr
+// report must not grow without bound.
+const maxErrorText = 4 << 10
+
+const truncatedMarker = "... (truncated)"
+
+// boundErrorText shortens s to maxErrorText bytes without splitting a UTF-8
+// sequence. Invalid bytes are replaced only here, in the human-readable error.
+func boundErrorText(s string) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if len(s) <= maxErrorText {
+		return s
 	}
-	s := unix.SignalNum(name)
-	if s == 0 {
-		return 0, fmt.Errorf("unknown signal %q", name)
+	limit := maxErrorText - len(truncatedMarker)
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
 	}
-	return s, nil
+	return s[:limit] + truncatedMarker
 }
