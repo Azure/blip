@@ -679,23 +679,45 @@ func (s *session) signal(sig unix.Signal) bool {
 	return true
 }
 
+// signalGroup sends sig to the command's process group only. Once the group
+// leader may have been reaped its PID can be reused, so falling back to
+// signalling the PID alone could hit an unrelated process. A missing group
+// reports false: there is nothing left to signal.
+func (s *session) signalGroup(sig unix.Signal) bool {
+	p := s.proc
+	if p == nil || p.pid <= 0 {
+		return false
+	}
+	return unix.Kill(-p.pid, sig) == nil
+}
+
 // terminate ends a detached exec command. Its last client is gone, so no one
 // can reach the session to signal it or ever attach to it again. The command
 // gets detachGrace to clean up before the process group is killed.
 func (s *session) terminate() {
 	s.mu.Lock()
-	running := !s.exited && s.clients == 0
+	detached := s.clients == 0
 	s.mu.Unlock()
-	if !running || !s.signal(unix.SIGTERM) {
+	if !detached {
+		return
+	}
+	// Signal the group rather than the leader: the leader may already have
+	// exited on SIGTERM while a background child in its group ignored it. A
+	// group that no longer exists has nothing left to clean up.
+	if !s.signalGroup(unix.SIGTERM) {
 		return
 	}
 	go func() {
 		time.Sleep(detachGrace)
 		s.mu.Lock()
-		running := !s.exited && s.clients == 0
+		detached := s.clients == 0
 		s.mu.Unlock()
-		if running {
-			s.signal(unix.SIGKILL)
+		if detached {
+			// The leader may have been reaped during the grace period. Its
+			// process group ID is still valid while any member survives, so
+			// do not skip the kill because s.exited is set: only the group's
+			// disappearance makes it unnecessary.
+			s.signalGroup(unix.SIGKILL)
 		}
 	}()
 }
@@ -732,8 +754,10 @@ func (s *session) serve(c *wire.Conn, conn io.Closer, follow bool) {
 		_, drop := sessionRetention(s.id == wire.PrimarySession, s.exited, s.attached, s.clients)
 		// Exec sessions have no way to reattach from the CLI, so a command
 		// whose last client vanished would keep running unreachable. Primary
-		// commands stay detached by design.
-		detach := s.id != wire.PrimarySession && s.clients == 0 && !s.exited
+		// commands stay detached by design. This applies even when the group
+		// leader has already exited: a background child may still be in the
+		// command's process group.
+		detach := s.id != wire.PrimarySession && s.clients == 0
 		s.cond.Broadcast()
 		s.mu.Unlock()
 		s.g.addClients(-1)
@@ -903,6 +927,14 @@ func (g *Guest) serveSession(f io.ReadWriteCloser) {
 		if c.WriteJSON(wire.TOpened, wire.Opened{Session: s.id, TTY: s.tty}) != nil {
 			f.Close()
 			s.releasePumps()
+			// The client never learned the session ID, so an exec with no
+			// OpenID can never attach to or retry it: treat the failed reply
+			// like a detach so the just-started group cannot run unreachable.
+			// With an OpenID a retry must still be able to reuse the session,
+			// so leave that case for the retry (or the VM's end of life).
+			if s.openID == "" {
+				s.terminate()
+			}
 			return
 		}
 		s.serve(c, f, o.Follow)
