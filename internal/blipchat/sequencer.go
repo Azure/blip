@@ -140,6 +140,9 @@ func (s *Sequencer) sequence(ctx context.Context, thread *v1.BlipThread, turn *v
 	if turn.Status.Seq != 0 {
 		return nil
 	}
+	if err := s.ensureTurnLabels(ctx, thread, turn); err != nil {
+		return err
+	}
 	seq, err := s.reserveSeq(ctx, thread)
 	if err != nil {
 		return err
@@ -304,7 +307,16 @@ func (s *Sequencer) repairLastSeq(ctx context.Context, turn *v1.BlipTurn) error 
 	if err := s.Get(ctx, key, &thread); err != nil {
 		return client.IgnoreNotFound(err)
 	}
-	if thread.Status.LastSeq >= turn.Status.Seq || !turnBelongsToThread(turn, &thread) {
+	if !turnBelongsToThread(turn, &thread) {
+		return nil
+	}
+	// Backfill the incarnation label on turns created before it existed, and
+	// migrate a long thread's old name-derived label. Only turns of the
+	// current incarnation get here; stale turns keep their old labels.
+	if err := s.ensureTurnLabels(ctx, &thread, turn); err != nil {
+		return err
+	}
+	if thread.Status.LastSeq >= turn.Status.Seq {
 		return nil
 	}
 	unlock := s.lock(key.Namespace, key.Name)
@@ -316,6 +328,27 @@ func (s *Sequencer) repairLastSeq(ctx context.Context, turn *v1.BlipTurn) error 
 		return nil
 	}
 	return s.raiseLastSeq(ctx, &thread, turn.Status.Seq)
+}
+
+// ensureTurnLabels stamps a turn with the current thread label and
+// incarnation. New turns already carry both; this backfills turns created
+// before the incarnation label existed and rewrites a long thread's old
+// name-derived hash to the reserved thread_ form. Only a turn already known to
+// belong to the current incarnation is passed here.
+func (s *Sequencer) ensureTurnLabels(ctx context.Context, thread *v1.BlipThread, turn *v1.BlipTurn) error {
+	wantThread, wantUID := v1.ThreadLabel(thread.Name), string(thread.UID)
+	if turn.Labels[v1.LabelThread] == wantThread && (wantUID == "" || turn.Labels[v1.LabelThreadUID] == wantUID) {
+		return nil
+	}
+	patch := client.MergeFrom(turn.DeepCopy())
+	if turn.Labels == nil {
+		turn.Labels = map[string]string{}
+	}
+	turn.Labels[v1.LabelThread] = wantThread
+	if wantUID != "" {
+		turn.Labels[v1.LabelThreadUID] = wantUID
+	}
+	return s.Patch(ctx, turn, patch)
 }
 
 // orphan decides what to do with a turn whose thread does not exist. A turn

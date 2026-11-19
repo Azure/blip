@@ -63,6 +63,9 @@ func createTurnIn(ctx context.Context, c client.Client, namespace, name string, 
 			return errStaleIncarnation
 		}
 		if err == nil && thread.UID != "" {
+			// The label pins the turn to this incarnation for the in-guest
+			// proxy, which selects only its own thread UID.
+			meta.Labels[v1.LabelThreadUID] = string(thread.UID)
 			meta.OwnerReferences = []metav1.OwnerReference{
 				*metav1.NewControllerRef(&thread, v1.GroupVersion.WithKind("BlipThread")),
 			}
@@ -147,11 +150,19 @@ func cleanAttributes(in map[string]string) map[string]string {
 // turnBelongsToThread reports whether a turn belongs to this incarnation of a
 // thread. A thread that is deleted and recreated keeps its name but gets a new
 // UID; turns from the old incarnation must not become input of the new one.
-// Turns without a recorded thread UID are legacy turns that predate this
-// field; when they carry a BlipThread owner reference, that reference decides.
+// The sequencer stamps status.threadUID; new turns also carry
+// blip.dev/thread-uid before they are sequenced. Turns without either are
+// legacy turns that predate this field; when they carry a BlipThread owner
+// reference, that reference decides.
 func turnBelongsToThread(t *v1.BlipTurn, thread *v1.BlipThread) bool {
 	if t.Status.ThreadUID != "" {
 		return t.Status.ThreadUID == string(thread.UID)
+	}
+	// New turns carry the incarnation as a label before the sequencer stamps
+	// status. A turn labelled for an earlier incarnation must not be adopted
+	// by the recreated thread.
+	if uid := t.Labels[v1.LabelThreadUID]; uid != "" {
+		return uid == string(thread.UID)
 	}
 	for _, ref := range t.OwnerReferences {
 		if ref.Kind == "BlipThread" && ref.Name == thread.Name && ref.APIVersion == v1.GroupVersion.String() {

@@ -24,6 +24,11 @@ const (
 	// value is ThreadLabel(name), because Kubernetes labels are at most 63
 	// characters but BlipThread names may be longer.
 	LabelThread = "blip.dev/thread"
+	// LabelThreadUID pins a turn to the BlipThread incarnation that produced
+	// it. A deleted and recreated thread keeps its name and thread label but
+	// gets a new UID, so the proxy can select only the current incarnation's
+	// turns instead of returning stale history from the previous one.
+	LabelThreadUID = "blip.dev/thread-uid"
 	// AnnotationThread carries the full BlipThread name when LabelThread is
 	// hashed for a long name.
 	AnnotationThread = "blip.dev/thread-name"
