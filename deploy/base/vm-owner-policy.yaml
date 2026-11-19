@@ -33,7 +33,10 @@
 # state (a durable fork's hidden children are owned by their root state). An
 # ownerReference inherited unchanged from the privileged creator (for example
 # the parent of a fork) is exempt, so a restricted child can still update
-# itself. Every pod-bound token of the request
+# itself. Finalizers are likewise write-once for a restricted owner: it may
+# keep finalizers already on the stored object and remove them, but may not
+# add any, so an attacker cannot leave its Blip or state Terminating after the
+# controller removes blip.dev/finalizer. Every pod-bound token of the request
 # namespace is treated as a VM and must have a claimed pod entry: a table
 # that is non-empty but lacks the caller's sa.<sa> or pod key fails closed
 # instead of skipping every check. A missing key is never treated as
@@ -154,6 +157,21 @@ spec:
       expression: >-
         request.operation == 'UPDATE' && has(oldObject.metadata.ownerReferences) ?
         oldObject.metadata.ownerReferences : []
+    # Finalizers make an object undeletable. blipchat's retention and namespace
+    # cleanup only call Delete, so a foreign finalizer left on a Blip or state
+    # keeps it Terminating forever after the controller removes its own
+    # blip.dev/finalizer. A restricted VM may therefore only carry finalizers
+    # that were already on the stored object: additions on CREATE (no
+    # oldObject) and UPDATE are denied, while unchanged inherited finalizers
+    # and removals stay allowed for normal patches and cleanup.
+    - name: finalizers
+      expression: >-
+        variables.writes && has(object.metadata.finalizers) ?
+        object.metadata.finalizers : []
+    - name: oldFinalizers
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.metadata.finalizers) ?
+        oldObject.metadata.finalizers : []
   validations:
     - expression: "!variables.vm || variables.owner != ''"
       messageExpression: >-
@@ -242,6 +260,16 @@ spec:
           variables.newAnnotations[k] == variables.oldAnnotations[k]))
       messageExpression: >-
         'owner ' + variables.owner + ' may not add, change, or remove a thread incarnation annotation'
+      reason: Forbidden
+    # Restricted VMs may only write blips and states (thread writes are denied
+    # above), so this covers every object they can make undeletable. Controller,
+    # blipchat, and administrator-owned VMs are not restricted and remain
+    # unaffected, including the controller's own finalizer removal.
+    - expression: >-
+        !variables.restricted || !variables.writes ||
+        variables.finalizers.all(f, f in variables.oldFinalizers)
+      messageExpression: >-
+        'owner ' + variables.owner + ' may not add finalizers to its objects'
       reason: Forbidden
     - expression: >-
         !variables.restricted || !variables.writes ||

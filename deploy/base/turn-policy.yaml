@@ -19,8 +19,9 @@
 # from a deleted thread therefore cannot write turns into the recreated one.
 #
 # Turns are immutable history. Pod-bound producers may not update or delete
-# them, and the deterministic names blipchat uses for watcher and coordinator
-# turns are reserved.
+# them, may not add finalizers that would outlive a system Delete, and the
+# deterministic names blipchat uses for watcher and coordinator turns are
+# reserved.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -48,6 +49,20 @@ spec:
       expression: >-
         has(request.userInfo.extra) &&
         'authentication.kubernetes.io/pod-name' in request.userInfo.extra
+    # A finalizer makes a turn undeletable, and a pod-bound producer cannot
+    # update or delete its own turn to remove one, so retention (which only
+    # calls Delete) would leave the turn Terminating forever. A pod-bound
+    # producer may only carry finalizers already present on oldObject: any
+    # finalizer on CREATE and any addition on UPDATE is denied. The object is
+    # null on DELETE, so guard that operation before reading metadata.
+    - name: finalizers
+      expression: >-
+        (request.operation == 'CREATE' || request.operation == 'UPDATE') &&
+        has(object.metadata.finalizers) ? object.metadata.finalizers : []
+    - name: oldFinalizers
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.metadata.finalizers) ?
+        oldObject.metadata.finalizers : []
   validations:
     - expression: >-
         variables.blipchat || request.operation != 'CREATE' ||
@@ -75,6 +90,15 @@ spec:
       messageExpression: >-
         'turns are immutable history; pod-bound service account ' +
         request.userInfo.username + ' may not change or delete them'
+      reason: Forbidden
+    # Turn immutability must include deletability: an attacker finalizer
+    # survives every system Delete and blocks retention and namespace cleanup.
+    - expression: >-
+        variables.blipchat || !variables.podBound ||
+        variables.finalizers.all(f, f in variables.oldFinalizers)
+      messageExpression: >-
+        'pod-bound producer ' + request.userInfo.username +
+        ' may not add finalizers to a turn'
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

@@ -561,6 +561,21 @@ func withoutAnnotation(o map[string]any, key string) map[string]any {
 	return o
 }
 
+// withFinalizers sets (or clears, when empty) metadata.finalizers.
+func withFinalizers(o map[string]any, finalizers ...string) map[string]any {
+	meta := o["metadata"].(map[string]any)
+	if len(finalizers) == 0 {
+		delete(meta, "finalizers")
+		return o
+	}
+	fs := make([]any, len(finalizers))
+	for i, f := range finalizers {
+		fs[i] = f
+	}
+	meta["finalizers"] = fs
+	return o
+}
+
 // A restricted VM may patch its own Blip. The thread incarnation annotations
 // are what the API proxy and blipchat trust to pin a Blip to one thread
 // incarnation, so they must not move after creation: removing the pin lets a
@@ -940,6 +955,110 @@ func TestTurnAuthorPolicy(t *testing.T) {
 		{"pod-bound producer cannot delete a turn", vmUser("vm", "default-mine"), admission.Delete, nil, turnObj("ServiceAccount", ci), false, "immutable history"},
 		{"pod-bound producer cannot relabel a turn", vmUser("vm", "default-mine"), admission.Update, turnObj("ServiceAccount", ci), turnObj("ServiceAccount", ci), false, "immutable history"},
 		{"blipchat may delete a turn", &user.DefaultInfo{Name: blipchat}, admission.Delete, nil, turnObj("User", "ceo@example.com"), true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns", name: "turn", object: tc.obj, oldObject: tc.old}
+			allow, msg := req.evaluate(t, v, nil)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+}
+
+// A restricted VM may not add a finalizer to its Blip or state. Retention and
+// namespace cleanup only call Delete, so a foreign finalizer would survive the
+// controller removing blip.dev/finalizer and leave the object Terminating
+// forever. Unchanged inherited finalizers and removals stay allowed so normal
+// patches and the controller's own cleanup keep working.
+func TestVMOwnerPolicyFinalizers(t *testing.T) {
+	v := loadVMOwnerPolicy(t)
+	const owner = "u-0123456789abcdef0123456789abcdef"
+	params := map[string]string{"sa.vm": "default", "default-mine": owner, "default-admin": "-"}
+	mine, admin := vmUser("vm", "default-mine"), vmUser("vm", "default-admin")
+	controller := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blip-controller"}
+	blipchat := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blipchat"}
+	blip := func(fs ...string) map[string]any {
+		return withFinalizers(blipObj(owner+".a", owner), fs...)
+	}
+	state := func(fs ...string) map[string]any {
+		return withFinalizers(stateObj(owner+".s", owner, ""), fs...)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		op    admission.Operation
+		res   string
+		obj   map[string]any
+		old   map[string]any
+		allow bool
+		msg   string
+	}{
+		{"restricted create with finalizer", mine, admission.Create, "blips", blip("w7-24.hold"), nil, false, "finalizer"},
+		{"restricted create without finalizer", mine, admission.Create, "blips", blip(), nil, true, ""},
+		{"restricted update adds finalizer", mine, admission.Update, "blips", blip("w7-24.hold"), blip(), false, "finalizer"},
+		{"restricted update adds a second finalizer", mine, admission.Update, "blips",
+			blip(v1.Finalizer, "w7-24.hold"), blip(v1.Finalizer), false, "finalizer"},
+		{"restricted update keeps inherited finalizers", mine, admission.Update, "blips",
+			blip(v1.Finalizer, "w7-24.hold"), blip(v1.Finalizer, "w7-24.hold"), true, ""},
+		{"restricted update removes a finalizer", mine, admission.Update, "blips",
+			blip(v1.Finalizer), blip(v1.Finalizer, "w7-24.hold"), true, ""},
+		{"restricted update replaces a finalizer", mine, admission.Update, "blips",
+			blip("w7-24.other"), blip("w7-24.hold"), false, "finalizer"},
+		{"restricted state create with finalizer", mine, admission.Create, "blipstates", state("w7-24.hold"), nil, false, "finalizer"},
+		{"restricted state update adds finalizer", mine, admission.Update, "blipstates", state("w7-24.hold"), state(), false, "finalizer"},
+		{"restricted state update keeps finalizer", mine, admission.Update, "blipstates",
+			state(v1.Finalizer), state(v1.Finalizer), true, ""},
+		{"controller adds its finalizer", controller, admission.Update, "blips", blip(v1.Finalizer), blip(), true, ""},
+		{"controller removes its finalizer", controller, admission.Update, "blips", blip(), blip(v1.Finalizer), true, ""},
+		{"blipchat adds a finalizer", blipchat, admission.Update, "blips", blip("w7-24.hold"), blip(), true, ""},
+		{"unrestricted VM adds a finalizer", admin, admission.Update, "blips", withFinalizers(blipObj("a", ""), "w7-24.hold"), blipObj("a", ""), true, ""},
+		{"plain admin adds a finalizer", &user.DefaultInfo{Name: "alice"}, admission.Update, "blips", blip("w7-24.hold"), blip(), true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := owner + ".a"
+			if tc.res == "blipstates" {
+				name = owner + ".s"
+			}
+			req := policyRequest{user: tc.user, op: tc.op, resource: tc.res, name: name, object: tc.obj, oldObject: tc.old}
+			allow, msg := req.evaluate(t, v, params)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+}
+
+// A pod-bound producer must not make a turn undeletable: it cannot update or
+// delete the turn afterwards, and retention only calls Delete, so a finalizer
+// would leave it Terminating forever. blipchat and other producers keep their
+// existing abilities.
+func TestTurnAuthorPolicyFinalizers(t *testing.T) {
+	v, _ := loadTurnPolicy(t)
+	const blipchat = "system:serviceaccount:blip-system:blipchat"
+	self := "system:serviceaccount:" + ns + ":vm"
+	turn := func(fs ...string) map[string]any {
+		return withFinalizers(turnFor("proj", "ServiceAccount", self), fs...)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		op    admission.Operation
+		obj   map[string]any
+		old   map[string]any
+		allow bool
+		msg   string
+	}{
+		{"pod-bound create with finalizer", vmUser("vm", "default-mine"), admission.Create, turn("evil"), nil, false, "finalizer"},
+		{"pod-bound create without finalizer", vmUser("vm", "default-mine"), admission.Create, turn(), nil, true, ""},
+		{"pod-bound update adds a finalizer", vmUser("vm", "default-mine"), admission.Update, turn("evil"), turn(), false, "immutable history"},
+		{"pod-bound update keeps an inherited finalizer", vmUser("vm", "default-mine"), admission.Update, turn("evil"), turn("evil"), false, "immutable history"},
+		{"blipchat create with finalizer", &user.DefaultInfo{Name: blipchat}, admission.Create, turn("evil"), nil, true, ""},
+		{"blipchat update with finalizer", &user.DefaultInfo{Name: blipchat}, admission.Update, turn("evil"), turn(), true, ""},
+		{"non-pod producer create with finalizer", &user.DefaultInfo{Name: "system:serviceaccount:" + ns + ":ci"}, admission.Create,
+			withFinalizers(turnFor("proj", "ServiceAccount", "system:serviceaccount:"+ns+":ci"), "evil"), nil, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns", name: "turn", object: tc.obj, oldObject: tc.old}
