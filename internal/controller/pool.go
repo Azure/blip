@@ -506,6 +506,15 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			// it so a replacement boots instead of it holding a slot and
 			// covering waiting demand until pendingTimeout.
 			total--
+			// A pinned spare that never became ready means the node failed
+			// to boot this pool's VM. Stop pinning replacements there for a
+			// warm budget so a Blip that already fell back can use a healthy
+			// node instead of repeating the same failed placement.
+			if pinnedNode := p.Annotations[v1.AnnotationPinnedNode]; pinnedNode != "" {
+				blocked[pinnedNode] = true
+				avoid[pinnedNode] = true
+				r.blockNode(rq.NamespacedName, pinnedNode, r.now().Add(warmTimeout))
+			}
 			if err := del(p); err != nil {
 				return reconcile.Result{}, err
 			}
@@ -899,6 +908,23 @@ func (r *PoolReconciler) deletePod(ctx context.Context, pool types.NamespacedNam
 	}
 	r.expect(&r.deleted, pool, p.Name, "")
 	return true, nil
+}
+
+// blockNode remembers that node cannot host this pool's VMs until the given
+// time.
+func (r *PoolReconciler) blockNode(pool types.NamespacedName, node string, until time.Time) {
+	if node == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.blocked == nil {
+		r.blocked = map[types.NamespacedName]map[string]time.Time{}
+	}
+	if r.blocked[pool] == nil {
+		r.blocked[pool] = map[string]time.Time{}
+	}
+	r.blocked[pool][node] = until
 }
 
 // podFor builds a VM pod (see the README's implementation outline).
