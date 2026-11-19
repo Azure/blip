@@ -92,6 +92,7 @@ spec:
                 description: InReplyTo is the sequence number of the turn this one
                   answers.
                 format: int64
+                maximum: 9007199254740991
                 minimum: 0
                 type: integer
               subjects:

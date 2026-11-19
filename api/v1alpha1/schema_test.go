@@ -569,6 +569,37 @@ func TestBlipTurnThreadNamePattern(t *testing.T) {
 	}
 }
 
+// TestBlipTurnInReplyToBounds guards that a direct producer cannot name a
+// reply sequence the coordinator tool cannot represent: inReplyTo is decoded
+// from a JSON number, which is only exact up to 2^53-1.
+func TestBlipTurnInReplyToBounds(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipturns.yaml")
+	reply, ok := spec.Properties["inReplyTo"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.inReplyTo property")
+	}
+	if reply.Minimum != 0 {
+		t.Errorf("spec.inReplyTo minimum = %d, want 0", reply.Minimum)
+	}
+	if reply.Maximum != MaxTurnInReplyTo {
+		t.Errorf("spec.inReplyTo maximum = %d, want %d", reply.Maximum, MaxTurnInReplyTo)
+	}
+
+	validate := admissionValidator(t, "blipturns")
+	turn := func(seq int64) string {
+		return fmt.Sprintf(`{"spec":{"thread":"project","author":{"kind":"User","name":"alice"},"inReplyTo":%d}}`, seq)
+	}
+	if errs := validate(turn(MaxTurnInReplyTo), ""); len(errs) != 0 {
+		t.Errorf("rejected inReplyTo at the maximum: %v", errs.ToAggregate())
+	}
+	if errs := validate(turn(MaxTurnInReplyTo+1), ""); len(errs) == 0 {
+		t.Error("admitted inReplyTo above the maximum")
+	}
+	if errs := validate(turn(-1), ""); len(errs) == 0 {
+		t.Error("admitted a negative inReplyTo")
+	}
+}
+
 // TestBlipTurnStatusSeqRules guards the defense-in-depth validation on
 // status.seq: a status writer can no longer move an already sequenced turn.
 func TestBlipTurnStatusSeqRules(t *testing.T) {

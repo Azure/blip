@@ -4,6 +4,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// MaxTurnInReplyTo is the largest sequence number a turn may name as its
+// reply target. The coordinator's reply tool decodes inReplyTo as a JSON
+// number, so larger values cannot be represented exactly and would silently
+// answer a different sequence than the producer named.
+const MaxTurnInReplyTo int64 = 1<<53 - 1
+
 // ---------------------------------------------------------------------------
 // BlipThread
 
@@ -210,6 +216,7 @@ type BlipTurnSpec struct {
 	Topic string `json:"topic,omitempty"`
 	// InReplyTo is the sequence number of the turn this one answers.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=9007199254740991
 	InReplyTo int64 `json:"inReplyTo,omitempty"`
 	// Subjects name the objects this turn is about.
 	// +kubebuilder:validation:MaxItems=8
