@@ -326,6 +326,10 @@ type Transfer struct {
 }
 
 type BlipStateStatus struct {
+	// Phase is one of the documented BlipState phases. An unknown value is
+	// rejected at admission so a status writer cannot leave a state in a
+	// phase that no reconcile path can advance or clean up.
+	// +kubebuilder:validation:Enum=Pending;Ready;InUse;Saving;Failed
 	Phase   string `json:"phase,omitempty"`
 	Message string `json:"message,omitempty"`
 	// ImageDigest is the resolved container image (digest reference
@@ -599,7 +603,11 @@ type MountStatus struct {
 	// is attached, so its disk must be saved on stop even if the last
 	// observation predates the attachment. A mount added to a running Blip
 	// is not in the claim and may never attach.
-	InClaim bool   `json:"inClaim,omitempty"`
+	InClaim bool `json:"inClaim,omitempty"`
+	// Phase is one of the documented mount phases. An unknown value is
+	// rejected at admission so the controller and CLI cannot be left
+	// waiting on a mount that is in no known phase.
+	// +kubebuilder:validation:Enum=Pending;Mounted;Unmounting;Saving;Failed
 	Phase   string `json:"phase"`
 	Message string `json:"message,omitempty"`
 	// Switching is set while the mount is being changed between read-only

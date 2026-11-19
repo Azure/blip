@@ -631,6 +631,67 @@ func TestBlipStatusPhaseAdmission(t *testing.T) {
 	}
 }
 
+// TestBlipStateStatusPhaseAdmission guards the state phases the controller
+// writes. An unknown phase stored by a status writer has no reconcile path
+// that can advance or clean it up.
+func TestBlipStateStatusPhaseAdmission(t *testing.T) {
+	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipstates.yaml")
+	phase, ok := status.Properties["phase"]
+	if !ok {
+		t.Fatal("generated CRD has no status.phase property")
+	}
+	want := []string{StatePending, StateReady, StateInUse, StateSaving, StateFailed}
+	if !slices.Equal(phase.Enum, want) {
+		t.Errorf("status.phase enum = %v, want %v", phase.Enum, want)
+	}
+	validate := admissionValidator(t, "blipstates")
+	object := func(p string) string {
+		return fmt.Sprintf(`{"spec":{},"status":{"phase":%q}}`, p)
+	}
+	for _, p := range want {
+		if errs := validate(object(p), ""); len(errs) != 0 {
+			t.Errorf("rejected documented phase %q: %v", p, errs.ToAggregate())
+		}
+	}
+	for _, p := range []string{"Hacked", "", "pending", "Stopped"} {
+		if errs := validate(object(p), ""); len(errs) == 0 {
+			t.Errorf("admitted unknown phase %q", p)
+		}
+	}
+}
+
+// TestBlipMountPhaseAdmission guards the mount phases the controller and CLI
+// use to decide whether a mount is pending, usable, or saving.
+func TestBlipMountPhaseAdmission(t *testing.T) {
+	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blips.yaml")
+	mounts, ok := status.Properties["mounts"]
+	if !ok || mounts.Items == nil {
+		t.Fatal("generated CRD has no status.mounts items schema")
+	}
+	phase, ok := mounts.Items.Properties["phase"]
+	if !ok {
+		t.Fatal("generated CRD has no status.mounts items phase property")
+	}
+	want := []string{MountPending, MountMounted, MountUnmounting, MountSaving, MountFailed}
+	if !slices.Equal(phase.Enum, want) {
+		t.Errorf("status.mounts.phase enum = %v, want %v", phase.Enum, want)
+	}
+	validate := admissionValidator(t, "blips")
+	object := func(p string) string {
+		return fmt.Sprintf(`{"spec":{"state":"root","command":["true"]},"status":{"mounts":[{"state":"root","path":"/m","phase":%q}]}}`, p)
+	}
+	for _, p := range want {
+		if errs := validate(object(p), ""); len(errs) != 0 {
+			t.Errorf("rejected documented mount phase %q: %v", p, errs.ToAggregate())
+		}
+	}
+	for _, p := range []string{"Hacked", "", "pending", "Mounted "} {
+		if errs := validate(object(p), ""); len(errs) == 0 {
+			t.Errorf("admitted unknown mount phase %q", p)
+		}
+	}
+}
+
 // TestBlipTurnImmutable guards that a producer cannot rewrite history.
 func TestBlipTurnImmutable(t *testing.T) {
 	data, err := os.ReadFile("../../deploy/crd/blip.dev_blipturns.yaml")

@@ -711,6 +711,16 @@ spec:
                 - sourceNode
                 type: object
               phase:
+                description: |-
+                  Phase is one of the documented BlipState phases. An unknown value is
+                  rejected at admission so a status writer cannot leave a state in a
+                  phase that no reconcile path can advance or clean up.
+                enum:
+                - Pending
+                - Ready
+                - InUse
+                - Saving
+                - Failed
                 type: string
               placements:
                 description: |-

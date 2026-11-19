@@ -466,6 +466,16 @@ spec:
                     path:
                       type: string
                     phase:
+                      description: |-
+                        Phase is one of the documented mount phases. An unknown value is
+                        rejected at admission so the controller and CLI cannot be left
+                        waiting on a mount that is in no known phase.
+                      enum:
+                      - Pending
+                      - Mounted
+                      - Unmounting
+                      - Saving
+                      - Failed
                       type: string
                     state:
                       type: string
