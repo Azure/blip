@@ -81,7 +81,7 @@ fault coverage counts controller writes, not these node-adapter writes.
 Storage effects still copy exact bytes and update physical volume inventory;
 they do not execute the storage device-mapper operation/recovery core. Guest
 effects implement the wire operations exercised here and do not execute the
-guest session/freeze cores. Those production cores can be composed through
+guest freeze core. Those production cores can be composed through
 their own value/effect boundaries in subsequent workloads. Preparation here
 uses local committed bases; a remote/image preparation request is rejected as
 an unsupported environment effect. Replica fetches use the production-selected

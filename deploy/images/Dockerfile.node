@@ -12,7 +12,6 @@ RUN apt-get update \
         kmod \
         libarchive13t64 \
         nftables \
-        nvme-cli \
         thin-provisioning-tools \
         util-linux \
     && rm -rf /var/lib/apt/lists/*

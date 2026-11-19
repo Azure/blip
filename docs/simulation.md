@@ -78,16 +78,6 @@ trace. Its `Complete` field distinguishes an exhausted finite graph from a
 truncated search. Neither a successful bounded run nor complete safety
 exploration establishes unbounded liveness.
 
-`sim.Shrink` reduces traces using a caller-supplied failure predicate. That
-predicate must reject causally impossible schedules and require the same
-property violation, rather than treating a replay error as the target failure.
-
-`sim.Queue` separates virtual deadlines and process-incarnation-scoped result
-delivery. Crashing a process drops its delivery events; independently owned
-kernel or server work must remain in the world. `sim.Obligations` tracks
-individual deadlines after a scenario establishes its recovery/fairness
-conditions. Unrelated progress must not conceal an unresolved save or deletion.
-
 ### Bounded liveness checking
 
 `internal/simlive` checks eventual reachability of a supplied goal using the
@@ -144,7 +134,7 @@ This coverage map is the simulation coverage ledger: each row names the producti
 | `internal/controller/simulation_test.go` | Allocation, state publication, claims, cleanup and optimistic API writes | Fake API with explicit cache delivery; lost replies followed by restart after normal error handling |
 | `internal/node/{plan,scheduler}_test.go` | Snapshot planning, GC, admission, source reservations, retries and completion generations | External device and API operations have separate tests |
 | `internal/runtime` | Production claim/mount/detach/freeze/stop machine and hypervisor confirmation helper | Guest, network and hypervisor service represented by effect outcomes |
-| `internal/guest`, `internal/wire` | Guest command/session control, process environment and stdio decisions, freeze/thaw lease expiry and stale-result handling, protocol framing and ambiguous session opens | Real guest filesystem/process behavior and host signal delivery need real-host qualification |
+| `internal/guest`, `internal/wire` | Guest freeze/thaw lease expiry and stale-result handling, protocol framing | Real guest filesystem/process behavior and host signal delivery need real-host qualification |
 | `internal/peer`, `internal/nvme` | Lease lifecycle, persistence, retry policy and connection workflows | Real transport/device semantics additionally tested by privileged suites |
 | `internal/stream/{stream_test.go,simulation_test.go}` | Ring append, whole-record trim, restart recovery, torn-tail rejection, reader gap reporting, and bounded-depth exhaustive exploration of a crash model with injected before/torn/lost writes | The model uses an in-memory `ReadWriterAt`; real volume I/O, concurrent failover and power-loss persistence need device tests |
 | `internal/workspace/{fork_test.go,simulation_test.go}` | Production `Fork` snapshot, preflight, child/root creation, owner patching, UID-guarded rollback, and rejected/transport/server read faults plus rejected/transport/server/lost-response write faults | Fake API with injected rejected and ambiguous responses; live API-server races, controller-driven snapshots and filesystem copy behavior are out of scope |
@@ -152,7 +142,7 @@ This coverage map is the simulation coverage ledger: each row names the producti
 | `internal/blipchat/simulation_test.go` | Hub publish/replay/gap ring and subscriber cancellation; ACP driver generation restart, transcript retention and teardown | Production handlers are called synchronously, so driver goroutines/tickers, the real ACP subprocess, Kubernetes watch delivery and the SSE handler are out of scope |
 | `internal/streamapi/simulation_test.go` | Production stream handler authorization gate, log/stdin cursor lifecycle, gap/restart/EOF handling, response framing and backend error mapping | Simulated backend ring and generation; real node transport, TLS/SAR authentication and discovery remain in the existing unit tests |
 | `internal/simapp` | Composed allocation, production node planning/admission, runtime, lease sequencing, save/replication, reacquisition and bounded liveness windows for runtime-claim handoff and seal/report progress | See its README for exact simulated services and exploration windows |
-| `internal/sim`, `internal/simlive` | Replay, shrinking, exploration bounds, crash delivery and fair-cycle witnesses | Checker tests include deliberately broken models; production properties live in component/world tests |
+| `internal/sim`, `internal/simlive` | Replay, exploration bounds and fair-cycle witnesses | Checker tests include deliberately broken models; production properties live in component/world tests |
 
 Pure and thin packages use property tests instead of a simulation model. In
 particular, `internal/network` checks that a Blip layer never widens the pool

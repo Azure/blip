@@ -15,8 +15,6 @@ RUN apt-get update \
         curl \
         git \
         less \
-        openssh-client \
-        openssh-sftp-server \
         procps \
         python3 \
         sudo \

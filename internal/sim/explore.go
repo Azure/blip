@@ -227,37 +227,3 @@ func enabled(m Model) ([]string, error) {
 	}
 	return a, nil
 }
-
-// Shrink removes chunks of a trace while the caller's predicate still
-// reproduces the same violation. The predicate must reject invalid schedules
-// and distinguish the original violation from unrelated errors. This makes
-// shrinking usable with fault scripts as well as model actions.
-// The predicate must be deterministic and must not mutate data referenced by
-// the elements (slice storage is copied). The result is 1-minimal: removing any
-// single remaining element no longer fails. It need not be the shortest failing
-// subsequence. A trace that does not fail is returned unchanged.
-func Shrink[T any](trace []T, fails func([]T) bool) []T {
-	out := slices.Clone(trace)
-	if len(out) == 0 || !fails(slices.Clone(out)) {
-		return out
-	}
-	if empty := slices.Clone(out[:0]); fails(empty) {
-		return empty
-	}
-	for size := max(1, len(out)/2); ; size = max(1, size/2) {
-		for i := 0; i+size <= len(out); {
-			candidate := append(slices.Clone(out[:i]), out[i+size:]...)
-			if fails(slices.Clone(candidate)) {
-				out = candidate
-				// A later deletion may make an earlier event removable, especially
-				// when the predicate also checks schedule validity.
-				i = 0
-			} else {
-				i++
-			}
-		}
-		if size == 1 {
-			return out
-		}
-	}
-}

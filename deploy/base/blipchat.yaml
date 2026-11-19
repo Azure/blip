@@ -5,8 +5,7 @@ metadata:
   namespace: blip-system
 ---
 # blipchat creates one BlipState per chat and one Blip per generation. It
-# reads pod status for the session list and writes the stdin/stdout of a chat
-# through the aggregated stream API. It never owns a BlipThread or BlipTurn.
+# writes the stdin/stdout of a chat through the aggregated stream API.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -18,9 +17,6 @@ rules:
   - apiGroups: [blip.dev]
     resources: [blips]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [get, list, watch]
   # The stream API authorizes resource requests (blipstreams/log and
   # blipstreams/stdin) through SubjectAccessReview; the non-resource rule
   # covers discovery and any handler that authorizes the raw path.
@@ -95,7 +91,7 @@ spec:
         runAsUser: 65532
       containers:
         - name: blipchat
-          image: ghcr.io/azure/blipchat:latest
+          image: ghcr.io/azure/blip-blipchat:latest
           imagePullPolicy: IfNotPresent
           args:
             - --listen=:8080

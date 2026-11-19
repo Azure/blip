@@ -22,17 +22,6 @@ for tool in docker kind kubectl go make modinfo; do
   command -v "${tool}" >/dev/null || { echo "missing tool: ${tool}" >&2; exit 1; }
 done
 
-# Node data from before encrypted volumes has no disk key ID and the node agent
-# refuses to open it. Fail before creating a cluster that cannot start.
-for node in "${WORKERS[@]}"; do
-  db="${DATA}/${node}/storage.db"
-  if sudo test -s "${db}" && ! sudo grep -aq diskKeyID "${db}"; then
-    echo "node data in ${DATA}/${node} predates encrypted volumes;" \
-      "run hack/kind-down.sh --purge to discard it" >&2
-    exit 1
-  fi
-done
-
 # kind nodes share the host kernel, so the modules blip needs are loaded on the
 # host.
 sudo modprobe -a configfs loop tun nvmet nvmet_tcp nvme_tcp nvme_fabrics dm_thin_pool dm_clone dm_crypt
@@ -123,8 +112,6 @@ for node in "${WORKERS[@]}"; do
   # Match deploy/kind/pools.yaml. The controller adds blip.dev/enrolled to
   # selected nodes and the node agent runs there.
   k label node "${node}" blip.dev/node-pool=default --overwrite >/dev/null
-  # Remove the old manual opt-in label; it is inert now.
-  k label node "${node}" blip.dev/node- >/dev/null 2>&1 || true
 done
 
 make build guest

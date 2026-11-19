@@ -11,6 +11,10 @@ cleanup_20() {
 }
 cleanup_register cleanup_20
 
+pod_gone_20() {
+	! k get pod -n default "$1" >/dev/null 2>&1
+}
+
 step "run honors per-execution env, working directory, and user"
 r20_run_env="run-env-$P"
 test "$(blip run --name "$P-runtime" --from "$P-base" \

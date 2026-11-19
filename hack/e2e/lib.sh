@@ -118,7 +118,7 @@ expect_fail_grep() {
 	fi
 }
 
-# expect_ok greps successful command output, and leaves it in $work/expect-ok.out.
+# expect_ok_grep greps successful command output, and leaves it in $work/expect-ok.out.
 expect_ok_grep() {
 	local desc=$1 pattern=$2
 	shift 2
@@ -132,17 +132,6 @@ expect_ok_grep() {
 		cat "$work/expect-ok.out" >&2
 		return 1
 	fi
-}
-
-# retry N COMMAND... runs a command up to N times with a one second pause.
-retry() {
-	local n=$1 i
-	shift
-	for ((i = 0; i < n; i++)); do
-		"$@" && return 0
-		sleep 1
-	done
-	return 1
 }
 
 # ensure_base makes the shared imported base available to any scenario, even
