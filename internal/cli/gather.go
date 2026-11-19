@@ -82,7 +82,9 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 	if err != nil {
 		return err
 	}
-	selector := f.selector
+	// labels.Parse treats whitespace as a selector that matches everything,
+	// and an unset shell variable is easy to pass by accident.
+	selector := strings.TrimSpace(f.selector)
 	if len(names) == 0 && selector == "" {
 		if a.self == nil {
 			return errors.New("gather needs blip names or --selector outside a blip")
@@ -227,6 +229,9 @@ func (a *app) gatherTargets(ctx context.Context, c *Clients, names []string, sel
 		sel, err := labels.Parse(selector)
 		if err != nil {
 			return nil, fmt.Errorf("invalid --selector %q: %w", selector, err)
+		}
+		if sel.Empty() {
+			return nil, fmt.Errorf("invalid --selector %q: it selects every blip", selector)
 		}
 		var list v1alpha1.BlipList
 		if err := c.Kube.List(ctx, &list, client.InNamespace(c.Namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {

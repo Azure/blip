@@ -118,6 +118,40 @@ func TestGatherOutsideBlipNeedsNames(t *testing.T) {
 	}
 }
 
+// A blank shell variable expands to whitespace, which labels.Parse treats as
+// "select everything". Outside a blip it must be rejected; inside one it must
+// fall back to the caller's forks, never widen to the whole namespace.
+func TestGatherRejectsWhitespaceSelector(t *testing.T) {
+	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
+	code, _, errOut := h.run("", "gather", "--selector", " ")
+	if code != 1 || !strings.Contains(errOut, "needs blip names or --selector") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if h.gone("w1") {
+		t.Fatal("whitespace selector gathered a blip")
+	}
+}
+
+func TestGatherWhitespaceSelectorFallsBackToCallerForks(t *testing.T) {
+	mine := finishedBlip("alice.w1", v1alpha1.BlipSucceeded, 0)
+	mine.Labels = map[string]string{v1alpha1.LabelOwner: "alice", v1alpha1.LabelParent: "box"}
+	other := finishedBlip("alice.w2", v1alpha1.BlipSucceeded, 0)
+	other.Labels = map[string]string{v1alpha1.LabelOwner: "alice", v1alpha1.LabelParent: "other"}
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), mine, other)
+	h.self = "alice.box"
+	code, out, errOut := h.run("", "gather", "--selector", " ")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/w1 Succeeded")
+	if !h.gone("alice.w1") {
+		t.Fatal("caller's fork kept")
+	}
+	if h.gone("alice.w2") {
+		t.Fatal("whitespace selector gathered another blip's fork")
+	}
+}
+
 func TestGatherSelector(t *testing.T) {
 	a := finishedBlip("w1", v1alpha1.BlipSucceeded, 0)
 	a.Labels = map[string]string{"team": "nightly"}
