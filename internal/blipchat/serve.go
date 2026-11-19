@@ -280,8 +280,13 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 
 	messages := []Message{
 		{Role: "system", Content: systemPrompt(thread)},
-		{Role: "user", Content: boardPrompt(thread, st.tasks, pending, dueTimers, st.summary)},
 	}
+	prompt, lastRendered := boardPrompt(thread, st.tasks, pending, dueTimers, st.summary)
+	// Never advance ConsumedSeq past a turn the prompt did not render.
+	if len(pending) > 0 && lastRendered < target {
+		target = lastRendered
+	}
+	messages = append(messages, Message{Role: "user", Content: prompt})
 	toollist := st.tools()
 	for calls := 0; calls < s.Config.MaxToolCalls; calls++ {
 		reply, usage, err := s.LLM.Chat(ctx, model, messages, toollist)
@@ -410,7 +415,12 @@ func systemPrompt(thread *v1.BlipThread) string {
 	return prompt + "\n\nCharter:\n" + thread.Spec.Charter
 }
 
-func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTurn, timers []v1.ThreadTimer, summary string) string {
+// boardPrompt renders one step's input. It returns the prompt and the
+// highest turn sequence it actually rendered, so the caller never consumes a
+// turn the coordinator did not see. When the turns do not fit the budget, the
+// newest turns win: they are the ones most likely to be actionable, and the
+// notice reports exactly how many older turns were left out.
+func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTurn, timers []v1.ThreadTimer, summary string) (string, int64) {
 	var b strings.Builder
 	b.WriteString("Task board:\n")
 	if len(tasks) == 0 {
@@ -446,20 +456,46 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 	b.WriteString("\nNew turns (oldest first):\n")
 	if len(turns) == 0 {
 		b.WriteString("(none; this is a scheduled wake-up)\n")
+		return b.String(), 0
 	}
+
+	lines := make([]string, len(turns))
 	for i := range turns {
 		line := renderTurn(&turns[i])
 		if len(line) > 2048 {
 			line = truncateRunes(line, 2048)
 		}
-		if b.Len()+len(line) > 48000 {
-			b.WriteString("(older turns omitted)\n")
+		lines[i] = line + "\n"
+	}
+	// Walk backwards from the newest turn, reserving room for an accurate
+	// notice about the older turns that will not fit. Keep at least the
+	// newest turn even when the board alone is already over budget, so a step
+	// always has something it may consume.
+	budget := 48000 - b.Len()
+	start := len(turns)
+	used := 0
+	for start > 0 {
+		i := start - 1
+		notice := 0
+		if i > 0 {
+			notice = len(fmt.Sprintf("(%d older turns omitted)\n", i))
+		}
+		if used+len(lines[i])+notice > budget {
 			break
 		}
-		b.WriteString(line)
-		b.WriteString("\n")
+		used += len(lines[i])
+		start = i
 	}
-	return b.String()
+	if start == len(turns) {
+		start = len(turns) - 1
+	}
+	if start > 0 {
+		fmt.Fprintf(&b, "(%d older turns omitted)\n", start)
+	}
+	for i := start; i < len(turns); i++ {
+		b.WriteString(lines[i])
+	}
+	return b.String(), turns[len(turns)-1].Status.Seq
 }
 
 func openState(open bool) string {
