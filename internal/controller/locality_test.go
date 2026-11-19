@@ -141,6 +141,40 @@ func TestLocalWaitEndsWhenPinnedPodUnschedulable(t *testing.T) {
 	}
 }
 
+// TestFallbackReturnsToDataNode covers a fallback caused only by transient
+// maxCount pressure: while it waits, the pool still treats the data node as
+// pinned demand, and the Blip claims the local VM as soon as one is booted.
+func TestFallbackReturnsToDataNode(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	home := e.readyState("data", "n1").Status.Placements[0]
+	e.newPool("default", 0, 1)
+	e.newBlip("b", withRoot("data"))
+	e.setBlipStatus("b", func(b *v1.Blip) {
+		b.Status.Phase = v1.BlipPending
+		b.Status.Locality = &v1.Locality{Node: home, Fallback: true}
+	})
+
+	// The fallback Blip is still demand for the data node; capacity allows a
+	// pinned VM even though its status says fallback.
+	e.run(e.pool, ns, "default")
+	pinned := pinnedPods(e, home)
+	if len(pinned) != 1 {
+		t.Fatalf("pods %+v, want one pinned to %s", e.pods(), home)
+	}
+
+	e.warmOn(home)
+	e.run(e.blip, ns, "b")
+	b := e.getBlip("b")
+	expectPhase(t, b, v1.BlipRunning, "")
+	if b.Status.Node != home {
+		t.Fatalf("started on %q, want the data node %q", b.Status.Node, home)
+	}
+	if b.Status.Locality == nil || b.Status.Locality.Fallback {
+		t.Fatalf("sticky fallback after returning local: %+v", b.Status.Locality)
+	}
+}
+
 func TestLocalWaitSkippedAtMaxCount(t *testing.T) {
 	e, _, away := localSetup(t, 1, 1)
 	e.newBlip("b", withRoot("data"))

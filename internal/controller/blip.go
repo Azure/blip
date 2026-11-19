@@ -559,18 +559,32 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		return reconcile.Result{}, err
 	}
 	candidates := r.warmPods(b, pool, states, pods, cl)
-	if loc := b.Status.Locality; loc != nil && !loc.Fallback {
+	if loc := b.Status.Locality; loc != nil {
 		local := slices.DeleteFunc(slices.Clone(candidates), func(p corev1.Pod) bool {
 			return !slices.Contains(home, p.Spec.NodeName)
 		})
-		if len(local) > 0 {
+		switch {
+		case len(local) > 0:
+			if loc.Fallback {
+				// Capacity is available at the data node again. Return to
+				// the pinned placement instead of keeping a fallback that a
+				// transient maxCount caused for the rest of the Blip's life.
+				loc.Fallback = false
+				loc.Node = podNode(&local[0])
+				loc.Since = nil
+			}
 			candidates = local
-		} else if why, left := r.waitLocally(b, pool, pods, home); why == "" {
-			wait(b, ReasonWaitingForVM, fmt.Sprintf("waiting for a VM on node %q, which holds the Blip's data", loc.Node))
-			return reconcile.Result{RequeueAfter: left}, r.unclaim(ctx, b)
-		} else {
-			log.FromContext(ctx).Info("starting away from the Blip's data", "node", loc.Node, "reason", why)
-			loc.Fallback = true
+		case loc.Fallback:
+			// No local VM is claimable yet. Keep the fallback eligible for
+			// any VM while the pool still treats the data node as demand.
+		default:
+			if why, left := r.waitLocally(b, pool, pods, home); why == "" {
+				wait(b, ReasonWaitingForVM, fmt.Sprintf("waiting for a VM on node %q, which holds the Blip's data", loc.Node))
+				return reconcile.Result{RequeueAfter: left}, r.unclaim(ctx, b)
+			} else {
+				log.FromContext(ctx).Info("starting away from the Blip's data", "node", loc.Node, "reason", why)
+				loc.Fallback = true
+			}
 		}
 	}
 	if len(candidates) == 0 {

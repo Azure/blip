@@ -234,7 +234,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			continue
 		}
 		demand++
-		if loc := b.Status.Locality; loc != nil && !loc.Fallback && loc.Node != "" && usable(loc.Node) {
+		// A fallback Blip has not claimed a VM yet. Its data node is still
+		// the right place to boot one once capacity allows: falling back
+		// under transient maxCount pressure is not a reason to start the
+		// replacement away from the data.
+		if loc := b.Status.Locality; loc != nil && loc.Node != "" && usable(loc.Node) {
 			pinned[loc.Node]++
 		}
 	}
