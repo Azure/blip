@@ -68,7 +68,7 @@ func (s *step) tools() []Tool {
 			map[string]any{"prompt": str("Work to do; becomes the agent's prompt")},
 			map[string]any{"from": str("Optional BlipState to fork the workspace from instead of spec.base")},
 		), "task", "prompt")),
-		FunctionTool("exec", "Run one command in a running blip and return its whole output. Waits at most 60 seconds.", schema(props(
+		FunctionTool("exec", "Run one command in a running blip. Returns the exit status and the last 8 KiB of each output stream, with a truncation notice when more was written. Waits at most 60 seconds.", schema(props(
 			map[string]any{"blip": str("Blip name")},
 			map[string]any{"argv": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1}},
 			map[string]any{"timeoutSeconds": map[string]any{"type": "integer", "minimum": 1, "maximum": 60}},
