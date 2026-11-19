@@ -247,7 +247,10 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 		}
 		from = "/"
 	}
-	if b.Spec.Pool == "" && a.self != nil && from != "" {
+	// Inside a blip, a fork runs in the caller's pool whether it forks the
+	// caller's root (--from /), another workspace (--from), or runs an
+	// existing one (--state). An explicit --pool still wins.
+	if b.Spec.Pool == "" && a.self != nil {
 		b.Spec.Pool = a.self.Spec.Pool
 	}
 	if err := a.preflight(ctx, c.Kube, b); err != nil {

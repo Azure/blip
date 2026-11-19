@@ -153,6 +153,32 @@ func TestRunInsideBlipDefaultsToCallerRoot(t *testing.T) {
 	}
 }
 
+func TestRunStateInsideBlipInheritsCallerPool(t *testing.T) {
+	box := ownedBlip("alice.box", "alice.home")
+	box.Spec.Pool = "big"
+	h := newHarness(t, box, readyState("alice.ws"))
+	h.self = "alice.box"
+	code, out, errOut := h.run("", "run", "--name", "child", "--state", "ws", "--", "true")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if strings.TrimSpace(out) != "child" {
+		t.Fatalf("output %q", out)
+	}
+	b := h.blip("alice.child")
+	if b.Spec.State != "alice.ws" || b.Spec.Pool != "big" {
+		t.Fatalf("blip %+v", b.Spec)
+	}
+
+	// An explicit --pool still wins over the caller's.
+	if code, _, errOut := h.run("", "run", "--name", "child2", "--state", "ws", "--pool", "default", "--", "true"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if got := h.blip("alice.child2").Spec.Pool; got != "default" {
+		t.Fatalf("pool %q", got)
+	}
+}
+
 func TestRunKeepLeavesWorkspaceOwnedByNobody(t *testing.T) {
 	h := newHarness(t, ownedBlip("alice.box", "alice.home"))
 	h.self = "alice.box"
