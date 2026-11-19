@@ -137,6 +137,150 @@ func TestLookupAccountNumericNormalization(t *testing.T) {
 	}
 }
 
+// accountDatabase writes a passwd and group file whose entries are clearly
+// distinguishable from the synthetic root fallback. The returned passwd makes
+// "escapee" look like a real account.
+func accountDatabase(t *testing.T, dir string) (passwd, group string) {
+	t.Helper()
+	passwd = filepath.Join(dir, "passwd")
+	group = filepath.Join(dir, "group")
+	if err := os.WriteFile(passwd,
+		[]byte("root:x:0:0:outside:/outside-root:/bin/outside\nescapee:x:4242:4242::/outside-home:/bin/outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(group,
+		[]byte("root:x:0:\nescapee:x:4242:escapee\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return passwd, group
+}
+
+// assertOutsideDatabaseNotUsed checks that root resolved to the synthetic
+// fallback entry and that the outside database's account is not visible.
+func assertOutsideDatabaseNotUsed(t *testing.T, root string) {
+	t.Helper()
+	a, err := lookupAccount(root, "")
+	if err != nil {
+		t.Fatalf("root lookup: %v", err)
+	}
+	if a.name != "root" || a.uid != 0 || a.gid != 0 || a.home != "/root" || a.shell != "/bin/sh" {
+		t.Fatalf("root resolved through the outside database: %+v", a)
+	}
+	if _, err := lookupAccount(root, "escapee"); err == nil ||
+		!strings.Contains(err.Error(), "not found in /etc/passwd") {
+		t.Fatalf("outside passwd entry visible: %v", err)
+	}
+	// The numeric uid must not pick up the outside entry's name/gid/home.
+	a, err = lookupAccount(root, "4242")
+	if err != nil {
+		t.Fatalf("numeric lookup: %v", err)
+	}
+	if a.name != "" || a.gid != 0 || a.home != "/" {
+		t.Fatalf("numeric uid resolved through the outside database: %+v", a)
+	}
+}
+
+// /etc/passwd and /etc/group are workload-controlled and are opened by the
+// guest init, so a symlink there must be resolved inside the workload root
+// (as every other guest path is) and never in the init's namespace. The old
+// plain os.Open followed an absolute link out of the root and read the host
+// database.
+func TestLookupAccountSymlinksStayInRoot(t *testing.T) {
+	outside := t.TempDir()
+	outsidePasswd, outsideGroup := accountDatabase(t, outside)
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsidePasswd, filepath.Join(root, "etc/passwd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideGroup, filepath.Join(root, "etc/group")); err != nil {
+		t.Fatal(err)
+	}
+	// The absolute target does not exist inside the root, so the database is
+	// empty and root falls back to its synthetic entry.
+	assertOutsideDatabaseNotUsed(t, root)
+
+	// An absolute link that loops back to itself inside the root fails with a
+	// read error instead of silently becoming an empty database.
+	loopRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(loopRoot, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc/passwd", filepath.Join(loopRoot, "etc/passwd")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lookupAccount(loopRoot, "root"); err == nil ||
+		!strings.Contains(err.Error(), "read /etc/passwd") {
+		t.Fatalf("self-referential passwd symlink: %v, want a read error", err)
+	}
+}
+
+// Magic links such as /proc/self/root and /proc/1/root are absolute links that
+// old plain opens followed into the guest init's namespace. RESOLVE_IN_ROOT
+// rewrites the target to a path inside the workload root and
+// RESOLVE_NO_MAGICLINKS forbids following it there, so the outside file is
+// never read.
+func TestLookupAccountMagicLinkSymlinksStayInRoot(t *testing.T) {
+	outside := t.TempDir()
+	outsidePasswd, _ := accountDatabase(t, outside)
+
+	targets := []string{
+		"/proc/1/root/init",
+		"/proc/self/root" + outsidePasswd,
+	}
+	for _, target := range targets {
+		t.Run(target, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range []string{"passwd", "group"} {
+				if err := os.Symlink(target, filepath.Join(root, "etc", p)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Reading may fail (ELOOP for a magic link inside the root) or the
+			// path may not exist inside the root (ENOENT, an empty database).
+			// Either way the outside file must not supply an identity.
+			a, err := lookupAccount(root, "")
+			if err == nil {
+				if a.name != "root" || a.home != "/root" || a.shell != "/bin/sh" {
+					t.Fatalf("root resolved through %s: %+v", target, a)
+				}
+				if _, err := lookupAccount(root, "escapee"); err == nil {
+					t.Fatalf("outside passwd entry visible through %s", target)
+				}
+			} else if !strings.Contains(err.Error(), "/etc/passwd") {
+				t.Fatalf("unexpected error for %s: %v", target, err)
+			}
+		})
+	}
+
+	// Regular files in the workload root still parse normally.
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/passwd"),
+		[]byte("root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/zsh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/group"),
+		[]byte("root:x:0:\nalice:x:1000:\nwheel:x:10:alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := lookupAccount(root, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.uid != 1000 || a.gid != 1000 || a.home != "/home/alice" || a.shell != "/bin/zsh" || len(a.groups) != 2 {
+		t.Fatalf("normal lookup: %+v", a)
+	}
+}
+
 // A failure to read the account database must be reported as such, not as a
 // missing user. Descriptor exhaustion used to surface as "user ... not found
 // in /etc/passwd" even though the lookup never read the file.

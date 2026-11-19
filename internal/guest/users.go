@@ -30,11 +30,11 @@ func lookupAccount(root, spec string) (*account, error) {
 		spec = "root"
 	}
 	userPart, groupPart, hasGroup := strings.Cut(spec, ":")
-	passwd, err := readColonFile(filepath.Join(root, "etc/passwd"))
+	passwd, err := readColonFile(root, "/etc/passwd")
 	if err != nil {
 		return nil, fmt.Errorf("read /etc/passwd: %w", err)
 	}
-	groups, err := readColonFile(filepath.Join(root, "etc/group"))
+	groups, err := readColonFile(root, "/etc/group")
 	if err != nil {
 		return nil, fmt.Errorf("read /etc/group: %w", err)
 	}
@@ -146,8 +146,14 @@ func parseID(s string) (id uint32, numeric bool, err error) {
 	return uint32(v), true, nil
 }
 
-func readColonFile(path string) ([][]string, error) {
-	f, err := os.Open(path)
+// readColonFile reads the colon-separated account database at p inside root.
+// The file is workload-controlled, so it is opened relative to root with
+// symlinks resolved inside it: an absolute link points at a root path and a
+// magic link (/proc/*/root) is never followed. Without this a workload symlink
+// at /etc/passwd or /etc/group could make the guest init read a file from its
+// own namespace.
+func readColonFile(root, p string) ([][]string, error) {
+	f, err := openReadInRoot(root, p)
 	if err != nil {
 		// A missing file is an empty database, not a read failure: callers
 		// fall back to defaults for root.

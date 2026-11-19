@@ -201,6 +201,25 @@ func openFileInRootFlags(root, p string, flags uint64) (int, error) {
 	return openat2(rootfd, strings.TrimPrefix(p, "/"), flags, 0o644, unix.RESOLVE_IN_ROOT)
 }
 
+// openReadInRoot opens p inside root read-only without creating it. Symlinks
+// are resolved as if root were "/", so an absolute link points at the root's
+// file and a relative one cannot climb out; magic links such as /proc/*/root
+// are never followed. This is the read side of openFileInRoot and is used for
+// workload-controlled files the guest init reads.
+func openReadInRoot(root, p string) (*os.File, error) {
+	rootfd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(rootfd)
+	fd, err := openat2(rootfd, strings.TrimPrefix(p, "/"), unix.O_RDONLY, 0,
+		unix.RESOLVE_IN_ROOT|unix.RESOLVE_NO_MAGICLINKS)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), p), nil
+}
+
 // statInRoot stats p inside root, resolving symlinks as if root were "/".
 func statInRoot(root, p string) (os.FileInfo, error) {
 	rootfd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
