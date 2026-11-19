@@ -103,6 +103,13 @@ spec:
                 description: |-
                   Mounts attaches states when this state is used as a blip's root.
                   Changes apply to the running blip.
+
+                  Paths must be unique and must not overlap, either lexically or after
+                  resolving a known base-image alias: the controller and guest would
+                  reject the topology on every execution. The rule visits ordered pairs,
+                  so it canonically rewrites only the first path; only the aliases in
+                  internal/mountpath.Aliases are known offline, and their targets are
+                  not themselves aliases, so one rewrite pass reaches their identity.
                 items:
                   description: |-
                     Mount attaches a state's filesystem inside a running blip.
@@ -185,6 +192,32 @@ spec:
                 - state
                 x-kubernetes-list-type: map
                 x-kubernetes-validations:
+                - message: mount paths must not overlap
+                  rule: 'self.all(m, self.all(o, m.path == o.path || !((m.path + ''/'').startsWith(o.path
+                    + ''/'') || (o.path + ''/'').startsWith(m.path + ''/'') || (((m.path
+                    == ''/var/run'' || m.path.startsWith(''/var/run/'')) ? m.path.replace(''/var/run'',
+                    ''/run'', 1) : (m.path == ''/var/lock'' || m.path.startsWith(''/var/lock/''))
+                    ? m.path.replace(''/var/lock'', ''/run/lock'', 1) : (m.path ==
+                    ''/bin'' || m.path.startsWith(''/bin/'')) ? m.path.replace(''/bin'',
+                    ''/usr/bin'', 1) : (m.path == ''/sbin'' || m.path.startsWith(''/sbin/''))
+                    ? m.path.replace(''/sbin'', ''/usr/sbin'', 1) : (m.path == ''/lib''
+                    || m.path.startsWith(''/lib/'')) ? m.path.replace(''/lib'', ''/usr/lib'',
+                    1) : (m.path == ''/lib64'' || m.path.startsWith(''/lib64/''))
+                    ? m.path.replace(''/lib64'', ''/usr/lib64'', 1) : (m.path == ''/var/spool/mail''
+                    || m.path.startsWith(''/var/spool/mail/'')) ? m.path.replace(''/var/spool/mail'',
+                    ''/var/mail'', 1) : m.path) + ''/'').startsWith(o.path + ''/'')
+                    || (o.path + ''/'').startsWith(((m.path == ''/var/run'' || m.path.startsWith(''/var/run/''))
+                    ? m.path.replace(''/var/run'', ''/run'', 1) : (m.path == ''/var/lock''
+                    || m.path.startsWith(''/var/lock/'')) ? m.path.replace(''/var/lock'',
+                    ''/run/lock'', 1) : (m.path == ''/bin'' || m.path.startsWith(''/bin/''))
+                    ? m.path.replace(''/bin'', ''/usr/bin'', 1) : (m.path == ''/sbin''
+                    || m.path.startsWith(''/sbin/'')) ? m.path.replace(''/sbin'',
+                    ''/usr/sbin'', 1) : (m.path == ''/lib'' || m.path.startsWith(''/lib/''))
+                    ? m.path.replace(''/lib'', ''/usr/lib'', 1) : (m.path == ''/lib64''
+                    || m.path.startsWith(''/lib64/'')) ? m.path.replace(''/lib64'',
+                    ''/usr/lib64'', 1) : (m.path == ''/var/spool/mail'' || m.path.startsWith(''/var/spool/mail/''))
+                    ? m.path.replace(''/var/spool/mail'', ''/var/mail'', 1) : m.path)
+                    + ''/''))))'
                 - message: mount paths must be unique
                   rule: self.all(m, self.exists_one(o, o.path == m.path))
               nodeSelector:

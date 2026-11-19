@@ -409,6 +409,67 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 	}
 }
 
+// TestMountOverlapAdmission proves admission rejects a mount topology the
+// controller's validateMounts rejects on every execution: nested paths and
+// paths that name one directory only after resolving a known image alias.
+// Either shape left a Ready state whose every Blip failed InvalidSpec.
+func TestMountOverlapAdmission(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipstates.yaml")
+	mounts, ok := spec.Properties["mounts"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.mounts")
+	}
+	ruleFor(t, mounts.XValidations, "mount paths must not overlap")
+
+	validate := admissionValidator(t, "blipstates")
+	object := func(paths ...string) string {
+		var list []string
+		for i, p := range paths {
+			raw, err := kubejson.Marshal(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			list = append(list, fmt.Sprintf(`{"state":"data%d","path":%s}`, i, raw))
+		}
+		return `{"spec":{"mounts":[` + strings.Join(list, ",") + `]}}`
+	}
+	for _, paths := range [][]string{
+		{"/data", "/data/sub"},
+		{"/data/sub", "/data"},
+		{"/bin", "/usr/bin"},
+		{"/bin/x", "/usr/bin/x"},
+		{"/bin/x/sub", "/usr/bin/x"},
+		{"/usr/bin/x", "/bin/x/sub"},
+		{"/var/mail", "/var/spool/mail"},
+		{"/var/mail/x", "/var/spool/mail/x"},
+		{"/var/run/x", "/run/x"},
+		{"/var/lock/x", "/run/lock/x"},
+		{"/lib/x", "/usr/lib/x"},
+		{"/lib64/x", "/usr/lib64/x"},
+		{"/sbin/x", "/usr/sbin/x"},
+	} {
+		if errs := validate(object(paths...), ""); len(errs) == 0 {
+			t.Errorf("admitted overlapping mount paths %v", paths)
+		}
+	}
+	for _, paths := range [][]string{
+		{"/data"},
+		{"/bin/x"},
+		{"/data", "/other"},
+		{"/data", "/data2"},
+		{"/var/log", "/var/log2"},
+		// Distinct canonical siblings are not an overlap.
+		{"/bin/x", "/usr/bin/y"},
+		{"/var/mail/x", "/var/spool/mail/y"},
+		{"/var/run/x", "/run/y"},
+		{"/var/lock/x", "/run/lock/y"},
+	} {
+		if errs := validate(object(paths...), ""); len(errs) != 0 {
+			t.Errorf("rejected distinct mount paths %v: %v", paths, errs.ToAggregate())
+		}
+	}
+}
+
 func TestStateProvisioningImmutableAndRuntimeMutable(t *testing.T) {
 	validate := admissionValidator(t, "blipstates")
 	for _, tc := range []struct{ name, initial, changed string }{
