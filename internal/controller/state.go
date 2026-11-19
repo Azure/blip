@@ -488,7 +488,11 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 				return fmt.Sprintf("copy source %q is not owned by %s or a shared image template", src.Name, owner), false, nil
 			}
 			switch {
-			case src.DeletionTimestamp != nil:
+			case src.DeletionTimestamp != nil && src.Status.Committed == nil:
+				// A source with no committed version can never serve the
+				// copy once it is gone. Fail cleanly without pinning the
+				// source's finalizer on a build that cannot succeed.
+				s.Phase = v1.StateFailed
 				return fmt.Sprintf("copy source %q is being deleted", src.Name), false, nil
 			case src.Status.Committed == nil && src.Status.Phase == v1.StateFailed:
 				s.Phase = v1.StateFailed
@@ -1158,10 +1162,13 @@ func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState
 		out = append(out, "blip "+b.Name)
 	}
 	var copies v1.BlipStateList
-	if err := r.List(ctx, &copies, client.InNamespace(st.Namespace), client.MatchingFields{indexCopyFrom: st.Name}); err != nil {
+	if err := r.deletionCopiesReader().List(ctx, &copies, client.InNamespace(st.Namespace)); err != nil {
 		return nil, err
 	}
 	for _, c := range copies.Items {
+		if c.Name == st.Name || c.Spec.CopyFrom != st.Name {
+			continue
+		}
 		if copyBlocksDeletion(&c, st) {
 			out = append(out, "copy "+c.Name)
 		}
@@ -1169,15 +1176,32 @@ func (r *StateReconciler) deletionBlockers(ctx context.Context, st *v1.BlipState
 	return out, nil
 }
 
+// deletionCopiesReader is the uncached reader used to confirm that no copy
+// still needs a deleting source. A just-created copy may not be in the cache
+// when the deletion is confirmed.
+func (r *StateReconciler) deletionCopiesReader() client.Reader {
+	if r.Live != nil {
+		return r.Live
+	}
+	return r.Client
+}
+
 // copyBlocksDeletion reports whether a copy still needs the source state's
 // data. A copy can only use the source while it is making progress: one that
 // failed terminally (for example a size smaller than the source) will never
 // commit, and one that is being deleted is no longer built by the controller.
 // Neither may pin the source's finalizer forever.
+//
+// A copy pins its source from creation: status.copiedFrom is only written when
+// the copy is first reconciled, so a copy that has not planned yet must still
+// block deletion. Otherwise deleting the source in that window loses the only
+// snapshot the copy could have taken.
 func copyBlocksDeletion(c, src *v1.BlipState) bool {
-	if c.DeletionTimestamp != nil || c.Status.Phase == v1.StateFailed {
+	if c.DeletionTimestamp != nil || c.Status.Phase == v1.StateFailed || c.Status.Committed != nil {
 		return false
 	}
-	return c.Status.Committed == nil && c.Status.CopiedFrom != nil &&
-		c.Status.CopiedFrom.StateUID == string(src.UID)
+	if cf := c.Status.CopiedFrom; cf != nil {
+		return cf.StateUID == string(src.UID)
+	}
+	return c.Spec.CopyFrom == src.Name
 }
