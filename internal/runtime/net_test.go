@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -89,23 +90,33 @@ func scriptChain(t *testing.T, script, name string) string {
 	return script[start : start+end]
 }
 
-// relatedChainAllows evaluates the simple address match that a generated
-// related_<i> chain emits. The chains contain only positive
-// `ct original ip daddr CIDR` terms and negative `!=` exceptions, so an
-// address matches the layer when it is inside a positive prefix and outside
-// every exception.
-func relatedChainAllows(t *testing.T, chain, addr string) bool {
+// relatedChainAllowsFlow evaluates a generated related_<i> chain for a
+// conntrack original tuple. Each return line is a conjunction of
+// `ct original ip daddr` and `ct original ip saddr` terms, and the chain
+// returns when any line matches.
+func relatedChainAllowsFlow(t *testing.T, chain, src, dst string) bool {
 	t.Helper()
-	ip := netip.MustParseAddr(addr)
+	srcIP, dstIP := netip.MustParseAddr(src), netip.MustParseAddr(dst)
 	for _, line := range strings.Split(chain, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.Contains(line, "ct original ip daddr") || !strings.HasSuffix(line, "counter return") {
+		if !strings.HasSuffix(line, "counter return") ||
+			(!strings.Contains(line, "ct original ip daddr") &&
+				!strings.Contains(line, "ct original ip saddr")) {
 			continue
 		}
 		fields := strings.Fields(line)
 		allowed, positive := true, false
 		for i := 0; i+3 < len(fields); i++ {
-			if fields[i] != "ct" || fields[i+1] != "original" || fields[i+2] != "ip" || fields[i+3] != "daddr" {
+			if fields[i] != "ct" || fields[i+1] != "original" || fields[i+2] != "ip" {
+				continue
+			}
+			var ip netip.Addr
+			switch fields[i+3] {
+			case "daddr":
+				ip = dstIP
+			case "saddr":
+				ip = srcIP
+			default:
 				continue
 			}
 			negative, at := false, i+4
@@ -113,9 +124,18 @@ func relatedChainAllows(t *testing.T, chain, addr string) bool {
 				negative, at = true, at+1
 			}
 			if at >= len(fields) {
-				t.Fatalf("malformed original destination match: %q", line)
+				t.Fatalf("malformed original address match: %q", line)
 			}
-			prefix := netip.MustParsePrefix(fields[at])
+			var prefix netip.Prefix
+			if p, err := netip.ParsePrefix(fields[at]); err == nil {
+				prefix = p
+			} else {
+				addr, err := netip.ParseAddr(fields[at])
+				if err != nil {
+					t.Fatalf("malformed address in %q: %v", line, err)
+				}
+				prefix = netip.PrefixFrom(addr, addr.BitLen())
+			}
 			if negative {
 				if prefix.Contains(ip) {
 					allowed = false
@@ -126,12 +146,28 @@ func relatedChainAllows(t *testing.T, chain, addr string) bool {
 					allowed = false
 				}
 			}
+			i = at
 		}
 		if positive && allowed {
 			return true
 		}
 	}
 	return false
+}
+
+// relatedChainAllows answers the guest-initiated question: does the chain
+// admit an error quoting a flow from the guest to addr (the original
+// destination)? The guest IP is never a named peer in these test policies.
+func relatedChainAllows(t *testing.T, chain, addr string) bool {
+	t.Helper()
+	return relatedChainAllowsFlow(t, chain, "169.254.10.2", addr)
+}
+
+// relatedChainAllowsInbound answers the inbound DNAT question: does the chain
+// admit an error quoting a flow from peer to the pod IP?
+func relatedChainAllowsInbound(t *testing.T, chain, peer string) bool {
+	t.Helper()
+	return relatedChainAllowsFlow(t, chain, peer, "192.0.2.2")
 }
 
 // TestPolicyAllowsRelatedICMPErrors covers PMTUD and related transport
@@ -183,7 +219,7 @@ func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 		t.Errorf("related dispatcher is not layer gated:\n%s", related)
 	}
 	layer := scriptChain(t, script, "related_0")
-	if !strings.Contains(layer, "ct original ip daddr 198.51.100.0/24 counter return") {
+	if !strings.Contains(layer, "ct original ip daddr 198.51.100.0/24 ct original ip daddr != 192.0.2.2 counter return") {
 		t.Errorf("related_0 does not match the allowed original destination:\n%s", layer)
 	}
 	// PMTUD/ECONNREFUSED for the allowed flow remains reachable: the original
@@ -270,7 +306,7 @@ func TestPolicyRelatedICMPMatchesOriginalDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	layer := scriptChain(t, script, "related_0")
-	if !strings.Contains(layer, "ct original ip daddr 0.0.0.0/0 ct original ip daddr != 10.0.0.0/8 counter return") {
+	if !strings.Contains(layer, "ct original ip daddr 0.0.0.0/0 ct original ip daddr != 10.0.0.0/8 ct original ip daddr != 192.0.2.2 counter return") {
 		t.Errorf("related_0 does not carry the rule's exceptions:\n%s", layer)
 	}
 	if !relatedChainAllows(t, layer, "203.0.113.10") {
@@ -314,6 +350,181 @@ func TestPolicyRelatedICMPMatchesOriginalDestination(t *testing.T) {
 	second := scriptChain(t, script, "related_1")
 	if relatedChainAllows(t, first, "10.96.0.10") || !relatedChainAllows(t, second, "10.96.0.10") {
 		t.Errorf("layer AND is not preserved for related ICMP:\n%s\n%s", first, second)
+	}
+	related := scriptChain(t, script, "related")
+	if !strings.Contains(related, "jump related_0\n  jump related_1") ||
+		!strings.HasSuffix(strings.TrimSpace(related), "counter accept") {
+		t.Errorf("related dispatcher does not require every layer:\n%s", related)
+	}
+}
+
+// TestPolicyRelatedICMPAllowsInboundDNATPeer is the inbound-DNAT regression:
+// a related frag-needed or port-unreachable quotes a connection whose
+// ORIGINAL destination is the pod itself (the connection arrived through the
+// DNAT and the guest is the server). Matching only ct original ip daddr
+// compared the pod IP against egress destinations and dropped PMTUD or
+// ECONNREFUSED for a peer the policy admitted. The related_<i> chain now also
+// matches the flow's ORIGINAL source, with the rule's exceptions.
+func TestPolicyRelatedICMPAllowsInboundDNATPeer(t *testing.T) {
+	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{{
+		{CIDR: "10.244.2.93/32", Protocol: "TCP", Port: 8443},
+	}}}
+	script, err := testPodNet(nil).policyScript(policy, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer := scriptChain(t, script, "related_0")
+	want := "ct original ip daddr 192.0.2.2 ct original ip saddr 10.244.2.93/32 counter return"
+	if !strings.Contains(layer, want) {
+		t.Errorf("related_0 does not match the inbound peer:\n%s", layer)
+	}
+	// The allowed inbound peer's related errors are delivered.
+	if !relatedChainAllowsInbound(t, layer, "10.244.2.93") {
+		t.Errorf("related_0 denies an allowed inbound peer:\n%s", layer)
+	}
+	// A peer outside the layer is still dropped, and an egress rule that
+	// happens to cover the pod IP does not substitute for a peer check.
+	if relatedChainAllowsInbound(t, layer, "10.244.9.9") {
+		t.Errorf("related_0 admits an unlisted inbound peer:\n%s", layer)
+	}
+	podEgress := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{{
+		{CIDR: "192.0.2.2/32"},
+	}}}
+	script, err = testPodNet(nil).policyScript(podEgress, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	podLayer := scriptChain(t, script, "related_0")
+	if relatedChainAllowsInbound(t, podLayer, "10.244.9.9") || relatedChainAllowsInbound(t, podLayer, "203.0.113.9") {
+		t.Errorf("pod-IP egress rule grants inbound related ICMP:\n%s", podLayer)
+	}
+	// Guest-initiated flows keep the destination path unchanged.
+	if !relatedChainAllows(t, layer, "10.244.2.93") {
+		t.Errorf("related_0 denies an allowed egress destination:\n%s", layer)
+	}
+	if relatedChainAllows(t, layer, "10.244.2.94") {
+		t.Errorf("related_0 admits an unlisted egress destination:\n%s", layer)
+	}
+	// PMTUD and ECONNREFUSED still travel through the layer dispatcher.
+	toGuest := scriptChain(t, script, "to_guest")
+	for _, code := range []string{"frag-needed", "port-unreachable"} {
+		rule := "ct state related icmp type destination-unreachable icmp code " + code + " jump related"
+		if !strings.Contains(toGuest, rule) {
+			t.Errorf("to_guest does not admit %q:\n%s", rule, toGuest)
+		}
+	}
+}
+
+// TestPolicyRelatedICMPInboundPeerRevocation covers the negative side of the
+// inbound path: exceptions apply to the peer, a policy narrowed to a different
+// peer revokes an established flow's related errors, a wildcard rule grants no
+// inbound peer at all, and deny-all generates no ICMP path.
+func TestPolicyRelatedICMPInboundPeerRevocation(t *testing.T) {
+	excepted := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{{
+		{CIDR: "10.244.0.0/16", Except: []string{"10.244.9.0/24"}},
+	}}}
+	script, err := testPodNet(nil).policyScript(excepted, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer := scriptChain(t, script, "related_0")
+	want := "ct original ip daddr 192.0.2.2 ct original ip saddr 10.244.0.0/16 ct original ip saddr != 10.244.9.0/24 counter return"
+	if !strings.Contains(layer, want) {
+		t.Errorf("related_0 does not carry the peer exceptions:\n%s", layer)
+	}
+	if !relatedChainAllowsInbound(t, layer, "10.244.2.93") {
+		t.Errorf("related_0 denies a peer inside the rule:\n%s", layer)
+	}
+	if relatedChainAllowsInbound(t, layer, "10.244.9.9") {
+		t.Errorf("related_0 admits an excepted peer:\n%s", layer)
+	}
+
+	narrowed := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{{
+		{CIDR: "10.244.9.9/32"},
+	}}}
+	script, err = testPodNet(nil).policyScript(narrowed, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowedLayer := scriptChain(t, script, "related_0")
+	if relatedChainAllowsInbound(t, narrowedLayer, "10.244.2.93") {
+		t.Errorf("related_0 keeps a stale inbound peer after narrowing:\n%s", narrowedLayer)
+	}
+	if !relatedChainAllowsInbound(t, narrowedLayer, "10.244.9.9") {
+		t.Errorf("related_0 denies its own inbound peer:\n%s", narrowedLayer)
+	}
+
+	// A wildcard is an egress allowance, not an ingress peer set. It must not
+	// grant inbound related ICMP even when its CIDR covers the pod IP.
+	wildcard := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{{
+		{CIDR: "0.0.0.0/0", Except: []string{"10.0.0.0/8"}, Protocol: "TCP", Port: 443},
+	}}}
+	script, err = testPodNet(nil).policyScript(wildcard, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wildcardLayer := scriptChain(t, script, "related_0")
+	if strings.Contains(wildcardLayer, "ct original ip saddr") {
+		t.Errorf("wildcard rule generated an inbound peer match:\n%s", wildcardLayer)
+	}
+	if relatedChainAllowsInbound(t, wildcardLayer, "203.0.113.9") {
+		t.Errorf("wildcard rule admits inbound related ICMP:\n%s", wildcardLayer)
+	}
+
+	for _, tt := range []struct {
+		name   string
+		policy *netpolicy.Policy
+	}{
+		{"no layers", &netpolicy.Policy{Revision: "deny"}},
+		{"empty layer", &netpolicy.Policy{Revision: "deny", Layers: [][]netpolicy.Rule{{}}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			script, err := testPodNet(nil).policyScript(tt.policy, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(script, "chain related") {
+				t.Errorf("deny-all generates related chains:\n%s", script)
+			}
+			if strings.Contains(scriptChain(t, script, "to_guest"), "ct state related icmp") {
+				t.Errorf("deny-all to_guest admits related ICMP:\n%s", script)
+			}
+		})
+	}
+}
+
+// TestPolicyRelatedICMPInboundKeepsLayerAND pins the layer AND for inbound
+// flows: every layer must name the peer before the dispatcher accepts, so a
+// pool layer that allows the peer cannot preserve related errors after the
+// Blip layer is narrowed to a different peer.
+func TestPolicyRelatedICMPInboundKeepsLayerAND(t *testing.T) {
+	peer := "10.244.2.93"
+	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
+		{{CIDR: peer + "/32", Protocol: "TCP", Port: 8443}},
+		{{CIDR: "10.244.0.0/16", Except: []string{"10.244.9.0/24"}}},
+	}}
+	script, err := testPodNet(nil).policyScript(policy, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range policy.Layers {
+		if !relatedChainAllowsInbound(t, scriptChain(t, script, "related_"+strconv.Itoa(i)), peer) {
+			t.Errorf("related_%d denies a peer named in every layer:\n%s", i, script)
+		}
+	}
+
+	narrowed := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
+		{{CIDR: peer + "/32", Protocol: "TCP", Port: 8443}},
+		{{CIDR: "203.0.113.0/24"}},
+	}}
+	script, err = testPodNet(nil).policyScript(narrowed, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := scriptChain(t, script, "related_0")
+	second := scriptChain(t, script, "related_1")
+	if !relatedChainAllowsInbound(t, first, peer) || relatedChainAllowsInbound(t, second, peer) {
+		t.Errorf("inbound layer AND is not preserved:\n%s\n%s", first, second)
 	}
 	related := scriptChain(t, script, "related")
 	if !strings.Contains(related, "jump related_0\n  jump related_1") ||

@@ -307,9 +307,9 @@ func (p *podNet) denyAll(cause error) (unsafe bool, err error) {
 
 // apply uses one nft transaction. Old conntrack entries never bypass the new
 // policy: both original packets and replies traverse the current layer chains,
-// and related ICMP errors are gated on the conntrack entry's original
-// destination through those same layers. Even invalid desired policy revokes
-// the previously installed allow rules.
+// and related ICMP errors are gated through those same layers on the conntrack
+// entry's original destination (egress) or original peer (inbound DNAT). Even
+// invalid desired policy revokes the previously installed allow rules.
 func (p *podNet) apply(policy *netpolicy.Policy, active bool) (unsafe bool, err error) {
 	unsafe, err = p.install(policy, active)
 	if err == nil && p.disabled {

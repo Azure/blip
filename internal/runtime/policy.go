@@ -62,20 +62,44 @@ func inboundMatch(r netpolicy.Rule) string {
 	return addrMatch(r, "saddr") + portMatch(r, "dport")
 }
 
-// relatedMatch admits a related ICMP error only when the conntrack entry's
-// ORIGINAL destination (the peer of the guest-initiated flow) is inside the
-// rule and outside its exceptions. That destination is what a stale flow would
-// otherwise carry an ICMP error for after the policy is narrowed, so it must
-// pass the same layers as the original packet. Ports and protocol are omitted
-// deliberately: they describe the quoted packet, not the outer ICMP packet,
-// and ct original l4proto/proto-dst are newer than the minimum nft supports.
-func relatedMatch(r netpolicy.Rule) string {
-	match := "ct original ip daddr " + r.CIDRPrefix().String()
+// relatedMatch renders the return terms a related_<i> chain uses for one rule.
+// A related ICMP error can quote either direction of a flow:
+//
+//   - A guest-initiated flow has the egress peer as its ORIGINAL destination.
+//     That destination is what a stale flow would otherwise carry an ICMP
+//     error for after the policy is narrowed, so it must pass the same layers
+//     as the original packet.
+//   - An inbound DNAT flow (the guest is the server) has the pod IP as its
+//     ORIGINAL destination and the peer that inbound_<i> admitted as its
+//     ORIGINAL source. Matching the original destination alone would compare
+//     the pod's own IP against egress destinations and drop PMTUD or transport
+//     errors for an allowed peer.
+//
+// The inbound path mirrors inbound_<i>: a wildcard rule names no peer and
+// therefore grants neither a new inbound connection nor its related errors.
+// The egress path excludes flows whose original destination is the pod itself
+// (an inbound DNAT conntrack), so an egress allowance that happens to cover
+// the pod IP cannot stand in for a peer check.
+// Ports and protocol are omitted deliberately: they describe the quoted
+// packet, not the outer ICMP packet, and ct original l4proto/proto-dst are
+// newer than the minimum nft supports.
+func relatedMatch(r netpolicy.Rule, podIP string) []string {
+	dest := "ct original ip daddr " + r.CIDRPrefix().String()
 	for _, value := range r.Except {
 		p, _ := netip.ParsePrefix(value)
-		match += " ct original ip daddr != " + p.Masked().String()
+		dest += " ct original ip daddr != " + p.Masked().String()
 	}
-	return match
+	dest += " ct original ip daddr != " + podIP
+	matches := []string{dest}
+	if r.CIDRPrefix().Bits() == 0 {
+		return matches
+	}
+	src := "ct original ip daddr " + podIP + " ct original ip saddr " + r.CIDRPrefix().String()
+	for _, value := range r.Except {
+		p, _ := netip.ParsePrefix(value)
+		src += " ct original ip saddr != " + p.Masked().String()
+	}
+	return append(matches, src)
 }
 
 // relatedICMPAllowed reports whether some policy layer grants related ICMP
@@ -156,13 +180,17 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 	// Related ICMP errors (PMTUD and transport errors) are only delivered when
 	// the conntrack entry they quote still passes EVERY policy layer. Each
 	// related_<i> chain returns only if the original flow's destination is
-	// allowed by that layer and drops otherwise, mirroring the egress AND.
-	// The dispatcher then accepts only after all layers have returned.
+	// allowed by that layer (guest-initiated egress) or, for an inbound DNAT
+	// flow, the original peer is allowed by that layer and drops otherwise.
+	// Either way the chain mirrors the layer AND for the flow that the error
+	// quotes. The dispatcher then accepts only after all layers have returned.
 	if relatedICMPAllowed(policy) {
 		for i, layer := range policy.Layers {
 			fmt.Fprintf(&b, " chain related_%d {\n", i)
 			for _, rule := range layer {
-				fmt.Fprintf(&b, "  %s counter return\n", relatedMatch(rule))
+				for _, match := range relatedMatch(rule, p.podIP) {
+					fmt.Fprintf(&b, "  %s counter return\n", match)
+				}
 			}
 			b.WriteString("  counter drop\n }\n")
 		}
@@ -223,9 +251,11 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 		// ECONNREFUSED) or that a route is unusable. RELATED ties the
 		// acceptance to a permitted conntrack entry, so unsolicited ICMP,
 		// echo, and router advertisements remain denied. The policy layers
-		// are still consulted through the original flow's destination, so a
-		// stale conntrack entry cannot deliver an error after the policy is
-		// narrowed; with deny-all no ICMP is admitted at all. Type and code
+		// are still consulted through the original flow: its destination for
+		// guest-initiated egress, and its peer for the inbound DNAT direction
+		// whose destination is the pod itself. A stale conntrack entry
+		// therefore cannot deliver an error after the policy is narrowed;
+		// with deny-all no ICMP is admitted at all. Type and code
 		// must stay symbolic: nftables rejects numeric ICMP selectors on
 		// some versions.
 		if relatedICMPAllowed(policy) {
