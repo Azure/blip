@@ -416,16 +416,18 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	created, createdOn, deleted := r.expectations(rq.NamespacedName, pods.Items)
 	// del records pods deleted in this pass. The cached list still shows
 	// them (and the deletion expectation hides them only on the next
-	// reconcile), so later phases must not act on them again.
-	del := func(p *corev1.Pod) error {
+	// reconcile), so later phases must not act on them again. It reports
+	// whether the pod is actually gone: a lost delete did not free its slot,
+	// so the caller must not account the pod as removed.
+	del := func(p *corev1.Pod) (bool, error) {
 		ok, err := r.deletePod(ctx, rq.NamespacedName, p)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if ok {
 			deleted[p.Name] = true
 		}
-		return nil
+		return ok, nil
 	}
 	total := len(pods.Items) + created
 	// used holds the nodes that host a pod of this pool; it bounds the
@@ -459,7 +461,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 				total--
 				if p.DeletionTimestamp == nil {
 					if terminalCaptured(p, blipByUID[types.UID(p.Labels[v1.LabelBlipUID])], r.now()) {
-						if err := del(p); err != nil {
+						if _, err := del(p); err != nil {
 							return reconcile.Result{}, err
 						}
 					} else {
@@ -480,10 +482,12 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 				total--
 			}
 		case podTerminated(p) || unusable || p.Annotations[v1.AnnotationTemplateHash] != hash:
-			if err := del(p); err != nil {
+			gone, err := del(p)
+			if err != nil {
 				return reconcile.Result{}, err
 			}
-			if unusable {
+			// A lost delete leaves the pod in place, still holding its slot.
+			if gone && unusable {
 				total--
 			}
 		case unschedulable(p):
@@ -495,17 +499,24 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			// has no node to wait for, and its stale avoid affinity may
 			// exclude nodes that are usable again, so delete it and let
 			// createPod recompute the placement.
-			total--
-			if p.Annotations[v1.AnnotationPinnedNode] == "" || localWaiters[node] == 0 {
-				if err := del(p); err != nil {
-					return reconcile.Result{}, err
-				}
+			if p.Annotations[v1.AnnotationPinnedNode] != "" && localWaiters[node] > 0 {
+				// The pod stays for its local waiter, but it is not capacity.
+				total--
+				break
+			}
+			gone, err := del(p)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			// A lost delete did not free the slot, so a replacement would
+			// exceed maxCount.
+			if gone {
+				total--
 			}
 		case warmingOverdue(p, r.now()):
 			// A spare that never became ready cannot accept a claim. Retire
 			// it so a replacement boots instead of it holding a slot and
 			// covering waiting demand until pendingTimeout.
-			total--
 			// A pinned spare that never became ready means the node failed
 			// to boot this pool's VM. Stop pinning replacements there for a
 			// warm budget so a Blip that already fell back can use a healthy
@@ -515,8 +526,14 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 				avoid[pinnedNode] = true
 				r.blockNode(rq.NamespacedName, pinnedNode, r.now().Add(warmTimeout))
 			}
-			if err := del(p); err != nil {
+			gone, err := del(p)
+			if err != nil {
 				return reconcile.Result{}, err
+			}
+			// A lost delete leaves the unready pod in place, still holding
+			// its slot.
+			if gone {
+				total--
 			}
 		default:
 			vacant = append(vacant, p)
@@ -617,8 +634,14 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		// Delete booting pods before ready ones, newest first.
 		sortForRemoval(spare)
 		for _, p := range spare[:max(0, min(have-target, len(spare)))] {
-			if err := del(p); err != nil {
+			gone, err := del(p)
+			if err != nil {
 				return reconcile.Result{}, err
+			}
+			// A lost delete, such as a Blip claiming the spare after the
+			// list, leaves it in place: it still counts as capacity.
+			if !gone {
+				continue
 			}
 			if ready(p) {
 				status.Ready--
