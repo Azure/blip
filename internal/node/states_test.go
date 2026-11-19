@@ -205,6 +205,21 @@ func TestFetchPlanning(t *testing.T) {
 	if len(p.fetches) != 1 || p.fetches[0].src.node != "n3" || p.fetches[0].src.commitID != "c1" {
 		t.Fatalf("repair fetches = %+v", p.fetches)
 	}
+
+	// A draining node is still a healthy source of the commit it already
+	// holds: draining blocks new placements, not serving an existing commit.
+	// Without this, repair could never move the sole copy off a draining node.
+	v = newView()
+	s = state("s")
+	s.Status.Committed = &v1alpha1.Commit{ID: "c1", Generation: 1}
+	s.Status.Placements = []string{"n2", self}
+	s.Status.Nodes = []v1alpha1.NodeObservation{holding("n2", "c1")}
+	v.states = append(v.states, s)
+	v.blipNodes["n2"].Spec.Drain = true
+	p = compute(v)
+	if len(p.fetches) != 1 || p.fetches[0].src.node != "n2" || p.fetches[0].src.commitID != "c1" {
+		t.Fatalf("repair from draining sole holder = %+v (errors %v)", p.fetches, p.errs)
+	}
 }
 
 func TestBuildPlanning(t *testing.T) {

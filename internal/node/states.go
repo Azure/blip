@@ -285,7 +285,7 @@ func planFetch(v *view, p *plan, s *v1alpha1.BlipState) *fetch {
 		}
 	} else if c := st.Committed; c != nil && slices.Contains(st.Placements, v.node) && !v.holds(c.ID) {
 		want = c.ID
-		src = v.holder(s, c.ID, "")
+		src = v.servingHolder(s, c.ID)
 	}
 	if want == "" {
 		return nil

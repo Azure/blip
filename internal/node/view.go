@@ -266,6 +266,20 @@ func (v *view) holder(s *v1alpha1.BlipState, commitID, prefer string) *source {
 	})
 }
 
+// servingHolder picks a holder for a commit this node needs to fetch. It
+// prefers a node healthy for new placements, then accepts a healthy draining
+// holder: draining forbids new placements, not serving a commit it already
+// sealed. Without the fallback repair could never move the last copy off a
+// draining node.
+func (v *view) servingHolder(s *v1alpha1.BlipState, commitID string) *source {
+	if src := v.holder(s, commitID, ""); src != nil {
+		return src
+	}
+	return v.holderFrom(s, commitID, "", func(name, incarnation string) bool {
+		return v.servingNode(name, incarnation) != nil
+	})
+}
+
 // servingSource picks a holder for a pending commit whose source is prefer.
 // It first looks for a node that is healthy for new placements; when there is
 // none, it accepts prefer itself if it is healthy and merely draining. Draining
