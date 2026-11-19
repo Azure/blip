@@ -1,6 +1,10 @@
 package v1alpha1
 
-import "strings"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+)
 
 // Labels, annotations, and the finalizer shared by every component. Everything
 // the controller, node agent, and CLI agree on lives here so a rename
@@ -12,14 +16,18 @@ const (
 	LabelEnrolled         = "blip.dev/enrolled"
 	LabelHypervisorPrefix = "blip.dev/hypervisor-"
 	LabelOwner            = "blip.dev/owner"
-	// LabelParent is the short name of the blip a fork was started from. It
-	// scopes "blip gather" with no arguments to that blip's forks.
+	// LabelParent scopes "blip gather" with no arguments to the forks of the
+	// blip it runs in. Label values are limited to 63 characters, so a long
+	// short name is hashed; AnnotationParent keeps the full name.
 	LabelParent = "blip.dev/parent"
 	// LabelThread marks blips and other objects owned by a BlipThread.
 	LabelThread = "blip.dev/thread"
 	// LabelTask marks a blip as work for one ThreadTask.
 	LabelTask = "blip.dev/task"
 
+	// AnnotationParent is the full short name of the blip a fork was started
+	// from, including names too long for LabelParent's hash.
+	AnnotationParent          = "blip.dev/parent-name"
 	AnnotationBlip            = "blip.dev/blip"
 	AnnotationObserved        = "blip.dev/observed"
 	AnnotationPrepareError    = "blip.dev/prepare-error"
@@ -41,6 +49,18 @@ const (
 
 	Finalizer = "blip.dev/finalizer"
 )
+
+// ParentLabel is the LabelParent value for a fork's short parent name.
+// Kubernetes label values are at most 63 characters: names that fit are used
+// as-is so existing selectors keep working, and longer names become a stable
+// 63-character hash. AnnotationParent always carries the full name.
+func ParentLabel(name string) string {
+	if len(name) <= 63 {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	return "sha256-" + hex.EncodeToString(sum[:])[:56]
+}
 
 // OwnerPrefix is the prefix of every object name scoped to owner.
 func OwnerPrefix(owner string) string { return owner + "." }

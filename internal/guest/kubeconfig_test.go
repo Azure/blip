@@ -18,7 +18,7 @@ func TestKubeConfigContainsNoCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(fd)
-	if err := writeKubeConfig(fd, "sandbox"); err != nil {
+	if err := writeKubeConfig(fd, "sandbox", "alice.default"); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(run, "blip/kubeconfig"))
@@ -49,6 +49,9 @@ func TestKubeConfigContainsNoCredentials(t *testing.T) {
 	if ns, err := os.ReadFile(filepath.Join(run, "blip/namespace")); err != nil || string(ns) != "sandbox" {
 		t.Fatalf("metadata namespace = %q, %v", ns, err)
 	}
+	if name, err := os.ReadFile(filepath.Join(run, "blip/name")); err != nil || string(name) != "alice.default" {
+		t.Fatalf("metadata blip name = %q, %v", name, err)
+	}
 	var files []string
 	err = filepath.WalkDir(run, func(path string, d os.DirEntry, err error) error {
 		if err != nil || path == run {
@@ -72,7 +75,7 @@ func TestKubeConfigContainsNoCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"blip", "blip/kubeconfig", "blip/namespace"}; !reflect.DeepEqual(files, want) {
+	if want := []string{"blip", "blip/kubeconfig", "blip/name", "blip/namespace"}; !reflect.DeepEqual(files, want) {
 		t.Fatalf("installed files = %v, want %v (no token or CA files)", files, want)
 	}
 }
@@ -82,11 +85,11 @@ func TestKubeConfigInstallOutsidePID1(t *testing.T) {
 		t.Skip("running as PID 1")
 	}
 	g := &Guest{root: t.TempDir(), kubeNamespace: "sandbox"}
-	if err := g.installKubeConfigLocked(); err != errNotInit {
+	if err := g.installKubeConfigLocked("alice.default"); err != errNotInit {
 		t.Fatalf("install = %v, want %v", err, errNotInit)
 	}
 	g.kubeNamespace = ""
-	if err := g.installKubeConfigLocked(); err != nil {
+	if err := g.installKubeConfigLocked("alice.default"); err != nil {
 		t.Fatalf("disabled install = %v", err)
 	}
 	if entries, err := os.ReadDir(g.root); err != nil || len(entries) != 0 {
@@ -95,7 +98,7 @@ func TestKubeConfigInstallOutsidePID1(t *testing.T) {
 }
 
 func TestKubeMetadataRejectsSymlinks(t *testing.T) {
-	for _, target := range []string{"blip", "blip/kubeconfig", "blip/namespace"} {
+	for _, target := range []string{"blip", "blip/kubeconfig", "blip/name", "blip/namespace"} {
 		t.Run(target, func(t *testing.T) {
 			run, outside := t.TempDir(), t.TempDir()
 			if err := os.MkdirAll(filepath.Dir(filepath.Join(run, target)), 0o755); err != nil {
@@ -109,7 +112,7 @@ func TestKubeMetadataRejectsSymlinks(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer unix.Close(fd)
-			if err := writeKubeConfig(fd, "sandbox"); err == nil {
+			if err := writeKubeConfig(fd, "sandbox", "alice.default"); err == nil {
 				t.Fatal("metadata installation followed a symlink")
 			}
 			if entries, err := os.ReadDir(outside); err != nil || len(entries) != 0 {

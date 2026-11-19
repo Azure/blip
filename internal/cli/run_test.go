@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"reflect"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/Azure/blip/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
@@ -151,6 +153,77 @@ func TestRunInsideBlipDefaultsToCallerRoot(t *testing.T) {
 	}
 	if b.Spec.TTLSecondsAfterFinished == nil || *b.Spec.TTLSecondsAfterFinished != int32(defaultForkTTL.Seconds()) {
 		t.Fatalf("ttl %v", b.Spec.TTLSecondsAfterFinished)
+	}
+}
+
+// Blip names longer than 63 characters cannot be label values, and names over
+// 64 bytes cannot be hostnames. Inside such a blip, nested run and gather must
+// still find the caller and its forks.
+func TestRunAndGatherInsideLongNamedBlip(t *testing.T) {
+	name := "long-" + strings.Repeat("a", 70)
+	box := runningBlip(name)
+	h := newHarness(t, box)
+	h.self = name
+	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
+
+	code, out, errOut := h.run("", "run", "--name", "child", "--", "true")
+	if code != 0 {
+		t.Fatalf("run code %d: %s", code, errOut)
+	}
+	if strings.TrimSpace(out) != "child" {
+		t.Fatalf("output %q", out)
+	}
+	b := h.blip("child")
+	parent := b.Labels[v1alpha1.LabelParent]
+	if len(parent) == 0 || len(parent) > 63 {
+		t.Fatalf("parent label %q (%d bytes)", parent, len(parent))
+	}
+	if problems := validation.IsValidLabelValue(parent); len(problems) > 0 {
+		t.Fatalf("parent label %q: %v", parent, problems)
+	}
+	if b.Annotations[v1alpha1.AnnotationParent] != name {
+		t.Fatalf("parent annotation = %q, want %q", b.Annotations[v1alpha1.AnnotationParent], name)
+	}
+
+	if fin := h.waitBlip("child"); fin.Status.Phase != v1alpha1.BlipSucceeded {
+		t.Fatalf("child phase %q", fin.Status.Phase)
+	}
+	code, out, errOut = h.run("", "gather")
+	if code != 0 {
+		t.Fatalf("gather code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/child Succeeded")
+	if !h.gone("child") {
+		t.Fatal("caller's long-named fork kept")
+	}
+}
+
+// A Blip whose name exceeds the hostname limit still identifies itself through
+// the guest's name file, even though the hostname stays the VM pod name.
+func TestFindSelfUsesNameFileWhenHostnameDiffers(t *testing.T) {
+	name := "long-" + strings.Repeat("b", 70)
+	h := newHarness(t, runningBlip(name))
+	h.self = name
+	env := h.env(strings.NewReader(""), io.Discard, io.Discard)
+	env.Hostname = func() (string, error) { return "default-kx9pf", nil }
+	a := &app{env: env}
+	if _, err := a.clients(); err != nil {
+		t.Fatal(err)
+	}
+	if a.self == nil || a.self.Name != name {
+		t.Fatalf("self = %+v, want %q", a.self, name)
+	}
+}
+
+func TestRunRejectsNameAboveKubernetesLimit(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	name := strings.Repeat("a", 254)
+	code, _, errOut := h.run("", "run", "--name", name, "--from", "base", "--", "true")
+	if code != 1 || !strings.Contains(errOut, "invalid blip name") || !strings.Contains(errOut, "253") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !isBlipGone(t, h, name) {
+		t.Fatal("invalid name created a blip")
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
@@ -210,6 +211,11 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	if err := a.scope(&name); err != nil {
 		return err
 	}
+	// Blip is a Kubernetes object, so its name is a DNS subdomain of at most
+	// 253 characters. Reject an impossible name before creating a workspace.
+	if problems := validation.IsDNS1123Subdomain(name); len(problems) > 0 {
+		return fmt.Errorf("invalid blip name %q: %s", a.short(name), strings.Join(problems, "; "))
+	}
 	env, err := parseEnv(f.env)
 	if err != nil {
 		return err
@@ -236,7 +242,12 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 		if b.Labels == nil {
 			b.Labels = map[string]string{}
 		}
-		b.Labels[v1alpha1.LabelParent] = a.short(a.self.Name)
+		if b.Annotations == nil {
+			b.Annotations = map[string]string{}
+		}
+		parent := a.short(a.self.Name)
+		b.Labels[v1alpha1.LabelParent] = v1alpha1.ParentLabel(parent)
+		b.Annotations[v1alpha1.AnnotationParent] = parent
 		if !f.keep {
 			b.OwnerReferences = []metav1.OwnerReference{blipRef(a.self)}
 		}

@@ -105,6 +105,10 @@ func (h *harness) env(in io.Reader, out, errOut io.Writer) *Env {
 		if err := os.WriteFile(env.NamespaceFile, []byte(ns), 0o644); err != nil {
 			h.t.Fatal(err)
 		}
+		env.NameFile = filepath.Join(h.t.TempDir(), "name")
+		if err := os.WriteFile(env.NameFile, []byte(h.self), 0o644); err != nil {
+			h.t.Fatal(err)
+		}
 		env.Hostname = func() (string, error) { return h.self, nil }
 	}
 	return env

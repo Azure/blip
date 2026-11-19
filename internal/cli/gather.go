@@ -92,7 +92,7 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		if a.self == nil {
 			return errors.New("gather needs blip names or --selector outside a blip")
 		}
-		selector = v1alpha1.LabelParent + "=" + a.short(a.self.Name)
+		selector = v1alpha1.LabelParent + "=" + v1alpha1.ParentLabel(a.short(a.self.Name))
 	}
 	if len(f.collect) > 0 && a.self == nil {
 		return errors.New("--collect copies into the workspace of the blip this command runs in, so it only works inside one; gather with --keep and collect with kubectl elsewhere")

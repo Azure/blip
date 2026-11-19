@@ -18,7 +18,9 @@ const (
 
 // installKubeConfigLocked runs during root setup, before accepting the claim
 // or starting any workload. Never mount or write guest files on the host.
-func (g *Guest) installKubeConfigLocked() error {
+// blipName lets commands inside the guest find their own Blip even when the
+// name is too long to be a hostname.
+func (g *Guest) installKubeConfigLocked(blipName string) error {
 	if g.kubeNamespace == "" {
 		return nil
 	}
@@ -37,12 +39,12 @@ func (g *Guest) installKubeConfigLocked() error {
 	if st.Type != unix.TMPFS_MAGIC {
 		return errors.New("/run is not a tmpfs")
 	}
-	return writeKubeConfig(runfd, g.kubeNamespace)
+	return writeKubeConfig(runfd, g.kubeNamespace, blipName)
 }
 
 // writeKubeConfig creates public, credential-free metadata relative to the
 // already-mounted /run. Using directory descriptors prevents symlink escapes.
-func writeKubeConfig(runfd int, namespace string) error {
+func writeKubeConfig(runfd int, namespace, blipName string) error {
 	config, err := json.Marshal(map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Config",
@@ -69,13 +71,18 @@ func writeKubeConfig(runfd int, namespace string) error {
 	if err := unix.Fchmod(dirfd, 0o755); err != nil {
 		return err
 	}
-	for _, file := range []struct {
+	type metadataFile struct {
 		name string
 		data []byte
-	}{
+	}
+	files := []metadataFile{
 		{"kubeconfig", append(config, '\n')},
 		{"namespace", []byte(namespace)},
-	} {
+	}
+	if blipName != "" {
+		files = append(files, metadataFile{"name", []byte(blipName)})
+	}
+	for _, file := range files {
 		fd, err := unix.Openat(dirfd, file.name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o644)
 		if err != nil {
 			return fmt.Errorf("create %s: %w", file.name, err)
