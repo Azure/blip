@@ -1,12 +1,14 @@
 package blipchat
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -153,7 +155,27 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func decodeChatRequest(w http.ResponseWriter, r *http.Request, req *chatRequest) error {
-	return json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(req)
+	// Read the whole body through the limiter before decoding. json.Decoder
+	// stops at the end of the first value, so decoding directly from the
+	// limited reader would leave trailing bytes unbounded.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChatBody))
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(req); err != nil {
+		return err
+	}
+	// A second value means the request has data after the JSON object.
+	// Trailing whitespace is not a value and yields io.EOF.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body has data after the JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
