@@ -185,9 +185,12 @@ type BlipStateSpec struct {
 	// copies and to 10Gi otherwise. An image state fails if the converted
 	// image does not fit.
 	//
-	// Size is an int-or-string in the schema, so the rule checks the string
-	// form as a quantity and the integer form numerically.
+	// Size is an int-or-string in the schema, so the rules check the string
+	// form as a quantity and the integer form numerically. Admission rejects
+	// sizes above MaxStateSizeBytes, matching the command-line preflight and
+	// the controller's own terminal check.
 	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="size must be greater than 0"
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? !quantity(self).isGreaterThan(quantity('1Ti')) : self <= 1099511627776",message="size must be at most 1Ti"
 	Size *resource.Quantity `json:"size,omitempty"`
 	// Replicas is the number of nodes that hold every committed version.
 	// Default 3. Must not be set for image states.

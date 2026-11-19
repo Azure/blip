@@ -467,14 +467,19 @@ spec:
                   copies and to 10Gi otherwise. An image state fails if the converted
                   image does not fit.
 
-                  Size is an int-or-string in the schema, so the rule checks the string
-                  form as a quantity and the integer form numerically.
+                  Size is an int-or-string in the schema, so the rules check the string
+                  form as a quantity and the integer form numerically. Admission rejects
+                  sizes above MaxStateSizeBytes, matching the command-line preflight and
+                  the controller's own terminal check.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
                 x-kubernetes-validations:
                 - message: size must be greater than 0
                   rule: 'type(self) == string ? quantity(self).isGreaterThan(quantity(''0''))
                     : self > 0'
+                - message: size must be at most 1Ti
+                  rule: 'type(self) == string ? !quantity(self).isGreaterThan(quantity(''1Ti''))
+                    : self <= 1099511627776'
             type: object
             x-kubernetes-validations:
             - message: set at most one of image and copyFrom

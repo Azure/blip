@@ -15,6 +15,7 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	celvalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
 	openapivalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
+	"k8s.io/apimachinery/pkg/api/resource"
 	kubejson "k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	celconfig "k8s.io/apiserver/pkg/apis/cel"
@@ -191,9 +192,10 @@ func TestBlipRootRequired(t *testing.T) {
 	}
 }
 
-// TestBlipStateSizeCRDRule guards the admission rule that rejects a zero or
-// negative BlipState.spec.size, which otherwise reached the node agent and
-// failed with an internal storage error.
+// TestBlipStateSizeCRDRule guards the admission rules that reject a zero,
+// negative, or too-large BlipState.spec.size. Such sizes otherwise reached the
+// node agent and failed with an internal storage error, or were stored and then
+// failed terminally by the controller after admission.
 func TestBlipStateSizeCRDRule(t *testing.T) {
 	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipstates.yaml")
 	size, ok := spec.Properties["size"]
@@ -203,6 +205,32 @@ func TestBlipStateSizeCRDRule(t *testing.T) {
 	const want = "type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0"
 	if rule := ruleFor(t, size.XValidations, "size must be greater than 0"); rule != want {
 		t.Errorf("size rule %q, want %q", rule, want)
+	}
+	maxQuantity := resource.NewQuantity(MaxStateSizeBytes, resource.BinarySI).String()
+	wantMax := fmt.Sprintf("type(self) == string ? !quantity(self).isGreaterThan(quantity('%s')) : self <= %d", maxQuantity, MaxStateSizeBytes)
+	if rule := ruleFor(t, size.XValidations, "size must be at most 1Ti"); rule != wantMax {
+		t.Errorf("size maximum rule %q, want %q", rule, wantMax)
+	}
+
+	validate := admissionValidator(t, "blipstates")
+	for _, object := range []string{
+		`{"spec":{"size":"1Ti"}}`,
+		`{"spec":{"size":"1024Gi"}}`,
+		`{"spec":{"size":"1099511627776"}}`,
+		fmt.Sprintf(`{"spec":{"size":%d}}`, MaxStateSizeBytes),
+	} {
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("admission rejected size at the maximum: %s: %v", object, errs.ToAggregate())
+		}
+	}
+	for _, object := range []string{
+		`{"spec":{"size":"2Ti"}}`,
+		`{"spec":{"size":"1099511627777"}}`,
+		fmt.Sprintf(`{"spec":{"size":%d}}`, MaxStateSizeBytes+1),
+	} {
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admission accepted size above the maximum: %s", object)
+		}
 	}
 }
 
