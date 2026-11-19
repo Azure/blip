@@ -779,6 +779,47 @@ func copyEntry(ctx context.Context, src, dst string, info os.FileInfo) error {
 // observe, or fail, the file copies a merge performs.
 var copyFileHook func(src, dst string) error
 
+// makeParentDirs creates dir and any missing parents, returning the
+// directories this call created, shallowest first. A failed copy can then
+// remove exactly those, and only while they are still empty; a pre-existing
+// directory is never returned.
+func makeParentDirs(dir string, perm os.FileMode) ([]string, error) {
+	var missing []string
+	for p := dir; ; {
+		if _, err := os.Lstat(p); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+		missing = append(missing, p)
+		parent := filepath.Dir(p)
+		if parent == p {
+			break
+		}
+		p = parent
+	}
+	created := make([]string, 0, len(missing))
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], perm); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			removeEmptyDirs(created)
+			return nil, err
+		}
+		created = append(created, missing[i])
+	}
+	return created, nil
+}
+
+// removeEmptyDirs removes directories this call created, deepest first. A
+// directory that is no longer empty is left alone.
+func removeEmptyDirs(dirs []string) {
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = os.Remove(dirs[i])
+	}
+}
+
 func copyFile(ctx context.Context, src, dst string, info os.FileInfo) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -789,9 +830,16 @@ func copyFile(ctx context.Context, src, dst string, info os.FileInfo) error {
 		}
 	}
 	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	created, err := makeParentDirs(dir, 0o755)
+	if err != nil {
 		return err
 	}
+	done := false
+	defer func() {
+		if !done {
+			removeEmptyDirs(created)
+		}
+	}()
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -804,7 +852,6 @@ func copyFile(ctx context.Context, src, dst string, info os.FileInfo) error {
 		return err
 	}
 	tmp := out.Name()
-	done := false
 	defer func() {
 		if !done {
 			out.Close()
