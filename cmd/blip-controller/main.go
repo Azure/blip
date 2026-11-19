@@ -50,7 +50,7 @@ func main() {
 	flag.StringVar(&runtimeImage, "runtime-image", "", "image of the VM pod's vm container (blip-runtime)")
 	flag.StringVar(&insecure, "insecure-registry", "", "comma-separated registry hosts reached over plain HTTP")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
-	flag.IntVar(&gcThreshold, "terminated-blip-gc-threshold", controller.DefaultTerminatedBlipGCThreshold, "delete the oldest finished blips beyond this many (0 disables)")
+	flag.IntVar(&gcThreshold, "terminated-blip-gc-threshold", controller.DefaultTerminatedBlipGCThreshold, "delete the oldest finished blips beyond this many per namespace (0 disables)")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
