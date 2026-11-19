@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -173,8 +172,7 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		waitCtx, cancel = context.WithTimeout(ctx, f.wait)
 		defer cancel()
 	}
-	var followWG sync.WaitGroup
-	followDone := map[string]chan struct{}{}
+	followDone := make([]chan struct{}, len(targets))
 	var followCancel context.CancelFunc
 	if f.follow {
 		var fctx context.Context
@@ -182,12 +180,10 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		// their retained-output replay instead of delaying the drain.
 		fctx, followCancel = context.WithCancel(waitCtx)
 		defer followCancel()
-		for _, b := range targets {
+		for i, b := range targets {
 			ch := make(chan struct{})
-			followDone[b.Name] = ch
-			followWG.Add(1)
+			followDone[i] = ch
 			go func(name string, ch chan struct{}) {
-				defer followWG.Done()
 				defer close(ch)
 				a.follow(fctx, name)
 			}(b.Name, ch)
@@ -197,21 +193,28 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 	done, errs := a.awaitTargets(waitCtx, f, targets)
 	if f.follow {
 		// Drain finished blips' replay before deleting them, then stop the
-		// followers still attached to running blips.
+		// followers still attached to running blips. A replay write to a local
+		// consumer that stopped reading cannot be cancelled, so stop waiting
+		// at the wait deadline: --wait bounds the whole gather, not just the
+		// watch.
 		finished := make(map[string]bool, len(done))
 		for _, b := range done {
 			finished[b.Name] = true
 		}
-		for _, b := range targets {
+		for i, b := range targets {
 			if !finished[b.Name] {
 				continue
 			}
-			if ch, ok := followDone[b.Name]; ok {
-				<-ch
+			if !waitFollower(waitCtx, followDone[i]) {
+				break
 			}
 		}
 		followCancel()
-		followWG.Wait()
+		for _, ch := range followDone {
+			if !waitFollower(waitCtx, ch) {
+				break
+			}
+		}
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Name < done[j].Name })
 	needsMountCheck, err := a.checkCollectDestinations(done, f.collect)
@@ -237,6 +240,25 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// waitFollower waits for one follower to finish. It reports false when ctx is
+// done first. A replay write to a local consumer that stopped reading cannot
+// be cancelled, so gather abandons the follower instead of blocking past
+// --wait.
+func waitFollower(ctx context.Context, ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		// A follower that finished at the same moment still counts.
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
 }
 
 // checkCollectDestinations rejects a gather whose expanded operations would
@@ -605,7 +627,7 @@ func (a *app) follow(ctx context.Context, name string) {
 				return
 			}
 			if !a.printRetained(ctx, name, short) && !a.endedWithoutOutput(ctx, name) {
-				a.progress("%s: output is no longer available (the VM pod is gone)", short)
+				a.progressCtx(ctx, "%s: output is no longer available (the VM pod is gone)", short)
 			}
 		}
 		return
@@ -643,16 +665,16 @@ func (a *app) follow(ctx context.Context, name string) {
 			return
 		}
 		if ending {
-			a.progress("%s: output is no longer available: %v", short, err)
+			a.progressCtx(ctx, "%s: output is no longer available: %v", short, err)
 			return
 		}
-		a.progress("%s: could not follow output: %v", short, err)
+		a.progressCtx(ctx, "%s: could not follow output: %v", short, err)
 		return
 	}
 	defer s.Close()
 	out := &prefixWriter{out: a.env.Out, prefix: short + "|"}
 	errw := &prefixWriter{out: a.env.Err, prefix: short + "|"}
-	_, copyErr := s.Copy(out, errw, func(m string) { a.progress("%s: %s", short, m) })
+	_, copyErr := s.Copy(out, errw, func(m string) { a.progressCtx(ctx, "%s: %s", short, m) })
 	out.flush()
 	errw.flush()
 	if copyErr != nil {
@@ -669,7 +691,7 @@ func (a *app) follow(ctx context.Context, name string) {
 	}
 	if !out.wrote && !errw.wrote && (ending || a.blipEnding(ctx, name)) {
 		if !a.replayFinished(ctx, name, short, pod, retainedOutputWait, false) && !a.endedWithoutOutput(ctx, name) {
-			a.progress("%s: output is no longer available", short)
+			a.progressCtx(ctx, "%s: output is no longer available", short)
 		}
 	}
 }
@@ -693,14 +715,14 @@ var attachFailWait = 3 * time.Second
 // available to print now, so the follower only warns.
 func (a *app) replayTruncatedOutput(ctx context.Context, name, short, pod string, ended bool) {
 	if !ended {
-		a.progress("%s: output stream ended before the command exited; output above may be incomplete", short)
+		a.progressCtx(ctx, "%s: output stream ended before the command exited; output above may be incomplete", short)
 		return
 	}
 	if a.replayFinished(ctx, name, short, pod, truncatedOutputWait, false) {
-		a.progress("%s: output stream ended before the command exited; replayed the retained output (lines above may repeat)", short)
+		a.progressCtx(ctx, "%s: output stream ended before the command exited; replayed the retained output (lines above may repeat)", short)
 		return
 	}
-	a.progress("%s: output stream ended before the command exited; the rest of the output is no longer available", short)
+	a.progressCtx(ctx, "%s: output stream ended before the command exited; the rest of the output is no longer available", short)
 }
 
 // blipEnding reports whether the blip is saving or finished now. A follower
@@ -763,7 +785,7 @@ func (a *app) printRetainedFor(ctx context.Context, name, short string, wait tim
 	if !ok {
 		return false
 	}
-	return a.printCombined(short, out)
+	return a.printCombined(ctx, short, out)
 }
 
 // retainedOutputFor polls status.output until the controller publishes it or
@@ -829,7 +851,7 @@ func (a *app) replayLogs(ctx context.Context, pod, short string) bool {
 	if !ok {
 		return false
 	}
-	return a.printCombined(short, out)
+	return a.printCombined(ctx, short, out)
 }
 
 // statusOutputTruncated is the controller's marker for a status tail whose
@@ -914,25 +936,64 @@ func (a *app) replayFinished(ctx context.Context, name, short, pod string, wait 
 	if out == "" {
 		return false
 	}
-	if !a.printCombined(short, out) {
+	if !a.printCombined(ctx, short, out) {
 		return false
 	}
 	if truncated {
-		a.progress("%s: output is truncated; only the retained tail is available", short)
+		a.progressCtx(ctx, "%s: output is truncated; only the retained tail is available", short)
 	}
 	return true
 }
 
 // printCombined writes stdout+stderr output that cannot be split again to
-// stderr with the blip prefix. It returns whether it wrote anything.
-func (a *app) printCombined(short, out string) bool {
+// stderr with the blip prefix. It returns whether it wrote anything. The whole
+// replay is one write so a stalled consumer can be abandoned at the wait
+// deadline without leaving a partly prefixed block behind.
+func (a *app) printCombined(ctx context.Context, short, out string) bool {
 	if out == "" {
 		return false
 	}
-	w := &prefixWriter{out: a.env.Err, prefix: short + "|"}
+	var b bytes.Buffer
+	w := &prefixWriter{out: &b, prefix: short + "|"}
 	_, _ = w.Write([]byte(out))
 	w.flush()
-	return w.wrote
+	if !w.wrote {
+		return false
+	}
+	return writeCtx(ctx, a.env.Err, b.Bytes())
+}
+
+// writeCtx writes p to w and reports whether the write completed before ctx
+// was done. A local write cannot be cancelled: a consumer that stopped
+// reading keeps the goroutine blocked. The caller abandons that write instead
+// of making --wait unbounded.
+func writeCtx(ctx context.Context, w io.Writer, p []byte) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	done := make(chan struct{})
+	go func() {
+		_, _ = w.Write(p)
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		// A write that completed at the same moment still counts.
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// progressCtx is progress for a follower: a progress line must not keep
+// gather past its wait deadline when the local consumer stalls.
+func (a *app) progressCtx(ctx context.Context, format string, args ...any) {
+	writeCtx(ctx, a.env.Err, []byte(fmt.Sprintf(format+"\n", args...)))
 }
 
 // prefixWriter turns arbitrary output chunks into whole prefixed lines. Each

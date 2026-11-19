@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1340,5 +1342,88 @@ func TestGatherFollowUsesRetainedStatusOutput(t *testing.T) {
 	}
 	if strings.Contains(errOut, "output is no longer available") {
 		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}
+
+// stalledWriter blocks every write until release, like a stderr consumer that
+// stopped reading. It keeps no buffer: a replay abandoned at the wait deadline
+// can finish later without racing with the test's output.
+type stalledWriter struct {
+	release <-chan struct{}
+	started chan struct{}
+	once    sync.Once
+}
+
+func (w *stalledWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.started) })
+	<-w.release
+	return len(p), nil
+}
+
+// A finished Blip is replayed from retained output (pod gone) or from a failed
+// attach. Either write goes to a local stderr that can stop draining; --wait
+// must still bound the whole gather, and the Blip must then be handled by the
+// usual keep/delete rules.
+func TestGatherFollowWaitBoundsStalledRetainedReplay(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pod  string
+		keep bool
+	}{
+		{name: "retained-keep", pod: "", keep: true},
+		{name: "attach-failed-delete", pod: "pod-stall"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := finishedBlip("stall", v1alpha1.BlipSucceeded, 0)
+			b.Status.Pod = tc.pod
+			b.Status.Output = strings.Repeat("retained output\n", 64)
+			h := newHarness(t, b)
+			h.guest.OpenError = "no session"
+
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(unblock)
+			errw := &stalledWriter{release: release, started: make(chan struct{})}
+			var out bytes.Buffer
+			env := h.env(strings.NewReader(""), &out, errw)
+
+			args := []string{"gather", "stall", "-f", "--wait", "1s"}
+			if tc.keep {
+				args = append(args, "--keep")
+			}
+			done := make(chan int, 1)
+			start := time.Now()
+			go func() { done <- Main(context.Background(), env, args) }()
+
+			select {
+			case <-errw.started:
+			case <-time.After(3 * time.Second):
+				unblock()
+				<-done
+				t.Fatal("gather never replayed the retained output")
+			}
+			var code int
+			select {
+			case code = <-done:
+			case <-time.After(5 * time.Second):
+				unblock()
+				<-done
+				t.Fatal("gather -f did not return at the --wait deadline while the output consumer stalled")
+			}
+			if elapsed := time.Since(start); elapsed > 3*time.Second {
+				t.Fatalf("gather -f took %s with --wait 1s", elapsed)
+			}
+			if code != 0 {
+				t.Fatalf("code %d: %s", code, out.String())
+			}
+			if tc.keep {
+				if h.gone("stall") {
+					t.Fatal("blip deleted with --keep")
+				}
+			} else if !h.gone("stall") {
+				t.Fatal("finished blip was not gathered")
+			}
+		})
 	}
 }
