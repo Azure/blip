@@ -67,7 +67,8 @@ type scopeRequest struct {
 	subresource string
 	list        bool
 	// watch marks a legacy /watch/ collection path, whose query does not
-	// carry watch=true. A normal list becomes a watch with ?watch=true.
+	// carry the watch parameter. A normal list becomes a watch with any
+	// query value the API server decodes as true.
 	watch bool
 }
 
@@ -371,10 +372,26 @@ func scopedList(r *http.Request, id identity, resource string) (*http.Request, b
 	}
 }
 
-// isWatch reports whether a scoped collection request is a watch: either the
-// modern ?watch=true form or a legacy /watch/ collection path.
+// isWatch reports whether a scoped collection request is a watch: either a
+// legacy /watch/ collection path or a ?watch query the API server decodes as
+// true. It mirrors runtime.Convert_Slice_string_To_bool, which the API server
+// uses for ListOptions: a present watch parameter is true unless its first
+// value is exactly "0" or case-insensitively "false". Accepting only "true"
+// here would let watch=1, watch=yes, or a bare ?watch skip the scoped watch
+// filters while the API server still streams.
 func isWatch(r *http.Request, req scopeRequest) bool {
-	return req.watch || strings.EqualFold(r.URL.Query().Get("watch"), "true")
+	if req.watch {
+		return true
+	}
+	values := r.URL.Query()["watch"]
+	switch {
+	case len(values) == 0:
+		return false
+	case values[0] == "0", strings.EqualFold(values[0], "false"):
+		return false
+	default:
+		return true
+	}
 }
 
 // threadWatchWriter forwards only blipthreads watch events for the thread

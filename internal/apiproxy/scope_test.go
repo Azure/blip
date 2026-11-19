@@ -962,6 +962,69 @@ func TestOwnerScopeThreadWatchPinsIncarnation(t *testing.T) {
 	}
 }
 
+// A recreated thread's ADDED event must be filtered for every watch spelling
+// the API server accepts, not only watch=true. A persistent ?watch=1 request
+// was previously treated as a list, so the replacement incarnation streamed to
+// the guest of the previous incarnation.
+func TestOwnerScopeThreadWatchFiltersEveryWatchSpelling(t *testing.T) {
+	kube := scopedFixture()
+	oldEvent := `{"type":"ADDED","object":{"metadata":{"name":"alice-proj","uid":"thread-alice"},"spec":{"charter":"OLD_CHARTER"}}}`
+	newEvent := `{"type":"ADDED","object":{"metadata":{"name":"alice-proj","uid":"thread-recreated"},"spec":{"charter":"NEW_INC_SECRET"}}}`
+	bookmark := `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"9"}}}`
+	upstream := tlsUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		// Identity and thread lookups are by name; only the collection request
+		// is a watch stream here.
+		if r.URL.Path != "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads" {
+			kube.ServeHTTP(w, r)
+			return
+		}
+		kube.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		flush := w.(http.Flusher)
+		for _, event := range []string{oldEvent, newEvent, bookmark} {
+			_, _ = io.WriteString(w, event+"\n")
+			flush.Flush()
+		}
+		<-r.Context().Done()
+	})
+	cfg := testConfig(t, upstream)
+	cfg.PodName, cfg.PodNamespace = "proj-vm", scopeNamespace
+	p := startProxy(t, cfg)
+
+	for _, query := range []string{"watch=1", "watch=true"} {
+		t.Run(query, func(t *testing.T) {
+			resp, err := p.client.Get("http://kube-apiserver/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads?" + query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			reader := bufio.NewReader(resp.Body)
+			var got []string
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					t.Fatalf("read watch: %v (got %q)", err, strings.Join(got, ""))
+				}
+				got = append(got, line)
+				if strings.Contains(line, "BOOKMARK") {
+					break
+				}
+			}
+			stream := strings.Join(got, "")
+			// The pinned incarnation is allowed through for both spellings.
+			if !strings.Contains(stream, `"uid":"thread-alice"`) || !strings.Contains(stream, "OLD_CHARTER") {
+				t.Fatalf("guest did not receive the pinned incarnation: %q", got)
+			}
+			if strings.Contains(stream, "thread-recreated") || strings.Contains(stream, "NEW_INC_SECRET") {
+				t.Fatalf("recreated thread leaked with %s: %q", query, got)
+			}
+			if len(got) != 2 {
+				t.Fatalf("guest events = %q, want the old incarnation and the bookmark", got)
+			}
+		})
+	}
+}
+
 func TestThreadWatchWriterBuffersPartialLines(t *testing.T) {
 	line := `{"type":"ADDED","object":{"metadata":{"uid":"thread-alice"}}}`
 	recreated := `{"type":"ADDED","object":{"metadata":{"uid":"thread-recreated"}}}`
@@ -979,6 +1042,48 @@ func TestThreadWatchWriterBuffersPartialLines(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != line+"\n" {
 		t.Fatalf("filtered stream = %q, want %q", got, line+"\n")
+	}
+}
+
+// The API server decodes ?watch like runtime.Convert_Slice_string_To_bool: a
+// present parameter is true unless its first value is "0" or "false"
+// (case-insensitive). The scope check must select the watch filters for every
+// spelling the API server treats as a watch.
+func TestIsWatchMatchesAPIServerDecoding(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		watch bool // legacy /watch/ path marker
+		want  bool
+	}{
+		{name: "absent", query: "", want: false},
+		{name: "empty", query: "watch=", want: true},
+		{name: "bare", query: "watch", want: true},
+		{name: "one", query: "watch=1", want: true},
+		{name: "zero", query: "watch=0", want: false},
+		{name: "true", query: "watch=true", want: true},
+		{name: "TRUE", query: "watch=TRUE", want: true},
+		{name: "false", query: "watch=false", want: false},
+		{name: "False", query: "watch=False", want: false},
+		{name: "FALSE", query: "watch=FALSE", want: false},
+		{name: "yes", query: "watch=yes", want: true},
+		{name: "no", query: "watch=no", want: true},
+		{name: "trailing space", query: "watch=true%20", want: true},
+		{name: "leading zero", query: "watch=00", want: true},
+		{name: "first value wins", query: "watch=1&watch=0", want: true},
+		{name: "first value is false", query: "watch=0&watch=1", want: false},
+		{name: "other parameters", query: "watch=1&resourceVersion=7", want: true},
+		{name: "legacy path ignores query", query: "watch=0", watch: true, want: true},
+		{name: "legacy path absent", query: "", watch: true, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthreads", nil)
+			r.URL.RawQuery = tt.query
+			if got := isWatch(r, scopeRequest{watch: tt.watch}); got != tt.want {
+				t.Errorf("isWatch(query %q, legacy %v) = %v, want %v", tt.query, tt.watch, got, tt.want)
+			}
+		})
 	}
 }
 
