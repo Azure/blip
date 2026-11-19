@@ -2271,6 +2271,7 @@ func TestMountPointRejectedClassifiesTerminalGuestErrors(t *testing.T) {
 		"mount path /home/dev/blip-link/x resolves to /run/blip/x, which the guest reserves",
 		"mount path /bad overlaps /run/blip",
 		"mount path /bad resolves to /",
+		"mkdir /usr/share/doc/gcc-13-base/probe: read-only file system",
 	} {
 		if !mountPointRejected(msg) {
 			t.Errorf("terminal guest error not classified as rejected: %q", msg)
@@ -2280,6 +2281,7 @@ func TestMountPointRejectedClassifiesTerminalGuestErrors(t *testing.T) {
 		"save failed: no space left on device",
 		"save of state data failed: device or resource busy",
 		"switch failed: timed out",
+		"save failed: read-only file system",
 		"attach failed: no space left on device",
 		"processes are still using /data",
 	} {
@@ -2299,6 +2301,7 @@ func TestMountTerminalGuestRejectionsRollBack(t *testing.T) {
 		{"guest reserves", "mount path /home/dev/blip-link/x resolves to /run/blip/x, which the guest reserves"},
 		{"overlap", "mount path /bad overlaps /run/blip"},
 		{"mount path", "mount path /bad resolves to /"},
+		{"read-only file system", "mkdir /usr/share/doc/gcc-13-base/w8-06-probe: read-only file system"},
 	} {
 		t.Run(tc.name+"/add", func(t *testing.T) {
 			b := runningBlip("agent")
@@ -2514,6 +2517,7 @@ func TestMountRemoveThenRejectedAddRestoresMount(t *testing.T) {
 		{"guest reserves", "mount path /home/dev/blip-link/x resolves to /run/blip/x, which the guest reserves"},
 		{"overlap", "mount path /bad overlaps /run/blip"},
 		{"mount path", "mount path /bad resolves to /"},
+		{"read-only file system", "mkdir /usr/share/doc/gcc-13-base/w8-06-probe: read-only file system"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := runningBlip("agent")

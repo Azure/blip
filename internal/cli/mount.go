@@ -579,7 +579,7 @@ func mountPointRejected(msg string) bool {
 	}
 	for _, permanent := range []string{
 		"is a symlink", "not a directory", "guest reserves", "overlaps",
-		"mount path",
+		"mount path", "read-only file system",
 	} {
 		if strings.Contains(msg, permanent) {
 			return true
