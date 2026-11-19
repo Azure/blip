@@ -20,10 +20,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -105,8 +107,10 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return []reconcile.Request{req(o.GetNamespace(), poolName(o.(*v1.Blip)))}
 		})).
 		Watches(&v1.BlipState{}, handler.EnqueueRequestsFromMapFunc(r.namespacePools)).
-		// Thread creation and deletion changes the turn-owner table.
-		Watches(&v1.BlipThread{}, handler.EnqueueRequestsFromMapFunc(r.namespacePools)).
+		// Thread creation and deletion changes the turn-owner table. Status
+		// updates from blipchat do not, so ignore them.
+		Watches(&v1.BlipThread{}, handler.EnqueueRequestsFromMapFunc(r.namespacePools),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// A stale heartbeat is a status-only change, and an agent that dies
 		// sends no event at all; reconcile also requeues itself while a node
 		// it uses is still healthy (see nextCrossing).
