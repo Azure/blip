@@ -16,10 +16,13 @@ spec:
         resources: [blipturns]
         operations: [CREATE]
   variables:
+    # Compare the whole username, not just the service account name: any
+    # namespace may contain a ServiceAccount called blipchat. Only the
+    # blipchat deployed in blip-system may author a turn as someone else.
     - name: blipchat
       expression: >-
-        request.userInfo.username.startsWith('system:serviceaccount:') &&
-        request.userInfo.username.split(':')[3] == 'blipchat'
+        request.userInfo.username ==
+        'system:serviceaccount:blip-system:blipchat'
   validations:
     - expression: >-
         variables.blipchat ||

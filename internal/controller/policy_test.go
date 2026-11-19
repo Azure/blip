@@ -103,6 +103,76 @@ func loadVMOwnerPolicy(t *testing.T) validating.Validator {
 	)
 }
 
+// loadTurnPolicy compiles deploy/base/turn-policy.yaml the way the API
+// server's validating admission policy plugin does.
+func loadTurnPolicy(t *testing.T) validating.Validator {
+	t.Helper()
+	raw, err := os.ReadFile("../../deploy/base/turn-policy.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policy *admissionv1.ValidatingAdmissionPolicy
+	var bindings []*admissionv1.ValidatingAdmissionPolicyBinding
+	r := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(raw)))
+	for {
+		doc, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case bytes.Contains(doc, []byte("kind: ValidatingAdmissionPolicyBinding")):
+			b := &admissionv1.ValidatingAdmissionPolicyBinding{}
+			if err = yaml.UnmarshalStrict(doc, b); err == nil {
+				bindings = append(bindings, b)
+			}
+		case bytes.Contains(doc, []byte("kind: ValidatingAdmissionPolicy")):
+			policy = &admissionv1.ValidatingAdmissionPolicy{}
+			err = yaml.UnmarshalStrict(doc, policy)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if policy == nil || policy.Name != "blip-turn-author" || len(bindings) != 1 ||
+		bindings[0].Spec.PolicyName != policy.Name ||
+		len(bindings[0].Spec.ValidationActions) != 1 ||
+		bindings[0].Spec.ValidationActions[0] != admissionv1.Deny {
+		t.Fatalf("policy %v bindings %v", policy, bindings)
+	}
+
+	env, err := plugincel.NewCompositionEnv(plugincel.VariablesTypeName, environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion(), true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiler := plugincel.NewCompositedCompilerFromTemplate(env)
+	opts := plugincel.OptionalVariableDeclarations{StrictCost: true}
+	var vars []plugincel.NamedExpressionAccessor
+	for _, v := range policy.Spec.Variables {
+		vars = append(vars, &validating.Variable{Name: v.Name, Expression: v.Expression})
+	}
+	compiler.CompileAndStoreVariables(vars, opts, environment.StoredExpressions)
+	var match, checks, messages []plugincel.ExpressionAccessor
+	for i := range policy.Spec.MatchConditions {
+		match = append(match, (*matchconditions.MatchCondition)(&policy.Spec.MatchConditions[i]))
+	}
+	for _, v := range policy.Spec.Validations {
+		checks = append(checks, &validating.ValidationCondition{Expression: v.Expression, Message: v.Message, Reason: v.Reason})
+		messages = append(messages, &validating.MessageExpressionCondition{MessageExpression: v.MessageExpression})
+	}
+	msgOpts := opts
+	msgOpts.HasAuthorizer = false
+	return validating.NewValidator(
+		compiler.CompileCondition(checks, opts, environment.StoredExpressions),
+		matchconditions.NewMatcher(compiler.CompileCondition(match, opts, environment.StoredExpressions), policy.Spec.FailurePolicy, "policy", "validate", policy.Name),
+		compiler.CompileCondition(nil, opts, environment.StoredExpressions),
+		compiler.CompileCondition(messages, msgOpts, environment.StoredExpressions),
+		policy.Spec.FailurePolicy,
+	)
+}
+
 type policyRequest struct {
 	user      user.Info
 	op        admission.Operation
@@ -162,6 +232,9 @@ func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map
 	}
 	if p.resource == "blipstates" {
 		gvk.Kind = "BlipState"
+	}
+	if p.resource == "blipturns" {
+		gvk.Kind = "BlipTurn"
 	}
 	var obj, old runtime.Object
 	if p.object != nil {
@@ -367,6 +440,52 @@ func TestVMOwnerPolicyOwnerReferences(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			allow, msg := tc.req.evaluate(t, v, params)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+}
+
+func turnObj(authorKind, authorName string) map[string]any {
+	return map[string]any{
+		"apiVersion": "blip.dev/v1alpha1",
+		"kind":       "BlipTurn",
+		"metadata":   map[string]any{"name": "turn", "namespace": ns},
+		"spec": map[string]any{
+			"thread": "project",
+			"author": map[string]any{"kind": authorKind, "name": authorName},
+		},
+	}
+}
+
+func TestTurnAuthorPolicy(t *testing.T) {
+	v := loadTurnPolicy(t)
+	const blipchat = "system:serviceaccount:blip-system:blipchat"
+	other := func(sa string) user.Info {
+		return &user.DefaultInfo{Name: "system:serviceaccount:hunt-p6-chat:" + sa}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		obj   map[string]any
+		allow bool
+		msg   string
+	}{
+		{"blipchat authors a user turn", &user.DefaultInfo{Name: blipchat}, turnObj("User", "ceo@example.com"), true, ""},
+		{"blipchat authors a system turn", &user.DefaultInfo{Name: blipchat}, turnObj("System", "blipchat"), true, ""},
+		{"foreign blipchat cannot impersonate a user", other("blipchat"), turnObj("User", "ceo@example.com"), false, "must set author.kind=ServiceAccount"},
+		{"foreign blipchat cannot impersonate a service account", other("blipchat"), turnObj("ServiceAccount", "system:serviceaccount:blip-system:blipchat"), false, "must set author.kind=ServiceAccount"},
+		{"lookalike blipchat cannot impersonate a user", &user.DefaultInfo{Name: blipchat + "2"}, turnObj("User", "ceo@example.com"), false, "must set author.kind=ServiceAccount"},
+		{"other service account names itself", other("ci"), turnObj("ServiceAccount", "system:serviceaccount:hunt-p6-chat:ci"), true, ""},
+		{"other service account cannot impersonate a user", other("ci"), turnObj("User", "ceo@example.com"), false, "must set author.kind=ServiceAccount"},
+		{"other service account cannot impersonate another account", other("ci"), turnObj("ServiceAccount", blipchat), false, "must set author.kind=ServiceAccount"},
+		{"plain user cannot author a turn", &user.DefaultInfo{Name: "alice"}, turnObj("User", "alice"), false, "must set author.kind=ServiceAccount"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{user: tc.user, op: admission.Create, resource: "blipturns", name: "turn", object: tc.obj}
+			allow, msg := req.evaluate(t, v, nil)
 			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
 				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
 			}

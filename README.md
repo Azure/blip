@@ -133,7 +133,8 @@ Pod as node-local, replicated, encrypted block storage.
   finished blip, or a coordinator step. Turns are immutable, carry a bounded
   text and free-form attributes, and blipchat stamps `status.seq` to put all
   turns in one order. In-cluster producers create turns; the API server
-  validates that a non-blipchat producer names its own service account.
+  validates that only the `blip-system/blipchat` service account may author a
+  turn as someone else, and every other producer names its own service account.
 
 Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 `BlipState` status; each node agent server-side-applies only its own
