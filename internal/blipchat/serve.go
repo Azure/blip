@@ -250,7 +250,7 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 	// not process this input, so it must stay pending.
 	started := timeNow()
 	tokensToday := thread.Status.TokensToday
-	if thread.Status.TokenDay != started.Format("2006-01-02") {
+	if thread.Status.TokenDay != started.UTC().Format("2006-01-02") {
 		tokensToday = 0
 	}
 	if thread.Spec.DailyTokens > 0 && tokensToday >= thread.Spec.DailyTokens {
@@ -338,7 +338,7 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 		}
 	}
 	tokens := st.usage
-	today := started.Format("2006-01-02")
+	today := started.UTC().Format("2006-01-02")
 	next := nextWake(st, started)
 	for attempt := 0; attempt < 5; attempt++ {
 		current := &v1.BlipThread{}
@@ -514,7 +514,8 @@ func openState(open bool) string {
 
 // maybeUnpause lets a thread run again on a new day after its budget paused it.
 func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
-	if thread.Status.Paused == nil || thread.Status.Paused.Reason != budgetPauseReason || thread.Status.TokenDay == timeNow().Format("2006-01-02") {
+	today := timeNow().UTC().Format("2006-01-02")
+	if thread.Status.Paused == nil || thread.Status.Paused.Reason != budgetPauseReason || thread.Status.TokenDay == today {
 		return
 	}
 	current := &v1.BlipThread{}
@@ -523,7 +524,7 @@ func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
 	}
 	current.Status.Paused = nil
 	current.Status.TokensToday = 0
-	current.Status.TokenDay = timeNow().Format("2006-01-02")
+	current.Status.TokenDay = today
 	if err := s.Status().Update(ctx, current); err != nil {
 		return
 	}

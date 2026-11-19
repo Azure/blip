@@ -171,6 +171,87 @@ func TestMidStepBudgetExhaustionRunsPaidToolCalls(t *testing.T) {
 	}
 }
 
+// The daily budget day boundary is UTC, not the process local zone. Commit
+// must also stamp tokenDay with the UTC date.
+func TestDailyBudgetDayBoundaryUsesUTC(t *testing.T) {
+	orig := timeNow
+	defer func() { timeNow = orig }()
+	zone := time.FixedZone("UTC+11", 11*60*60)
+
+	t.Run("pause survives until UTC midnight", func(t *testing.T) {
+		timeNow = func() time.Time { return time.Date(2026, 11, 19, 23, 30, 0, 0, time.UTC).In(zone) }
+		thread := testThread()
+		thread.Status.Paused = &v1.ThreadPause{Reason: budgetPauseReason}
+		thread.Status.TokenDay = "2026-11-19"
+		thread.Status.TokensToday = 100
+		c := testClient(t, thread)
+		s := &Server{Client: c}
+		s.maybeUnpause(context.Background(), thread)
+		var updated v1.BlipThread
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(thread), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.Paused == nil {
+			t.Error("maybeUnpause cleared the budget pause before the UTC day ended")
+		}
+		if updated.Status.TokenDay != "2026-11-19" || updated.Status.TokensToday != 100 {
+			t.Errorf("status after pre-UTC-midnight unpause check = day %q tokens %d, want unchanged", updated.Status.TokenDay, updated.Status.TokensToday)
+		}
+	})
+
+	t.Run("pause clears after UTC midnight", func(t *testing.T) {
+		timeNow = func() time.Time { return time.Date(2026, 11, 20, 0, 30, 0, 0, time.UTC).In(zone) }
+		thread := testThread()
+		thread.Status.Paused = &v1.ThreadPause{Reason: budgetPauseReason}
+		thread.Status.TokenDay = "2026-11-19"
+		thread.Status.TokensToday = 100
+		c := testClient(t, thread)
+		s := &Server{Client: c}
+		s.maybeUnpause(context.Background(), thread)
+		var updated v1.BlipThread
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(thread), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.Paused != nil {
+			t.Errorf("maybeUnpause kept the pause after UTC midnight: %+v", updated.Status.Paused)
+		}
+		if updated.Status.TokenDay != "2026-11-20" || updated.Status.TokensToday != 0 {
+			t.Errorf("status after UTC reset = day %q tokens %d, want 2026-11-20/0", updated.Status.TokenDay, updated.Status.TokensToday)
+		}
+	})
+
+	t.Run("commit stamps the UTC date", func(t *testing.T) {
+		timeNow = func() time.Time { return time.Date(2026, 11, 19, 23, 30, 0, 0, time.UTC).In(zone) }
+		thread := testThread()
+		thread.Spec.DailyTokens = 1000
+		thread.Status.TokenDay = "2026-11-18"
+		thread.Status.TokensToday = 50
+		turn := testTurn("one", "proj")
+		turn.Status.Seq = 1
+		turn.Status.AcceptedTime = &metav1.Time{Time: timeNow().Add(-time.Minute)}
+		c := testClient(t, thread, turn)
+		server := llmServer(t, Message{Role: "assistant", Content: "ok"})
+		s := &Server{
+			Client: c,
+			Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+			LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+		}
+		if err := s.step(context.Background(), thread); err != nil {
+			t.Fatal(err)
+		}
+		var updated v1.BlipThread
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(thread), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.TokenDay != "2026-11-19" {
+			t.Errorf("tokenDay = %q, want the UTC date 2026-11-19 (local is 2026-11-20)", updated.Status.TokenDay)
+		}
+		if updated.Status.TokensToday != 15 {
+			t.Errorf("tokensToday = %d, want 15 from this step", updated.Status.TokensToday)
+		}
+	})
+}
+
 // requestPrompt returns the user message content from a recorded request.
 func requestPrompt(t *testing.T, request map[string]any) string {
 	t.Helper()
