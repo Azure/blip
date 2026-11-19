@@ -190,6 +190,23 @@ func TestFindSelfReportsForbidden(t *testing.T) {
 	}
 }
 
+// A source path containing a colon must not be silently split at the first
+// one, which would copy the wrong file to the wrong destination.
+func TestParseCollectOpRejectsAmbiguousSource(t *testing.T) {
+	const cwd = "/home/dev"
+	op, err := parseCollectOp("/home/dev/a:b:./colon-out", cwd)
+	if err == nil {
+		t.Fatalf("ambiguous source accepted as %+v", op)
+	}
+	if !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "':'") {
+		t.Fatalf("error %q does not explain the ambiguous colon", err)
+	}
+	// A colon only in the destination is equally ambiguous.
+	if _, err := parseCollectOp("/home/dev/a:./out:b", cwd); err == nil {
+		t.Fatal("colon in destination accepted")
+	}
+}
+
 func TestParseCollectOpsAndState(t *testing.T) {
 	const cwd = "/home/dev/src"
 	for _, tc := range []struct {
