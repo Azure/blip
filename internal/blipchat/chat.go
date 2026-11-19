@@ -232,6 +232,10 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	if err := c.s.Get(ctx, client.ObjectKey{Namespace: c.thread.Namespace, Name: name}, &b); err != nil {
 		return "", err
 	}
+	owner := Owner(&ThreadKey{Namespace: c.thread.Namespace, Name: c.thread.Name})
+	if b.Labels[v1.LabelThread] != c.thread.Name || b.Labels[v1.LabelOwner] != owner {
+		return "", fmt.Errorf("blip %q does not belong to thread %q", name, c.thread.Name)
+	}
 	if v1.Finished(&b) || b.Status.Pod == "" {
 		summary := ""
 		if r := b.Status.Report; r != nil {
@@ -248,23 +252,102 @@ func (c *chatStep) inspect(ctx context.Context, name string, argv []string) (str
 	return c.s.execIn(ctx, c.thread.Namespace, name, argv, 60)
 }
 
+// readOnly reports whether argv is safe to run as an inspection command. It
+// checks the whole argument vector: several otherwise read-only tools can
+// execute commands or write files through options, so looking only at argv[0]
+// is not enough.
 func readOnly(argv []string) error {
 	if len(argv) == 0 {
 		return fmt.Errorf("empty command")
 	}
 	switch argv[0] {
-	case "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd":
+	case "ls", "cat", "head", "tail", "wc", "grep", "pwd":
+		return nil
+	case "rg":
+		for _, arg := range argv[1:] {
+			if isRipgrepEscape(arg) {
+				return fmt.Errorf("rg option %q can execute commands", arg)
+			}
+		}
+		return nil
+	case "find":
+		for _, arg := range argv[1:] {
+			if isFindEscape(arg) {
+				return fmt.Errorf("find option %q can execute commands or write files", arg)
+			}
+		}
 		return nil
 	case "git":
-		if len(argv) < 2 {
-			return nil
-		}
-		switch argv[1] {
-		case "status", "log", "diff", "show", "branch", "rev-parse":
-			return nil
-		}
+		return readOnlyGit(argv[1:])
 	}
 	return fmt.Errorf("only read-only commands are allowed here")
+}
+
+func isRipgrepEscape(arg string) bool {
+	return arg == "--pre" || strings.HasPrefix(arg, "--pre=") ||
+		arg == "--pre-glob" || strings.HasPrefix(arg, "--pre-glob=")
+}
+
+func isFindEscape(arg string) bool {
+	switch arg {
+	case "-exec", "-execdir", "-delete", "-ok", "-okdir",
+		"-fprint", "-fprint0", "-fprintf", "-fls":
+		return true
+	}
+	return false
+}
+
+func readOnlyGit(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("git needs a subcommand")
+	}
+	switch args[0] {
+	case "status", "log", "diff", "show", "rev-parse":
+		for _, arg := range args[1:] {
+			if isGitEscape(arg) {
+				return fmt.Errorf("git option %q can execute commands or write files", arg)
+			}
+		}
+		return nil
+	case "branch":
+		for _, arg := range args[1:] {
+			if isGitEscape(arg) {
+				return fmt.Errorf("git option %q can execute commands or write files", arg)
+			}
+			if !strings.HasPrefix(arg, "-") {
+				return fmt.Errorf("git branch may only list branches")
+			}
+			if !isReadOnlyBranchOption(arg) {
+				return fmt.Errorf("git branch option %q is not read-only", arg)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("only read-only git subcommands are allowed here")
+}
+
+func isGitEscape(arg string) bool {
+	return arg == "--output" || strings.HasPrefix(arg, "--output=") ||
+		arg == "-O" || strings.HasPrefix(arg, "-O") ||
+		arg == "--ext-diff" || strings.HasPrefix(arg, "--ext-diff=") ||
+		arg == "--textconv" || strings.HasPrefix(arg, "--textconv=") ||
+		arg == "--open-files-in-pager" || strings.HasPrefix(arg, "--open-files-in-pager=")
+}
+
+func isReadOnlyBranchOption(arg string) bool {
+	name := arg
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+	}
+	switch name {
+	case "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose",
+		"-l", "--list", "--show-current", "-i", "--ignore-case",
+		"--merged", "--no-merged", "--contains", "--no-contains",
+		"--points-at", "--format", "--sort", "--column", "--no-column",
+		"--color", "--no-color", "--abbrev", "--no-abbrev", "--omit-empty":
+		return true
+	}
+	return false
 }
 
 func shortUser(user string) string {

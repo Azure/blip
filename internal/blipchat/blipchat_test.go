@@ -375,15 +375,114 @@ func TestReportFields(t *testing.T) {
 }
 
 func TestReadOnlyInspect(t *testing.T) {
-	for _, ok := range [][]string{{"git", "status"}, {"ls", "-la"}, {"cat", "README.md"}} {
-		if err := readOnly(ok); err != nil {
-			t.Errorf("%v rejected: %v", ok, err)
-		}
+	tests := []struct {
+		name string
+		argv []string
+		ok   bool
+	}{
+		// Benign inspection.
+		{name: "git status", argv: []string{"git", "status"}, ok: true},
+		{name: "git log", argv: []string{"git", "log", "--oneline", "-n", "5"}, ok: true},
+		{name: "git diff", argv: []string{"git", "diff", "--stat"}, ok: true},
+		{name: "git show", argv: []string{"git", "show", "HEAD:README.md"}, ok: true},
+		{name: "git rev-parse", argv: []string{"git", "rev-parse", "HEAD"}, ok: true},
+		{name: "git branch list", argv: []string{"git", "branch"}, ok: true},
+		{name: "git branch all", argv: []string{"git", "branch", "-a"}, ok: true},
+		{name: "git branch merged", argv: []string{"git", "branch", "--merged=main"}, ok: true},
+		{name: "ls", argv: []string{"ls", "-la"}, ok: true},
+		{name: "cat", argv: []string{"cat", "README.md"}, ok: true},
+		{name: "head", argv: []string{"head", "-n", "20", "README.md"}, ok: true},
+		{name: "tail", argv: []string{"tail", "-n", "20", "README.md"}, ok: true},
+		{name: "wc", argv: []string{"wc", "-l", "README.md"}, ok: true},
+		{name: "grep", argv: []string{"grep", "-n", "func", "main.go"}, ok: true},
+		{name: "rg", argv: []string{"rg", "-n", "--glob", "*.go", "func"}, ok: true},
+		{name: "rg pretty", argv: []string{"rg", "--pretty", "func"}, ok: true},
+		{name: "find", argv: []string{"find", ".", "-name", "*.go", "-type", "f"}, ok: true},
+		{name: "find printable", argv: []string{"find", ".", "-maxdepth", "2", "-print"}, ok: true},
+		{name: "pwd", argv: []string{"pwd"}, ok: true},
+
+		// Options that execute commands or write files.
+		{name: "find exec", argv: []string{"find", "/", "-exec", "sh", "-c", "id", ";"}},
+		{name: "find execdir", argv: []string{"find", ".", "-execdir", "rm", "{}", ";"}},
+		{name: "find delete", argv: []string{"find", "/tmp", "-delete"}},
+		{name: "find ok", argv: []string{"find", ".", "-ok", "rm", "{}", ";"}},
+		{name: "find okdir", argv: []string{"find", ".", "-okdir", "rm", "{}", ";"}},
+		{name: "find fprint", argv: []string{"find", ".", "-fprint", "/tmp/pwn"}},
+		{name: "find fprintf", argv: []string{"find", ".", "-fprintf", "/tmp/pwn", "%p"}},
+		{name: "find fls", argv: []string{"find", ".", "-fls", "/tmp/pwn"}},
+		{name: "rg pre", argv: []string{"rg", "--pre", "id", "x", "."}},
+		{name: "rg pre equals", argv: []string{"rg", "--pre=id", "x", "."}},
+		{name: "rg pre glob", argv: []string{"rg", "--pre-glob", "*.pdf", "--pre", "id", "x", "."}},
+		{name: "git output", argv: []string{"git", "log", "--output=/tmp/pwn"}},
+		{name: "git output separate", argv: []string{"git", "log", "--output", "/tmp/pwn"}},
+		{name: "git order file", argv: []string{"git", "log", "-O", "/tmp/pwn"}},
+		{name: "git ext diff", argv: []string{"git", "diff", "--ext-diff"}},
+		{name: "git textconv", argv: []string{"git", "show", "--textconv", "HEAD"}},
+		{name: "git branch delete", argv: []string{"git", "branch", "-D", "main"}},
+		{name: "git branch create", argv: []string{"git", "branch", "newbranch"}},
+		{name: "git push", argv: []string{"git", "push"}},
+		{name: "rm", argv: []string{"rm", "-rf", "/"}},
+		{name: "sh", argv: []string{"sh", "-c", "echo"}},
+		{name: "empty", argv: nil},
 	}
-	for _, bad := range [][]string{{"rm", "-rf", "/"}, {"git", "push"}, {"sh", "-c", "echo"}} {
-		if err := readOnly(bad); err == nil {
-			t.Errorf("%v accepted", bad)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := readOnly(tt.argv)
+			if tt.ok && err != nil {
+				t.Errorf("%v rejected: %v", tt.argv, err)
+			}
+			if !tt.ok && err == nil {
+				t.Errorf("%v accepted", tt.argv)
+			}
+		})
+	}
+}
+
+func TestInspectRequiresThreadOwnedBlip(t *testing.T) {
+	owner := Owner(&ThreadKey{Namespace: "ns", Name: "proj"})
+	tests := []struct {
+		name   string
+		labels map[string]string
+	}{
+		{name: "other thread", labels: map[string]string{v1.LabelThread: "other", v1.LabelOwner: owner}},
+		{name: "other owner", labels: map[string]string{v1.LabelThread: "proj", v1.LabelOwner: "p-other"}},
+		{name: "no labels", labels: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &v1.Blip{
+				ObjectMeta: metav1.ObjectMeta{Name: "blip-a", Namespace: "ns", Labels: tt.labels},
+				Status:     v1.BlipStatus{Phase: v1.BlipSucceeded},
+			}
+			c := testClient(t, testThread(), b)
+			chat := &chatStep{s: &Server{Client: c}, thread: testThread()}
+			if _, err := chat.inspect(context.Background(), "blip-a", nil); err == nil {
+				t.Fatal("inspect accepted a blip outside the thread")
+			}
+		})
+	}
+}
+
+func TestInspectAcceptsThreadOwnedBlip(t *testing.T) {
+	owner := Owner(&ThreadKey{Namespace: "ns", Name: "proj"})
+	b := &v1.Blip{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "blip-a", Namespace: "ns",
+			Labels: map[string]string{v1.LabelThread: "proj", v1.LabelOwner: owner},
+		},
+		Status: v1.BlipStatus{
+			Phase:  v1.BlipSucceeded,
+			Report: &v1.BlipReport{Text: `{"summary":"done"}`},
+		},
+	}
+	c := testClient(t, testThread(), b)
+	chat := &chatStep{s: &Server{Client: c}, thread: testThread()}
+	got, err := chat.inspect(context.Background(), "blip-a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "done") {
+		t.Errorf("inspect result = %q", got)
 	}
 }
 
