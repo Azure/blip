@@ -202,6 +202,29 @@ func checkDestParents(dst string) error {
 
 const collectTempPattern = ".blip-tmp-*"
 
+// removeTree deletes a staging tree even when it contains directories copied
+// with read-only modes, which would otherwise stop RemoveAll from descending.
+// It only ever runs on trees this process created or moved aside.
+func removeTree(path string) error {
+	makeTreeWritable(path)
+	return os.RemoveAll(path)
+}
+
+func makeTreeWritable(path string) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	_ = os.Chmod(path, info.Mode().Perm()|0o700)
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		makeTreeWritable(filepath.Join(path, e.Name()))
+	}
+}
+
 // copyTree builds the tree in a temporary directory and only then moves it
 // into place. A failed or interrupted copy therefore leaves an existing
 // destination as it was; a new destination appears only when it is complete.
@@ -236,7 +259,7 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 	keep := false
 	defer func() {
 		if !keep {
-			os.RemoveAll(staging)
+			removeTree(staging)
 		}
 	}()
 	if err := copyTreeInto(ctx, src, staging, info); err != nil {
@@ -329,10 +352,58 @@ func checkMergeTypes(src, dst string) error {
 	return nil
 }
 
-// mergeTree moves a complete staged tree into an existing destination. Files
-// and symlinks are renamed into place atomically; only directory metadata of
-// directories the caller already had is left untouched.
+// mergeTree merges a complete staged tree into an existing destination without
+// touching the destination until the merge is complete: it snapshots the
+// existing tree into a sibling staging directory, overlays the staged entries
+// there, and swaps the result into place. A failed merge therefore leaves the
+// destination as it was. Directory metadata of directories the caller already
+// had is preserved by the snapshot.
 func mergeTree(ctx context.Context, staged, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dst)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("cannot merge into %s: not a directory", dst)
+	}
+	parent := filepath.Dir(dst)
+	merged, err := os.MkdirTemp(parent, collectTempPattern)
+	if err != nil {
+		return err
+	}
+	defer removeTree(merged)
+	if err := copyTreeInto(ctx, dst, merged, info); err != nil {
+		return err
+	}
+	if err := overlayTree(ctx, staged, merged); err != nil {
+		return err
+	}
+	// Keep the old tree under a temporary name until the new one is in place,
+	// and restore it if the swap fails.
+	backup, err := os.MkdirTemp(parent, collectTempPattern)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	if err := os.Rename(dst, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(merged, dst); err != nil {
+		_ = os.Rename(backup, dst)
+		return err
+	}
+	return removeTree(backup)
+}
+
+// overlayTree moves a complete staged tree into a staging copy of the
+// destination. A directory present in both is merged; any other existing
+// entry at the same name is replaced.
+func overlayTree(ctx context.Context, staged, dst string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -355,10 +426,15 @@ func mergeTree(ctx context.Context, staged, dst string) error {
 			return err
 		}
 		if si.IsDir() && err == nil && di.IsDir() {
-			if err := mergeTree(ctx, s, d); err != nil {
+			if err := overlayTree(ctx, s, d); err != nil {
 				return err
 			}
 			continue
+		}
+		if err == nil {
+			if err := removeTree(d); err != nil {
+				return err
+			}
 		}
 		if err := os.Rename(s, d); err != nil {
 			return err

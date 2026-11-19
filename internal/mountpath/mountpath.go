@@ -12,6 +12,14 @@ import (
 // must not be at, below, or above one of them.
 var Reserved = []string{"/proc", "/sys", "/dev", "/run/blip"}
 
+const (
+	// NameMax is the maximum length in bytes of one Linux path component.
+	NameMax = 255
+	// PathMax is Linux PATH_MAX (4096 bytes) including the terminating NUL,
+	// so the longest usable path string is PathMax-1 bytes.
+	PathMax = 4096
+)
+
 // ImageSymlinks are directories that are symlinks in the standard usr-merged
 // base images (Debian and Ubuntu) and in the development image. The guest
 // creates mount points without following symlinks, so a mount at or below one
@@ -32,9 +40,27 @@ func Overlap(a, b string) bool {
 	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
 
+// ValidateLength reports why p is too long for a Linux filesystem. Every
+// component must fit NAME_MAX and the whole path must leave room for the
+// terminating NUL within PATH_MAX, or no guest can create the mount point.
+func ValidateLength(p string) error {
+	if len(p) >= PathMax {
+		return fmt.Errorf("mount path is %d bytes, exceeding the Linux PATH_MAX limit of %d bytes", len(p), PathMax-1)
+	}
+	for _, c := range strings.Split(p, "/") {
+		if len(c) > NameMax {
+			return fmt.Errorf("mount path has a %d-byte component, exceeding the Linux NAME_MAX limit of %d bytes", len(c), NameMax)
+		}
+	}
+	return nil
+}
+
 // Validate reports why p cannot be a guest mount point, ignoring the guest's
 // dynamic check for symlinks that are specific to a custom image.
 func Validate(p string) error {
+	if err := ValidateLength(p); err != nil {
+		return err
+	}
 	for _, r := range Reserved {
 		if Overlap(p, r) {
 			return fmt.Errorf("mount path %s overlaps %s, which the guest reserves", p, r)

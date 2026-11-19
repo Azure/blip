@@ -42,17 +42,27 @@ type BlipPoolSpec struct {
 	// +kubebuilder:default=kvm
 	Hypervisor string `json:"hypervisor,omitempty"`
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2147483647
 	// +kubebuilder:default=2
 	CPUs int32 `json:"cpus,omitempty"`
+	// Memory is the guest RAM. It must be positive: the controller adds the
+	// VMM overhead, so a negative value would make the pod request negative
+	// memory and the pool would never create a VM.
 	// +kubebuilder:default="2Gi"
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="memory must be greater than 0"
 	Memory resource.Quantity `json:"memory,omitempty"`
 	// WarmCount is the number of vacant, booted VMs to keep ready.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	WarmCount int32 `json:"warmCount,omitempty"`
 	// MaxCount caps vacant plus claimed VM pods. 0 means no cap.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	MaxCount int32 `json:"maxCount,omitempty"`
-	// ServiceAccountName is the identity of VMs in this pool.
+	// ServiceAccountName is the identity of VMs in this pool. It is capped
+	// below the generic 253-character DNS limit so the "sa.<name>" key in the
+	// VM owner ConfigMap fits the 253-character key limit.
+	// +kubebuilder:validation:MaxLength=250
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Endpoints exposes fixed HTTPS endpoints to workloads at http://<name>/.
 	// +optional
@@ -100,8 +110,14 @@ type PoolEndpoint struct {
 
 type BlipPoolStatus struct {
 	// Ready counts vacant VMs that finished booting.
-	Ready   int32 `json:"ready,omitempty"`
-	Vacant  int32 `json:"vacant,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	Ready int32 `json:"ready,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	Vacant int32 `json:"vacant,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	Claimed int32 `json:"claimed,omitempty"`
 	// Reason is a CamelCase cause set when the pool configuration cannot
 	// produce VMs, for example InvalidConfiguration for an endpoint that
@@ -140,14 +156,14 @@ type BlipPoolList struct {
 // filesystem or an auxiliary mount. Provisioning fields are immutable;
 // mounts and runtime defaults can be updated for subsequent or running blips.
 //
-// +kubebuilder:validation:XValidation:rule="!(has(self.image) && has(self.copyFrom))",message="set at most one of image and copyFrom"
-// +kubebuilder:validation:XValidation:rule="!(has(self.image) && has(self.replicas))",message="replicas cannot be set for image states; they are held by every eligible node"
-// +kubebuilder:validation:XValidation:rule="has(self.image) == has(oldSelf.image) && (!has(self.image) || self.image == oldSelf.image)",message="image is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.copyFrom) == has(oldSelf.copyFrom) && (!has(self.copyFrom) || self.copyFrom == oldSelf.copyFrom)",message="copyFrom is immutable"
+// +kubebuilder:validation:XValidation:rule="!(has(self.image) && size(self.image) > 0 && has(self.copyFrom) && size(self.copyFrom) > 0)",message="set at most one of image and copyFrom"
+// +kubebuilder:validation:XValidation:rule="!(has(self.image) && size(self.image) > 0 && has(self.replicas))",message="replicas cannot be set for image states; they are held by every eligible node"
+// +kubebuilder:validation:XValidation:rule="(has(self.image) && size(self.image) > 0) == (has(oldSelf.image) && size(oldSelf.image) > 0) && (!has(self.image) || size(self.image) == 0 || self.image == oldSelf.image)",message="image is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.copyFrom) && size(self.copyFrom) > 0) == (has(oldSelf.copyFrom) && size(oldSelf.copyFrom) > 0) && (!has(self.copyFrom) || size(self.copyFrom) == 0 || self.copyFrom == oldSelf.copyFrom)",message="copyFrom is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size == oldSelf.size)",message="size is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas) || self.replicas == oldSelf.replicas)",message="replicas is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.nodeSelector) == has(oldSelf.nodeSelector) && (!has(self.nodeSelector) || self.nodeSelector == oldSelf.nodeSelector)",message="nodeSelector is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.imagePullSecrets) == has(oldSelf.imagePullSecrets) && (!has(self.imagePullSecrets) || self.imagePullSecrets == oldSelf.imagePullSecrets)",message="imagePullSecrets is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.nodeSelector) && size(self.nodeSelector) > 0) == (has(oldSelf.nodeSelector) && size(oldSelf.nodeSelector) > 0) && (!has(self.nodeSelector) || size(self.nodeSelector) == 0 || self.nodeSelector == oldSelf.nodeSelector)",message="nodeSelector is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.imagePullSecrets) && size(self.imagePullSecrets) > 0) == (has(oldSelf.imagePullSecrets) && size(oldSelf.imagePullSecrets) > 0) && (!has(self.imagePullSecrets) || size(self.imagePullSecrets) == 0 || self.imagePullSecrets == oldSelf.imagePullSecrets)",message="imagePullSecrets is immutable"
 type BlipStateSpec struct {
 	// Image initializes the filesystem from a container image, which each
 	// node converts to ext4 itself. Every eligible node (matching
@@ -190,10 +206,12 @@ type BlipStateSpec struct {
 	Runtime *RuntimeDefaults `json:"runtime,omitempty"`
 }
 
-// MaxStateSizeBytes is the largest filesystem size a BlipState accepts. It is
-// far beyond any practical thin-pool volume and keeps block-rounding
-// arithmetic safely inside int64.
-const MaxStateSizeBytes int64 = 1 << 50 // 1 PiB
+// MaxStateSizeBytes is the largest filesystem size a BlipState accepts. It
+// must be small enough that a node can provision it: an accepted state that
+// exceeds every node's free space reaches the node and starts a long mkfs that
+// exhausts the shared thin pool. The controller additionally rejects a state
+// larger than the free space of every node it would place it on.
+const MaxStateSizeBytes int64 = 1 << 40 // 1 TiB
 
 const (
 	StatePending = "Pending" // initial version not committed yet
@@ -475,6 +493,9 @@ type RuntimeDefaults struct {
 type BlipSpec struct {
 	// Pool names a BlipPool in the blip's namespace.
 	// +kubebuilder:default=default
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="pool is immutable"
 	Pool string `json:"pool,omitempty"`
 	// State gives the blip a durable root filesystem. A new version is
@@ -500,11 +521,13 @@ type BlipSpec struct {
 	// long. The VM is stopped as if spec.stop were set. `blip run --timeout`
 	// sets it.
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9223372036
 	// +optional
 	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
 	// TTLSecondsAfterFinished deletes the blip this long after it finished,
 	// whether or not anyone gathered its results. `blip run --ttl` sets it.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	// +optional
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 	// Network narrows the pool's egress policy. Omitted inherits the root
@@ -570,8 +593,16 @@ type BlipStatus struct {
 	RootAttachmentID string       `json:"rootAttachmentID,omitempty"`
 	StartTime        *metav1.Time `json:"startTime,omitempty"`
 	FinishTime       *metav1.Time `json:"finishTime,omitempty"`
-	ExitCode         *int32       `json:"exitCode,omitempty"`
-	Sessions         int32        `json:"sessions,omitempty"`
+	// ExitCode is the command's exit status. It is 0-255 for a real process,
+	// but the bound is the int32 range so a malformed status cannot break the
+	// controller's typed list/watch decode.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	ExitCode *int32 `json:"exitCode,omitempty"`
+	// Sessions is the number of attached sessions.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	Sessions int32 `json:"sessions,omitempty"`
 	// +listType=map
 	// +listMapKey=state
 	Mounts []MountStatus `json:"mounts,omitempty"`

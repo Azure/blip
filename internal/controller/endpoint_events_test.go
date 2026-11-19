@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -13,8 +14,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -118,6 +121,94 @@ func TestPoolEndpointCAValidation(t *testing.T) {
 			t.Fatalf("valid CA rejected: %v", err)
 		}
 	})
+
+	t.Run("binaryData ca.crt is accepted", func(t *testing.T) {
+		e := newEnv(t)
+		e.create(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "binary-ca"},
+			BinaryData: map[string][]byte{"ca.crt": []byte(validCA)},
+		})
+		pool := &v1.BlipPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: ns},
+			Spec: v1.BlipPoolSpec{
+				Endpoints: []v1.PoolEndpoint{{Name: "whoami", URL: "https://whoami.example.com", CAConfigMap: "binary-ca"}},
+			},
+		}
+		if err := validateEndpointCAs(e.ctx, e.c, pool); err != nil {
+			t.Fatalf("CA in binaryData rejected: %v", err)
+		}
+	})
+
+	// The manager cache watches only blip-vm-owners, so a cache-backed Get
+	// reports every other ConfigMap as missing. Pool reconciliation must read
+	// CA ConfigMaps through the uncached API reader instead of freezing the
+	// pool with a false "not found".
+	t.Run("CA ConfigMap outside the cache is read through the API reader", func(t *testing.T) {
+		e := newEnv(t)
+		e.addNodes("n1")
+		e.newPool("default", 1, 0)
+		e.create(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "good-ca"},
+			Data:       map[string]string{"ca.crt": validCA},
+		})
+		e.updatePool("default", func(p *v1.BlipPool) {
+			p.Spec.Endpoints = []v1.PoolEndpoint{{Name: "whoami", URL: "https://whoami.example.com", CAConfigMap: "good-ca"}}
+		})
+		e.pool.Client = vmOwnersOnlyCache{e.c}
+		e.pool.APIReader = e.c
+		if _, err := e.pool.Reconcile(e.ctx, req(ns, "default")); err != nil {
+			t.Fatalf("valid CA through the API reader rejected: %v", err)
+		}
+		if n := len(e.pods()); n != 1 {
+			t.Fatalf("%d pods, want 1 warm pod for a valid pool", n)
+		}
+	})
+
+	// A transient API failure must be retried, not recorded as a permanent
+	// configuration error.
+	t.Run("read failure other than NotFound is retried", func(t *testing.T) {
+		e := newEnv(t)
+		e.newPool("default", 1, 0)
+		e.updatePool("default", func(p *v1.BlipPool) {
+			p.Spec.Endpoints = []v1.PoolEndpoint{{Name: "whoami", URL: "https://whoami.example.com", CAConfigMap: "good-ca"}}
+		})
+		recorder := record.NewFakeRecorder(10)
+		e.pool.Recorder = recorder
+		e.pool.APIReader = failingReader{Client: e.c}
+
+		if _, err := e.pool.Reconcile(e.ctx, req(ns, "default")); err == nil {
+			t.Fatal("transient ConfigMap read error was ignored")
+		}
+		if pool := e.getPool("default"); pool.Status.Reason == poolInvalidConfiguration {
+			t.Fatalf("transient error recorded as %s: %s", pool.Status.Reason, pool.Status.Message)
+		}
+		select {
+		case event := <-recorder.Events:
+			t.Errorf("transient error published an Event: %q", event)
+		default:
+		}
+	})
+}
+
+// vmOwnersOnlyCache mimics the manager cache's ConfigMap field selector: only
+// the admission policy's parameter table is visible.
+type vmOwnersOnlyCache struct{ client.Client }
+
+func (c vmOwnersOnlyCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.ConfigMap); ok && key.Name != VMOwnersConfigMap {
+		return apierrors.NewNotFound(corev1.Resource("configmaps"), key.Name)
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// failingReader fails ConfigMap reads the way an unavailable API server does.
+type failingReader struct{ client.Client }
+
+func (f failingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.ConfigMap); ok {
+		return apierrors.NewServiceUnavailable("apiserver unavailable")
+	}
+	return f.Client.Get(ctx, key, obj, opts...)
 }
 
 func testCAPEM(t *testing.T) string {

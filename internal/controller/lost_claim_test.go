@@ -86,6 +86,67 @@ func TestLostClaimClearsPodAndStartBudget(t *testing.T) {
 	}
 }
 
+// TestLostClaimForgottenWhenPodTerminating covers a graceful pod deletion
+// before the guest accepts the claim. The pod stays listed with a
+// DeletionTimestamp for its termination grace period; that must not be read as
+// a started guest. The Blip must forget the claim and wait for a replacement
+// instead of running and later failing with no working volume.
+func TestLostClaimForgottenWhenPodTerminating(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.newBlip("b", e.withImage("reg/img:v1"))
+
+	b := e.claimedButWarm("b")
+	dead := b.Status.Pod
+	pod := e.getPod(dead)
+	pod.Finalizers = []string{"lost-claim.test/hold"}
+	e.must(e.c.Update(e.ctx, pod))
+	e.must(e.c.Delete(e.ctx, pod))
+
+	pod = e.getPod(dead)
+	if pod.DeletionTimestamp == nil {
+		t.Fatal("pod is not terminating")
+	}
+	e.run(e.blip, ns, "b")
+
+	b = e.getBlip("b")
+	expectPhase(t, b, v1.BlipPending, ReasonWaitingForVM)
+	if b.Status.Pod != "" || b.Status.PodUID != "" || b.Status.Node != "" || b.Status.StartTime != nil {
+		t.Fatalf("kept a terminating pre-start claim: pod=%q uid=%q node=%q start=%v",
+			b.Status.Pod, b.Status.PodUID, b.Status.Node, b.Status.StartTime)
+	}
+
+	// Once the pod is gone a replacement VM is claimed with a fresh window.
+	pod = e.getPod(dead)
+	pod.Finalizers = nil
+	e.must(e.c.Update(e.ctx, pod))
+	if !e.podGone(dead) {
+		e.must(e.c.Delete(e.ctx, pod))
+	}
+	if !e.podGone(dead) {
+		t.Fatal("pod did not vanish")
+	}
+	// The pool may still count the vanished pod as an in-flight creation; wait
+	// out that expectation before it can boot the replacement.
+	e.now = e.now.Add(expectTimeout + time.Second)
+	e.heartbeat()
+	e.run(e.pool, ns, "default")
+	e.warmOn("n1")
+	for _, p := range e.pods() {
+		if p.Name != dead && isVacant(&p) {
+			e.observe(p.Name, podapi.Observed{Phase: podapi.PhaseWarm})
+		}
+	}
+	e.run(e.blip, ns, "b")
+
+	b = e.getBlip("b")
+	expectPhase(t, b, v1.BlipPending, ReasonStarting)
+	if b.Status.Pod == "" || b.Status.Pod == dead {
+		t.Fatalf("replacement pod = %q, want a new pod", b.Status.Pod)
+	}
+}
+
 // TestRunningPodLossStillReportsPodLost makes sure forgetting a lost claim only
 // covers pods that never started: a pod lost after the guest claimed it still
 // stops the Blip with PodLost.

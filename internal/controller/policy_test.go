@@ -788,3 +788,49 @@ func TestVMOwnerPolicyBindingCoverage(t *testing.T) {
 		}
 	}
 }
+
+// The blip.dev/thread label is ThreadLabel(name), which is hashed for names
+// longer than a label value. The table therefore has to publish the owner
+// under the hashed label too, not only under the raw thread name.
+func TestVMOwnerPolicyLongThreadLabel(t *testing.T) {
+	v := loadVMOwnerPolicy(t)
+	long := strings.Repeat("long-thread-", 8)
+	victim := strings.Repeat("other-thread-", 8)
+	if len(long) <= 63 || len(victim) <= 63 {
+		t.Fatalf("test thread names are not long: %q %q", long, victim)
+	}
+	project := v1.ThreadOwner(ns, long)
+	victimOwner := v1.ThreadOwner(ns, victim)
+	label, victimLabel := v1.ThreadLabel(long), v1.ThreadLabel(victim)
+	params := map[string]string{
+		"sa.vm":                 "default",
+		"default-mine":          project,
+		"default-admin":         "-",
+		"thread." + long:        project, // spec.thread key read by blip-turn-owner
+		"thread." + label:       project, // label key read by blip-vm-owner
+		"thread." + victim:      victimOwner,
+		"thread." + victimLabel: victimOwner,
+	}
+	mine := vmUser("vm", "default-mine")
+	own := withThreadLabel(blipObj(project+".a", project), label)
+	foreign := withThreadLabel(blipObj(project+".a", project), victimLabel)
+	unknown := withThreadLabel(blipObj(project+".a", project), v1.ThreadLabel("missing-thread"))
+
+	for _, tc := range []struct {
+		name  string
+		obj   map[string]any
+		allow bool
+	}{
+		{"own hashed thread", own, true},
+		{"foreign hashed thread", foreign, false},
+		{"unknown hashed thread", unknown, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{user: mine, op: admission.Create, resource: "blips", name: project + ".a", object: tc.obj}
+			allow, msg := req.evaluate(t, v, params)
+			if allow != tc.allow || (!tc.allow && !strings.Contains(msg, "thread")) {
+				t.Fatalf("allow %v (%q), want %v", allow, msg, tc.allow)
+			}
+		})
+	}
+}

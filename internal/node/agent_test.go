@@ -830,3 +830,72 @@ func TestLiveCopyJob(t *testing.T) {
 		t.Fatalf("still frozen: %v", left)
 	}
 }
+
+// TestConfirmGoneSeesRunningBuildState: an in-flight build has no visible
+// volume yet, so its running operation is the only evidence that the state it
+// belongs to may have been deleted.
+func TestConfirmGoneSeesRunningBuildState(t *testing.T) {
+	a, _, _ := testAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.opCancels = map[string]context.CancelFunc{stateKey("uid-building"): cancel}
+	a.confirmGone(ctx, &view{node: self, dirs: map[string]*podDir{}, volumes: map[string]storage.Volume{}})
+	a.mu.Lock()
+	gone := a.statesGone["uid-building"]
+	a.mu.Unlock()
+	if !gone {
+		t.Fatal("running build's state was not confirmed gone")
+	}
+	a.cancelGoneBuilds(&view{statesGone: map[string]bool{"uid-building": true}})
+	if ctx.Err() == nil {
+		t.Fatal("running build was not cancelled")
+	}
+}
+
+// TestAgentCancelsBuildWhenStateGone: a state confirmed absent by a live read
+// must cancel its running build, not just forget it, or mkfs keeps allocating
+// thin-pool space after the object is gone.
+func TestAgentCancelsBuildWhenStateGone(t *testing.T) {
+	a := &Agent{operations: *NewScheduler(map[string]int{"image": 2}), wake: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	key := stateKey("uid-gone")
+	started := make(chan struct{})
+	finished := make(chan error, 1)
+	a.runOperations(ctx, []Operation{{Key: key, Class: "image", Writes: []string{"c1"}}},
+		map[string]operationJob{key: {what: "build commit", run: func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done()
+			finished <- ctx.Err()
+			return ctx.Err()
+		}}})
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("build did not start")
+	}
+	a.cancelGoneBuilds(&view{statesGone: map[string]bool{}})
+	select {
+	case err := <-finished:
+		t.Fatalf("build cancelled while its state still exists: %v", err)
+	default:
+	}
+
+	a.cancelGoneBuilds(&view{statesGone: map[string]bool{"uid-gone": true}})
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("build stopped with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("build not cancelled after its state disappeared")
+	}
+	a.workers.Wait()
+	a.mu.Lock()
+	left := len(a.opCancels)
+	a.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("cancelled operation still registered: %d", left)
+	}
+}

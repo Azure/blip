@@ -3,6 +3,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -42,6 +46,8 @@ func (e *env) safeToRemove(node string) bool {
 
 func TestStateInitialization(t *testing.T) {
 	size20G := resource.MustParse("20Gi")
+	size200G := resource.MustParse("200Gi")
+	size1Pi := resource.MustParse("1Pi")
 	zeroSize := resource.MustParse("0")
 	negativeSize := resource.MustParse("-1Gi")
 	hugeSize := resource.MustParse("10Ei")
@@ -60,6 +66,8 @@ func TestStateInitialization(t *testing.T) {
 		{name: "negative size", spec: v1.BlipStateSpec{Replicas: 2, Size: &negativeSize}, message: "size -1Gi must be greater than 0", phase: v1.StateFailed},
 		{name: "huge size", spec: v1.BlipStateSpec{Replicas: 2, Size: &hugeSize}, message: "too large", phase: v1.StateFailed},
 		{name: "max int64 size", spec: v1.BlipStateSpec{Replicas: 2, Size: &maxInt64Size}, message: "too large", phase: v1.StateFailed},
+		{name: "previous maximum size", spec: v1.BlipStateSpec{Replicas: 2, Size: &size1Pi}, message: "too large", phase: v1.StateFailed},
+		{name: "size beyond node free", spec: v1.BlipStateSpec{Replicas: 1, Size: &size200G}, message: "has only 100Gi free", phase: v1.StateFailed},
 		{name: "image", spec: v1.BlipStateSpec{Image: "reg/img:v1"}, size: 10 << 30, nodes: 2},
 		{name: "image size", spec: v1.BlipStateSpec{Image: "reg/img:v1", Size: &size20G}, size: 20 << 30, nodes: 2},
 		{name: "missing image", spec: v1.BlipStateSpec{Image: "reg/nope:v1"}, message: "image reg/nope:v1: not found", phase: v1.StateFailed},
@@ -212,6 +220,44 @@ func TestStateUnusablePullSecretFails(t *testing.T) {
 				t.Fatalf("message %q does not contain %q", st.Status.Message, tt.want)
 			}
 		})
+	}
+}
+
+// TestStateRejectedCredentialsFailTerminally is the controller side of the
+// `blip pull` hang: a 401 from a registry with the state's immutable
+// imagePullSecrets must fail the state, because the CLI waits for a commit
+// (or a terminal phase) and would otherwise stay on Pending forever.
+func TestStateRejectedCredentialsFailTerminally(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"details":"incorrect username or password"}`)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.state.Registry = RemoteRegistry{Reader: e.c}
+	e.create(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "badcred"},
+		Type:       corev1.SecretTypeDockerConfigJson,
+		Data: map[string][]byte{corev1.DockerConfigJsonKey: []byte(
+			fmt.Sprintf(`{"auths":{%q:{"username":"nouser","password":"definitely-wrong"}}}`, u.Host))},
+	})
+	e.newState("s", func(st *v1.BlipState) {
+		st.Spec.Image = u.Host + "/library/hello-world:latest"
+		st.Spec.Replicas = 0
+		st.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "badcred"}}
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("rejected credentials not terminal: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "registry rejected image pull credentials") ||
+		!strings.Contains(st.Status.Message, "incorrect username or password") {
+		t.Fatalf("message %q does not explain the rejected credentials", st.Status.Message)
 	}
 }
 

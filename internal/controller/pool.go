@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -41,11 +42,10 @@ func (r *PoolReconciler) recordWarning(obj client.Object, reason string, err err
 	}
 }
 
-// invalidPool records an endpoint validation failure in pool status and, when
-// a recorder is configured, as a Warning Event. Status is written only when it
-// changes, so the error-driven requeue does not patch forever.
-func (r *PoolReconciler) invalidPool(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
-	err = fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
+// recordPoolProblem writes a pool problem to status and, when a recorder is
+// configured, as a Warning Event. Status is written only when it changes, so
+// the error-driven requeue does not patch forever.
+func (r *PoolReconciler) recordPoolProblem(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
 	if pool.Status.Reason != poolInvalidConfiguration || pool.Status.Message != err.Error() {
 		base := pool.DeepCopy()
 		pool.Status.Reason = poolInvalidConfiguration
@@ -58,6 +58,19 @@ func (r *PoolReconciler) invalidPool(ctx context.Context, pool *v1.BlipPool, rea
 	return err
 }
 
+// invalidPool records an endpoint validation failure in pool status and as a
+// Warning Event.
+func (r *PoolReconciler) invalidPool(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
+	return r.recordPoolProblem(ctx, pool, reason, fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err))
+}
+
+// invalidPoolSpec records a non-endpoint spec failure, such as a negative
+// memory request. Without it the pool retries a Pod create forever with empty
+// status and no Event, while Blips wait for a VM that can never exist.
+func (r *PoolReconciler) invalidPoolSpec(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
+	return r.recordPoolProblem(ctx, pool, reason, fmt.Errorf("invalid pool %s/%s: %w", pool.Namespace, pool.Name, err))
+}
+
 // expectTimeout bounds how long a created or deleted pod that the cache does
 // not reflect yet is accounted for.
 const expectTimeout = time.Minute
@@ -67,6 +80,12 @@ const expectTimeout = time.Minute
 // room is used again, but deleting one rejected pod cannot immediately
 // recreate another unschedulable one there.
 const blockedGrace = time.Minute
+
+// warmTimeout bounds how long a spare may stay unready before the pool retires
+// it. A pod that never becomes ready (image pull failure, VM boot failure, or
+// a crash-looping sidecar) cannot accept a claim, so keeping it would consume
+// warmCount/maxCount and suppress the replacement that waiting demand needs.
+const warmTimeout = 5 * time.Minute
 
 const (
 	// Bump when pod topology changes without a pool spec change, so warm
@@ -120,6 +139,11 @@ type PoolReconciler struct {
 	// discovered at startup. validateEndpoints rejects an endpoint token
 	// projected for any of them.
 	APIAudiences []string
+	// APIReader reads objects uncached. The manager cache only watches the
+	// blip-vm-owners ConfigMap, so CA ConfigMaps must bypass it or every CA
+	// reference looks missing. SetupWithManager sets it; direct callers that
+	// leave it nil fall back to Client.
+	APIReader client.Reader
 
 	mu sync.Mutex
 	// created and deleted hold pod names (per pool) whose change the
@@ -177,6 +201,15 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// caReader returns the reader used for CA ConfigMaps. The default direct
+// client backs tests and callers that reconcile without a manager.
+func (r *PoolReconciler) caReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 // State imports and deletions, and thread changes, refresh the authorization
 // table even when no Blip currently waits for a VM.
 func (r *PoolReconciler) namespacePools(ctx context.Context, o client.Object) []reconcile.Request {
@@ -202,7 +235,7 @@ func (r *PoolReconciler) poolRequests(ctx context.Context, namespace string) []r
 }
 
 func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (reconcile.Result, error) {
-	if err := syncVMOwners(ctx, r.Client, rq.Namespace); err != nil {
+	if err := syncVMOwnersEvents(ctx, r.Client, rq.Namespace, r.Recorder); err != nil {
 		return reconcile.Result{}, err
 	}
 	pool := &v1.BlipPool{}
@@ -219,6 +252,13 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	if pool.DeletionTimestamp != nil {
 		return reconcile.Result{}, nil
 	}
+	// A negative memory makes the Pod request invalid (the VMM overhead is
+	// added to it), and the Pod would be rejected on every retry. Admission
+	// rejects it, but an object stored before that rule existed must fail
+	// visibly instead of leaving empty status and no Event.
+	if err := validatePoolResources(pool); err != nil {
+		return reconcile.Result{}, r.invalidPoolSpec(ctx, pool, "InvalidConfiguration", err)
+	}
 	// Refuse to create pods whose api-proxy sidecar would exit at startup.
 	// The failure is recorded in pool status and as an Event on the pool, so
 	// an operator can see why no VM becomes ready instead of only finding it
@@ -228,7 +268,14 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	}
 	// The API checks the ConfigMap reference's shape; its contents must also
 	// be a usable CA bundle or the sidecar crash-loops before the pod is ready.
-	if err := validateEndpointCAs(ctx, r.Client, pool); err != nil {
+	// Read through the API reader: the manager cache only watches
+	// blip-vm-owners, so a cached Get would report every other ConfigMap as
+	// missing. A transient read failure is retried, not pinned in status.
+	if err := validateEndpointCAs(ctx, r.caReader(), pool); err != nil {
+		var invalid invalidEndpointCAError
+		if !errors.As(err, &invalid) {
+			return reconcile.Result{}, err
+		}
 		return reconcile.Result{}, r.invalidPool(ctx, pool, "InvalidEndpointCA", err)
 	}
 	var pods corev1.PodList
@@ -410,9 +457,9 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			}
 		case p.DeletionTimestamp != nil || deleted[p.Name]:
 			// Its replacement is already accounted for; do not let a pod
-			// leaving an unusable node (or a rejected pinned node) hold
-			// maxCount capacity either.
-			if unusable || (unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "") {
+			// leaving an unusable node, a node the scheduler rejected, or
+			// one that never became ready hold maxCount capacity either.
+			if unusable || !ready(p) {
 				total--
 			}
 		case podTerminated(p) || unusable || p.Annotations[v1.AnnotationTemplateHash] != hash:
@@ -422,17 +469,28 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			if unusable {
 				total--
 			}
-		case unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "":
-			// The scheduler rejected this pinned pod, so it cannot satisfy
-			// pinned demand and must not hold a maxCount slot: booting the
-			// fallback VM elsewhere is the whole point. Keep it while a Blip
+		case unschedulable(p):
+			// The scheduler rejected this pod, so it cannot satisfy demand
+			// and must not hold a maxCount slot: booting the replacement
+			// elsewhere is the whole point. Keep a pinned pod while a Blip
 			// still waits locally (the scheduler may place it once the node
-			// has room); once the Blip fell back, replace it.
+			// has room); once the Blip fell back, replace it. A generic spare
+			// has no node to wait for, and its stale avoid affinity may
+			// exclude nodes that are usable again, so delete it and let
+			// createPod recompute the placement.
 			total--
-			if localWaiters[node] == 0 {
+			if p.Annotations[v1.AnnotationPinnedNode] == "" || localWaiters[node] == 0 {
 				if err := del(p); err != nil {
 					return reconcile.Result{}, err
 				}
+			}
+		case warmingOverdue(p, r.now()):
+			// A spare that never became ready cannot accept a claim. Retire
+			// it so a replacement boots instead of it holding a slot and
+			// covering waiting demand until pendingTimeout.
+			total--
+			if err := del(p); err != nil {
+				return reconcile.Result{}, err
 			}
 		default:
 			vacant = append(vacant, p)
@@ -467,8 +525,16 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	target := int(pool.Spec.WarmCount) + demand
 	maxCount := int(pool.Spec.MaxCount)
 	if maxCount > 0 {
-		target = min(target, maxCount)
+		// maxCount caps claimed VMs as well as vacant spares. Budget the
+		// spares only what the claims leave: lowering the cap while a Blip
+		// runs must delete surplus spares, not keep maxCount of them on top
+		// of every claim. A cap below the claims leaves no spare budget.
+		target = min(target, max(maxCount-int(status.Claimed), 0))
 	}
+	// Only ready vacant pods can satisfy a waiting Blip. A booting or broken
+	// spare must not stand in for demand and suppress the replacement that the
+	// waiting Blip needs.
+	claimable := int(status.Ready)
 	have := len(vacant) + created
 	log.FromContext(ctx).V(1).Info("pool sizing", "demand", demand, "deferred", deferred, "claimed", len(claimed), "pinned", pinned, "vacant", len(vacant), "created", created, "target", target, "have", have, "total", total, "blocked", blocked)
 	room := func() bool { return maxCount <= 0 || total < maxCount }
@@ -499,11 +565,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		warm[n] += c
 	}
 	if want := target - have; want > 0 {
-		// If every waiting Blip can claim an existing warm VM, do not boot
-		// replacements yet. The claim tells us which node is hot, and a
+		// If every waiting Blip can claim an existing ready warm VM, do not
+		// boot replacements yet. The claim tells us which node is hot, and a
 		// spare booted now would land on an arbitrary node and be moved
 		// again. The claim wakes the pool, which then boots the replacement.
-		if demand > 0 && len(vacant) >= demand {
+		if demand > 0 && claimable >= demand {
 			want = 0
 		}
 		for ; want > 0; want-- {
@@ -527,6 +593,9 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		for _, p := range spare[:max(0, min(have-target, len(spare)))] {
 			if err := del(p); err != nil {
 				return reconcile.Result{}, err
+			}
+			if ready(p) {
+				status.Ready--
 			}
 			have--
 			warm[podNode(p)]--
@@ -618,6 +687,26 @@ func ready(p *corev1.Pod) bool {
 	// A pod that the kubelet has not yet described keeps the previous
 	// behavior; phase and warm already say it booted.
 	return true
+}
+
+// warmingOverdue reports whether a spare has been unready for longer than
+// warmTimeout. A Ready=False transition time bounds the wait from when the pod
+// stopped being usable; a pod that never reported Readiness is measured from
+// its creation. Pods without a usable timestamp are never retired, so a fake
+// or unscheduled pod is not deleted immediately.
+func warmingOverdue(p *corev1.Pod, now time.Time) bool {
+	if ready(p) || podTerminated(p) || p.DeletionTimestamp != nil {
+		return false
+	}
+	since := p.CreationTimestamp.Time
+	for _, condition := range p.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status != corev1.ConditionTrue &&
+			!condition.LastTransitionTime.IsZero() {
+			since = condition.LastTransitionTime.Time
+			break
+		}
+	}
+	return !since.IsZero() && now.Sub(since) > warmTimeout
 }
 
 // pickWarmNode picks the node where a warm spare is most useful: a node
@@ -995,6 +1084,18 @@ func addAPIProxy(pod *corev1.Pod, pool *v1.BlipPool, image string) {
 		proxy.Env = append(proxy.Env, corev1.EnvVar{Name: endpointsEnv, Value: string(data)})
 	}
 	pod.Spec.InitContainers = []corev1.Container{proxy}
+}
+
+// validatePoolResources rejects a pool shape that cannot become a valid Pod.
+// Admission rejects non-positive spec.memory, but the controller also checks a
+// negative value so one stored before that rule existed fails with a visible
+// status and Event instead of retrying the Pod create forever. A zero quantity
+// is the unset Go value and poolShape defaults it, so it stays accepted here.
+func validatePoolResources(pool *v1.BlipPool) error {
+	if pool.Spec.Memory.Sign() < 0 {
+		return fmt.Errorf("spec.memory must be greater than 0, got %s", pool.Spec.Memory.String())
+	}
+	return nil
 }
 
 // poolShape returns the effective VM shape of pool.

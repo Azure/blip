@@ -335,20 +335,24 @@ func TestWaitDeliveredNoClient(t *testing.T) {
 func TestCheckMountPath(t *testing.T) {
 	existing := []string{"/data"}
 	for p, ok := range map[string]bool{
-		"/work":              true,
-		"/mnt/a/b":           true,
-		"/datax":             true,
-		"/":                  false,
-		"relative":           false,
-		"/a/../b":            false,
-		"/data":              false,
-		"/data/sub":          false,
-		"/proc/x":            false,
-		"/dev":               false,
-		"/run":               false,
-		"/run/blip":          false,
-		"/run/blip/metadata": false,
-		"/run/work":          true,
+		"/work":                                 true,
+		"/mnt/a/b":                              true,
+		"/datax":                                true,
+		"/":                                     false,
+		"relative":                              false,
+		"/a/../b":                               false,
+		"/data":                                 false,
+		"/data/sub":                             false,
+		"/proc/x":                               false,
+		"/dev":                                  false,
+		"/run":                                  false,
+		"/run/blip":                             false,
+		"/run/blip/metadata":                    false,
+		"/run/work":                             true,
+		"/" + strings.Repeat("a", 300):          false,
+		"/" + strings.Repeat("a", 260):          false,
+		"/" + strings.Repeat("a", 255):          true,
+		"/" + strings.Repeat("abcdefghij/", 20): true,
 	} {
 		err := checkMountPath(p, existing)
 		if (err == nil) != ok {

@@ -269,6 +269,44 @@ func TestRunKeepLeavesWorkspaceOwnedByNobody(t *testing.T) {
 	}
 }
 
+func TestRunKeepOwnsForkCopiesByRoot(t *testing.T) {
+	home := readyState("alice.home")
+	home.Spec.Mounts = []v1alpha1.Mount{{State: "alice.data", Path: "/data", Writable: true}}
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), home, readyState("alice.data"))
+	h.self = "alice.box"
+	if code, _, errOut := h.run("", "run", "--name", "w1", "--keep", "--ttl", "0", "--timeout", "0", "--", "true"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	root := h.state("alice.w1")
+	if len(root.OwnerReferences) != 0 {
+		t.Fatalf("durable root owner references %+v", root.OwnerReferences)
+	}
+	if len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0].State == "alice.data" {
+		t.Fatalf("fork mounts %+v", root.Spec.Mounts)
+	}
+	// The root owns its hidden copy, so deleting the root (the documented
+	// cleanup of a --keep workspace) also removes the copy.
+	child := h.state(root.Spec.Mounts[0].State)
+	refs := child.OwnerReferences
+	if len(refs) != 1 || refs[0].Kind != "BlipState" || refs[0].Name != "alice.w1" || refs[0].UID != root.UID {
+		t.Fatalf("copy owner references %+v", refs)
+	}
+}
+
+func TestRunFromRejectsDanglingReadOnlyMount(t *testing.T) {
+	src := readyState("src")
+	src.Spec.Mounts = []v1alpha1.Mount{{State: "gone", Path: "/ro"}}
+	h := newHarness(t, src)
+	code, _, errOut := h.run("", "run", "--name", "worker", "--from", "src", "--", "true")
+	if code != 1 || !strings.Contains(errOut, `read mount source "gone"`) || !strings.Contains(errOut, "not found") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	var b v1alpha1.Blip
+	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "worker"}, &b); !apierrors.IsNotFound(err) {
+		t.Fatalf("blip kept after rejected fork: %v", err)
+	}
+}
+
 func TestRunLabelsAndNameCollision(t *testing.T) {
 	h := newHarness(t, readyState("base"))
 	if code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--label", "team=a", "--", "true"); code != 0 {
@@ -324,6 +362,37 @@ func TestRunInterruptedDuringForkRemovesBlip(t *testing.T) {
 	}
 	if !h.gone("worker") {
 		t.Fatal("interrupted run leaked its blip")
+	}
+}
+
+func TestRunInterruptedKeepDuringForkRemovesCreatedStates(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{
+		Create: func(c context.Context, w client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			err := w.Create(c, obj, opts...)
+			// Interrupt after the unowned --keep fork exists but before the
+			// CLI has waited for it to become usable.
+			if err == nil {
+				if _, ok := obj.(*v1alpha1.BlipState); ok {
+					cancel()
+				}
+			}
+			return err
+		},
+	})
+	var out, errb bytes.Buffer
+	err := h.app(strings.NewReader(""), &out, &errb).run(ctx, []string{"true"}, &runFlags{name: "worker", from: "base", keep: true})
+	if err == nil {
+		t.Fatal("interrupted run succeeded")
+	}
+	if !h.gone("worker") {
+		t.Fatal("interrupted run leaked its blip")
+	}
+	var st v1alpha1.BlipState
+	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "worker"}, &st); !apierrors.IsNotFound(err) {
+		t.Fatalf("interrupted --keep run leaked its fork state: %v", err)
 	}
 }
 

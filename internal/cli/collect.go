@@ -84,6 +84,14 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 		cleanups = append(cleanups, cleanup)
 	}
 
+	// The gather check cannot see the source types before the states are
+	// mounted. Resolve every effective write now, in order, so a directory
+	// merge that would overwrite a sibling operation is rejected before
+	// anything is copied.
+	if err := checkCollectWrites(ops, mounts); err != nil {
+		return err
+	}
+
 	for _, op := range ops {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -104,6 +112,180 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 		}
 		if err := copyPath(ctx, src, op.dest); err != nil {
 			return fmt.Errorf("collect %s: %w", op.source, err)
+		}
+	}
+	return nil
+}
+
+// checkCollectWrites rejects collect operations whose effective writes collide
+// once their sources are mounted. It models the destination the way copyPath
+// will find it: a file copied onto an existing (or newly created) directory is
+// stored under its basename, and a directory source merges its whole tree into
+// the destination. The check runs before the first copy, so a rejected gather
+// leaves the destination untouched.
+func checkCollectWrites(ops []collectOp, mounts map[string]string) error {
+	// One copy cannot collide with another; do not walk a large tree twice.
+	copies := 0
+	for _, op := range ops {
+		if !op.git {
+			copies++
+		}
+	}
+	if copies < 2 {
+		return nil
+	}
+	p := &collectWrites{writes: map[string]collectWrite{}}
+	for _, op := range ops {
+		if op.git {
+			continue
+		}
+		src := filepath.Join(mounts[op.state], op.rel)
+		info, err := os.Lstat(src)
+		if err != nil {
+			// copyPath reports a missing source with the operation's name,
+			// and nothing is copied for it.
+			continue
+		}
+		dst := collectDestKey(op.dest)
+		if info.IsDir() {
+			if err := p.addTree(src, dst, op); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := p.addFile(src, dst, op); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collectDestKey resolves a destination the way copyPath sees it, including
+// symlinks in the existing part.
+func collectDestKey(path string) string {
+	if resolved, err := resolvePath(path); err == nil {
+		return filepath.Clean(resolved)
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(path)
+}
+
+// collectWrite records a path an operation creates or replaces. Directory
+// entries are only claimed for the merge itself; two directory merges may
+// share a path because their children are checked individually.
+type collectWrite struct {
+	dir    bool
+	source string
+}
+
+type collectWrites struct {
+	writes map[string]collectWrite
+}
+
+func (p *collectWrites) stat(path string) (isDir, exists bool) {
+	if w, ok := p.writes[path]; ok {
+		return w.dir, true
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false, false
+	}
+	return fi.IsDir(), true
+}
+
+func (p *collectWrites) claim(path string, dir bool, op collectOp) error {
+	prev, ok := p.writes[path]
+	if ok {
+		if prev.dir && dir {
+			return nil
+		}
+		return fmt.Errorf("collect %s: destination %s collides with %s; give each operation a distinct DEST", op.source, path, prev.source)
+	}
+	p.writes[path] = collectWrite{dir: dir, source: op.source}
+	return nil
+}
+
+// ensureParents records the directories an operation creates on the way to
+// path, and rejects a parent that an earlier operation made a file.
+func (p *collectWrites) ensureParents(path string, op collectOp) error {
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		if prev, ok := p.writes[dir]; ok {
+			if !prev.dir {
+				return fmt.Errorf("collect %s: destination %s collides with %s; give each operation a distinct DEST", op.source, path, prev.source)
+			}
+			return nil
+		}
+		fi, err := os.Stat(dir)
+		if err == nil {
+			if !fi.IsDir() {
+				return fmt.Errorf("collect %s: destination parent %s is not a directory", op.source, dir)
+			}
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("collect %s: %w", op.source, err)
+		}
+		p.writes[dir] = collectWrite{dir: true, source: op.source}
+		if parent := filepath.Dir(dir); parent == dir {
+			return nil
+		}
+	}
+}
+
+func (p *collectWrites) addFile(src, dst string, op collectOp) error {
+	if isDir, exists := p.stat(dst); exists && isDir {
+		dst = filepath.Join(dst, filepath.Base(src))
+	}
+	if err := p.ensureParents(dst, op); err != nil {
+		return err
+	}
+	return p.claim(dst, false, op)
+}
+
+func (p *collectWrites) addTree(src, dst string, op collectOp) error {
+	if isDir, exists := p.stat(dst); exists && !isDir {
+		if prev, ok := p.writes[dst]; ok {
+			return fmt.Errorf("collect %s: destination %s collides with %s; give each operation a distinct DEST", op.source, dst, prev.source)
+		}
+		return fmt.Errorf("collect %s: cannot copy directory %s onto %s: not a directory", op.source, src, dst)
+	}
+	if err := p.ensureParents(dst, op); err != nil {
+		return err
+	}
+	return p.addTreeAt(src, dst, op)
+}
+
+func (p *collectWrites) addTreeAt(src, dst string, op collectOp) error {
+	if err := p.claim(dst, true, op); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("collect %s: %w", op.source, err)
+	}
+	for _, e := range entries {
+		s := filepath.Join(src, e.Name())
+		d := filepath.Join(dst, e.Name())
+		info, err := os.Lstat(s)
+		if err != nil {
+			return fmt.Errorf("collect %s: %w", op.source, err)
+		}
+		if info.IsDir() {
+			if isDir, exists := p.stat(d); exists && !isDir {
+				return fmt.Errorf("collect %s: cannot copy directory %s onto %s: not a directory", op.source, s, d)
+			}
+			if err := p.addTreeAt(s, d, op); err != nil {
+				return err
+			}
+			continue
+		}
+		if isDir, exists := p.stat(d); exists && isDir {
+			return fmt.Errorf("collect %s: cannot copy file %s onto directory %s", op.source, s, d)
+		}
+		if err := p.claim(d, false, op); err != nil {
+			return err
 		}
 	}
 	return nil

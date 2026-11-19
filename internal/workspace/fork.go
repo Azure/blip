@@ -64,14 +64,18 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 		if mount.BlipUID != "" {
 			continue
 		}
+		// Every referenced state must still exist, not only the writable
+		// ones. A read-only reference is copied verbatim into the fork, so a
+		// dead reference would produce a workspace that reports success but
+		// cannot start.
+		var src v1alpha1.BlipState
+		if err := c.Get(ctx, client.ObjectKey{Namespace: source.Namespace, Name: mount.State}, &src); err != nil {
+			return nil, fmt.Errorf("read mount source %q: %w", mount.State, err)
+		}
+		if err := CheckSource(&src); err != nil {
+			return nil, err
+		}
 		if mount.Writable {
-			var src v1alpha1.BlipState
-			if err := c.Get(ctx, client.ObjectKey{Namespace: source.Namespace, Name: mount.State}, &src); err != nil {
-				return nil, fmt.Errorf("read mount source %q: %w", mount.State, err)
-			}
-			if err := CheckSource(&src); err != nil {
-				return nil, err
-			}
 			child := &v1alpha1.BlipState{
 				ObjectMeta: metav1.ObjectMeta{Name: childName(root, mount), Namespace: root.Namespace, Labels: maps.Clone(root.Labels)},
 				Spec:       v1alpha1.BlipStateSpec{CopyFrom: mount.State, Replicas: root.Spec.Replicas, NodeSelector: maps.Clone(root.Spec.NodeSelector)},
@@ -106,22 +110,52 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 			if !createRejected(err) {
 				return nil, result
 			}
-			for i := len(created) - 1; i >= 0; i-- {
-				obj := created[i]
-				opts := &client.DeleteOptions{}
-				if obj.UID != "" {
-					opts.Preconditions = &metav1.Preconditions{UID: &obj.UID}
-				}
-				if cleanupErr := c.Delete(context.WithoutCancel(ctx), obj, opts); cleanupErr != nil && !apierrors.IsNotFound(cleanupErr) {
-					result = errors.Join(result, fmt.Errorf("remove newly created state %q: %w", obj.Name, cleanupErr))
-				}
-			}
-			return nil, result
+			return nil, errors.Join(result, deleteCreated(ctx, c, created))
 		}
 		created = append(created, st)
 	}
+	// The root is created last, so its UID is only known now. A durable fork
+	// has no owner of its own, but the root still owns the hidden
+	// writable-mount copies, so deleting the workspace root (the documented
+	// cleanup for a --keep fork) removes them too. An owned fork keeps the
+	// caller's owner on both root and copies.
+	if opts.Owner == nil && len(created) > 1 {
+		ref := metav1.OwnerReference{
+			APIVersion: v1alpha1.GroupVersion.String(),
+			Kind:       "BlipState",
+			Name:       root.Name,
+			UID:        root.UID,
+		}
+		for _, child := range created[:len(created)-1] {
+			base := child.DeepCopy()
+			child.OwnerReferences = []metav1.OwnerReference{ref}
+			// A merge patch avoids racing the state controller, which may
+			// write the copy's status between the create and this update.
+			if err := c.Patch(ctx, child, client.MergeFrom(base)); err != nil {
+				result := fmt.Errorf("own state %q: %w", child.Name, err)
+				return nil, errors.Join(result, deleteCreated(ctx, c, created))
+			}
+		}
+	}
 	*dest = *root
 	return created, nil
+}
+
+// deleteCreated removes states created by this call, newest first, with UID
+// preconditions so an object replaced in the meantime is never deleted.
+func deleteCreated(ctx context.Context, c client.Client, created []*v1alpha1.BlipState) error {
+	var result error
+	for i := len(created) - 1; i >= 0; i-- {
+		obj := created[i]
+		opts := &client.DeleteOptions{}
+		if obj.UID != "" {
+			opts.Preconditions = &metav1.Preconditions{UID: &obj.UID}
+		}
+		if err := c.Delete(context.WithoutCancel(ctx), obj, opts); err != nil && !apierrors.IsNotFound(err) {
+			result = errors.Join(result, fmt.Errorf("remove newly created state %q: %w", obj.Name, err))
+		}
+	}
+	return result
 }
 
 // createRejected identifies explicit rejections that guarantee this request

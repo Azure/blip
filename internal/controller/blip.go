@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -443,6 +444,18 @@ func (r *BlipReconciler) finish(b *v1.Blip, phase, reason, msg string) {
 	b.Status.FinishTime = &now
 }
 
+// deadlineTime returns start plus seconds, saturating seconds at the largest
+// value whose nanosecond duration fits in an int64. The CRD rejects larger
+// values, but an object stored before that bound existed must not wrap the
+// duration negative and stop the Blip immediately.
+func deadlineTime(start time.Time, seconds int64) time.Time {
+	const maxSeconds = int64(math.MaxInt64 / int64(time.Second))
+	if seconds > maxSeconds {
+		seconds = maxSeconds
+	}
+	return start.Add(time.Duration(seconds) * time.Second)
+}
+
 // deadlineExceeded reports whether a started, unfinished Blip has outlived
 // spec.activeDeadlineSeconds. A Blip that is already stopping is left to that
 // stop so the deadline cannot restart it, and Saving means the command already
@@ -452,7 +465,7 @@ func (r *BlipReconciler) deadlineExceeded(b *v1.Blip) bool {
 		b.Spec.ActiveDeadlineSeconds == nil || b.Status.StartTime == nil {
 		return false
 	}
-	return !r.now().Before(b.Status.StartTime.Add(time.Duration(*b.Spec.ActiveDeadlineSeconds) * time.Second))
+	return !r.now().Before(deadlineTime(b.Status.StartTime.Time, *b.Spec.ActiveDeadlineSeconds))
 }
 
 // stopForDeadline sets spec.stop as an expired deadline would. A conflict is
@@ -507,7 +520,7 @@ func (r *BlipReconciler) startDeadline(b *v1.Blip) (time.Time, bool) {
 		add(b.CreationTimestamp.Add(pendingTimeout))
 	}
 	if !v1.Finished(b) && b.Spec.ActiveDeadlineSeconds != nil && b.Status.StartTime != nil {
-		add(b.Status.StartTime.Add(time.Duration(*b.Spec.ActiveDeadlineSeconds) * time.Second))
+		add(deadlineTime(b.Status.StartTime.Time, *b.Spec.ActiveDeadlineSeconds))
 	}
 	return deadline, !deadline.IsZero()
 }
@@ -517,6 +530,13 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	claimed, err := claimedPod(ctx, r.Client, b)
 	if err != nil {
 		return reconcile.Result{}, err
+	}
+	if claimed != nil && lostClaim(claimed) {
+		// A graceful pod deletion leaves the object Terminating for its
+		// grace period. The guest never accepted the claim, so this is the
+		// same lost claim as a pod that vanished: forget it and use the rest
+		// of this pass to claim a replacement.
+		claimed = nil
 	}
 	if claimed == nil {
 		if err := r.forgetLostClaim(ctx, b); err != nil {
@@ -561,6 +581,14 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	if rootReplaced(b, root) {
+		// The workspace this Blip saw was deleted and a different state now
+		// exists under the same name. It is not the Blip's data, so fail
+		// instead of claiming a VM and committing into a substituted volume.
+		res, err := fail(ReasonStateNotFound, rootReplacedMessage(b.Spec.State, b.Status.RootStateUID, string(root.UID)))
+		res.RequeueAfter = retryAfter
+		return res, err
+	}
 	if root != nil && b.Status.RootStateUID == "" {
 		// Remember that the workspace existed. A later NotFound is then a
 		// deletion, not the launch window before the CLI creates it.
@@ -601,6 +629,10 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		if err != nil {
 			return reconcile.Result{}, err
 		}
+		if i == 0 && rootReplaced(b, st) {
+			// The root was deleted and recreated between the two reads.
+			return fail(ReasonStateNotFound, rootReplacedMessage(b.Spec.State, b.Status.RootStateUID, string(st.UID)))
+		}
 		if reason == ReasonStateFailed {
 			return fail(reason, msg)
 		}
@@ -611,6 +643,16 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 			// before it was queued (there is no pod yet: claimedPod was
 			// checked above).
 			return fail(reason, msg)
+		}
+		if i > 0 && reason == ReasonStateNotFound {
+			// The root exists, so this is not the launch window: the CLI
+			// creates a Blip before workspace.Fork creates its workspace,
+			// but Fork creates mount copies before the root and mount --new
+			// commits the state before adding it to the root. A mount state
+			// named by an existing root that is fully gone was deleted and
+			// cannot be recreated for this Blip. Waiting would only delay
+			// the certain failure until the pending timeout.
+			return fail(reason, fmt.Sprintf("mount state %q was deleted while the Blip was pending", n))
 		}
 		if st != nil {
 			all[n] = st
@@ -727,6 +769,17 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		return reconcile.Result{}, nil
 	}
 	return reconcile.Result{}, r.startRunning(ctx, b, pod)
+}
+
+// rootReplaced reports whether the live root state is a different object than
+// the one this Blip saw when it became Pending. A state created under the same
+// name after the original was deleted is a different workspace.
+func rootReplaced(b *v1.Blip, root *v1.BlipState) bool {
+	return root != nil && b.Status.RootStateUID != "" && b.Status.RootStateUID != string(root.UID)
+}
+
+func rootReplacedMessage(name, want, got string) string {
+	return fmt.Sprintf("state %q was replaced while the Blip was pending (was %s, now %s); refusing to use the substituted workspace", name, want, got)
 }
 
 // unclaim gives up everything a Blip acquired before claiming a pod.
@@ -863,7 +916,7 @@ func (r *BlipReconciler) forgetLostClaim(ctx context.Context, b *v1.Blip) error 
 	pod := &corev1.Pod{}
 	err := r.Live.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.Pod}, pod)
 	switch {
-	case err == nil && string(pod.UID) == b.Status.PodUID:
+	case err == nil && string(pod.UID) == b.Status.PodUID && !lostClaim(pod):
 		// Still a live claim; keep its pod and start time.
 		return nil
 	case err != nil && !apierrors.IsNotFound(err):
@@ -874,6 +927,23 @@ func (r *BlipReconciler) forgetLostClaim(ctx context.Context, b *v1.Blip) error 
 	b.Status.Node = ""
 	b.Status.StartTime = nil
 	return nil
+}
+
+// claimAccepted reports whether the guest accepted the claim or already
+// produced an exit. Merely being scheduled, prepared, or deleted is not a
+// start: only the node's observation proves that the guest has the disks.
+func claimAccepted(pod *corev1.Pod) bool {
+	obs := observed(pod)
+	return obs.ClaimID != "" || obs.Exit != nil || obs.Phase == podapi.PhaseExited ||
+		pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+}
+
+// lostClaim reports whether a claimed pod is terminating before its guest
+// accepted the claim. A graceful delete keeps the pod listed with a
+// DeletionTimestamp for the termination grace period, but that claim can never
+// start this Blip and must not be mistaken for a running guest.
+func lostClaim(pod *corev1.Pod) bool {
+	return pod.DeletionTimestamp != nil && !claimAccepted(pod)
 }
 
 // observed decodes the node's observation annotation, if present.
@@ -1030,11 +1100,10 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 		return err
 	}
 	// Running means the guest accepted the claim; until then the node is
-	// still preparing disks.
+	// still preparing disks. A pod that is only Terminating was filtered out
+	// by pending unless the guest already accepted it.
 	obs := observed(pod)
-	started := obs.ClaimID != "" || obs.Exit != nil || obs.Phase == podapi.PhaseExited ||
-		pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded ||
-		pod.DeletionTimestamp != nil || stopping(b)
+	started := claimAccepted(pod) || stopping(b)
 	if !started {
 		prepareErr := pod.Annotations[v1.AnnotationPrepareError]
 		msg := "preparing the root disk on " + pod.Spec.NodeName

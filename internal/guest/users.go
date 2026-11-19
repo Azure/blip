@@ -183,8 +183,14 @@ const defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bi
 // command's working directory dir. It follows execvp semantics: an empty or
 // relative PATH entry is relative to dir, a candidate the account cannot
 // execute is reported as permission denied (126) rather than not found (127),
-// and a later executable candidate still wins.
+// and a later executable candidate still wins. An empty name is ENOENT
+// (127): there is no file to execute.
 func lookPath(root, dir, name string, env []string, acct *account) (string, error) {
+	if name == "" {
+		// execve("") is ENOENT. Every PATH candidate would otherwise be
+		// the directory itself, whose "not regular" check reads as 126.
+		return "", startFail(127, fmt.Errorf("%s: command not found", name))
+	}
 	if strings.Contains(name, "/") {
 		return name, nil
 	}

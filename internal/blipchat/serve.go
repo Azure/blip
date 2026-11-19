@@ -2,6 +2,7 @@ package blipchat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -32,6 +33,24 @@ const (
 )
 
 var timeNow = time.Now
+
+// errStaleIncarnation means the thread name now belongs to a different
+// incarnation than the snapshot a step or prune pass started from. The
+// snapshot's turns, board, timers and spend must not be written to it.
+var errStaleIncarnation = errors.New("thread incarnation changed")
+
+// currentThread re-reads a thread and rejects it when the name was deleted
+// and recreated since snapshot was taken.
+func (s *Server) currentThread(ctx context.Context, snapshot *v1.BlipThread) (*v1.BlipThread, error) {
+	current := &v1.BlipThread{}
+	if err := s.Get(ctx, client.ObjectKeyFromObject(snapshot), current); err != nil {
+		return nil, err
+	}
+	if snapshot.UID != "" && current.UID != snapshot.UID {
+		return nil, errStaleIncarnation
+	}
+	return current, nil
+}
 
 // logError logs when a logger was configured. Tests construct Server values
 // without one, and a zero logr.Logger panics on use.
@@ -255,7 +274,7 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 	}
 	if thread.Spec.DailyTokens > 0 && tokensToday >= thread.Spec.DailyTokens {
 		st.paused = budgetPauseReason
-		return s.commit(ctx, st, thread.Status.ConsumedSeq, pending, started)
+		return s.commitStep(ctx, st, thread.Status.ConsumedSeq, pending, started)
 	}
 
 	// Consume due timers: their notes are part of this step's input.
@@ -323,22 +342,39 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 			break
 		}
 	}
-	if err := s.commit(ctx, st, target, pending, started); err != nil {
+	if err := s.commitStep(ctx, st, target, pending, started); err != nil {
 		s.chargeUsage(ctx, thread, st.usage)
 		return err
 	}
 	return nil
 }
 
+// commitStep commits a finished step. A thread deleted and recreated while
+// the completion was in flight is left untouched: the step belongs to the
+// previous incarnation, whose turn history and board are already gone.
+func (s *Server) commitStep(ctx context.Context, st *step, target int64, pending []v1.BlipTurn, started time.Time) error {
+	err := s.commit(ctx, st, target, pending, started)
+	if errors.Is(err, errStaleIncarnation) {
+		return nil
+	}
+	return err
+}
+
 // commit writes the step's coordinator turns and then one thread status
 // update. Turns are named by step start so retries are idempotent.
 func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.BlipTurn, started time.Time) error {
+	// Abandon before creating any coordinator turn when the name already
+	// belongs to another incarnation. createTurnIn repeats the UID check so a
+	// deletion racing this commit cannot attach replies to the new thread.
+	if _, err := s.currentThread(ctx, st.thread); err != nil {
+		return err
+	}
 	key := &ThreadKey{Namespace: st.thread.Namespace, Name: st.thread.Name}
 	prefix := fmt.Sprintf("coord-%s-%d", Owner(key), started.Unix())
 	for i := range st.replies {
 		spec := st.replies[i]
 		if err := createTurnIn(ctx, s.Client, st.thread.Namespace, fmt.Sprintf("%s-%d", prefix, i), turnSpec{
-			Thread: spec.Thread, AuthorKind: spec.Author.Kind, AuthorName: spec.Author.Name,
+			Thread: spec.Thread, ThreadUID: string(st.thread.UID), AuthorKind: spec.Author.Kind, AuthorName: spec.Author.Name,
 			Topic: spec.Topic, Text: spec.Text, InReplyTo: spec.InReplyTo, Wake: v1.WakeNone,
 		}); err != nil {
 			return err
@@ -348,8 +384,8 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 	today := started.UTC().Format("2006-01-02")
 	next := nextWake(st, started)
 	for attempt := 0; attempt < 5; attempt++ {
-		current := &v1.BlipThread{}
-		if err := s.Get(ctx, client.ObjectKeyFromObject(st.thread), current); err != nil {
+		current, err := s.currentThread(ctx, st.thread)
+		if err != nil {
 			return err
 		}
 		current.Status.ConsumedSeq = target
@@ -364,7 +400,9 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 			current.Status.TokensToday = 0
 		}
 		current.Status.TokensToday += tokens
-		if st.paused != "" {
+		// A pause set while the step ran (an operator hold) is not ours to
+		// replace: only install the budget pause on an otherwise idle thread.
+		if st.paused != "" && current.Status.Paused == nil {
 			current.Status.Paused = &v1.ThreadPause{Reason: st.paused}
 		}
 		if err := s.Status().Update(ctx, current); err != nil {
@@ -387,8 +425,8 @@ func (s *Server) chargeUsage(ctx context.Context, thread *v1.BlipThread, usage i
 	}
 	today := timeNow().UTC().Format("2006-01-02")
 	for attempt := 0; attempt < 5; attempt++ {
-		current := &v1.BlipThread{}
-		if err := s.Get(ctx, client.ObjectKeyFromObject(thread), current); err != nil {
+		current, err := s.currentThread(ctx, thread)
+		if err != nil {
 			return
 		}
 		if current.Status.TokenDay != today {
@@ -461,7 +499,8 @@ func systemPrompt(thread *v1.BlipThread) string {
 // highest turn sequence it actually rendered, so the caller never consumes a
 // turn the coordinator did not see. When the turns do not fit the budget, the
 // newest turns win: they are the ones most likely to be actionable, and the
-// notice reports exactly how many older turns were left out.
+// older turns are summarized so the notice is accurate and consuming them
+// does not silently lose input.
 func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTurn, timers []v1.ThreadTimer, summary string) (string, int64) {
 	var b strings.Builder
 	b.WriteString("Task board:\n")
@@ -501,6 +540,53 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 		return b.String(), 0
 	}
 
+	last := boardTurns(&b, turns, 48000-b.Len())
+	return b.String(), last
+}
+
+// summarizeTurn renders a compact one-line form of a turn. It keeps the
+// sequence, author, and topic plus a short excerpt so a prompt that cannot fit
+// the full text still shows the coordinator that the turn happened.
+func summarizeTurn(t *v1.BlipTurn, excerpt int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "#%d %s/%s %s", t.Status.Seq, t.Spec.Author.Kind, t.Spec.Author.Name, t.Spec.Topic)
+	if t.Spec.Text != "" && excerpt > 0 {
+		fmt.Fprintf(&b, ": %s", truncateRunes(t.Spec.Text, excerpt))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// summarizeTurns fits a compact form of every turn into budget. It reports
+// false when even the metadata-only summaries do not fit: the caller must then
+// render a prefix and leave the rest pending rather than consuming turns it
+// cannot show.
+func summarizeTurns(turns []v1.BlipTurn, budget int) (string, bool) {
+	if budget <= 0 {
+		return "", false
+	}
+	for _, excerpt := range []int{240, 120, 60, 0} {
+		var b strings.Builder
+		for i := range turns {
+			b.WriteString(summarizeTurn(&turns[i], excerpt))
+		}
+		if b.Len() <= budget {
+			return b.String(), true
+		}
+	}
+	return "", false
+}
+
+// boardTurns renders the turn section under budget and returns the highest
+// sequence it showed. Newest-wins: the suffix that fits is rendered in full,
+// and the older turns are summarized so consuming them loses no input
+// silently. When the older turns cannot be represented even compactly, the
+// oldest turns are rendered instead and the newer ones stay pending, because
+// consumedSeq can only advance over a contiguous prefix that was shown.
+func boardTurns(b *strings.Builder, turns []v1.BlipTurn, budget int) int64 {
+	if len(turns) == 0 {
+		return 0
+	}
 	lines := make([]string, len(turns))
 	for i := range turns {
 		line := renderTurn(&turns[i])
@@ -509,18 +595,145 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 		}
 		lines[i] = line + "\n"
 	}
-	// Walk backwards from the newest turn, reserving room for an accurate
-	// notice about the older turns that will not fit. Keep at least the
-	// newest turn even when the board alone is already over budget, so a step
-	// always has something it may consume.
-	budget := 48000 - b.Len()
-	start := len(turns)
+	if budget < 0 {
+		budget = 0
+	}
+	start, used := suffixTurns(lines, budget)
+	// A turn that asked to wake the coordinator must not be dropped in favour
+	// of newer context: it is the input this step exists for. When one is
+	// outside the newest suffix, render the contiguous prefix through it and
+	// consume only that prefix so the skipped context stays pending.
+	keepEnd := -1
+	for i := 0; i < start; i++ {
+		if turns[i].Spec.Wake != v1.WakeNone {
+			keepEnd = i
+		}
+	}
+	if keepEnd >= 0 {
+		return renderWakePrefix(b, turns, lines, budget, start, keepEnd)
+	}
+	if start == 0 {
+		for i := range lines {
+			b.WriteString(lines[i])
+		}
+		return turns[len(turns)-1].Status.Seq
+	}
+	notice := fmt.Sprintf("(%d older turns summarized)\n", start)
+	if summaries, ok := summarizeTurns(turns[:start], budget-used-len(notice)); ok {
+		b.WriteString(notice)
+		b.WriteString(summaries)
+		for i := start; i < len(lines); i++ {
+			b.WriteString(lines[i])
+		}
+		return turns[len(turns)-1].Status.Seq
+	}
+	// The omitted turns cannot be shown in any form. Rendering the newest
+	// suffix would consume them without ever presenting them, so render the
+	// oldest turns and leave the newer ones for a later step instead. Any
+	// wake turn in the pending suffix is still shown compactly, but the
+	// returned sequence stops at the rendered prefix so it stays pending.
+	omittedStart := start
+	start = 0
+	used = 0
+	for start < len(turns) {
+		rest := len(turns) - start - 1
+		notice := 0
+		if rest > 0 {
+			notice = len(fmt.Sprintf("(%d newer turns left for a later step)\n", rest))
+		}
+		if used+len(lines[start])+notice > budget {
+			break
+		}
+		used += len(lines[start])
+		start++
+	}
+	if start == 0 {
+		start = 1
+	}
+	if rest := len(turns) - start; rest > 0 {
+		fmt.Fprintf(b, "(%d newer turns left for a later step)\n", rest)
+	}
+	for i := 0; i < start; i++ {
+		b.WriteString(lines[i])
+	}
+	for i := omittedStart; i < len(turns); i++ {
+		if turns[i].Spec.Wake != v1.WakeNone {
+			fmt.Fprintf(b, "(wake turn %d shown, left for a later step)\n", turns[i].Status.Seq)
+			b.WriteString(summarizeTurn(&turns[i], 0))
+		}
+	}
+	return turns[start-1].Status.Seq
+}
+
+// renderWakePrefix renders a contiguous prefix through the last omitted wake
+// turn plus as much of the newest suffix as fits. It returns the highest
+// sequence of the contiguous rendered prefix; gaps stay pending.
+func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, budget, newestStart, keepEnd int) int64 {
+	rendered := make([]bool, len(turns))
+	for i := newestStart; i < len(turns); i++ {
+		rendered[i] = true
+	}
+	prefix := 0
+	for i := 0; i <= keepEnd; i++ {
+		prefix += len(lines[i])
+	}
+	if prefix <= budget {
+		for i := 0; i <= keepEnd; i++ {
+			rendered[i] = true
+		}
+		if remaining := budget - prefix; remaining > 0 {
+			s, _ := suffixTurns(lines[keepEnd+1:], remaining)
+			for i := s + keepEnd + 1; i < len(turns); i++ {
+				rendered[i] = true
+			}
+		}
+	} else {
+		// The context before the wake turn is itself over budget. Keep every
+		// wake turn, but never consume across a gap.
+		for i := 0; i <= keepEnd; i++ {
+			rendered[i] = turns[i].Spec.Wake != v1.WakeNone
+		}
+	}
+	lastRendered := int64(0)
+	for i := 0; i < len(turns); i++ {
+		if !rendered[i] {
+			break
+		}
+		lastRendered = turns[i].Status.Seq
+	}
+	gap := 0
+	for i := 0; i < len(turns); i++ {
+		if !rendered[i] {
+			gap++
+			continue
+		}
+		if gap > 0 {
+			if i == gap {
+				fmt.Fprintf(b, "(%d older turns omitted)\n", gap)
+			} else {
+				fmt.Fprintf(b, "(%d context turns omitted)\n", gap)
+			}
+			gap = 0
+		}
+		b.WriteString(lines[i])
+	}
+	if gap > 0 {
+		fmt.Fprintf(b, "(%d newer turns omitted)\n", gap)
+	}
+	return lastRendered
+}
+
+// suffixTurns returns the index where the newest suffix of lines that fits
+// budget begins, along with the bytes it uses. It keeps at least the newest
+// line so a step always has something it may consume.
+func suffixTurns(lines []string, budget int) (int, int) {
+	start := len(lines)
 	used := 0
 	for start > 0 {
 		i := start - 1
 		notice := 0
 		if i > 0 {
-			notice = len(fmt.Sprintf("(%d older turns omitted)\n", i))
+			notice = len(fmt.Sprintf("(%d older turns summarized)\n", i))
 		}
 		if used+len(lines[i])+notice > budget {
 			break
@@ -528,16 +741,10 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 		used += len(lines[i])
 		start = i
 	}
-	if start == len(turns) {
-		start = len(turns) - 1
+	if start == len(lines) && len(lines) > 0 {
+		start = len(lines) - 1
 	}
-	if start > 0 {
-		fmt.Fprintf(&b, "(%d older turns omitted)\n", start)
-	}
-	for i := start; i < len(turns); i++ {
-		b.WriteString(lines[i])
-	}
-	return b.String(), turns[len(turns)-1].Status.Seq
+	return start, used
 }
 
 func openState(open bool) string {
@@ -568,6 +775,18 @@ func (s *Server) maybeUnpause(ctx context.Context, thread *v1.BlipThread) {
 
 // prune deletes consumed turns past retention and old closed tasks.
 func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
+	// The Steps list snapshot can be minutes old when an earlier step in the
+	// same tick ran long. If the name was deleted and recreated, this pass
+	// belongs to an incarnation that no longer exists: sweeping with the old
+	// UID would delete the new thread's turns and restore its old board.
+	live, err := s.currentThread(ctx, thread)
+	if err != nil {
+		if apierrors.IsNotFound(err) || errors.Is(err, errStaleIncarnation) {
+			return nil
+		}
+		return err
+	}
+	*thread = *live
 	now := timeNow()
 	// Turns sequenced by a previous incarnation of a recreated thread are
 	// not history of this one. Delete them regardless of age or sequence.
@@ -598,7 +817,12 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 	kept := 0
 	for i := len(turns) - 1; i >= 0; i-- {
 		t := &turns[i]
-		if t.Status.Seq > thread.Status.ConsumedSeq || kept < keepTurns {
+		// A sequence above consumedSeq only marks pending *input*.
+		// pendingTurns excludes coordinator output, so a timer-driven note
+		// or reply above consumedSeq must still age out; otherwise a thread
+		// whose steps emit notes keeps every one of them forever.
+		pending := t.Status.Seq > thread.Status.ConsumedSeq && t.Spec.Author.Kind != v1.TurnAuthorCoordinator
+		if pending || kept < keepTurns {
 			kept++
 			continue
 		}
@@ -640,8 +864,8 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 		keptTasks = append(keptTasks[:oldest], keptTasks[oldest+1:]...)
 	}
 	if len(keptTasks) != len(thread.Status.Tasks) {
-		current := &v1.BlipThread{}
-		if err := s.Get(ctx, client.ObjectKeyFromObject(thread), current); err != nil {
+		current, err := s.currentThread(ctx, thread)
+		if err != nil {
 			return err
 		}
 		current.Status.Tasks = keptTasks

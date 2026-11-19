@@ -261,7 +261,10 @@ func (s *step) startTask(ctx context.Context, taskID, prompt, from string) (stri
 	}
 	active := 0
 	for i := range running.Items {
-		if !v1.Finished(&running.Items[i]) {
+		// The thread label is self-asserted; require the derived owner too,
+		// like exec/stop/inspect, so a foreign Blip cannot consume this
+		// thread's concurrency budget.
+		if belongsToThread(&running.Items[i], s.thread) && !v1.Finished(&running.Items[i]) {
 			active++
 		}
 	}
@@ -404,6 +407,9 @@ func (s *Server) blipList(ctx context.Context, thread *v1.BlipThread) (string, e
 	var b strings.Builder
 	for i := range blips.Items {
 		x := &blips.Items[i]
+		if !belongsToThread(x, thread) {
+			continue
+		}
 		fmt.Fprintf(&b, "%s task=%s phase=%s", x.Name, x.Labels[v1.LabelTask], x.Status.Phase)
 		if r := x.Status.Report; r != nil {
 			_, summary := reportFields(r.Text)

@@ -56,6 +56,7 @@ spec:
               cpus:
                 default: 2
                 format: int32
+                maximum: 2147483647
                 minimum: 1
                 type: integer
               endpoints:
@@ -129,6 +130,7 @@ spec:
                 description: MaxCount caps vacant plus claimed VM pods. 0 means no
                   cap.
                 format: int32
+                maximum: 2147483647
                 minimum: 0
                 type: integer
               memory:
@@ -136,8 +138,16 @@ spec:
                 - type: integer
                 - type: string
                 default: 2Gi
+                description: |-
+                  Memory is the guest RAM. It must be positive: the controller adds the
+                  VMM overhead, so a negative value would make the pod request negative
+                  memory and the pool would never create a VM.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: memory must be greater than 0
+                  rule: 'type(self) == string ? quantity(self).isGreaterThan(quantity(''0''))
+                    : self > 0'
               network:
                 description: |-
                   Network is the maximum egress allowed for this pool. Omitted applies the
@@ -396,7 +406,11 @@ spec:
                 minProperties: 1
                 type: object
               serviceAccountName:
-                description: ServiceAccountName is the identity of VMs in this pool.
+                description: |-
+                  ServiceAccountName is the identity of VMs in this pool. It is capped
+                  below the generic 253-character DNS limit so the "sa.<name>" key in the
+                  VM owner ConfigMap fits the 253-character key limit.
+                maxLength: 250
                 type: string
               tolerations:
                 items:
@@ -440,6 +454,7 @@ spec:
                 description: WarmCount is the number of vacant, booted VMs to keep
                   ready.
                 format: int32
+                maximum: 2147483647
                 minimum: 0
                 type: integer
             required:
@@ -449,6 +464,8 @@ spec:
             properties:
               claimed:
                 format: int32
+                maximum: 2147483647
+                minimum: 0
                 type: integer
               message:
                 description: Message is a human-readable explanation of Reason.
@@ -456,6 +473,8 @@ spec:
               ready:
                 description: Ready counts vacant VMs that finished booting.
                 format: int32
+                maximum: 2147483647
+                minimum: 0
                 type: integer
               reason:
                 description: |-
@@ -465,6 +484,8 @@ spec:
                 type: string
               vacant:
                 format: int32
+                maximum: 2147483647
+                minimum: 0
                 type: integer
             type: object
         type: object

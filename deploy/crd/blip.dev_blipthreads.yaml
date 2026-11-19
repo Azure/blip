@@ -27,6 +27,11 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
+        description: |-
+          The controller records each thread as "thread.<name>" in the VM owner
+          ConfigMap, whose keys are limited to 253 characters. Reject a name that
+          cannot be represented there: one such thread used to make the whole table
+          patch invalid and stop every pool in the namespace from reconciling.
         properties:
           apiVersion:
             description: |-
@@ -55,7 +60,9 @@ spec:
               base:
                 description: |-
                   Base is the BlipState new task blips fork from, when the coordinator
-                  does not choose another one.
+                  does not choose another one. Empty selects the coordinator's default.
+                maxLength: 253
+                pattern: ^$|^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string
               charter:
                 description: |-
@@ -85,6 +92,7 @@ spec:
                 description: MaxRunning caps concurrently running blips labelled with
                   this thread.
                 format: int32
+                maximum: 2147483647
                 minimum: 1
                 type: integer
               model:
@@ -93,7 +101,9 @@ spec:
                 type: string
               pool:
                 description: Pool is the BlipPool tasks run in.
+                maxLength: 253
                 minLength: 1
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string
               retention:
                 description: Retention bounds the history blipchat keeps for this
@@ -110,12 +120,14 @@ spec:
                     description: KeepTurns is the minimum number of turns kept per
                       thread.
                     format: int32
+                    maximum: 2147483647
                     minimum: 0
                     type: integer
                   maxTasks:
                     description: MaxTasks caps the task board. The oldest closed tasks
                       are pruned first.
                     format: int32
+                    maximum: 2147483647
                     minimum: 0
                     type: integer
                   turns:
@@ -253,6 +265,11 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: thread names must be at most 246 characters to fit the VM owner
+            table
+          rule: '!has(self.metadata) || !has(self.metadata.name) || self.metadata.name.size()
+            <= 246'
     served: true
     storage: true
     subresources:

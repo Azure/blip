@@ -83,6 +83,13 @@ type storageDevices interface {
 }
 
 func (s *Store) runOperation(steps []deviceEffect, fill func(string) error) error {
+	return s.runOperationContext(context.Background(), steps, fill)
+}
+
+// runOperationContext runs an operation and stops before the next ordinary
+// step once ctx is done. Compensations (Always) and teardown steps still run
+// so a cancelled build removes the devices and thin volume it created.
+func (s *Store) runOperationContext(ctx context.Context, steps []deviceEffect, fill func(string) error) error {
 	s.mu.Lock()
 	err := s.metadataErr
 	s.mu.Unlock()
@@ -100,12 +107,15 @@ func (s *Store) runOperation(steps []deviceEffect, fill func(string) error) erro
 			err = s.beforeTeardown()
 		}
 		if err == nil {
-			if e.Kind == eFill {
+			switch {
+			case ctx.Err() != nil && !e.Always && !e.Teardown:
+				err = ctx.Err()
+			case e.Kind == eFill:
 				err = fill(mapperPath(e.Name))
-			} else if s.devices != nil {
+			case s.devices != nil:
 				err = s.devices.Apply(e)
-			} else {
-				err = applyDeviceEffect(e)
+			default:
+				err = applyDeviceEffectContext(ctx, e)
 			}
 		}
 		m.complete(err)
@@ -113,6 +123,10 @@ func (s *Store) runOperation(steps []deviceEffect, fill func(string) error) erro
 }
 
 func applyDeviceEffect(e deviceEffect) error {
+	return applyDeviceEffectContext(context.Background(), e)
+}
+
+func applyDeviceEffectContext(ctx context.Context, e deviceEffect) error {
 	id := strconv.FormatUint(uint64(e.Thin), 10)
 	switch e.Kind {
 	case eCreateThin:
@@ -141,9 +155,9 @@ func applyDeviceEffect(e deviceEffect) error {
 		_, err := dmsetup("mknodes", e.Name)
 		return err
 	case eFormat:
-		return mkfsExt4(mapperPath(e.Name))
+		return mkfsExt4(ctx, mapperPath(e.Name))
 	case eGrow:
-		return growExt4(mapperPath(e.Name), e.Reproducible)
+		return growExt4(ctx, mapperPath(e.Name), e.Reproducible)
 	case eDiscard:
 		return discardOutside(mapperPath(e.Name), e.Regions, e.Size)
 	case eMessage:

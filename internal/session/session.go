@@ -18,6 +18,11 @@ import (
 // chance to report an outcome.
 var ErrUnreachable = errors.New("the VM is not reachable; it may have stopped or crashed")
 
+// ErrRequestTooLarge means the open request does not fit in one wire frame.
+// It is a local validation error: nothing was sent, so retrying cannot help
+// and the VM cannot be at fault.
+var ErrRequestTooLarge = errors.New("request too large")
+
 // Connector opens a byte stream to the guest session port of a VM pod. The
 // stream lives until it is closed or ctx is done. Callers that must still
 // signal a guest after their own request is gone have to pass a context that
@@ -41,6 +46,13 @@ func (c *Client) Open(ctx context.Context, namespace, pod string, o wire.Open) (
 	conn := wire.NewConn(rwc)
 	if err := conn.WriteJSON(wire.TOpen, o); err != nil {
 		rwc.Close()
+		var sizeErr *wire.FrameSizeError
+		if errors.As(err, &sizeErr) {
+			// argv and env share one Open frame. Rejecting it locally must
+			// not look like a VM lifecycle race: a retry reusing OpenID
+			// would fail the same way.
+			return nil, fmt.Errorf("%w: %d bytes exceeds the %d-byte frame limit; argv and env are sent in one frame", ErrRequestTooLarge, sizeErr.Size, wire.MaxFrame)
+		}
 		// A pod that stopped between ensure and exec can close the pipe
 		// here. A transport error does not prove the guest saw no bytes:
 		// retries must preserve OpenID even when the request write failed.

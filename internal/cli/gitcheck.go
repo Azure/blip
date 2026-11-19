@@ -159,6 +159,13 @@ func warnGitWorktree(ctx context.Context, repo, display, branch string, errOut i
 // fetchBranch fetches branch from repo into the repository at cwd under the
 // same local name.
 func fetchBranch(ctx context.Context, in io.Reader, out, errOut io.Writer, cwd, repo, branch string) error {
+	// Git refuses to fetch over a branch that a worktree has checked out,
+	// because updating the ref would desynchronise that worktree.
+	// --update-head-ok would do exactly that, so report the conflict before
+	// running fetch instead of surfacing a raw exit status.
+	if at, ok := branchWorktree(ctx, cwd, branch); ok {
+		return fmt.Errorf("cannot collect branch %q: it is checked out at %s; switch that worktree to another branch first, or collect a different branch", branch, at)
+	}
 	// The caller's working directory may be a subdirectory of the
 	// repository. Fetch from the repository root instead.
 	if top, err := gitRepoRoot(ctx, repo); err == nil {
@@ -179,6 +186,27 @@ func fetchBranch(ctx context.Context, in io.Reader, out, errOut io.Writer, cwd, 
 		return fmt.Errorf("git fetch %s %s: %w", repo, branch, err)
 	}
 	return nil
+}
+
+// branchWorktree returns the path of the caller worktree that has branch
+// checked out, if any. It uses the same worktree list git consults when it
+// refuses a fetch, so linked worktrees are covered too.
+func branchWorktree(ctx context.Context, cwd, branch string) (string, bool) {
+	out, err := exec.CommandContext(ctx, "git", "-C", cwd, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return "", false
+	}
+	var path string
+	for _, line := range strings.Split(string(out), "\n") {
+		if p, ok := strings.CutPrefix(line, "worktree "); ok {
+			path = strings.TrimSpace(p)
+			continue
+		}
+		if line == "branch refs/heads/"+branch {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 // gitRepoRoot returns the repository containing repo.

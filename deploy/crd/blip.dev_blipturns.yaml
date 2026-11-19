@@ -127,8 +127,10 @@ spec:
                 description: |-
                   Thread is the name of a BlipThread in the same namespace. It must be a
                   valid thread (DNS subdomain) name so a typo cannot create a turn that
-                  no thread can ever claim.
-                maxLength: 253
+                  no thread can ever claim. It is capped below the generic 253-character
+                  DNS limit so the corresponding "thread.<name>" key in the VM owner
+                  ConfigMap fits the 253-character key limit.
+                maxLength: 246
                 minLength: 1
                 pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                 type: string
@@ -153,7 +155,13 @@ spec:
             - thread
             type: object
           status:
-            description: BlipTurnStatus is written only by blipchat.
+            description: |-
+              BlipTurnStatus is written only by blipchat.
+
+              The struct-level rule makes seq immutable once it has been set. A rule on
+              the seq property alone does not run when seq is removed: a status writer
+              could clear it with `seq: null`, and the sequencer would then stamp a later
+              sequence, reordering the thread's history.
             properties:
               acceptedTime:
                 description: AcceptedTime is when blipchat sequenced the turn.
@@ -184,6 +192,11 @@ spec:
                   by the old incarnation are ignored rather than adopted as history.
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: seq is immutable once set
+              optionalOldSelf: true
+              rule: '!oldSelf.hasValue() || (has(self.seq) == has(oldSelf.value().seq)
+                && (!has(self.seq) || self.seq == oldSelf.value().seq))'
         type: object
         x-kubernetes-validations:
         - message: turns are immutable

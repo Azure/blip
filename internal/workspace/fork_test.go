@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"strings"
@@ -76,7 +77,9 @@ func TestForkWorkspaceSnapshot(t *testing.T) {
 		if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: m.State}, &child); err != nil {
 			t.Fatal(err)
 		}
-		if child.Spec.CopyFrom != src.Spec.Mounts[i].State || child.Spec.Runtime != nil || len(child.Spec.Mounts) != 0 || len(child.OwnerReferences) != 0 || child.Labels[v1alpha1.LabelOwner] != "alice" || child.Spec.Replicas != 2 || child.Spec.Size != nil {
+		if child.Spec.CopyFrom != src.Spec.Mounts[i].State || child.Spec.Runtime != nil || len(child.Spec.Mounts) != 0 ||
+			len(child.OwnerReferences) != 1 || child.OwnerReferences[0].Kind != "BlipState" || child.OwnerReferences[0].Name != dest.Name ||
+			child.Labels[v1alpha1.LabelOwner] != "alice" || child.Spec.Replicas != 2 || child.Spec.Size != nil {
 			t.Fatalf("child: %+v", child)
 		}
 	}
@@ -307,6 +310,105 @@ func TestChildNamesBoundedAndDistinct(t *testing.T) {
 	root.Name += "x"
 	if name == childName(root, mount) {
 		t.Fatal("truncated names collide")
+	}
+}
+
+// TestDurableForkCopiesOwnedByRoot reproduces a --keep fork: the root has no
+// owner (it must outlive its Blip), but every hidden writable-mount copy is
+// owned by the root so deleting the workspace root removes the copies too.
+func TestDurableForkCopiesOwnedByRoot(t *testing.T) {
+	ctx := context.Background()
+	src := testState("src")
+	src.Spec.Mounts = []v1alpha1.Mount{
+		{State: "repo", Path: "/work", Writable: true},
+		{State: "cache", Path: "/cache", Writable: true},
+		{State: "tools", Path: "/tools"},
+	}
+	base := testClient(t, src, testState("repo"), testState("cache"), testState("tools"))
+	created := 0
+	c := interceptor.NewClient(base, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+		created++
+		// The API server assigns UIDs; the fake client does not.
+		obj.SetUID(types.UID(fmt.Sprintf("uid-%d", created)))
+		return c.Create(ctx, obj, opts...)
+	}})
+	dest := testState("keep")
+	states, err := Fork(ctx, c, src, dest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 3 {
+		t.Fatalf("created %d states", len(states))
+	}
+	root := states[len(states)-1]
+	if root.Name != dest.Name || root.UID != "uid-3" {
+		t.Fatalf("root %q uid %q", root.Name, root.UID)
+	}
+	if len(root.OwnerReferences) != 0 {
+		t.Fatalf("durable root has an owner: %+v", root.OwnerReferences)
+	}
+	for _, st := range states[:len(states)-1] {
+		var live v1alpha1.BlipState
+		if err := base.Get(ctx, client.ObjectKeyFromObject(st), &live); err != nil {
+			t.Fatal(err)
+		}
+		for _, ref := range [][]metav1.OwnerReference{st.OwnerReferences, live.OwnerReferences} {
+			if len(ref) != 1 || ref[0].Kind != "BlipState" || ref[0].Name != root.Name ||
+				ref[0].UID != root.UID || ref[0].APIVersion != v1alpha1.GroupVersion.String() {
+				t.Fatalf("copy %q owner references: %+v", st.Name, ref)
+			}
+		}
+	}
+}
+
+// TestForkRejectsDanglingReadOnlyMount verifies that --from validates every
+// mount reference it copies, not only the writable ones it snapshots. A
+// read-only reference to a state that is gone or going away would otherwise
+// produce a fork that reports success but cannot start.
+func TestForkRejectsDanglingReadOnlyMount(t *testing.T) {
+	now := metav1.Now()
+	for _, tc := range []struct {
+		name  string
+		state *v1alpha1.BlipState
+		want  string
+	}{
+		{"missing", nil, "not found"},
+		{"deleting", &v1alpha1.BlipState{
+			ObjectMeta: metav1.ObjectMeta{Name: "ro", Namespace: "ns", DeletionTimestamp: &now, Finalizers: []string{"hold"}},
+		}, "being deleted"},
+		{"failed", &v1alpha1.BlipState{
+			ObjectMeta: metav1.ObjectMeta{Name: "ro", Namespace: "ns"},
+			Status:     v1alpha1.BlipStateStatus{Phase: v1alpha1.StateFailed, Message: "import failed"},
+		}, "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			src := testState("src")
+			src.Spec.Mounts = []v1alpha1.Mount{{State: "ro", Path: "/ro"}}
+			objects := []client.Object{src}
+			if tc.state != nil {
+				objects = append(objects, tc.state)
+			}
+			c := testClient(t, objects...)
+			dest := testState("fork")
+			states, err := Fork(ctx, c, src, dest, nil)
+			if err == nil || !strings.Contains(err.Error(), `"ro"`) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error: %v", err)
+			}
+			if states != nil {
+				t.Fatalf("returned %d states on rejection", len(states))
+			}
+			var list v1alpha1.BlipStateList
+			if err := c.List(ctx, &list); err != nil {
+				t.Fatal(err)
+			}
+			if len(list.Items) != len(objects) {
+				t.Fatalf("rejection created states: %+v", list.Items)
+			}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(dest), &v1alpha1.BlipState{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("destination created: %v", err)
+			}
+		})
 	}
 }
 

@@ -280,6 +280,10 @@ func TestIdentityHeadersAndTokenRotation(t *testing.T) {
 			"X-Auth-Request-User", "X-Auth-Request-Groups", "Remote-User", "Remote-Groups", "Remote-Email",
 			"Tailscale-User-Login", "Tailscale-User-Name", "Cf-Access-Authenticated-User-Email",
 			"Cf-Access-Jwt-Assertion", "X-Authentik-Username", "X-Ssl-Client-S-Dn", "Client-Cert", "X-Pomerium-Jwt-Assertion",
+			"X-Amzn-Oidc-Data", "X-Amzn-Oidc-Identity", "X-Amzn-Oidc-Accesstoken",
+			"X-Ms-Token-Aad-Access-Token", "X-Auth-Email", "X-Authenticated-User", "X-Scope", "X-Userinfo",
+			// Underscore spellings that frameworks expose as HTTP_X_*.
+			"X_User", "X_Forwarded_User", "X_Remote_User",
 		} {
 			req.Header.Set(key, "caller-controlled")
 		}
@@ -830,6 +834,20 @@ func TestStripIdentity(t *testing.T) {
 		{"X-Envoy-Peer-Metadata", false},
 		{"X-User", false},
 		{"X-Email", false},
+		// AWS ALB OIDC and Azure AD assertion families.
+		{"X-Amzn-Oidc-Data", false},
+		{"X-Amzn-Oidc-Identity", false},
+		{"X-Amzn-Oidc-Accesstoken", false},
+		{"X-Ms-Token-Aad-Access-Token", false},
+		{"X-Auth-Email", false},
+		{"X-Authenticated-User", false},
+		{"X-Scope", false},
+		{"X-Userinfo", false},
+		// Underscore spellings must not bypass the denylist.
+		{"X_User", false},
+		{"X_Forwarded_User", false},
+		{"X_Remote_User", false},
+		{"X_Auth_Email", false},
 		{"Authorization", false},
 		{"X-Forwarded-For", false},
 		{"X-Remote-User", false},
@@ -840,6 +858,7 @@ func TestStripIdentity(t *testing.T) {
 		{"X-Safe", true},
 		{"X-Client-Version", true},
 		{"X-Email-Digest", true},
+		{"X-Scope-Id", true},
 	} {
 		headers := http.Header{}
 		// Store the spelling as written so matching is genuinely

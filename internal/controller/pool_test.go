@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/podapi"
@@ -1094,12 +1095,49 @@ func TestPoolPinsDurableCopiesOfSharedBase(t *testing.T) {
 // TestPoolMaxCountCapsWarmCount checks that a pool edited below its warm
 // count does not keep more vacant VMs than maxCount allows.
 func TestPoolMaxCountCapsWarmCount(t *testing.T) {
-	e := newEnv(t)
-	e.newPool("default", 4, 2)
-	e.run(e.pool, ns, "default")
-	if n := len(e.pods()); n != 2 {
-		t.Errorf("%d pods, want maxCount 2", n)
-	}
+	t.Run("warm count over cap", func(t *testing.T) {
+		e := newEnv(t)
+		e.newPool("default", 4, 2)
+		e.run(e.pool, ns, "default")
+		if n := len(e.pods()); n != 2 {
+			t.Errorf("%d pods, want maxCount 2", n)
+		}
+	})
+
+	// Claimed VMs share the cap with vacant spares. Lowering maxCount below
+	// claimed+warm must delete the surplus spares instead of keeping
+	// maxCount of them in addition to every claimed VM.
+	t.Run("claimed pod over cap", func(t *testing.T) {
+		e := newEnv(t)
+		e.addNodes("n1")
+		e.newPool("default", 2, 2)
+		pool := e.getPool("default")
+
+		claimed := e.pool.podFor(pool, "default-claimed")
+		claimed.Spec.NodeName = "n1"
+		claimed.Status.Phase = corev1.PodRunning
+		claimed.Labels[v1.LabelBlipUID] = "uid-claimed"
+		e.create(claimed)
+		for i := range 2 {
+			p := e.pool.podFor(pool, fmt.Sprintf("default-spare-%d", i))
+			p.Spec.NodeName = "n1"
+			p.Status.Phase = corev1.PodRunning
+			p.Labels[v1.LabelWarm] = "true"
+			e.create(p)
+		}
+
+		e.run(e.pool, ns, "default")
+		if n := len(e.pods()); n != 2 {
+			t.Fatalf("%d pods, want 2 (one claimed plus one spare) within maxCount", n)
+		}
+		if e.podGone(claimed.Name) {
+			t.Error("claimed VM deleted; the cap only removes vacant spares")
+		}
+		want := v1.BlipPoolStatus{Ready: 1, Vacant: 1, Claimed: 1}
+		if got := e.getPool("default").Status; got != want {
+			t.Errorf("status %+v, want %+v", got, want)
+		}
+	})
 }
 
 // TestPoolDemand checks that only Blips that can use this pool create
@@ -1193,6 +1231,7 @@ func TestBrokenSidecarIsNotReadyOrClaimable(t *testing.T) {
 	if len(pods) != 1 {
 		t.Fatalf("pods = %d, want 1", len(pods))
 	}
+	broken := pods[0]
 	p := pods[0]
 	p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady"}}
 	e.must(e.c.Status().Update(e.ctx, &p))
@@ -1207,5 +1246,96 @@ func TestBrokenSidecarIsNotReadyOrClaimable(t *testing.T) {
 	b := e.getBlip("b")
 	if b.Status.Pod != "" || b.Status.Phase != v1.BlipPending {
 		t.Fatalf("blip claimed a pod with a broken sidecar: phase %s pod %q", b.Status.Phase, b.Status.Pod)
+	}
+
+	// The unready spare cannot satisfy the waiting Blip, so it must not
+	// suppress the replacement the uncapped pool can boot.
+	e.run(e.pool, ns, "default")
+	pods = e.pods()
+	if len(pods) != 2 {
+		t.Fatalf("%d pods, want the broken spare and a replacement: %+v", len(pods), pods)
+	}
+	if pool := e.getPool("default"); pool.Status.Ready != 0 || pool.Status.Vacant != 2 {
+		t.Fatalf("pool status = %+v, want ready 0 vacant 2", pool.Status)
+	}
+
+	e.warmOn("n1")
+	for _, p := range e.pods() {
+		if p.Name != broken.Name && isVacant(&p) {
+			e.observe(p.Name, podapi.Observed{Phase: podapi.PhaseWarm})
+		}
+	}
+	e.run(e.blip, ns, "b")
+	b = e.getBlip("b")
+	if b.Status.Pod == "" || b.Status.Pod == broken.Name {
+		t.Fatalf("blip did not claim the replacement: pod %q", b.Status.Pod)
+	}
+	expectPhase(t, b, v1.BlipPending, ReasonStarting)
+}
+
+// TestPoolRetiresPermanentlyNotReadySpare covers a spare that never becomes
+// ready in a capped pool: it consumed the only maxCount slot, so a waiting
+// Blip starved until pendingTimeout. After the warming budget the pool must
+// retire it and boot a replacement.
+func TestPoolRetiresPermanentlyNotReadySpare(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.newPool("default", 1, 1)
+	e.run(e.pool, ns, "default")
+	e.warmOn("n1")
+	pods := e.pods()
+	if len(pods) != 1 {
+		t.Fatalf("%d pods, want one spare", len(pods))
+	}
+	stale := pods[0]
+	p := pods[0]
+	p.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady",
+		LastTransitionTime: metav1.NewTime(e.now.Add(-warmTimeout - time.Minute)),
+	}}
+	e.must(e.c.Status().Update(e.ctx, &p))
+
+	e.run(e.pool, ns, "default")
+	pods = e.pods()
+	if len(pods) != 1 {
+		t.Fatalf("%d pods, want one replacement within maxCount=1: %+v", len(pods), pods)
+	}
+	if pods[0].Name == stale.Name || !isVacant(&pods[0]) {
+		t.Fatalf("stale not-ready spare still holds the slot: %+v", pods[0])
+	}
+	e.run(e.pool, ns, "default")
+	if n := len(e.pods()); n != 1 {
+		t.Fatalf("%d pods after the replacement, want no churn", n)
+	}
+}
+
+// TestPoolNegativeMemoryIsInvalid guards that a pool with negative guest memory
+// reports InvalidConfiguration and an Event instead of retrying a Pod create
+// forever with empty status. Admission rejects the value; the controller check
+// covers objects stored before that rule existed.
+func TestPoolNegativeMemoryIsInvalid(t *testing.T) {
+	e := newEnv(t)
+	e.newPool("default", 1, 0)
+	e.updatePool("default", func(p *v1.BlipPool) { p.Spec.Memory = resource.MustParse("-1Gi") })
+	recorder := record.NewFakeRecorder(10)
+	e.pool.Recorder = recorder
+
+	_, err := e.pool.Reconcile(e.ctx, req(ns, "default"))
+	if err == nil || !strings.Contains(err.Error(), "spec.memory must be greater than 0") {
+		t.Fatalf("reconcile error %v, want a memory validation error", err)
+	}
+	event := waitForEvent(t, recorder)
+	if !strings.Contains(event, corev1.EventTypeWarning+" InvalidConfiguration") {
+		t.Errorf("event = %q, want a Warning InvalidConfiguration event", event)
+	}
+	pool := e.getPool("default")
+	if pool.Status.Reason != poolInvalidConfiguration {
+		t.Errorf("status reason %q, want %s", pool.Status.Reason, poolInvalidConfiguration)
+	}
+	if !strings.Contains(pool.Status.Message, "spec.memory must be greater than 0") {
+		t.Errorf("status message %q does not report the memory problem", pool.Status.Message)
+	}
+	if n := len(e.pods()); n != 0 {
+		t.Errorf("%d pods created for an invalid pool", n)
 	}
 }

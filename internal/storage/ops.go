@@ -30,7 +30,7 @@ func (s *Store) CreateImage(ctx context.Context, id string, sizeBytes int64, fil
 }
 
 func (s *Store) buildImage(ctx context.Context, rec *record, fill func(dev string) error) error {
-	return s.runOperation(createPlan(s.layout(rec), rec, nil, true), imageFill(ctx, fill))
+	return s.runOperationContext(ctx, createPlan(s.layout(rec), rec, nil, true), imageFill(ctx, fill))
 }
 
 // CreateCommit builds a commit from an image, another commit, or nothing.
@@ -69,7 +69,7 @@ func (s *Store) CreateCommit(ctx context.Context, req CreateCommit) error {
 	if _, err := s.begin(rec, 1); err != nil {
 		return err
 	}
-	if err := s.buildCommit(rec, src); err != nil {
+	if err := s.buildCommit(ctx, rec, src); err != nil {
 		if rerr := s.rollback(rec); rerr != nil {
 			logf("rollback commit %s: %v", rec.ID, rerr)
 		}
@@ -78,8 +78,8 @@ func (s *Store) CreateCommit(ctx context.Context, req CreateCommit) error {
 	return s.setPhase(rec, phaseReady)
 }
 
-func (s *Store) buildCommit(rec, src *record) error {
-	return s.runOperation(createPlan(s.layout(rec), rec, src, false), nil)
+func (s *Store) buildCommit(ctx context.Context, rec, src *record) error {
+	return s.runOperationContext(ctx, createPlan(s.layout(rec), rec, src, false), nil)
 }
 
 // source holds a ready volume of the given kind for the duration of an
@@ -149,7 +149,7 @@ func (s *Store) CreateWorking(ctx context.Context, req CreateWorking) (string, e
 	if _, err := s.begin(rec, 1); err != nil {
 		return "", err
 	}
-	if err := s.buildWorking(rec, src); err != nil {
+	if err := s.buildWorking(ctx, rec, src); err != nil {
 		if rerr := s.rollback(rec); rerr != nil {
 			logf("rollback working %s: %v", rec.ID, rerr)
 		}
@@ -161,8 +161,8 @@ func (s *Store) CreateWorking(ctx context.Context, req CreateWorking) (string, e
 	return mapperPath(s.plainName(rec)), nil
 }
 
-func (s *Store) buildWorking(rec, src *record) error {
-	return s.runOperation(createPlan(s.layout(rec), rec, src, false), nil)
+func (s *Store) buildWorking(ctx context.Context, rec, src *record) error {
+	return s.runOperationContext(ctx, createPlan(s.layout(rec), rec, src, false), nil)
 }
 
 func releaseOnce(r *Remote) {

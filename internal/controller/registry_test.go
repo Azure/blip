@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -20,6 +21,10 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestRemoteRegistry(t *testing.T) {
@@ -158,5 +163,104 @@ func TestNotFoundClassification(t *testing.T) {
 		if got := notFound(tt.err); got != tt.want {
 			t.Errorf("%s: notFound = %v, want %v", tt.name, got, tt.want)
 		}
+	}
+}
+
+// TestAuthRejectionIsTerminal: a registry that rejects the state's
+// imagePullSecrets with 401/403 can never succeed on a retry, because the
+// secret reference is immutable. It must be classified as terminal so the
+// controller fails the state instead of leaving `blip pull` waiting on
+// Pending forever. Server errors stay retryable.
+func TestAuthRejectionIsTerminal(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		status   int
+		terminal bool
+	}{
+		{"unauthorized", http.StatusUnauthorized, true},
+		{"forbidden", http.StatusForbidden, true},
+		{"server error", http.StatusInternalServerError, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, `{"details":"incorrect username or password"}`)
+			}))
+			defer srv.Close()
+			u, _ := url.Parse(srv.URL)
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "badcred"},
+				Type:       corev1.SecretTypeDockerConfigJson,
+				Data: map[string][]byte{corev1.DockerConfigJsonKey: []byte(
+					fmt.Sprintf(`{"auths":{%q:{"username":"nouser","password":"definitely-wrong"}}}`, u.Host))},
+			}
+			c := fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).WithObjects(secret).Build()
+			r := RemoteRegistry{Reader: c}
+			ctx := context.Background()
+			ref := u.Host + "/library/hello-world:latest"
+			secrets := []corev1.LocalObjectReference{{Name: "badcred"}}
+
+			_, err := r.Digest(ctx, ref, ns, secrets)
+			if err == nil {
+				t.Fatal("Digest succeeded against a rejecting registry")
+			}
+			if got := terminalImageError(err); got != tt.terminal {
+				t.Fatalf("Digest error %v: terminal = %v, want %v", err, got, tt.terminal)
+			}
+			if tt.terminal {
+				if !errors.Is(err, ErrAuthRejected) {
+					t.Fatalf("rejected credentials not classified: %v", err)
+				}
+				if !strings.Contains(err.Error(), "incorrect username or password") {
+					t.Fatalf("terminal error lost the registry detail: %v", err)
+				}
+			}
+
+			_, err = r.ImageConfig(ctx, ref, ns, secrets)
+			if err == nil {
+				t.Fatal("ImageConfig succeeded against a rejecting registry")
+			}
+			if got := terminalImageError(err); got != tt.terminal {
+				t.Fatalf("image config error %v: terminal = %v, want %v", err, got, tt.terminal)
+			}
+			if tt.terminal && !errors.Is(err, ErrAuthRejected) {
+				t.Fatalf("rejected credentials not classified: %v", err)
+			}
+		})
+	}
+}
+
+// TestAuthRejectionClassification pins the classification itself, including
+// that a 401 without supplied credentials is left to the existing retry path.
+func TestAuthRejectionClassification(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"401", &transport.Error{StatusCode: http.StatusUnauthorized}, true},
+		{"403", &transport.Error{StatusCode: http.StatusForbidden}, true},
+		{"401 with detail", &transport.Error{StatusCode: http.StatusUnauthorized,
+			Errors: []transport.Diagnostic{{Code: transport.UnauthorizedErrorCode, Message: "incorrect username or password"}}}, true},
+		{"500", &transport.Error{StatusCode: http.StatusInternalServerError}, false},
+		{"503", &transport.Error{StatusCode: http.StatusServiceUnavailable}, false},
+		{"timeout", &transport.Error{StatusCode: http.StatusGatewayTimeout}, false},
+		{"network", errors.New("connection reset"), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			wrapped := classifyAuthRejection(tt.err, "reg/img:latest", []corev1.LocalObjectReference{{Name: "creds"}})
+			if got := terminalImageError(wrapped); got != tt.want {
+				t.Fatalf("terminalImageError(%v) = %v, want %v", wrapped, got, tt.want)
+			}
+			if tt.want && !errors.Is(wrapped, ErrAuthRejected) {
+				t.Fatalf("%v not marked ErrAuthRejected", wrapped)
+			}
+		})
+	}
+	if got := terminalImageError(classifyAuthRejection(
+		&transport.Error{StatusCode: http.StatusUnauthorized}, "reg/img:latest", nil)); got {
+		t.Fatal("anonymous 401 classified as terminal without supplied credentials")
 	}
 }

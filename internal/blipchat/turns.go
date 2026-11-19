@@ -18,7 +18,11 @@ import (
 
 // turnSpec describes a turn a producer wants to create.
 type turnSpec struct {
-	Thread     string
+	Thread string
+	// ThreadUID, when set, pins the turn to one incarnation of Thread. A
+	// turn that would be owned by a recreated thread of the same name is
+	// rejected instead of being adopted by it.
+	ThreadUID  string
 	AuthorKind string
 	AuthorName string
 	Topic      string
@@ -54,8 +58,11 @@ func createTurnIn(ctx context.Context, c client.Client, namespace, name string, 
 	// sequencer stamps its thread UID.
 	if spec.Thread != "" {
 		var thread v1.BlipThread
-		if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: spec.Thread}, &thread); err == nil &&
-			thread.UID != "" {
+		err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: spec.Thread}, &thread)
+		if spec.ThreadUID != "" && (err != nil || string(thread.UID) != spec.ThreadUID) {
+			return errStaleIncarnation
+		}
+		if err == nil && thread.UID != "" {
 			meta.OwnerReferences = []metav1.OwnerReference{
 				*metav1.NewControllerRef(&thread, v1.GroupVersion.WithKind("BlipThread")),
 			}
@@ -89,10 +96,23 @@ func createTurnIn(ctx context.Context, c client.Client, namespace, name string, 
 		if equality.Semantic.DeepEqual(existing.Spec, turn.Spec) {
 			return nil
 		}
-		if err := c.Delete(ctx, &existing); err != nil && !apierrors.IsNotFound(err) {
-			return err
+		if existing.Spec.Thread != turn.Spec.Thread || existing.Spec.Author != turn.Spec.Author {
+			// A different producer squatted the name before admission
+			// reserved it; the owner of the name is the coordinator, so
+			// replace the impostor.
+			if err := c.Delete(ctx, &existing); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+			return c.Create(ctx, turn)
 		}
-		return c.Create(ctx, turn)
+		// The same producer re-sent the turn with changed content (for
+		// example a report whose fields were cleaned differently). Update
+		// the spec in place: replacing the turn would drop status.seq and
+		// status.threadUID, which record whether the thread already
+		// consumed the report, and the sequencer would hand it a new,
+		// higher sequence number.
+		existing.Spec = turn.Spec
+		return c.Update(ctx, &existing)
 	}
 	return nil
 }
@@ -103,13 +123,20 @@ func cleanAttributes(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		if k == "" {
-			continue
+	// Sort the keys so an oversized map keeps the same subset on every call.
+	// Map iteration order is random, and a different subset makes a
+	// deterministic turn name look like a changed spec, which used to make
+	// the watcher delete and re-create the turn on every reconcile.
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		if k != "" {
+			keys = append(keys, k)
 		}
-		k = truncateRunes(k, 63)
-		out[k] = truncateRunes(v, 256)
+	}
+	sort.Strings(keys)
+	out := make(map[string]string, len(in))
+	for _, k := range keys {
+		out[truncateRunes(k, 63)] = truncateRunes(in[k], 256)
 		if len(out) == 16 {
 			break
 		}

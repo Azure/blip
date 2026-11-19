@@ -1,12 +1,16 @@
 package storage
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const (
@@ -19,7 +23,26 @@ func run(name string, args ...string) (string, error) { return runIn("", nil, na
 
 // runIn is run with stdin and extra environment variables.
 func runIn(stdin string, env []string, name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+	return runInContext(context.Background(), stdin, env, name, args...)
+}
+
+// runInContext runs a tool and aborts it when ctx is done. Long filesystem
+// tools such as mkfs.ext4 run in their own process group so cancellation also
+// stops helpers they spawn; otherwise a build for a deleted state would keep
+// allocating thin-pool blocks after its parent was cancelled.
+func runInContext(ctx context.Context, stdin string, env []string, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = 5 * time.Second
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}

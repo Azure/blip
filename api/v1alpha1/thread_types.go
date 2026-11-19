@@ -25,12 +25,17 @@ type BlipThreadSpec struct {
 	SystemPrompt string `json:"systemPrompt,omitempty"`
 	// Pool is the BlipPool tasks run in.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	Pool string `json:"pool"`
 	// Base is the BlipState new task blips fork from, when the coordinator
-	// does not choose another one.
+	// does not choose another one. Empty selects the coordinator's default.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	Base string `json:"base,omitempty"`
 	// MaxRunning caps concurrently running blips labelled with this thread.
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2147483647
 	// +kubebuilder:default=1
 	MaxRunning int32 `json:"maxRunning,omitempty"`
 	// Model is the model name passed to the OpenAI-compatible endpoint.
@@ -55,12 +60,14 @@ type ThreadRetention struct {
 	Turns *metav1.Duration `json:"turns,omitempty"`
 	// KeepTurns is the minimum number of turns kept per thread.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	KeepTurns int32 `json:"keepTurns,omitempty"`
 	// ClosedTasks is how long closed tasks are kept after their last update.
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="retention.closedTasks must be a non-negative duration"
 	ClosedTasks *metav1.Duration `json:"closedTasks,omitempty"`
 	// MaxTasks caps the task board. The oldest closed tasks are pruned first.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
 	MaxTasks int32 `json:"maxTasks,omitempty"`
 }
 
@@ -140,6 +147,12 @@ type ThreadTask struct {
 // +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.pool`
 // +kubebuilder:printcolumn:name="Seq",type=integer,JSONPath=`.status.lastSeq`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+//
+// The controller records each thread as "thread.<name>" in the VM owner
+// ConfigMap, whose keys are limited to 253 characters. Reject a name that
+// cannot be represented there: one such thread used to make the whole table
+// patch invalid and stop every pool in the namespace from reconciling.
+// +kubebuilder:validation:XValidation:rule="!has(self.metadata) || !has(self.metadata.name) || self.metadata.name.size() <= 246",message="thread names must be at most 246 characters to fit the VM owner table"
 type BlipThread struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -178,9 +191,11 @@ const (
 type BlipTurnSpec struct {
 	// Thread is the name of a BlipThread in the same namespace. It must be a
 	// valid thread (DNS subdomain) name so a typo cannot create a turn that
-	// no thread can ever claim.
+	// no thread can ever claim. It is capped below the generic 253-character
+	// DNS limit so the corresponding "thread.<name>" key in the VM owner
+	// ConfigMap fits the 253-character key limit.
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:MaxLength=246
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	Thread string     `json:"thread"`
 	Author TurnAuthor `json:"author"`
@@ -234,6 +249,13 @@ type TurnSubject struct {
 }
 
 // BlipTurnStatus is written only by blipchat.
+//
+// The struct-level rule makes seq immutable once it has been set. A rule on
+// the seq property alone does not run when seq is removed: a status writer
+// could clear it with `seq: null`, and the sequencer would then stamp a later
+// sequence, reordering the thread's history.
+//
+// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || (has(self.seq) == has(oldSelf.value().seq) && (!has(self.seq) || self.seq == oldSelf.value().seq))",optionalOldSelf=true,message="seq is immutable once set"
 type BlipTurnStatus struct {
 	// Seq is the turn's position in the thread's single global order.
 	// +kubebuilder:validation:Minimum=0

@@ -33,6 +33,7 @@ type crdSchema struct {
 	Pattern      string               `json:"pattern"`
 	MaxLength    int64                `json:"maxLength"`
 	Minimum      int64                `json:"minimum"`
+	Maximum      int64                `json:"maximum"`
 	MinItems     int64                `json:"minItems"`
 	MaxItems     int64                `json:"maxItems"`
 	Required     []string             `json:"required"`
@@ -580,5 +581,410 @@ func TestBlipThreadTaskIDPattern(t *testing.T) {
 	}
 	if id.MaxLength != 16 {
 		t.Errorf("task id maxLength = %d, want 16", id.MaxLength)
+	}
+}
+
+// schemaAt walks a generated CRD schema to a property path.
+func schemaAt(t *testing.T, root crdSchema, path ...string) crdSchema {
+	t.Helper()
+	current := root
+	for _, name := range path {
+		next, ok := current.Properties[name]
+		if !ok {
+			t.Fatalf("generated CRD has no %s property", strings.Join(path, "."))
+		}
+		current = next
+	}
+	return current
+}
+
+// TestInt32FieldsBounded guards every int32 field the API generates.
+// format: int32 is metadata only: the API server stores 2147483648, and one
+// such value makes the controller's cluster-wide typed list/watch decode fail,
+// breaking every namespace. Maximums are therefore explicit in the schema.
+func TestInt32FieldsBounded(t *testing.T) {
+	type int32Field struct {
+		crd  string
+		root func(*testing.T) crdSchema
+		path []string
+		min  int64
+	}
+	const maxInt32 = 2147483647
+	root := func(crd string) func(*testing.T) crdSchema {
+		return func(t *testing.T) crdSchema { return loadCRDRoot(t, "../../deploy/crd/blip.dev_"+crd+".yaml") }
+	}
+	for _, tc := range []int32Field{
+		{crd: "blips", root: root("blips"), path: []string{"spec", "ttlSecondsAfterFinished"}, min: 0},
+		{crd: "blips", root: root("blips"), path: []string{"status", "exitCode"}, min: 0},
+		{crd: "blips", root: root("blips"), path: []string{"status", "sessions"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"spec", "cpus"}, min: 1},
+		{crd: "blippools", root: root("blippools"), path: []string{"spec", "warmCount"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"spec", "maxCount"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"status", "ready"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"status", "vacant"}, min: 0},
+		{crd: "blippools", root: root("blippools"), path: []string{"status", "claimed"}, min: 0},
+		{crd: "blipthreads", root: root("blipthreads"), path: []string{"spec", "maxRunning"}, min: 1},
+		{crd: "blipthreads", root: root("blipthreads"), path: []string{"spec", "retention", "keepTurns"}, min: 0},
+		{crd: "blipthreads", root: root("blipthreads"), path: []string{"spec", "retention", "maxTasks"}, min: 0},
+	} {
+		field := schemaAt(t, tc.root(t), tc.path...)
+		if field.Maximum != maxInt32 {
+			t.Errorf("%s %s maximum = %d, want %d", tc.crd, strings.Join(tc.path, "."), field.Maximum, maxInt32)
+		}
+		if field.Minimum != tc.min {
+			t.Errorf("%s %s minimum = %d, want %d", tc.crd, strings.Join(tc.path, "."), field.Minimum, tc.min)
+		}
+	}
+}
+
+// ownerTableDNSName returns a valid DNS-subdomain name of exactly n
+// characters, as a BlipThread name or service account name would be.
+func ownerTableDNSName(n int) string {
+	var s string
+	for len(s) < n {
+		if s != "" {
+			s += "."
+		}
+		s += strings.Repeat("a", min(63, n-len(s)))
+	}
+	return s
+}
+
+// TestBlipThreadNameFitsOwnerTable guards that admission rejects a thread
+// name that cannot be stored as a 253-character ConfigMap key. An accepted
+// 247-character name used to invalidate the whole blip-vm-owners patch and
+// stop every pool in the namespace from reconciling.
+func TestBlipThreadNameFitsOwnerTable(t *testing.T) {
+	root := loadCRDRoot(t, "../../deploy/crd/blip.dev_blipthreads.yaml")
+	const want = "!has(self.metadata) || !has(self.metadata.name) || self.metadata.name.size() <= 246"
+	if got := ruleFor(t, root.XValidations, "thread names must be at most 246 characters to fit the VM owner table"); got != want {
+		t.Errorf("thread name rule %q, want %q", got, want)
+	}
+
+	validate := admissionValidator(t, "blipthreads")
+	for _, n := range []int{1, 63, 64, 246} {
+		name := ownerTableDNSName(n)
+		object := fmt.Sprintf(`{"metadata":{"name":%q},"spec":{"pool":"p"}}`, name)
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected %d-character thread name: %v", n, errs.ToAggregate())
+		}
+	}
+	for _, n := range []int{247, 253} {
+		name := ownerTableDNSName(n)
+		object := fmt.Sprintf(`{"metadata":{"name":%q},"spec":{"pool":"p"}}`, name)
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted %d-character thread name %q", n, name)
+		}
+	}
+}
+
+// TestInt32AdmissionBoundaries proves admission rejects one past int32 max and
+// still accepts the exact maximum.
+func TestInt32AdmissionBoundaries(t *testing.T) {
+	const tooBig = 2147483648
+	blip := admissionValidator(t, "blips")
+	for _, tc := range []struct {
+		name   string
+		object string
+	}{
+		{"ttl", fmt.Sprintf(`{"spec":{"state":"root","command":["true"],"ttlSecondsAfterFinished":%d}}`, tooBig)},
+		{"exitCode", fmt.Sprintf(`{"spec":{"state":"root","command":["true"]},"status":{"exitCode":%d}}`, tooBig)},
+		{"sessions", fmt.Sprintf(`{"spec":{"state":"root","command":["true"]},"status":{"sessions":%d}}`, tooBig)},
+	} {
+		if errs := blip(tc.object, ""); len(errs) == 0 {
+			t.Errorf("admitted out-of-range blip %s", tc.name)
+		}
+	}
+	if errs := blip(`{"spec":{"state":"root","command":["true"],"ttlSecondsAfterFinished":2147483647}}`, ""); len(errs) != 0 {
+		t.Errorf("rejected max int32 ttl: %v", errs.ToAggregate())
+	}
+
+	pool := admissionValidator(t, "blippools")
+	for _, field := range []string{"cpus", "warmCount", "maxCount"} {
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"blip.dev/node-pool":"default"},"%s":%d}}`, field, tooBig)
+		if errs := pool(object, ""); len(errs) == 0 {
+			t.Errorf("admitted out-of-range pool spec.%s", field)
+		}
+	}
+
+	thread := admissionValidator(t, "blipthreads")
+	for _, object := range []string{
+		fmt.Sprintf(`{"spec":{"pool":"p","maxRunning":%d}}`, tooBig),
+		fmt.Sprintf(`{"spec":{"pool":"p","retention":{"keepTurns":%d}}}`, tooBig),
+		fmt.Sprintf(`{"spec":{"pool":"p","retention":{"maxTasks":%d}}}`, tooBig),
+	} {
+		if errs := thread(object, ""); len(errs) == 0 {
+			t.Errorf("admitted out-of-range thread field: %s", object)
+		}
+	}
+}
+
+// TestActiveDeadlineOverflowRejected guards the seconds-to-duration bound.
+// The controller multiplies activeDeadlineSeconds by time.Second; a value
+// above 9223372036 overflows int64 nanoseconds, wrapped negative, and stopped
+// the Blip immediately.
+func TestActiveDeadlineOverflowRejected(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blips.yaml")
+	deadline := schemaAt(t, crdSchema{Properties: map[string]crdSchema{"spec": spec}}, "spec", "activeDeadlineSeconds")
+	if deadline.Maximum != 9223372036 {
+		t.Errorf("activeDeadlineSeconds maximum = %d, want 9223372036", deadline.Maximum)
+	}
+
+	validate := admissionValidator(t, "blips")
+	blip := func(seconds int64) string {
+		return fmt.Sprintf(`{"spec":{"state":"root","command":["true"],"activeDeadlineSeconds":%d}}`, seconds)
+	}
+	if errs := validate(blip(9223372036), ""); len(errs) != 0 {
+		t.Errorf("rejected the largest safe deadline: %v", errs.ToAggregate())
+	}
+	for _, seconds := range []int64{9223372037, 9223372036854775807} {
+		if errs := validate(blip(seconds), ""); len(errs) == 0 {
+			t.Errorf("admitted overflowing deadline %d", seconds)
+		}
+	}
+}
+
+// TestBlipPoolMemoryMustBePositive guards that a negative or zero guest memory
+// fails at admission. A negative value made the Pod request negative (the VMM
+// overhead is added), so the pool retried forever with empty status and no
+// Event while Blips waited for a VM that could never exist.
+func TestBlipPoolMemoryMustBePositive(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blippools.yaml")
+	memory, ok := spec.Properties["memory"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.memory property")
+	}
+	const rule = "type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0"
+	if got := ruleFor(t, memory.XValidations, "memory must be greater than 0"); got != rule {
+		t.Errorf("memory rule %q, want %q", got, rule)
+	}
+
+	validate := admissionValidator(t, "blippools")
+	for _, value := range []string{`"0"`, `"-1Gi"`, `0`, `-1`} {
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"blip.dev/node-pool":"default"},"memory":%s}}`, value)
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted pool memory %s", value)
+		}
+	}
+	// Omitted memory is defaulted to 2Gi by the API server; the raw schema test
+	// cannot default, and a defaulted object is a valid positive quantity.
+	for _, value := range []string{`"2Gi"`, `"512Mi"`, `1`} {
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"blip.dev/node-pool":"default"},"memory":%s}}`, value)
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected valid pool memory %s: %v", value, errs.ToAggregate())
+		}
+	}
+}
+
+// TestBlipTurnStatusSeqCannotBeCleared guards immutability when a status writer
+// removes seq instead of changing it. With a rule on the property alone, the
+// rule is not evaluated for an absent field: seq: null was accepted and the
+// sequencer stamped a later sequence, moving the turn forward in history.
+func TestBlipTurnStatusSeqCannotBeCleared(t *testing.T) {
+	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipturns.yaml")
+	ruleFor(t, status.XValidations, "seq is immutable once set")
+
+	validate := admissionValidator(t, "blipturns")
+	seq := func(value string) string {
+		return fmt.Sprintf(`{"spec":{"thread":"project","author":{"kind":"User","name":"alice"}},"status":%s}`, value)
+	}
+	first := seq(`{"seq":3}`)
+	if errs := validate(first, ""); len(errs) != 0 {
+		t.Fatalf("rejected the first sequence assignment: %v", errs.ToAggregate())
+	}
+	if errs := validate(first, first); len(errs) != 0 {
+		t.Fatalf("rejected an unchanged sequence: %v", errs.ToAggregate())
+	}
+	for _, cleared := range []string{seq(`{}`), seq(`{"seq":null}`)} {
+		if errs := validate(cleared, first); len(errs) == 0 {
+			t.Errorf("admitted clearing an assigned sequence: %s", cleared)
+		}
+	}
+	if errs := validate(seq(`{"seq":4}`), first); len(errs) == 0 {
+		t.Error("admitted a sequence rewrite")
+	}
+	// A turn that was never sequenced can still be created and remain unset.
+	if errs := validate(seq(`{}`), ""); len(errs) != 0 {
+		t.Errorf("rejected an unsequenced turn: %v", errs.ToAggregate())
+	}
+}
+
+// TestReferenceNamesValidated guards that pool and base references look like
+// Kubernetes object names. Names with '/', spaces, or underscores can never
+// exist, so failing at admission avoids a pending Blip or a later coordinator
+// step failure. Empty base retains its documented default semantics.
+func TestReferenceNamesValidated(t *testing.T) {
+	blip := admissionValidator(t, "blips")
+	for _, pool := range []string{"Bad/Pool", "Bad Pool", "Bad_Pool", ""} {
+		object := fmt.Sprintf(`{"spec":{"pool":%q,"state":"root","command":["true"]}}`, pool)
+		if errs := blip(object, ""); len(errs) == 0 {
+			t.Errorf("admitted blip pool %q", pool)
+		}
+	}
+	for _, pool := range []string{"default", "pool-1", "pool.one"} {
+		object := fmt.Sprintf(`{"spec":{"pool":%q,"state":"root","command":["true"]}}`, pool)
+		if errs := blip(object, ""); len(errs) != 0 {
+			t.Errorf("rejected valid blip pool %q: %v", pool, errs.ToAggregate())
+		}
+	}
+
+	thread := admissionValidator(t, "blipthreads")
+	for _, spec := range []string{
+		`{"pool":"Bad/Pool"}`,
+		`{"pool":"Bad Pool"}`,
+		`{"pool":"p","base":"Bad_State"}`,
+		`{"pool":"p","base":"Bad/State"}`,
+	} {
+		if errs := thread(`{"spec":`+spec+`}`, ""); len(errs) == 0 {
+			t.Errorf("admitted thread spec %s", spec)
+		}
+	}
+	for _, spec := range []string{
+		`{"pool":"default"}`,
+		`{"pool":"pool-1","base":""}`,
+		`{"pool":"pool.one","base":"project.base"}`,
+	} {
+		if errs := thread(`{"spec":`+spec+`}`, ""); len(errs) != 0 {
+			t.Errorf("rejected valid thread spec %s: %v", spec, errs.ToAggregate())
+		}
+	}
+}
+
+// TestBlipPoolServiceAccountNameFitsOwnerTable guards the same limit on the
+// "sa.<name>" key. The field has no DNS pattern, so without a cap a 251-byte
+// name was accepted and wedged the owner table.
+func TestBlipPoolServiceAccountNameFitsOwnerTable(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blippools.yaml")
+	sa, ok := spec.Properties["serviceAccountName"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.serviceAccountName property")
+	}
+	if sa.MaxLength != 250 {
+		t.Errorf("spec.serviceAccountName maxLength = %d, want 250", sa.MaxLength)
+	}
+
+	validate := admissionValidator(t, "blippools")
+	for _, n := range []int{0, 63, 250} {
+		name := ownerTableDNSName(n)
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"a":"b"},"serviceAccountName":%q}}`, name)
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected %d-character service account name: %v", n, errs.ToAggregate())
+		}
+	}
+	name := ownerTableDNSName(251)
+	object := fmt.Sprintf(`{"spec":{"nodeSelector":{"a":"b"},"serviceAccountName":%q}}`, name)
+	if errs := validate(object, ""); len(errs) == 0 {
+		t.Errorf("admitted 251-character service account name %q", name)
+	}
+}
+
+// TestBlipTurnThreadFitsOwnerTable guards that a turn cannot name a thread
+// that admission now rejects. The turn-owner policy looks up the raw
+// "thread.<name>" key, which does not fit for these names.
+func TestBlipTurnThreadFitsOwnerTable(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipturns.yaml")
+	thread, ok := spec.Properties["thread"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.thread property")
+	}
+	if thread.MaxLength != 246 {
+		t.Errorf("spec.thread maxLength = %d, want 246", thread.MaxLength)
+	}
+	validate := admissionValidator(t, "blipturns")
+	turn := func(name string) string {
+		return fmt.Sprintf(`{"spec":{"thread":%q,"author":{"kind":"ServiceAccount","name":"ci"}}}`, name)
+	}
+	if errs := validate(turn(ownerTableDNSName(246)), ""); len(errs) != 0 {
+		t.Errorf("rejected 246-character thread: %v", errs.ToAggregate())
+	}
+	if errs := validate(turn(ownerTableDNSName(247)), ""); len(errs) == 0 {
+		t.Error("admitted a turn for a 247-character thread")
+	}
+}
+
+// TestBlipStateEmptyImageIsUnset guards that an explicitly empty image is the
+// same as an omitted image, matching the controller's `Image != ""` check. An
+// empty image used to be treated as a configured image, forbidding copyFrom
+// and replicas and making a real image immutable.
+func TestBlipStateEmptyImageIsUnset(t *testing.T) {
+	validate := admissionValidator(t, "blipstates")
+	for _, object := range []string{
+		`{"spec":{"image":""}}`,
+		`{"spec":{"image":"","copyFrom":"source"}}`,
+		`{"spec":{"image":"","replicas":2}}`,
+		`{"spec":{"copyFrom":"source"}}`,
+		`{"spec":{"replicas":2}}`,
+	} {
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected empty-image state %s: %v", object, errs.ToAggregate())
+		}
+	}
+
+	// A real image is still exclusive with copyFrom and replicas.
+	for _, object := range []string{
+		`{"spec":{"image":"busybox:1","copyFrom":"source"}}`,
+		`{"spec":{"image":"busybox:1","replicas":2}}`,
+	} {
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted %s", object)
+		}
+	}
+
+	// Empty is interchangeable with absent, and a real image stays immutable.
+	for _, tc := range []struct {
+		name          string
+		before, after string
+		ok            bool
+	}{
+		{"empty to empty", `{"spec":{"image":""}}`, `{"spec":{"image":""}}`, true},
+		{"empty to absent", `{"spec":{"image":""}}`, `{"spec":{}}`, true},
+		{"absent to empty", `{"spec":{}}`, `{"spec":{"image":""}}`, true},
+		{"real unchanged", `{"spec":{"image":"busybox:1"}}`, `{"spec":{"image":"busybox:1"}}`, true},
+		{"empty to real", `{"spec":{"image":""}}`, `{"spec":{"image":"busybox:1"}}`, false},
+		{"real to empty", `{"spec":{"image":"busybox:1"}}`, `{"spec":{"image":""}}`, false},
+		{"real changed", `{"spec":{"image":"busybox:1"}}`, `{"spec":{"image":"busybox:2"}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validate(tc.after, tc.before)
+			if tc.ok && len(errs) != 0 {
+				t.Errorf("rejected %s -> %s: %v", tc.before, tc.after, errs.ToAggregate())
+			}
+			if !tc.ok && len(errs) == 0 {
+				t.Errorf("admitted %s -> %s", tc.before, tc.after)
+			}
+		})
+	}
+
+	// nodeSelector and imagePullSecrets are removable when empty, but a real
+	// value cannot be removed or changed. copyFrom's pattern already rejects
+	// an explicit empty value, so only absent/real transitions apply.
+	for _, tc := range []struct {
+		name          string
+		before, after string
+		ok            bool
+	}{
+		{"copyFrom real to absent", `{"spec":{"copyFrom":"source"}}`, `{"spec":{}}`, false},
+		{"copyFrom absent to real", `{"spec":{}}`, `{"spec":{"copyFrom":"source"}}`, false},
+		{"copyFrom unchanged", `{"spec":{"copyFrom":"source"}}`, `{"spec":{"copyFrom":"source"}}`, true},
+		{"copyFrom changed", `{"spec":{"copyFrom":"source"}}`, `{"spec":{"copyFrom":"other"}}`, false},
+		{"nodeSelector empty removed", `{"spec":{"nodeSelector":{}}}`, `{"spec":{}}`, true},
+		{"nodeSelector added empty", `{"spec":{}}`, `{"spec":{"nodeSelector":{}}}`, true},
+		{"nodeSelector changed", `{"spec":{"nodeSelector":{"a":"b"}}}`, `{"spec":{"nodeSelector":{"a":"c"}}}`, false},
+		{"nodeSelector real removed", `{"spec":{"nodeSelector":{"a":"b"}}}`, `{"spec":{}}`, false},
+		{"imagePullSecrets empty removed", `{"spec":{"imagePullSecrets":[]}}`, `{"spec":{}}`, true},
+		{"imagePullSecrets added empty", `{"spec":{}}`, `{"spec":{"imagePullSecrets":[]}}`, true},
+		{"imagePullSecrets changed", `{"spec":{"imagePullSecrets":[{"name":"a"}]}}`, `{"spec":{"imagePullSecrets":[{"name":"b"}]}}`, false},
+		{"replicas real removed", `{"spec":{"replicas":2}}`, `{"spec":{}}`, false},
+		{"replicas changed", `{"spec":{"replicas":1}}`, `{"spec":{"replicas":2}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validate(tc.after, tc.before)
+			if tc.ok && len(errs) != 0 {
+				t.Errorf("rejected %s -> %s: %v", tc.before, tc.after, errs.ToAggregate())
+			}
+			if !tc.ok && len(errs) == 0 {
+				t.Errorf("admitted %s -> %s", tc.before, tc.after)
+			}
+		})
 	}
 }

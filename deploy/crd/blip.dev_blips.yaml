@@ -65,6 +65,7 @@ spec:
                   long. The VM is stopped as if spec.stop were set. `blip run --timeout`
                   sets it.
                 format: int64
+                maximum: 9223372036
                 minimum: 1
                 type: integer
               command:
@@ -335,6 +336,9 @@ spec:
               pool:
                 default: default
                 description: Pool names a BlipPool in the blip's namespace.
+                maxLength: 253
+                minLength: 1
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string
                 x-kubernetes-validations:
                 - message: pool is immutable
@@ -358,6 +362,7 @@ spec:
                   TTLSecondsAfterFinished deletes the blip this long after it finished,
                   whether or not anyone gathered its results. `blip run --ttl` sets it.
                 format: int32
+                maximum: 2147483647
                 minimum: 0
                 type: integer
               tty:
@@ -395,7 +400,13 @@ spec:
           status:
             properties:
               exitCode:
+                description: |-
+                  ExitCode is the command's exit status. It is 0-255 for a real process,
+                  but the bound is the int32 range so a malformed status cannot break the
+                  controller's typed list/watch decode.
                 format: int32
+                maximum: 2147483647
+                minimum: 0
                 type: integer
               finishTime:
                 format: date-time
@@ -519,7 +530,10 @@ spec:
                   recreated for this Blip, so waiting for it cannot succeed.
                 type: string
               sessions:
+                description: Sessions is the number of attached sessions.
                 format: int32
+                maximum: 2147483647
+                minimum: 0
                 type: integer
               startTime:
                 format: date-time

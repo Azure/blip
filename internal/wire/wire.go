@@ -41,6 +41,21 @@ const (
 	MaxFrame = 1 << 20
 )
 
+// ErrFrameTooLarge reports a frame payload larger than MaxFrame. The size is
+// checked before anything is written, so the peer never sees the frame and a
+// retry cannot succeed.
+var ErrFrameTooLarge = errors.New("frame too large")
+
+// FrameSizeError is an over-limit frame payload. Size is the encoded payload
+// size, useful when the caller reports why a request was rejected.
+type FrameSizeError struct {
+	Size int
+}
+
+func (e *FrameSizeError) Error() string { return fmt.Sprintf("%v: %d", ErrFrameTooLarge, e.Size) }
+
+func (e *FrameSizeError) Unwrap() error { return ErrFrameTooLarge }
+
 type Type byte
 
 const (
@@ -253,7 +268,7 @@ func NewConn(rw io.ReadWriter) *Conn {
 // Write sends one frame with a raw payload.
 func (c *Conn) Write(t Type, payload []byte) error {
 	if len(payload) > MaxFrame {
-		return fmt.Errorf("frame too large: %d", len(payload))
+		return &FrameSizeError{Size: len(payload)}
 	}
 	var hdr [5]byte
 	hdr[0] = byte(t)

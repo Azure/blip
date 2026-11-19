@@ -5,6 +5,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -26,6 +27,75 @@ func w317SchedulableVacant(pods []corev1.Pod) int {
 		}
 	}
 	return n
+}
+
+// TestPoolReplacesGenericUnschedulableSpare covers a warm spare whose stale
+// avoid affinity excludes a node that is usable again. The scheduler rejected
+// the spare, but only pinned pods were treated as non-capacity, so the generic
+// spare held maxCount forever and waiting Blips starved while other nodes were
+// idle. A generic rejected spare must be replaced with a refreshed placement.
+func TestPoolReplacesGenericUnschedulableSpare(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.newPool("default", 1, 1)
+
+	// n2 is unusable when the spare is created, so its affinity excludes n2.
+	e.setDrain("n2")
+	e.run(e.pool, ns, "default")
+	pods := e.pods()
+	if len(pods) != 1 {
+		t.Fatalf("%d pods, want one spare: %+v", len(pods), pods)
+	}
+	spare := pods[0]
+	if spare.Annotations[v1.AnnotationPinnedNode] != "" {
+		t.Fatalf("spare is pinned, not generic: %+v", spare.Annotations)
+	}
+	if !unschedulableExcludes(&spare, "n2") {
+		t.Fatalf("spare affinity does not exclude the drained node: %+v", spare.Spec.Affinity)
+	}
+	w317MarkUnschedulable(t, e, &spare)
+
+	// n2 comes back and is idle. The stale spare still excludes it, so it can
+	// never satisfy the pool's warm slot.
+	bn := &v1.BlipNode{}
+	e.must(e.c.Get(e.ctx, types.NamespacedName{Name: "n2"}, bn))
+	bn.Spec.Drain = false
+	e.must(e.c.Update(e.ctx, bn))
+	e.heartbeat()
+
+	e.run(e.pool, ns, "default")
+	e.run(e.pool, ns, "default")
+	pods = e.pods()
+	if len(pods) != 1 {
+		t.Fatalf("%d pods, want one replacement within maxCount=1: %+v", len(pods), pods)
+	}
+	if p := pods[0]; p.Name == spare.Name || unschedulable(&p) {
+		t.Fatalf("stale unschedulable spare still holds the only slot: %+v", p)
+	}
+	if unschedulableExcludes(&pods[0], "n2") {
+		t.Fatalf("replacement keeps the stale avoid affinity: %+v", pods[0].Spec.Affinity)
+	}
+}
+
+// unschedulableExcludes reports whether p carries a required node affinity of
+// the form metadata.name NotIn(values) that contains node.
+func unschedulableExcludes(p *corev1.Pod, node string) bool {
+	aff := p.Spec.Affinity
+	if aff == nil || aff.NodeAffinity == nil || aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return false
+	}
+	for _, term := range aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		for _, req := range term.MatchFields {
+			if req.Key == "metadata.name" && req.Operator == corev1.NodeSelectorOpNotIn {
+				for _, v := range req.Values {
+					if v == node {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // TestPoolReplacesBlockedPinnedPodForFallbackBlip covers maxCount=1: the one

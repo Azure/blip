@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -107,12 +108,20 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		fmt.Fprintln(a.env.Out, "no blips to gather")
 		return nil
 	}
+	waitCtx := ctx
+	if f.wait > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, f.wait)
+		defer cancel()
+	}
 	var followWG sync.WaitGroup
 	followDone := map[string]chan struct{}{}
 	var followCancel context.CancelFunc
 	if f.follow {
 		var fctx context.Context
-		fctx, followCancel = context.WithCancel(ctx)
+		// Followers share the wait deadline, so an expired --wait also stops
+		// their retained-output replay instead of delaying the drain.
+		fctx, followCancel = context.WithCancel(waitCtx)
 		defer followCancel()
 		for _, b := range targets {
 			ch := make(chan struct{})
@@ -126,12 +135,6 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		}
 	}
 
-	waitCtx := ctx
-	if f.wait > 0 {
-		var cancel context.CancelFunc
-		waitCtx, cancel = context.WithTimeout(ctx, f.wait)
-		defer cancel()
-	}
 	done, errs := a.awaitTargets(waitCtx, f, targets)
 	if f.follow {
 		// Drain finished blips' replay before deleting them, then stop the
@@ -170,11 +173,13 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 // copy two blips to the same path or into overlapping trees. {name} makes
 // each destination unique.
 //
-// A destination is compared the way copyPath will use it: symlinks in the
-// existing part are resolved, and a destination that is already a directory
-// receives a file under the source's basename. Comparing the declared strings
-// alone missed both that rewrite (DEST and DEST/basename(SRC)) and a
-// directory merge spreading over everything below DEST.
+// A destination is compared with symlinks in the existing part resolved, and
+// a destination nested under another is treated as part of that tree. Git
+// operations share the caller's repository, so a branch name is a destination
+// too. The sources are not mounted yet, so this check cannot tell a file
+// source from a directory source; collect re-checks the effective writes
+// against the mounted sources before copying anything. Operations of the same
+// blip are left to collect, which can compare their effective paths exactly.
 func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) error {
 	if len(raw) == 0 {
 		return nil
@@ -184,9 +189,9 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 		return err
 	}
 	type use struct {
-		blip, source, dest string
+		id, blip, source, dest, branch string
 	}
-	var seen []use
+	var seen, seenGit []use
 	for _, b := range done {
 		ops := make([]string, len(raw))
 		for i, op := range raw {
@@ -197,8 +202,19 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 			// The per-blip collect reports parse errors with its name.
 			continue
 		}
+		blipID, blip := b.Name, a.short(b.Name)
 		for _, op := range parsed {
 			if op.git {
+				// Every git operation fetches into the caller's repository,
+				// so a branch name is a destination shared by the whole
+				// gather. A second fetch of the same branch fails after the
+				// first blip has already been collected and deleted.
+				for _, prev := range seenGit {
+					if prev.branch == op.branch {
+						return fmt.Errorf("collect destination branch %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct BRANCH", op.branch, prev.blip, prev.source, blip, op.source)
+					}
+				}
+				seenGit = append(seenGit, use{id: blipID, blip: blip, source: op.source, branch: op.branch})
 				continue
 			}
 			dst, err := resolvePath(op.dest)
@@ -210,27 +226,36 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 				}
 			}
 			dst = filepath.Clean(dst)
-			isDir := false
-			if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
-				isDir = true
-			}
 			for _, prev := range seen {
+				// collect applies all of one blip's operations together and
+				// models each effective write after the sources are mounted,
+				// so it accepts distinct file paths under one destination
+				// and rejects a real collision before the first copy. Only
+				// operations from different blips need this conservative
+				// pre-mount comparison: an earlier blip has already been
+				// collected and deleted when a later one is checked.
+				if prev.id == blipID {
+					continue
+				}
 				if prev.dest == dst {
-					// Two files with distinct basenames can share an
-					// existing directory without colliding.
-					if isDir && filepath.Base(prev.source) != filepath.Base(op.source) {
+					// Distinct basenames can share a destination. The
+					// gather check runs before any state is mounted, so it
+					// cannot tell whether a source is a directory; collect
+					// re-checks the mounted sources in order and rejects a
+					// directory merge that would overwrite a sibling.
+					if filepath.Base(prev.source) != filepath.Base(op.source) {
 						continue
 					}
-					return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, a.short(b.Name), op.source)
+					return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, blip, op.source)
 				}
 				// A directory destination covers everything below it: the
 				// tree is merged into place, and a file source is stored at
 				// DEST/basename(SRC).
 				if underDir(prev.dest, dst) || underDir(dst, prev.dest) {
-					return fmt.Errorf("collect destinations %s for blip %s (%s) and %s for blip %s (%s) overlap; add {name} or give each blip a distinct DEST", prev.dest, prev.blip, prev.source, dst, a.short(b.Name), op.source)
+					return fmt.Errorf("collect destinations %s for blip %s (%s) and %s for blip %s (%s) overlap; add {name} or give each blip a distinct DEST", prev.dest, prev.blip, prev.source, dst, blip, op.source)
 				}
 			}
-			seen = append(seen, use{blip: a.short(b.Name), source: op.source, dest: dst})
+			seen = append(seen, use{id: blipID, blip: blip, source: op.source, dest: dst})
 		}
 	}
 	return nil
@@ -465,10 +490,23 @@ func (a *app) follow(ctx context.Context, name string) {
 		// command to the serial console, and the controller retains the tail
 		// in status. Try both even when our cached view still says Running:
 		// the pod can disappear between the wait and this attach.
-		if a.replayLogs(ctx, pod, short) || a.printRetainedFor(ctx, name, short, 3*time.Second) {
+		if a.replayLogs(ctx, pod, short) {
 			return
 		}
-		if ending || a.blipEnding(ctx, name) {
+		ending = ending || a.blipEnding(ctx, name)
+		// A finished, empty-output Blip whose pod is gone cannot publish
+		// output later: the controller writes status.output before it deletes
+		// the pod. Do not spend the retained-output grace on it.
+		if ending && a.outputFinal(ctx, name, pod) {
+			return
+		}
+		if a.printRetainedFor(ctx, name, short, 3*time.Second) {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if ending {
 			if !a.endedWithoutOutput(ctx, name) {
 				a.progress("%s: output is no longer available: %v", short, err)
 			}
@@ -543,6 +581,27 @@ func (a *app) endedWithoutOutput(ctx context.Context, name string) bool {
 		return false
 	}
 	return (v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving) && b.Status.Output == ""
+}
+
+// outputFinal reports that a finished, empty-output blip can no longer
+// publish retained output because the VM pod that would hold it is gone. The
+// controller writes status.output before it deletes the pod, so this is safe
+// even when the client's cached view lags. While the pod still exists the
+// follower keeps polling: the controller may not have published the output
+// yet.
+func (a *app) outputFinal(ctx context.Context, name, pod string) bool {
+	b, err := a.getBlip(ctx, name)
+	if err != nil || b.Status.Pod != pod || b.Status.Output != "" ||
+		!(v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving) {
+		return false
+	}
+	c, err := a.clients()
+	if err != nil {
+		return false
+	}
+	p := &corev1.Pod{}
+	err = c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: pod}, p)
+	return apierrors.IsNotFound(err) || (err == nil && p.DeletionTimestamp != nil)
 }
 
 // retainedOutputWait bounds how long gather waits for the controller to

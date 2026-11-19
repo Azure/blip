@@ -14,6 +14,7 @@ import (
 	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/session/fakeguest"
 	"github.com/Azure/blip/internal/wire"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -302,8 +303,10 @@ func TestGatherGitCollectFailureKeepsBlipError(t *testing.T) {
 	h.self = "alice.box"
 	t.Chdir(callerRepo)
 
-	// Fetching into the branch the caller has checked out is refused by git.
-	code, _, errOut := h.run("", "gather", "w1", "--collect", "git:/home/dev/src:main")
+	// Fetching a branch that does not exist fails with a git error. (The
+	// branch the caller has checked out is rejected earlier, with an
+	// actionable message; see the test below.)
+	code, _, errOut := h.run("", "gather", "w1", "--collect", "git:/home/dev/src:missing")
 	if code != 1 {
 		t.Fatalf("code %d, want 1 for a failed gather: %s", code, errOut)
 	}
@@ -437,6 +440,43 @@ func TestGatherAllowsDistinctFilesIntoExistingDirectory(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(dir, "out/b")); got != "BBB\n" {
 		t.Fatalf("b = %q", got)
+	}
+	if !h.gone("alice.w1") {
+		t.Fatal("blip kept")
+	}
+}
+
+// A file collected onto an existing directory is stored under its basename,
+// so a destination nested below that directory is not necessarily covered by
+// it. Model the effective write paths instead of the declared destinations:
+// a/file lands on out2/file and b/file on out2/sub/b.txt, which do not
+// collide.
+func TestGatherAllowsNestedFileDestinationUnderFileDestination(t *testing.T) {
+	root := withCollectMountRoot(t)
+	worker := ownedBlip("alice.w1", "alice.w1")
+	worker.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), worker, readyState("alice.w1"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/tree/a/file", "AAA\n", 0o644)
+	writeCollectFile(t, root, "alice.w1", "/home/dev/tree/b/file", "BBB\n", 0o644)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.MkdirAll(filepath.Join(dir, "out2/sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := h.run("", "gather", "w1",
+		"--collect", "/home/dev/tree/a/file:./out2",
+		"--collect", "/home/dev/tree/b/file:./out2/sub/b.txt")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if got := readFile(t, filepath.Join(dir, "out2/file")); got != "AAA\n" {
+		t.Fatalf("out2/file = %q", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "out2/sub/b.txt")); got != "BBB\n" {
+		t.Fatalf("out2/sub/b.txt = %q", got)
 	}
 	if !h.gone("alice.w1") {
 		t.Fatal("blip kept")
@@ -676,6 +716,50 @@ func TestGatherFollowDoesNotWarnWhenEmptyReplayHasNoOutput(t *testing.T) {
 	mustContain(t, out, "blip/empty Succeeded (exit 0)")
 	if strings.Contains(errOut, "output is no longer available") {
 		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}
+
+// A finished command that printed nothing and whose VM pod is already gone
+// cannot gain retained output later. gather -f must not spend the
+// retained-output grace on it, and --wait must still bound the command.
+func TestGatherFollowFinishedEmptyOutputReturnsPromptly(t *testing.T) {
+	h := newHarness(t, finishedBlip("empty", v1alpha1.BlipSucceeded, 0))
+	// The session is gone and the serial log is unavailable.
+	h.guest.OpenError = "no session"
+	start := time.Now()
+	code, out, errOut := h.run("", "gather", "empty", "-f", "--wait", "200ms")
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("gather -f took %s for a finished empty-output blip", elapsed)
+	}
+	mustContain(t, out, "blip/empty Succeeded (exit 0)")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}
+
+// Even while the VM pod outlives the finished session, --wait bounds the
+// follower's retained-output poll instead of letting it run out its grace.
+func TestGatherFollowWaitBoundsFinishedEmptyReplay(t *testing.T) {
+	b := finishedBlip("empty", v1alpha1.BlipSucceeded, 0)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: b.Status.Pod, Namespace: ns}}
+	h := newHarness(t, b, pod)
+	h.guest.OpenError = "no session"
+	start := time.Now()
+	code, out, errOut := h.run("", "gather", "empty", "-f", "--wait", "200ms")
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("gather -f ignored --wait for %s", elapsed)
+	}
+	mustContain(t, out, "blip/empty Succeeded (exit 0)")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message after --wait: %q", errOut)
 	}
 }
 

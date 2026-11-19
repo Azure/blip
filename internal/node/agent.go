@@ -75,7 +75,8 @@ type Agent struct {
 	mu           sync.Mutex
 	workers      sync.WaitGroup
 	operations   Scheduler
-	freezes      map[string][]string // podKey -> disk IDs to keep frozen
+	opCancels    map[string]context.CancelFunc // running operation key -> cancel
+	freezes      map[string][]string           // podKey -> disk IDs to keep frozen
 	sealErrs     map[string]string
 	stateErrs    map[string]string
 	progress     map[string]*v1alpha1.Transfer
@@ -101,6 +102,7 @@ func newAgent(cfg Config, c client.Client, live client.Reader, st Store) *Agent 
 		peers:      func([]peer.Peer) error { return nil },
 		wake:       make(chan struct{}, 1),
 		operations: *NewScheduler(map[string]int{"image": imageConcurrency, "seal": sealConcurrency}),
+		opCancels:  map[string]context.CancelFunc{},
 		freezes:    map[string][]string{},
 		sealErrs:   map[string]string{},
 		stateErrs:  map[string]string{},
@@ -481,23 +483,33 @@ func (a *Agent) runOperations(ctx context.Context, ops []Operation, jobs map[str
 	a.mu.Unlock()
 	for _, attempt := range attempts {
 		job := jobs[attempt.Operation.Key]
+		key := attempt.Operation.Key
+		jobCtx, cancel := context.WithCancel(ctx)
+		a.mu.Lock()
+		if a.opCancels == nil {
+			a.opCancels = map[string]context.CancelFunc{}
+		}
+		a.opCancels[key] = cancel
+		a.mu.Unlock()
 		a.workers.Add(1)
 		go func() {
 			defer a.workers.Done()
+			defer cancel()
 			start := time.Now()
-			slog.Info(job.what, "key", attempt.Operation.Key)
+			slog.Info(job.what, "key", key)
 			err := ctx.Err()
 			if err == nil {
-				err = job.run(ctx)
+				err = job.run(jobCtx)
 			}
 			outcome := Succeeded
 			if err != nil {
 				outcome = Failed
-				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				if ctx.Err() != nil || jobCtx.Err() != nil || errors.Is(err, context.Canceled) {
 					outcome = Canceled
 				}
 			}
 			a.mu.Lock()
+			delete(a.opCancels, key)
 			a.operations.Complete(time.Now(), attempt, outcome)
 			a.mu.Unlock()
 			if err != nil && ctx.Err() == nil {
@@ -514,6 +526,20 @@ func (a *Agent) failures(key string) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.operations.Failures(key)
+}
+
+// cancelGoneBuilds aborts operations for states confirmed absent by a live
+// read: their storage will never be reported or used, so continuing a mkfs
+// would only consume the thin pool. The storage layer kills the running tool
+// and rolls back the volume.
+func (a *Agent) cancelGoneBuilds(v *view) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for uid := range v.statesGone {
+		if cancel := a.opCancels[stateKey(uid)]; cancel != nil {
+			cancel()
+		}
+	}
 }
 
 func (a *Agent) setStateErr(uid string, err error) {

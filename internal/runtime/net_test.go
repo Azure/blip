@@ -88,11 +88,13 @@ func scriptChain(t *testing.T, script, name string) string {
 	return script[start : start+end]
 }
 
-// TestPolicyAllowsRelatedICMPErrors covers PMTUD: a router's ICMP
-// fragmentation-needed (type 3 code 4) and time-exceeded (type 11) replies are
+// TestPolicyAllowsRelatedICMPErrors covers PMTUD and related transport
+// errors: router ICMP destination-unreachable replies (type 3: fragmentation
+// needed, port/host/net/protocol unreachable) and time-exceeded (type 11) are
 // RELATED to a permitted flow, but the guest gate used to admit only
-// established TCP/UDP replies, so the guest never lowered its path MTU.
-// General ICMP (including echo) stays denied.
+// established TCP/UDP replies and frag-needed, so the guest never lowered its
+// path MTU and UDP sockets never learned that an allowed port was closed.
+// General ICMP (echo, router advertisements) stays denied.
 func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
 		{{CIDR: "0.0.0.0/0", Protocol: "TCP", Port: 443}},
@@ -102,13 +104,17 @@ func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	toGuest := scriptChain(t, script, "to_guest")
-	for _, rule := range []string{
-		"ct state related icmp type destination-unreachable icmp code frag-needed counter accept",
-		"ct state related icmp type time-exceeded counter accept",
+	for _, code := range []string{
+		"net-unreachable", "host-unreachable", "prot-unreachable",
+		"port-unreachable", "frag-needed",
 	} {
+		rule := "ct state related icmp type destination-unreachable icmp code " + code + " counter accept"
 		if !strings.Contains(toGuest, rule) {
 			t.Errorf("to_guest does not admit %q:\n%s", rule, toGuest)
 		}
+	}
+	if rule := "ct state related icmp type time-exceeded counter accept"; !strings.Contains(toGuest, rule) {
+		t.Errorf("to_guest does not admit %q:\n%s", rule, toGuest)
 	}
 	// The pod-IP DNAT accepts carry non-ICMP traffic only. In particular the
 	// reply rule must not accept the echo reply that an unsolicited, spoofed
@@ -119,9 +125,15 @@ func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 	if body := scriptChain(t, script, "from_guest"); !strings.Contains(body, "ct state established meta l4proto != icmp counter accept") {
 		t.Errorf("from_guest DNAT reply accept does not exclude ICMP:\n%s", body)
 	}
-	for _, rule := range []string{"icmp type 8", "icmp type 0", "meta l4proto icmp", "icmp type 3"} {
+	// Symbolic types/codes only: numeric selectors are not portable across
+	// nftables versions, and echo (8), echo-reply (0), and router
+	// advertisement (9) must never be admitted.
+	for _, rule := range []string{
+		"icmp type 8", "icmp type 0", "icmp type 9", "meta l4proto icmp",
+		"icmp type 3", "icmp code 0", "icmp code 1", "icmp code 3", "icmp code 4",
+	} {
 		if strings.Contains(script, rule) {
-			t.Errorf("script admits general ICMP with %q:\n%s", rule, script)
+			t.Errorf("script uses a numeric or general ICMP selector %q:\n%s", rule, script)
 		}
 	}
 	// A warm VM or deny-all gate must not open the ICMP path before a policy.
