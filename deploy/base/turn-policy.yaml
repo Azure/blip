@@ -8,6 +8,10 @@
 # controller records each thread's owner hash in blip-vm-owners, and the
 # caller's claimed pod maps to the same hash. This keeps a VM from injecting
 # turns into another owner's thread.
+#
+# Turns are immutable history. Pod-bound producers may not update or delete
+# them, and the deterministic names blipchat uses for watcher and coordinator
+# turns are reserved.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -19,7 +23,7 @@ spec:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
         resources: [blipturns]
-        operations: [CREATE]
+        operations: [CREATE, UPDATE, DELETE]
   variables:
     # Compare the whole username, not just the service account name: any
     # namespace may contain a ServiceAccount called blipchat. Only the
@@ -28,15 +32,40 @@ spec:
       expression: >-
         request.userInfo.username ==
         'system:serviceaccount:blip-system:blipchat'
+    # A pod-bound token is a VM token, or another workload's. Neither may
+    # rewrite or delete turns, and neither may squat the deterministic names
+    # blipchat uses for watcher and coordinator turns.
+    - name: podBound
+      expression: >-
+        has(request.userInfo.extra) &&
+        'authentication.kubernetes.io/pod-name' in request.userInfo.extra
   validations:
     - expression: >-
-        variables.blipchat ||
+        variables.blipchat || request.operation != 'CREATE' ||
         (object.spec.author.kind == 'ServiceAccount' &&
         object.spec.author.name == request.userInfo.username)
       messageExpression: >-
         'turns must be created by blipchat or by a service account that names
         itself; ' + request.userInfo.username + ' must set
         author.kind=ServiceAccount and author.name to its own username'
+      reason: Forbidden
+    # The watcher names report and finish turns deterministically and
+    # createTurnIn treats an existing turn as a retry, so a producer that can
+    # pre-create blip-<uid>-r<seq> or blip-<uid>-fin can suppress history.
+    # Coordinator turns have their own reserved prefix.
+    - expression: >-
+        variables.blipchat || request.operation != 'CREATE' ||
+        (!object.metadata.name.startsWith('blip-') &&
+        !object.metadata.name.startsWith('coord-'))
+      messageExpression: >-
+        'the blip- and coord- turn names are reserved for blipchat'
+      reason: Forbidden
+    - expression: >-
+        variables.blipchat || !variables.podBound ||
+        (request.operation != 'UPDATE' && request.operation != 'DELETE')
+      messageExpression: >-
+        'turns are immutable history; pod-bound service account ' +
+        request.userInfo.username + ' may not change or delete them'
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

@@ -947,3 +947,52 @@ func TestCreateTurnInLabelsScope(t *testing.T) {
 		t.Errorf("owner label = %q, want %q", got.Labels[v1.LabelOwner], want)
 	}
 }
+
+// A deterministic watcher name is a retry only when the existing turn is the
+// same turn. A squatted name must not suppress the real report or finish.
+func TestCreateTurnInReplacesSquattedName(t *testing.T) {
+	c := testClient(t, testThread())
+	squat := &v1.BlipTurn{
+		ObjectMeta: metav1.ObjectMeta{Name: "blip-uid-fin", Namespace: "ns"},
+		Spec: v1.BlipTurnSpec{
+			Thread: "proj",
+			Author: v1.TurnAuthor{Kind: v1.TurnAuthorServiceAccount, Name: "system:serviceaccount:ns:ci"},
+			Topic:  "blip.finished",
+			Text:   "forged finish",
+		},
+	}
+	if err := c.Create(context.Background(), squat); err != nil {
+		t.Fatal(err)
+	}
+	want := turnSpec{
+		Thread: "proj", AuthorKind: v1.TurnAuthorBlip, AuthorName: "blip-a",
+		Topic: "blip.finished", Text: "Succeeded complete",
+	}
+	if err := createTurnIn(context.Background(), c, "ns", "blip-uid-fin", want); err != nil {
+		t.Fatal(err)
+	}
+	var got v1.BlipTurn
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "blip-uid-fin"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Text != want.Text || got.Spec.Author.Kind != v1.TurnAuthorBlip || got.Spec.Author.Name != "blip-a" {
+		t.Fatalf("squatted turn survived: %+v", got.Spec)
+	}
+}
+
+func TestCreateTurnInRetryIsIdempotent(t *testing.T) {
+	c := testClient(t, testThread())
+	spec := turnSpec{Thread: "proj", AuthorKind: v1.TurnAuthorBlip, AuthorName: "blip-a", Topic: "blip.report", Text: "done"}
+	for i := 0; i < 2; i++ {
+		if err := createTurnIn(context.Background(), c, "ns", "blip-uid-r1", spec); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+	var got v1.BlipTurn
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "blip-uid-r1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Text != "done" {
+		t.Fatalf("turn = %+v", got.Spec)
+	}
+}

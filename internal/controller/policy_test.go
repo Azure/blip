@@ -531,10 +531,14 @@ func turnObj(authorKind, authorName string) map[string]any {
 }
 
 func turnFor(thread, authorKind, authorName string) map[string]any {
+	return namedTurn("turn", thread, authorKind, authorName)
+}
+
+func namedTurn(name, thread, authorKind, authorName string) map[string]any {
 	return map[string]any{
 		"apiVersion": "blip.dev/v1alpha1",
 		"kind":       "BlipTurn",
-		"metadata":   map[string]any{"name": "turn", "namespace": ns},
+		"metadata":   map[string]any{"name": name, "namespace": ns},
 		"spec": map[string]any{
 			"thread": thread,
 			"author": map[string]any{"kind": authorKind, "name": authorName},
@@ -585,25 +589,36 @@ func TestTurnAuthorPolicy(t *testing.T) {
 		return &user.DefaultInfo{Name: "system:serviceaccount:hunt-p6-chat:" + sa}
 	}
 
+	ci := "system:serviceaccount:hunt-p6-chat:ci"
 	for _, tc := range []struct {
 		name  string
 		user  user.Info
+		op    admission.Operation
 		obj   map[string]any
+		old   map[string]any
 		allow bool
 		msg   string
 	}{
-		{"blipchat authors a user turn", &user.DefaultInfo{Name: blipchat}, turnObj("User", "ceo@example.com"), true, ""},
-		{"blipchat authors a system turn", &user.DefaultInfo{Name: blipchat}, turnObj("System", "blipchat"), true, ""},
-		{"foreign blipchat cannot impersonate a user", other("blipchat"), turnObj("User", "ceo@example.com"), false, "must set author.kind=ServiceAccount"},
-		{"foreign blipchat cannot impersonate a service account", other("blipchat"), turnObj("ServiceAccount", "system:serviceaccount:blip-system:blipchat"), false, "must set author.kind=ServiceAccount"},
-		{"lookalike blipchat cannot impersonate a user", &user.DefaultInfo{Name: blipchat + "2"}, turnObj("User", "ceo@example.com"), false, "must set author.kind=ServiceAccount"},
-		{"other service account names itself", other("ci"), turnObj("ServiceAccount", "system:serviceaccount:hunt-p6-chat:ci"), true, ""},
-		{"other service account cannot impersonate a user", other("ci"), turnObj("User", "ceo@example.com"), false, "must set author.kind=ServiceAccount"},
-		{"other service account cannot impersonate another account", other("ci"), turnObj("ServiceAccount", blipchat), false, "must set author.kind=ServiceAccount"},
-		{"plain user cannot author a turn", &user.DefaultInfo{Name: "alice"}, turnObj("User", "alice"), false, "must set author.kind=ServiceAccount"},
+		{"blipchat authors a user turn", &user.DefaultInfo{Name: blipchat}, admission.Create, turnObj("User", "ceo@example.com"), nil, true, ""},
+		{"blipchat authors a system turn", &user.DefaultInfo{Name: blipchat}, admission.Create, turnObj("System", "blipchat"), nil, true, ""},
+		{"blipchat may use a watcher name", &user.DefaultInfo{Name: blipchat}, admission.Create, namedTurn("blip-uid-fin", "project", "Blip", "blip-a"), nil, true, ""},
+		{"foreign blipchat cannot impersonate a user", other("blipchat"), admission.Create, turnObj("User", "ceo@example.com"), nil, false, "must set author.kind=ServiceAccount"},
+		{"foreign blipchat cannot impersonate a service account", other("blipchat"), admission.Create, turnObj("ServiceAccount", "system:serviceaccount:blip-system:blipchat"), nil, false, "must set author.kind=ServiceAccount"},
+		{"lookalike blipchat cannot impersonate a user", &user.DefaultInfo{Name: blipchat + "2"}, admission.Create, turnObj("User", "ceo@example.com"), nil, false, "must set author.kind=ServiceAccount"},
+		{"other service account names itself", other("ci"), admission.Create, turnObj("ServiceAccount", ci), nil, true, ""},
+		{"other service account may use its own name", other("ci"), admission.Create, namedTurn("ci-turn", "project", "ServiceAccount", ci), nil, true, ""},
+		{"other service account cannot impersonate a user", other("ci"), admission.Create, turnObj("User", "ceo@example.com"), nil, false, "must set author.kind=ServiceAccount"},
+		{"other service account cannot impersonate another account", other("ci"), admission.Create, turnObj("ServiceAccount", blipchat), nil, false, "must set author.kind=ServiceAccount"},
+		{"plain user cannot author a turn", &user.DefaultInfo{Name: "alice"}, admission.Create, turnObj("User", "alice"), nil, false, "must set author.kind=ServiceAccount"},
+		{"service account cannot squat a report turn", other("ci"), admission.Create, namedTurn("blip-uid-r1", "project", "ServiceAccount", ci), nil, false, "reserved"},
+		{"service account cannot squat a finish turn", other("ci"), admission.Create, namedTurn("blip-uid-fin", "project", "ServiceAccount", ci), nil, false, "reserved"},
+		{"service account cannot squat a coordinator turn", other("ci"), admission.Create, namedTurn("coord-p-uid-1-0", "project", "ServiceAccount", ci), nil, false, "reserved"},
+		{"pod-bound producer cannot delete a turn", vmUser("vm", "default-mine"), admission.Delete, nil, turnObj("ServiceAccount", ci), false, "immutable history"},
+		{"pod-bound producer cannot relabel a turn", vmUser("vm", "default-mine"), admission.Update, turnObj("ServiceAccount", ci), turnObj("ServiceAccount", ci), false, "immutable history"},
+		{"blipchat may delete a turn", &user.DefaultInfo{Name: blipchat}, admission.Delete, nil, turnObj("User", "ceo@example.com"), true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			req := policyRequest{user: tc.user, op: admission.Create, resource: "blipturns", name: "turn", object: tc.obj}
+			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns", name: "turn", object: tc.obj, oldObject: tc.old}
 			allow, msg := req.evaluate(t, v, nil)
 			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
 				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)

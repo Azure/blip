@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -73,8 +74,25 @@ func createTurnIn(ctx context.Context, c client.Client, namespace, name string, 
 			Attributes: cleanAttributes(spec.Attributes),
 		},
 	}
-	if err := c.Create(ctx, turn); err != nil && !apierrors.IsAlreadyExists(err) {
-		return err
+	if err := c.Create(ctx, turn); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		// Deterministic names make retries idempotent, but an existing turn
+		// is only a retry if it is the same turn. A different producer may
+		// have squatted the name before admission reserved it; the owner of
+		// the name is still the coordinator, so replace the impostor.
+		var existing v1.BlipTurn
+		if err := c.Get(ctx, client.ObjectKeyFromObject(turn), &existing); err != nil {
+			return err
+		}
+		if equality.Semantic.DeepEqual(existing.Spec, turn.Spec) {
+			return nil
+		}
+		if err := c.Delete(ctx, &existing); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		return c.Create(ctx, turn)
 	}
 	return nil
 }
