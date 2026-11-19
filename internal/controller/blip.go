@@ -581,6 +581,14 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	if rootReplaced(b, root) {
+		// The workspace this Blip saw was deleted and a different state now
+		// exists under the same name. It is not the Blip's data, so fail
+		// instead of claiming a VM and committing into a substituted volume.
+		res, err := fail(ReasonStateNotFound, rootReplacedMessage(b.Spec.State, b.Status.RootStateUID, string(root.UID)))
+		res.RequeueAfter = retryAfter
+		return res, err
+	}
 	if root != nil && b.Status.RootStateUID == "" {
 		// Remember that the workspace existed. A later NotFound is then a
 		// deletion, not the launch window before the CLI creates it.
@@ -620,6 +628,10 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		st, reason, msg, err := r.usableState(ctx, b.Namespace, n)
 		if err != nil {
 			return reconcile.Result{}, err
+		}
+		if i == 0 && rootReplaced(b, st) {
+			// The root was deleted and recreated between the two reads.
+			return fail(ReasonStateNotFound, rootReplacedMessage(b.Spec.State, b.Status.RootStateUID, string(st.UID)))
 		}
 		if reason == ReasonStateFailed {
 			return fail(reason, msg)
@@ -747,6 +759,17 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		return reconcile.Result{}, nil
 	}
 	return reconcile.Result{}, r.startRunning(ctx, b, pod)
+}
+
+// rootReplaced reports whether the live root state is a different object than
+// the one this Blip saw when it became Pending. A state created under the same
+// name after the original was deleted is a different workspace.
+func rootReplaced(b *v1.Blip, root *v1.BlipState) bool {
+	return root != nil && b.Status.RootStateUID != "" && b.Status.RootStateUID != string(root.UID)
+}
+
+func rootReplacedMessage(name, want, got string) string {
+	return fmt.Sprintf("state %q was replaced while the Blip was pending (was %s, now %s); refusing to use the substituted workspace", name, want, got)
 }
 
 // unclaim gives up everything a Blip acquired before claiming a pod.

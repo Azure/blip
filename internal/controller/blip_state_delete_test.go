@@ -102,6 +102,83 @@ func TestPendingVanishedRootFailsFast(t *testing.T) {
 	}
 }
 
+// TestPendingRecreatedRootFailsFast covers a root state deleted and recreated
+// under the same name while the Blip is Pending. The new object is a different
+// workspace: the Blip must fail instead of claiming a VM, running its command
+// and committing into data it never saw.
+func TestPendingRecreatedRootFailsFast(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.newBlip("job", withRoot("home"))
+	e.run(e.blip, ns, "job")
+	b := e.getBlip("job")
+	expectPhase(t, b, v1.BlipPending, ReasonWaitingForVM)
+	old := b.Status.RootStateUID
+	if old == "" {
+		t.Fatalf("pending Blip did not record its root: %+v", b.Status)
+	}
+
+	// Remove the original completely, then create a different state under the
+	// same name before the next reconcile.
+	st := e.getState("home")
+	st.Finalizers = nil
+	e.must(e.c.Update(e.ctx, st))
+	e.must(e.c.Delete(e.ctx, st))
+	e.readyState("home", "n1")
+	recreated := string(e.getState("home").UID)
+	if recreated == old {
+		t.Fatalf("recreated state kept UID %q", old)
+	}
+
+	// A warm VM is now available, so only the UID check stands between this
+	// Blip and running in the substituted workspace.
+	e.run(e.pool, ns, "default")
+	e.warmOn("n1")
+	e.run(e.blip, ns, "job")
+
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipFailed, ReasonStateNotFound)
+	if !strings.Contains(b.Status.Message, "replaced") || !strings.Contains(b.Status.Message, "substituted workspace") {
+		t.Fatalf("unclear replacement message: %q", b.Status.Message)
+	}
+	if b.Status.RootStateUID != old {
+		t.Fatalf("rootStateUID changed to %q, want the original %q", b.Status.RootStateUID, old)
+	}
+}
+
+// TestPendingMatchingRootUIDStarts is the control for
+// TestPendingRecreatedRootFailsFast: the same root object must still start the
+// Blip normally.
+func TestPendingMatchingRootUIDStarts(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.newBlip("job", withRoot("home"))
+	e.run(e.blip, ns, "job")
+	b := e.getBlip("job")
+	expectPhase(t, b, v1.BlipPending, ReasonWaitingForVM)
+	uid := b.Status.RootStateUID
+	if uid == "" || uid != string(e.getState("home").UID) {
+		t.Fatalf("rootStateUID %q does not name the live root %q", uid, e.getState("home").UID)
+	}
+
+	e.run(e.pool, ns, "default")
+	e.warmOn("n1")
+	e.run(e.blip, ns, "job")
+
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipRunning, "")
+	if b.Status.Pod == "" {
+		t.Fatalf("Blip did not claim a VM: %+v", b.Status)
+	}
+	if b.Status.RootStateUID != uid {
+		t.Fatalf("rootStateUID changed from %q to %q", uid, b.Status.RootStateUID)
+	}
+}
+
 // TestDirectlyDeletedWritableMountFailsRunningBlip mirrors the root case for a
 // writable mount whose state is durable (no owner references). Saving must not
 // mark the doomed mount Mounted and report success for its discarded save.
