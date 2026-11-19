@@ -734,3 +734,36 @@ func TestBlipPoolMemoryMustBePositive(t *testing.T) {
 		}
 	}
 }
+
+// TestBlipTurnStatusSeqCannotBeCleared guards immutability when a status writer
+// removes seq instead of changing it. With a rule on the property alone, the
+// rule is not evaluated for an absent field: seq: null was accepted and the
+// sequencer stamped a later sequence, moving the turn forward in history.
+func TestBlipTurnStatusSeqCannotBeCleared(t *testing.T) {
+	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipturns.yaml")
+	ruleFor(t, status.XValidations, "seq is immutable once set")
+
+	validate := admissionValidator(t, "blipturns")
+	seq := func(value string) string {
+		return fmt.Sprintf(`{"spec":{"thread":"project","author":{"kind":"User","name":"alice"}},"status":%s}`, value)
+	}
+	first := seq(`{"seq":3}`)
+	if errs := validate(first, ""); len(errs) != 0 {
+		t.Fatalf("rejected the first sequence assignment: %v", errs.ToAggregate())
+	}
+	if errs := validate(first, first); len(errs) != 0 {
+		t.Fatalf("rejected an unchanged sequence: %v", errs.ToAggregate())
+	}
+	for _, cleared := range []string{seq(`{}`), seq(`{"seq":null}`)} {
+		if errs := validate(cleared, first); len(errs) == 0 {
+			t.Errorf("admitted clearing an assigned sequence: %s", cleared)
+		}
+	}
+	if errs := validate(seq(`{"seq":4}`), first); len(errs) == 0 {
+		t.Error("admitted a sequence rewrite")
+	}
+	// A turn that was never sequenced can still be created and remain unset.
+	if errs := validate(seq(`{}`), ""); len(errs) != 0 {
+		t.Errorf("rejected an unsequenced turn: %v", errs.ToAggregate())
+	}
+}
