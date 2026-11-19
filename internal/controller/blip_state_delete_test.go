@@ -225,3 +225,83 @@ func TestDirectlyDeletedWritableMountFailsRunningBlip(t *testing.T) {
 		t.Fatalf("deleted mount not reported as failed: %+v", b.Status.Mounts)
 	}
 }
+func TestPendingVanishedMountFailsFast(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.readyState("data", "n1")
+	root := e.getState("home")
+	root.Spec.Mounts = []v1.Mount{{State: "data", Path: "/data"}}
+	root.Generation++
+	e.must(e.c.Update(e.ctx, root))
+
+	// The mount is fully gone before the Blip is created, as when a forked
+	// root keeps a dangling read-only reference.
+	st := e.getState("data")
+	st.Finalizers = nil
+	e.must(e.c.Update(e.ctx, st))
+	e.must(e.c.Delete(e.ctx, st))
+
+	e.newBlip("job", withRoot("home"))
+	e.run(e.blip, ns, "job")
+	b := e.getBlip("job")
+	expectPhase(t, b, v1.BlipFailed, ReasonStateNotFound)
+	if !strings.Contains(b.Status.Message, "deleted") {
+		t.Fatalf("no deletion message: %+v", b.Status)
+	}
+	if b.Status.RootStateUID == "" {
+		t.Fatalf("pending Blip did not record its root: %+v", b.Status)
+	}
+}
+
+// TestPendingValidMountWaitsForVM guards the reverse case: an existing mount
+// must not be mistaken for a deletion and must keep the Blip pending normally.
+func TestPendingValidMountWaitsForVM(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.readyState("data", "n1")
+	e.newBlip("job", withRoot("home"), e.withMount("data", "/data", false))
+	e.run(e.blip, ns, "job")
+	expectPhase(t, e.getBlip("job"), v1.BlipPending, ReasonWaitingForVM)
+}
+
+// TestPendingForkMountLaunchWindowWaits covers the legitimate launch race: the
+// CLI creates the Blip before workspace.Fork creates the workspace. Fork
+// creates mount children before the root, so a missing root (and therefore a
+// missing mount) still waits instead of failing as a deletion.
+func TestPendingForkMountLaunchWindowWaits(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.newBlip("job", withRoot("fork"))
+	e.run(e.blip, ns, "job")
+	expectPhase(t, e.getBlip("job"), v1.BlipPending, ReasonStateNotFound)
+
+	// Fork's order: mount children first, root last.
+	e.readyState("fork-m", "n1")
+	e.newState("fork", func(st *v1.BlipState) {
+		st.Spec.Replicas = 1
+		st.Spec.Mounts = []v1.Mount{{State: "fork-m", Path: "/mnt"}}
+	})
+	e.run(e.state, ns, "fork")
+	st := e.getState("fork")
+	if st.Status.Pending == nil {
+		t.Fatalf("fork root has no pending version: %+v", st.Status)
+	}
+	e.hold("fork", st.Status.Pending.CommitID, st.Status.Pending.Replicas...)
+	e.run(e.state, ns, "fork")
+
+	e.run(e.blip, ns, "job")
+	b := e.getBlip("job")
+	expectPhase(t, b, v1.BlipPending, ReasonWaitingForVM)
+	if b.Status.RootStateUID == "" {
+		t.Fatalf("pending Blip did not record its root: %+v", b.Status)
+	}
+}
+
+// TestDirectlyDeletedWritableMountFailsRunningBlip mirrors the root case for a
+// writable mount whose state is durable (no owner references). Saving must not
+// mark the doomed mount Mounted and report success for its discarded save.

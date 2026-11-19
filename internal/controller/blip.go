@@ -644,6 +644,16 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 			// checked above).
 			return fail(reason, msg)
 		}
+		if i > 0 && reason == ReasonStateNotFound {
+			// The root exists, so this is not the launch window: the CLI
+			// creates a Blip before workspace.Fork creates its workspace,
+			// but Fork creates mount copies before the root and mount --new
+			// commits the state before adding it to the root. A mount state
+			// named by an existing root that is fully gone was deleted and
+			// cannot be recreated for this Blip. Waiting would only delay
+			// the certain failure until the pending timeout.
+			return fail(reason, fmt.Sprintf("mount state %q was deleted while the Blip was pending", n))
+		}
 		if st != nil {
 			all[n] = st
 			writable := i == 0 || mounts[i-1].Writable
