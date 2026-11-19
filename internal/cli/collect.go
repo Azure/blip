@@ -66,24 +66,11 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 	}
 
 	// Mount each referenced state once, read-only.
-	mounts := map[string]string{}
-	var cleanups []func()
-	defer func() {
-		for i := len(cleanups) - 1; i >= 0; i-- {
-			cleanups[i]()
-		}
-	}()
-	for _, op := range ops {
-		if _, ok := mounts[op.state]; ok {
-			continue
-		}
-		mountPath, cleanup, err := a.collectMount(ctx, op.state)
-		if err != nil {
-			return err
-		}
-		mounts[op.state] = mountPath
-		cleanups = append(cleanups, cleanup)
+	mounts, cleanup, err := a.mountCollectOps(ctx, ops)
+	if err != nil {
+		return err
 	}
+	defer cleanup()
 
 	// The gather check cannot see the source types before the states are
 	// mounted. Resolve every effective write now, in order, so a directory
@@ -116,6 +103,32 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 		}
 	}
 	return nil
+}
+
+// mountCollectOps mounts every distinct state referenced by ops read-only and
+// returns the mount paths. The cleanup releases them in reverse order,
+// including the mounts added before a later one failed.
+func (a *app) mountCollectOps(ctx context.Context, ops []collectOp) (map[string]string, func(), error) {
+	mounts := map[string]string{}
+	var cleanups []func()
+	cleanup := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+	for _, op := range ops {
+		if _, ok := mounts[op.state]; ok {
+			continue
+		}
+		mountPath, release, err := a.collectMount(ctx, op.state)
+		if err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+		mounts[op.state] = mountPath
+		cleanups = append(cleanups, release)
+	}
+	return mounts, cleanup, nil
 }
 
 // checkCollectWrites rejects collect operations whose effective writes collide

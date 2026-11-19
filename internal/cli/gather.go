@@ -162,11 +162,22 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		followWG.Wait()
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Name < done[j].Name })
-	if err := a.checkCollectDestinations(done, f.collect); err != nil {
+	needsMountCheck, err := a.checkCollectDestinations(done, f.collect)
+	if err != nil {
 		// Do not collect or delete anything: the user cannot tell whose data
 		// would survive.
 		errs = append(errs, err)
 		return errors.Join(errs...)
+	}
+	if needsMountCheck {
+		if err := a.checkCollectMountedWrites(ctx, done, f.collect); err != nil {
+			// The mounted sources revealed a cross-blip collision that the
+			// pre-mount check could not see. Do not collect or delete
+			// anything: an earlier blip would already be gone when the later
+			// one is collected.
+			errs = append(errs, err)
+			return errors.Join(errs...)
+		}
 	}
 	for _, b := range done {
 		if err := a.gatherOne(ctx, c, b, f); err != nil {
@@ -187,13 +198,19 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 // source from a directory source; collect re-checks the effective writes
 // against the mounted sources before copying anything. Operations of the same
 // blip are left to collect, which can compare their effective paths exactly.
-func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) error {
+//
+// The returned bool reports that an existing directory destination was shared
+// by different basenames. That is only safe when every source is a file, which
+// this check cannot know, so gather also compares the mounted writes across
+// all blips before collecting any of them.
+func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) (bool, error) {
 	if len(raw) == 0 {
-		return nil
+		return false, nil
 	}
+	needsMountCheck := false
 	cwd, err := os.Getwd()
 	if err != nil {
-		return err
+		return false, err
 	}
 	type use struct {
 		id, blip, source, dest, branch string
@@ -218,7 +235,7 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 				// first blip has already been collected and deleted.
 				for _, prev := range seenGit {
 					if prev.branch == op.branch {
-						return fmt.Errorf("collect destination branch %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct BRANCH", op.branch, prev.blip, prev.source, blip, op.source)
+						return false, fmt.Errorf("collect destination branch %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct BRANCH", op.branch, prev.blip, prev.source, blip, op.source)
 					}
 				}
 				seenGit = append(seenGit, use{id: blipID, blip: blip, source: op.source, branch: op.branch})
@@ -251,22 +268,70 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 					// by the first operation: a file op makes DEST itself a
 					// file and a later file op replaces it, whatever the
 					// basenames, so only an existing directory is safe.
+					// A directory source, however, merges its whole tree
+					// into DEST. The sources are not mounted yet, so the
+					// mounted preflight below must rule that out.
 					if filepath.Base(prev.source) != filepath.Base(op.source) && isExistingDir(dst) {
+						needsMountCheck = true
 						continue
 					}
-					return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, blip, op.source)
+					return false, fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, blip, op.source)
 				}
 				// A directory destination covers everything below it: the
 				// tree is merged into place, and a file source is stored at
 				// DEST/basename(SRC).
 				if underDir(prev.dest, dst) || underDir(dst, prev.dest) {
-					return fmt.Errorf("collect destinations %s for blip %s (%s) and %s for blip %s (%s) overlap; add {name} or give each blip a distinct DEST", prev.dest, prev.blip, prev.source, dst, blip, op.source)
+					return false, fmt.Errorf("collect destinations %s for blip %s (%s) and %s for blip %s (%s) overlap; add {name} or give each blip a distinct DEST", prev.dest, prev.blip, prev.source, dst, blip, op.source)
 				}
 			}
 			seen = append(seen, use{id: blipID, blip: blip, source: op.source, dest: dst})
 		}
 	}
-	return nil
+	return needsMountCheck, nil
+}
+
+// checkCollectMountedWrites mounts every target read-only and runs one
+// effective-write check over all of the blips' operations. The pre-mount
+// destination check cannot tell whether a source is a file or a directory;
+// this second, mounted check sees the real trees and rejects a directory merge
+// that would overwrite another blip's child before any copy or delete.
+func (a *app) checkCollectMountedWrites(ctx context.Context, done []*v1alpha1.Blip, raw []string) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	var all []collectOp
+	for _, b := range done {
+		ops := make([]string, len(raw))
+		for i, op := range raw {
+			ops[i] = strings.ReplaceAll(op, "{name}", a.short(b.Name))
+		}
+		parsed, err := parseCollectOps(ops, cwd)
+		if err != nil {
+			// The per-blip collect reports parse errors with its name.
+			continue
+		}
+		root, err := a.getState(ctx, b.Spec.State)
+		if err != nil {
+			return fmt.Errorf("collect from %s: %w", a.short(b.Name), err)
+		}
+		for i := range parsed {
+			parsed[i].state, parsed[i].rel = stateForPath(b, root, parsed[i].source)
+		}
+		all = append(all, parsed...)
+	}
+	var copies []collectOp
+	for _, op := range all {
+		if !op.git {
+			copies = append(copies, op)
+		}
+	}
+	mounts, cleanup, err := a.mountCollectOps(ctx, copies)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	return checkCollectWrites(all, mounts)
 }
 
 // ownerSelector narrows a label selector to the caller's owner when the
