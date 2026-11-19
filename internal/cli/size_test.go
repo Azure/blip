@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseSizeFlag(t *testing.T) {
-	for _, value := range []string{"1", "20Gi", "1.5Gi", "1Pi"} {
+	for _, value := range []string{"1", "20Gi", "1.5Gi", "1Ti"} {
 		size, err := parseSizeFlag(value)
 		if err != nil {
 			t.Errorf("%s rejected: %v", value, err)
@@ -20,6 +20,8 @@ func TestParseSizeFlag(t *testing.T) {
 		{"nope", "invalid --size"},
 		{"0", "must be positive"},
 		{"-1Gi", "must be positive"},
+		{"1025Gi", "too large"},
+		{"1Pi", "too large"},
 		{"8Ei", "too large"},
 		{"10Ei", "too large"},
 		{"100Ei", "too large"},

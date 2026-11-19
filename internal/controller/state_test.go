@@ -42,6 +42,8 @@ func (e *env) safeToRemove(node string) bool {
 
 func TestStateInitialization(t *testing.T) {
 	size20G := resource.MustParse("20Gi")
+	size200G := resource.MustParse("200Gi")
+	size1Pi := resource.MustParse("1Pi")
 	zeroSize := resource.MustParse("0")
 	negativeSize := resource.MustParse("-1Gi")
 	hugeSize := resource.MustParse("10Ei")
@@ -60,6 +62,8 @@ func TestStateInitialization(t *testing.T) {
 		{name: "negative size", spec: v1.BlipStateSpec{Replicas: 2, Size: &negativeSize}, message: "size -1Gi must be greater than 0", phase: v1.StateFailed},
 		{name: "huge size", spec: v1.BlipStateSpec{Replicas: 2, Size: &hugeSize}, message: "too large", phase: v1.StateFailed},
 		{name: "max int64 size", spec: v1.BlipStateSpec{Replicas: 2, Size: &maxInt64Size}, message: "too large", phase: v1.StateFailed},
+		{name: "previous maximum size", spec: v1.BlipStateSpec{Replicas: 2, Size: &size1Pi}, message: "too large", phase: v1.StateFailed},
+		{name: "size beyond node free", spec: v1.BlipStateSpec{Replicas: 1, Size: &size200G}, message: "has only 100Gi free", phase: v1.StateFailed},
 		{name: "image", spec: v1.BlipStateSpec{Image: "reg/img:v1"}, size: 10 << 30, nodes: 2},
 		{name: "image size", spec: v1.BlipStateSpec{Image: "reg/img:v1", Size: &size20G}, size: 20 << 30, nodes: 2},
 		{name: "missing image", spec: v1.BlipStateSpec{Image: "reg/nope:v1"}, message: "image reg/nope:v1: not found", phase: v1.StateFailed},

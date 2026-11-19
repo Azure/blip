@@ -550,6 +550,16 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 	if len(nodes) == 0 {
 		return "no healthy node can hold the state", false, nil
 	}
+	if s.SizeBytes > 0 {
+		size := resource.NewQuantity(s.SizeBytes, resource.BinarySI)
+		for _, n := range nodes {
+			if free := cl.nodes[n].Status.FreeBytes; free < s.SizeBytes {
+				s.Phase = v1.StateFailed
+				return fmt.Sprintf("state needs %s per replica but node %s has only %s free",
+					size.String(), n, resource.NewQuantity(free, resource.BinarySI).String()), false, nil
+			}
+		}
+	}
 	s.Pending = &v1.PendingCommit{CommitID: r.newID(), Generation: 1, SourceNode: nodes[0], Replicas: nodes}
 	return "", false, nil
 }

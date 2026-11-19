@@ -190,10 +190,12 @@ type BlipStateSpec struct {
 	Runtime *RuntimeDefaults `json:"runtime,omitempty"`
 }
 
-// MaxStateSizeBytes is the largest filesystem size a BlipState accepts. It is
-// far beyond any practical thin-pool volume and keeps block-rounding
-// arithmetic safely inside int64.
-const MaxStateSizeBytes int64 = 1 << 50 // 1 PiB
+// MaxStateSizeBytes is the largest filesystem size a BlipState accepts. It
+// must be small enough that a node can provision it: an accepted state that
+// exceeds every node's free space reaches the node and starts a long mkfs that
+// exhausts the shared thin pool. The controller additionally rejects a state
+// larger than the free space of every node it would place it on.
+const MaxStateSizeBytes int64 = 1 << 40 // 1 TiB
 
 const (
 	StatePending = "Pending" // initial version not committed yet
