@@ -77,6 +77,7 @@ type Agent struct {
 	operations   Scheduler
 	opCancels    map[string]context.CancelFunc // running operation key -> cancel
 	freezes      map[string][]string           // podKey -> disk IDs to keep frozen
+	freezeRefs   map[string]map[string]int     // podKey -> disk ID -> live copies holding it
 	sealErrs     map[string]string
 	stateErrs    map[string]string
 	progress     map[string]*v1alpha1.Transfer
@@ -104,6 +105,7 @@ func newAgent(cfg Config, c client.Client, live client.Reader, st Store) *Agent 
 		operations: *NewScheduler(map[string]int{"image": imageConcurrency, "seal": sealConcurrency}),
 		opCancels:  map[string]context.CancelFunc{},
 		freezes:    map[string][]string{},
+		freezeRefs: map[string]map[string]int{},
 		sealErrs:   map[string]string{},
 		stateErrs:  map[string]string{},
 		progress:   map[string]*v1alpha1.Transfer{},

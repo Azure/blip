@@ -424,7 +424,9 @@ func (a *Agent) liveCopy(ctx context.Context, lc liveCopy) error {
 		return nil
 	}
 	// observed.json may still report the freeze of a previous copy of
-	// this attachment; wait for its thaw so it isn't taken as ours.
+	// this attachment; wait for its thaw so it isn't taken as ours. The
+	// freeze is requested only after this wait, so waiting copies never hold
+	// a reference that would prevent the guest from thawing.
 	if err := a.waitFrozen(ctx, lc.pod, lc.attachmentID, false); err != nil {
 		if errors.Is(err, errPodGone) || errors.Is(err, errPodStopping) {
 			slog.Info("live copy abandoned; source pod is gone or stopping", "pod", lc.pod, "attachment", lc.attachmentID, "state", lc.stateUID)
@@ -449,21 +451,46 @@ func (a *Agent) liveCopy(ctx context.Context, lc liveCopy) error {
 	return nil
 }
 
-// setFreeze adds or removes id from the disks pod's guest must keep frozen
-// and wakes a pass to write desired.json.
+// setFreeze adds or removes one request to keep a disk of pod's guest frozen
+// and wakes a pass to write desired.json. Requests are reference-counted:
+// concurrent live copies of the same writer share one desired freeze, which is
+// cleared only when the last copy releases it.
 func (a *Agent) setFreeze(pod, id string, on bool) {
 	a.mu.Lock()
-	ids := slices.DeleteFunc(slices.Clone(a.freezes[pod]), func(x string) bool { return x == id })
-	if on {
-		ids = append(ids, id)
+	refs := a.freezeRefs[pod]
+	changed := false
+	switch {
+	case on:
+		if refs == nil {
+			refs = map[string]int{}
+		}
+		refs[id]++
+		changed = true
+	case refs[id] > 0:
+		refs[id]--
+		if refs[id] == 0 {
+			delete(refs, id)
+		}
+		changed = true
 	}
-	if len(ids) == 0 {
-		delete(a.freezes, pod)
-	} else {
-		a.freezes[pod] = ids
+	if changed {
+		if len(refs) == 0 {
+			delete(a.freezeRefs, pod)
+			delete(a.freezes, pod)
+		} else {
+			a.freezeRefs[pod] = refs
+			ids := make([]string, 0, len(refs))
+			for x := range refs {
+				ids = append(ids, x)
+			}
+			slices.Sort(ids)
+			a.freezes[pod] = ids
+		}
 	}
 	a.mu.Unlock()
-	a.kick()
+	if changed {
+		a.kick()
+	}
 }
 
 // podGone reports whether the pod's host directory has been removed, which

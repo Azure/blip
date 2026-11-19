@@ -162,6 +162,24 @@ func (f *fakeStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// gatedLiveCopyStore holds each live copy inside LiveCopy so a test can
+// interleave two copies deterministically.
+type gatedLiveCopyStore struct {
+	*fakeStore
+	started chan string
+	release map[string]chan struct{}
+}
+
+func (g *gatedLiveCopyStore) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID string) (int64, error) {
+	g.started <- commitID
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-g.release[commitID]:
+	}
+	return g.fakeStore.LiveCopy(ctx, attachmentID, commitID, stateUID)
+}
+
 type applied struct {
 	mu      sync.Mutex
 	patches map[string]map[string]any // name -> last applied status
@@ -828,6 +846,85 @@ func TestLiveCopyJob(t *testing.T) {
 	a.mu.Unlock()
 	if len(left) != 0 {
 		t.Fatalf("still frozen: %v", left)
+	}
+}
+
+// TestConcurrentLiveCopiesKeepFreeze: two copies of one writer share a single
+// desired freeze, but neither may thaw the guest while the other is still
+// snapshotting.
+func TestConcurrentLiveCopiesKeepFreeze(t *testing.T) {
+	a, st, _ := testAgent(t)
+	key := podKey(ns, "p")
+	dir := a.podDirFor(key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	obsPath := filepath.Join(dir, podapi.ObservedFile)
+	if err := podapi.WriteJSON(obsPath, podapi.Observed{Phase: podapi.PhaseRunning}); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := []string{"k1", "k2"}
+	store := &gatedLiveCopyStore{fakeStore: st, started: make(chan string, len(ids)), release: map[string]chan struct{}{}}
+	for _, id := range ids {
+		store.release[id] = make(chan struct{})
+	}
+	a.store = store
+
+	done := map[string]chan error{}
+	for _, id := range ids {
+		done[id] = make(chan error, 1)
+	}
+	for _, id := range ids {
+		go func(id string) {
+			done[id] <- a.liveCopy(context.Background(), liveCopy{pod: key, stateUID: "uid-" + id, attachmentID: "a1", commitID: id})
+		}(id)
+	}
+
+	// Keep the guest thawed until both copies have requested the freeze, so
+	// both pass the thaw pre-wait before either snapshot starts.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		a.mu.Lock()
+		refs := a.freezeRefs[key]["a1"]
+		a.mu.Unlock()
+		if refs == len(ids) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("freeze refs = %d, want %d", refs, len(ids))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := podapi.WriteJSON(obsPath, podapi.Observed{Phase: podapi.PhaseRunning, Frozen: []string{"a1"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both copies now snapshot. Finish the first while the second is still
+	// held inside the store.
+	first, second := <-store.started, <-store.started
+	close(store.release[first])
+	if err := <-done[first]; err != nil {
+		t.Fatalf("first live copy: %v", err)
+	}
+	a.mu.Lock()
+	frozen := slices.Contains(a.freezes[key], "a1")
+	refs := a.freezeRefs[key]["a1"]
+	a.mu.Unlock()
+	if !frozen || refs != 1 {
+		t.Fatalf("after first copy finished: frozen=%v refs=%d, want the second copy's freeze retained", frozen, refs)
+	}
+
+	close(store.release[second])
+	if err := <-done[second]; err != nil {
+		t.Fatalf("second live copy: %v", err)
+	}
+	a.mu.Lock()
+	frozen = slices.Contains(a.freezes[key], "a1")
+	refs = a.freezeRefs[key]["a1"]
+	a.mu.Unlock()
+	if frozen || refs != 0 {
+		t.Fatalf("after both copies finished: frozen=%v refs=%d, want thawed", frozen, refs)
 	}
 }
 
