@@ -109,6 +109,59 @@ func TestCopySpoolsOutputPastReadAhead(t *testing.T) {
 	}
 }
 
+// TestOutputQueueSpoolIsUnlinkedWhileOpen is the w8-12 F3 regression: a
+// SIGKILLed client never runs cleanup, so the spool must not keep a named file
+// in the temp directory. The open descriptor still holds the data.
+func TestOutputQueueSpoolIsUnlinkedWhileOpen(t *testing.T) {
+	dir := t.TempDir()
+	oldDir := outputSpoolDir
+	outputSpoolDir = dir
+	t.Cleanup(func() { outputSpoolDir = oldDir })
+
+	q := newOutputQueue(16)
+	defer q.cleanup()
+	frames := []Frame{
+		{Type: wire.TStdout, Data: []byte("0123456789abcdef")},
+		{Type: wire.TStderr, Data: []byte("fedcba9876543210")},
+	}
+	for _, f := range frames {
+		if !q.put(f) {
+			t.Fatal("put failed")
+		}
+	}
+	if q.spool == nil {
+		t.Fatal("the second frame was not spooled")
+	}
+	if _, err := os.Stat(q.spool.Name()); !os.IsNotExist(err) {
+		t.Fatalf("spool path still exists: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spool kept a named temp file: %v", entries)
+	}
+	for _, want := range frames {
+		got, err := q.get()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Type != want.Type || !bytes.Equal(got.Data, want.Data) {
+			t.Fatalf("get = %+v, want %+v", got, want)
+		}
+	}
+	// A graceful close still releases the descriptor and leaves nothing named.
+	q.cleanup()
+	entries, err = os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spool files were not cleaned up: %v", entries)
+	}
+}
+
 // idleTestConn tears down the stream when it is not read for idle, like the
 // pod-exec transport did after a stalled local consumer.
 type idleTestConn struct {

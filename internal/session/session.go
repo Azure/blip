@@ -274,8 +274,9 @@ type outputQueue struct {
 	// Frames that do not fit in memory are written in order to one temporary
 	// file. spoolWrite is the committed end of the file, spoolRead the next
 	// record to deliver, and spoolBytes the unread amount (for the bound).
+	// The file is unlinked as soon as it is created: only the open descriptor
+	// keeps it alive, so a SIGKILLed client cannot leave a named file behind.
 	spool      *os.File
-	spoolPath  string
 	spoolRead  int64
 	spoolWrite int64
 	spoolBytes int64
@@ -328,8 +329,16 @@ func (q *outputQueue) spoolLocked(f Frame) error {
 		if err != nil {
 			return fmt.Errorf("session output exceeded memory and could not be spooled: %w", err)
 		}
+		// Unlink the name immediately and keep only the descriptor. A client
+		// killed while the local consumer is stalled never runs cleanup, and a
+		// named file would leak up to outputSpoolMax in the temp directory.
+		// The open descriptor still reads and writes normally and the space is
+		// released when it is closed or the process dies.
+		if err := os.Remove(file.Name()); err != nil {
+			file.Close()
+			return fmt.Errorf("session output exceeded memory and could not be spooled: %w", err)
+		}
 		q.spool = file
-		q.spoolPath = file.Name()
 	}
 	rec, err := encodeSpoolFrame(f)
 	if err != nil {
@@ -451,14 +460,11 @@ func (q *outputQueue) closeSpoolLocked() {
 	if q.spool == nil {
 		return
 	}
-	name := q.spoolPath
+	// The file has no name (it was unlinked when created), so closing the
+	// descriptor releases the space.
 	_ = q.spool.Close()
 	q.spool = nil
-	q.spoolPath = ""
 	q.spoolRead, q.spoolWrite, q.spoolBytes = 0, 0, 0
-	if name != "" {
-		_ = os.Remove(name)
-	}
 }
 
 // Spool records are [1 byte type][4 byte big-endian length][payload]. Data
