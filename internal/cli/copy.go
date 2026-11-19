@@ -271,30 +271,15 @@ func copyTree(ctx context.Context, src, dst string, info os.FileInfo) error {
 		}
 		return os.Rename(staging, absDst)
 	}
-	staging, atomic, err := stageTree(ctx, src, absDst, info)
+	staging, _, err := stageTree(ctx, src, absDst, info)
 	if err != nil {
 		return err
 	}
 	defer removeTree(staging)
-	// Swapping the destination itself is not safe when it contains the
-	// process's working directory: the old tree is removed after the swap,
-	// leaving the caller in a deleted directory.
-	if atomic && !cwdInside(absDst) {
-		err := mergeTree(ctx, staging, absDst)
-		if err == nil {
-			return nil
-		}
-		if !swapUnsupported(err) {
-			return err
-		}
-		// A mountpoint cannot be renamed even when its parent is writable
-		// and on the same filesystem. Only merge in place if the failed
-		// swap left the destination where it was.
-		if _, statErr := os.Lstat(absDst); statErr != nil {
-			return err
-		}
-	}
-	return mergeInPlace(ctx, staging, absDst)
+	// Merge entry by entry into the existing destination. The destination
+	// directory is never renamed or copied, so it keeps its inode and all
+	// untouched entries keep their inode, mode, and hard links.
+	return mergeTree(ctx, staging, absDst)
 }
 
 // stageTree copies src into a temporary directory used to merge into dst,
@@ -442,12 +427,62 @@ func checkMergeTypes(src, dst string) error {
 	return nil
 }
 
-// mergeTree merges a complete staged tree into an existing destination without
-// touching the destination until the merge is complete: it snapshots the
-// existing tree into a sibling staging directory, overlays the staged entries
-// there, and swaps the result into place. A failed merge therefore leaves the
-// destination as it was. Directory metadata of directories the caller already
-// had is preserved by the snapshot.
+// mergeOp is one entry a merge changed: a path it created or replaced, and for
+// a replaced path the hidden sibling name holding the previous entry.
+type mergeOp struct {
+	path   string
+	backup string
+}
+
+// mergeJournal records the changes an in-place merge made so that a failure can
+// undo them in reverse order. Replaced entries are moved aside with a rename,
+// so rolling back restores their inode, mode, ownership, and hard links.
+type mergeJournal struct {
+	ops []mergeOp
+}
+
+func (j *mergeJournal) add(path, backup string) {
+	j.ops = append(j.ops, mergeOp{path: path, backup: backup})
+}
+
+// rollback removes anything the merge created and moves every replaced entry
+// back to its original name.
+func (j *mergeJournal) rollback() error {
+	var errs []error
+	for i := len(j.ops) - 1; i >= 0; i-- {
+		op := j.ops[i]
+		if err := removeTree(op.path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+			continue
+		}
+		if op.backup == "" {
+			continue
+		}
+		if err := os.Rename(op.backup, op.path); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// commit discards the backups of entries the merge replaced. The destination is
+// already complete at this point, so a backup that cannot be removed is left
+// behind rather than turning a successful merge into a reported failure.
+func (j *mergeJournal) commit() {
+	for _, op := range j.ops {
+		if op.backup != "" {
+			_ = removeTree(op.backup)
+		}
+	}
+}
+
+// mergeTree merges a complete staged tree into an existing destination in
+// place. Only entries the source provides are written: a new name is moved into
+// place, while an existing name is moved to a hidden sibling first and restored
+// if a later entry fails. Untouched destination entries are never copied or
+// rewritten, so they keep their inode, mode, ownership, and hard links, and the
+// merge needs space for the source and replaced entries rather than the whole
+// destination.
 func mergeTree(ctx context.Context, staged, dst string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -459,41 +494,20 @@ func mergeTree(ctx context.Context, staged, dst string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("cannot merge into %s: not a directory", dst)
 	}
-	parent := filepath.Dir(dst)
-	merged, err := os.MkdirTemp(parent, collectTempPattern)
-	if err != nil {
+	journal := &mergeJournal{}
+	if err := mergeTreeInto(ctx, staged, dst, journal); err != nil {
+		if rerr := journal.rollback(); rerr != nil {
+			return fmt.Errorf("%w (restoring destination: %v)", err, rerr)
+		}
 		return err
 	}
-	defer removeTree(merged)
-	if err := copyTreeInto(ctx, dst, merged, info); err != nil {
-		return err
-	}
-	if err := overlayTree(ctx, staged, merged); err != nil {
-		return err
-	}
-	// Keep the old tree under a temporary name until the new one is in place,
-	// and restore it if the swap fails.
-	backup, err := os.MkdirTemp(parent, collectTempPattern)
-	if err != nil {
-		return err
-	}
-	if err := os.Remove(backup); err != nil {
-		return err
-	}
-	if err := os.Rename(dst, backup); err != nil {
-		return err
-	}
-	if err := os.Rename(merged, dst); err != nil {
-		_ = os.Rename(backup, dst)
-		return err
-	}
-	return removeTree(backup)
+	journal.commit()
+	return nil
 }
 
-// overlayTree moves a complete staged tree into a staging copy of the
-// destination. A directory present in both is merged; any other existing
-// entry at the same name is replaced.
-func overlayTree(ctx context.Context, staged, dst string) error {
+// mergeTreeInto moves the entries of a staged directory into the matching
+// existing destination directory, recursing where both have a directory.
+func mergeTreeInto(ctx context.Context, staged, dst string, journal *mergeJournal) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -515,17 +529,40 @@ func overlayTree(ctx context.Context, staged, dst string) error {
 		if err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		if si.IsDir() && err == nil && di.IsDir() {
-			if err := overlayTree(ctx, s, d); err != nil {
+		exists := err == nil
+		if si.IsDir() {
+			if !exists {
+				// Nothing to merge with: move the whole staged subtree.
+				if err := os.Rename(s, d); err != nil {
+					return err
+				}
+				journal.add(d, "")
+				continue
+			}
+			if !di.IsDir() {
+				return fmt.Errorf("cannot copy directory %s onto %s: not a directory", s, d)
+			}
+			// Keep the destination directory and its metadata.
+			if err := mergeTreeInto(ctx, s, d, journal); err != nil {
 				return err
 			}
 			continue
 		}
-		if err == nil {
-			if err := removeTree(d); err != nil {
+		if !exists {
+			if err := os.Rename(s, d); err != nil {
 				return err
 			}
+			journal.add(d, "")
+			continue
 		}
+		// Move the old entry aside without copying it, then put the staged
+		// entry at the original name. The journal restores the old one if the
+		// rename or a later entry fails.
+		backup, err := moveAside(d)
+		if err != nil {
+			return err
+		}
+		journal.add(d, backup)
 		if err := os.Rename(s, d); err != nil {
 			return err
 		}
@@ -533,85 +570,23 @@ func overlayTree(ctx context.Context, staged, dst string) error {
 	return nil
 }
 
-// mergeInPlace merges a complete staged tree into an existing destination
-// without renaming the destination itself. It is used when the destination is
-// a mountpoint or lives at a filesystem boundary, where the atomic swap in
-// mergeTree cannot work. Files are replaced by a rename when staging is on the
-// destination's filesystem, so a partially written file is never visible.
-// Unlike mergeTree, a failure can leave earlier children merged.
-func mergeInPlace(ctx context.Context, staged, dst string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(staged)
+// moveAside renames path to a fresh hidden name in the same directory, which
+// keeps the old entry's inode and links intact and stays on one filesystem.
+func moveAside(path string) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), collectTempPattern)
 	if err != nil {
-		return err
+		return "", err
 	}
-	for _, e := range entries {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		s := filepath.Join(staged, e.Name())
-		d := filepath.Join(dst, e.Name())
-		si, err := os.Lstat(s)
-		if err != nil {
-			return err
-		}
-		di, derr := os.Lstat(d)
-		if derr != nil && !os.IsNotExist(derr) {
-			return derr
-		}
-		if si.IsDir() {
-			if derr == nil && di.IsDir() {
-				if err := mergeInPlace(ctx, s, d); err != nil {
-					return err
-				}
-				continue
-			}
-			if derr == nil {
-				if err := removeTree(d); err != nil {
-					return err
-				}
-			}
-			if err := os.Rename(s, d); err == nil {
-				continue
-			} else if !swapUnsupported(err) {
-				return err
-			}
-			// Staging is on another filesystem: create the directory and
-			// merge its children across the boundary.
-			if err := os.Mkdir(d, 0o700); err != nil && !os.IsExist(err) {
-				return err
-			}
-			if err := mergeInPlace(ctx, s, d); err != nil {
-				return err
-			}
-			if err := os.Remove(s); err != nil {
-				return err
-			}
-			if err := os.Chmod(d, si.Mode().Perm()); err != nil {
-				return err
-			}
-			if err := os.Chtimes(d, si.ModTime(), si.ModTime()); err != nil {
-				return err
-			}
-			continue
-		}
-		if derr == nil && di.IsDir() {
-			if err := removeTree(d); err != nil {
-				return err
-			}
-		}
-		if err := os.Rename(s, d); err == nil {
-			continue
-		} else if !swapUnsupported(err) {
-			return err
-		}
-		if err := copyEntry(ctx, s, d, si); err != nil {
-			return err
-		}
+	backup := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(backup)
+		return "", err
 	}
-	return nil
+	if err := os.Rename(path, backup); err != nil {
+		_ = os.Remove(backup)
+		return "", err
+	}
+	return backup, nil
 }
 
 // copyEntry copies a regular file or a symlink. It never follows a source
@@ -640,9 +615,18 @@ func copyEntry(ctx context.Context, src, dst string, info os.FileInfo) error {
 	}
 }
 
+// copyFileHook, when non-nil, runs before copyFile reads src. Tests use it to
+// observe, or fail, the file copies a merge performs.
+var copyFileHook func(src, dst string) error
+
 func copyFile(ctx context.Context, src, dst string, info os.FileInfo) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if copyFileHook != nil {
+		if err := copyFileHook(src, dst); err != nil {
+			return err
+		}
 	}
 	dir := filepath.Dir(dst)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
