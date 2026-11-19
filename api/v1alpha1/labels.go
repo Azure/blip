@@ -76,16 +76,25 @@ func ParentLabel(name string) string {
 	return "sha256-" + hex.EncodeToString(sum[:])[:56]
 }
 
+// threadLabelHash is the reserved prefix of a hashed ThreadLabel. An
+// underscore is legal in a Kubernetes label value but not in a DNS-1123
+// BlipThread name, so a hashed label can never equal a literal thread name.
+// Without that separation, a short thread named exactly another thread's
+// 63-character hash shared its blip.dev/thread label and the API proxy mixed
+// both projects' turns.
+const threadLabelHash = "thread_"
+
 // ThreadLabel is the LabelThread value for a BlipThread name. Kubernetes label
 // values are at most 63 characters: names that fit are used as-is so existing
-// selectors keep working, and longer names become a stable 63-character hash.
-// AnnotationThread always carries the full name.
+// selectors keep working, and longer names become a stable 63-character hash
+// under the reserved thread_ prefix. AnnotationThread always carries the full
+// name.
 func ThreadLabel(name string) string {
 	if len(name) <= 63 {
 		return name
 	}
 	sum := sha256.Sum256([]byte(name))
-	return "thread-" + hex.EncodeToString(sum[:])[:56]
+	return threadLabelHash + hex.EncodeToString(sum[:])[:56]
 }
 
 // ThreadOwner is the blip.dev/owner label of the blips and states a

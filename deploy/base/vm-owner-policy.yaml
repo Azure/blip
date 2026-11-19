@@ -90,9 +90,10 @@ spec:
     # are appended to. The label is self-asserted by the VM, so a restricted
     # owner may only set it to a thread it owns. Label values are
     # ThreadLabel(name): the raw name when it fits a label, otherwise a hash
-    # recorded under "thread-hash.<label>". A raw thread name that happens to
-    # equal another thread's hash is a separate "thread.<label>" key, so both
-    # are checked and either one may match.
+    # recorded under "thread-hash.<label>". The hashed form has a reserved
+    # prefix that is not a legal thread name, so a short thread can never carry
+    # another thread's hash. Both encodings are still checked so objects from
+    # before that split keep working.
     - name: thread
       expression: >-
         (request.operation == 'CREATE' || request.operation == 'UPDATE') &&

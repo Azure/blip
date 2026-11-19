@@ -26,10 +26,11 @@ import (
 // thread to the owner hash of its project for turn producers. Labels are
 // hashed for names longer than a label value, and live under their own
 // "thread-hash.<ThreadLabel(name)>" prefix so a hashed label can never
-// overwrite the raw entry of a short thread whose name happens to equal that
-// hash. A name too long for a ConfigMap key is omitted: the missing entry
-// keeps its VMs restricted. "bases" lists the ownerless imported states
-// available for shared read-only use and copying.
+// overwrite the raw entry of a short thread. ThreadLabel's hashed form uses a
+// reserved thread_ prefix that is not a legal thread name, so the two encodings
+// cannot denote the same label either. A name too long for a ConfigMap key is
+// omitted: the missing entry keeps its VMs restricted. "bases" lists the
+// ownerless imported states available for shared read-only use and copying.
 const VMOwnersConfigMap = "blip-vm-owners"
 
 const (

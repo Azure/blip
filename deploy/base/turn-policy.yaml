@@ -180,7 +180,8 @@ spec:
       reason: Forbidden
     # Either encoding of the label is accepted, but it must resolve to the
     # owner of spec.thread. A raw short name lives under "thread.<label>";
-    # a long name's hashed label lives under "thread-hash.<label>".
+    # a long name's hashed label lives under "thread-hash.<label>" and uses a
+    # reserved prefix that no thread name can contain.
     - expression: >-
         variables.blipchat || request.operation != 'CREATE' ||
         variables.threadLabel == '' ||

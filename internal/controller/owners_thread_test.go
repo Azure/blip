@@ -5,48 +5,47 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
 
-// A long thread's hashed label can equal a legal short thread name. The table
-// must keep their owners apart, so neither thread can be authorized through
-// the other's entry.
+// A long thread's hashed label is under a reserved prefix that cannot be a
+// legal thread name, so no short thread (and no turn labelled for one) can
+// share it. The table still keeps the hashed label entry separate from raw
+// names.
 func TestVMOwnersThreadKeysAreUnambiguous(t *testing.T) {
 	e := newEnv(t)
 	long := "project-" + strings.Repeat("x", 70)
-	short := v1.ThreadLabel(long)
-	if len(short) != 63 || len(long) <= 63 {
-		t.Fatalf("test names: short %q (%d), long %q (%d)", short, len(short), long, len(long))
+	label := v1.ThreadLabel(long)
+	if len(label) != 63 || len(long) <= 63 {
+		t.Fatalf("test names: label %q (%d), long %q (%d)", label, len(label), long, len(long))
 	}
-	for _, name := range []string{long, short} {
-		e.create(&v1.BlipThread{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       v1.BlipThreadSpec{Pool: "default"},
-		})
+	if problems := validation.IsDNS1123Subdomain(label); len(problems) == 0 {
+		t.Fatalf("hashed label %q is a legal thread name; a short thread could collide", label)
 	}
+	e.create(&v1.BlipThread{
+		ObjectMeta: metav1.ObjectMeta{Name: long, Namespace: ns},
+		Spec:       v1.BlipThreadSpec{Pool: "default"},
+	})
 	e.must(syncVMOwners(e.ctx, e.c, ns))
 
-	longOwner, shortOwner := v1.ThreadOwner(ns, long), v1.ThreadOwner(ns, short)
-	if longOwner == shortOwner {
-		t.Fatal("test threads have the same owner")
-	}
+	owner := v1.ThreadOwner(ns, long)
 	owners := e.owners()
 	for _, tc := range []struct {
 		key  string
 		want string
 	}{
-		{"thread." + long, longOwner},
-		{"thread-hash." + short, longOwner},
-		{"thread." + short, shortOwner},
+		{"thread." + long, owner},
+		{"thread-hash." + label, owner},
 	} {
 		if got := owners[tc.key]; got != tc.want {
 			t.Errorf("%s = %q, want %q", tc.key, got, tc.want)
 		}
 	}
-	// A short thread's label is its name, so it needs no hash entry.
-	if got, ok := owners["thread-hash."+long]; ok {
-		t.Errorf("short thread recorded a hashed key: %q", got)
+	// The hashed label is reserved, so it never needs a raw-name entry.
+	if got, ok := owners["thread."+label]; ok {
+		t.Errorf("reserved hash was recorded as a short thread: %q", got)
 	}
 }
 
