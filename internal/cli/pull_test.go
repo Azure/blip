@@ -23,6 +23,43 @@ func TestPullCreatesImportedBase(t *testing.T) {
 	}
 }
 
+// TestPullRejectsExplicitEmptySize reproduces an explicitly blank --size being
+// ignored: pull only checked f.size != "", so "" created a base on the default
+// size and reported success. As with mount --from, the flag being set makes the
+// value intentional even when blank, so it must be rejected before the state is
+// created.
+func TestPullRejectsExplicitEmptySize(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		size string
+	}{
+		{"empty", ""},
+		{"whitespace", "   "},
+		{"tab", "\t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			code, _, errOut := h.run("", "pull", "base", "registry/dev:v1", "--size", tc.size, "--detach")
+			if code != 1 || !strings.Contains(errOut, "--size must not be empty") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if !stateNotFound(t, h, "base") {
+				t.Fatal("empty --size still created the base state")
+			}
+		})
+	}
+
+	// Leaving --size unset still creates a base with the default size.
+	h := newHarness(t)
+	code, out, errOut := h.run("", "pull", "base", "registry/dev:v1", "--detach")
+	if code != 0 || out != "blipstate/base created\n" {
+		t.Fatalf("code %d out %q: %s", code, out, errOut)
+	}
+	if s := h.state("base"); s.Spec.Size != nil {
+		t.Fatalf("unset --size set a size: %v", s.Spec.Size)
+	}
+}
+
 func TestPullDetachAndFailure(t *testing.T) {
 	h := newHarness(t)
 	h.ctrl.set(func(c *fakeController) { c.paused = true })

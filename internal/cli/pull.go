@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -16,6 +17,7 @@ import (
 
 type pullFlags struct {
 	size    string
+	sizeSet bool
 	secrets []string
 	detach  bool
 }
@@ -32,6 +34,7 @@ independent writable workspace from it.`,
   blip run --from base -- bash`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			f.sizeSet = cmd.Flags().Changed("size")
 			return a.pull(cmd.Context(), args[0], args[1], f)
 		},
 	}
@@ -44,6 +47,11 @@ independent writable workspace from it.`,
 func (a *app) pull(ctx context.Context, name, image string, f *pullFlags) error {
 	if strings.TrimSpace(image) == "" {
 		return fmt.Errorf("OCI_REF must not be empty")
+	}
+	// An explicitly blank size is a mistake, not a request for the default
+	// size: an unset shell variable must not silently create a base.
+	if f.sizeSet && strings.TrimSpace(f.size) == "" {
+		return errors.New("--size must not be empty")
 	}
 	if err := a.scope(&name); err != nil {
 		return err
