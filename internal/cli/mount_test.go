@@ -192,6 +192,68 @@ func TestMountUnusableSourceBeforeEdit(t *testing.T) {
 	}
 }
 
+// TestMountSourceDeletedBeforeEditLeavesNoIntent reproduces a source state
+// deleted after the preflight read but before the root's atomic edit. The edit
+// must re-read the source, or the command leaves durable intent that every
+// later execution fails to resolve.
+func TestMountSourceDeletedBeforeEditLeavesNoIntent(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		replace bool
+		want    string
+	}{
+		{"deleted", false, `state "data" not found`},
+		{"replaced", true, `state "data" was replaced`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, data := readyState("home"), readyState("data")
+			data.UID = "uid-old"
+			a := mountTestApp(t, root, data)
+			reads := 0
+			a.c.Kube = interceptor.NewClient(a.c.Kube, interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, ok := obj.(*v1alpha1.BlipState); ok && key.Name == root.Name {
+						reads++
+						if reads == 3 {
+							// The third read is updateState's atomic
+							// re-read; the source vanishes in that window.
+							if err := c.Delete(ctx, data); err != nil {
+								return err
+							}
+							if tc.replace {
+								replacement := readyState("data")
+								replacement.UID = "uid-new"
+								if err := c.Create(ctx, replacement); err != nil {
+									return err
+								}
+							}
+						}
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			})
+			var out, errOut bytes.Buffer
+			a.env.Out, a.env.Err = &out, &errOut
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if code := Main(ctx, a.env, []string{"mount", "data:/data", "--root", "home"}); code != 1 {
+				t.Fatalf("mount code %d: %s", code, errOut.String())
+			}
+			mustContain(t, errOut.String(), tc.want)
+			s, err := a.getState(ctx, root.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Spec.Mounts) != 0 {
+				t.Fatalf("deleted source left desired intent: %+v", s.Spec.Mounts)
+			}
+			if strings.Contains(out.String(), "applied on next execution") {
+				t.Fatalf("command claimed intent for a gone source: %s", out.String())
+			}
+		})
+	}
+}
+
 func TestMountStateGone(t *testing.T) {
 	for _, tc := range []struct{ name, msg, want string }{
 		{

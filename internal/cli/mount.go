@@ -264,6 +264,14 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 			// edit it. Do not add intent that can never run.
 			return "", fmt.Errorf("state %q is being deleted", a.short(root))
 		}
+		// Re-read the source inside the edit: the preflight read can race
+		// with a deletion, and intent for a gone state would make every
+		// later execution wait for it.
+		if gone, err := a.mountSourceChanged(ctx, source); err != nil {
+			return "", err
+		} else if gone != "" {
+			return "", errors.New(gone)
+		}
 		want, demoting, added, moved = false, false, false, false
 		prevPath, prevWritable = "", false
 		oldAttachment = ""
@@ -495,6 +503,30 @@ func (a *app) mountSourceGone(ctx context.Context, state string) string {
 		return fmt.Sprintf("state %q is being deleted", state)
 	}
 	return ""
+}
+
+// mountSourceChanged reports why the mount's source state can no longer be
+// attached, re-reading it inside the root edit. The preflight read can race
+// with a deletion, and writing desired intent for a state that is gone would
+// make every later execution wait for it. A state recreated under the same
+// name is not the source this command validated either.
+func (a *app) mountSourceChanged(ctx context.Context, source *v1alpha1.BlipState) (string, error) {
+	c, err := a.clients()
+	if err != nil {
+		return "", err
+	}
+	var cur v1alpha1.BlipState
+	switch err := c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: source.Name}, &cur); {
+	case apierrors.IsNotFound(err):
+		return fmt.Sprintf("state %q not found", a.short(source.Name)), nil
+	case err != nil:
+		return "", err
+	case cur.DeletionTimestamp != nil:
+		return fmt.Sprintf("state %q is being deleted", a.short(source.Name)), nil
+	case source.UID != "" && cur.UID != source.UID:
+		return fmt.Sprintf("state %q was replaced", a.short(source.Name)), nil
+	}
+	return "", nil
 }
 
 // mountRejectedError marks a mount the guest or controller refused for a
