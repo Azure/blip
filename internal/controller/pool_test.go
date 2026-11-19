@@ -1094,12 +1094,49 @@ func TestPoolPinsDurableCopiesOfSharedBase(t *testing.T) {
 // TestPoolMaxCountCapsWarmCount checks that a pool edited below its warm
 // count does not keep more vacant VMs than maxCount allows.
 func TestPoolMaxCountCapsWarmCount(t *testing.T) {
-	e := newEnv(t)
-	e.newPool("default", 4, 2)
-	e.run(e.pool, ns, "default")
-	if n := len(e.pods()); n != 2 {
-		t.Errorf("%d pods, want maxCount 2", n)
-	}
+	t.Run("warm count over cap", func(t *testing.T) {
+		e := newEnv(t)
+		e.newPool("default", 4, 2)
+		e.run(e.pool, ns, "default")
+		if n := len(e.pods()); n != 2 {
+			t.Errorf("%d pods, want maxCount 2", n)
+		}
+	})
+
+	// Claimed VMs share the cap with vacant spares. Lowering maxCount below
+	// claimed+warm must delete the surplus spares instead of keeping
+	// maxCount of them in addition to every claimed VM.
+	t.Run("claimed pod over cap", func(t *testing.T) {
+		e := newEnv(t)
+		e.addNodes("n1")
+		e.newPool("default", 2, 2)
+		pool := e.getPool("default")
+
+		claimed := e.pool.podFor(pool, "default-claimed")
+		claimed.Spec.NodeName = "n1"
+		claimed.Status.Phase = corev1.PodRunning
+		claimed.Labels[v1.LabelBlipUID] = "uid-claimed"
+		e.create(claimed)
+		for i := range 2 {
+			p := e.pool.podFor(pool, fmt.Sprintf("default-spare-%d", i))
+			p.Spec.NodeName = "n1"
+			p.Status.Phase = corev1.PodRunning
+			p.Labels[v1.LabelWarm] = "true"
+			e.create(p)
+		}
+
+		e.run(e.pool, ns, "default")
+		if n := len(e.pods()); n != 2 {
+			t.Fatalf("%d pods, want 2 (one claimed plus one spare) within maxCount", n)
+		}
+		if e.podGone(claimed.Name) {
+			t.Error("claimed VM deleted; the cap only removes vacant spares")
+		}
+		want := v1.BlipPoolStatus{Ready: 1, Vacant: 1, Claimed: 1}
+		if got := e.getPool("default").Status; got != want {
+			t.Errorf("status %+v, want %+v", got, want)
+		}
+	})
 }
 
 // TestPoolDemand checks that only Blips that can use this pool create

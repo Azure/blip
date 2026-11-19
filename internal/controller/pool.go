@@ -506,7 +506,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	target := int(pool.Spec.WarmCount) + demand
 	maxCount := int(pool.Spec.MaxCount)
 	if maxCount > 0 {
-		target = min(target, maxCount)
+		// maxCount caps claimed VMs as well as vacant spares. Budget the
+		// spares only what the claims leave: lowering the cap while a Blip
+		// runs must delete surplus spares, not keep maxCount of them on top
+		// of every claim. A cap below the claims leaves no spare budget.
+		target = min(target, max(maxCount-int(status.Claimed), 0))
 	}
 	// Only ready vacant pods can satisfy a waiting Blip. A booting or broken
 	// spare must not stand in for demand and suppress the replacement that the
@@ -570,6 +574,9 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		for _, p := range spare[:max(0, min(have-target, len(spare)))] {
 			if err := del(p); err != nil {
 				return reconcile.Result{}, err
+			}
+			if ready(p) {
+				status.Ready--
 			}
 			have--
 			warm[podNode(p)]--
