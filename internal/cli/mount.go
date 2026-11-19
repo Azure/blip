@@ -1203,6 +1203,9 @@ func (a *app) prepareNewMounts(f *mountFlags, replicasSet bool) ([]newMount, err
 		if err := a.scope(&name); err != nil {
 			return nil, err
 		}
+		if err := a.validateName("state", name); err != nil {
+			return nil, err
+		}
 		news = append(news, newMount{spec: spec, name: name, path: mountPath, writable: writable})
 	}
 	return news, nil
@@ -1241,6 +1244,9 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 		return errors.New("--replicas must be between 1 and 3")
 	}
 	if err := a.scope(&name); err != nil {
+		return err
+	}
+	if err := a.validateName("state", name); err != nil {
 		return err
 	}
 	c, err := a.clients()
