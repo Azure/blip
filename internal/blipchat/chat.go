@@ -62,7 +62,19 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	user := r.Header.Get("X-Forwarded-User")
+	// X-Forwarded-User is trusted from the front end (see README). A proxy
+	// that appends instead of overwriting would let a client pre-seed the
+	// first value, so require exactly one.
+	users := r.Header.Values("X-Forwarded-User")
+	if len(users) == 0 {
+		http.Error(w, "missing X-Forwarded-User", http.StatusUnauthorized)
+		return
+	}
+	if len(users) != 1 {
+		http.Error(w, "exactly one X-Forwarded-User header is required", http.StatusBadRequest)
+		return
+	}
+	user := strings.TrimSpace(users[0])
 	if user == "" {
 		http.Error(w, "missing X-Forwarded-User", http.StatusUnauthorized)
 		return
