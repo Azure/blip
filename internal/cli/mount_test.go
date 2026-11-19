@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // mountTestApp has no controller: waits can only succeed from observed status,
@@ -2001,6 +2002,74 @@ func TestMountMoveRejectedRestoresPreviousPath(t *testing.T) {
 	}
 	if m := findSpecMount(mounts, "keep"); m == nil || m.Path != "/keep" {
 		t.Fatalf("removed mount was not restored: %+v", mounts)
+	}
+}
+
+// TestMountMoveRollbackHonorsOccupiedPreviousPath reproduces a rejected move
+// whose old path a concurrent edit has taken. Restoring over the other mount
+// would leave a topology the controller rejects on every execution, so the
+// rollback must remove the rejected entry and say the restore was impossible.
+func TestMountMoveRollbackHonorsOccupiedPreviousPath(t *testing.T) {
+	const guestErr = "/usr/bin/env is a symlink or not a directory"
+	for _, tc := range []struct{ name, occupied string }{
+		{"nested", "/data/sub"},
+		{"exact", "/data"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBlip("agent")
+			root := readyState(b.Spec.State)
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Spec.Mounts = []v1alpha1.Mount{
+				{State: "data", Path: "/data"},
+				{State: "keep", Path: "/keep"},
+			}
+			b.Status.Mounts = []v1alpha1.MountStatus{
+				{State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "data-attachment"},
+				{State: "keep", Path: "/keep", Phase: v1alpha1.MountMounted, AttachmentID: "keep-attachment"},
+			}
+			h := newHarness(t, b, root, readyState("data"), readyState("keep"))
+			h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
+			// Take the old path in the same write that applies the move,
+			// as a concurrent editor between the root read and update would.
+			injected := false
+			h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{
+				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+					if s, ok := obj.(*v1alpha1.BlipState); ok && !injected {
+						if m := findSpecMount(s.Spec.Mounts, "data"); m != nil && m.Path == "/new" {
+							injected = true
+							s.Spec.Mounts = append(s.Spec.Mounts, v1alpha1.Mount{State: "other", Path: tc.occupied})
+						}
+					}
+					return c.Update(ctx, obj, opts...)
+				},
+			})
+
+			code, _, errOut := h.run("", "mount", "data:/new", "--rm", "keep", "--root", root.Name)
+			if code != 1 || !strings.Contains(errOut, guestErr) {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if strings.Contains(errOut, "was restored") {
+				t.Fatalf("blocked rollback claims success: %s", errOut)
+			}
+			mustContain(t, errOut, "previous mount", "/data", "could not be restored", "mount data again")
+			mounts := h.state(root.Name).Spec.Mounts
+			if findSpecMount(mounts, "data") != nil {
+				t.Fatalf("blocked rollback left rejected intent: %+v", mounts)
+			}
+			if m := findSpecMount(mounts, "other"); m == nil || m.Path != tc.occupied {
+				t.Fatalf("concurrent mount was lost: %+v", mounts)
+			}
+			if m := findSpecMount(mounts, "keep"); m == nil || m.Path != "/keep" {
+				t.Fatalf("removed mount was not restored: %+v", mounts)
+			}
+			for _, m := range mounts {
+				for _, other := range mounts {
+					if m.State != other.State && mountPathsOverlap(m.Path, other.Path) {
+						t.Fatalf("rollback left overlapping mounts: %+v", mounts)
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -368,12 +368,22 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 			case moved:
 				// A move rewrote an existing mount's path. On a rejection
 				// the old path must come back, or every later execution of
-				// the root fails at the rejected mount point.
-				if rerr := a.restoreMovedMount(ctx, root, state, mountPath, want, prevPath, prevWritable); rerr != nil {
+				// the root fails at the rejected mount point. If another
+				// mount now occupies the old path, the rejected entry is
+				// removed instead and the user must mount again.
+				restored, blockedBy, rerr := a.restoreMovedMount(ctx, root, state, mountPath, want, prevPath, prevWritable)
+				switch {
+				case rerr != nil:
 					fmt.Fprintf(a.env.Err, "warning: could not restore previous path of state %s on root state %s: %v\n", a.short(state), a.short(root), rerr)
 					err = fmt.Errorf("%w; desired mount remains applied", err)
-				} else {
+				case restored:
 					err = fmt.Errorf("%w; the previous mount of state %s at %s was restored", err, a.short(state), prevPath)
+				case blockedBy != "":
+					err = fmt.Errorf("%w; the previous mount of state %s at %s could not be restored because %s; the rejected mount was removed from root state %q; mount %s again", err, a.short(state), prevPath, blockedBy, a.short(root), a.short(state))
+				default:
+					// A concurrent edit replaced the entry this command
+					// wrote, so there is nothing to roll back.
+					err = fmt.Errorf("%w; the mount of state %s was changed concurrently and was left as is", err, a.short(state))
 				}
 			default:
 				// The mount was already in the root before this command, so
@@ -587,21 +597,44 @@ func (a *app) restoreMountMode(ctx context.Context, root, state, mountPath strin
 
 // restoreMovedMount reverts the path and mode of an existing mount after a
 // rejected move. It only rewrites the exact entry this command wrote, so a
-// concurrent edit wins and the old path is never restored over someone else's
-// change.
-func (a *app) restoreMovedMount(ctx context.Context, root, state, mountPath string, want bool, prevPath string, prevWritable bool) error {
-	_, err := a.updateState(ctx, root, func(s *v1alpha1.BlipState) error {
+// concurrent edit wins. The previous path is restored only when it is still
+// free: restoring over another mount would leave an overlapping set the
+// controller rejects on every execution, so in that case the rejected entry is
+// removed instead and blockedBy describes the occupant.
+func (a *app) restoreMovedMount(ctx context.Context, root, state, mountPath string, want bool, prevPath string, prevWritable bool) (restored bool, blockedBy string, err error) {
+	_, err = a.updateState(ctx, root, func(s *v1alpha1.BlipState) error {
+		restored, blockedBy = false, ""
 		m := findSpecMount(s.Spec.Mounts, state)
 		if m == nil || m.Path != mountPath || m.Writable != want || m.BlipUID != "" {
 			return errUnchanged
 		}
+		for _, other := range s.Spec.Mounts {
+			if other.State == state {
+				continue
+			}
+			if mountPathsOverlap(other.Path, prevPath) {
+				blockedBy = fmt.Sprintf("state %s is mounted at %s", a.short(other.State), other.Path)
+				// Neither the rejected path nor the old path is usable.
+				// Remove this command's entry so the root can run again.
+				users := mountUsers(s)
+				delete(users, state)
+				for i := range s.Spec.Mounts {
+					if s.Spec.Mounts[i].State == state {
+						s.Spec.Mounts = append(s.Spec.Mounts[:i], s.Spec.Mounts[i+1:]...)
+						break
+					}
+				}
+				return setMountUsers(s, users)
+			}
+		}
 		m.Path, m.Writable = prevPath, prevWritable
+		restored = true
 		return nil
 	})
 	if errors.Is(err, errUnchanged) {
-		return nil
+		err = nil
 	}
-	return err
+	return restored, blockedBy, err
 }
 
 // rollbackAddedMount removes the desired mount this command just added after
