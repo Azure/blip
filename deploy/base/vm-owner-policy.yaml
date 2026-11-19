@@ -163,12 +163,32 @@ spec:
         ' (' + variables.pools.join(', ') + ')'
       reason: Forbidden
 ---
-# Fail secure: without the table, pod-bound tokens of the namespace may not
-# change blips or states at all.
+# Without the table, pod-bound tokens may not create blips or states. Updates
+# and deletes must still be allowed: a terminating namespace drops the table
+# before the controller removes its finalizers, and a Deny there would leave
+# the namespace stuck in Terminating forever.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
   name: blip-vm-owner
+spec:
+  policyName: blip-vm-owner
+  validationActions: [Deny]
+  paramRef:
+    name: blip-vm-owners
+    parameterNotFoundAction: Allow
+  matchResources:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: ["*"]
+        resources: [blips, blips/status, blipstates, blipstates/status]
+        operations: [UPDATE, DELETE]
+---
+# New objects stay fail-secure: no table means no creation.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-vm-owner-create
 spec:
   policyName: blip-vm-owner
   validationActions: [Deny]
@@ -180,7 +200,7 @@ spec:
       - apiGroups: [blip.dev]
         apiVersions: ["*"]
         resources: [blips, blips/status, blipstates, blipstates/status]
-        operations: [CREATE, UPDATE, DELETE]
+        operations: [CREATE]
 ---
 # Namespaces without blips keep pod exec working for their own workloads.
 apiVersion: admissionregistration.k8s.io/v1
