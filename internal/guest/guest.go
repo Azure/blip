@@ -464,7 +464,13 @@ func (g *Guest) startPrimary() {
 	if claim == nil || started {
 		return
 	}
-	spec := procSpec{argv: claim.Command, dir: claim.WorkingDir, user: claim.User, tty: claim.TTY}
+	// A non-interactive primary command has no client that could close its
+	// stdin, so give it EOF; a TTY session stays interactive through its
+	// terminal. Exec sessions are unaffected: their client sends EOF.
+	spec := procSpec{
+		argv: claim.Command, dir: claim.WorkingDir, user: claim.User, tty: claim.TTY,
+		stdinEOF: !claim.TTY,
+	}
 	hold := claim.WaitForClient
 	s, err := g.startSession(wire.PrimarySession, spec, claim.Env, hold)
 	if err != nil {

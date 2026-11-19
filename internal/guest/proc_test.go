@@ -1,6 +1,7 @@
 package guest
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,46 @@ import (
 
 	"github.com/Azure/blip/internal/podapi"
 )
+
+// A non-interactive primary command must see end of input immediately. It used
+// to get a pipe whose write end stayed open until exit, so `cat` (and any
+// other read) waited forever because no primary client ever sends EOF.
+func TestProcStdinEOF(t *testing.T) {
+	child, parent, err := procStdin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	defer parent.Close()
+	if n, err := parent.Write([]byte("discarded")); err != nil || n == 0 {
+		t.Fatalf("writing to the discarded stdin: %d, %v", n, err)
+	}
+	buf := make([]byte, 1)
+	if n, err := child.Read(buf); n != 0 || err != io.EOF {
+		t.Fatalf("reading primary stdin = %d, %v; want 0, EOF", n, err)
+	}
+}
+
+// Exec sessions keep a pipe so their client can upload stdin and forward its
+// own end of input.
+func TestProcStdinPipe(t *testing.T) {
+	child, parent, err := procStdin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	if _, err := parent.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	parent.Close()
+	buf := make([]byte, 2)
+	if n, err := io.ReadFull(child, buf); err != nil || string(buf) != "hi" {
+		t.Fatalf("read = %q, %v", buf[:n], err)
+	}
+	if n, err := child.Read(buf); n != 0 || err != io.EOF {
+		t.Fatalf("after EOF: %d, %v", n, err)
+	}
+}
 
 func TestWorkdirInRoot(t *testing.T) {
 	for _, tc := range []struct {

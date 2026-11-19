@@ -83,6 +83,33 @@ type procSpec struct {
 	tty  bool
 	rows uint16
 	cols uint16
+	// stdinEOF gives a non-TTY process an immediately closed stdin instead
+	// of a pipe that stays open for its whole lifetime. The primary command
+	// has no client that could feed it or send EOF, so without this `cat`
+	// waits forever. Exec sessions keep the pipe: their client uploads stdin
+	// and forwards its own end of input.
+	stdinEOF bool
+}
+
+// procStdin returns the child's stdin and the parent-side writer. For a
+// non-interactive primary command both are /dev/null, so reads see EOF and
+// stdin a client sends is discarded instead of blocking. Otherwise the child
+// reads from a pipe whose write end the session owns.
+func procStdin(stdinEOF bool) (child, parent *os.File, err error) {
+	if stdinEOF {
+		child, err = os.Open(os.DevNull)
+		if err != nil {
+			return nil, nil, err
+		}
+		parent, err = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err != nil {
+			child.Close()
+			return nil, nil, err
+		}
+		return child, parent, nil
+	}
+	child, parent, err = os.Pipe()
+	return child, parent, err
 }
 
 // proc is a running workload process and the host side of its stdio.
@@ -228,7 +255,7 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 		attr.Setctty = true
 		attr.Ctty = 0
 	} else {
-		inR, inW, err := os.Pipe()
+		inR, inW, err := procStdin(s.stdinEOF)
 		if err != nil {
 			return nil, nil, err
 		}
