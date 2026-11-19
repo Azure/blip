@@ -68,8 +68,8 @@ func TestVMOwnersWrittenBeforeClaim(t *testing.T) {
 	if got := e.getPod(b.Status.Pod).Labels[v1.LabelOwner]; got != testOwner {
 		t.Errorf("owned pod owner label = %q", got)
 	}
-	if got := e.getPod(plain.Status.Pod).Labels[v1.LabelOwner]; got != ownerAny {
-		t.Errorf("unrestricted pod owner label = %q", got)
+	if got := e.getPod(plain.Status.Pod).Labels[v1.LabelOwner]; got != "" {
+		t.Errorf("unrestricted pod owner label = %q, want none", got)
 	}
 	if uid := e.getPod(b.Status.Pod).Labels[v1.LabelBlipUID]; uid != string(b.UID) {
 		t.Errorf("owned pod lost its blip UID label: %q", uid)
@@ -165,7 +165,7 @@ func TestVMOwnersRestoredAfterLostClaim(t *testing.T) {
 		t.Fatalf("owner of %s = %q, want %q", stale.Name, got, ownerAny)
 	}
 	// A failed claim must not relabel a pod that another Blip still owns.
-	if got := e.getPod(stale.Name).Labels[v1.LabelOwner]; got != ownerAny {
+	if got := e.getPod(stale.Name).Labels[v1.LabelOwner]; got != "" {
 		t.Fatalf("failed claim changed owner label of %s to %q", stale.Name, got)
 	}
 

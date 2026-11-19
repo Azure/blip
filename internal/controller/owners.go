@@ -29,9 +29,16 @@ const (
 	ownerAny       = "-"
 )
 
-// blipOwner is the owner a Blip's VM acts for.
+// blipOwner is the owner a Blip's VM acts for, or "" for an unrestricted
+// Blip. An absent pod label is what makes the VM unrestricted; the admission
+// table uses ownerAny because it needs a non-empty entry per claimed pod.
 func blipOwner(b *v1.Blip) string {
-	if o := b.Labels[v1.LabelOwner]; o != "" {
+	return b.Labels[v1.LabelOwner]
+}
+
+// ownerEntry is the admission table value for a Blip's claimed pod.
+func ownerEntry(b *v1.Blip) string {
+	if o := blipOwner(b); o != "" {
 		return o
 	}
 	return ownerAny
@@ -123,7 +130,7 @@ func patchVMOwners(ctx context.Context, c client.Client, ns string, data map[str
 // setVMOwner records the owner of pod before b claims it, so the VM's
 // token is restricted from the moment it acts for b.
 func setVMOwner(ctx context.Context, c client.Client, p *corev1.Pod, b *v1.Blip) error {
-	owner := blipOwner(b)
+	owner := ownerEntry(b)
 	patch := map[string]*string{p.Name: &owner}
 	if sa := podServiceAccount(p); sa != "" {
 		var pools v1.BlipPoolList
@@ -152,7 +159,7 @@ func restoreVMOwner(ctx context.Context, c client.Client, live client.Reader, ns
 			return err
 		}
 		if err == nil && string(b.UID) == p.Labels[v1.LabelBlipUID] {
-			o := blipOwner(b)
+			o := ownerEntry(b)
 			owner = &o
 		}
 	}
@@ -209,7 +216,7 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 			}
 		}
 		if b := byUID[p.Labels[v1.LabelBlipUID]]; !isVacant(p) && b != nil && b.Name == p.Annotations[v1.AnnotationBlip] {
-			want[p.Name] = blipOwner(b)
+			want[p.Name] = ownerEntry(b)
 		}
 	}
 

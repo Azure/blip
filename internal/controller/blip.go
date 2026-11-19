@@ -733,7 +733,11 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 			p.Labels = map[string]string{}
 		}
 		p.Labels[v1.LabelBlipUID] = string(b.UID)
-		p.Labels[v1.LabelOwner] = blipOwner(b)
+		if owner := blipOwner(b); owner != "" {
+			p.Labels[v1.LabelOwner] = owner
+		} else {
+			delete(p.Labels, v1.LabelOwner)
+		}
 		if p.Annotations == nil {
 			p.Annotations = map[string]string{}
 		}
