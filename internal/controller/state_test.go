@@ -3,6 +3,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -216,6 +220,44 @@ func TestStateUnusablePullSecretFails(t *testing.T) {
 				t.Fatalf("message %q does not contain %q", st.Status.Message, tt.want)
 			}
 		})
+	}
+}
+
+// TestStateRejectedCredentialsFailTerminally is the controller side of the
+// `blip pull` hang: a 401 from a registry with the state's immutable
+// imagePullSecrets must fail the state, because the CLI waits for a commit
+// (or a terminal phase) and would otherwise stay on Pending forever.
+func TestStateRejectedCredentialsFailTerminally(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"details":"incorrect username or password"}`)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.state.Registry = RemoteRegistry{Reader: e.c}
+	e.create(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "badcred"},
+		Type:       corev1.SecretTypeDockerConfigJson,
+		Data: map[string][]byte{corev1.DockerConfigJsonKey: []byte(
+			fmt.Sprintf(`{"auths":{%q:{"username":"nouser","password":"definitely-wrong"}}}`, u.Host))},
+	})
+	e.newState("s", func(st *v1.BlipState) {
+		st.Spec.Image = u.Host + "/library/hello-world:latest"
+		st.Spec.Replicas = 0
+		st.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "badcred"}}
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("rejected credentials not terminal: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "registry rejected image pull credentials") ||
+		!strings.Contains(st.Status.Message, "incorrect username or password") {
+		t.Fatalf("message %q does not explain the rejected credentials", st.Status.Message)
 	}
 }
 

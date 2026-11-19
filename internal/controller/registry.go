@@ -33,17 +33,43 @@ var ErrInvalidImage = errors.New("invalid image reference")
 // retrying the same reference can never succeed.
 var ErrUnsupportedImage = errors.New("image has no manifest for this platform")
 
+// ErrAuthRejected means the registry rejected the image pull credentials the
+// state supplied. The imagePullSecrets reference is immutable, so the same
+// credentials are retried forever on every reconcile while `blip pull` waits
+// on Pending. Mark it terminal so the user sees the auth error and can fix the
+// Secret.
+var ErrAuthRejected = errors.New("registry rejected image pull credentials")
+
 // terminalImageError reports whether an image resolution error is permanent.
 // Image references and imagePullSecrets are immutable on a state, so a
 // missing image, an unparsable reference, an image without a manifest for the
-// node platform, or an unusable pull secret can never recover by retrying.
-// Other registry errors remain transient.
+// node platform, an unusable pull secret, or a rejected pull credential can
+// never recover by retrying. Other registry errors remain transient.
 func terminalImageError(err error) bool {
 	return errors.Is(err, ErrImageNotFound) ||
 		errors.Is(err, ErrInvalidImage) ||
 		errors.Is(err, ErrUnsupportedImage) ||
+		errors.Is(err, ErrAuthRejected) ||
 		errors.Is(err, registryauth.ErrUnusableSecret) ||
 		platformMismatch(err)
+}
+
+// classifyAuthRejection marks a 401/403 from the registry as terminal when the
+// state supplied image pull secrets: retrying the same rejected credentials
+// cannot succeed. Without supplied secrets the existing retry path is kept,
+// and transient network/5xx errors are never reclassified.
+func classifyAuthRejection(err error, ref string, secrets []corev1.LocalObjectReference) error {
+	if err == nil || len(secrets) == 0 {
+		return err
+	}
+	var terr *transport.Error
+	if !errors.As(err, &terr) {
+		return err
+	}
+	if terr.StatusCode != http.StatusUnauthorized && terr.StatusCode != http.StatusForbidden {
+		return err
+	}
+	return fmt.Errorf("%w for image %s: %v", ErrAuthRejected, ref, err)
 }
 
 // platformMismatch reports whether err is go-containerregistry's "no child
@@ -128,7 +154,11 @@ func (r RemoteRegistry) Digest(ctx context.Context, ref, namespace string, secre
 	if err != nil {
 		return "", err
 	}
-	return r.digest(ctx, ref, kc)
+	pinned, err := r.digest(ctx, ref, kc)
+	if err != nil {
+		return "", classifyAuthRejection(err, ref, secrets)
+	}
+	return pinned, nil
 }
 
 func (r RemoteRegistry) digest(ctx context.Context, ref string, kc authn.Keychain) (string, error) {
@@ -156,7 +186,11 @@ func (r RemoteRegistry) ImageConfig(ctx context.Context, ref, namespace string, 
 	if err != nil {
 		return nil, err
 	}
-	return r.imageConfig(ctx, ref, kc)
+	cfg, err := r.imageConfig(ctx, ref, kc)
+	if err != nil {
+		return nil, classifyAuthRejection(err, ref, secrets)
+	}
+	return cfg, nil
 }
 
 func (r RemoteRegistry) imageConfig(ctx context.Context, ref string, kc authn.Keychain) (*v1.ImageConfig, error) {
