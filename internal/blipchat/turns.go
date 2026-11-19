@@ -105,14 +105,14 @@ func createTurnIn(ctx context.Context, c client.Client, namespace, name string, 
 			}
 			return c.Create(ctx, turn)
 		}
-		// The same producer re-sent the turn with changed content (for
-		// example a report whose fields were cleaned differently). Update
-		// the spec in place: replacing the turn would drop status.seq and
-		// status.threadUID, which record whether the thread already
-		// consumed the report, and the sequencer would hand it a new,
-		// higher sequence number.
-		existing.Spec = turn.Spec
-		return c.Update(ctx, &existing)
+		// The same producer re-sent a deterministic turn with changed
+		// content (for example a report whose fields were cleaned
+		// differently). Turns are immutable at admission, so the spec cannot
+		// be updated: doing so fails validation and wedges the producer's
+		// watcher forever. The already-created turn is authoritative and may
+		// already record status.seq/threadUID; keep its content and report
+		// success so the reconcile converges.
+		return nil
 	}
 	return nil
 }
