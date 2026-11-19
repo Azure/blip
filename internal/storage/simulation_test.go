@@ -862,3 +862,99 @@ func TestStorageSimulationHostRestartAfterHydration(t *testing.T) {
 		}
 	}
 }
+
+// fetchHydration returns a cloneWait that completes the fetch immediately.
+func fetchHydration(x *storageSimulation) func(context.Context, string, string, func(int64, int64)) error {
+	return func(_ context.Context, name, _ string, _ func(int64, int64)) error {
+		return x.action("hydrate all", func() error {
+			for block := range 8 {
+				x.hydrate(name, block)
+			}
+			return nil
+		})
+	}
+}
+
+func fetchRemote() Remote {
+	return Remote{ID: "remote/lease", Device: "/remote/source", SizeBytes: 8 * blockSize,
+		Regions: []Region{{0, 8 * blockSize}}}
+}
+
+// TestFetchReplacesOrphanedDevices covers a fetch interrupted after it created
+// its destination, metadata, and clone target while its record was lost. Those
+// names are derived from the commit ID alone, so every later fetch used to fail
+// creating them ("Device or resource busy") and the save stayed pending
+// forever. A fetch holding the commit's key lock and finding no record may
+// clear them, including their pool allocations.
+func TestFetchReplacesOrphanedDevices(t *testing.T) {
+	x := newStorageSimulation(t)
+	x.s.cloneWait = fetchHydration(x)
+	rec := &record{ID: "new", Kind: KindCommit, Size: 8 * blockSize}
+	l := x.s.layout(rec)
+	for _, d := range []struct {
+		name string
+		thin uint32
+	}{{l.thin, 900}, {l.meta, 901}} {
+		x.dm[d.name] = &simDevice{table: thinTable(x.s.poolName(), d.thin, 8*blockSize), hydrated: map[int]bool{}}
+	}
+	x.dm[l.fetch] = &simDevice{table: fmt.Sprintf("0 %d clone %s %s /remote/source %d",
+		8*blockSize/512, mapperPath(l.meta), mapperPath(l.thin), blockSectors), hydrated: map[int]bool{}}
+
+	if err := x.s.FetchCommit(context.Background(), "state", "new", fetchRemote(), nil); err != nil {
+		t.Fatalf("FetchCommit with orphaned devices = %v", err)
+	}
+	r := x.s.vols["new"]
+	if r == nil || r.Phase != phaseReady || r.Clone != nil {
+		t.Fatalf("fetched commit = %+v", r)
+	}
+	for _, name := range []string{l.fetch, l.thin, l.meta} {
+		if x.dm[name] != nil {
+			t.Fatalf("orphaned device %s survived the fetch", name)
+		}
+	}
+	if got := x.thin[r.Thin][1]; got != x.remote[1] {
+		t.Fatalf("fetched block 1 = %q", got)
+	}
+	// Both orphaned thin IDs were reclaimed, plus the clone's own metadata.
+	deletes := 0
+	for _, step := range x.trace {
+		if strings.HasPrefix(step, string(eDeleteThin)+" ") {
+			deletes++
+		}
+	}
+	if deletes < 3 {
+		t.Fatalf("stale thin IDs were not deleted: %v", x.trace)
+	}
+	x.checkOwnership()
+}
+
+// TestFetchRetriesUnfinishedRecord covers an attempt whose rollback failed:
+// its record stays in the creating phase, which begin rejects and recovery
+// retries only at startup. A later fetch on the same node must retry that
+// rollback, otherwise the commit can never be fetched again.
+func TestFetchRetriesUnfinishedRecord(t *testing.T) {
+	x := newStorageSimulation(t)
+	x.s.cloneWait = fetchHydration(x)
+	rec := &record{ID: "new", Kind: KindCommit, Size: 8 * blockSize,
+		Clone: &cloneInfo{MetaSize: blockSize, Source: "/remote/source", SourceSize: 8 * blockSize}}
+	if _, err := x.s.begin(rec, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.s.setupClone(rec, nil, x.s.fetchName(rec), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := x.s.Get("new"); ok {
+		t.Fatal("unfinished record is visible")
+	}
+	if err := x.s.FetchCommit(context.Background(), "state", "new", fetchRemote(), nil); err != nil {
+		t.Fatalf("FetchCommit after failed rollback = %v", err)
+	}
+	r := x.s.vols["new"]
+	if r == nil || r.Phase != phaseReady || r.Clone != nil {
+		t.Fatalf("fetched commit = %+v", r)
+	}
+	if x.dm[x.s.fetchName(r)] != nil {
+		t.Fatal("fetch device survived")
+	}
+	x.checkOwnership()
+}
