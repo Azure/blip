@@ -48,3 +48,46 @@ func TestBudgetExhaustedStepLeavesTurnsAndTimersPending(t *testing.T) {
 		t.Errorf("budget-exhausted step lost the due timer: %+v", updated.Status.Timers)
 	}
 }
+
+// Tokens spent yesterday must not count against today's budget, and a step
+// today must not pause a thread that has only spent today's small amount.
+func TestDailyTokenBudgetRollsOverAtDayBoundary(t *testing.T) {
+	yesterday := timeNow().UTC().Add(-24 * time.Hour).Format("2006-01-02")
+	thread := testThread()
+	thread.Spec.DailyTokens = 40
+	thread.Status.TokenDay = yesterday
+	thread.Status.TokensToday = 600
+	server := llmServer(t,
+		Message{Role: "assistant", Content: "ok"},
+		Message{Role: "assistant", Content: "ok"},
+	)
+	c := testClient(t, thread)
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	ctx := context.Background()
+	for step := 1; step <= 2; step++ {
+		var current v1.BlipThread
+		if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &current); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.step(ctx, &current); err != nil {
+			t.Fatal(err)
+		}
+		var updated v1.BlipThread
+		if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.TokenDay != timeNow().UTC().Format("2006-01-02") {
+			t.Errorf("after step %d tokenDay = %q, want today", step, updated.Status.TokenDay)
+		}
+		if want := int64(step * 15); updated.Status.TokensToday != want {
+			t.Errorf("after step %d tokensToday = %d, want %d", step, updated.Status.TokensToday, want)
+		}
+		if updated.Status.Paused != nil {
+			t.Errorf("after step %d paused = %+v; today's spend is under the budget", step, updated.Status.Paused)
+		}
+	}
+}

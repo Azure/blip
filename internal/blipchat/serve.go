@@ -321,10 +321,11 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 		current.Status.Tasks = st.tasks
 		current.Status.Timers = st.timers
 		current.Status.NextWake = next
-		current.Status.TokenDay = today
-		if current.Status.TokenDay == today {
-			current.Status.TokensToday += tokens
+		if current.Status.TokenDay != today {
+			current.Status.TokenDay = today
+			current.Status.TokensToday = 0
 		}
+		current.Status.TokensToday += tokens
 		if st.paused != "" {
 			current.Status.Paused = &v1.ThreadPause{Reason: st.paused}
 		}
