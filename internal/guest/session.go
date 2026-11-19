@@ -7,8 +7,10 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Azure/blip/internal/wire"
 	"golang.org/x/sys/unix"
@@ -341,7 +343,7 @@ func (g *Guest) rememberOpenLocked(openID string) {
 // client sees the error and an exit status.
 func (g *Guest) failedSession(id string, argv []string, err error) *session {
 	ss := newSession(g, id, argv, false)
-	ss.out.add(wire.TStderr, []byte(err.Error()+"\n"))
+	ss.out.add(wire.TStderr, []byte(boundErrorText(err.Error())+"\n"))
 	g.mu.Lock()
 	g.sessions[id] = ss
 	g.mu.Unlock()
@@ -1141,7 +1143,7 @@ func execProcSpec(claim *wire.Claim, o wire.Open) procSpec {
 }
 
 func reject(c *wire.Conn, f io.Closer, err error) {
-	_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error()})
+	_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: boundErrorText(err.Error())})
 	f.Close()
 }
 
@@ -1152,11 +1154,35 @@ func reject(c *wire.Conn, f io.Closer, err error) {
 func rejectStart(c *wire.Conn, f io.Closer, err error) {
 	var se *startError
 	if errors.As(err, &se) {
-		_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error(), Code: se.code})
+		_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: boundErrorText(err.Error()), Code: se.code})
 	} else {
-		_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: err.Error()})
+		_ = c.WriteJSON(wire.TOpened, wire.Opened{Error: boundErrorText(err.Error())})
 	}
 	f.Close()
+}
+
+// maxErrorText bounds start and open error text sent in one frame. A single
+// client argument can be nearly 128 KiB and JSON escapes control bytes six
+// times, so an unbounded start error can exceed wire.MaxFrame. The TOpened
+// write would then fail, the connection would close, and the client would
+// report a VM lifecycle failure instead of the real 126.
+const maxErrorText = 4 << 10
+
+const truncatedMarker = "... (truncated)"
+
+// boundErrorText shortens s to maxErrorText bytes without splitting a UTF-8
+// sequence. Invalid bytes are replaced only here, in the human-readable error,
+// so the frame is always valid JSON and deterministic in size.
+func boundErrorText(s string) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if len(s) <= maxErrorText {
+		return s
+	}
+	limit := maxErrorText - len(truncatedMarker)
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit] + truncatedMarker
 }
 
 func (s *session) tail(max int) string {

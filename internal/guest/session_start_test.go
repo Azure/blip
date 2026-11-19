@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 
@@ -356,5 +357,68 @@ func TestExecStartFailureCarriesExitStatus(t *testing.T) {
 				t.Fatalf("opened = %+v, want code %d and %q", o, tc.code, tc.msg)
 			}
 		})
+	}
+}
+
+// A start error containing a very long path is escaped by JSON. The reply must
+// still fit one frame, otherwise WriteJSON fails, the client sees EOF, and it
+// reports "the VM is not reachable" instead of the real 126.
+func TestExecStartFailureBoundsOversizedError(t *testing.T) {
+	g := testGuest(t)
+	g.claim = &wire.Claim{ID: "root"}
+	long := strings.Repeat("\x01", 130_000)
+	huge := fmt.Errorf("start /tmp/%s: %w", long,
+		&os.PathError{Op: "fork/exec", Path: "/tmp/" + long, Err: unix.ENAMETOOLONG})
+	g.startProcess = func(procSpec, []string) (*proc, []string, error) {
+		return nil, nil, startFail(126, huge)
+	}
+	srv, cli := sessionPair(t)
+	defer cli.Close()
+	c := wire.NewConn(cli)
+	go g.serveSession(srv)
+	if err := c.WriteJSON(wire.TOpen, wire.Open{Mode: wire.OpenExec, Argv: []string{"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	typ, payload, err := c.Read()
+	if err != nil || typ != wire.TOpened {
+		t.Fatalf("read = %d, %v", typ, err)
+	}
+	if len(payload) > wire.MaxFrame {
+		t.Fatalf("TOpened payload = %d bytes, over MaxFrame %d", len(payload), wire.MaxFrame)
+	}
+	var o wire.Opened
+	if err := wire.Decode(payload, &o); err != nil {
+		t.Fatal(err)
+	}
+	if o.Code != 126 {
+		t.Fatalf("Code = %d, want 126", o.Code)
+	}
+	if len(o.Error) > maxErrorText || !strings.Contains(o.Error, truncatedMarker) {
+		t.Fatalf("error not bounded: %d bytes, %q", len(o.Error), o.Error)
+	}
+	if !utf8.ValidString(o.Error) {
+		t.Fatalf("bounded error is not valid UTF-8: %q", o.Error)
+	}
+}
+
+// The primary command's start failure is replayed as stderr rather than a
+// TOpened. That frame must be bounded too, or an attaching client cannot read
+// it and the exit status is lost.
+func TestFailedSessionBoundsOversizedStartError(t *testing.T) {
+	g := &Guest{sessions: map[string]*session{}}
+	huge := errors.New("start /tmp/" + strings.Repeat("\x01", 130_000))
+	s := g.failedSession("exec-1", []string{"x"}, huge)
+	frames, _, _ := s.out.since(0)
+	if len(frames) != 1 {
+		t.Fatalf("frames = %d, want 1", len(frames))
+	}
+	if len(frames[0].data) > maxErrorText+1 {
+		t.Fatalf("stderr frame = %d bytes, want at most %d", len(frames[0].data), maxErrorText+1)
+	}
+	if !strings.Contains(string(frames[0].data), truncatedMarker) {
+		t.Fatalf("stderr was not visibly truncated: %d bytes", len(frames[0].data))
+	}
+	if !utf8.Valid(frames[0].data) {
+		t.Fatal("bounded stderr is not valid UTF-8")
 	}
 }
