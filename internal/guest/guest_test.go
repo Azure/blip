@@ -508,6 +508,42 @@ func TestMkdirInRoot(t *testing.T) {
 	}
 }
 
+// TestEnsureRunLock reproduces the base image's dangling /var/lock: /run is a
+// fresh tmpfs with no /run/lock, so a /var/lock mount point cannot be created
+// until setup restores the target directory.
+func TestEnsureRunLock(t *testing.T) {
+	root := t.TempDir()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.MkdirAll(filepath.Join(root, "run"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "var"), 0o755))
+	must(os.Symlink("/run/lock", filepath.Join(root, "var/lock")))
+
+	if _, err := mkdirInRoot(root, "/var/lock/x", true); err == nil {
+		t.Fatal("mount point created through a dangling /var/lock")
+	}
+	must(ensureRunLock(root))
+	info, err := os.Stat(filepath.Join(root, "run/lock"))
+	must(err)
+	if !info.IsDir() || info.Mode().Perm() != 0o755 {
+		t.Fatalf("/run/lock is %v, want a 0755 directory", info.Mode())
+	}
+	fd, err := mkdirInRoot(root, "/var/lock/x", true)
+	must(err)
+	p, err := fdPath(fd)
+	syscall.Close(fd)
+	must(err)
+	if p != filepath.Join(root, "run/lock/x") {
+		t.Fatalf("mount point resolved to %s", p)
+	}
+	// Setup may run on a root that already has the directory.
+	must(ensureRunLock(root))
+}
+
 func TestMountPointInRoot(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

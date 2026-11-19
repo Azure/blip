@@ -180,6 +180,23 @@ func mkdirInRoot(root, p string, follow bool) (int, error) {
 	return -1, errors.New("unreachable")
 }
 
+// ensureRunLock creates /run/lock inside root. /run is mounted as a fresh
+// tmpfs during setup, while the base image's /var/lock is a symlink to
+// /run/lock; without the target directory a mount at /var/lock/... fails with
+// ENOENT. mkdirInRoot creates the directory 0755, and the explicit chmod keeps
+// that mode even if the guest process has a restrictive umask.
+func ensureRunLock(root string) error {
+	fd, err := mkdirInRoot(root, "/run/lock", false)
+	if err != nil {
+		return fmt.Errorf("create /run/lock: %w", err)
+	}
+	defer unix.Close(fd)
+	if err := unix.Fchmodat(fd, "", 0o755, unix.AT_EMPTY_PATH); err != nil {
+		return fmt.Errorf("chmod /run/lock: %w", err)
+	}
+	return nil
+}
+
 // openFileInRoot opens (creating if missing) regular file p inside root,
 // resolving symlinks as if root were "/". It opens read-only, which is enough
 // to bind-mount the file even when the image made it read-only.

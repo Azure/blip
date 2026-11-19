@@ -401,6 +401,12 @@ func (g *Guest) setupRootLocked(m wire.Claim) error {
 		_ = unix.Fchmodat(fd, "", 0o1777, unix.AT_EMPTY_PATH)
 		unix.Close(fd)
 	}
+	// /run is a fresh tmpfs, but the base image's /var/lock points at
+	// /run/lock. Without that directory /var/lock is dangling and a mount
+	// there can never be created.
+	if err := ensureRunLock(g.root); err != nil {
+		return err
+	}
 	for _, f := range []string{"/etc/resolv.conf", "/etc/hosts"} {
 		if err := g.bindFileLocked(f); err != nil {
 			log.Printf("bind %s: %v", f, err)
