@@ -1057,6 +1057,53 @@ func TestMountRemoveFreesPathInSameCommand(t *testing.T) {
 	})
 }
 
+// TestMountRejectsTerminatingRoot reproduces a root state that is being
+// deleted: no mount can ever run there, so the command must reject before
+// writing intent or creating and committing a --new state.
+func TestMountRejectsTerminatingRoot(t *testing.T) {
+	newRoot := func() *v1alpha1.BlipState {
+		root := readyState("home")
+		now := metav1.Now()
+		root.Finalizers = []string{"test"}
+		root.DeletionTimestamp = &now
+		return root
+	}
+	t.Run("add", func(t *testing.T) {
+		h := newHarness(t, newRoot(), readyState("data"), readyState("base"))
+		for _, arg := range []string{"data:/data", "base:/y:ro"} {
+			code, _, errOut := h.run("", "mount", arg, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, `state "home" is being deleted`) {
+				t.Fatalf("mount %s: code %d: %s", arg, code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("mount %s left desired intent: %+v", arg, mounts)
+			}
+		}
+	})
+	t.Run("new", func(t *testing.T) {
+		h := newHarness(t, newRoot(), readyState("base"))
+		code, _, errOut := h.run("", "mount", "--new", "leak:/t4:rw", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `state "home" is being deleted`) {
+			t.Fatalf("--new code %d: %s", code, errOut)
+		}
+		if !stateNotFound(t, h, "leak") {
+			t.Fatal("terminating root left the new state behind")
+		}
+	})
+	t.Run("remove still allowed", func(t *testing.T) {
+		root := newRoot()
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+		h := newHarness(t, root, readyState("data"))
+		code, _, errOut := h.run("", "mount", "--rm", "data", "--root", "home")
+		if code != 0 {
+			t.Fatalf("--rm code %d: %s", code, errOut)
+		}
+		if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+			t.Fatalf("--rm left desired intent: %+v", mounts)
+		}
+	})
+}
+
 func TestMountRejectsDuplicateMounts(t *testing.T) {
 	t.Run("duplicate state", func(t *testing.T) {
 		h := newHarness(t, readyState("home"), readyState("data"))

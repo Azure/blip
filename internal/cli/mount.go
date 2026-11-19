@@ -203,6 +203,13 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 	if state == root {
 		return errors.New("a root state cannot mount itself")
 	}
+	r, err := a.getState(ctx, root)
+	if err != nil {
+		return err
+	}
+	if r.DeletionTimestamp != nil {
+		return fmt.Errorf("state %q is being deleted", a.short(root))
+	}
 	source, err := a.getState(ctx, state)
 	if err != nil {
 		return err
@@ -216,6 +223,11 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 	var want, demoting, added bool
 	var oldAttachment string
 	s, err := a.editMountsWaitingStale(ctx, root, state, func(s *v1alpha1.BlipState) (string, error) {
+		if s.DeletionTimestamp != nil {
+			// The root started deleting while this command waited to
+			// edit it. Do not add intent that can never run.
+			return "", fmt.Errorf("state %q is being deleted", a.short(root))
+		}
 		want, demoting, added = false, false, false
 		oldAttachment = ""
 		m := findSpecMount(s.Spec.Mounts, state)
@@ -862,6 +874,13 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	if err != nil {
 		return err
 	}
+	if root.DeletionTimestamp != nil && (len(args) > 0 || len(f.create) > 0) {
+		// A terminating root can never execute again. Reject before
+		// creating a state or writing intent that no run can use. A
+		// removal-only command stays legal so a reader can still detach
+		// and release the state's finalizer.
+		return fmt.Errorf("state %q is being deleted", a.short(f.root))
+	}
 	removed := make(map[string]bool, len(f.remove))
 	for _, arg := range f.remove {
 		state, err := a.removalState(ctx, arg, root)
@@ -985,6 +1004,9 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	if err != nil {
 		return err
 	}
+	if root.DeletionTimestamp != nil {
+		return fmt.Errorf("state %q is being deleted", a.short(f.root))
+	}
 	if err := validateMountPlan(root, []mountRequest{{state: name, path: mountPath, writable: writable}}, nil, false); err != nil {
 		return err
 	}
@@ -1025,6 +1047,16 @@ func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, r
 	if _, err := a.waitStateCommitted(ctx, name); err != nil {
 		a.removeCreatedStates(ctx, built)
 		return err
+	}
+	// The root may have started deleting while the new state committed. It
+	// can never run this mount, so remove what this command created instead
+	// of leaving an orphan behind.
+	if root, err := a.getState(ctx, f.root); err != nil {
+		a.removeCreatedStates(ctx, built)
+		return err
+	} else if root.DeletionTimestamp != nil {
+		a.removeCreatedStates(ctx, built)
+		return fmt.Errorf("state %q is being deleted", a.short(f.root))
 	}
 	if err := a.mountState(ctx, name, f.root, mountPath, &writable); err != nil {
 		// A mount that became desired intent before failing is referenced by
