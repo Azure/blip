@@ -188,6 +188,8 @@ func TestStreamTTYSignalIgnoredByGuestDetaches(t *testing.T) {
 		// no API server, so report it unreachable and keep the failure local.
 		Connect: func(KubeFlags) (*Clients, error) { return nil, errors.New("no API server in test") },
 	}}
+	// Detach quickly so the test does not wait for the production grace.
+	a.signalGrace = 200 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)

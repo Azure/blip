@@ -20,7 +20,15 @@ import (
 // unacknowledged by the guest. A command that ignores the signal (an
 // interactive shell ignores SIGTERM) would otherwise leave the client alive
 // forever, so a supervisor could only SIGKILL it and skip terminal restore.
-const signalGrace = 2 * time.Second
+// The grace restarts whenever the command or the local writer makes progress
+// and is capped by signalGraceMax, so a command that needs longer to clean up
+// is not cut off mid-shutdown and output the command already produced is not
+// discarded because the local consumer is slow.
+const (
+	signalGrace    = 10 * time.Second
+	signalGraceMax = 60 * time.Second
+	signalPoll     = 100 * time.Millisecond
+)
 
 // terminal returns stdin as a terminal file, or nil.
 func (a *app) terminal() *os.File {
@@ -84,7 +92,11 @@ func (a *app) stream(ctx context.Context, s *session.Session, opts streamOpts) e
 	// byte in raw mode and is delivered by the guest's terminal.
 	detached := make(chan string, 1)
 	if tty || a.env.Terminal {
-		go forwardSignals(ctx, s, detached)
+		grace := a.signalGrace
+		if grace <= 0 {
+			grace = signalGrace
+		}
+		go forwardSignals(ctx, s, detached, grace)
 	}
 
 	go func() {
@@ -179,10 +191,13 @@ func detachedSignal(ch <-chan string) (string, bool) {
 
 // forwardSignals forwards termination signals and bounds how long it waits
 // for the guest to end the session. A guest process may ignore the signal (an
-// interactive shell ignores SIGTERM), so after signalGrace the transport is
-// closed. That detaches the exec session, which makes the guest terminate the
-// command group, and lets stream return so the deferred terminal restore runs.
-func forwardSignals(ctx context.Context, s *session.Session, detached chan<- string) {
+// interactive shell ignores SIGTERM), so after a grace without progress the
+// transport is closed. That detaches the exec session, which makes the guest
+// terminate the command group, and lets stream return so the deferred terminal
+// restore runs. Progress restarting the grace keeps a command that is still
+// cleaning up, or output the local writer is still draining, from being
+// reported as an unacknowledged signal.
+func forwardSignals(ctx context.Context, s *session.Session, detached chan<- string, grace time.Duration) {
 	ch := make(chan os.Signal, 4)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(ch)
@@ -196,25 +211,50 @@ func forwardSignals(ctx context.Context, s *session.Session, detached chan<- str
 		name := strings.TrimPrefix(unix.SignalName(sig.(syscall.Signal)), "SIG")
 		_ = s.Signal(name)
 
-		// Keep forwarding signals while waiting, but do not let a repeated
-		// signal extend the grace indefinitely.
-		timer := time.NewTimer(signalGrace)
-	wait:
-		for {
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-				break wait
-			case more := <-ch:
-				_ = s.Signal(strings.TrimPrefix(unix.SignalName(more.(syscall.Signal)), "SIG"))
-			}
+		if !waitSignalGrace(ctx, s, ch, grace) {
+			return
 		}
 		// Publish first: the channel is buffered, and stream only consults
 		// it after Copy returns an error caused by the close below.
 		detached <- name
 		_ = s.Close()
 		return
+	}
+}
+
+// waitSignalGrace waits for the guest to end the session after a signal. It
+// returns false when ctx is done and true when the grace expired without any
+// progress. Immediate signals are still forwarded while waiting, but a
+// repeated signal does not extend the grace by itself.
+func waitSignalGrace(ctx context.Context, s *session.Session, ch <-chan os.Signal, grace time.Duration) bool {
+	deadline := time.Now().Add(grace)
+	hard := time.Now().Add(signalGraceMax)
+	progress := s.Progress()
+	tick := time.NewTicker(signalPoll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case more := <-ch:
+			_ = s.Signal(strings.TrimPrefix(unix.SignalName(more.(syscall.Signal)), "SIG"))
+		case <-tick.C:
+			// Output that the command produced before the signal, or that the
+			// local writer is still draining, proves the session is making
+			// progress. Extend up to the hard cap so neither a handled
+			// shutdown nor backpressured output is mistaken for an ignored
+			// signal.
+			if p := s.Progress(); p != progress || s.PendingOutput() > 0 {
+				progress = p
+				next := time.Now().Add(grace)
+				if next.After(hard) {
+					next = hard
+				}
+				deadline = next
+			}
+			if !time.Now().Before(deadline) {
+				return true
+			}
+		}
 	}
 }

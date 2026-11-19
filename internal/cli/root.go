@@ -131,6 +131,9 @@ type app struct {
 	self   *v1alpha1.Blip
 	owner  string
 	prefix string
+
+	// signalGrace overrides the default grace for tests.
+	signalGrace time.Duration
 }
 
 func (a *app) clients() (*Clients, error) {

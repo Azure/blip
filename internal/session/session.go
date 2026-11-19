@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/Azure/blip/internal/wire"
@@ -138,7 +139,24 @@ type Session struct {
 	rwc    io.ReadWriteCloser
 	conn   *wire.Conn
 	once   sync.Once
+
+	// progress counts completed output writes, and pending counts output
+	// frames received but not yet written to the caller's writer. A caller
+	// waiting for the command to react to a signal uses both to tell a
+	// command that is still shutting down (or output the client is still
+	// draining) from one that ignores the signal.
+	progress atomic.Int64
+	pending  atomic.Int64
 }
+
+// Progress reports how much output has been copied to the caller's writers.
+// It is monotonic and safe to read from another goroutine.
+func (s *Session) Progress() int64 { return s.progress.Load() }
+
+// PendingOutput reports output frames that have been received but not yet
+// written. A nonzero value means the client is still delivering output the
+// command already produced, not waiting on the guest.
+func (s *Session) PendingOutput() int64 { return s.pending.Load() }
 
 // Frame is one message from the guest.
 type Frame struct {
@@ -226,11 +244,19 @@ func (s *Session) Copy(stdout, stderr io.Writer, notice func(string)) (*wire.Exi
 		}
 		switch f.Type {
 		case wire.TStdout:
-			if _, err := stdout.Write(f.Data); err != nil {
+			s.pending.Add(1)
+			_, err := stdout.Write(f.Data)
+			s.pending.Add(-1)
+			s.progress.Add(1)
+			if err != nil {
 				return nil, err
 			}
 		case wire.TStderr:
-			if _, err := stderr.Write(f.Data); err != nil {
+			s.pending.Add(1)
+			_, err := stderr.Write(f.Data)
+			s.pending.Add(-1)
+			s.progress.Add(1)
+			if err != nil {
 				return nil, err
 			}
 		case wire.TNotice:
