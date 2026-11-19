@@ -351,8 +351,14 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 		}
 		return err
 	}
-	if err := a.launch(ctx, b, source, !f.keep); err != nil {
-		// The blip owns its workspace; deleting it removes the copies too.
+	created, err := a.launch(ctx, b, source, !f.keep)
+	if err != nil {
+		// launch may have created the fork's states before it failed. They
+		// must not outlive a run that never printed the blip: with --keep
+		// they have no owner reference, so nothing would ever remove them.
+		// The blip owns its workspace otherwise, so deleting it removes the
+		// copies too.
+		a.removeCreatedStates(ctx, created)
 		delErr := c.Kube.Delete(context.WithoutCancel(ctx), b)
 		if delErr != nil && !apierrors.IsNotFound(delErr) {
 			err = errors.Join(err, fmt.Errorf("remove blip %q: %w", a.short(name), delErr))
@@ -360,9 +366,10 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 		return err
 	}
 	// An interrupt can arrive after the last wait. Remove the blip before
-	// returning so an interrupted run does not leave a VM running. With
-	// --keep its workspace has no owner, so only the blip is removed.
+	// returning so an interrupted run does not leave a VM running. The
+	// workspace of a --keep run has no owner, so remove it explicitly too.
 	if err := ctx.Err(); err != nil {
+		a.removeCreatedStates(ctx, created)
 		delErr := c.Kube.Delete(context.WithoutCancel(ctx), b)
 		if delErr != nil && !apierrors.IsNotFound(delErr) {
 			err = errors.Join(err, fmt.Errorf("remove blip %q: %w", a.short(name), delErr))
@@ -375,14 +382,15 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 
 // launch creates the fork's states and waits until their first version is
 // usable, which is the snapshot the caller relies on. It is a no-op when the
-// blip runs in an existing workspace.
-func (a *app) launch(ctx context.Context, b *v1alpha1.Blip, source *v1alpha1.BlipState, owned bool) error {
+// blip runs in an existing workspace. It returns the states it created even
+// when it fails, so the caller can remove a fork it cannot use.
+func (a *app) launch(ctx context.Context, b *v1alpha1.Blip, source *v1alpha1.BlipState, owned bool) ([]*v1alpha1.BlipState, error) {
 	if source == nil {
-		return nil
+		return nil, nil
 	}
 	c, err := a.clients()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	fork := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: b.Name, Namespace: b.Namespace}}
 	a.label(fork)
@@ -391,24 +399,25 @@ func (a *app) launch(ctx context.Context, b *v1alpha1.Blip, source *v1alpha1.Bli
 		ref := blipRef(b)
 		opts = &workspace.ForkOptions{Owner: &ref}
 	}
-	if _, err := workspace.Fork(ctx, c.Kube, source, fork, opts); err != nil {
+	created, err := workspace.Fork(ctx, c.Kube, source, fork, opts)
+	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("state for blip %q already exists: %w", a.short(b.Name), err)
+			return nil, fmt.Errorf("state for blip %q already exists: %w", a.short(b.Name), err)
 		}
-		return err
+		return nil, err
 	}
 	if _, err := a.waitStateCommitted(ctx, b.Name); err != nil {
-		return err
+		return created, err
 	}
 	for _, mount := range fork.Spec.Mounts {
 		if !mount.Writable {
 			continue
 		}
 		if _, err := a.waitStateCommitted(ctx, mount.State); err != nil {
-			return err
+			return created, err
 		}
 	}
-	return nil
+	return created, nil
 }
 
 // describe summarizes a blip's reason and message.

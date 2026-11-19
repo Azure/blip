@@ -327,6 +327,37 @@ func TestRunInterruptedDuringForkRemovesBlip(t *testing.T) {
 	}
 }
 
+func TestRunInterruptedKeepDuringForkRemovesCreatedStates(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{
+		Create: func(c context.Context, w client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			err := w.Create(c, obj, opts...)
+			// Interrupt after the unowned --keep fork exists but before the
+			// CLI has waited for it to become usable.
+			if err == nil {
+				if _, ok := obj.(*v1alpha1.BlipState); ok {
+					cancel()
+				}
+			}
+			return err
+		},
+	})
+	var out, errb bytes.Buffer
+	err := h.app(strings.NewReader(""), &out, &errb).run(ctx, []string{"true"}, &runFlags{name: "worker", from: "base", keep: true})
+	if err == nil {
+		t.Fatal("interrupted run succeeded")
+	}
+	if !h.gone("worker") {
+		t.Fatal("interrupted run leaked its blip")
+	}
+	var st v1alpha1.BlipState
+	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "worker"}, &st); !apierrors.IsNotFound(err) {
+		t.Fatalf("interrupted --keep run leaked its fork state: %v", err)
+	}
+}
+
 func TestRunInterruptedWithStateKeepsWorkspace(t *testing.T) {
 	h := newHarness(t, readyState("ws"))
 	ctx, cancel := context.WithCancel(context.Background())
