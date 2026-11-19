@@ -54,6 +54,27 @@ func (m *counter) Check() error {
 	return nil
 }
 
+func TestSeedsDefaultAndEnvironmentOverride(t *testing.T) {
+	t.Setenv("BLIP_SIM_SEED", "")
+	t.Setenv("BLIP_SIM_RUNS", "")
+	if got, want := Seeds(7, 3), []uint64{7, 8, 9}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Seeds() = %v, want %v", got, want)
+	}
+	t.Setenv("BLIP_SIM_SEED", "1000")
+	t.Setenv("BLIP_SIM_RUNS", "4")
+	if got, want := Seeds(7, 3), []uint64{1000, 1001, 1002, 1003}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Seeds() = %v, want %v", got, want)
+	}
+	t.Setenv("BLIP_SIM_SEED", "bad")
+	t.Setenv("BLIP_SIM_RUNS", "-1")
+	if got, want := Seeds(7, 3), []uint64{7, 8, 9}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("malformed environment changed Seeds() = %v, want %v", got, want)
+	}
+	if got := Seeds(0, 0); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("Seeds(0, 0) = %v, want [0]", got)
+	}
+}
+
 func TestRunReplaysEverySeedWithoutMutatingInitial(t *testing.T) {
 	initial := &counter{}
 	want := initial.Key()

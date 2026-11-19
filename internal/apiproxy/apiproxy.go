@@ -225,6 +225,23 @@ func (l *requestLimiter) release() {
 	<-l.slots
 }
 
+// serve is the admission gate for one request. The slot is held for the whole
+// handler, including watches, streams, and hijacked upgrades, and released on
+// every return path. It is separate from the http.Server wiring so the decision
+// can be exercised without a network listener.
+func (l *requestLimiter) serve(w http.ResponseWriter, r *http.Request, handler http.Handler) {
+	if !l.acquire() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "too many concurrent requests", http.StatusServiceUnavailable)
+		return
+	}
+	defer l.release()
+	if lifetime, ok := r.Context().Value(connectionLifetimeKey{}).(context.Context); ok {
+		r = r.WithContext(lifetime)
+	}
+	handler.ServeHTTP(w, r)
+}
+
 // connectionLifetimeKey carries the connection-scoped context. A client may
 // half-close its write side after sending a complete request; net/http
 // cancels the per-request context when the read side reaches EOF, even
@@ -254,16 +271,7 @@ func newProxyServer(ctx context.Context, socketPath string, handler http.Handler
 			// streams, and hijacked upgrades, and released on every return
 			// path: normal completion, client cancellation, and upstream
 			// errors all end ServeHTTP.
-			if !limiter.acquire() {
-				w.Header().Set("Retry-After", "1")
-				http.Error(w, "too many concurrent requests", http.StatusServiceUnavailable)
-				return
-			}
-			defer limiter.release()
-			if lifetime, ok := r.Context().Value(connectionLifetimeKey{}).(context.Context); ok {
-				r = r.WithContext(lifetime)
-			}
-			handler.ServeHTTP(w, r)
+			limiter.serve(w, r, handler)
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
@@ -403,6 +411,26 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, http.
 	return handler, transport, ca, nil
 }
 
+// credentialFS is the filesystem subset used for projected credential files.
+// osCredentialFS is the production implementation; tests inject an in-memory
+// one to make rotation and revocation deterministic.
+type credentialFS interface {
+	Stat(name string) (os.FileInfo, error)
+	ReadFile(name string) ([]byte, error)
+}
+
+type osCredentialFS struct{}
+
+func (osCredentialFS) Stat(name string) (os.FileInfo, error) { return os.Stat(name) }
+func (osCredentialFS) ReadFile(name string) ([]byte, error)  { return os.ReadFile(name) }
+
+func credentialFiles(fs credentialFS) credentialFS {
+	if fs != nil {
+		return fs
+	}
+	return osCredentialFS{}
+}
+
 // caPool reads the configured CA bundle on demand. A projected ConfigMap
 // volume can rotate or revoke a CA in place; the bundle is re-read whenever
 // the file's modification time or size changes, so a running sidecar does not
@@ -411,6 +439,7 @@ type caPool struct {
 	caFile      string
 	label       string
 	systemRoots bool
+	files       credentialFS
 
 	mu      sync.Mutex
 	modTime time.Time
@@ -420,7 +449,7 @@ type caPool struct {
 }
 
 func newCAPool(caFile, label string, systemRoots bool) *caPool {
-	return &caPool{caFile: caFile, label: label, systemRoots: systemRoots}
+	return &caPool{caFile: caFile, label: label, systemRoots: systemRoots, files: osCredentialFS{}}
 }
 
 // current returns the current root pool. The generation increases on every
@@ -428,6 +457,7 @@ func newCAPool(caFile, label string, systemRoots bool) *caPool {
 func (p *caPool) current() (*x509.CertPool, uint64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	files := credentialFiles(p.files)
 	if p.caFile == "" {
 		if !p.systemRoots {
 			return nil, 0, fmt.Errorf("read %s: CA file is empty", p.label)
@@ -442,14 +472,14 @@ func (p *caPool) current() (*x509.CertPool, uint64, error) {
 		}
 		return p.roots, p.gen, nil
 	}
-	info, err := os.Stat(p.caFile)
+	info, err := files.Stat(p.caFile)
 	if err != nil {
 		return nil, 0, fmt.Errorf("read %s: %w", p.label, err)
 	}
 	if p.roots != nil && info.ModTime().Equal(p.modTime) && info.Size() == p.size {
 		return p.roots, p.gen, nil
 	}
-	ca, err := os.ReadFile(p.caFile)
+	ca, err := files.ReadFile(p.caFile)
 	if err != nil {
 		return nil, 0, fmt.Errorf("read %s: %w", p.label, err)
 	}
@@ -462,11 +492,19 @@ func (p *caPool) current() (*x509.CertPool, uint64, error) {
 	return p.roots, p.gen, nil
 }
 
+// idleClosingRoundTripper is the part of *http.Transport caTransport uses.
+// Keeping it as an interface lets the simulation drive the generation and
+// idle-connection decision with an in-memory upstream.
+type idleClosingRoundTripper interface {
+	http.RoundTripper
+	CloseIdleConnections()
+}
+
 // caTransport checks the CA bundle before each request and closes idle TLS
 // connections after a change, so the next request handshakes against the new
 // bundle instead of reusing a connection trusted under the old one.
 type caTransport struct {
-	base *http.Transport
+	base idleClosingRoundTripper
 	pool *caPool
 
 	mu  sync.Mutex
@@ -568,10 +606,11 @@ func stripIdentity(headers http.Header) {
 type tokenTransport struct {
 	base      http.RoundTripper
 	tokenFile string
+	files     credentialFS
 }
 
 func (t tokenTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	token, err := projectedToken(t.tokenFile)
+	token, err := projectedTokenFrom(t.files, t.tokenFile)
 	if err != nil {
 		return nil, err
 	}
@@ -582,7 +621,11 @@ func (t tokenTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func projectedToken(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	return projectedTokenFrom(nil, path)
+}
+
+func projectedTokenFrom(fs credentialFS, path string) (string, error) {
+	data, err := credentialFiles(fs).ReadFile(path)
 	if err != nil {
 		return "", errors.New("read projected service account token")
 	}

@@ -947,11 +947,7 @@ func TestForkSimulationSeededReplay(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			initial := newForkSim(collision)
-			seeds := make([]uint64, 20)
-			for i := range seeds {
-				seeds[i] = uint64(i)
-			}
-			simtest.Run(t, initial, seeds, 1)
+			simtest.Run(t, initial, simtest.Seeds(0, 20), 1)
 			if initial.ran || len(initial.Enabled()) != len(initial.cases) {
 				t.Fatal("Run or Replay mutated the initial model")
 			}

@@ -13,8 +13,11 @@ make test-sim
 ```
 
 The daily campaign explores a fresh, reproducible range of lifecycle seeds and
-retains failing output, including JSON traces, as a workflow artifact. To replay
-a particular seed or expand the local campaign, bypass the Go test cache:
+runs the component model target with a fresh seed base. Both jobs retain failing
+test output as a workflow artifact; lifecycle failures also include JSON traces.
+`internal/simtest.Seeds` applies `BLIP_SIM_SEED` and `BLIP_SIM_RUNS` to component
+models, while the composed lifecycle test reads them directly. To replay a
+particular seed or expand the local campaign, bypass the Go test cache:
 
 ```sh
 BLIP_SIM_SEED=123 BLIP_SIM_RUNS=1 go test -count=1 -v \
@@ -145,8 +148,19 @@ This coverage map is the simulation coverage ledger: each row names the producti
 | `internal/peer`, `internal/nvme` | Lease lifecycle, persistence, retry policy and connection workflows | Real transport/device semantics additionally tested by privileged suites |
 | `internal/stream/{stream_test.go,simulation_test.go}` | Ring append, whole-record trim, restart recovery, torn-tail rejection, reader gap reporting, and bounded-depth exhaustive exploration of a crash model with injected before/torn/lost writes | The model uses an in-memory `ReadWriterAt`; real volume I/O, concurrent failover and power-loss persistence need device tests |
 | `internal/workspace/{fork_test.go,simulation_test.go}` | Production `Fork` snapshot, preflight, child/root creation, owner patching, UID-guarded rollback, and rejected/transport/server read faults plus rejected/transport/server/lost-response write faults | Fake API with injected rejected and ambiguous responses; live API-server races, controller-driven snapshots and filesystem copy behavior are out of scope |
-| `internal/simapp` | Composed allocation, production node planning/admission, runtime, lease sequencing, save/replication and reacquisition | See its README for exact simulated services and exploration windows |
+| `internal/apiproxy/simulation_test.go` | Projected token and CA rotation/revocation, idle TLS connection invalidation, request admission, tracked connections, watch/upgrade lifetime and shutdown | In-memory credential filesystem and synchronous upstream; real TLS handshakes, API server, socket and `http.Server` goroutine behavior are out of scope |
+| `internal/blipchat/simulation_test.go` | Hub publish/replay/gap ring and subscriber cancellation; ACP driver generation restart, transcript retention and teardown | Production handlers are called synchronously, so driver goroutines/tickers, the real ACP subprocess, Kubernetes watch delivery and the SSE handler are out of scope |
+| `internal/streamapi/simulation_test.go` | Production stream handler authorization gate, log/stdin cursor lifecycle, gap/restart/EOF handling, response framing and backend error mapping | Simulated backend ring and generation; real node transport, TLS/SAR authentication and discovery remain in the existing unit tests |
+| `internal/simapp` | Composed allocation, production node planning/admission, runtime, lease sequencing, save/replication, reacquisition and bounded liveness windows for runtime-claim handoff and seal/report progress | See its README for exact simulated services and exploration windows |
 | `internal/sim`, `internal/simlive` | Replay, shrinking, exploration bounds, crash delivery and fair-cycle witnesses | Checker tests include deliberately broken models; production properties live in component/world tests |
+
+Pure and thin packages use property tests instead of a simulation model. In
+particular, `internal/network` checks that a Blip layer never widens the pool
+layer across an address/protocol/port grid and that every compiled policy
+passes the runtime's `netpolicy` validation; `internal/netpolicy` validates the
+wire representation directly; and `internal/image` shuffles unique layer
+entries to check parent-before-child emission and single-copy flattening.
+These tests run in the ordinary suite.
 
 Tests use independent content, ownership and resource monitors where applicable.
 Seeded campaigns check reproducibility, while complete bounded exploration is
@@ -155,6 +169,9 @@ reported only for the specific finite models/windows whose graphs were exhausted
 using the production runtime machine, with host execution and response delivery
 as separate actions. It finds a non-progress cycle without fairness and exhausts
 the goal-avoiding graph without a counterexample under the stated service groups.
+`internal/simapp/liveness_test.go` applies the same bounded check to the
+runtime-claim handoff and the seal/report phase, and includes a stalled-progress
+negative control that must produce a fair cycle.
 
 ## Durable document replacement
 

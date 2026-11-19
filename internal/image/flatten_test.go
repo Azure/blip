@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"io"
+	"math/rand/v2"
 	"strings"
 	"testing"
 
@@ -80,6 +81,36 @@ func checkParents(t *testing.T, entries []entry) {
 // (Dockerfile: COPY app /bin/app). The file must land at usr/bin/app, because
 // mke2fs replaces the real bin directory with the symlink and loses its
 // contents otherwise.
+// TestFlattenUniqueEntriesOrderIndependent shuffles unique directory and file
+// entries from one layer. Duplicate paths would make first-wins precedence
+// meaningful, so this test only uses unique paths; siblings may still be
+// emitted in any order.
+func TestFlattenUniqueEntriesOrderIndependent(t *testing.T) {
+	base := []entry{
+		{hdr: tar.Header{Name: "etc/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "etc/hostname", Typeflag: tar.TypeReg}, body: "blip"},
+		{hdr: tar.Header{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "usr/bin/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "usr/bin/sh", Typeflag: tar.TypeReg, Mode: 0o755}, body: "sh"},
+		{hdr: tar.Header{Name: "var/lib/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "var/lib/data", Typeflag: tar.TypeReg}, body: "data"},
+	}
+	for seed := uint64(0); seed < 20; seed++ {
+		shuffled := append([]entry(nil), base...)
+		rng := rand.New(rand.NewPCG(seed, 0x5eed))
+		rng.Shuffle(len(shuffled), func(i, j int) {
+			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+		})
+		got := flattenStream(t, bytes.NewReader(tarBytes(t, shuffled...)))
+		checkParents(t, got)
+		for _, want := range base {
+			if n := countEntry(got, strings.TrimSuffix(want.hdr.Name, "/")); n != 1 {
+				t.Fatalf("seed %d: entry %q emitted %d times", seed, want.hdr.Name, n)
+			}
+		}
+	}
+}
+
 func TestFlattenSymlinkedParent(t *testing.T) {
 	debian := []entry{
 		{hdr: tar.Header{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755}},

@@ -75,7 +75,7 @@ type Record struct {
 	// Offset is the logical byte offset of the record in the ring history.
 	Offset uint64
 	// Gen is the blip generation that wrote the record.
-	Gen uint64
+	Gen  uint64
 	Type RecordType
 	Data []byte
 }

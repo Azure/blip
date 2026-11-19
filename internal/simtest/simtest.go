@@ -5,10 +5,32 @@
 package simtest
 
 import (
+	"os"
+	"strconv"
 	"testing"
 
 	"github.com/Azure/blip/internal/sim"
 )
+
+// Seeds returns count consecutive seeds starting at base. BLIP_SIM_SEED and
+// BLIP_SIM_RUNS override the defaults for nightly campaigns; malformed values
+// leave the defaults in place so an ordinary test run stays deterministic.
+func Seeds(base uint64, count int) []uint64 {
+	if count < 1 {
+		count = 1
+	}
+	if value, err := strconv.ParseUint(os.Getenv("BLIP_SIM_SEED"), 10, 64); err == nil {
+		base = value
+	}
+	if value, err := strconv.Atoi(os.Getenv("BLIP_SIM_RUNS")); err == nil && value > 0 {
+		count = value
+	}
+	seeds := make([]uint64, count)
+	for i := range seeds {
+		seeds[i] = base + uint64(i)
+	}
+	return seeds
+}
 
 // Run executes a seeded simulation of initial for each seed and replays every
 // trace, failing if either step errors or if replay does not reproduce the

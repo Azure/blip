@@ -46,6 +46,10 @@ writer remains live.
 - `sim.Run` schedules seeded interleavings; `sim.Replay` verifies exact keys;
   `sim.Explore` exhaustively checks explicitly bounded four-transition windows.
   Window completeness is not a claim of exhaustive whole-system exploration.
+- `simlive` checks bounded eventual progress for the runtime-claim handoff and
+  the seal/report phase under configured weak fairness. A stalled-progress
+  negative control must produce a fair goal-avoiding cycle. This is a finite,
+  goal-pruned result, not a claim about the unbounded workload.
 - `Clone` uses the runtime and scheduler's deep-copy APIs. Keys include their
   complete canonical private state, clocks, queues, cache,
   physical and durable state, fault budgets, and monitors. An in-flight removal

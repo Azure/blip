@@ -37,3 +37,28 @@ jobs:
           name: simulation-traces
           path: simulation.log
           if-no-files-found: ignore
+
+  components:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Explore fresh reproducible component schedules
+        env:
+          BLIP_SIM_RUNS: '64'
+        run: |
+          export BLIP_SIM_SEED=$((GITHUB_RUN_NUMBER * BLIP_SIM_RUNS))
+          echo "Seeds start at ${BLIP_SIM_SEED}; runs=${BLIP_SIM_RUNS}"
+          set -o pipefail
+          make test-sim 2>&1 | tee simulation-components.log
+      - name: Retain failure traces
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: simulation-component-traces
+          path: simulation-components.log
+          if-no-files-found: ignore

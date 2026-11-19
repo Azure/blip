@@ -601,11 +601,7 @@ func TestStreamSimulation(t *testing.T) {
 	}
 	t.Logf("explored %d states, %d transitions", report.States, report.Transitions)
 
-	seeds := make([]uint64, 8)
-	for i := range seeds {
-		seeds[i] = uint64(i)
-	}
-	simtest.Run(t, initial, seeds, 14)
+	simtest.Run(t, initial, simtest.Seeds(0, 8), 14)
 }
 
 func TestStreamRealFile(t *testing.T) {

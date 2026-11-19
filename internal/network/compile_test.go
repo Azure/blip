@@ -257,6 +257,90 @@ func TestStableRevisionsAndNoInputMutation(t *testing.T) {
 	}
 }
 
+// TestCompileIntersectionNeverWidens checks the security property that a Blip
+// layer can only narrow the pool layer. The grid deliberately includes
+// addresses and ports that appear in neither rule, so a broken intersection
+// that falls back to allow-all is caught.
+func TestCompileIntersectionNeverWidens(t *testing.T) {
+	d := Destinations{
+		Namespaces: []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "apps", Labels: map[string]string{"team": "app"}}}},
+		Pods:       []corev1.Pod{pod("apps", "db", "10.0.0.1"), pod("apps", "web", "10.0.0.2")},
+	}
+	allowAll := &v1alpha1.NetworkPolicy{Egress: []v1alpha1.NetworkEgressRule{{}}}
+	web := policyFor(v1alpha1.NetworkPeer{IPBlock: &v1alpha1.NetworkIPBlock{CIDR: "10.0.0.0/8"}},
+		v1alpha1.NetworkPort{Port: 443})
+	udpRange := policyFor(v1alpha1.NetworkPeer{IPBlock: &v1alpha1.NetworkIPBlock{CIDR: "10.0.0.0/8"}},
+		v1alpha1.NetworkPort{Protocol: corev1.ProtocolUDP, Port: 8000, EndPort: int32ptr(8010)})
+	selectedPods := policyFor(v1alpha1.NetworkPeer{PodSelector: match("app", "db")},
+		v1alpha1.NetworkPort{Port: 443})
+	empty := &v1alpha1.NetworkPolicy{}
+
+	pools := []*v1alpha1.NetworkPolicy{nil, allowAll, web, udpRange, selectedPods, empty}
+	blips := []*v1alpha1.NetworkPolicy{nil, allowAll, web, udpRange, selectedPods, empty}
+	addresses := []string{"10.0.0.1", "10.0.0.2", "10.1.2.3", "192.0.2.1", "127.0.0.1"}
+	protocols := []string{"TCP", "UDP", "ICMP"}
+	ports := []int32{0, 53, 80, 443, 7999, 8000, 8005, 8010, 8011, 65535}
+
+	for _, pool := range pools {
+		base := mustCompile(t, "apps", pool, nil, d)
+		for _, blip := range blips {
+			combined := mustCompile(t, "apps", pool, blip, d)
+			for _, address := range addresses {
+				for _, protocol := range protocols {
+					for _, port := range ports {
+						if !allows(combined, address, protocol, port) {
+							continue
+						}
+						if !allows(base, address, protocol, port) {
+							t.Fatalf("blip widened pool: address=%s protocol=%s port=%d", address, protocol, port)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestCompiledPoliciesPassRuntimeValidation guards the wire contract between
+// the compiler and the node runtime's desired.json boundary.
+func TestCompiledPoliciesPassRuntimeValidation(t *testing.T) {
+	d := Destinations{
+		Namespaces: []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "apps", Labels: map[string]string{"team": "app"}}}},
+		Pods:       []corev1.Pod{pod("apps", "db", "10.0.0.1"), pod("apps", "web", "10.0.0.2")},
+		Services:   []corev1.Service{service("apps", "cluster", "10.96.0.1"), service("apps", "headless", corev1.ClusterIPNone)},
+		EndpointSlices: []discoveryv1.EndpointSlice{
+			endpointSlice("apps", "headless", "10.2.0.1"),
+		},
+	}
+	allowAll := &v1alpha1.NetworkPolicy{Egress: []v1alpha1.NetworkEgressRule{{}}}
+	cidr := policyFor(v1alpha1.NetworkPeer{IPBlock: &v1alpha1.NetworkIPBlock{
+		CIDR: "10.0.0.0/8", Except: []string{"10.1.0.0/16"},
+	}}, v1alpha1.NetworkPort{Port: 443}, v1alpha1.NetworkPort{Protocol: corev1.ProtocolUDP, Port: 8000, EndPort: int32ptr(8010)})
+	pods := policyFor(v1alpha1.NetworkPeer{
+		NamespaceSelector: match("team", "app"), PodSelector: match("app", "db"),
+	}, v1alpha1.NetworkPort{Port: 443})
+	services := policyFor(v1alpha1.NetworkPeer{ServiceSelector: match("app", "db")},
+		v1alpha1.NetworkPort{Port: 8080})
+	for _, tc := range []struct {
+		name       string
+		pool, blip *v1alpha1.NetworkPolicy
+	}{
+		{"nil", nil, nil},
+		{"allow all", allowAll, nil},
+		{"cidr and ports", cidr, nil},
+		{"pods", pods, nil},
+		{"services", services, nil},
+		{"both", allowAll, cidr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mustCompile(t, "apps", tc.pool, tc.blip, d)
+			if err := got.Validate(); err != nil {
+				t.Fatalf("compiled policy failed runtime validation: %v\n%+v", err, got)
+			}
+		})
+	}
+}
+
 func TestInvalidDestinationAddressFailsClosed(t *testing.T) {
 	got, err := Compile("apps", policyFor(v1alpha1.NetworkPeer{PodSelector: &metav1.LabelSelector{}}), nil, Destinations{Pods: []corev1.Pod{pod("apps", "db", "not-an-ip")}})
 	if err == nil || len(got.Layers) != 0 {
