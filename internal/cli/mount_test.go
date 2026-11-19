@@ -1683,12 +1683,66 @@ func TestMountRejectsBaseImageDirectorySymlinks(t *testing.T) {
 	}
 }
 
+// TestMountRejectsBaseImageFilesOffline covers the offline half of a mount
+// below a regular base-image file (/etc/passwd/x): the guest reports "is a
+// symlink or not a directory" on the next execution, so the CLI must not
+// report success or create a --new state for it.
+func TestMountRejectsBaseImageFilesOffline(t *testing.T) {
+	for _, path := range []string{"/etc/passwd/x", "/etc/group/x"} {
+		t.Run(path, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", "mount", "data:"+path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "in the base image") {
+				t.Fatalf("mount %s: code %d: %s", path, code, errOut)
+			}
+			code, _, errOut = h.run("", "mount", "--new", "leak:"+path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "in the base image") {
+				t.Fatalf("--new %s: code %d: %s", path, code, errOut)
+			}
+			if !stateNotFound(t, h, "leak") {
+				t.Fatal("rejected --new left its state behind")
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected mount left desired intent: %+v", mounts)
+			}
+		})
+	}
+}
+
+// TestMountRejectsGuestManagedFiles reproduces mounting over /etc/hosts or
+// /etc/resolv.conf: the guest bind-mounts those regular files before user
+// mounts, so a filesystem mount point there can never attach. Preflight must
+// reject it before writing intent or creating a --new state.
+func TestMountRejectsGuestManagedFiles(t *testing.T) {
+	for _, path := range []string{"/etc/hosts", "/etc/resolv.conf", "/etc/hosts/x"} {
+		t.Run(path, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"), readyState("base"))
+			for _, arg := range []string{"data:" + path, "base:" + path + ":ro"} {
+				code, _, errOut := h.run("", "mount", arg, "--root", "home")
+				if code != 1 || !strings.Contains(errOut, "guest-managed file") {
+					t.Fatalf("mount %s: code %d: %s", arg, code, errOut)
+				}
+			}
+			code, _, errOut := h.run("", "mount", "--new", "leak:"+path, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "guest-managed file") {
+				t.Fatalf("--new code %d: %s", code, errOut)
+			}
+			if !stateNotFound(t, h, "leak") {
+				t.Fatal("rejected --new left its state behind")
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected mount left desired intent: %+v", mounts)
+			}
+		})
+	}
+}
+
 // TestMountGuestRejectedPathRollsBack reproduces the guest refusing a mount
 // point the CLI could not preflight (a path below a regular file). A running
 // root must not keep the desired mount or, for --new, the state that was
 // created for a mount that can never attach.
 func TestMountGuestRejectedPathRollsBack(t *testing.T) {
-	const guestErr = "/etc/passwd is a symlink or not a directory"
+	const guestErr = "/usr/bin/env is a symlink or not a directory"
 	for _, created := range []bool{false, true} {
 		name := "existing state"
 		if created {
@@ -1701,7 +1755,7 @@ func TestMountGuestRejectedPathRollsBack(t *testing.T) {
 			h := newHarness(t, b, root, readyState("keep"), readyState("data"))
 			h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
 			if created {
-				code, _, errOut := h.run("", "mount", "--new", "leak:/etc/passwd/x", "--root", root.Name)
+				code, _, errOut := h.run("", "mount", "--new", "leak:/usr/bin/env/x", "--root", root.Name)
 				if code != 1 || !strings.Contains(errOut, guestErr) || !strings.Contains(errOut, "desired mount was removed") {
 					t.Fatalf("--new code %d: %s", code, errOut)
 				}
@@ -1709,7 +1763,7 @@ func TestMountGuestRejectedPathRollsBack(t *testing.T) {
 					t.Fatal("rejected --new left state leak behind")
 				}
 			} else {
-				code, _, errOut := h.run("", "mount", "data:/etc/passwd/x", "--root", root.Name)
+				code, _, errOut := h.run("", "mount", "data:/usr/bin/env/x", "--root", root.Name)
 				if code != 1 || !strings.Contains(errOut, guestErr) || !strings.Contains(errOut, "desired mount was removed") {
 					t.Fatalf("mount code %d: %s", code, errOut)
 				}

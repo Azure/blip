@@ -37,6 +37,18 @@ func TestValidate(t *testing.T) {
 		{"/usr/share/doc/git/contrib/hooks/z", false},
 		{"/usr/lib/x86_64-linux-gnu/perl/5.38/x", false},
 		{"/usr/lib/aarch64-linux-gnu/perl/5.38/x", false},
+		// Permanent guest-managed files: they are bind-mounted over the
+		// root before any user mount and are not directories.
+		{"/etc/hosts", false},
+		{"/etc/hosts/x", false},
+		{"/etc/resolv.conf", false},
+		{"/etc/resolv.conf/x", false},
+		// Regular files shipped by the base image are not directories
+		// either; an offline mount below them must be rejected.
+		{"/etc/passwd", false},
+		{"/etc/passwd/x", false},
+		{"/etc/group/x", false},
+		{"/etc/mtab", false},
 		{"/run/data", true},
 		{"/procdata", true},
 		{"/lib64x", true},
@@ -60,6 +72,13 @@ func TestValidate(t *testing.T) {
 		{"/usr/share/doc/git", true},
 		{"/usr/share/doc/git/contrib", true},
 		{"/usr/lib/x86_64-linux-gnu/perl", true},
+		{"/etc", true},
+		{"/etc/hostname", false},
+		{"/etc/hostname.d", true},
+		{"/etc/hosts.d", true},
+		{"/etc/resolv.conf.d", true},
+		{"/etc/passwd.d", true},
+		{"/etc/mtab.d", true},
 	} {
 		err := Validate(tc.path)
 		if (err == nil) != tc.ok {

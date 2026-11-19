@@ -43,6 +43,24 @@ var ImageSymlinks = []string{
 	// Per-package documentation aliases in the base image.
 	"/usr/share/doc/gcc", "/usr/share/doc/libatomic1",
 	"/usr/share/doc/git/contrib/hooks",
+	// /etc/mtab is a symlink to the proc mount table.
+	"/etc/mtab",
+}
+
+// GuestFiles are the regular files the guest bind-mounts over the durable
+// root before a user command runs. A filesystem mount point must be a
+// directory, so these exact files and anything below them can never attach.
+// The ancestor directory /etc stays legal.
+var GuestFiles = []string{"/etc/hosts", "/etc/resolv.conf"}
+
+// ImageFiles are regular files that every base image ships. Like GuestFiles,
+// they cannot be a filesystem mount point or one of its ancestors, so an
+// offline mount below one would poison the root on its next execution.
+var ImageFiles = []string{
+	"/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow",
+	"/etc/hostname", "/etc/hostid", "/etc/machine-id",
+	"/etc/os-release", "/etc/debian_version", "/etc/nsswitch.conf",
+	"/etc/subuid", "/etc/subgid",
 }
 
 // Overlap reports whether either path contains the other.
@@ -82,6 +100,22 @@ func Validate(p string) error {
 		}
 		if strings.HasPrefix(p, s+"/") {
 			return fmt.Errorf("mount path %s is below %s, which is a symlink in the image; choose a real directory", p, s)
+		}
+	}
+	for _, f := range GuestFiles {
+		if p == f {
+			return fmt.Errorf("mount path %s is a guest-managed file; choose a directory", p)
+		}
+		if strings.HasPrefix(p, f+"/") {
+			return fmt.Errorf("mount path %s is below %s, which is a guest-managed file; choose a directory", p, f)
+		}
+	}
+	for _, f := range ImageFiles {
+		if p == f {
+			return fmt.Errorf("mount path %s is a file in the base image; choose a directory", p)
+		}
+		if strings.HasPrefix(p, f+"/") {
+			return fmt.Errorf("mount path %s is below %s, which is a file in the base image; choose a directory", p, f)
 		}
 	}
 	return nil
