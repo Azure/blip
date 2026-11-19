@@ -23,14 +23,17 @@
 # such states (or copy/read-only mount shared bases), set no imagePullSecrets,
 # and create blips only in pools of its own service account. Thread specs are
 # administrator-owned: a restricted VM may read its own thread through the
-# API proxy but may not create, change or delete threads. Every
+# API proxy but may not create, change or delete threads. Every new or changed
 # ownerReference it sets must name a Blip of the same owner: fork blips may
 # only be owned by blips of the same owner, and states may only be owned by
-# such blips. Every pod-bound token of the request namespace is treated as a
-# VM and must have a claimed pod entry: a table that is non-empty but lacks the
-# caller's sa.<sa> or pod key fails closed instead of skipping every check. A
-# missing key is never treated as unrestricted for a claimed VM, because such a
-# sync or cache gap would bypass every check. A VM pod without an entry
+# such blips. An ownerReference inherited unchanged from the privileged
+# creator (for example the parent of a fork) is exempt, so a restricted
+# child can still update itself. Every pod-bound token of the request
+# namespace is treated as a VM and must have a claimed pod entry: a table
+# that is non-empty but lacks the caller's sa.<sa> or pod key fails closed
+# instead of skipping every check. A missing key is never treated as
+# unrestricted for a claimed VM, because such a sync or cache gap would bypass
+# every check. A VM pod without an entry
 # (vacant, unknown, or absent from a partial table) is denied. Only a claimed
 # pod recorded as "-" is unrestricted. Service account keys are pruned only
 # once no pool or VM pod uses the account, and a missing table denies all blip
@@ -119,6 +122,15 @@ spec:
         request.operation == 'UPDATE' && has(oldObject.metadata.labels) &&
         'blip.dev/thread' in oldObject.metadata.labels ?
         string(oldObject.metadata.labels['blip.dev/thread']) : ''
+    # A child forked from a different-owner or unrestricted Blip inherits the
+    # ownerReference its privileged creator set. An UPDATE by the child's own
+    # VM leaves that reference untouched, so the prefix rule must exempt
+    # references already present in oldObject; otherwise no self-patch can
+    # succeed. New or changed references are still checked in full.
+    - name: oldOwnerReferences
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.metadata.ownerReferences) ?
+        oldObject.metadata.ownerReferences : []
   validations:
     - expression: "!variables.vm || variables.owner != ''"
       messageExpression: >-
@@ -201,7 +213,7 @@ spec:
           o.apiVersion == 'blip.dev/v1alpha1' && o.kind == 'Blip' &&
           (!has(o.controller) || o.controller != true) &&
           (!has(o.blockOwnerDeletion) || o.blockOwnerDeletion != true) &&
-          o.name.startsWith(variables.prefix))
+          (o.name.startsWith(variables.prefix) || o in variables.oldOwnerReferences))
       messageExpression: >-
         'owner ' + variables.owner + ' may only set ownerReferences to blips named ' + variables.prefix + '*'
       reason: Forbidden

@@ -604,6 +604,14 @@ func TestVMOwnerPolicyOwnerReferences(t *testing.T) {
 	set := func(key string, value any) func(map[string]any) {
 		return func(ref map[string]any) { ref[key] = value }
 	}
+	// A child forked from another owner's Blip inherits its parent reference.
+	// Unrelated updates must not re-validate that unchanged reference against
+	// the caller's prefix.
+	inheritedOld := withOwnerReferences(blipObj(o+".child", o), ownerReference(x+".parent"))
+	inheritedNew := withOwnerReferences(withLabels(blipObj(o+".child", o), map[string]string{"probe": "1"}), ownerReference(x+".parent"))
+	ownAndForeign := withOwnerReferences(blipObj(o+".child", o),
+		ownerReference(o+".parent"), ownerReference(x+".parent"))
+	foreignRenamed := withOwnerReferences(blipObj(o+".child", o), ownerReference(x+".other"))
 
 	for _, tc := range []struct {
 		name  string
@@ -629,6 +637,21 @@ func TestVMOwnerPolicyOwnerReferences(t *testing.T) {
 			name: o + ".s", object: withOwnerReferences(stateObj(o+".s", o, ""), ownerReference(o+".fork", set("blockOwnerDeletion", true)))}, false, "ownerReferences"},
 		{"unrestricted foreign owner", policyRequest{user: admin, op: admission.Create, resource: "blips",
 			name: "a", object: withOwnerReferences(blipObj("a", ""), ownerReference(x+".parent"))}, true, ""},
+		{"inherited foreign owner unchanged", policyRequest{user: mine, op: admission.Update, resource: "blips",
+			name: o + ".child", object: inheritedNew, oldObject: inheritedOld}, true, ""},
+		{"add foreign owner reference", policyRequest{user: mine, op: admission.Update, resource: "blips",
+			name: o + ".child", object: ownAndForeign,
+			oldObject: withOwnerReferences(blipObj(o+".child", o), ownerReference(o+".parent"))}, false, "ownerReferences"},
+		{"change inherited foreign owner reference", policyRequest{user: mine, op: admission.Update, resource: "blips",
+			name: o + ".child", object: foreignRenamed, oldObject: inheritedOld}, false, "ownerReferences"},
+		{"change inherited foreign owner uid", policyRequest{user: mine, op: admission.Update, resource: "blips",
+			name: o + ".child", object: withOwnerReferences(blipObj(o+".child", o), ownerReference(x+".parent", set("uid", "uid-replaced"))),
+			oldObject: inheritedOld}, false, "ownerReferences"},
+		{"own prefixed owner reference on update", policyRequest{user: mine, op: admission.Update, resource: "blips",
+			name: o + ".fork", object: withOwnerReferences(blipObj(o+".fork", o), ownerReference(o+".parent")),
+			oldObject: blipObj(o+".fork", o)}, true, ""},
+		{"remove inherited foreign owner reference", policyRequest{user: mine, op: admission.Update, resource: "blips",
+			name: o + ".child", object: blipObj(o+".child", o), oldObject: inheritedOld}, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			allow, msg := tc.req.evaluate(t, v, params)
@@ -636,6 +659,60 @@ func TestVMOwnerPolicyOwnerReferences(t *testing.T) {
 				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
 			}
 		})
+	}
+}
+
+// TestVMOwnerPolicyInheritedOwnerReference follows the e2e flow that exposed
+// the bug: an unrestricted Blip forks a child, an administrator labels the
+// child for a project, and the child's own VM then patches an unrelated label.
+// The child keeps the ownerReference its privileged creator set; re-validating
+// that unchanged reference against the project prefix denied every self-patch.
+func TestVMOwnerPolicyInheritedOwnerReference(t *testing.T) {
+	v := loadVMOwnerPolicy(t)
+	const project, parent = "u-0123456789abcdef0123456789abcdef", "w6-18-top"
+	child := project + ".child"
+	params := map[string]string{
+		"sa.vm":         "default",
+		"default-top":   "-",
+		"default-child": project,
+	}
+	topVM, childVM := vmUser("vm", "default-top"), vmUser("vm", "default-child")
+	ref := ownerReference(parent)
+
+	// The unrestricted parent may fork a child owned by itself.
+	created := withOwnerReferences(blipObj(child, ""), ref)
+	create := policyRequest{user: topVM, op: admission.Create, resource: "blips", name: child, object: created}
+	if allow, msg := create.evaluate(t, v, params); !allow {
+		t.Fatalf("unrestricted parent fork: %s", msg)
+	}
+
+	// An administrator labels the child as project-owned. Its own VM may now
+	// patch the child, but the inherited reference must not be re-validated.
+	old := withOwnerReferences(blipObj(child, project), ref)
+	patched := withOwnerReferences(withLabels(blipObj(child, project), map[string]string{"probe": "1"}), ref)
+	update := policyRequest{user: childVM, op: admission.Update, resource: "blips", name: child, object: patched, oldObject: old}
+	if allow, msg := update.evaluate(t, v, params); !allow {
+		t.Fatalf("self-patch with inherited ownerReference: %s", msg)
+	}
+
+	// The exemption is for unchanged references only: adding another foreign
+	// reference, or replacing the inherited one, is still a foreign write.
+	update.object = withOwnerReferences(withLabels(blipObj(child, project), map[string]string{"probe": "1"}),
+		ref, ownerReference("other-project.parent"))
+	if allow, msg := update.evaluate(t, v, params); allow {
+		t.Fatalf("adding a foreign ownerReference was allowed: %s", msg)
+	}
+	update.object = withOwnerReferences(withLabels(blipObj(child, project), map[string]string{"probe": "1"}),
+		ownerReference("other-project.parent"))
+	if allow, msg := update.evaluate(t, v, params); allow {
+		t.Fatalf("changing the inherited ownerReference was allowed: %s", msg)
+	}
+
+	// A reference the caller may set itself remains allowed.
+	update.object = withOwnerReferences(withLabels(blipObj(child, project), map[string]string{"probe": "1"}),
+		ownerReference(project+".parent"))
+	if allow, msg := update.evaluate(t, v, params); !allow {
+		t.Fatalf("own-prefixed ownerReference: %s", msg)
 	}
 }
 
