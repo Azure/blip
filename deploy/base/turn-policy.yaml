@@ -41,3 +41,35 @@ metadata:
 spec:
   policyName: blip-turn-author
   validationActions: [Deny]
+---
+# A turn's status.seq is its position in the thread's single global order.
+# Only the sequencer in blipchat assigns it; allowing any other holder of
+# blipturns/status to write it could hide or reorder turns. This is defense in
+# depth behind RBAC, and it also stops an administrator with a broad token
+# from accidentally forging a sequence jump.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-turn-status
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: ["*"]
+        resources: [blipturns/status]
+        operations: [UPDATE]
+  validations:
+    - expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:blip-system:blipchat'
+      message: only blipchat may write turn status
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-turn-status
+spec:
+  policyName: blip-turn-status
+  validationActions: [Deny]

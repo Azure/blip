@@ -103,11 +103,11 @@ func loadVMOwnerPolicy(t *testing.T) validating.Validator {
 	)
 }
 
-// loadTurnPolicy compiles deploy/base/turn-policy.yaml the way the API
-// server's validating admission policy plugin does.
-func loadTurnPolicy(t *testing.T) validating.Validator {
+// loadPolicy compiles one policy from a multi-document policy file the way the
+// API server's validating admission policy plugin does.
+func loadPolicy(t *testing.T, file, name string) validating.Validator {
 	t.Helper()
-	raw, err := os.ReadFile("../../deploy/base/turn-policy.yaml")
+	raw, err := os.ReadFile(file)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,19 +125,20 @@ func loadTurnPolicy(t *testing.T) validating.Validator {
 		switch {
 		case bytes.Contains(doc, []byte("kind: ValidatingAdmissionPolicyBinding")):
 			b := &admissionv1.ValidatingAdmissionPolicyBinding{}
-			if err = yaml.UnmarshalStrict(doc, b); err == nil {
+			if err = yaml.UnmarshalStrict(doc, b); err == nil && b.Spec.PolicyName == name {
 				bindings = append(bindings, b)
 			}
 		case bytes.Contains(doc, []byte("kind: ValidatingAdmissionPolicy")):
-			policy = &admissionv1.ValidatingAdmissionPolicy{}
-			err = yaml.UnmarshalStrict(doc, policy)
+			p := &admissionv1.ValidatingAdmissionPolicy{}
+			if err = yaml.UnmarshalStrict(doc, p); err == nil && p.Name == name {
+				policy = p
+			}
 		}
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	if policy == nil || policy.Name != "blip-turn-author" || len(bindings) != 1 ||
-		bindings[0].Spec.PolicyName != policy.Name ||
+	if policy == nil || len(bindings) != 1 ||
 		len(bindings[0].Spec.ValidationActions) != 1 ||
 		bindings[0].Spec.ValidationActions[0] != admissionv1.Deny {
 		t.Fatalf("policy %v bindings %v", policy, bindings)
@@ -171,6 +172,11 @@ func loadTurnPolicy(t *testing.T) validating.Validator {
 		compiler.CompileCondition(messages, msgOpts, environment.StoredExpressions),
 		policy.Spec.FailurePolicy,
 	)
+}
+
+// loadTurnPolicy compiles the turn author policy.
+func loadTurnPolicy(t *testing.T) validating.Validator {
+	return loadPolicy(t, "../../deploy/base/turn-policy.yaml", "blip-turn-author")
 }
 
 type policyRequest struct {
@@ -226,14 +232,19 @@ func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map
 	gvk := schema.GroupVersionKind{Group: "blip.dev", Version: "v1alpha1", Kind: "Blip"}
 	sub := ""
 	if res, s, ok := strings.Cut(p.resource, "/"); ok {
-		gvr = schema.GroupVersionResource{Version: "v1", Resource: res}
-		gvk = schema.GroupVersionKind{Version: "v1", Kind: "PodExecOptions"}
+		if res == "blipturns" {
+			gvr = schema.GroupVersionResource{Group: "blip.dev", Version: "v1alpha1", Resource: res}
+			gvk = schema.GroupVersionKind{Group: "blip.dev", Version: "v1alpha1", Kind: "BlipTurn"}
+		} else {
+			gvr = schema.GroupVersionResource{Version: "v1", Resource: res}
+			gvk = schema.GroupVersionKind{Version: "v1", Kind: "PodExecOptions"}
+		}
 		sub = s
 	}
 	if p.resource == "blipstates" {
 		gvk.Kind = "BlipState"
 	}
-	if p.resource == "blipturns" {
+	if strings.HasPrefix(p.resource, "blipturns") {
 		gvk.Kind = "BlipTurn"
 	}
 	var obj, old runtime.Object
@@ -456,6 +467,42 @@ func turnObj(authorKind, authorName string) map[string]any {
 			"thread": "project",
 			"author": map[string]any{"kind": authorKind, "name": authorName},
 		},
+	}
+}
+
+// Only blipchat (the sequencer) may write turn status, so a stray status
+// credential cannot forge or reorder a turn's sequence number.
+func TestTurnStatusPolicy(t *testing.T) {
+	v := loadPolicy(t, "../../deploy/base/turn-policy.yaml", "blip-turn-status")
+	status := func(seq any) map[string]any {
+		obj := turnObj("User", "alice")
+		obj["status"] = map[string]any{"seq": seq}
+		return obj
+	}
+	blipchat := &user.DefaultInfo{Name: "system:serviceaccount:blip-system:blipchat"}
+	other := &user.DefaultInfo{Name: "system:serviceaccount:hunt-p6-chat:blip-agent"}
+
+	for _, tc := range []struct {
+		name  string
+		user  user.Info
+		op    admission.Operation
+		obj   map[string]any
+		old   map[string]any
+		allow bool
+		msg   string
+	}{
+		{"blipchat writes turn status", blipchat, admission.Update, status(int64(1)), status(nil), true, ""},
+		{"blipchat updates turn status again", blipchat, admission.Update, status(int64(2)), status(int64(1)), true, ""},
+		{"producer cannot set seq", other, admission.Update, status(int64(4242)), status(nil), false, "only blipchat"},
+		{"producer cannot change seq", other, admission.Update, status(int64(4242)), status(int64(1)), false, "only blipchat"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := policyRequest{user: tc.user, op: tc.op, resource: "blipturns/status", name: "turn", object: tc.obj, oldObject: tc.old}
+			allow, msg := req.evaluate(t, v, nil)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
 	}
 }
 

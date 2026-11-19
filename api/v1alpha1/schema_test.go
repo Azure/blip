@@ -32,6 +32,7 @@ type crdSchema struct {
 	Type         string               `json:"type"`
 	Pattern      string               `json:"pattern"`
 	MaxLength    int64                `json:"maxLength"`
+	Minimum      int64                `json:"minimum"`
 	MinItems     int64                `json:"minItems"`
 	MaxItems     int64                `json:"maxItems"`
 	Required     []string             `json:"required"`
@@ -399,6 +400,40 @@ func TestBlipTurnThreadNamePattern(t *testing.T) {
 	}
 	if errs := validate(`{"spec":{"thread":"project","author":{"kind":"ServiceAccount","name":"ci"}}}`, ""); len(errs) != 0 {
 		t.Fatal(errs.ToAggregate())
+	}
+}
+
+// TestBlipTurnStatusSeqRules guards the defense-in-depth validation on
+// status.seq: a status writer can no longer move an already sequenced turn.
+func TestBlipTurnStatusSeqRules(t *testing.T) {
+	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipturns.yaml")
+	seq, ok := status.Properties["seq"]
+	if !ok {
+		t.Fatal("generated CRD has no status.seq property")
+	}
+	if seq.Minimum != 0 {
+		t.Errorf("status.seq minimum = %d, want 0", seq.Minimum)
+	}
+	const rule = "!oldSelf.hasValue() || self == oldSelf.value()"
+	if got := ruleFor(t, seq.XValidations, "seq is immutable once set"); got != rule {
+		t.Errorf("status.seq rule %q, want %q", got, rule)
+	}
+
+	validate := admissionValidator(t, "blipturns")
+	turn := func(seq int64) string {
+		return fmt.Sprintf(`{"spec":{"thread":"project","author":{"kind":"User","name":"alice"}},"status":{"seq":%d}}`, seq)
+	}
+	if errs := validate(turn(1), ""); len(errs) != 0 {
+		t.Errorf("rejected the first sequence assignment: %v", errs.ToAggregate())
+	}
+	if errs := validate(turn(1), turn(1)); len(errs) != 0 {
+		t.Errorf("rejected rewriting the same sequence: %v", errs.ToAggregate())
+	}
+	if errs := validate(turn(4242), turn(1)); len(errs) == 0 {
+		t.Error("admitted a sequence rewrite")
+	}
+	if errs := validate(turn(-1), ""); len(errs) == 0 {
+		t.Error("admitted a negative sequence")
 	}
 }
 

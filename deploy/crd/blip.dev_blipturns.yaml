@@ -171,7 +171,12 @@ spec:
                 description: Seq is the turn's position in the thread's single global
                   order.
                 format: int64
+                minimum: 0
                 type: integer
+                x-kubernetes-validations:
+                - message: seq is immutable once set
+                  optionalOldSelf: true
+                  rule: '!oldSelf.hasValue() || self == oldSelf.value()'
               threadUID:
                 description: |-
                   ThreadUID is the UID of the BlipThread incarnation that sequenced the

@@ -236,6 +236,8 @@ type TurnSubject struct {
 // BlipTurnStatus is written only by blipchat.
 type BlipTurnStatus struct {
 	// Seq is the turn's position in the thread's single global order.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value()",optionalOldSelf=true,message="seq is immutable once set"
 	Seq int64 `json:"seq,omitempty"`
 	// AcceptedTime is when blipchat sequenced the turn.
 	AcceptedTime *metav1.Time `json:"acceptedTime,omitempty"`
