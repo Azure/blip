@@ -80,6 +80,12 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing X-Forwarded-User", http.StatusUnauthorized)
 		return
 	}
+	// Header.Values returns one element per header line, so a proxy that
+	// joins repeated values with commas still arrives as one element here.
+	if strings.Contains(user, ",") {
+		http.Error(w, "exactly one X-Forwarded-User identity is required", http.StatusBadRequest)
+		return
+	}
 	var req chatRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(&req); err != nil {
 		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
