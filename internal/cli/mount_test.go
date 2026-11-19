@@ -1606,6 +1606,45 @@ func TestMountRejectsBaseImageDirectorySymlinks(t *testing.T) {
 	}
 }
 
+// TestMountGuestRejectedPathRollsBack reproduces the guest refusing a mount
+// point the CLI could not preflight (a path below a regular file). A running
+// root must not keep the desired mount or, for --new, the state that was
+// created for a mount that can never attach.
+func TestMountGuestRejectedPathRollsBack(t *testing.T) {
+	const guestErr = "/etc/passwd is a symlink or not a directory"
+	for _, created := range []bool{false, true} {
+		name := "existing state"
+		if created {
+			name = "new state"
+		}
+		t.Run(name, func(t *testing.T) {
+			b := runningBlip("agent")
+			root := readyState(b.Spec.State)
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "keep", Path: "/keep"}}
+			h := newHarness(t, b, root, readyState("keep"), readyState("data"))
+			h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
+			if created {
+				code, _, errOut := h.run("", "mount", "--new", "leak:/etc/passwd/x", "--root", root.Name)
+				if code != 1 || !strings.Contains(errOut, guestErr) || !strings.Contains(errOut, "desired mount was removed") {
+					t.Fatalf("--new code %d: %s", code, errOut)
+				}
+				if !stateNotFound(t, h, "leak") {
+					t.Fatal("rejected --new left state leak behind")
+				}
+			} else {
+				code, _, errOut := h.run("", "mount", "data:/etc/passwd/x", "--root", root.Name)
+				if code != 1 || !strings.Contains(errOut, guestErr) || !strings.Contains(errOut, "desired mount was removed") {
+					t.Fatalf("mount code %d: %s", code, errOut)
+				}
+			}
+			mounts := h.state(root.Name).Spec.Mounts
+			if len(mounts) != 1 || mounts[0].State != "keep" || mounts[0].Path != "/keep" {
+				t.Fatalf("rejected mount left desired intent: %+v", mounts)
+			}
+		})
+	}
+}
+
 // TestMountNewMountFailureLeavesState ports create's attach-failure coverage:
 // the created state keeps its first commit even when mounting it fails.
 func TestMountNewMountFailureLeavesState(t *testing.T) {

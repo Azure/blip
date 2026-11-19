@@ -297,10 +297,12 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 			}
 		}
 		var gone *mountStateGoneError
-		if added && errors.As(err, &gone) {
-			// The state disappeared while this command waited. Remove only
-			// the desired mount this command just added; a mount that was
-			// already in the root belongs to someone else.
+		var rejected *mountRejectedError
+		if added && (errors.As(err, &gone) || errors.As(err, &rejected)) {
+			// The state disappeared or the guest rejected the mount point
+			// while this command waited. Remove only the desired mount this
+			// command just added; a mount that was already in the root
+			// belongs to someone else.
 			if rerr := a.rollbackAddedMount(ctx, root, state, mountPath, want); rerr != nil {
 				fmt.Fprintf(a.env.Err, "warning: could not remove desired mount of state %s from root state %s: %v\n", a.short(state), a.short(root), rerr)
 			} else {
@@ -391,6 +393,21 @@ func mountStateGone(msg, state string) string {
 type mountStateGoneError struct{ msg string }
 
 func (e *mountStateGoneError) Error() string { return e.msg }
+
+// mountRejectedError marks a mount the guest refused to create, usually
+// because an ancestor of the mount point is a symlink or a regular file.
+// Retrying cannot help, so mountState rolls back the desired mount it added
+// instead of leaving a root that can never start.
+type mountRejectedError struct{ msg string }
+
+func (e *mountRejectedError) Error() string { return e.msg }
+
+// mountPointRejected reports the guest's fixed error for a mount point it
+// cannot create. Only this class is rolled back: a transient attach failure
+// (no space, device gone) may still be worth keeping as desired intent.
+func mountPointRejected(msg string) bool {
+	return strings.Contains(msg, "is a symlink or not a directory")
+}
 
 // mountBusy reports the part of a top-level Blip status message that says the
 // wanted state is already written by another Blip. The controller records a
@@ -518,7 +535,11 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			if strings.Contains(m.Message, "busy") {
 				return false, fmt.Errorf("could not switch state %q on blip %q: processes are still using %s; desired mount remains applied", state, b.Name, mountPath)
 			}
-			return false, fmt.Errorf("mount of state %q on blip %q failed: %s; desired mount remains applied", state, b.Name, m.Message)
+			msg := fmt.Sprintf("mount of state %q on blip %q failed: %s; desired mount remains applied", state, b.Name, m.Message)
+			if mountPointRejected(m.Message) {
+				return false, &mountRejectedError{msg: msg}
+			}
+			return false, errors.New(msg)
 		}
 		if m.Phase == v1alpha1.MountMounted && !m.Switching && m.Writable != want && m.Message != "" &&
 			!strings.HasPrefix(m.Message, "waiting to switch to writable") {
