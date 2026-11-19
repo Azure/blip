@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -109,6 +110,53 @@ func workdirInRoot(dir string) string {
 	return path.Clean(dir)
 }
 
+// checkDirAccess verifies that the target account can search every component
+// of dir inside root. Without this, os.StartProcess fails in the child with
+// "fork/exec <program>: permission denied", which makes an inaccessible
+// working directory look like a missing or unexecutable program.
+func checkDirAccess(root, dir string, acct *account) error {
+	if acct.uid == 0 {
+		return nil
+	}
+	p := "/"
+	for _, part := range strings.Split(strings.TrimPrefix(dir, "/"), "/") {
+		if part == "" {
+			continue
+		}
+		p = path.Join(p, part)
+		fi, err := statInRoot(root, p)
+		if err != nil {
+			return fmt.Errorf("chdir %s: %w", dir, err)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR)
+		}
+		if !canSearchDir(fi, acct) {
+			return fmt.Errorf("chdir %s: %w for uid %d", dir, unix.EACCES, acct.uid)
+		}
+	}
+	return nil
+}
+
+// canSearchDir reports whether acct has execute (search) permission on the
+// directory, matching the kernel's owner/group/other rule.
+func canSearchDir(fi os.FileInfo, acct *account) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		// Without ownership information, leave the decision to the kernel.
+		return true
+	}
+	mode := fi.Mode().Perm()
+	switch {
+	case acct.uid == st.Uid:
+		return mode&0o100 != 0
+	case slices.Contains(acct.groups, st.Gid):
+		return mode&0o010 != 0
+	default:
+		return mode&0o001 != 0
+	}
+}
+
 // startProc starts a process chrooted in the root filesystem, as the
 // requested user, in the work cgroup, in a new session.
 func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
@@ -148,6 +196,9 @@ func (g *Guest) startProc(s procSpec, base []string) (*proc, []string, error) {
 		return nil, nil, fmt.Errorf("chdir %s: %w", dir, err)
 	} else if !fi.IsDir() {
 		return nil, nil, fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR)
+	}
+	if err := checkDirAccess(g.root, dir, acct); err != nil {
+		return nil, nil, err
 	}
 
 	p := &proc{}

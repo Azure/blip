@@ -1,7 +1,10 @@
 package guest
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/Azure/blip/internal/podapi"
@@ -53,6 +56,51 @@ func TestStartProcNormalizesRelativeWorkdir(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "chdir") {
 		t.Fatalf("dot-dot workdir was not normalized inside the root: %v", err)
+	}
+}
+
+// TestCheckDirAccessNamesInaccessibleWorkdir verifies that a workdir the
+// target account cannot search is reported as such, instead of surfacing from
+// the child as "fork/exec <program>: permission denied" and blaming the
+// command. The owner and group cases must stay allowed.
+func TestCheckDirAccessNamesInaccessibleWorkdir(t *testing.T) {
+	root := testRoot(t)
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "home/dev")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no stat ownership information")
+	}
+
+	outsider := &account{uid: st.Uid + 1, gid: st.Gid + 1, groups: []uint32{st.Gid + 1}}
+	err = checkDirAccess(root, "/home/dev", outsider)
+	if err == nil {
+		t.Fatal("inaccessible workdir was accepted")
+	}
+	if want := "chdir /home/dev: permission denied"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want it to contain %q", err, want)
+	}
+
+	owner := &account{uid: st.Uid, gid: st.Gid + 1, groups: []uint32{st.Gid + 1}}
+	if err := checkDirAccess(root, "/home/dev", owner); err != nil {
+		t.Fatalf("owner was denied the workdir: %v", err)
+	}
+	group := &account{uid: st.Uid + 1, gid: st.Gid, groups: []uint32{st.Gid}}
+	if err := checkDirAccess(root, "/home/dev", group); err != nil {
+		t.Fatalf("group member was denied the workdir: %v", err)
+	}
+	rootUser := &account{uid: 0}
+	if err := checkDirAccess(root, "/home/dev", rootUser); err != nil {
+		t.Fatalf("root was denied the workdir: %v", err)
 	}
 }
 
