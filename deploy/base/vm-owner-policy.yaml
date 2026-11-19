@@ -17,11 +17,14 @@
 # API proxy but may not create, change or delete threads. Every
 # ownerReference it sets must name a Blip of the same owner: fork blips may
 # only be owned by blips of the same owner, and states may only be owned by
-# such blips. A VM pod without an entry (vacant, or unknown) is denied, as is
-# any other pod that uses a VM service account. Service account keys are pruned
-# only once no pool or VM pod uses the account, and a missing table denies all
-# blip and state changes made with pod-bound tokens. Grant VM service accounts
-# RBAC only in their own namespace: the table is per namespace.
+# such blips. A pod-bound token is restricted whenever the table exists: a
+# caller whose pod entry or service-account key is missing is never treated as
+# unrestricted, because such a race would bypass every check. A VM pod
+# without an entry (vacant, or unknown) is denied. Service account keys are
+# pruned only once no pool or VM pod uses the account, and a missing table
+# denies all blip and state changes made with pod-bound tokens. Grant VM
+# service accounts RBAC only in their own namespace: the table is per
+# namespace.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -52,8 +55,12 @@ spec:
       expression: "has(params.data) ? params.data : {}"
     - name: callerSA
       expression: request.userInfo.username.split(':')[3]
+    # matchConditions selected a pod-bound token in this namespace, so every
+    # request that reaches these expressions acts for a VM. An absent
+    # service-account key (or an empty table) is a table race, not an
+    # unrestricted caller.
     - name: vm
-      expression: "('sa.' + variables.callerSA) in variables.data"
+      expression: "true"
     - name: callerPod
       expression: request.userInfo.extra['authentication.kubernetes.io/pod-name'][0]
     - name: owner
@@ -65,7 +72,9 @@ spec:
     - name: writes
       expression: request.operation == 'CREATE' || request.operation == 'UPDATE'
     - name: pools
-      expression: "string(variables.data['sa.' + variables.callerSA]).split(' ')"
+      expression: >-
+        ('sa.' + variables.callerSA) in variables.data ?
+        string(variables.data['sa.' + variables.callerSA]).split(' ') : []
     - name: bases
       expression: "'bases' in variables.data ? string(variables.data['bases']).split(' ') : []"
   validations:
@@ -168,7 +177,7 @@ spec:
       reason: Forbidden
     - expression: >-
         !variables.restricted || request.operation != 'CREATE' || request.resource.resource != 'blips' ||
-        (has(object.spec) && has(object.spec.pool) ? object.spec.pool : 'default') in variables.pools
+        (has(object.spec) && has(object.spec.pool) && object.spec.pool != '' ? object.spec.pool : 'default') in variables.pools
       messageExpression: >-
         'owner ' + variables.owner + ' may only use pools of service account ' + variables.callerSA +
         ' (' + variables.pools.join(', ') + ')'

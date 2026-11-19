@@ -401,7 +401,7 @@ func TestVMOwnerPolicy(t *testing.T) {
 		allow bool
 		msg   string
 	}{
-		{"non-VM service account", policyRequest{user: vmUser("ci", "ci-pod"), op: admission.Create, resource: "blips", name: "anything", object: blipObj("anything", "")}, true, ""},
+		{"pod-bound account without an entry", policyRequest{user: vmUser("ci", "ci-pod"), op: admission.Create, resource: "blips", name: "anything", object: blipObj("anything", "")}, false, "not claimed"},
 		{"user without pod token", policyRequest{user: &user.DefaultInfo{Name: "alice"}, op: admission.Delete, resource: "blips", name: x + ".a", oldObject: blipObj(x+".a", x)}, true, ""},
 		{"other namespace service account", policyRequest{user: &user.DefaultInfo{Name: "system:serviceaccount:other:vm", Extra: map[string][]string{"authentication.kubernetes.io/pod-name": {"p"}}}, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "")}, true, ""},
 		{"vacant VM denied", policyRequest{user: vacant, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o)}, false, "not claimed"},
@@ -436,6 +436,7 @@ func TestVMOwnerPolicy(t *testing.T) {
 		{"relabel own name", policyRequest{user: mine, op: admission.Update, resource: "blips", name: o + ".a", object: blipObj(o+".a", o), oldObject: blipObj(o+".a", x)}, false, "change objects labelled"},
 		{"delete own name labelled other", policyRequest{user: mine, op: admission.Delete, resource: "blipstates", name: o + ".s", oldObject: stateObj(o+".s", x, "")}, false, "change objects labelled"},
 		{"own pool", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withPool("gpu"))}, true, ""},
+		{"empty pool means default", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withPool(""))}, true, ""},
 		{"other account's pool", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withPool("private"))}, false, "pools of service account vm"},
 		{"pool prefix is not a pool", policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o, withPool("gp"))}, false, "pools"},
 		{"account without pools", policyRequest{user: podsOnly, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o)}, false, "pools"},
@@ -465,10 +466,18 @@ func TestVMOwnerPolicy(t *testing.T) {
 		})
 	}
 
-	// A table without data (or without the caller's service account)
-	// leaves the caller unrestricted.
-	if ok, msg := (policyRequest{user: vacant, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "")}).evaluate(t, v, nil); !ok {
-		t.Fatalf("empty table denied: %s", msg)
+	// An existing table is authoritative even without the caller's key: a
+	// claimed pod whose service account is missing must not become
+	// unrestricted, and an empty table denies creates rather than allowing
+	// them. A missing table remains Allow for UPDATE/DELETE (terminating
+	// namespaces) and Deny for CREATE through the binding below.
+	noKey := map[string]string{"default-mine": o}
+	create := policyRequest{user: mine, op: admission.Create, resource: "blips", name: o + ".a", object: blipObj(o+".a", o)}
+	if ok, msg := create.evaluate(t, v, noKey); ok {
+		t.Fatalf("create allowed without the caller's service-account key: %s", msg)
+	}
+	if ok, msg := (policyRequest{user: vacant, op: admission.Create, resource: "blips", name: "a", object: blipObj("a", "")}).evaluate(t, v, nil); ok {
+		t.Fatalf("empty table allowed a create: %s", msg)
 	}
 }
 
