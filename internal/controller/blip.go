@@ -1319,6 +1319,16 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 			if err := r.syncMounts(ctx, b, mounts, pod, &obs); err != nil {
 				return reconcile.Result{}, err
 			}
+			stopped, err := r.ensureMountedWriters(ctx, b, pod)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			if stopped {
+				// The stop patch advanced the object's resourceVersion;
+				// flush still has to send the status built above.
+				base.ResourceVersion = b.ResourceVersion
+				return reconcile.Result{RequeueAfter: retryAfter}, nil
+			}
 			if mountsReconciled(b, mounts) {
 				b.Status.StateGeneration = root.Generation
 			} else if after == 0 || after > retryAfter {

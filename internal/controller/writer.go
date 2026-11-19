@@ -198,6 +198,68 @@ func (r *BlipReconciler) releaseSwitchWriter(ctx context.Context, b *v1.Blip, st
 	return r.releaseWriter(ctx, st, b.UID)
 }
 
+// ensureMountedWriters restores the writer slot of every writable mount that
+// is already attached. A concurrent replacement can publish the mounted
+// attachment after another edit moved or cleared the state's writer, leaving a
+// writable disk that the node will never seal: the node seals the writer
+// attachment only. The mounted attachment must own the writer.
+//
+// It never steals a writer from another Blip or pod; that would let two guests
+// write the same disk. The Blip is stopped instead, so no more writes are
+// accepted. stopped reports that the caller must persist the returned status
+// and stop reconciling mounts in this pass.
+func (r *BlipReconciler) ensureMountedWriters(ctx context.Context, b *v1.Blip, pod *corev1.Pod) (stopped bool, err error) {
+	podName, podUID, node := pod.Name, string(pod.UID), pod.Spec.NodeName
+	for _, m := range b.Status.Mounts {
+		if !m.Writable || m.Phase != v1.MountMounted || m.AttachmentID == "" {
+			continue
+		}
+		st := &v1.BlipState{}
+		if err := r.Live.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: m.State}, st); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		w := st.Status.Writer
+		if w != nil && w.AttachmentID == m.AttachmentID && w.BlipUID == string(b.UID) &&
+			w.PodName == podName && w.PodUID == podUID && w.Node == node {
+			continue
+		}
+		otherPod := w != nil && (w.PodUID != "" && w.PodUID != podUID ||
+			w.PodUID == "" && w.PodName != "" && w.PodName != podName)
+		if w != nil && (w.BlipUID != string(b.UID) || otherPod) {
+			msg := fmt.Sprintf("writable mount %s lost its writer attachment %s: state %q is held by blip %q pod %q",
+				m.State, m.AttachmentID, m.State, w.BlipName, w.PodName)
+			// Stop a copy so b keeps the mount status this reconcile built.
+			stop := b.DeepCopy()
+			if err := r.stop(ctx, stop, ReasonSaveFailed); err != nil {
+				return false, err
+			}
+			b.ResourceVersion = stop.ResourceVersion
+			b.Status.Reason, b.Status.Message = ReasonSaveFailed, msg
+			return true, nil
+		}
+		if st.Status.Committed == nil {
+			// A mounted writable disk without a committed version cannot
+			// describe its base; the normal save path reports the failure.
+			continue
+		}
+		base := st.DeepCopy()
+		st.Status.Writer = &v1.Writer{
+			AttachmentID: m.AttachmentID,
+			BlipName:     b.Name,
+			BlipUID:      string(b.UID),
+			BaseCommit:   st.Status.Committed.ID,
+		}
+		setWriterPod(st.Status.Writer, podName, podUID, node)
+		if err := patchStatus(ctx, r.Client, st, base); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
 // ensureWriterPods records the claimed pod in each writer slot the Blip
 // holds; the node acts only when writer.podUID matches the pod.
 func (r *BlipReconciler) ensureWriterPods(ctx context.Context, b *v1.Blip) error {
