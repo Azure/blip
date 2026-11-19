@@ -449,7 +449,7 @@ type RuntimeDefaults struct {
 // BlipSpec is one VM lifetime: one command that runs as the primary session.
 // The blip ends when the command exits.
 //
-// +kubebuilder:validation:XValidation:rule="self.command == oldSelf.command",message="command is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.command) == has(oldSelf.command) && (!has(self.command) || self.command == oldSelf.command)",message="command is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env == oldSelf.env)",message="env is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.workingDir) == has(oldSelf.workingDir)) && (!has(self.workingDir) || self.workingDir == oldSelf.workingDir)",message="workingDir is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user == oldSelf.user)",message="user is immutable"

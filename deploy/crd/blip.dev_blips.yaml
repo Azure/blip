@@ -379,7 +379,8 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: command is immutable
-              rule: self.command == oldSelf.command
+              rule: has(self.command) == has(oldSelf.command) && (!has(self.command)
+                || self.command == oldSelf.command)
             - message: env is immutable
               rule: (has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env
                 == oldSelf.env)
