@@ -397,191 +397,208 @@ func TestTTYEOFEndsPartialLineInput(t *testing.T) {
 	}
 }
 
-// TestTTYRawEOFEndsSessionWithoutVEOFData verifies that piped stdin EOF ends a
-// program which put the terminal into raw mode. A raw-mode reader interprets
-// the canonical VEOF bytes as ordinary data, so it both received 004 004 and
-// waited forever. The guest must end the session without injecting those bytes
-// as input.
-func TestTTYRawEOFEndsSessionWithoutVEOFData(t *testing.T) {
+// ttyReader is a command started on a PTY in its own session. The session's
+// input pump feeds its terminal exactly like an exec session in the guest.
+type ttyReader struct {
+	master *os.File
+	cmd    *exec.Cmd
+	s      *session
+	mu     sync.Mutex
+	out    bytes.Buffer
+}
+
+func startTTYReader(t *testing.T, script string) *ttyReader {
+	t.Helper()
 	master, slave, err := openPTY()
 	if err != nil {
 		t.Skipf("open PTY: %v", err)
 	}
-	defer master.Close()
-
-	cmd := exec.Command("sh", "-c", "stty raw -echo; cat")
-	cmd.Stdin = slave
-	stdout, err := cmd.StdoutPipe()
+	outR, outW, err := os.Pipe()
 	if err != nil {
+		master.Close()
 		slave.Close()
 		t.Fatal(err)
 	}
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Stdin = slave
+	cmd.Stdout = outW
+	cmd.Stderr = outW
+	// Own session and controlling terminal, so the guest's SIGSTOP/SIGCONT
+	// restart reaches the reader like it does for an exec session.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	if err := cmd.Start(); err != nil {
+		master.Close()
 		slave.Close()
-		t.Skipf("start cat on PTY: %v", err)
+		outR.Close()
+		outW.Close()
+		t.Skipf("start %q on PTY: %v", script, err)
 	}
 	slave.Close()
-	defer func() { _ = cmd.Process.Kill() }()
+	outW.Close()
 
-	s := &session{proc: &proc{tty: master}, tty: true, out: ring{max: ringSize}}
-	s.inCond = sync.NewCond(&s.inMu)
-	go s.pumpInput()
-	defer s.closeInput()
-
-	if err := s.queueInput([]byte("abc")); err != nil {
-		t.Fatal(err)
-	}
-
-	// The terminal is only known to be raw once cat has returned the partial
-	// line without a newline. Reading that output also proves the data was
-	// delivered before EOF.
-	var (
-		mu  sync.Mutex
-		got bytes.Buffer
-	)
-	eof := make(chan struct{})
+	r := &ttyReader{master: master, cmd: cmd}
 	go func() {
 		buf := make([]byte, 4096)
 		for {
-			n, rerr := stdout.Read(buf)
+			n, rerr := outR.Read(buf)
 			if n > 0 {
-				mu.Lock()
-				got.Write(buf[:n])
-				mu.Unlock()
+				r.mu.Lock()
+				r.out.Write(buf[:n])
+				r.mu.Unlock()
 			}
 			if rerr != nil {
-				close(eof)
 				return
 			}
 		}
 	}()
+	r.s = &session{proc: &proc{pid: cmd.Process.Pid, tty: master}, tty: true, out: ring{max: ringSize}}
+	r.s.inCond = sync.NewCond(&r.s.inMu)
+	go r.s.pumpInput()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		r.s.closeInput()
+		master.Close()
+	})
+	return r
+}
 
-	deadline := time.Now().Add(5 * time.Second)
+func (r *ttyReader) output() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.out.String()
+}
+
+func (r *ttyReader) waitFor(t *testing.T, want string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
 	for {
-		mu.Lock()
-		seen := got.Len() >= 3
-		mu.Unlock()
-		if seen {
-			break
+		out := r.output()
+		if bytes.Contains([]byte(out), []byte(want)) {
+			return out
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("raw-mode cat did not receive the piped bytes")
+			t.Fatalf("output %q never contained %q", out, want)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
 
-	s.queueEOF()
-
-	select {
-	case <-eof:
-	case <-time.After(5 * time.Second):
-		t.Fatal("raw-mode cat still waits for input after piped stdin closed")
+// feed queues stdin and its end of input, like an attached client sending a
+// piped stream.
+func (r *ttyReader) feed(t *testing.T, input string) {
+	t.Helper()
+	if input != "" {
+		if err := r.s.queueInput([]byte(input)); err != nil {
+			t.Fatal(err)
+		}
 	}
-	mu.Lock()
-	out := got.Bytes()
-	mu.Unlock()
-	if bytes.Contains(out, []byte{4}) {
-		t.Fatalf("raw-mode reader received VEOF as data: %q", out)
-	}
+	r.s.queueEOF()
+}
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("raw-mode cat did not exit after EOF")
+func assertNoNUL(t *testing.T, out string) {
+	t.Helper()
+	if bytes.Contains([]byte(out), []byte{0}) {
+		t.Fatalf("stdin EOF was delivered as NUL data: %q", out)
 	}
 }
 
-// TestTTYRawEOFSubmitsPartialLine verifies that a piped final line without a
-// newline is still executed by a raw-mode reader. The guest submits the line
-// the reader is holding and then delivers a canonical VEOF, instead of
-// appending VEOF bytes to the raw line buffer.
+// TestTTYRawEOFIsByteExact is the regression for a piped stream read by a raw
+// terminal: EOF must not append a newline or any other byte. wc must count
+// exactly the three bytes that were sent.
+func TestTTYRawEOFIsByteExact(t *testing.T) {
+	r := startTTYReader(t, "stty raw -echo; wc -c; echo DONE=$?")
+	r.feed(t, "abc")
+	out := r.waitFor(t, "DONE=")
+	assertNoNUL(t, out)
+	if out != "3\nDONE=0\n" {
+		t.Fatalf("output = %q, want %q", out, "3\nDONE=0\n")
+	}
+}
+
+// TestTTYRawEOFAfterNewline ends a raw reader whose input ends with a newline.
+// The newline must not be turned into a hangup or followed by NUL data.
+func TestTTYRawEOFAfterNewline(t *testing.T) {
+	r := startTTYReader(t, "stty raw -echo; cat; echo DONE=$?")
+	r.feed(t, "hello\n")
+	out := r.waitFor(t, "DONE=")
+	assertNoNUL(t, out)
+	if out != "hello\nDONE=0\n" {
+		t.Fatalf("output = %q, want %q", out, "hello\nDONE=0\n")
+	}
+}
+
+// TestTTYRawEOFEmptyInput delivers EOF to a raw reader that never received a
+// byte. read(2) must return 0 instead of the process group being hung up.
+func TestTTYRawEOFEmptyInput(t *testing.T) {
+	r := startTTYReader(t, "stty raw -echo; echo READY; IFS= read -r x; echo GOT=$x; echo DONE=$?")
+	r.feed(t, "")
+	out := r.waitFor(t, "DONE=")
+	if out != "READY\nGOT=\nDONE=0\n" {
+		t.Fatalf("output = %q, want %q", out, "READY\nGOT=\nDONE=0\n")
+	}
+}
+
+// TestTTYRawEOFAfterStartupDelay covers a program that enters raw mode after
+// the client already sent its input and EOF. The bytes must arrive unchanged
+// (no NULs from VEOF) and the reader must still see EOF.
+func TestTTYRawEOFAfterStartupDelay(t *testing.T) {
+	for _, delay := range []string{"0.1", "0.4"} {
+		t.Run("sleep-"+delay, func(t *testing.T) {
+			r := startTTYReader(t, "sleep "+delay+"; stty raw -echo; cat; echo DONE=$?")
+			r.feed(t, "abc")
+			out := r.waitFor(t, "DONE=")
+			assertNoNUL(t, out)
+			if out != "abcDONE=0\n" {
+				t.Fatalf("output = %q, want %q", out, "abcDONE=0\n")
+			}
+		})
+	}
+}
+
+// TestTTYRawThenCanonicalRestoreDoesNotHang covers a program that briefly
+// enters raw mode and restores canonical mode before reading to EOF. The old
+// fallback assumed canonical mode at the check meant EOF had been consumed,
+// so the read blocked forever.
+func TestTTYRawThenCanonicalRestoreDoesNotHang(t *testing.T) {
+	r := startTTYReader(t, "sleep 0.1; stty raw -echo; sleep 0.1; stty sane; cat; echo DONE=$?")
+	r.feed(t, "abc")
+	out := r.waitFor(t, "DONE=")
+	assertNoNUL(t, out)
+	if out != "abcDONE=0\n" {
+		t.Fatalf("output = %q, want %q", out, "abcDONE=0\n")
+	}
+}
+
+// TestTTYInteractiveShellEOFExitsCleanly pipes a script to an interactive
+// shell. The shell switches the terminal to raw mode while reading; EOF must
+// end it cleanly instead of hanging it up (SIGHUP, exit 129).
+func TestTTYInteractiveShellEOFExitsCleanly(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is not installed")
+	}
+	r := startTTYReader(t, "bash -i; echo DONE=$?")
+	r.feed(t, "echo BASH_OK\n")
+	out := r.waitFor(t, "DONE=")
+	assertNoNUL(t, out)
+	if !bytes.Contains([]byte(out), []byte("BASH_OK")) {
+		t.Fatalf("shell did not run the piped command: %q", out)
+	}
+	if !bytes.Contains([]byte(out), []byte("DONE=0")) {
+		t.Fatalf("interactive shell did not exit cleanly: %q", out)
+	}
+}
+
+// TestTTYRawEOFSubmitsPartialLine verifies that a piped partial line reaches a
+// raw reader and is followed by EOF without VEOF appearing as input.
 func TestTTYRawEOFSubmitsPartialLine(t *testing.T) {
-	master, slave, err := openPTY()
-	if err != nil {
-		t.Skipf("open PTY: %v", err)
-	}
-	defer master.Close()
-
-	cmd := exec.Command("sh", "-c", "stty raw -echo; echo READY; IFS= read -r x; echo GOT=$x")
-	cmd.Stdin = slave
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		slave.Close()
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		slave.Close()
-		t.Skipf("start shell on PTY: %v", err)
-	}
-	slave.Close()
-	defer func() { _ = cmd.Process.Kill() }()
-
-	s := &session{proc: &proc{tty: master}, tty: true, out: ring{max: ringSize}}
-	s.inCond = sync.NewCond(&s.inMu)
-	go s.pumpInput()
-	defer s.closeInput()
-
-	var (
-		mu  sync.Mutex
-		got bytes.Buffer
-	)
-	exited := make(chan struct{})
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, rerr := stdout.Read(buf)
-			if n > 0 {
-				mu.Lock()
-				got.Write(buf[:n])
-				mu.Unlock()
-			}
-			if rerr != nil {
-				close(exited)
-				return
-			}
-		}
-	}()
-
-	// Queue the partial line only after the shell has set raw mode, so the
-	// test exercises the raw EOF path regardless of startup timing.
-	waitFor := func(want string) {
-		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			mu.Lock()
-			seen := bytes.Contains(got.Bytes(), []byte(want))
-			mu.Unlock()
-			if seen {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("reader did not print %q", want)
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-	waitFor("READY")
-
-	if err := s.queueInput([]byte("abc")); err != nil {
-		t.Fatal(err)
-	}
-	s.queueEOF()
-
-	select {
-	case <-exited:
-	case <-time.After(5 * time.Second):
-		t.Fatal("raw-mode read did not finish after piped stdin closed")
-	}
-	mu.Lock()
-	out := got.String()
-	mu.Unlock()
+	r := startTTYReader(t, "stty raw -echo; echo READY; IFS= read -r x; echo GOT=$x; echo DONE=$?")
+	r.waitFor(t, "READY")
+	r.feed(t, "abc")
+	out := r.waitFor(t, "DONE=")
+	assertNoNUL(t, out)
 	if !bytes.Contains([]byte(out), []byte("GOT=abc")) {
 		t.Fatalf("partial line was not executed: %q", out)
-	}
-	if bytes.Contains([]byte(out), []byte{4}) {
-		t.Fatalf("raw-mode reader received VEOF as data: %q", out)
 	}
 }
 

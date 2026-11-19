@@ -88,18 +88,33 @@ const (
 	// large dequeued batch; without it a slow-but-steady reader looked dead
 	// for as long as it took to write the whole batch.
 	inputWriteChunk = 32 << 10
-	// ttyEOFSettle lets a program that is switching the terminal to raw
-	// mode (line editors do this at startup) finish before the guest
-	// decides whether a canonical VEOF will be interpreted as EOF or data.
-	ttyEOFSettle = 50 * time.Millisecond
-	// ttyEOFDrain gives the output pump a moment to collect what the
-	// command produced from the final input before a raw terminal is hung
-	// up, which is the only in-band EOF-like event a raw PTY reader sees.
-	ttyEOFDrain = 100 * time.Millisecond
-	// ttyEOFFallback bounds the canonical VEOF wait. If the terminal became
-	// raw after the VEOFs were queued, the program would consume them as
-	// data and keep waiting; hanging up then ends the session instead.
-	ttyEOFFallback = 500 * time.Millisecond
+	// ttyEOFSettle bounds how long the guest waits for a program that is
+	// about to switch its terminal to raw mode. Programs that use raw mode
+	// (line editors, TUIs) usually do it during startup, sometimes after the
+	// client has already sent its input and end of input. Waiting for the
+	// observed transition keeps VEOF bytes out of a raw input stream, where
+	// they would be delivered as NUL data.
+	ttyEOFSettle = 500 * time.Millisecond
+	// ttyEOFRecover bounds how long the guest keeps watching for a raw-mode
+	// switch after EOF was delivered. A late switch turns a queued VEOF into
+	// NUL data; re-asserting canonical mode while the group is stopped turns
+	// the trailing NUL back into an EOF marker before it can be read.
+	ttyEOFRecover = 2 * time.Second
+	// ttyEOFPoll is the terminal-state sampling interval used while waiting
+	// for a raw-mode transition or a late recovery.
+	ttyEOFPoll = 10 * time.Millisecond
+	// ttyEOFStopDelay lets SIGSTOP reach the whole process group before the
+	// VEOF is queued. A SIGCONT that overtakes the pending stop would leave
+	// the command stopped forever.
+	ttyEOFStopDelay = 5 * time.Millisecond
+	// ttyEOFRecoveries bounds how many times a late raw-mode switch is
+	// repaired, so a program that toggles raw mode continuously is not
+	// stopped and resumed in a loop.
+	ttyEOFRecoveries = 5
+	// ttyEOFWriteTimeout bounds the VEOF write. A stopped process cannot
+	// drain a full terminal input queue, so an unbounded write would leave
+	// the group stopped forever.
+	ttyEOFWriteTimeout = 100 * time.Millisecond
 )
 
 type client struct {
@@ -501,54 +516,101 @@ func (s *session) endInput() {
 		_ = p.stdin.Close()
 		return
 	}
-	// A program switching to raw mode does so during startup, often after
-	// the client has already queued its input and EOF. Let that transition
-	// settle before choosing how to signal EOF.
-	time.Sleep(ttyEOFSettle)
-	if canonical, ok := ttyCanonical(p.tty); !ok || canonical {
-		// In canonical mode the first VEOF (Ctrl-D) delivers a partial line
-		// to the reader but does not end the read: only a VEOF at the start
-		// of an empty line makes read(2) return 0. A piped caller sends its
-		// last line without a newline, so send two: the first flushes the
-		// partial line and the second yields EOF. Interactive Ctrl-D is a
-		// normal stdin byte and does not go through endInput, so typing it
-		// still behaves as before.
-		_, _ = p.tty.Write([]byte{4, 4})
-		if ok {
-			// If the terminal becomes raw after these bytes were queued,
-			// the program will consume them as data and wait forever. A
-			// bounded check turns that case into a hangup.
-			go s.hangupIfRaw(p.tty)
+	s.endTTYInput(p.tty)
+}
+
+// endTTYInput delivers end of input to a terminal session. Closing the master
+// would hang up the foreground process group and cut off output, so EOF is
+// delivered in-band with a canonical VEOF instead.
+//
+// A VEOF is only an EOF marker while the terminal is canonical; in raw mode it
+// is stored as NUL data. A program that is about to enter raw mode may have
+// already received the client's input and end of input, so the guest waits for
+// the observed raw-mode transition (bounded by ttyEOFSettle) before deciding.
+// The VEOF is then queued while the command's process group is stopped, which
+// guarantees a read that was already blocked in raw mode cannot consume it as
+// data: the stop restarts the read, which re-enters the line discipline with
+// the terminal canonical and observes EOF.
+func (s *session) endTTYInput(master *os.File) {
+	// Hold our own descriptor: the process reaper closes the session's master
+	// as soon as the command exits. Writing to a closed descriptor could hit a
+	// reused fd, and the duplicate keeps the PTY object alive while EOF is
+	// being delivered. withFD avoids switching the master to blocking mode
+	// while the output pump is reading it.
+	var fd int
+	err := withFD(master, func(mfd int) error {
+		var err error
+		fd, err = unix.Dup(mfd)
+		return err
+	})
+	if err != nil {
+		return
+	}
+	f := os.NewFile(uintptr(fd), "pty-eof")
+	if f == nil {
+		_ = unix.Close(fd)
+		return
+	}
+	defer f.Close()
+	waitRaw := time.Now().Add(ttyEOFSettle)
+	for !s.processDone() && time.Now().Before(waitRaw) {
+		if canonical, ok := ttyCanonical(f); ok && !canonical {
+			break
+		}
+		time.Sleep(ttyEOFPoll)
+	}
+	s.deliverTTYEOF(f)
+	// A program can still switch to raw mode after EOF was delivered. Re-assert
+	// canonical while the group is stopped so any VEOF the program has not read
+	// yet becomes an EOF marker again instead of NUL data. If the reader already
+	// consumed it in raw mode, a fresh VEOF and read restart ends the session.
+	deadline := time.Now().Add(ttyEOFRecover)
+	for recovered := 0; recovered < ttyEOFRecoveries && !s.processDone() && time.Now().Before(deadline); {
+		time.Sleep(ttyEOFPoll)
+		if canonical, ok := ttyCanonical(f); ok && !canonical {
+			s.deliverTTYEOF(f)
+			recovered++
+		}
+	}
+}
+
+// processDone reports whether the process has been reaped.
+func (s *session) processDone() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.procDone
+}
+
+// deliverTTYEOF queues a canonical VEOF for the reader. The process group is
+// stopped first so no raw-mode read can turn the byte into data; resuming it
+// restarts a blocked read in canonical mode, where the VEOF means EOF.
+func (s *session) deliverTTYEOF(f *os.File) {
+	stopped := s.signalGroup(unix.SIGSTOP)
+	if stopped {
+		// A SIGCONT that overtakes the pending stop can leave the group
+		// stopped forever; give the stop a moment to take effect before
+		// queueing bytes the readers must not consume as data.
+		time.Sleep(ttyEOFStopDelay)
+	}
+	if !ttySetCanonical(f) {
+		if stopped {
+			s.signalGroup(unix.SIGCONT)
 		}
 		return
 	}
-	// A raw line editor keeps its own line buffer, so a newline submits a
-	// pending partial line. Once the terminal is canonical again, a VEOF at
-	// the start of the next (empty) line gives the reader a real EOF. This
-	// preserves the partial line instead of discarding it with a hangup.
-	if s.inWrote && s.inLast != '\n' && ttySetCanonical(p.tty) {
-		_, _ = p.tty.Write([]byte{'\n', 4})
-		// A program that restores raw mode before consuming the VEOF would
-		// read it as data; bound that case with a hangup.
-		go s.hangupIfRaw(p.tty)
-		return
-	}
-	// A raw PTY has no in-band EOF: VEOF is ordinary data there. The only
-	// EOF-like event a raw reader can observe is the master going away,
-	// which makes its read fail instead of blocking.
+	// A partial line needs one VEOF to make it available and a second to end
+	// the read. A line that already ended with a newline only needs the EOF.
+	eof := []byte{4}
 	if s.inWrote && s.inLast != '\n' {
-		_, _ = p.tty.Write([]byte{'\n'})
+		eof = []byte{4, 4}
 	}
-	if s.inWrote {
-		time.Sleep(ttyEOFDrain)
-	}
-	s.mu.Lock()
-	done := s.procDone
-	s.mu.Unlock()
-	if !done {
-		// p.close runs after the output pumps drain when the process exits.
-		// Closing here would cut that drain short.
-		_ = p.tty.Close()
+	// The master is pollable, so the deadline bounds a write that cannot
+	// complete while the group is stopped and the input queue is full.
+	_ = f.SetWriteDeadline(time.Now().Add(ttyEOFWriteTimeout))
+	_, _ = f.Write(eof)
+	_ = f.SetWriteDeadline(time.Time{})
+	if stopped {
+		s.signalGroup(unix.SIGCONT)
 	}
 }
 
@@ -580,25 +642,6 @@ func ttySetCanonical(f *os.File) bool {
 		return unix.IoctlSetTermios(fd, unix.TCSETS, st)
 	})
 	return err == nil
-}
-
-// hangupIfRaw closes a terminal that turned raw after canonical VEOFs were
-// queued. Those bytes are data in raw mode, so the reader would otherwise wait
-// for input that can no longer arrive.
-func (s *session) hangupIfRaw(f *os.File) {
-	time.Sleep(ttyEOFFallback)
-	if canonical, ok := ttyCanonical(f); ok && canonical {
-		return
-	}
-	s.mu.Lock()
-	done := s.procDone
-	s.mu.Unlock()
-	if done {
-		// The process exited; p.close owns the descriptor and the output
-		// pumps may still be draining it.
-		return
-	}
-	_ = f.Close()
 }
 
 // queueInput appends stdin.
