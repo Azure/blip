@@ -27,6 +27,9 @@ const (
 	// maxMessageRunes matches the per-history-entry bound below. It keeps a
 	// single prompt from dwarfing the thread's context.
 	maxMessageRunes = 8000
+	// maxUserRunes matches TurnAuthor.Name's CRD limit. A longer identity
+	// would reach the model but could never author a turn.
+	maxUserRunes = 253
 	// maxHistoryMessages and maxHistoryRunes bound the transcript the browser
 	// may replay. The body limit alone still allows hundreds of 8k messages.
 	maxHistoryMessages = 40
@@ -88,6 +91,14 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// joins repeated values with commas still arrives as one element here.
 	if strings.Contains(user, ",") {
 		http.Error(w, "exactly one X-Forwarded-User identity is required", http.StatusBadRequest)
+		return
+	}
+	if !utf8.ValidString(user) {
+		http.Error(w, "invalid X-Forwarded-User", http.StatusBadRequest)
+		return
+	}
+	if n := utf8.RuneCountInString(user); n > maxUserRunes {
+		http.Error(w, fmt.Sprintf("X-Forwarded-User is too long: %d characters, limit %d", n, maxUserRunes), http.StatusBadRequest)
 		return
 	}
 	var req chatRequest
