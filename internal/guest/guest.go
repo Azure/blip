@@ -154,15 +154,46 @@ func Main() {
 	powerOff()
 }
 
+// acceptConn accepts one host connection. It is a variable so tests can
+// simulate transient accept failures.
+var acceptConn = acceptVsock
+
+// Accept retry backoff: a transient error such as EMFILE must not kill the
+// listener, but retries are bounded so a persistent failure cannot spin.
+var (
+	acceptRetryDelay = 10 * time.Millisecond
+	acceptMaxDelay   = time.Second
+)
+
 func (g *Guest) accept(lfd int, serve func(io.ReadWriteCloser)) {
+	delay := acceptRetryDelay
 	for {
-		f, err := acceptVsock(lfd)
-		if err != nil {
+		f, err := acceptConn(lfd)
+		if err == nil {
+			delay = acceptRetryDelay
+			go serve(f)
+			continue
+		}
+		if !temporaryAcceptError(err) {
 			log.Printf("accept: %v", err)
 			return
 		}
-		go serve(f)
+		// Descriptor exhaustion is temporary: the report server and other
+		// connections release descriptors, so keep the listener armed.
+		log.Printf("accept: %v; retrying in %v", err, delay)
+		time.Sleep(delay)
+		delay *= 2
+		if delay > acceptMaxDelay {
+			delay = acceptMaxDelay
+		}
 	}
+}
+
+// temporaryAcceptError reports whether an accept failure is worth retrying.
+func temporaryAcceptError(err error) bool {
+	return errors.Is(err, unix.EMFILE) || errors.Is(err, unix.ENFILE) ||
+		errors.Is(err, unix.ECONNABORTED) || errors.Is(err, unix.EINTR) ||
+		errors.Is(err, unix.ENOBUFS) || errors.Is(err, unix.ENOMEM)
 }
 
 func (g *Guest) helloLocked() wire.Hello {
