@@ -55,6 +55,30 @@ type httpRunnable struct {
 
 func (r *httpRunnable) NeedLeaderElection() bool { return false }
 
+// HTTP server bounds. The read timeout stops slow-body and slow-header
+// clients, the idle timeout closes unused keep-alive connections, and the
+// write timeout bounds a client that stops reading. The write timeout is kept
+// at the LLM client's own timeout so a slow completion is not cut off.
+const (
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 5 * time.Minute
+	idleTimeout       = 60 * time.Second
+	maxHeaderBytes    = 16 << 10
+)
+
+func newChatServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
+}
+
 func (r *httpRunnable) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -62,7 +86,7 @@ func (r *httpRunnable) Start(ctx context.Context) error {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.Handle("/chat", &Chat{Server: r.s})
-	srv := &http.Server{Addr: r.s.Config.Listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := newChatServer(r.s.Config.Listen, mux)
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 	select {
