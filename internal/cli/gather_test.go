@@ -121,6 +121,92 @@ func TestGatherDefaultsToCallerForks(t *testing.T) {
 	}
 }
 
+// Two owners can use the same short blip name in one namespace. Bare gather
+// inside one owner's blip must not select the other owner's forks.
+func TestGatherDefaultsStayInCallerOwner(t *testing.T) {
+	victim := finishedBlip("bob.victim", v1alpha1.BlipSucceeded, 0)
+	victim.Labels = map[string]string{v1alpha1.LabelOwner: "bob", v1alpha1.LabelParent: "box"}
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), victim)
+	h.self = "alice.box"
+	code, out, errOut := h.run("", "gather")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "no blips to gather")
+	if h.gone("bob.victim") {
+		t.Fatal("bare gather deleted another owner's fork")
+	}
+}
+
+// An explicit selector is intersected with the caller's owner, so it cannot
+// list or delete another owner's blips even when their labels match.
+func TestGatherSelectorStaysInCallerOwner(t *testing.T) {
+	mine := finishedBlip("alice.w1", v1alpha1.BlipSucceeded, 0)
+	mine.Labels = map[string]string{v1alpha1.LabelOwner: "alice", "team": "nightly"}
+	other := finishedBlip("bob.victim", v1alpha1.BlipSucceeded, 0)
+	other.Labels = map[string]string{v1alpha1.LabelOwner: "bob", "team": "nightly"}
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), mine, other)
+	h.self = "alice.box"
+	code, out, errOut := h.run("", "gather", "--selector", "team=nightly")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/w1 Succeeded")
+	if strings.Contains(out, "victim") {
+		t.Fatalf("selector listed another owner's fork: %q", out)
+	}
+	if !h.gone("alice.w1") {
+		t.Fatal("caller's fork kept")
+	}
+	if h.gone("bob.victim") {
+		t.Fatal("selector gathered another owner's fork")
+	}
+}
+
+// A selector that names a different owner matches nothing instead of being
+// rejected or widened: the caller's owner always wins.
+func TestGatherSelectorCannotCrossOwner(t *testing.T) {
+	other := finishedBlip("bob.victim", v1alpha1.BlipSucceeded, 0)
+	other.Labels = map[string]string{v1alpha1.LabelOwner: "bob", "team": "nightly"}
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), other)
+	h.self = "alice.box"
+	code, out, errOut := h.run("", "gather", "--selector", "blip.dev/owner=bob")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "no blips to gather")
+	if h.gone("bob.victim") {
+		t.Fatal("selector gathered another owner's fork")
+	}
+}
+
+// A caller without an owner (admin or an unowned blip) is unchanged: no owner
+// constraint is added to its default or explicit selectors.
+func TestGatherOwnerlessCallerUnchanged(t *testing.T) {
+	fork := finishedBlip("w1", v1alpha1.BlipSucceeded, 0)
+	fork.Labels = map[string]string{v1alpha1.LabelParent: "box"}
+	selected := finishedBlip("w2", v1alpha1.BlipSucceeded, 0)
+	selected.Labels = map[string]string{"team": "nightly"}
+	h := newHarness(t, runningBlip("box"), fork, selected)
+	h.self = "box"
+	code, out, errOut := h.run("", "gather")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/w1 Succeeded")
+	if !h.gone("w1") {
+		t.Fatal("ownerless caller did not gather its fork")
+	}
+	code, out, errOut = h.run("", "gather", "--selector", "team=nightly")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/w2 Succeeded")
+	if !h.gone("w2") {
+		t.Fatal("ownerless caller did not gather its selector matches")
+	}
+}
+
 func TestGatherOutsideBlipNeedsNames(t *testing.T) {
 	h := newHarness(t)
 	code, _, errOut := h.run("", "gather")

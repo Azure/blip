@@ -42,7 +42,8 @@ func (a *app) gatherCommand() *cobra.Command {
 them.
 
 Inside a blip, gather with no arguments targets the forks that blip started.
-Select any other set with blip names or --selector, not both.
+Inside an owner-scoped blip, both the default set and --selector are limited
+to that owner's blips. Select a set with blip names or --selector, not both.
 
 With --collect, each operation is applied to every finished blip. Operations
 are the same as the collect syntax, and {name} is replaced with the blip's
@@ -97,6 +98,11 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		}
 		selector = v1alpha1.LabelParent + "=" + v1alpha1.ParentLabel(a.short(a.self.Name))
 	}
+	// Inside an owner-scoped blip, every selector is intersected with the
+	// caller's owner. An explicit selector is constrained rather than
+	// rejected, so one that names another owner matches nothing and can never
+	// list or delete that owner's blips.
+	selector = a.ownerSelector(selector)
 	if len(f.collect) > 0 && a.self == nil {
 		return errors.New("--collect copies into the workspace of the blip this command runs in, so it only works inside one; gather with --keep and collect with kubectl elsewhere")
 	}
@@ -259,6 +265,16 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 		}
 	}
 	return nil
+}
+
+// ownerSelector narrows a label selector to the caller's owner when the
+// command runs inside an owner-scoped blip. Ownerless callers, including
+// admins, keep the selector unchanged.
+func (a *app) ownerSelector(selector string) string {
+	if selector == "" || a.owner == "" {
+		return selector
+	}
+	return selector + "," + v1alpha1.LabelOwner + "=" + a.owner
 }
 
 // gatherTargets resolves the blips named on the command line and the ones that
