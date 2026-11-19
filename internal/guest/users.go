@@ -233,9 +233,17 @@ func lookPath(root, dir, name string, env []string, acct *account) (string, erro
 			denied = true
 			continue
 		}
-		if canExecFile(fi, acct) {
+		err = checkAccess(root, p, unix.X_OK, acct)
+		if err == nil {
 			return p, nil
 		}
+		if errors.Is(err, errAccessUnavailable) && canExecFile(fi, acct) {
+			// Kernels without faccessat2 or a process that cannot switch
+			// to acct's credentials: use the mode-bit approximation.
+			return p, nil
+		}
+		// The candidate exists but this account cannot execute it (or
+		// cannot reach it). execvp keeps searching later PATH entries.
 		denied = true
 	}
 	if denied {

@@ -243,20 +243,34 @@ func checkSearchable(root, p string, acct *account) error {
 	if !fi.IsDir() {
 		return unix.ENOTDIR
 	}
-	if !canSearchDir(fi, acct) {
-		return fmt.Errorf("%w for uid %d", unix.EACCES, acct.uid)
+	err = checkAccess(root, p, unix.X_OK, acct)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errAccessUnavailable):
+		// Kernels without faccessat2 or a process that cannot switch to
+		// acct's credentials: use the mode-bit approximation.
+		if canSearchDir(fi, acct) {
+			return nil
+		}
+	case !errors.Is(err, unix.EACCES):
+		return err
 	}
-	return nil
+	return fmt.Errorf("%w for uid %d", unix.EACCES, acct.uid)
 }
 
 // canSearchDir reports whether acct has execute (search) permission on the
-// directory, matching the kernel's owner/group/other rule.
+// directory under the owner/group/other rule. It is the fallback for kernels
+// without faccessat2; checkAccess is authoritative because it also accounts
+// for POSIX ACLs.
 func canSearchDir(fi os.FileInfo, acct *account) bool {
 	return canAccess(fi, acct, 0o100, 0o010, 0o001)
 }
 
-// canExecFile reports whether acct may execute the file. Root still needs at
-// least one execute bit set, like the kernel.
+// canExecFile reports whether acct may execute the file under the
+// owner/group/other rule. Root still needs at least one execute bit set, like
+// the kernel. It is the fallback for kernels without faccessat2; checkAccess
+// is authoritative because it also accounts for POSIX ACLs.
 func canExecFile(fi os.FileInfo, acct *account) bool {
 	if acct.uid == 0 {
 		return fi.Mode().Perm()&0o111 != 0
