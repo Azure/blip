@@ -835,7 +835,7 @@ func TestMountValidationErrors(t *testing.T) {
 		{"relative path", []string{"mount", "data:work", "--root", "home"}, `invalid mount "data:work"`},
 		{"unclean path", []string{"mount", "data:/a/../b", "--root", "home"}, `invalid mount "data:/a/../b"`},
 		{"root path", []string{"mount", "data:/", "--root", "home"}, `invalid mount "data:/"`},
-		{"mode", []string{"mount", "data:/w:rx", "--root", "home"}, `invalid mount "data:/w:rx"`},
+		{"relative path with mode", []string{"mount", "data:work:rw", "--root", "home"}, `invalid mount "data:work:rw"`},
 		{"self mount", []string{"mount", "home:/data", "--root", "home"}, "a root state cannot mount itself"},
 		{"bad size", []string{"mount", "--new", "x:/data", "--size", "nope", "--root", "home"}, "invalid --size"},
 		{"zero size", []string{"mount", "--new", "x:/data", "--size", "0", "--root", "home"}, "must be positive"},
@@ -1040,6 +1040,50 @@ func TestMountNewRejectsFailedSource(t *testing.T) {
 	code, _, errOut := h.run("", "mount", "--new", "copy:/data", "--from", "bad", "--root", "home")
 	if code != 1 || !strings.Contains(errOut, `copy source "bad" failed: image too large`) {
 		t.Fatalf("code %d: %s", code, errOut)
+	}
+}
+
+// TestMountPathsMayContainColons reproduces a colon-containing path being
+// split as if its last segment were a mode. Modes are only recognized when the
+// path before them has no colon; a path that is both colon-containing and
+// mode-suffixed is genuinely ambiguous and reported as such.
+func TestMountPathsMayContainColons(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		path string
+		rw   bool
+	}{
+		{"colon path", []string{"mount", "data:/a:b", "--root", "home"}, "/a:b", false},
+		{"colon path and non-mode suffix", []string{"mount", "data:/a:b:rx", "--root", "home"}, "/a:b:rx", false},
+		{"mode", []string{"mount", "data:/a:rw", "--root", "home"}, "/a", true},
+		{"read-only mode", []string{"mount", "data:/a:ro", "--root", "home"}, "/a", false},
+		{"new colon path", []string{"mount", "--new", "cache:/a:b", "--root", "home"}, "/a:b", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", tc.args...)
+			if code != 0 {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			mounts := h.state("home").Spec.Mounts
+			if len(mounts) != 1 || mounts[0].Path != tc.path || mounts[0].Writable != tc.rw {
+				t.Fatalf("mounts %+v, want path %s rw=%v", mounts, tc.path, tc.rw)
+			}
+		})
+	}
+
+	for _, arg := range []string{"data:/a:b:rw", "data:/a:b:ro"} {
+		t.Run("ambiguous "+arg, func(t *testing.T) {
+			h := newHarness(t, readyState("home"), readyState("data"))
+			code, _, errOut := h.run("", "mount", arg, "--root", "home")
+			if code != 1 || !strings.Contains(errOut, "ambiguous") {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+			if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("ambiguous mount written: %+v", mounts)
+			}
+		})
 	}
 }
 

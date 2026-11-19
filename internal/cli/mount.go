@@ -613,7 +613,11 @@ list the root's mounts.
   blip mount                        list the root's mounts
 
 Inside a blip the root defaults to its own root state, so a mount takes effect
-in the running command. Outside one, --root names the state to edit.`,
+in the running command. Outside one, --root names the state to edit.
+
+A PATH may contain ':' (for example /a:b). A trailing :rw or :ro is a mode
+only when the PATH before it contains no colon; input with both is ambiguous
+and rejected.`,
 		Example: `  blip mount repo:/work:rw
   blip mount --rm repo
   blip mount --new cache:/cache:rw --size 20Gi
@@ -635,25 +639,36 @@ in the running command. Outside one, --root names the state to edit.`,
 
 // parseMountSpec parses STATE:PATH[:rw|ro]. A nil mode leaves an existing
 // mount's mode unchanged and makes a new mount read-only.
+//
+// A trailing :rw or :ro is a mode only when the path before it contains no
+// colon, so a legal path containing ':' is not truncated. Input that both
+// contains ':' in its path and ends in a mode suffix is ambiguous: it could be
+// either, so it is rejected instead of silently choosing one.
 func parseMountSpec(s string) (state, mountPath string, writable *bool, err error) {
-	parts := strings.SplitN(s, ":", 3)
-	if len(parts) < 2 || parts[0] == "" {
+	i := strings.IndexByte(s, ':')
+	if i <= 0 {
 		return "", "", nil, fmt.Errorf("invalid mount %q: want STATE:PATH[:rw|ro]", s)
 	}
-	state, mountPath = parts[0], parts[1]
+	state, rest := s[:i], s[i+1:]
+	mountPath = rest
+	var mode string
+	switch {
+	case strings.HasSuffix(rest, ":rw"):
+		mode = "rw"
+	case strings.HasSuffix(rest, ":ro"):
+		mode = "ro"
+	}
+	if mode != "" {
+		base := strings.TrimSuffix(rest, ":"+mode)
+		if strings.Contains(base, ":") {
+			return "", "", nil, fmt.Errorf("invalid mount %q: ambiguous path %q ends with :%s but also contains ':'", s, rest, mode)
+		}
+		mountPath = base
+		want := mode == "rw"
+		writable = &want
+	}
 	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
 		return "", "", nil, fmt.Errorf("invalid mount %q: PATH must be a clean absolute path other than /", s)
-	}
-	if len(parts) == 3 {
-		want := false
-		switch parts[2] {
-		case "rw":
-			want = true
-		case "ro":
-		default:
-			return "", "", nil, fmt.Errorf("invalid mount %q: mode must be rw or ro", s)
-		}
-		writable = &want
 	}
 	return state, mountPath, writable, nil
 }
