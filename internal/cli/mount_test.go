@@ -1740,6 +1740,105 @@ func TestMountGuestRejectedPathRollsBack(t *testing.T) {
 	}
 }
 
+// TestMountMoveRejectedRestoresPreviousPath reproduces a move whose new path
+// the guest rejects. The old path must be restored, or every later execution
+// of the root fails at the rejected path.
+func TestMountMoveRejectedRestoresPreviousPath(t *testing.T) {
+	const guestErr = "/usr/bin/env is a symlink or not a directory"
+	b := runningBlip("agent")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{
+		{State: "data", Path: "/data"},
+		{State: "keep", Path: "/keep"},
+	}
+	b.Status.Mounts = []v1alpha1.MountStatus{
+		{State: "data", Path: "/data", Phase: v1alpha1.MountMounted, AttachmentID: "data-attachment"},
+		{State: "keep", Path: "/keep", Phase: v1alpha1.MountMounted, AttachmentID: "keep-attachment"},
+	}
+	h := newHarness(t, b, root, readyState("data"), readyState("keep"))
+	h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
+
+	code, _, errOut := h.run("", "mount", "data:/usr/bin/env/x", "--rm", "keep", "--root", root.Name)
+	if code != 1 || !strings.Contains(errOut, guestErr) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if strings.Contains(errOut, "desired mount remains applied") {
+		t.Fatalf("rejected move claims the mount remains applied: %s", errOut)
+	}
+	mustContain(t, errOut, "previous mount", "/data", "was restored")
+	mounts := h.state(root.Name).Spec.Mounts
+	if len(mounts) != 2 {
+		t.Fatalf("rejected move lost mounts: %+v", mounts)
+	}
+	if m := findSpecMount(mounts, "data"); m == nil || m.Path != "/data" {
+		t.Fatalf("rejected move did not restore /data: %+v", mounts)
+	}
+	if m := findSpecMount(mounts, "keep"); m == nil || m.Path != "/keep" {
+		t.Fatalf("removed mount was not restored: %+v", mounts)
+	}
+}
+
+// TestMountRemoveThenRejectedAddRestoresMount reproduces --rm of a state
+// followed by a rejected add of the same state (an implicit move). The removal
+// has already been applied, so the original mount must be restored instead of
+// silently lost.
+func TestMountRemoveThenRejectedAddRestoresMount(t *testing.T) {
+	const guestErr = "/usr/bin/env is a symlink or not a directory"
+	b := runningBlip("agent")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "data", Path: "/data", Writable: true, Phase: v1alpha1.MountMounted, AttachmentID: "data-attachment",
+	}}
+	h := newHarness(t, b, root, readyState("data"))
+	h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
+
+	code, _, errOut := h.run("", "mount", "--rm", "data", "data:/usr/bin/env/x", "--root", root.Name)
+	if code != 1 || !strings.Contains(errOut, guestErr) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if strings.Contains(errOut, "desired mount remains applied") {
+		t.Fatalf("rejected add claims the mount remains applied: %s", errOut)
+	}
+	mustContain(t, errOut, "were restored")
+	mounts := h.state(root.Name).Spec.Mounts
+	if len(mounts) != 1 || mounts[0] != (v1alpha1.Mount{State: "data", Path: "/data", Writable: true}) {
+		t.Fatalf("original mount was lost: %+v", mounts)
+	}
+}
+
+// TestMountRemoveThenRejectedNewRestoresMount is the --new counterpart: the
+// invocation removes a mount, creates and commits a state, then the guest
+// rejects its path. Rollback removes the new state but must restore the
+// original mount it removed first.
+func TestMountRemoveThenRejectedNewRestoresMount(t *testing.T) {
+	const guestErr = "/usr/bin/env is a symlink or not a directory"
+	b := runningBlip("agent")
+	root := readyState(b.Spec.State)
+	root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+	root.Spec.Mounts = []v1alpha1.Mount{{State: "keep", Path: "/keep", Writable: true}}
+	b.Status.Mounts = []v1alpha1.MountStatus{{
+		State: "keep", Path: "/keep", Writable: true, Phase: v1alpha1.MountMounted, AttachmentID: "keep-attachment",
+	}}
+	h := newHarness(t, b, root, readyState("keep"))
+	h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
+
+	code, _, errOut := h.run("", "mount", "--new", "cache:/usr/bin/env/x:rw", "--rm", "keep", "--root", root.Name)
+	if code != 1 || !strings.Contains(errOut, guestErr) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, errOut, "were restored")
+	if !stateNotFound(t, h, "cache") {
+		t.Fatal("rejected --new left state cache behind")
+	}
+	mounts := h.state(root.Name).Spec.Mounts
+	if len(mounts) != 1 || mounts[0] != (v1alpha1.Mount{State: "keep", Path: "/keep", Writable: true}) {
+		t.Fatalf("original mount was lost: %+v", mounts)
+	}
+}
+
 // TestMountNewMountFailureLeavesState ports create's attach-failure coverage:
 // the created state keeps its first commit even when mounting it fails.
 func TestMountNewMountFailureLeavesState(t *testing.T) {

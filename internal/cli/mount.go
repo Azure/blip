@@ -242,7 +242,9 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 		// every later Blip on the root wait for a state that is gone.
 		return fmt.Errorf("state %q is being deleted", a.short(state))
 	}
-	var want, demoting, added bool
+	var want, demoting, added, moved bool
+	var prevPath string
+	var prevWritable bool
 	var oldAttachment string
 	s, err := a.editMountsWaitingStale(ctx, root, state, func(s *v1alpha1.BlipState) (string, error) {
 		if s.DeletionTimestamp != nil {
@@ -250,7 +252,8 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 			// edit it. Do not add intent that can never run.
 			return "", fmt.Errorf("state %q is being deleted", a.short(root))
 		}
-		want, demoting, added = false, false, false
+		want, demoting, added, moved = false, false, false, false
+		prevPath, prevWritable = "", false
 		oldAttachment = ""
 		if err := mountpath.Validate(mountPath); err != nil && !collectAdoption(s, state, mountPath) {
 			return "", err
@@ -267,6 +270,8 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 				if err := mountPathConflict(root, s.Spec.Mounts, state, mountPath); err != nil {
 					return "", err
 				}
+				moved = true
+				prevPath, prevWritable = m.Path, m.Writable
 				m.Path = mountPath
 			}
 			want = m.Writable
@@ -335,19 +340,33 @@ func (a *app) mountStatePlanned(ctx context.Context, state, root, mountPath stri
 		}
 		var gone *mountStateGoneError
 		var rejected *mountRejectedError
-		if added && (errors.As(err, &gone) || errors.As(err, &rejected)) {
-			// The state disappeared or the guest rejected the mount point
-			// while this command waited. Remove only the desired mount this
-			// command just added; a mount that was already in the root
-			// belongs to someone else.
-			if rerr := a.rollbackAddedMount(ctx, root, state, mountPath, want); rerr != nil {
-				fmt.Fprintf(a.env.Err, "warning: could not remove desired mount of state %s from root state %s: %v\n", a.short(state), a.short(root), rerr)
-			} else {
-				// The wait error says the desired mount remains applied.
-				// It does not any more, so replace that claim instead of
-				// appending a contradiction.
-				msg := strings.TrimSuffix(err.Error(), "; desired mount remains applied")
-				err = fmt.Errorf("%s; the desired mount was removed from root state %q", msg, a.short(root))
+		if errors.As(err, &gone) || errors.As(err, &rejected) {
+			switch {
+			case added:
+				// The state disappeared or the guest rejected the mount
+				// point while this command waited. Remove only the desired
+				// mount this command just added; a mount that was already in
+				// the root belongs to someone else.
+				if rerr := a.rollbackAddedMount(ctx, root, state, mountPath, want); rerr != nil {
+					fmt.Fprintf(a.env.Err, "warning: could not remove desired mount of state %s from root state %s: %v\n", a.short(state), a.short(root), rerr)
+					err = fmt.Errorf("%w; desired mount remains applied", err)
+				} else {
+					err = fmt.Errorf("%w; the desired mount was removed from root state %q", err, a.short(root))
+				}
+			case moved:
+				// A move rewrote an existing mount's path. On a rejection
+				// the old path must come back, or every later execution of
+				// the root fails at the rejected mount point.
+				if rerr := a.restoreMovedMount(ctx, root, state, mountPath, want, prevPath, prevWritable); rerr != nil {
+					fmt.Fprintf(a.env.Err, "warning: could not restore previous path of state %s on root state %s: %v\n", a.short(state), a.short(root), rerr)
+					err = fmt.Errorf("%w; desired mount remains applied", err)
+				} else {
+					err = fmt.Errorf("%w; the previous mount of state %s at %s was restored", err, a.short(state), prevPath)
+				}
+			default:
+				// The mount was already in the root before this command, so
+				// it stays as desired intent.
+				err = fmt.Errorf("%w; desired mount remains applied", err)
 			}
 		}
 		return err
@@ -493,6 +512,25 @@ func (a *app) restoreMountMode(ctx context.Context, root, state, mountPath strin
 	return err
 }
 
+// restoreMovedMount reverts the path and mode of an existing mount after a
+// rejected move. It only rewrites the exact entry this command wrote, so a
+// concurrent edit wins and the old path is never restored over someone else's
+// change.
+func (a *app) restoreMovedMount(ctx context.Context, root, state, mountPath string, want bool, prevPath string, prevWritable bool) error {
+	_, err := a.updateState(ctx, root, func(s *v1alpha1.BlipState) error {
+		m := findSpecMount(s.Spec.Mounts, state)
+		if m == nil || m.Path != mountPath || m.Writable != want || m.BlipUID != "" {
+			return errUnchanged
+		}
+		m.Path, m.Writable = prevPath, prevWritable
+		return nil
+	})
+	if errors.Is(err, errUnchanged) {
+		return nil
+	}
+	return err
+}
+
 // rollbackAddedMount removes the desired mount this command just added after
 // its source state disappeared. It removes only the exact entry this command
 // wrote, so a concurrent edit or a pre-existing mount is left alone.
@@ -516,6 +554,77 @@ func (a *app) rollbackAddedMount(ctx context.Context, root, state, mountPath str
 		return nil
 	}
 	return err
+}
+
+// restoreRemovedMounts re-adds the mounts this invocation removed when a later
+// add failed. A combined command that cannot be applied must not silently lose
+// the original mounts. It returns the removed states it restored and the ones
+// that could not be restored because their path is now occupied.
+func (a *app) restoreRemovedMounts(ctx context.Context, root string, original []v1alpha1.Mount, removed map[string]bool) (restored, missing []string, err error) {
+	if len(removed) == 0 {
+		return nil, nil, nil
+	}
+	_, err = a.updateState(ctx, root, func(s *v1alpha1.BlipState) error {
+		restored, missing = nil, nil
+		for _, old := range original {
+			if !removed[old.State] {
+				continue
+			}
+			if findSpecMount(s.Spec.Mounts, old.State) != nil {
+				// A move rollback or a concurrent edit already restored it.
+				continue
+			}
+			blocked := false
+			for _, cur := range s.Spec.Mounts {
+				if mountPathsOverlap(cur.Path, old.Path) {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				missing = append(missing, old.State)
+				continue
+			}
+			s.Spec.Mounts = append(s.Spec.Mounts, old)
+			restored = append(restored, old.State)
+		}
+		if len(restored) == 0 {
+			return errUnchanged
+		}
+		return nil
+	})
+	if errors.Is(err, errUnchanged) {
+		err = nil
+	}
+	return restored, missing, err
+}
+
+// restoreAfterFailedAdd reports a failed add together with the fate of the
+// mounts the same invocation removed first. Either they are restored, or the
+// error says they are gone and must be mounted again; it never leaves the user
+// to infer a rollback that did not happen.
+func (a *app) restoreAfterFailedAdd(ctx context.Context, root string, original []v1alpha1.Mount, removed map[string]bool, cause error) error {
+	restored, missing, err := a.restoreRemovedMounts(ctx, root, original, removed)
+	if err != nil {
+		fmt.Fprintf(a.env.Err, "warning: could not restore mounts unmounted by this command: %v\n", err)
+		return cause
+	}
+	if len(restored) > 0 {
+		return fmt.Errorf("%w; the previously removed mount(s) %s were restored", cause, strings.Join(a.shortAll(restored), ", "))
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w; the mount(s) %s removed by this command could not be restored; mount them again", cause, strings.Join(a.shortAll(missing), ", "))
+	}
+	return cause
+}
+
+// shortAll maps state names through short for user-facing lists.
+func (a *app) shortAll(names []string) []string {
+	out := make([]string, len(names))
+	for i, name := range names {
+		out[i] = a.short(name)
+	}
+	return out
 }
 
 // waitMount observes the runtime attachment without editing desired intent.
@@ -580,10 +689,14 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 			if strings.Contains(m.Message, "busy") {
 				return false, fmt.Errorf("could not switch state %q on blip %q: processes are still using %s; desired mount remains applied", state, b.Name, mountPath)
 			}
-			msg := fmt.Sprintf("mount of state %q on blip %q failed: %s; desired mount remains applied", state, b.Name, m.Message)
+			msg := fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, m.Message)
 			if mountPointRejected(m.Message) {
+				// mountState appends the accurate outcome after attempting
+				// its rollback; claiming here that the mount remains applied
+				// would contradict a successful removal.
 				return false, &mountRejectedError{msg: msg}
 			}
+			msg += "; desired mount remains applied"
 			return false, errors.New(msg)
 		}
 		if m.Phase == v1alpha1.MountMounted && !m.Switching && m.Writable != want && m.Message != "" &&
@@ -903,13 +1016,15 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	if err != nil {
 		return err
 	}
-	if root.DeletionTimestamp != nil && (len(args) > 0 || len(f.create) > 0) {
+	hasAdds := len(args) > 0 || len(f.create) > 0
+	if root.DeletionTimestamp != nil && hasAdds {
 		// A terminating root can never execute again. Reject before
 		// creating a state or writing intent that no run can use. A
 		// removal-only command stays legal so a reader can still detach
 		// and release the state's finalizer.
 		return fmt.Errorf("state %q is being deleted", a.short(f.root))
 	}
+	original := append([]v1alpha1.Mount(nil), root.Spec.Mounts...)
 	removed := make(map[string]bool, len(f.remove))
 	for _, arg := range f.remove {
 		state, err := a.removalState(ctx, arg, root)
@@ -933,12 +1048,12 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	}
 	for _, n := range news {
 		if err := a.newMountedState(ctx, n.spec, f, replicasSet); err != nil {
-			return err
+			return a.restoreAfterFailedAdd(ctx, f.root, original, removed, err)
 		}
 	}
 	for _, add := range adds {
 		if err := a.mountStatePlanned(ctx, add.state, f.root, add.path, add.writable, move); err != nil {
-			return err
+			return a.restoreAfterFailedAdd(ctx, f.root, original, removed, err)
 		}
 	}
 	return nil
