@@ -525,6 +525,9 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 		if err := s.Status().Update(ctx, current); err != nil {
 			return err
 		}
+		// Steps shares this thread value; keep it in sync so a step later in
+		// the same tick cannot write the pruned tasks back.
+		thread.Status = current.Status
 	}
 	return nil
 }

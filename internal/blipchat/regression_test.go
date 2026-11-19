@@ -147,3 +147,52 @@ func TestOlderWakeNowTurnStillStepsAndAppearsInPrompt(t *testing.T) {
 		t.Errorf("prompt dropped the oldest turn (Wake=Now):\n%s", content)
 	}
 }
+
+// Retention advances the API, so a step later in the same tick must see the
+// pruned board and must not write the old tasks back.
+func TestPrunedTasksStayPrunedAfterSameTickStep(t *testing.T) {
+	old := metav1.NewTime(timeNow().Add(-100 * time.Hour))
+	fresh := metav1.NewTime(timeNow())
+	thread := testThread()
+	thread.Spec.Retention.ClosedTasks = &metav1.Duration{Duration: time.Hour}
+	thread.Status.Tasks = []v1.ThreadTask{
+		{ID: "old", Title: "old closed task", Open: false, Updated: &old},
+		{ID: "live", Title: "live open task", Open: true, Updated: &fresh},
+	}
+	c := testClient(t, thread)
+	server, requests := llmServerWithRequests(t, Message{Role: "assistant", Content: "ok"})
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	ctx := context.Background()
+	if err := s.prune(ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.step(ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Status.Tasks) != 1 || updated.Status.Tasks[0].ID != "live" {
+		t.Errorf("tasks after prune+step = %+v, want only the live task", updated.Status.Tasks)
+	}
+	if len(*requests) == 0 {
+		t.Fatal("no LLM request recorded")
+	}
+	messages, ok := (*requests)[0]["messages"].([]any)
+	if !ok || len(messages) < 2 {
+		t.Fatalf("request messages = %#v", (*requests)[0]["messages"])
+	}
+	user, ok := messages[1].(map[string]any)
+	if !ok {
+		t.Fatalf("user message = %#v", messages[1])
+	}
+	content, _ := user["content"].(string)
+	if strings.Contains(content, "old closed task") {
+		t.Errorf("step prompt still showed the pruned task:\n%s", content)
+	}
+}
