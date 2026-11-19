@@ -30,6 +30,15 @@ const (
 	turnField = "spec.thread"
 	// budgetPauseReason is the only pause blipchat clears automatically.
 	budgetPauseReason = "daily token budget exhausted"
+	// promptBudget bounds the turns section of one step's user prompt.
+	promptBudget = 48000
+	// boardBudget bounds the task board so it cannot crowd the turns out of
+	// the prompt. The CRD allows a board far larger than a whole prompt.
+	boardBudget = promptBudget / 2
+	// stalledPromptBackoff delays a thread whose pending turns cannot be
+	// rendered within promptBudget at all. Without it the same unrenderable
+	// input would return to shouldStep every tick.
+	stalledPromptBackoff = time.Minute
 )
 
 var timeNow = time.Now
@@ -248,17 +257,16 @@ type step struct {
 	// from a step that did not touch the summary.
 	summarySet bool
 	paused     string
-	usage      int64
+	// deferred records a step that made no renderable progress. Its next
+	// wake is delayed instead of immediately re-running the same input.
+	deferred bool
+	usage    int64
 }
 
 func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 	pending, err := s.pendingTurns(ctx, thread)
 	if err != nil {
 		return err
-	}
-	target := thread.Status.ConsumedSeq
-	if len(pending) > 0 {
-		target = pending[len(pending)-1].Status.Seq
 	}
 	now := timeNow()
 	st := &step{
@@ -280,6 +288,7 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 	}
 
 	// Consume due timers: their notes are part of this step's input.
+	allTimers := append([]v1.ThreadTimer{}, st.timers...)
 	var dueTimers []v1.ThreadTimer
 	kept := st.timers[:0]
 	for _, timer := range st.timers {
@@ -303,9 +312,32 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 		{Role: "system", Content: systemPrompt(thread)},
 	}
 	prompt, lastRendered := boardPrompt(thread, st.tasks, pending, dueTimers, st.summary)
-	// Never advance ConsumedSeq past a turn the prompt did not render.
+	// A renderer that cannot show even the oldest pending turn cannot make
+	// contiguous progress: a completion would send the same input and repeat
+	// its replies every tick. Keep every turn pending and defer the retry
+	// instead of paying for an identical step.
+	if len(pending) > 0 && lastRendered <= thread.Status.ConsumedSeq {
+		st.deferred = true
+		// This step consumed no input, so keep the due timers pending too.
+		st.timers = allTimers
+		if err := s.commitStep(ctx, st, thread.Status.ConsumedSeq, pending, started); err != nil {
+			return err
+		}
+		s.deferThread(thread, stalledPromptBackoff)
+		return nil
+	}
+	target := thread.Status.ConsumedSeq
+	if len(pending) > 0 {
+		target = pending[len(pending)-1].Status.Seq
+	}
+	// Never advance ConsumedSeq past a turn the prompt did not render, and
+	// never move it backwards: a rewind resurrects consumed turns and makes
+	// the same step run again.
 	if len(pending) > 0 && lastRendered < target {
 		target = lastRendered
+	}
+	if target < thread.Status.ConsumedSeq {
+		target = thread.Status.ConsumedSeq
 	}
 	messages = append(messages, Message{Role: "user", Content: prompt})
 	toollist := st.tools()
@@ -413,12 +445,23 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 	tokens := st.usage
 	today := started.UTC().Format("2006-01-02")
 	next := nextWake(st, started)
+	if st.deferred {
+		// The step did not run, so retry after the bounded backoff rather
+		// than schedule an immediate wake for the same input.
+		next = &metav1.Time{Time: started.Add(stalledPromptBackoff)}
+	}
 	for attempt := 0; attempt < 5; attempt++ {
 		current, err := s.currentThread(ctx, st.thread)
 		if err != nil {
 			return err
 		}
-		current.Status.ConsumedSeq = target
+		// A concurrent commit must never let this step move consumption
+		// backwards, even when its prompt rendered only older turns.
+		consumed := target
+		if consumed < current.Status.ConsumedSeq {
+			consumed = current.Status.ConsumedSeq
+		}
+		current.Status.ConsumedSeq = consumed
 		if st.summarySet {
 			current.Status.Summary = truncateRunes(st.summary, 16384)
 		}
@@ -570,7 +613,7 @@ func boardPrompt(thread *v1.BlipThread, tasks []v1.ThreadTask, turns []v1.BlipTu
 		return b.String(), 0
 	}
 
-	last := boardTurns(&b, turns, 48000-b.Len())
+	last := boardTurns(&b, turns, promptBudget-b.Len())
 	return b.String(), last
 }
 
@@ -640,7 +683,7 @@ func boardTurns(b *strings.Builder, turns []v1.BlipTurn, budget int) int64 {
 		}
 	}
 	if keepEnd >= 0 {
-		return renderWakePrefix(b, turns, lines, budget, start, keepEnd)
+		return renderWakePrefix(b, turns, lines, budget, keepEnd)
 	}
 	if start == 0 {
 		for i := range lines {
@@ -696,13 +739,14 @@ func boardTurns(b *strings.Builder, turns []v1.BlipTurn, budget int) int64 {
 }
 
 // renderWakePrefix renders a contiguous prefix through the last omitted wake
-// turn plus as much of the newest suffix as fits. It returns the highest
-// sequence of the contiguous rendered prefix; gaps stay pending.
-func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, budget, newestStart, keepEnd int) int64 {
+// turn plus as much of the newest suffix as fits. When the full prefix does
+// not fit, it is shown compactly so the step can still consume it; only when
+// even the compact form does not fit does the rendered prefix stay empty (the
+// caller then defers instead of re-running the same input). It returns the
+// highest sequence of the contiguous rendered prefix; gaps stay pending.
+func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, budget, keepEnd int) int64 {
+	out := make([]string, len(turns))
 	rendered := make([]bool, len(turns))
-	for i := newestStart; i < len(turns); i++ {
-		rendered[i] = true
-	}
 	prefix := 0
 	for i := 0; i <= keepEnd; i++ {
 		prefix += len(lines[i])
@@ -710,18 +754,51 @@ func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, b
 	if prefix <= budget {
 		for i := 0; i <= keepEnd; i++ {
 			rendered[i] = true
+			out[i] = lines[i]
 		}
 		if remaining := budget - prefix; remaining > 0 {
 			s, _ := suffixTurns(lines[keepEnd+1:], remaining)
 			for i := s + keepEnd + 1; i < len(turns); i++ {
 				rendered[i] = true
+				out[i] = lines[i]
 			}
 		}
 	} else {
-		// The context before the wake turn is itself over budget. Keep every
-		// wake turn, but never consume across a gap.
-		for i := 0; i <= keepEnd; i++ {
-			rendered[i] = turns[i].Spec.Wake != v1.WakeNone
+		// The context before the wake turn is itself over budget. Show it as
+		// compact summaries so the contiguous prefix through the wake turn
+		// can be consumed without dropping its input; the wake turn itself
+		// stays in full and the newest suffix uses whatever room remains.
+		notice, summaries := "", ""
+		ok := true
+		if keepEnd > 0 {
+			notice = fmt.Sprintf("(%d older turns summarized)\n", keepEnd)
+			summaries, ok = summarizeTurns(turns[:keepEnd], budget-len(lines[keepEnd])-len(notice))
+		}
+		if ok {
+			if keepEnd > 0 {
+				out[0] = notice + summaries
+				for i := 0; i < keepEnd; i++ {
+					rendered[i] = true
+				}
+			}
+			rendered[keepEnd] = true
+			out[keepEnd] = lines[keepEnd]
+			remaining := budget - len(notice) - len(summaries) - len(lines[keepEnd])
+			if remaining > 0 {
+				s, _ := suffixTurns(lines[keepEnd+1:], remaining)
+				for i := s + keepEnd + 1; i < len(turns); i++ {
+					rendered[i] = true
+					out[i] = lines[i]
+				}
+			}
+		} else {
+			// Keep every wake turn, but never consume across a gap.
+			for i := 0; i <= keepEnd; i++ {
+				if turns[i].Spec.Wake != v1.WakeNone {
+					rendered[i] = true
+					out[i] = lines[i]
+				}
+			}
 		}
 	}
 	lastRendered := int64(0)
@@ -745,7 +822,7 @@ func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, b
 			}
 			gap = 0
 		}
-		b.WriteString(lines[i])
+		b.WriteString(out[i])
 	}
 	if gap > 0 {
 		fmt.Fprintf(b, "(%d newer turns omitted)\n", gap)

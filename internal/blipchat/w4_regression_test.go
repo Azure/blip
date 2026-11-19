@@ -225,7 +225,8 @@ func TestOverBudgetPromptKeepsWakingTurn(t *testing.T) {
 }
 
 // When the context before the waking turn is itself over budget, the step
-// must keep the waking turn but consume nothing across the gap.
+// summarizes that context so the contiguous prefix through the waking turn can
+// be consumed. It must keep the waking turn and never drop the skipped input.
 func TestOverBudgetPromptKeepsLateWakingTurnWithoutConsuming(t *testing.T) {
 	fresh := metav1.NewTime(timeNow())
 	objs := []client.Object{testThread()}
@@ -259,8 +260,20 @@ func TestOverBudgetPromptKeepsLateWakingTurnWithoutConsuming(t *testing.T) {
 	if err := c.Get(ctx, client.ObjectKeyFromObject(objs[0]), &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Status.ConsumedSeq != 0 {
-		t.Errorf("consumedSeq = %d, want 0 when the prefix was not rendered", updated.Status.ConsumedSeq)
+	if updated.Status.ConsumedSeq != 51 {
+		t.Errorf("consumedSeq = %d, want the summarized prefix through the waking turn", updated.Status.ConsumedSeq)
+	}
+	// The condensed context must still be present, and the turns after the
+	// waking one stay pending rather than being silently consumed.
+	if !strings.Contains(prompt, "older turns summarized") {
+		t.Errorf("the over-budget context was not summarized:\n%s", prompt)
+	}
+	pending, err := s.pendingTurns(ctx, &updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 49 || pending[0].Status.Seq != 52 {
+		t.Errorf("pending = %d turns, want 49 starting at 52", len(pending))
 	}
 }
 
