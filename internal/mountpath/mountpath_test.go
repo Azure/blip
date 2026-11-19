@@ -129,6 +129,8 @@ func TestValidateLinuxPathLimits(t *testing.T) {
 	if len(pathAtMax) != PathMax {
 		t.Fatalf("test path is %d bytes, want PATH_MAX %d", len(pathAtMax), PathMax)
 	}
+	componentsAtMax := "/" + strings.Repeat("c/", MaxComponents-1) + "c"
+	componentsOver := "/" + strings.Repeat("c/", MaxComponents) + "c"
 	for _, tc := range []struct {
 		name string
 		path string
@@ -138,6 +140,10 @@ func TestValidateLinuxPathLimits(t *testing.T) {
 		{"300 byte component", longComponent(300), false},
 		{"260 byte component", longComponent(260), false},
 		{"exact name_max component", longComponent(NameMax), true},
+		{"multibyte name_max over", "/" + strings.Repeat("é", 128), false},
+		{"multibyte name_max at", "/" + strings.Repeat("é", 127), true},
+		{"components at max", componentsAtMax, true},
+		{"components over max", componentsOver, false},
 		{"path at limit", pathAtMax, false},
 		{"safe long nested path", safeNested, true},
 	} {

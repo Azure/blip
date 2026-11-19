@@ -260,6 +260,18 @@ func TestMountPathCRDRules(t *testing.T) {
 	if rule := ruleFor(t, path.XValidations, "path must not contain . or .. segments"); rule != segments {
 		t.Errorf("mount path segment rule %q, want %q", rule, segments)
 	}
+	// NAME_MAX is a byte limit: a 128-character multibyte component is 256
+	// bytes and no guest can create it. The split limit and the component
+	// cap keep the byte check within the CEL cost budget while still covering
+	// every component a path may have.
+	const nameMax = "self.split('/', 256).all(s, bytes(s).size() <= 255)"
+	if rule := ruleFor(t, path.XValidations, "path components must be at most 255 bytes, the Linux NAME_MAX limit"); rule != nameMax {
+		t.Errorf("mount path NAME_MAX rule %q, want %q", rule, nameMax)
+	}
+	const componentCap = "self.split('/').size() <= 256"
+	if rule := ruleFor(t, path.XValidations, "path must have at most 255 components"); rule != componentCap {
+		t.Errorf("mount path component cap rule %q, want %q", rule, componentCap)
+	}
 	const unique = "self.all(m, self.exists_one(o, o.path == m.path))"
 	if rule := ruleFor(t, mounts.XValidations, "mount paths must be unique"); rule != unique {
 		t.Errorf("mount path uniqueness rule %q, want %q", rule, unique)
@@ -312,6 +324,8 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 	if len(pathAtLimit) != mountpath.PathMax-1 {
 		t.Fatalf("test path is %d bytes, want %d", len(pathAtLimit), mountpath.PathMax-1)
 	}
+	componentsAtMax := "/" + strings.Repeat("c/", mountpath.MaxComponents-1) + "c"
+	componentsOver := "/" + strings.Repeat("c/", mountpath.MaxComponents) + "c"
 	for _, p := range []string{
 		"/mnt/a", "/a b/c", "/.hidden", "/a.b/c", "/var/log", "/usr/bin", "/run/data",
 		// Directory symlinks are resolved by the guest, so these are legal.
@@ -319,7 +333,10 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 		// The CLI writes one temporary collect mount below the reserved root.
 		"/run/blip-collect/data",
 		"/" + strings.Repeat("a", mountpath.NameMax),
+		// NAME_MAX is 255 bytes, so 127 two-byte characters (254 bytes) fit.
+		"/" + strings.Repeat("é", 127),
 		pathAtLimit,
+		componentsAtMax,
 	} {
 		if errs := validate(object(p), ""); len(errs) != 0 {
 			t.Errorf("admission rejected valid mount path (%d bytes): %v", len(p), errs.ToAggregate())
@@ -328,7 +345,10 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 	for _, p := range []string{
 		"/" + strings.Repeat("a", mountpath.NameMax+1),
 		"/" + strings.Repeat("a", 300),
+		// 128 two-byte characters are 256 bytes despite being 128 characters.
+		"/" + strings.Repeat("é", 128),
 		"/" + strings.Repeat("é", 3000),
+		componentsOver,
 		"/" + strings.Repeat("a", mountpath.PathMax-1),
 		"/a\x00b",
 		"/a\tb",

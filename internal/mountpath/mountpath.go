@@ -47,6 +47,11 @@ const (
 	// PathMax is Linux PATH_MAX (4096 bytes) including the terminating NUL,
 	// so the longest usable path string is PathMax-1 bytes.
 	PathMax = 4096
+	// MaxComponents bounds how many components a mount path may have. Linux
+	// allows more in PATH_MAX, but the CRD's per-component byte check has to
+	// fit the API server's CEL cost budget; 255 components is far beyond any
+	// real mount layout.
+	MaxComponents = 255
 )
 
 // GuestFiles are the regular files the guest bind-mounts over the durable
@@ -108,10 +113,18 @@ func ValidateLength(p string) error {
 	if len(p) >= PathMax {
 		return fmt.Errorf("mount path is %d bytes, exceeding the Linux PATH_MAX limit of %d bytes", len(p), PathMax-1)
 	}
+	components := 0
 	for _, c := range strings.Split(p, "/") {
+		if c == "" {
+			continue
+		}
+		components++
 		if len(c) > NameMax {
 			return fmt.Errorf("mount path has a %d-byte component, exceeding the Linux NAME_MAX limit of %d bytes", len(c), NameMax)
 		}
+	}
+	if components > MaxComponents {
+		return fmt.Errorf("mount path has %d components, exceeding the limit of %d", components, MaxComponents)
 	}
 	return nil
 }
