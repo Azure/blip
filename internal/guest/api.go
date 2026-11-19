@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -23,18 +24,54 @@ type apiForwarder struct {
 	name     string // log label, e.g. "Kubernetes API" or "gateway"
 	listener net.Listener
 	dial     func() (apiStream, error)
-	mu       sync.Mutex
-	closed   bool
-	conns    map[apiStream]struct{}
+	// keepAlive is applied to accepted workload connections. A workload may
+	// half-close its request side and keep reading a streamed response; the
+	// kernel answers keepalive probes for it. A workload that is really gone
+	// cannot answer, which is the only way TCP can reveal a full close after
+	// the peer's FIN.
+	keepAlive    net.KeepAliveConfig
+	pollInterval time.Duration
+	mu           sync.Mutex
+	closed       bool
+	conns        map[apiStream]struct{}
+}
+
+// forwarderConfig tunes connection lifetime detection. Production uses
+// defaultForwarderConfig; tests shorten the keepalive timings.
+type forwarderConfig struct {
+	keepAlive    net.KeepAliveConfig
+	pollInterval time.Duration
+}
+
+func defaultForwarderConfig() forwarderConfig {
+	return forwarderConfig{
+		keepAlive: net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     15 * time.Second,
+			Interval: 5 * time.Second,
+			Count:    3,
+		},
+		pollInterval: 500 * time.Millisecond,
+	}
 }
 
 // startForwarder binds the requested IPv4 address, including port 0 in tests.
 func startForwarder(name, address string, dial func() (apiStream, error)) (*apiForwarder, error) {
+	return startForwarderConfig(name, address, dial, defaultForwarderConfig())
+}
+
+func startForwarderConfig(name, address string, dial func() (apiStream, error), cfg forwarderConfig) (*apiForwarder, error) {
 	l, err := net.Listen("tcp4", address)
 	if err != nil {
 		return nil, err
 	}
-	p := &apiForwarder{name: name, listener: l, dial: dial, conns: map[apiStream]struct{}{}}
+	p := &apiForwarder{
+		name: name, listener: l, dial: dial, conns: map[apiStream]struct{}{},
+		keepAlive: cfg.keepAlive, pollInterval: cfg.pollInterval,
+	}
+	if p.pollInterval <= 0 {
+		p.pollInterval = 500 * time.Millisecond
+	}
 	go p.serve()
 	return p, nil
 }
@@ -56,6 +93,9 @@ func (p *apiForwarder) serve() {
 			return
 		}
 		c := conn.(*net.TCPConn)
+		// Best effort: if keepalive cannot be configured an abandoned idle
+		// stream may outlive its workload, but forwarding still works.
+		_ = c.SetKeepAliveConfig(p.keepAlive)
 		if !p.track(c) {
 			c.Close()
 			return
@@ -93,25 +133,89 @@ func (p *apiForwarder) forward(client apiStream) {
 		return
 	}
 	defer p.release(host)
-	pump := func(dst, src apiStream) {
-		_, err := io.Copy(dst, src)
+
+	responseDone := make(chan struct{})
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		_, err := io.Copy(host, client)
 		if err == nil {
-			err = dst.CloseWrite()
+			err = host.CloseWrite()
 		}
 		if err != nil {
 			// An error must also wake the other copy, which may be waiting
 			// indefinitely on a watch or upgraded stream.
 			client.Close()
 			host.Close()
+			return
+		}
+		// The client's request direction is complete. Keep the host open so
+		// a half-closed client can still read the response, but do not hold
+		// it forever: a full close after a half-close sends no further TCP
+		// segment, so only keepalive can notice that the client is gone.
+		if p.clientGone(client, responseDone) {
+			client.Close()
+			host.Close()
+		}
+	}()
+	_, err = io.Copy(client, host)
+	if err == nil {
+		err = client.CloseWrite()
+	}
+	if err != nil {
+		client.Close()
+		host.Close()
+	}
+	close(responseDone)
+	<-requestDone
+}
+
+// clientGone waits until the peer of conn is fully gone. done reports that the
+// response direction finished, after which there is nothing left to protect.
+//
+// It must only be called after the request direction reached EOF and the host
+// write side was half-closed. A client that only half-closed is still reading
+// the response and answers keepalive probes, so its socket stays healthy. A
+// client that fully closed has no process to answer them, so the kernel marks
+// this socket with an error once the peer's orphaned FIN_WAIT2 socket expires
+// (tcp_fin_timeout) and the next probe fails. That bounds an abandoned idle
+// stream instead of leaking it for the life of the VM.
+func (p *apiForwarder) clientGone(conn apiStream, done <-chan struct{}) bool {
+	ticker := time.NewTicker(p.pollInterval)
+	defer ticker.Stop()
+	for {
+		if streamGone(conn) {
+			return true
+		}
+		select {
+		case <-done:
+			return false
+		case <-ticker.C:
 		}
 	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		pump(host, client)
-	}()
-	pump(client, host)
-	<-done
+}
+
+// streamGone reports whether the kernel has marked conn as failed. POLLERR
+// covers a keepalive timeout and a reset; POLLHUP and POLLNVAL cover a socket
+// that is already closed. POLLRDHUP is deliberately ignored: it only means
+// the peer half-closed its write side, which must keep working.
+func streamGone(conn io.Closer) bool {
+	sysc, ok := conn.(syscall.Conn)
+	if !ok {
+		return false
+	}
+	raw, err := sysc.SyscallConn()
+	if err != nil {
+		return true
+	}
+	gone := false
+	err = raw.Control(func(fd uintptr) {
+		fds := []unix.PollFd{{Fd: int32(fd)}}
+		if n, _ := unix.Poll(fds, 0); n > 0 {
+			gone = fds[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0
+		}
+	})
+	return err != nil || gone
 }
 
 func (p *apiForwarder) Close() {

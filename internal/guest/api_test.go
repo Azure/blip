@@ -97,6 +97,210 @@ func TestAPIForwarderStream(t *testing.T) {
 	}
 }
 
+// testForwarderConfig shortens keepalive detection so tests do not wait for
+// the production timings.
+func testForwarderConfig() forwarderConfig {
+	return forwarderConfig{
+		keepAlive: net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     time.Second,
+			Interval: time.Second,
+			Count:    1,
+		},
+		pollInterval: 20 * time.Millisecond,
+	}
+}
+
+func forwarderConnections(p *apiForwarder) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.conns)
+}
+
+// fileHungUp reports whether the peer of an AF_UNIX socket has fully closed
+// it. POLLRDHUP alone is a half-close and must not count.
+func fileHungUp(t *testing.T, f *os.File) bool {
+	t.Helper()
+	raw, err := f.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hungUp := false
+	if err := raw.Control(func(fd uintptr) {
+		fds := []unix.PollFd{{Fd: int32(fd)}}
+		if n, _ := unix.Poll(fds, 0); n > 0 {
+			hungUp = fds[0].Revents&unix.POLLHUP != 0
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return hungUp
+}
+
+func abortOnClose(t *testing.T, conn net.Conn) {
+	t.Helper()
+	raw, err := conn.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Control(func(fd uintptr) {
+		if err := unix.SetsockoptLinger(int(fd), unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1}); err != nil {
+			t.Errorf("set SO_LINGER: %v", err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAPIForwarderFullCloseAfterHalfCloseClosesHost covers an abandoned idle
+// stream: the workload half-closes after its request, reads the headers, then
+// goes away without any further response traffic. TCP reveals that only by
+// reset or keepalive, so the forwarder must keep the host for a live
+// half-close but close it once the client socket is dead. The sidecar can then
+// cancel the upstream watch instead of holding it forever.
+func TestAPIForwarderFullCloseAfterHalfCloseClosesHost(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := &apiSocket{File: os.NewFile(uintptr(fds[0]), "host")}
+	peer := &apiSocket{File: os.NewFile(uintptr(fds[1]), "peer")}
+	defer peer.Close()
+	p, err := startForwarderConfig("Kubernetes API", "127.0.0.1:0", func() (apiStream, error) { return host, nil }, testForwarderConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	client, err := net.Dial("tcp4", p.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = peer.SetDeadline(time.Now().Add(10 * time.Second))
+
+	request := "GET /api/v1/pods?watch=true HTTP/1.1\r\nHost: kube-apiserver\r\n\r\n"
+	if _, err := io.WriteString(client, request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(peer, make([]byte, len(request))); err != nil {
+		t.Fatalf("host read request: %v", err)
+	}
+	response := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+	if _, err := io.WriteString(peer, response); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(client, make([]byte, len(response))); err != nil {
+		t.Fatalf("client read headers: %v", err)
+	}
+
+	// Half-close: the client is still reading, so the host must not be
+	// fully closed. Wait past a keepalive round so the live client's kernel
+	// is the one answering the probes.
+	if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2500 * time.Millisecond)
+	if fileHungUp(t, peer.File) {
+		t.Fatal("forwarder fully closed the host after a half-close")
+	}
+	if n := forwarderConnections(p); n != 2 {
+		t.Fatalf("forwarder tracks %d connection(s) after a half-close, want 2", n)
+	}
+
+	// The client is really gone. A reset is how the kernel reports a close
+	// that follows a half-close once probing reveals it.
+	abortOnClose(t, client)
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !fileHungUp(t, peer.File) {
+		if time.Now().After(deadline) {
+			t.Fatal("forwarder kept the host open after the client was fully gone")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for forwarderConnections(p) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("forwarder kept %d connection(s) after the client was fully gone", forwarderConnections(p))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAPIForwarderClientKeepAlive checks the liveness probe that bounds an
+// abandoned idle stream. Only keepalive can reveal a full close that follows
+// a half-close, so the accepted workload connection must carry short timings
+// rather than the system defaults.
+func TestAPIForwarderClientKeepAlive(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := &apiSocket{File: os.NewFile(uintptr(fds[0]), "host")}
+	peer := &apiSocket{File: os.NewFile(uintptr(fds[1]), "peer")}
+	defer peer.Close()
+	p, err := startForwarder("Kubernetes API", "127.0.0.1:0", func() (apiStream, error) { return host, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	client, err := net.Dial("tcp4", p.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(client, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(peer, make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+
+	var accepted *net.TCPConn
+	deadline := time.Now().Add(5 * time.Second)
+	for accepted == nil && time.Now().Before(deadline) {
+		p.mu.Lock()
+		for conn := range p.conns {
+			if tc, ok := conn.(*net.TCPConn); ok {
+				accepted = tc
+				break
+			}
+		}
+		p.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if accepted == nil {
+		t.Fatal("forwarder did not accept the client connection")
+	}
+
+	want := defaultForwarderConfig().keepAlive
+	raw, err := accepted.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Control(func(fd uintptr) {
+		check := func(name string, level, opt, expected int) {
+			got, err := unix.GetsockoptInt(int(fd), level, opt)
+			if err != nil {
+				t.Errorf("get %s: %v", name, err)
+			} else if got != expected {
+				t.Errorf("%s = %d, want %d", name, got, expected)
+			}
+		}
+		check("SO_KEEPALIVE", unix.SOL_SOCKET, unix.SO_KEEPALIVE, 1)
+		check("TCP_KEEPIDLE", unix.IPPROTO_TCP, unix.TCP_KEEPIDLE, int(want.Idle/time.Second))
+		check("TCP_KEEPINTVL", unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, int(want.Interval/time.Second))
+		check("TCP_KEEPCNT", unix.IPPROTO_TCP, unix.TCP_KEEPCNT, want.Count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAPIForwarderFailureBlocksClaim(t *testing.T) {
 	g := &Guest{kubeNamespace: "sandbox"}
 	claim := wire.Claim{ID: "root"}
