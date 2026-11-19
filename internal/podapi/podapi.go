@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"time"
 
 	"github.com/Azure/blip/internal/atomicfile"
 	"github.com/Azure/blip/internal/netpolicy"
@@ -50,13 +49,6 @@ const (
 	VsockSocket = "vsock/vsock.sock"
 	APISocket   = "ch-api.sock"
 
-	// ReportEnv names the guest loopback report endpoint. A workload POSTs
-	// bounded UTF-8 text here to publish progress into Blip status.
-	ReportEnv = "BLIP_REPORT_URL"
-	// ReportURL is the fixed guest loopback report endpoint.
-	ReportURL = "http://blip/report"
-	// MaxReportBytes bounds one report body.
-	MaxReportBytes = 1024
 )
 
 // Desired is written by the node agent.
@@ -75,6 +67,9 @@ type Desired struct {
 	// filesystems the guest should keep frozen (FIFREEZE) so the host can
 	// snapshot them consistently. The guest thaws on its own after 30s.
 	Freeze []string `json:"freeze,omitempty"`
+	// StopReason labels the exit when Stop is set by the node agent itself,
+	// for example "Idle". It is empty for user and deadline stops.
+	StopReason string `json:"stopReason,omitempty"`
 }
 
 // Claim turns a vacant VM into a running blip.
@@ -84,13 +79,9 @@ type Claim struct {
 	Root     Disk   `json:"root"`
 	// Command is the required primary command.
 	Command    []string `json:"command,omitempty"`
-	TTY        bool     `json:"tty,omitempty"`
 	Env        []string `json:"env,omitempty"` // KEY=VALUE, image env first
 	WorkingDir string   `json:"workingDir,omitempty"`
 	User       string   `json:"user,omitempty"`
-	// WaitForClient holds the command's output until a client attaches, so a
-	// fast command cannot outrun a caller that is about to connect.
-	WaitForClient bool `json:"waitForClient,omitempty"`
 }
 
 // Disk is a block device for the VM. Device is a path inside the vm
@@ -139,24 +130,12 @@ type Observed struct {
 	// Mounts reports every auxiliary disk the runtime still tracks,
 	// including detached ones until the node removes them from Desired.
 	Mounts []DiskStatus `json:"mounts,omitempty"`
-	// Sessions is the number of attached sessions.
-	Sessions int `json:"sessions,omitempty"`
 	// Exit is set when the primary command exited or the guest stopped.
 	Exit *Exit `json:"exit,omitempty"`
 	// Error describes a fatal runtime or guest failure.
 	Error string `json:"error,omitempty"`
 	// Frozen lists the disk IDs from Desired.Freeze that are frozen now.
 	Frozen []string `json:"frozen,omitempty"`
-	// Report is the last report the workload submitted through the guest's
-	// loopback report endpoint.
-	Report *Report `json:"report,omitempty"`
-}
-
-// Report is a bounded string a workload submitted while it ran.
-type Report struct {
-	Seq  uint64    `json:"seq"`
-	Text string    `json:"text"`
-	Time time.Time `json:"time"`
 }
 
 type DiskStatus struct {

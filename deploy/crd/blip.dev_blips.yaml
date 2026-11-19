@@ -86,6 +86,17 @@ spec:
                   - name
                   type: object
                 type: array
+              idleTimeoutSeconds:
+                description: |-
+                  IdleTimeoutSeconds stops a blip whose command has produced no input or
+                  output for this long. It is a backstop for interactive agents, not a
+                  deadline: `blip run` leaves it unset and relies on
+                  activeDeadlineSeconds. The exit reason is Idle, which is treated like
+                  Stopped (the root is saved and the blip succeeds).
+                format: int64
+                maximum: 9223372036
+                minimum: 1
+                type: integer
               network:
                 description: |-
                   Network narrows the pool's egress policy. Omitted inherits the root
@@ -366,9 +377,6 @@ spec:
                 maximum: 2147483647
                 minimum: 0
                 type: integer
-              tty:
-                description: TTY gives the primary command a terminal.
-                type: boolean
               user:
                 type: string
                 x-kubernetes-validations:
@@ -396,8 +404,6 @@ spec:
             - message: user is immutable
               rule: (has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user
                 == oldSelf.user)
-            - message: tty is immutable
-              rule: (has(self.tty) && self.tty) == (has(oldSelf.tty) && oldSelf.tty)
           status:
             properties:
               exitCode:
@@ -503,14 +509,6 @@ spec:
                 x-kubernetes-list-type: map
               node:
                 type: string
-              output:
-                description: |-
-                  Output is the tail of the command output recovered from the VM serial
-                  console when the Blip finishes. It lets gather -f show a command that
-                  ended before the client could attach. It is bounded and may be empty
-                  if the pod log was unavailable.
-                maxLength: 65536
-                type: string
               phase:
                 description: |-
                   Phase is one of the documented Blip phases. An unknown value is
@@ -529,25 +527,6 @@ spec:
                 type: string
               reason:
                 type: string
-              report:
-                description: |-
-                  Report is the last report the workload submitted through
-                  BLIP_REPORT_URL. It is retained after the pod is gone.
-                properties:
-                  seq:
-                    format: int64
-                    minimum: 1
-                    type: integer
-                  text:
-                    maxLength: 1024
-                    type: string
-                  time:
-                    format: date-time
-                    type: string
-                required:
-                - seq
-                - text
-                type: object
               rootAttachmentID:
                 description: RootAttachmentID is the writer attachment of a durable
                   root.
@@ -558,12 +537,6 @@ spec:
                   it. A root that disappears after that was deleted; it is never
                   recreated for this Blip, so waiting for it cannot succeed.
                 type: string
-              sessions:
-                description: Sessions is the number of attached sessions.
-                format: int32
-                maximum: 2147483647
-                minimum: 0
-                type: integer
               startTime:
                 format: date-time
                 type: string

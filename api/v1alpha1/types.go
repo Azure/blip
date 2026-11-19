@@ -192,6 +192,14 @@ type BlipStateSpec struct {
 	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="size must be greater than 0"
 	// +kubebuilder:validation:XValidation:rule="type(self) == string ? !quantity(self).isGreaterThan(quantity('1Ti')) : self <= 1099511627776",message="size must be at most 1Ti"
 	Size *resource.Quantity `json:"size,omitempty"`
+	// StreamSize is the size of the trajectory ring that stores the blip's
+	// input and output after its filesystem. It defaults to 64Mi and is
+	// immutable. Copies inherit the source's ring size, so forked blips see
+	// the parent's conversation.
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="streamSize must be greater than 0"
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? !quantity(self).isGreaterThan(quantity('1Gi')) : self <= 1073741824",message="streamSize must be at most 1Gi"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="streamSize is immutable"
+	StreamSize *resource.Quantity `json:"streamSize,omitempty"`
 	// Replicas is the number of nodes that hold every committed version.
 	// Default 3. Must not be set for image states.
 	// +kubebuilder:validation:Minimum=1
@@ -220,6 +228,12 @@ type BlipStateSpec struct {
 	// Blip execution overrides take precedence.
 	Runtime *RuntimeDefaults `json:"runtime,omitempty"`
 }
+
+// DefaultStreamSize is the default trajectory ring size.
+const DefaultStreamSize int64 = 64 << 20
+
+// MaxStreamSizeBytes is the largest accepted trajectory ring.
+const MaxStreamSizeBytes int64 = 1 << 30
 
 // MaxStateSizeBytes is the largest filesystem size a BlipState accepts. It
 // must be small enough that a node can provision it: an accepted state that
@@ -533,7 +547,6 @@ type RuntimeDefaults struct {
 // +kubebuilder:validation:XValidation:rule="(has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env == oldSelf.env)",message="env is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.workingDir) == has(oldSelf.workingDir)) && (!has(self.workingDir) || self.workingDir == oldSelf.workingDir)",message="workingDir is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user == oldSelf.user)",message="user is immutable"
-// +kubebuilder:validation:XValidation:rule="(has(self.tty) && self.tty) == (has(oldSelf.tty) && oldSelf.tty)",message="tty is immutable"
 type BlipSpec struct {
 	// Pool names a BlipPool in the blip's namespace.
 	// +kubebuilder:default=default
@@ -558,8 +571,15 @@ type BlipSpec struct {
 	WorkingDir string `json:"workingDir,omitempty"`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="user is immutable"
 	User string `json:"user,omitempty"`
-	// TTY gives the primary command a terminal.
-	TTY bool `json:"tty,omitempty"`
+	// IdleTimeoutSeconds stops a blip whose command has produced no input or
+	// output for this long. It is a backstop for interactive agents, not a
+	// deadline: `blip run` leaves it unset and relies on
+	// activeDeadlineSeconds. The exit reason is Idle, which is treated like
+	// Stopped (the root is saved and the blip succeeds).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9223372036
+	// +optional
+	IdleTimeoutSeconds *int64 `json:"idleTimeoutSeconds,omitempty"`
 	// Stop asks the blip to shut down gracefully and save.
 	Stop bool `json:"stop,omitempty"`
 	// ActiveDeadlineSeconds stops the blip's command when it has run this
@@ -656,10 +676,6 @@ type BlipStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=2147483647
 	ExitCode *int32 `json:"exitCode,omitempty"`
-	// Sessions is the number of attached sessions.
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=2147483647
-	Sessions int32 `json:"sessions,omitempty"`
 	// +listType=map
 	// +listMapKey=state
 	Mounts []MountStatus `json:"mounts,omitempty"`
@@ -667,25 +683,6 @@ type BlipStatus struct {
 	// boots a VM pinned to that node so the Blip does not start on a
 	// remote clone.
 	Locality *Locality `json:"locality,omitempty"`
-	// Report is the last report the workload submitted through
-	// BLIP_REPORT_URL. It is retained after the pod is gone.
-	Report *BlipReport `json:"report,omitempty"`
-	// Output is the tail of the command output recovered from the VM serial
-	// console when the Blip finishes. It lets gather -f show a command that
-	// ended before the client could attach. It is bounded and may be empty
-	// if the pod log was unavailable.
-	// +kubebuilder:validation:MaxLength=65536
-	Output string `json:"output,omitempty"`
-}
-
-// BlipReport is one bounded progress or result string published by a
-// workload. Seq increases for every accepted report and never decreases.
-type BlipReport struct {
-	// +kubebuilder:validation:Minimum=1
-	Seq int64 `json:"seq"`
-	// +kubebuilder:validation:MaxLength=1024
-	Text string       `json:"text"`
-	Time *metav1.Time `json:"time,omitempty"`
 }
 
 // Locality records the node a pending Blip prefers and whether it still

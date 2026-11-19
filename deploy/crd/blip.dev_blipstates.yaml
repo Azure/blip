@@ -525,6 +525,26 @@ spec:
                 - message: size must be at most 1Ti
                   rule: 'type(self) == string ? !quantity(self).isGreaterThan(quantity(''1Ti''))
                     : self <= 1099511627776'
+              streamSize:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  StreamSize is the size of the trajectory ring that stores the blip's
+                  input and output after its filesystem. It defaults to 64Mi and is
+                  immutable. Copies inherit the source's ring size, so forked blips see
+                  the parent's conversation.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: streamSize must be greater than 0
+                  rule: 'type(self) == string ? quantity(self).isGreaterThan(quantity(''0''))
+                    : self > 0'
+                - message: streamSize must be at most 1Gi
+                  rule: 'type(self) == string ? !quantity(self).isGreaterThan(quantity(''1Gi''))
+                    : self <= 1073741824'
+                - message: streamSize is immutable
+                  rule: self == oldSelf
             type: object
             x-kubernetes-validations:
             - message: set at most one of image and copyFrom

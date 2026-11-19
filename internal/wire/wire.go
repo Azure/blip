@@ -7,7 +7,7 @@
 // one JSON object. There are two guest ports:
 //
 //   - ControlPort: the in-pod runtime only (claim, mounts, shutdown).
-//   - SessionPort: command and exec sessions.
+//   - StdioPort: the node agent, which owns the command's stdin and output.
 //
 // EndpointPort is a host listener for the guest's loopback HTTP proxy. The
 // guest forwards raw bytes to it; the sidecar routes each request by Host to
@@ -35,7 +35,7 @@ import (
 const (
 	Version             = 1
 	ControlPort         = 1024
-	SessionPort         = 1025
+	StdioPort           = 1026
 	EndpointPort uint32 = 1027
 	// MaxFrame bounds one frame payload.
 	MaxFrame = 1 << 20
@@ -64,11 +64,9 @@ const (
 	TClaimResult   Type = 2 // Result
 	TMountResult   Type = 3 // Result
 	TUnmountResult Type = 4 // Result
-	TStatus        Type = 5 // Status
 	TExit          Type = 6 // Exit: primary command exited; guest is shutting down
 	TShutdownDone  Type = 7 // ShutdownDone: sent right before power off
 	TFreezeResult  Type = 8 // FreezeResult: answers Freeze and Thaw, or reports a timed-out thaw
-	TReport        Type = 9 // Report: a bounded progress/result string from the guest
 
 	// Control: host -> guest
 	TClaim    Type = 20 // Claim
@@ -79,17 +77,15 @@ const (
 	TThaw     Type = 26 // Freeze
 	// 27 is reserved for the removed service account token message.
 
-	// Session
-	TOpen     Type = 40 // client -> guest: Open
-	TOpened   Type = 41 // guest -> client: Opened
-	TStdin    Type = 42 // client -> guest: raw bytes
-	TStdinEOF Type = 43 // client -> guest: {}
-	TResize   Type = 44 // client -> guest: Resize
-	TSignal   Type = 45 // client -> guest: Signal
-	TStdout   Type = 46 // guest -> client: raw bytes
-	TStderr   Type = 47 // guest -> client: raw bytes
-	TExited   Type = 48 // guest -> client: Exit
-	TNotice   Type = 49 // guest -> client: Notice (e.g. replay gap)
+	// Stdio: commands and events for the primary command.
+	TStdin       Type = 42 // host -> guest: raw bytes
+	TStdinEOF    Type = 43 // host -> guest: {}
+	TStdout      Type = 46 // guest -> host: offset + raw bytes
+	TStderr      Type = 47 // guest -> host: offset + raw bytes
+	TExited      Type = 48 // guest -> host: Exit
+	TStdioHello  Type = 50 // guest -> host: StdioHello
+	TStdioResume Type = 51 // host -> guest: StdioResume
+	TStdioGap    Type = 52 // guest -> host: StdioGap
 )
 
 // ---- control payloads ----
@@ -102,17 +98,6 @@ type Hello struct {
 	Mounts  []string `json:"mounts,omitempty"` // IDs of mounted disks
 	Frozen  []string `json:"frozen,omitempty"` // IDs of frozen disks
 	Exit    *Exit    `json:"exit,omitempty"`
-	// Report is the last report the guest accepted, so a reconnecting
-	// runtime does not lose it.
-	Report *Report `json:"report,omitempty"`
-}
-
-// Report is one bounded string a workload submitted to the guest's loopback
-// report endpoint. Seq increases by one for every accepted report.
-type Report struct {
-	Seq  uint64    `json:"seq"`
-	Text string    `json:"text"`
-	Time time.Time `json:"time"`
 }
 
 type Claim struct {
@@ -120,14 +105,9 @@ type Claim struct {
 	Serial     string   `json:"serial"` // root disk serial
 	Hostname   string   `json:"hostname"`
 	Command    []string `json:"command,omitempty"`
-	TTY        bool     `json:"tty,omitempty"`
 	Env        []string `json:"env,omitempty"`
 	WorkingDir string   `json:"workingDir,omitempty"`
 	User       string   `json:"user,omitempty"`
-	// WaitForClient asks the guest to hold the command's output until a
-	// client attaches. Without it the pumps start immediately, so a fast
-	// command can overflow the replay ring before the caller connects.
-	WaitForClient bool `json:"waitForClient,omitempty"`
 	// Mounts are mounted before Command starts. The guest answers each with
 	// a TMountResult; if one fails, Command does not run.
 	Mounts []Mount `json:"mounts,omitempty"`
@@ -168,10 +148,6 @@ type Result struct {
 	Error string `json:"error,omitempty"`
 }
 
-type Status struct {
-	Sessions int `json:"sessions"`
-}
-
 // Exit reasons shared by the guest, the runtime, and their clients. The
 // controller compares the same strings when it interprets Blip status.
 const (
@@ -181,6 +157,8 @@ const (
 	ReasonStopped = "Stopped"
 	// ReasonGuestCrashed marks a VM that exited without a shutdown request.
 	ReasonGuestCrashed = "GuestCrashed"
+	// ReasonIdle marks a command stopped by its idle timeout.
+	ReasonIdle = "Idle"
 )
 
 type Exit struct {
@@ -197,58 +175,43 @@ type ShutdownDone struct {
 	Error string `json:"error,omitempty"`
 }
 
-// ---- session payloads ----
+// ---- stdio payloads ----
 
-const (
-	// OpenExec starts a new session.
-	OpenExec = "exec"
-	// OpenAttach joins an existing session (Session empty = primary).
-	OpenAttach = "attach"
-)
-
-// PrimarySession is the ID of the claim's primary command session.
-const PrimarySession = "main"
-
-type Open struct {
-	Mode       string   `json:"mode"`
-	Session    string   `json:"session,omitempty"`
-	Argv       []string `json:"argv,omitempty"` // empty = login shell
-	Env        []string `json:"env,omitempty"`
-	WorkingDir string   `json:"workingDir,omitempty"`
-	User       string   `json:"user,omitempty"`
-	TTY        bool     `json:"tty,omitempty"`
-	Rows       uint16   `json:"rows,omitempty"`
-	Cols       uint16   `json:"cols,omitempty"`
-	// OpenID identifies one logical exec/attach attempt. A client that
-	// retries after a transport failure reuses it so the guest can attach to
-	// a session it may already have started instead of running the command
-	// twice. Old clients leave it empty, which preserves the old behavior.
-	OpenID string `json:"openID,omitempty"`
-	// Follow tails the session without holding it open: the client receives
-	// retained output but never pins the replay ring or blocks the command.
-	Follow bool `json:"follow,omitempty"`
+// StdioHello is the first frame the guest sends on the stdio port.
+type StdioHello struct {
+	// Exit is set when the primary command has already exited.
+	Exit *Exit `json:"exit,omitempty"`
 }
 
-type Opened struct {
-	Session string `json:"session,omitempty"`
-	TTY     bool   `json:"tty,omitempty"`
-	Error   string `json:"error,omitempty"`
-	// Code is the conventional exit status of a command that could not be
-	// started (126 or 127). Zero for errors that are not start failures.
-	Code int `json:"code,omitempty"`
+// StdioResume asks the guest to resend output after the given offsets. The
+// guest answers with TStdout/TStderr frames starting there, or with
+// TStdioGap when the requested data is no longer buffered.
+type StdioResume struct {
+	Out uint64 `json:"out"`
+	Err uint64 `json:"err"`
 }
 
-type Resize struct {
-	Rows uint16 `json:"rows"`
-	Cols uint16 `json:"cols"`
+// StdioGap reports the first offsets the guest can still resend.
+type StdioGap struct {
+	Out uint64 `json:"out"`
+	Err uint64 `json:"err"`
 }
 
-type Signal struct {
-	Name string `json:"name"` // e.g. "HUP", "INT", "TERM", "KILL"
+// EncodeData encodes a stdout/stderr frame: an 8-byte big-endian offset
+// followed by the raw bytes.
+func EncodeData(off uint64, data []byte) []byte {
+	b := make([]byte, 8+len(data))
+	binary.BigEndian.PutUint64(b, off)
+	copy(b[8:], data)
+	return b
 }
 
-type Notice struct {
-	Message string `json:"message"`
+// DecodeData splits a stdout/stderr frame.
+func DecodeData(payload []byte) (uint64, []byte, error) {
+	if len(payload) < 8 {
+		return 0, nil, errors.New("stdio frame too short")
+	}
+	return binary.BigEndian.Uint64(payload), payload[8:], nil
 }
 
 // ---- codec ----
