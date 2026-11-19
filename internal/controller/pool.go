@@ -235,7 +235,7 @@ func (r *PoolReconciler) poolRequests(ctx context.Context, namespace string) []r
 }
 
 func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (reconcile.Result, error) {
-	if err := syncVMOwners(ctx, r.Client, rq.Namespace); err != nil {
+	if err := syncVMOwnersEvents(ctx, r.Client, rq.Namespace, r.Recorder); err != nil {
 		return reconcile.Result{}, err
 	}
 	pool := &v1.BlipPool{}

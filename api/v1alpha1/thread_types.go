@@ -147,6 +147,12 @@ type ThreadTask struct {
 // +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.pool`
 // +kubebuilder:printcolumn:name="Seq",type=integer,JSONPath=`.status.lastSeq`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+//
+// The controller records each thread as "thread.<name>" in the VM owner
+// ConfigMap, whose keys are limited to 253 characters. Reject a name that
+// cannot be represented there: one such thread used to make the whole table
+// patch invalid and stop every pool in the namespace from reconciling.
+// +kubebuilder:validation:XValidation:rule="!has(self.metadata) || !has(self.metadata.name) || self.metadata.name.size() <= 246",message="thread names must be at most 246 characters to fit the VM owner table"
 type BlipThread struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -185,9 +191,11 @@ const (
 type BlipTurnSpec struct {
 	// Thread is the name of a BlipThread in the same namespace. It must be a
 	// valid thread (DNS subdomain) name so a typo cannot create a turn that
-	// no thread can ever claim.
+	// no thread can ever claim. It is capped below the generic 253-character
+	// DNS limit so the corresponding "thread.<name>" key in the VM owner
+	// ConfigMap fits the 253-character key limit.
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:MaxLength=246
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	Thread string     `json:"thread"`
 	Author TurnAuthor `json:"author"`

@@ -637,6 +637,47 @@ func TestInt32FieldsBounded(t *testing.T) {
 	}
 }
 
+// ownerTableDNSName returns a valid DNS-subdomain name of exactly n
+// characters, as a BlipThread name or service account name would be.
+func ownerTableDNSName(n int) string {
+	var s string
+	for len(s) < n {
+		if s != "" {
+			s += "."
+		}
+		s += strings.Repeat("a", min(63, n-len(s)))
+	}
+	return s
+}
+
+// TestBlipThreadNameFitsOwnerTable guards that admission rejects a thread
+// name that cannot be stored as a 253-character ConfigMap key. An accepted
+// 247-character name used to invalidate the whole blip-vm-owners patch and
+// stop every pool in the namespace from reconciling.
+func TestBlipThreadNameFitsOwnerTable(t *testing.T) {
+	root := loadCRDRoot(t, "../../deploy/crd/blip.dev_blipthreads.yaml")
+	const want = "!has(self.metadata) || !has(self.metadata.name) || self.metadata.name.size() <= 246"
+	if got := ruleFor(t, root.XValidations, "thread names must be at most 246 characters to fit the VM owner table"); got != want {
+		t.Errorf("thread name rule %q, want %q", got, want)
+	}
+
+	validate := admissionValidator(t, "blipthreads")
+	for _, n := range []int{1, 63, 64, 246} {
+		name := ownerTableDNSName(n)
+		object := fmt.Sprintf(`{"metadata":{"name":%q},"spec":{"pool":"p"}}`, name)
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected %d-character thread name: %v", n, errs.ToAggregate())
+		}
+	}
+	for _, n := range []int{247, 253} {
+		name := ownerTableDNSName(n)
+		object := fmt.Sprintf(`{"metadata":{"name":%q},"spec":{"pool":"p"}}`, name)
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted %d-character thread name %q", n, name)
+		}
+	}
+}
+
 // TestInt32AdmissionBoundaries proves admission rejects one past int32 max and
 // still accepts the exact maximum.
 func TestInt32AdmissionBoundaries(t *testing.T) {
@@ -806,5 +847,57 @@ func TestReferenceNamesValidated(t *testing.T) {
 		if errs := thread(`{"spec":`+spec+`}`, ""); len(errs) != 0 {
 			t.Errorf("rejected valid thread spec %s: %v", spec, errs.ToAggregate())
 		}
+	}
+}
+
+// TestBlipPoolServiceAccountNameFitsOwnerTable guards the same limit on the
+// "sa.<name>" key. The field has no DNS pattern, so without a cap a 251-byte
+// name was accepted and wedged the owner table.
+func TestBlipPoolServiceAccountNameFitsOwnerTable(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blippools.yaml")
+	sa, ok := spec.Properties["serviceAccountName"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.serviceAccountName property")
+	}
+	if sa.MaxLength != 250 {
+		t.Errorf("spec.serviceAccountName maxLength = %d, want 250", sa.MaxLength)
+	}
+
+	validate := admissionValidator(t, "blippools")
+	for _, n := range []int{0, 63, 250} {
+		name := ownerTableDNSName(n)
+		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"a":"b"},"serviceAccountName":%q}}`, name)
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected %d-character service account name: %v", n, errs.ToAggregate())
+		}
+	}
+	name := ownerTableDNSName(251)
+	object := fmt.Sprintf(`{"spec":{"nodeSelector":{"a":"b"},"serviceAccountName":%q}}`, name)
+	if errs := validate(object, ""); len(errs) == 0 {
+		t.Errorf("admitted 251-character service account name %q", name)
+	}
+}
+
+// TestBlipTurnThreadFitsOwnerTable guards that a turn cannot name a thread
+// that admission now rejects. The turn-owner policy looks up the raw
+// "thread.<name>" key, which does not fit for these names.
+func TestBlipTurnThreadFitsOwnerTable(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipturns.yaml")
+	thread, ok := spec.Properties["thread"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.thread property")
+	}
+	if thread.MaxLength != 246 {
+		t.Errorf("spec.thread maxLength = %d, want 246", thread.MaxLength)
+	}
+	validate := admissionValidator(t, "blipturns")
+	turn := func(name string) string {
+		return fmt.Sprintf(`{"spec":{"thread":%q,"author":{"kind":"ServiceAccount","name":"ci"}}}`, name)
+	}
+	if errs := validate(turn(ownerTableDNSName(246)), ""); len(errs) != 0 {
+		t.Errorf("rejected 246-character thread: %v", errs.ToAggregate())
+	}
+	if errs := validate(turn(ownerTableDNSName(247)), ""); len(errs) == 0 {
+		t.Error("admitted a turn for a 247-character thread")
 	}
 }

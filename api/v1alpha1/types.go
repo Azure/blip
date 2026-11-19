@@ -59,7 +59,10 @@ type BlipPoolSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=2147483647
 	MaxCount int32 `json:"maxCount,omitempty"`
-	// ServiceAccountName is the identity of VMs in this pool.
+	// ServiceAccountName is the identity of VMs in this pool. It is capped
+	// below the generic 253-character DNS limit so the "sa.<name>" key in the
+	// VM owner ConfigMap fits the 253-character key limit.
+	// +kubebuilder:validation:MaxLength=250
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Endpoints exposes fixed HTTPS endpoints to workloads at http://<name>/.
 	// +optional

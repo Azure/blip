@@ -9,7 +9,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -22,8 +25,9 @@ import (
 // each claimed VM pod ("-" for an unrestricted Blip). "thread.<name>" maps a
 // thread to the owner hash of its project for turn producers, and
 // "thread.<ThreadLabel(name)>" does the same for the blip.dev/thread label
-// (which is hashed for long names). "bases" lists the ownerless imported
-// states available for shared read-only use and copying.
+// (which is hashed for long names). A name too long for a ConfigMap key is
+// omitted: the missing entry keeps its VMs restricted. "bases" lists the
+// ownerless imported states available for shared read-only use and copying.
 const VMOwnersConfigMap = "blip-vm-owners"
 
 const (
@@ -32,6 +36,26 @@ const (
 	ownersBasesKey     = "bases"
 	ownerAny           = "-"
 )
+
+// ownersKey returns the table key for prefix+name and whether it is a valid
+// ConfigMap key. Names that cannot be represented cannot go in the table;
+// callers must omit the key rather than abort the whole sync.
+func ownersKey(prefix, name string) (string, bool) {
+	key := prefix + name
+	return key, len(validation.IsConfigMapKey(key)) == 0
+}
+
+// warnUnrepresentableOwnerKey publishes an Event when an owner-table key
+// cannot be stored. Skipping the key is fail-closed: the policy denies a
+// pod-bound token that cannot be matched to an owner.
+func warnUnrepresentableOwnerKey(recorder record.EventRecorder, obj runtime.Object, prefix, name string) {
+	if recorder == nil {
+		return
+	}
+	recorder.Eventf(obj, corev1.EventTypeWarning, "OwnerTableKeyUnrepresentable",
+		"cannot record %q in %s: it is not a valid ConfigMap key; VMs using it stay restricted",
+		prefix+name, VMOwnersConfigMap)
+}
 
 // blipOwner is the owner a Blip's VM acts for, or "" for an unrestricted
 // Blip. An absent pod label is what makes the VM unrestricted; the admission
@@ -84,13 +108,17 @@ func hasAPIProxyToken(p *corev1.Pod) bool {
 
 // poolsByServiceAccount maps the table key of each pool service account to
 // the sorted, space-separated names of its pools. Pools without an account
-// give their VMs no token and are not listed.
+// give their VMs no token and are not listed. A service account name too long
+// for a ConfigMap key is skipped: its VMs stay restricted by their pod entry.
 func poolsByServiceAccount(pools []v1.BlipPool) map[string]string {
 	names := map[string][]string{}
 	for i := range pools {
-		if sa := pools[i].Spec.ServiceAccountName; sa != "" {
-			names[ownersSAPrefix+sa] = append(names[ownersSAPrefix+sa], pools[i].Name)
+		sa := pools[i].Spec.ServiceAccountName
+		key, ok := ownersKey(ownersSAPrefix, sa)
+		if sa == "" || !ok {
+			continue
 		}
+		names[key] = append(names[key], pools[i].Name)
 	}
 	out := map[string]string{}
 	for k, v := range names {
@@ -141,8 +169,10 @@ func setVMOwner(ctx context.Context, c client.Client, p *corev1.Pod, b *v1.Blip)
 		if err := c.List(ctx, &pools, client.InNamespace(p.Namespace)); err != nil {
 			return err
 		}
-		names := poolsByServiceAccount(pools.Items)[ownersSAPrefix+sa]
-		patch[ownersSAPrefix+sa] = &names
+		if key, ok := ownersKey(ownersSAPrefix, sa); ok {
+			names := poolsByServiceAccount(pools.Items)[key]
+			patch[key] = &names
+		}
 	}
 	return patchVMOwners(ctx, c, p.Namespace, patch)
 }
@@ -177,7 +207,19 @@ func restoreVMOwner(ctx context.Context, c client.Client, live client.Reader, ns
 // if no pool names a service account. Vacant pods keep any entry: the cache
 // may not show a claim yet, and the claim path overwrites the entry before the
 // next claim.
+//
+// A name too long for a ConfigMap key (a legal BlipThread name can be, and a
+// pool service account name is not bounded by the API) is skipped rather than
+// making the whole patch invalid: one such object must not stop every pool in
+// the namespace from reconciling. Skipping is fail-closed because the
+// admission policy cannot match the missing entry.
 func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
+	return syncVMOwnersEvents(ctx, c, ns, nil)
+}
+
+// syncVMOwnersEvents is syncVMOwners with an optional recorder for Events
+// about owner-table keys that cannot be represented.
+func syncVMOwnersEvents(ctx context.Context, c client.Client, ns string, recorder record.EventRecorder) error {
 	var pools v1.BlipPoolList
 	if err := c.List(ctx, &pools, client.InNamespace(ns)); err != nil {
 		return err
@@ -196,6 +238,13 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 	}
 
 	want := poolsByServiceAccount(pools.Items)
+	for i := range pools.Items {
+		if sa := pools.Items[i].Spec.ServiceAccountName; sa != "" {
+			if _, ok := ownersKey(ownersSAPrefix, sa); !ok {
+				warnUnrepresentableOwnerKey(recorder, &pools.Items[i], ownersSAPrefix, sa)
+			}
+		}
+	}
 	var states v1.BlipStateList
 	if err := c.List(ctx, &states, client.InNamespace(ns)); err != nil {
 		return err
@@ -215,6 +264,8 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 	// own project without trusting labels on the turn. Keys use both the raw
 	// thread name (spec.thread on a turn) and ThreadLabel(name) (the
 	// blip.dev/thread label, which is hashed for names over 63 characters).
+	// A raw name too long for a ConfigMap key is omitted; the hashed key
+	// still authorizes Blips, and turns for it fail closed at admission.
 	var threads v1.BlipThreadList
 	if err := c.List(ctx, &threads, client.InNamespace(ns)); err != nil {
 		return err
@@ -222,16 +273,24 @@ func syncVMOwners(ctx context.Context, c client.Client, ns string) error {
 	for i := range threads.Items {
 		name := threads.Items[i].Name
 		owner := v1.ThreadOwner(ns, name)
-		want[ownersThreadPrefix+name] = owner
 		want[ownersThreadPrefix+v1.ThreadLabel(name)] = owner
+		if key, ok := ownersKey(ownersThreadPrefix, name); ok {
+			want[key] = owner
+		} else {
+			warnUnrepresentableOwnerKey(recorder, &threads.Items[i], ownersThreadPrefix, name)
+		}
 	}
 	exists := map[string]bool{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		exists[p.Name] = true
 		if sa := podServiceAccount(p); sa != "" {
-			if _, ok := want[ownersSAPrefix+sa]; !ok {
-				want[ownersSAPrefix+sa] = ""
+			if key, ok := ownersKey(ownersSAPrefix, sa); ok {
+				if _, exists := want[key]; !exists {
+					want[key] = ""
+				}
+			} else {
+				warnUnrepresentableOwnerKey(recorder, p, ownersSAPrefix, sa)
 			}
 		}
 		if b := byUID[p.Labels[v1.LabelBlipUID]]; !isVacant(p) && b != nil && b.Name == p.Annotations[v1.AnnotationBlip] {

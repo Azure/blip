@@ -27,6 +27,11 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
+        description: |-
+          The controller records each thread as "thread.<name>" in the VM owner
+          ConfigMap, whose keys are limited to 253 characters. Reject a name that
+          cannot be represented there: one such thread used to make the whole table
+          patch invalid and stop every pool in the namespace from reconciling.
         properties:
           apiVersion:
             description: |-
@@ -260,6 +265,11 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: thread names must be at most 246 characters to fit the VM owner
+            table
+          rule: '!has(self.metadata) || !has(self.metadata.name) || self.metadata.name.size()
+            <= 246'
     served: true
     storage: true
     subresources:

@@ -406,7 +406,11 @@ spec:
                 minProperties: 1
                 type: object
               serviceAccountName:
-                description: ServiceAccountName is the identity of VMs in this pool.
+                description: |-
+                  ServiceAccountName is the identity of VMs in this pool. It is capped
+                  below the generic 253-character DNS limit so the "sa.<name>" key in the
+                  VM owner ConfigMap fits the 253-character key limit.
+                maxLength: 250
                 type: string
               tolerations:
                 items:
