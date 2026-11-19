@@ -247,8 +247,8 @@ type upstreamOptions struct {
 }
 
 func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error) {
-	roots, err := certPool(cfg.caFile, cfg.caLabel, cfg.systemRoots)
-	if err != nil {
+	pool := newCAPool(cfg.caFile, cfg.caLabel, cfg.systemRoots)
+	if _, _, err := pool.current(); err != nil {
 		return nil, nil, err
 	}
 	if cfg.tokenFile != "" {
@@ -264,23 +264,42 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, network, cfg.address)
 		},
-		TLSClientConfig: &tls.Config{
-			RootCAs:    roots,
-			ServerName: cfg.serverName,
-			MinVersion: tls.VersionTLS12,
-			NextProtos: []string{"http/1.1"},
-		},
 		// Kubernetes exec/attach/port-forward require HTTP/1 upgrades.
 		TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
 		DisableCompression:    true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
-	var roundTripper http.RoundTripper = transport
+	// TLS is set up here rather than in TLSClientConfig so every handshake
+	// can use the current projected CA bundle.
+	transport.DialTLSContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		conn, err := transport.DialContext(ctx, network, cfg.address)
+		if err != nil {
+			return nil, err
+		}
+		roots, _, err := pool.current()
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		tlsConn := tls.Client(conn, &tls.Config{
+			RootCAs:    roots,
+			ServerName: cfg.serverName,
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"http/1.1"},
+		})
+		handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+	var roundTripper http.RoundTripper = &caTransport{base: transport, pool: pool}
 	if cfg.tokenFile != "" {
-		roundTripper = tokenTransport{base: transport, tokenFile: cfg.tokenFile}
+		roundTripper = tokenTransport{base: roundTripper, tokenFile: cfg.tokenFile}
 	}
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -315,26 +334,88 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error
 	return handler, transport, nil
 }
 
-func certPool(caFile, label string, systemRoots bool) (*x509.CertPool, error) {
-	if caFile == "" {
-		if !systemRoots {
-			return nil, fmt.Errorf("read %s: CA file is empty", label)
+// caPool reads the configured CA bundle on demand. A projected ConfigMap
+// volume can rotate or revoke a CA in place; the bundle is re-read whenever
+// the file's modification time or size changes, so a running sidecar does not
+// keep trusting an old CA until it restarts.
+type caPool struct {
+	caFile      string
+	label       string
+	systemRoots bool
+
+	mu      sync.Mutex
+	modTime time.Time
+	size    int64
+	gen     uint64
+	roots   *x509.CertPool
+}
+
+func newCAPool(caFile, label string, systemRoots bool) *caPool {
+	return &caPool{caFile: caFile, label: label, systemRoots: systemRoots}
+}
+
+// current returns the current root pool. The generation increases on every
+// successful reload so callers can drop connections that used an older CA.
+func (p *caPool) current() (*x509.CertPool, uint64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.caFile == "" {
+		if !p.systemRoots {
+			return nil, 0, fmt.Errorf("read %s: CA file is empty", p.label)
 		}
-		roots, err := x509.SystemCertPool()
-		if err != nil {
-			return nil, fmt.Errorf("load system certificates for %s: %w", label, err)
+		if p.roots == nil {
+			roots, err := x509.SystemCertPool()
+			if err != nil {
+				return nil, 0, fmt.Errorf("load system certificates for %s: %w", p.label, err)
+			}
+			p.roots = roots
+			p.gen++
 		}
-		return roots, nil
+		return p.roots, p.gen, nil
 	}
-	ca, err := os.ReadFile(caFile)
+	info, err := os.Stat(p.caFile)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", label, err)
+		return nil, 0, fmt.Errorf("read %s: %w", p.label, err)
+	}
+	if p.roots != nil && info.ModTime().Equal(p.modTime) && info.Size() == p.size {
+		return p.roots, p.gen, nil
+	}
+	ca, err := os.ReadFile(p.caFile)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read %s: %w", p.label, err)
 	}
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM(ca) {
-		return nil, fmt.Errorf("%s contains no certificates", label)
+		return nil, 0, fmt.Errorf("%s contains no certificates", p.label)
 	}
-	return roots, nil
+	p.roots, p.modTime, p.size = roots, info.ModTime(), info.Size()
+	p.gen++
+	return p.roots, p.gen, nil
+}
+
+// caTransport checks the CA bundle before each request and closes idle TLS
+// connections after a change, so the next request handshakes against the new
+// bundle instead of reusing a connection trusted under the old one.
+type caTransport struct {
+	base *http.Transport
+	pool *caPool
+
+	mu  sync.Mutex
+	gen uint64
+}
+
+func (t *caTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	_, gen, err := t.pool.current()
+	if err != nil {
+		return nil, err
+	}
+	t.mu.Lock()
+	if t.gen != 0 && t.gen != gen {
+		t.base.CloseIdleConnections()
+	}
+	t.gen = gen
+	t.mu.Unlock()
+	return t.base.RoundTrip(r)
 }
 
 // identityHeaderPrefixes are headers through which an authenticating front

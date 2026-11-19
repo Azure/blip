@@ -60,6 +60,16 @@ func writeFile(t *testing.T, name string, data []byte) {
 	}
 }
 
+// writeFileAt also sets a distinct mtime, so a reload test does not depend on
+// filesystem timestamp granularity.
+func writeFileAt(t *testing.T, name string, data []byte, mtime time.Time) {
+	t.Helper()
+	writeFile(t, name, data)
+	if err := os.Chtimes(name, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type runningProxy struct {
 	cfg    Config
 	client *http.Client
@@ -862,6 +872,86 @@ func TestClientCloseCancelsUpstream(t *testing.T) {
 		t.Error("upstream watch still running 1s after the guest closed the connection")
 	}
 	p.stop(t)
+}
+
+// TestProjectedCARotationAndRemoval checks that a running sidecar follows its
+// projected CA file. The upstream certificate and the CA bundle are rotated
+// together: the new CA must be trusted without a restart, and a CA removed
+// from the bundle must stop being trusted.
+func TestProjectedCARotationAndRemoval(t *testing.T) {
+	caA := newTestCA(t, "CA A")
+	caB := newTestCA(t, "CA B")
+	var served atomic.Pointer[tls.Certificate]
+	certA := caA.issue(t, "127.0.0.1")
+	served.Store(&certA)
+
+	var requests atomic.Int32
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		}),
+		ErrorLog: log.New(io.Discard, "", 0),
+	}
+	go func() {
+		_ = server.Serve(tls.NewListener(listener, &tls.Config{
+			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				return served.Load(), nil
+			},
+			MinVersion: tls.VersionTLS12,
+		}))
+	}()
+	t.Cleanup(func() { _ = server.Close() })
+
+	dir := t.TempDir()
+	cfg := Config{
+		SocketPath: filepath.Join(dir, "vsock", "api.sock"),
+		API: &API{
+			Address:   listener.Addr().String(),
+			TokenFile: filepath.Join(dir, "token"),
+			CAFile:    filepath.Join(dir, "ca.crt"),
+		},
+	}
+	writeFile(t, cfg.API.TokenFile, []byte("projected-secret\n"))
+	writeFileAt(t, cfg.API.CAFile, caA.pem, time.Unix(1, 0))
+	p := startProxy(t, cfg)
+	get := func() *http.Response {
+		t.Helper()
+		resp, err := p.client.Get("http://kube-apiserver/api")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = responseBody(t, resp)
+		return resp
+	}
+
+	if resp := get(); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("initial status = %d", resp.StatusCode)
+	}
+
+	// Rotate the upstream certificate and the projected CA together, as a
+	// CA ConfigMap rotation would. The proxy drops its idle connection when
+	// the CA file changes, so the next request handshakes with the new CA.
+	certB := caB.issue(t, "127.0.0.1")
+	served.Store(&certB)
+	writeFileAt(t, cfg.API.CAFile, caB.pem, time.Unix(2, 0))
+	if resp := get(); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status after CA rotation = %d, want the new CA to be trusted", resp.StatusCode)
+	}
+
+	// Remove the rotated CA from the bundle again. The old CA must no longer
+	// be trusted, even by the running sidecar.
+	writeFileAt(t, cfg.API.CAFile, caA.pem, time.Unix(3, 0))
+	if resp := get(); resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status after CA removal = %d, want the removed CA to be distrusted", resp.StatusCode)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("upstream requests = %d, want 2 (untrusted requests must not arrive)", got)
+	}
 }
 
 func TestStripIdentity(t *testing.T) {
