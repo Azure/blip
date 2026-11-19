@@ -103,8 +103,8 @@ func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 	}
 	toGuest := scriptChain(t, script, "to_guest")
 	for _, rule := range []string{
-		"ct state related icmp type 3 code 4 counter accept",
-		"ct state related icmp type 11 counter accept",
+		"ct state related icmp type destination-unreachable icmp code frag-needed counter accept",
+		"ct state related icmp type time-exceeded counter accept",
 	} {
 		if !strings.Contains(toGuest, rule) {
 			t.Errorf("to_guest does not admit %q:\n%s", rule, toGuest)
@@ -116,7 +116,7 @@ func TestPolicyAllowsRelatedICMPErrors(t *testing.T) {
 			t.Errorf("%s admits ICMP:\n%s", name, body)
 		}
 	}
-	for _, rule := range []string{"icmp type 8", "icmp type 0", "meta l4proto icmp"} {
+	for _, rule := range []string{"icmp type 8", "icmp type 0", "meta l4proto icmp", "icmp type 3"} {
 		if strings.Contains(script, rule) {
 			t.Errorf("script admits general ICMP with %q:\n%s", rule, script)
 		}
