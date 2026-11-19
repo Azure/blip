@@ -171,11 +171,13 @@ type BlipStateSpec struct {
 	// state starts as an empty ext4 filesystem. Image states may only be
 	// attached read-only; copy one to create a writable root.
 	Image string `json:"image,omitempty"`
-	// CopyFrom names a state in the same namespace. The copy resolves the
-	// source once: it pins the committed version current at that point, or
-	// takes a live snapshot of an active writer's disk. If the source is
-	// saving, the copy waits for that save and pins its new version. Once
-	// resolved, later source changes or deletion do not affect the copy.
+	// CopyFrom names a state in the same namespace. A copy either pins the
+	// source's committed version or, if the source has an active writer,
+	// takes a live snapshot of its disk. If the source is saving, the copy
+	// waits for that save and pins its new version. A committed copy is not
+	// affected by later source changes or deletion. A live snapshot is
+	// replanned onto the source's post-save commit if that writer stops or
+	// starts saving before the copy commits.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:MaxLength=253
 	CopyFrom string `json:"copyFrom,omitempty"`
