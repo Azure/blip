@@ -3,6 +3,7 @@ package blipchat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,12 +11,15 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -34,6 +38,11 @@ func testScheme(t *testing.T) *runtime.Scheme {
 
 func testClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
+	return testClientWith(t, interceptor.Funcs{}, objs...)
+}
+
+func testClientWith(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) client.Client {
+	t.Helper()
 	return fake.NewClientBuilder().
 		WithScheme(testScheme(t)).
 		WithObjects(objs...).
@@ -41,7 +50,22 @@ func testClient(t *testing.T, objs ...client.Object) client.Client {
 		WithIndex(&v1.BlipTurn{}, turnField, func(o client.Object) []string {
 			return []string{o.(*v1.BlipTurn).Spec.Thread}
 		}).
+		WithInterceptorFuncs(funcs).
 		Build()
+}
+
+// conflictTurns makes the next n turn status updates fail the way the API
+// server does when a producer updates the turn between our read and write.
+func conflictTurns(n *int) interceptor.Funcs {
+	return interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := obj.(*v1.BlipTurn); ok && *n > 0 {
+				*n--
+				return apierrors.NewConflict(k8sschema.GroupResource{Group: "blip.dev", Resource: "blipturns"}, obj.GetName(), errors.New("the object has been modified"))
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}
 }
 
 func testThread() *v1.BlipThread {
@@ -219,6 +243,84 @@ func TestSequencerOrdersTurns(t *testing.T) {
 	}
 	if thread.Status.LastSeq != 2 {
 		t.Errorf("lastSeq after repeat = %d, want 2", thread.Status.LastSeq)
+	}
+}
+
+// A conflict while writing the turn status must not consume a sequence
+// number: the old code advanced lastSeq first, leaving a permanent hole.
+func TestSequencerConflictDoesNotBurnSeq(t *testing.T) {
+	conflicts := 1
+	c := testClientWith(t, conflictTurns(&conflicts), testThread(), testTurn("one", "proj"))
+	s := &Sequencer{Client: c}
+	ctx := context.Background()
+	req := func(name string) ctrl.Request {
+		return ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: name}}
+	}
+	if _, err := s.Reconcile(ctx, req("one")); err != nil {
+		t.Fatal(err)
+	}
+	if conflicts != 0 {
+		t.Fatalf("test did not exercise a conflict")
+	}
+	var turn v1.BlipTurn
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "one"}, &turn); err != nil {
+		t.Fatal(err)
+	}
+	if turn.Status.Seq != 1 {
+		t.Errorf("turn seq = %d, want 1", turn.Status.Seq)
+	}
+	var thread v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "proj"}, &thread); err != nil {
+		t.Fatal(err)
+	}
+	if thread.Status.LastSeq != 1 {
+		t.Errorf("lastSeq = %d, want 1", thread.Status.LastSeq)
+	}
+}
+
+// Persistent conflicts leave the counter untouched instead of burning one
+// number per reconcile, so sequencing cannot starve under update churn.
+func TestSequencerFailedWritesDoNotAdvanceLastSeq(t *testing.T) {
+	conflicts := seqRetries
+	c := testClientWith(t, conflictTurns(&conflicts), testThread(), testTurn("one", "proj"))
+	s := &Sequencer{Client: c}
+	ctx := context.Background()
+	if _, err := s.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "one"}}); err == nil {
+		t.Fatal("expected a conflict error")
+	}
+	var thread v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "proj"}, &thread); err != nil {
+		t.Fatal(err)
+	}
+	if thread.Status.LastSeq != 0 {
+		t.Errorf("lastSeq = %d, want 0 after only conflicts", thread.Status.LastSeq)
+	}
+	var turn v1.BlipTurn
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "one"}, &turn); err != nil {
+		t.Fatal(err)
+	}
+	if turn.Status.Seq != 0 {
+		t.Errorf("turn seq = %d, want 0", turn.Status.Seq)
+	}
+}
+
+// If the counter write fails after the turn was numbered, the next reconcile
+// repairs lastSeq instead of handing out the same number again.
+func TestSequencerRepairsLaggingLastSeq(t *testing.T) {
+	turn := testTurn("one", "proj")
+	turn.Status = v1.BlipTurnStatus{Seq: 4}
+	c := testClient(t, testThread(), turn)
+	s := &Sequencer{Client: c}
+	ctx := context.Background()
+	if _, err := s.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	var thread v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "proj"}, &thread); err != nil {
+		t.Fatal(err)
+	}
+	if thread.Status.LastSeq != 4 {
+		t.Errorf("lastSeq = %d, want 4", thread.Status.LastSeq)
 	}
 }
 
