@@ -234,6 +234,9 @@ open a login shell, with a terminal when the local side has one.`,
   kubectl blip exec dev -- make test`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := a.rejectAmbiguousCommandFlags(cmd, 1, "blip exec [flags] NAME -- CMD [ARG...]"); err != nil {
+				return err
+			}
 			if err := a.scope(&args[0]); err != nil {
 				return err
 			}

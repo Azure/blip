@@ -61,6 +61,9 @@ they finish, so an abandoned fork cannot leak its workspace.`,
   blip run --name dev --from base -- sleep infinity`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := a.rejectAmbiguousCommandFlags(cmd, 0, "blip run [flags] -- CMD [ARG...]"); err != nil {
+				return err
+			}
 			f.timeoutSet = cmd.Flags().Changed("timeout")
 			f.ttlSet = cmd.Flags().Changed("ttl")
 			// A run that is interrupted before it returns must not leave a

@@ -40,6 +40,10 @@ type Env struct {
 	// Without NamespaceFile the command is never inside a blip.
 	NamespaceFile string
 	Hostname      func() (string, error)
+	// Args is the raw command line. Commands use it to notice flags that
+	// pflag parsed after a positional argument, where the user meant them
+	// for the command instead.
+	Args []string
 }
 
 // KubeFlags are the kubeconfig flags.
@@ -117,6 +121,7 @@ func connect(f KubeFlags) (*Clients, error) {
 
 type app struct {
 	env   *Env
+	args  []string
 	flags KubeFlags
 	c     *Clients
 	// self is the blip the command runs in, if any. prefix scopes the
@@ -224,7 +229,7 @@ func (a *app) progress(format string, args ...any) {
 
 // NewCommand returns the root command.
 func NewCommand(env *Env) *cobra.Command {
-	a := &app{env: env}
+	a := &app{env: env, args: env.Args}
 	root := &cobra.Command{
 		Use:         "blip",
 		Annotations: map[string]string{cobra.CommandDisplayNameAnnotation: "kubectl blip"},
@@ -257,6 +262,7 @@ shared bases. Use kubectl for everything else:
 
 // Main runs the command line and returns the process exit code.
 func Main(ctx context.Context, env *Env, args []string) int {
+	env.Args = args
 	cmd := NewCommand(env)
 	cmd.SetArgs(args)
 	err := cmd.ExecuteContext(ctx)
