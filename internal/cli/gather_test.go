@@ -251,3 +251,25 @@ func TestGatherWaitReportsActualPhase(t *testing.T) {
 		})
 	}
 }
+
+// A caller that matches its own selector must not gather itself, which would
+// otherwise wait forever or delete the running caller.
+func TestGatherSelectorExcludesCaller(t *testing.T) {
+	caller := ownedBlip("alice.box", "alice.home")
+	caller.Labels["team"] = "bulk"
+	worker := finishedBlip("alice.w1", v1alpha1.BlipSucceeded, 0)
+	worker.Labels = map[string]string{v1alpha1.LabelOwner: "alice", "team": "bulk"}
+	h := newHarness(t, caller, worker)
+	h.self = "alice.box"
+	code, out, errOut := h.run("", "gather", "-l", "team=bulk")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/w1 Succeeded")
+	if !h.gone("alice.w1") {
+		t.Fatal("matched blip kept")
+	}
+	if h.gone("alice.box") {
+		t.Fatal("caller gathered itself")
+	}
+}

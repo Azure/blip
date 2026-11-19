@@ -178,7 +178,13 @@ func (a *app) gatherTargets(ctx context.Context, c *Clients, names []string, sel
 			return nil, err
 		}
 		for i := range list.Items {
-			add(&list.Items[i])
+			b := &list.Items[i]
+			// The caller is often labelled like the blips it gathers, but it
+			// cannot wait for or delete itself.
+			if a.self != nil && b.Name == a.self.Name {
+				continue
+			}
+			add(b)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
