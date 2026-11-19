@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/session/fakeguest"
 	"github.com/Azure/blip/internal/wire"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,6 +36,14 @@ func withRetainedOutputWait(t *testing.T, d time.Duration) {
 	old := retainedOutputWait
 	retainedOutputWait = d
 	t.Cleanup(func() { retainedOutputWait = old })
+}
+
+// withTruncatedOutputWait shortens the wait after a cut-off live stream.
+func withTruncatedOutputWait(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := truncatedOutputWait
+	truncatedOutputWait = d
+	t.Cleanup(func() { truncatedOutputWait = old })
 }
 
 // setOutput writes status.output directly, like the controller does.
@@ -361,6 +371,90 @@ func TestGatherFollowReplaysFastFinishedBlip(t *testing.T) {
 	if len(opens) != 1 || opens[0].Open.Mode != wire.OpenAttach ||
 		opens[0].Open.Session != wire.PrimarySession || !opens[0].Open.Follow {
 		t.Fatalf("opens = %+v", opens)
+	}
+}
+
+// truncatedConnector serves one primary attach, writes prefix, and then drops
+// the connection without a TExited frame. That is what a follower sees when
+// the guest closes a finished primary session while the follower is still
+// backpressured and the delivery deadline expires.
+func truncatedConnector(prefix string) session.Connector {
+	return func(context.Context, string, string) (io.ReadWriteCloser, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			conn := wire.NewConn(server)
+			t, payload, err := conn.Read()
+			if err != nil || t != wire.TOpen {
+				return
+			}
+			var o wire.Open
+			if err := wire.Decode(payload, &o); err != nil {
+				return
+			}
+			_ = conn.WriteJSON(wire.TOpened, wire.Opened{Session: o.Session, TTY: o.TTY})
+			_ = conn.Write(wire.TStdout, []byte(prefix))
+		}()
+		return client, nil
+	}
+}
+
+// A follower that is cut off before TExited has printed only a prefix of the
+// command output. The controller's retained status.output still has the tail,
+// so gather -f must warn and replay it instead of silently losing it.
+func TestGatherFollowReplaysRetainedOutputAfterTruncatedStream(t *testing.T) {
+	b := finishedBlip("cut", v1alpha1.BlipSucceeded, 0)
+	b.Status.Output = "RETAINED1\nFINAL_MARKER\n"
+	h := newHarness(t, b)
+	h.connect = truncatedConnector("LIVE1\nLIVE2\n")
+
+	code, out, errOut := h.run("", "gather", "cut", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "cut| LIVE1", "cut| LIVE2", "cut| RETAINED1", "cut| FINAL_MARKER", "blip/cut Succeeded (exit 0)")
+	mustContain(t, errOut, "output stream ended before the command exited", "replayed the retained output")
+	if !h.gone("cut") {
+		t.Fatal("blip kept")
+	}
+}
+
+// The same cut with no retained output must still warn instead of looking like
+// a clean, complete follow.
+func TestGatherFollowWarnsWhenTruncatedOutputIsGone(t *testing.T) {
+	withTruncatedOutputWait(t, 50*time.Millisecond)
+	h := newHarness(t, finishedBlip("cut", v1alpha1.BlipSucceeded, 0))
+	h.connect = truncatedConnector("LIVE1\n")
+
+	code, out, errOut := h.run("", "gather", "cut", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "cut| LIVE1", "blip/cut Succeeded (exit 0)")
+	mustContain(t, errOut, "output stream ended before the command exited", "rest of the output is no longer available")
+}
+
+// A clean TExited follow is complete output, not truncation; do not replay
+// status.output or print the truncation warning.
+func TestGatherFollowDoesNotReplayAfterCleanExit(t *testing.T) {
+	b := finishedBlip("clean", v1alpha1.BlipSucceeded, 0)
+	b.Status.Output = "RETAINED1\n"
+	h := newHarness(t, b)
+	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
+		s.Stdout("LIVE1\n")
+		return wire.Exit{}
+	}
+
+	code, out, errOut := h.run("", "gather", "clean", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "clean| LIVE1", "blip/clean Succeeded (exit 0)")
+	if strings.Contains(out, "RETAINED1") {
+		t.Fatalf("clean completion replayed retained output: %q", out)
+	}
+	if strings.Contains(errOut, "output stream ended before the command exited") {
+		t.Fatalf("clean completion warned about truncation: %q", errOut)
 	}
 }
 

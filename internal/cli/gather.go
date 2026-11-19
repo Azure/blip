@@ -452,14 +452,50 @@ func (a *app) follow(ctx context.Context, name string) {
 	defer s.Close()
 	out := &prefixWriter{out: a.env.Out, prefix: short + "|"}
 	errw := &prefixWriter{out: a.env.Err, prefix: short + "|"}
-	_, _ = s.Copy(out, errw, func(m string) { a.progress("%s: %s", short, m) })
+	_, copyErr := s.Copy(out, errw, func(m string) { a.progress("%s: %s", short, m) })
 	out.flush()
 	errw.flush()
+	if copyErr != nil {
+		// The live stream ended before the guest delivered TExited, so the
+		// bytes above are only a prefix. A follower that stops reading while
+		// the command finishes is cut off when the guest closes the finished
+		// primary session at its delivery deadline; the controller's retained
+		// status.output still has the tail. Do not warn when gather itself
+		// stopped the follower (ctx is done), for example after --wait or --any.
+		if ctx.Err() == nil {
+			a.replayTruncatedOutput(ctx, name, short, pod, ending || a.blipEnding(ctx, name))
+		}
+		return
+	}
 	if !out.wrote && !errw.wrote && (ending || a.blipEnding(ctx, name)) {
 		if !a.replayLogs(ctx, pod, short) && !a.printRetained(ctx, name, short) && !a.endedWithoutOutput(ctx, name) {
 			a.progress("%s: output is no longer available", short)
 		}
 	}
+}
+
+// truncatedOutputWait bounds how long a follower waits for the controller to
+// publish status.output after its live stream was cut off. The controller
+// writes the output before it deletes the VM pod, so this only covers client
+// staleness.
+var truncatedOutputWait = 3 * time.Second
+
+// replayTruncatedOutput reports that a followed stream ended before the
+// command's exit status arrived and, when the blip is finishing, prints the
+// output the controller retained in status. Line-oriented prefixing cannot
+// resume mid-stream, so the retained print repeats any lines the follower
+// already saw. A blip that is still running may have more output, but nothing
+// available to print now, so the follower only warns.
+func (a *app) replayTruncatedOutput(ctx context.Context, name, short, pod string, ended bool) {
+	if !ended {
+		a.progress("%s: output stream ended before the command exited; output above may be incomplete", short)
+		return
+	}
+	if a.printRetainedFor(ctx, name, short, truncatedOutputWait) || a.replayLogs(ctx, pod, short) {
+		a.progress("%s: output stream ended before the command exited; replayed the retained output (lines above may repeat)", short)
+		return
+	}
+	a.progress("%s: output stream ended before the command exited; the rest of the output is no longer available", short)
 }
 
 // blipEnding reports whether the blip is saving or finished now. A follower
