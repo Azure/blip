@@ -72,6 +72,9 @@ const (
 	// inputNoticeInterval throttles the stdin-discarded warning so a flood
 	// produces one notice rather than one per dropped frame.
 	inputNoticeInterval = time.Second
+	// detachGrace is how long a detached exec command gets between SIGTERM
+	// and SIGKILL after its last client goes away.
+	detachGrace = 2 * time.Second
 )
 
 type client struct {
@@ -663,6 +666,40 @@ func (s *session) info() sessionInfo {
 	return sessionInfo{ID: s.id, Argv: s.argv, TTY: s.tty, Clients: s.clients, Exited: s.exited}
 }
 
+// signal sends sig to the command's process group, falling back to the process
+// itself. It reports whether a signal was attempted.
+func (s *session) signal(sig unix.Signal) bool {
+	p := s.proc
+	if p == nil || p.pid <= 0 {
+		return false
+	}
+	if unix.Kill(-p.pid, sig) != nil {
+		_ = unix.Kill(p.pid, sig)
+	}
+	return true
+}
+
+// terminate ends a detached exec command. Its last client is gone, so no one
+// can reach the session to signal it or ever attach to it again. The command
+// gets detachGrace to clean up before the process group is killed.
+func (s *session) terminate() {
+	s.mu.Lock()
+	running := !s.exited && s.clients == 0
+	s.mu.Unlock()
+	if !running || !s.signal(unix.SIGTERM) {
+		return
+	}
+	go func() {
+		time.Sleep(detachGrace)
+		s.mu.Lock()
+		running := !s.exited && s.clients == 0
+		s.mu.Unlock()
+		if running {
+			s.signal(unix.SIGKILL)
+		}
+	}()
+}
+
 // serve attaches a client until it disconnects or the session ends. A
 // follower receives retained and live output but is not registered as a
 // reader, so its cursor never pins the replay ring and never backpressures
@@ -693,11 +730,18 @@ func (s *session) serve(c *wire.Conn, conn io.Closer, follow bool) {
 		delete(s.readers, cl)
 		s.clearReplayLocked()
 		_, drop := sessionRetention(s.id == wire.PrimarySession, s.exited, s.attached, s.clients)
+		// Exec sessions have no way to reattach from the CLI, so a command
+		// whose last client vanished would keep running unreachable. Primary
+		// commands stay detached by design.
+		detach := s.id != wire.PrimarySession && s.clients == 0 && !s.exited
 		s.cond.Broadcast()
 		s.mu.Unlock()
 		s.g.addClients(-1)
 		if drop {
 			s.g.removeSession(s)
+		}
+		if detach {
+			s.terminate()
 		}
 	}()
 	go s.write(c, conn, cl)
@@ -810,9 +854,7 @@ func (s *session) input(t wire.Type, payload []byte) error {
 		exited := s.exited
 		s.mu.Unlock()
 		if !exited {
-			if unix.Kill(-p.pid, sig) != nil {
-				_ = unix.Kill(p.pid, sig)
-			}
+			s.signal(sig)
 		}
 	}
 	return nil

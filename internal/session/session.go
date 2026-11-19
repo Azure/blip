@@ -131,7 +131,8 @@ func (s *Session) Signal(name string) error {
 	return s.conn.WriteJSON(wire.TSignal, wire.Signal{Name: name})
 }
 
-// Close disconnects. The guest keeps the session running.
+// Close disconnects. A primary command keeps running without a client; an
+// exec command is terminated once its last client goes away.
 func (s *Session) Close() error {
 	var err error
 	s.once.Do(func() { err = s.rwc.Close() })
