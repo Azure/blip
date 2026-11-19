@@ -367,3 +367,81 @@ func TestCreateTurnDropsNegativeInReplyTo(t *testing.T) {
 		t.Errorf("stored inReplyTo = %d, want clamped to >= 0", turn.Spec.InReplyTo)
 	}
 }
+
+// MaxTasks caps the whole board, pruning the oldest closed tasks first. Open
+// tasks still count toward the cap but are never deleted.
+func TestMaxTasksCapsTotalTaskBoard(t *testing.T) {
+	t.Run("open tasks count toward the cap", func(t *testing.T) {
+		fresh := metav1.NewTime(timeNow())
+		thread := testThread()
+		thread.Spec.Retention.MaxTasks = 5
+		for i := 0; i < 5; i++ {
+			thread.Status.Tasks = append(thread.Status.Tasks, v1.ThreadTask{
+				ID: fmt.Sprintf("open%d", i), Open: true, Updated: &fresh,
+			})
+		}
+		for i := 0; i < 10; i++ {
+			thread.Status.Tasks = append(thread.Status.Tasks, v1.ThreadTask{
+				ID: fmt.Sprintf("closed%d", i), Open: false, Updated: &fresh,
+			})
+		}
+		c := testClient(t, thread)
+		s := &Server{Client: c}
+		if err := s.prune(context.Background(), thread); err != nil {
+			t.Fatal(err)
+		}
+		var updated v1.BlipThread
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(thread), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if len(updated.Status.Tasks) > 5 {
+			t.Errorf("tasks = %d (%v), want at most 5", len(updated.Status.Tasks), taskIDs(updated.Status.Tasks))
+		}
+		for _, task := range updated.Status.Tasks {
+			if !task.Open {
+				t.Errorf("closed task %s survived while the board was over its cap", task.ID)
+			}
+		}
+	})
+
+	t.Run("oldest closed task goes first", func(t *testing.T) {
+		thread := testThread()
+		thread.Spec.Retention.MaxTasks = 3
+		for i := 0; i < 4; i++ {
+			updated := metav1.NewTime(timeNow().Add(time.Duration(i) * time.Minute))
+			thread.Status.Tasks = append(thread.Status.Tasks, v1.ThreadTask{
+				ID: fmt.Sprintf("closed%d", i), Open: false, Updated: &updated,
+			})
+		}
+		fresh := metav1.NewTime(timeNow())
+		thread.Status.Tasks = append(thread.Status.Tasks, v1.ThreadTask{ID: "open", Open: true, Updated: &fresh})
+		c := testClient(t, thread)
+		s := &Server{Client: c}
+		if err := s.prune(context.Background(), thread); err != nil {
+			t.Fatal(err)
+		}
+		var updated v1.BlipThread
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(thread), &updated); err != nil {
+			t.Fatal(err)
+		}
+		got := taskIDs(updated.Status.Tasks)
+		want := []string{"closed2", "closed3", "open"}
+		if len(got) != len(want) {
+			t.Fatalf("tasks = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("tasks = %v, want %v", got, want)
+				break
+			}
+		}
+	})
+}
+
+func taskIDs(tasks []v1.ThreadTask) []string {
+	ids := make([]string, len(tasks))
+	for i, task := range tasks {
+		ids[i] = task.ID
+	}
+	return ids
+}

@@ -513,24 +513,27 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 		maxTasks = 200
 	}
 	var keptTasks []v1.ThreadTask
-	closed := 0
 	for _, t := range thread.Status.Tasks {
 		if !t.Open && t.Updated != nil && now.Sub(t.Updated.Time) > taskAge.Duration {
 			continue
 		}
 		keptTasks = append(keptTasks, t)
-		if !t.Open {
-			closed++
-		}
 	}
-	for closed > maxTasks && len(keptTasks) > 0 {
+	for len(keptTasks) > maxTasks {
+		oldest := -1
 		for i, t := range keptTasks {
-			if !t.Open {
-				keptTasks = append(keptTasks[:i], keptTasks[i+1:]...)
-				closed--
-				break
+			if t.Open {
+				continue
+			}
+			if oldest < 0 || closedTaskOlder(t, keptTasks[oldest]) {
+				oldest = i
 			}
 		}
+		if oldest < 0 {
+			// Only open tasks remain; deleting them would lose live work.
+			break
+		}
+		keptTasks = append(keptTasks[:oldest], keptTasks[oldest+1:]...)
 	}
 	if len(keptTasks) != len(thread.Status.Tasks) {
 		current := &v1.BlipThread{}
@@ -546,4 +549,16 @@ func (s *Server) prune(ctx context.Context, thread *v1.BlipThread) error {
 		thread.Status = current.Status
 	}
 	return nil
+}
+
+// closedTaskOlder reports whether a should be pruned before b. A closed task
+// without an update time is treated as the oldest.
+func closedTaskOlder(a, b v1.ThreadTask) bool {
+	if a.Updated == nil {
+		return b.Updated != nil
+	}
+	if b.Updated == nil {
+		return false
+	}
+	return a.Updated.Before(b.Updated)
 }
