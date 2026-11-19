@@ -99,9 +99,9 @@ func (v *view) workingUnneeded(vol storage.Volume, ownerPods []string, needed ma
 // keepCommit is the GC rule: a commit stays while it is the state's pending
 // commit, its committed commit on a placement (or base for a pending
 // replica), a not yet processed seal, a writer base, a read-only mount, a copy
-// source in progress, or pinned by an export lease. A commit of a state with
-// no committed version, or of a state not confirmed deleted, is kept too, so
-// a version newer than the committed one is never deleted.
+// source still needed by a live copy, or pinned by an export lease. A commit
+// of a state with no committed version, or of a state not confirmed deleted,
+// is kept too, so a version newer than the committed one is never deleted.
 func (v *view) keepCommit(c storage.Volume, sealed map[string][]v1alpha1.SealResult) bool {
 	id := c.ID
 	if v.pinned[id] {
@@ -118,7 +118,13 @@ func (v *view) keepCommit(c storage.Volume, sealed map[string][]v1alpha1.SealRes
 		}
 	}
 	for _, t := range v.states {
-		if cf := t.Status.CopiedFrom; cf != nil && cf.CommitID == id && t.Status.Committed == nil {
+		// A failed copy cannot use its source, so it must not pin the
+		// source's commit after the source is deleted. This matches the
+		// controller, which lets a failed copy release the source
+		// finalizer. A pending build can still commit, so it stays
+		// pinned.
+		if cf := t.Status.CopiedFrom; cf != nil && cf.CommitID == id && t.Status.Committed == nil &&
+			!(t.Status.Phase == v1alpha1.StateFailed && t.Status.Pending == nil) {
 			return true
 		}
 		if w := t.Status.Writer; w != nil && w.BaseCommit == id {
