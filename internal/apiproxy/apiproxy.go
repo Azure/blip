@@ -343,6 +343,8 @@ var identityHeaderPrefixes = []string{
 	"x-pomerium-",
 	"x-goog-authenticated-user-", // Google IAP and Cloud Run identity
 	"x-ms-client-principal",      // Azure Easy Auth principal and its -Name/-Id variants
+	"x-ms-token-",                // Azure AD / managed-identity access-token assertions
+	"x-amzn-oidc-",               // AWS ALB OIDC data, identity, and access-token assertions
 	"x-envoy-",                   // Envoy peer metadata and external-address assertions
 }
 
@@ -359,14 +361,22 @@ var identityHeaders = map[string]struct{}{
 	"x-client-dn":              {},
 	"x-original-user":          {},
 	"x-auth-user":              {},
+	"x-auth-email":             {},
+	"x-authenticated-user":     {},
 	"x-user":                   {},
 	"x-email":                  {},
+	"x-scope":                  {},
+	"x-userinfo":               {},
 	"x-envoy-peer-metadata":    {},
 }
 
 func stripIdentity(headers http.Header) {
 	for key := range headers {
-		name := strings.ToLower(key)
+		// Frameworks commonly expose X_Forwarded_User to applications as
+		// HTTP_X_FORWARDED_USER, so a caller can smuggle a denylisted name
+		// past an exact "-" match with underscores. Normalize separators
+		// before matching; the original key is what gets deleted.
+		name := strings.ReplaceAll(strings.ToLower(key), "_", "-")
 		if _, ok := identityHeaders[name]; ok {
 			delete(headers, key)
 			continue
