@@ -170,11 +170,11 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 // copy two blips to the same path or into overlapping trees. {name} makes
 // each destination unique.
 //
-// A destination is compared the way copyPath will use it: symlinks in the
-// existing part are resolved, and a destination that is already a directory
-// receives a file under the source's basename. Comparing the declared strings
-// alone missed both that rewrite (DEST and DEST/basename(SRC)) and a
-// directory merge spreading over everything below DEST.
+// A destination is compared with symlinks in the existing part resolved, and
+// a destination nested under another is treated as part of that tree. The
+// sources are not mounted yet, so this check cannot tell a file source from a
+// directory source; collect re-checks the effective writes against the
+// mounted sources before copying anything.
 func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) error {
 	if len(raw) == 0 {
 		return nil
@@ -210,15 +210,14 @@ func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) erro
 				}
 			}
 			dst = filepath.Clean(dst)
-			isDir := false
-			if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
-				isDir = true
-			}
 			for _, prev := range seen {
 				if prev.dest == dst {
-					// Two files with distinct basenames can share an
-					// existing directory without colliding.
-					if isDir && filepath.Base(prev.source) != filepath.Base(op.source) {
+					// Distinct basenames can share a destination. The
+					// gather check runs before any state is mounted, so it
+					// cannot tell whether a source is a directory; collect
+					// re-checks the mounted sources in order and rejects a
+					// directory merge that would overwrite a sibling.
+					if filepath.Base(prev.source) != filepath.Base(op.source) {
 						continue
 					}
 					return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, a.short(b.Name), op.source)
