@@ -109,6 +109,19 @@ func (c *cluster) bad(name string) bool {
 	return bn == nil || k == nil || bn.Spec.Drain || heartbeatAge(bn, c.now) > repairAfter
 }
 
+// liveHolder reports whether the node still exists, is recent enough to finish
+// or recover the commit it reports, and reports holding commitID. A node whose
+// Kubernetes Node is gone, or whose heartbeat has been stale past repairAfter,
+// cannot complete the save: treating it as a holder would keep the save pending
+// forever. A briefly stale holder and a healthy draining holder still count.
+func (c *cluster) liveHolder(st *v1.BlipState, name, commitID string) bool {
+	bn, k := c.nodes[name], c.k8s[name]
+	if bn == nil || k == nil || !c.holds(st, name, commitID) {
+		return false
+	}
+	return heartbeatAge(bn, c.now) <= repairAfter
+}
+
 // holds reports whether the node's current incarnation reports commitID.
 func (c *cluster) holds(st *v1.BlipState, name, commitID string) bool {
 	bn := c.nodes[name]

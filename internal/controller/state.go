@@ -894,14 +894,18 @@ func resolveFailedReplicas(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) (
 	return dropped, false
 }
 
-// saveHeld reports whether any replica or the source still holds the pending
-// commit, whether or not that node is currently usable.
+// saveHeld reports whether a node that can still finish or recover the save
+// reports holding the pending commit. A briefly stale or healthy draining
+// holder counts: a heartbeat lag is not data loss, and draining forbids new
+// placements, not completing a save. A holder that is gone from Kubernetes or
+// has been stale past repairAfter does not: it can never complete the save, so
+// keeping it as a holder would wedge the save forever.
 func saveHeld(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
-	if cl.holds(st, p.SourceNode, p.CommitID) {
+	if cl.liveHolder(st, p.SourceNode, p.CommitID) {
 		return true
 	}
 	for _, n := range p.Replicas {
-		if cl.holds(st, n, p.CommitID) {
+		if cl.liveHolder(st, n, p.CommitID) {
 			return true
 		}
 	}
