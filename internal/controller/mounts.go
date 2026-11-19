@@ -183,13 +183,14 @@ func (r *BlipReconciler) syncMounts(ctx context.Context, b *v1.Blip, mounts []v1
 			// attachment treats a deleting state as resolved so its
 			// finalizers cannot deadlock with this Blip. Never let an
 			// already-attached mount keep writing into it (and keep the
-			// state's finalizer waiting) after its owner deletes it.
-			name, err := r.deletingOwnedState(ctx, b, m.State)
+			// state's finalizer waiting) after it is deleted, whether by
+			// its owner or directly.
+			st, err := r.deletingState(ctx, b, m.State)
 			if err != nil {
 				return err
 			}
-			if name != "" {
-				msg := fmt.Sprintf("state %q was deleted by its owner while in use; the save was discarded", name)
+			if st != nil {
+				msg := discardedSave(st, b)
 				m.Phase, m.Message = v1.MountFailed, "save failed: "+msg
 				saveErrs = append(saveErrs, msg)
 				out = append(out, m)

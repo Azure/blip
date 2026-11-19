@@ -381,38 +381,52 @@ func deletedByOwner(st *v1.BlipState, b *v1.Blip) bool {
 	return true
 }
 
-// deletingOwnedState reports the state's name when another owner is deleting
-// it. That deletion removes the data, so a borrowed writer cannot save into it.
-func (r *BlipReconciler) deletingOwnedState(ctx context.Context, b *v1.Blip, name string) (string, error) {
+// deletingState returns the state while it is being deleted and b is not.
+// Any deletion of a workspace removes the data its writer would save, whether
+// it comes from an owner (a Blip or its TTL) or from a direct delete of a
+// durable, borrowed, or writable-mount state. When b itself is being deleted
+// its save is handled by the normal deletion path, not reported as discarded.
+func (r *BlipReconciler) deletingState(ctx context.Context, b *v1.Blip, name string) (*v1.BlipState, error) {
+	if b.DeletionTimestamp != nil {
+		return nil, nil
+	}
 	st := &v1.BlipState{}
 	switch err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, st); {
 	case apierrors.IsNotFound(err):
 		// A missing state is already reported as a failed save by attachment.
-		return "", nil
+		return nil, nil
 	case err != nil:
-		return "", err
-	case st.DeletionTimestamp != nil && deletedByOwner(st, b):
-		return st.Name, nil
+		return nil, err
+	case st.DeletionTimestamp != nil:
+		return st, nil
 	}
-	return "", nil
+	return nil, nil
 }
 
-// deletingOwnedMount returns the first desired writable mount whose state
-// another owner is deleting. Its disk is about to be removed while this Blip
+// discardedSave explains a save that a state deletion throws away.
+func discardedSave(st *v1.BlipState, b *v1.Blip) string {
+	if deletedByOwner(st, b) {
+		return fmt.Sprintf("state %q was deleted by its owner while in use; the save was discarded", st.Name)
+	}
+	return fmt.Sprintf("state %q was deleted while in use; the save was discarded", st.Name)
+}
+
+// deletingMount returns the first desired writable mount whose state is being
+// deleted while b is not. Its disk is about to be removed while this Blip
 // writes to it.
-func (r *BlipReconciler) deletingOwnedMount(ctx context.Context, b *v1.Blip, mounts []v1.Mount) (string, error) {
+func (r *BlipReconciler) deletingMount(ctx context.Context, b *v1.Blip, mounts []v1.Mount) (*v1.BlipState, error) {
 	seen := map[string]bool{}
 	for _, m := range mounts {
 		if !m.Writable || seen[m.State] {
 			continue
 		}
 		seen[m.State] = true
-		name, err := r.deletingOwnedState(ctx, b, m.State)
-		if err != nil || name != "" {
-			return name, err
+		st, err := r.deletingState(ctx, b, m.State)
+		if err != nil || st != nil {
+			return st, err
 		}
 	}
-	return "", nil
+	return nil, nil
 }
 
 func wait(b *v1.Blip, reason, msg string) {
@@ -1066,35 +1080,45 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 				return reconcile.Result{}, err
 			}
 			if reason != "" {
-				if reason == reasonStateDeleting && b.DeletionTimestamp == nil && root != nil && deletedByOwner(root, b) {
-					// The owner Blip (or its TTL) is removing the
-					// workspace. Its deletion also removes the data this
-					// Blip would save, so stop now and fail the save
-					// instead of reporting success for a discarded result.
+				if reason == reasonStateDeleting && b.DeletionTimestamp == nil && root != nil {
+					// The workspace is being removed, whether by its
+					// owner or directly. Its deletion also removes the
+					// data this Blip would save, so stop now and fail
+					// the save instead of reporting success for a
+					// discarded result.
 					if err := r.stop(ctx, b, reasonStateDeleting); err != nil {
 						return reconcile.Result{}, err
 					}
 					*base = *b.DeepCopy()
+					by := ""
+					if deletedByOwner(root, b) {
+						by = " by its owner"
+					}
 					b.Status.Reason, b.Status.Message = ReasonStateNotFound,
-						fmt.Sprintf("state %q is being deleted by its owner; stopping before the workspace is removed", root.Name)
+						fmt.Sprintf("state %q is being deleted%s; stopping before the workspace is removed", root.Name, by)
 					return reconcile.Result{}, nil
 				}
 				b.Status.Reason, b.Status.Message = reason, msg
 				return reconcile.Result{RequeueAfter: retryAfter}, nil
 			}
-			if name, err := r.deletingOwnedMount(ctx, b, mounts); err != nil {
+			if st, err := r.deletingMount(ctx, b, mounts); err != nil {
 				return reconcile.Result{}, err
-			} else if name != "" {
-				// The owner Blip (or its TTL) is removing a writable
-				// mount. Its deletion also removes the data this Blip is
-				// writing, so stop now and fail the save instead of
-				// reporting success for a discarded result.
+			} else if st != nil {
+				// A writable mount is being removed, whether by its
+				// owner or directly. Its deletion also removes the
+				// data this Blip is writing, so stop now and fail the
+				// save instead of reporting success for a discarded
+				// result.
 				if err := r.stop(ctx, b, reasonStateDeleting); err != nil {
 					return reconcile.Result{}, err
 				}
 				*base = *b.DeepCopy()
+				by := ""
+				if deletedByOwner(st, b) {
+					by = " by its owner"
+				}
 				b.Status.Reason, b.Status.Message = ReasonStateNotFound,
-					fmt.Sprintf("mount state %q is being deleted by its owner; stopping before the workspace is removed", name)
+					fmt.Sprintf("mount state %q is being deleted%s; stopping before the workspace is removed", st.Name, by)
 				return reconcile.Result{}, nil
 			}
 			b.Status.Reason = ""
@@ -1246,12 +1270,12 @@ func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
 				// attachment resolves a deleting state without a seal so
 				// the finalizers cannot deadlock. Report the discarded
 				// save rather than marking the doomed mount mounted.
-				name, err := r.deletingOwnedState(ctx, b, m.State)
+				st, err := r.deletingState(ctx, b, m.State)
 				if err != nil {
 					return err
 				}
-				if name != "" {
-					msg := fmt.Sprintf("state %q was deleted by its owner while in use; the save was discarded", name)
+				if st != nil {
+					msg := discardedSave(st, b)
 					m.Phase, m.Message = v1.MountFailed, "save failed: "+msg
 					if saveErr == "" {
 						saveErr = msg
@@ -1268,19 +1292,18 @@ func (r *BlipReconciler) saving(ctx context.Context, b *v1.Blip) error {
 		}
 		return nil
 	}
-	// A workspace being removed by its owner's deletion or TTL cannot keep
-	// this save. attachment deliberately treats a deleting state as resolved
-	// so the finalizer cannot deadlock with the Blip; without this check the
-	// borrower would report Succeeded for data that is about to disappear.
+	// A workspace being removed cannot keep this save, whether its deletion
+	// comes from its owner (a Blip or its TTL) or directly. attachment
+	// deliberately treats a deleting state as resolved so the finalizer
+	// cannot deadlock with the Blip; without this check the writer would
+	// report Succeeded for data that is about to disappear.
 	if b.Spec.State != "" && saveErr == "" {
-		st := &v1.BlipState{}
-		switch err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.State}, st); {
-		case apierrors.IsNotFound(err):
-			// attachment already reports a deleted state as a failed save.
-		case err != nil:
+		st, err := r.deletingState(ctx, b, b.Spec.State)
+		if err != nil {
 			return err
-		case st.DeletionTimestamp != nil && deletedByOwner(st, b):
-			saveErr = fmt.Sprintf("state %q was deleted by its owner while in use; the save was discarded", st.Name)
+		}
+		if st != nil {
+			saveErr = discardedSave(st, b)
 		}
 	}
 	// Every attachment is resolved. A writable mount still marked Saving was

@@ -785,11 +785,12 @@ func TestStateDeletionBlockedByActiveWriter(t *testing.T) {
 	}
 
 	// A deleting state does not keep the saving Blip alive: its seal can
-	// never be recorded against the state. The state keeps its finalizer
-	// until the node reports the seal, then the last save is discarded.
+	// never be recorded against the state, so the save is reported as
+	// discarded. The state keeps its finalizer until the node reports the
+	// seal, then the last save is discarded.
 	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
 	e.run(e.blip, ns, "b")
-	expectPhase(t, e.getBlip("b"), v1.BlipSucceeded, ReasonStopped)
+	expectPhase(t, e.getBlip("b"), v1.BlipFailed, ReasonSaveFailed)
 	e.run(e.state, ns, "s")
 	if st := e.getState("s"); !strings.Contains(st.Status.Message, "writer b") || len(st.Finalizers) == 0 {
 		t.Fatalf("writer released without a seal: %+v", st.Status)
@@ -832,11 +833,11 @@ func TestQueuedBlipDoesNotBlockStateDeletion(t *testing.T) {
 		t.Fatalf("deletion not blocked by the holder: %+v", st.Status)
 	}
 
-	// Stop the holder. A deleting root does not keep the saving Blip alive,
-	// so it finishes immediately; the state still waits for its writer.
+	// Stop the holder. A deleting root does not keep the saving Blip alive:
+	// the discarded save fails it; the state still waits for its writer.
 	e.observe(holder.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
 	e.run(e.blip, ns, "holder")
-	expectPhase(t, e.getBlip("holder"), v1.BlipSucceeded, ReasonStopped)
+	expectPhase(t, e.getBlip("holder"), v1.BlipFailed, ReasonSaveFailed)
 	e.run(e.state, ns, "s")
 	if st := e.getState("s"); !strings.Contains(st.Status.Message, "writer holder") || len(st.Finalizers) == 0 {
 		t.Fatalf("writer released without a seal: %+v", st.Status)
