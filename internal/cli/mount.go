@@ -1128,12 +1128,19 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	}
 	original := append([]v1alpha1.Mount(nil), root.Spec.Mounts...)
 	removed := make(map[string]bool, len(f.remove))
+	removeOrder := make([]string, 0, len(f.remove))
 	for _, arg := range f.remove {
 		state, err := a.removalState(ctx, arg, root)
 		if err != nil {
 			return err
 		}
 		removed[state] = true
+		removeOrder = append(removeOrder, state)
+	}
+	// Reject a --rm that is not mounted before applying any of the others:
+	// a typo must not leave the root without the mounts named earlier.
+	if err := a.preflightRemovals(ctx, f.root, removeOrder); err != nil {
+		return err
 	}
 	// A move is only implicit when the invocation also frees mount paths;
 	// a plain add at a second path still tells the user to unmount first.
@@ -1467,6 +1474,31 @@ func (a *app) listMounts(ctx context.Context, root string) error {
 	}
 	if printed == 0 {
 		fmt.Fprintf(a.env.Out, "state %s has no mounts\n", a.short(root))
+	}
+	return nil
+}
+
+// preflightRemovals rejects a command whose --rm names a state that is not
+// mounted, before any later removal or add has been applied. A temporary
+// collect mount may only be visible in the running writer's status, where
+// unmountState can still remove it.
+func (a *app) preflightRemovals(ctx context.Context, root string, states []string) error {
+	s, err := a.getState(ctx, root)
+	if err != nil {
+		return err
+	}
+	var b *v1alpha1.Blip
+	for _, state := range states {
+		if findSpecMount(s.Spec.Mounts, state) != nil {
+			continue
+		}
+		if b, err = a.rootWriter(ctx, s); err != nil {
+			return err
+		}
+		if b != nil && findMount(b.Status.Mounts, state) != nil {
+			continue
+		}
+		return fmt.Errorf("state %q is not mounted on root state %q", state, root)
 	}
 	return nil
 }

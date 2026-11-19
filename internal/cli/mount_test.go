@@ -2043,6 +2043,50 @@ func TestMountRemoveThenRejectedAddRestoresMount(t *testing.T) {
 	}
 }
 
+// TestMountRemoveUnmountedRejectsWholeCommand covers --rm naming a state that
+// is not mounted after an earlier --rm named one that is. The command must be
+// rejected before the first removal is applied, leaving the root untouched.
+func TestMountRemoveUnmountedRejectsWholeCommand(t *testing.T) {
+	t.Run("offline", func(t *testing.T) {
+		root := readyState("home")
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+		a := mountTestApp(t, root, readyState("data"))
+		var errOut bytes.Buffer
+		a.env.Err = &errOut
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		code := Main(ctx, a.env, []string{"mount", "--rm", "data", "--rm", "ghost", "--root", "home"})
+		if code != 1 || !strings.Contains(errOut.String(), `state "ghost" is not mounted`) {
+			t.Fatalf("code %d: %s", code, errOut.String())
+		}
+		s, err := a.getState(ctx, root.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].State != "data" {
+			t.Fatalf("rejected removal mutated the root: %+v", s.Spec.Mounts)
+		}
+	})
+
+	t.Run("running", func(t *testing.T) {
+		b := runningBlip("agent", v1alpha1.Mount{State: "data", Path: "/data", Writable: true})
+		root := readyState(b.Spec.State)
+		root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+		root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data", Writable: true}}
+		h := newHarness(t, b, root, readyState("data"))
+
+		code, _, errOut := h.run("", "mount", "--rm", "data", "--rm", "ghost", "--root", root.Name)
+		if code != 1 || !strings.Contains(errOut, `state "ghost" is not mounted`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+		mounts := h.state(root.Name).Spec.Mounts
+		if len(mounts) != 1 || mounts[0].State != "data" {
+			t.Fatalf("rejected removal mutated the root: %+v", mounts)
+		}
+	})
+}
+
 // TestMountRemoveThenRejectedNewRestoresMount is the --new counterpart: the
 // invocation removes a mount, creates and commits a state, then the guest
 // rejects its path. Rollback removes the new state but must restore the
