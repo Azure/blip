@@ -71,6 +71,37 @@ func TestDirectlyDeletedRootFailsRunningBlip(t *testing.T) {
 	}
 }
 
+// TestPendingVanishedRootFailsFast covers deleting the workspace of a Pending
+// Blip that is waiting for a VM. Once the state is fully gone, the root cannot
+// come back, so the Blip must fail at once instead of parking until the
+// pending timeout with an unrelated StartTimeout.
+func TestPendingVanishedRootFailsFast(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 0)
+	e.readyState("home", "n1")
+	e.newBlip("job", withRoot("home"))
+	e.run(e.blip, ns, "job")
+	b := e.getBlip("job")
+	expectPhase(t, b, v1.BlipPending, ReasonWaitingForVM)
+
+	// Remove the state completely: it has no writer or finalizer to keep it.
+	st := e.getState("home")
+	st.Finalizers = nil
+	e.must(e.c.Update(e.ctx, st))
+	e.must(e.c.Delete(e.ctx, st))
+
+	e.run(e.blip, ns, "job")
+	b = e.getBlip("job")
+	expectPhase(t, b, v1.BlipFailed, ReasonStateNotFound)
+	if !strings.Contains(b.Status.Message, "deleted") {
+		t.Fatalf("no deletion message: %+v", b.Status)
+	}
+	if b.Status.RootStateUID == "" {
+		t.Fatalf("pending Blip did not record its root: %+v", b.Status)
+	}
+}
+
 // TestDirectlyDeletedWritableMountFailsRunningBlip mirrors the root case for a
 // writable mount whose state is durable (no owner references). Saving must not
 // mark the doomed mount Mounted and report success for its discarded save.

@@ -556,6 +556,10 @@ type BlipStatus struct {
 	Node    string `json:"node,omitempty"`
 	// StateGeneration is the observed desired generation of the root state.
 	StateGeneration int64 `json:"stateGeneration,omitempty"`
+	// RootStateUID is the UID of the root state once a pending Blip has seen
+	// it. A root that disappears after that was deleted; it is never
+	// recreated for this Blip, so waiting for it cannot succeed.
+	RootStateUID string `json:"rootStateUID,omitempty"`
 	// RootAttachmentID is the writer attachment of a durable root.
 	RootAttachmentID string       `json:"rootAttachmentID,omitempty"`
 	StartTime        *metav1.Time `json:"startTime,omitempty"`

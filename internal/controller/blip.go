@@ -552,12 +552,24 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 		}
 		return reconcile.Result{}, err
 	}
-	_, mounts, reason, msg, err := r.rootIntent(ctx, b)
+	root, mounts, reason, msg, err := r.rootIntent(ctx, b)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	if root != nil && b.Status.RootStateUID == "" {
+		// Remember that the workspace existed. A later NotFound is then a
+		// deletion, not the launch window before the CLI creates it.
+		b.Status.RootStateUID = string(root.UID)
+	}
 	if reason != "" {
-		if reason == ReasonInvalidSpec || reason == reasonStateDeleting {
+		gone := reason == ReasonStateNotFound && b.Status.RootStateUID != ""
+		if gone {
+			// The root was seen and is now gone. Nothing recreates a
+			// Blip's workspace, so the pending timeout would only delay
+			// a failure that is already certain.
+			msg = fmt.Sprintf("state %q was deleted while the Blip was pending", b.Spec.State)
+		}
+		if reason == ReasonInvalidSpec || reason == reasonStateDeleting || gone {
 			res, err := fail(reason, msg)
 			res.RequeueAfter = retryAfter
 			return res, err

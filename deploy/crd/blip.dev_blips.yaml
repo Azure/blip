@@ -504,6 +504,12 @@ spec:
                 description: RootAttachmentID is the writer attachment of a durable
                   root.
                 type: string
+              rootStateUID:
+                description: |-
+                  RootStateUID is the UID of the root state once a pending Blip has seen
+                  it. A root that disappears after that was deleted; it is never
+                  recreated for this Blip, so waiting for it cannot succeed.
+                type: string
               sessions:
                 format: int32
                 type: integer
