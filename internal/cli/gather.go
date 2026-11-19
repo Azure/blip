@@ -43,7 +43,9 @@ Select any other set with blip names or --selector.
 
 With --collect, each operation is applied to every finished blip. Operations
 are the same as the collect syntax, and {name} is replaced with the blip's
-short name, so "git:/work/repo:{name}" gives each blip its own branch.
+short name, so "git:/work/repo:{name}" gives each blip its own branch. A git
+operation fetches commits only; uncommitted and untracked changes are not
+collected, and a warning is printed when a worktree has them.
 
 A blip whose command failed, or whose results could not be collected, is kept
 for inspection; its TTL (1h for forks by default) still deletes it. Successful
@@ -60,7 +62,7 @@ blips are deleted with their workspaces.`,
 	}
 	fl := cmd.Flags()
 	fl.StringVarP(&f.selector, "selector", "l", "", "label selector of blips to gather")
-	fl.StringArrayVar(&f.collect, "collect", nil, "copy out of each blip: SRC:DEST or git:SRC:BRANCH ({name} is the blip's name; repeatable)")
+	fl.StringArrayVar(&f.collect, "collect", nil, "copy out of each blip: SRC:DEST (split at the last ':') or git:SRC:BRANCH (commits only; {name} is the blip's name; repeatable)")
 	fl.BoolVar(&f.any, "any", false, "return as soon as one blip finishes")
 	fl.DurationVar(&f.wait, "wait", 0, "give up waiting after this long (0 waits forever)")
 	fl.BoolVarP(&f.follow, "follow", "f", false, "stream the output of blips while they run")

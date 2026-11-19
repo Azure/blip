@@ -59,7 +59,9 @@ blip gather --collect "git:$PWD:{name}" --collect "$PWD/out:./out/{name}"
 Each `run` returns as soon as its fork's snapshot is committed, each fork sees
 the same starting files, and changes stay private to their fork. `gather`
 waits for all of them, prints `blip/NAME Phase (exit N)` for each, fetches each
-blip's branch or files, and deletes each blip with its workspace. `-f` streams
+blip's branch or files, and deletes each blip with its workspace. `git:`
+collection fetches commits only: uncommitted and untracked changes are not
+collected, and gather prints a warning when it finds them. `-f` streams
 a running fork's output; `--any` returns on the first finish; `--wait` bounds
 the wait; a fork whose command failed or whose results could not be collected
 is kept for inspection until its TTL (1h by default) deletes it.

@@ -93,6 +93,7 @@ func (a *app) collect(ctx context.Context, name string, raw []string) error {
 			if err := checkGitSource(ctx, mounts[op.state], src, op.source, a.short(op.state)); err != nil {
 				return err
 			}
+			warnGitWorktree(ctx, src, op.source, op.branch, a.env.Err)
 			if err := fetchBranch(ctx, a.env.In, a.env.Out, a.env.Err, cwd, src, op.branch); err != nil {
 				return err
 			}

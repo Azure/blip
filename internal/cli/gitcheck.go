@@ -145,6 +145,17 @@ func checkParentInsideMount(mountPath, src, display, stateName string) error {
 	return nil
 }
 
+// warnGitWorktree tells the user that git collection is commit-only when the
+// source worktree has changes that would otherwise disappear with the blip.
+func warnGitWorktree(ctx context.Context, repo, display, branch string, errOut io.Writer) {
+	out, err := exec.CommandContext(ctx, "git", "-C", repo,
+		"-c", "safe.directory=*", "status", "--porcelain", "--untracked-files=normal").Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return
+	}
+	fmt.Fprintf(errOut, "warning: %s has uncommitted or untracked changes; git collection fetches only commits from branch %s, so those changes are not collected\n", display, branch)
+}
+
 // fetchBranch fetches branch from repo into the repository at cwd under the
 // same local name.
 func fetchBranch(ctx context.Context, in io.Reader, out, errOut io.Writer, cwd, repo, branch string) error {
