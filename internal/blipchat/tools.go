@@ -218,6 +218,7 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 		return "note recorded", nil
 	case "remember":
 		s.summary = truncateRunes(strArg("text"), 16384)
+		s.summarySet = true
 		return "summary replaced", nil
 	case "idle":
 		s.idle = true

@@ -300,3 +300,31 @@ func TestMaybeUnpauseOnlyClearsBudgetPause(t *testing.T) {
 		})
 	}
 }
+
+// remember replaces the rolling summary, so an empty text is an explicit
+// request to clear it.
+func TestRememberEmptyTextClearsSummary(t *testing.T) {
+	thread := testThread()
+	thread.Status.Summary = "previous summary"
+	server := llmServer(t,
+		Message{Role: "assistant", ToolCalls: []ToolCall{toolCall("remember", `{"text":""}`)}},
+		Message{Role: "assistant", Content: "cleared"},
+	)
+	c := testClient(t, thread)
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 1000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	ctx := context.Background()
+	if err := s.step(ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKeyFromObject(thread), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Summary != "" {
+		t.Errorf("summary after remember(\"\") = %q, want cleared", updated.Status.Summary)
+	}
+}

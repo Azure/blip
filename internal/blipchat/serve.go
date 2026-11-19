@@ -212,9 +212,12 @@ type step struct {
 	// replies become coordinator turns at the end of the step.
 	replies []v1.BlipTurnSpec
 	summary string
-	idle    bool
-	paused  string
-	usage   int64
+	// summarySet distinguishes "remember was called" (even with empty text)
+	// from a step that did not touch the summary.
+	summarySet bool
+	idle       bool
+	paused     string
+	usage      int64
 }
 
 func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
@@ -321,7 +324,7 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 			return err
 		}
 		current.Status.ConsumedSeq = target
-		if st.summary != "" {
+		if st.summarySet {
 			current.Status.Summary = truncateRunes(st.summary, 16384)
 		}
 		current.Status.Tasks = st.tasks
