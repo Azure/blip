@@ -151,13 +151,13 @@ func (s *Store) retryUnfinished(id string) error {
 		return nil
 	case phase == phaseCreating || phase == phaseDeleting:
 		if kind != KindCommit {
-			return fmt.Errorf("%w: %s is a %s", ErrInUse, id, kind)
+			return fmt.Errorf("%w: %s is a %s", ErrConflict, id, kind)
 		}
 		return s.rollback(r)
 	case phase == phaseDetaching:
-		return fmt.Errorf("%w: %s is being deleted", ErrInUse, id)
+		return fmt.Errorf("%w: %s is being deleted", ErrConflict, id)
 	default:
-		return fmt.Errorf("%w: %s is %s", ErrInUse, id, phase)
+		return fmt.Errorf("%w: %s is %s", ErrConflict, id, phase)
 	}
 }
 

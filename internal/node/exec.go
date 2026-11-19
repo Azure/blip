@@ -400,7 +400,9 @@ func (a *Agent) seal(ctx context.Context, s seal) error {
 		return err
 	}
 	// A disk that is still open means the VMM may still write: never
-	// give up on it, keep the writer reserved and retry.
+	// give up on it, keep the writer reserved and retry. A record conflict
+	// (ErrConflict) is not an open disk, so it falls through to the bounded
+	// path and is reported instead of blocking the save forever.
 	if !errors.Is(err, storage.ErrInUse) && (errors.Is(err, storage.ErrUnclean) || a.failures(s.attachmentID) >= maxSealAttempts-1) {
 		slog.Error("seal failed; not saving", "attachment", s.attachmentID, "err", err)
 		a.mu.Lock()

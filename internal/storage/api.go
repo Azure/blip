@@ -102,4 +102,9 @@ var (
 	ErrPinned   = errors.New("volume is pinned")
 	ErrUnclean  = errors.New("filesystem was not cleanly unmounted")
 	ErrInUse    = errors.New("volume is in use")
+	// ErrConflict reports an ID held by a record this operation cannot
+	// replace: another kind of volume, a deletion in progress, or a record
+	// that did not finish. Unlike ErrInUse for an open device, retrying does
+	// not help until that owner resolves, so callers may bound their retries.
+	ErrConflict = errors.New("volume record conflict")
 )

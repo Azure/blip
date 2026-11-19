@@ -189,6 +189,13 @@ func (s *Store) prepareSnapshot(ctx context.Context, attachmentID, commitID stri
 		}
 		return nil, c.Size, true, unlock, nil
 	}
+	// Retry a snapshot whose own cleanup failed after begin. Recovery does
+	// the same at startup, but without it a running node would refuse this
+	// deterministic commit ID forever and never retry the seal.
+	if err := s.retryUnfinished(commitID); err != nil {
+		unlock()
+		return nil, 0, false, nil, err
+	}
 	w, err = s.lookup(attachmentID)
 	if err != nil {
 		unlock()
@@ -237,6 +244,12 @@ func (s *Store) Seal(ctx context.Context, attachmentID, commitID string) (int64,
 		return 0, err
 	}
 	if err := s.setPhase(rec, phaseReady); err != nil {
+		// The snapshot is complete but not published. Roll it back so a
+		// retry starts clean instead of finding a creating record; if the
+		// rollback fails, the next Seal retries it before beginning.
+		if rerr := s.rollback(rec); rerr != nil {
+			logf("rollback seal %s after phase write: %v", rec.ID, rerr)
+		}
 		return 0, err
 	}
 	return rec.Size, nil
@@ -273,6 +286,9 @@ func (s *Store) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID s
 		return 0, err
 	}
 	if err := s.setPhase(rec, phaseReady); err != nil {
+		if rerr := s.rollback(rec); rerr != nil {
+			logf("rollback live copy %s after phase write: %v", rec.ID, rerr)
+		}
 		return 0, err
 	}
 	return rec.Size, nil

@@ -78,6 +78,7 @@ func TestSealRetryMachinePreservesWriterSafety(t *testing.T) {
 		terminal bool
 	}{
 		{"in use never gives up", storage.ErrInUse, 12, false},
+		{"record conflict is bounded", storage.ErrConflict, maxSealAttempts, true},
 		{"unclean reports immediately", storage.ErrUnclean, 1, true},
 		{"other errors bounded", errors.New("disk I/O failure"), maxSealAttempts, true},
 		{"success", nil, 1, true},
