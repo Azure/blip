@@ -527,15 +527,35 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 			} else {
 				var holders []string
 				for _, n := range src.Status.Placements {
-					if cl.holds(src, n, src.Status.Committed.ID) {
+					// A healthy draining holder still serves the commit it
+					// sealed; only unhealthy or stale-incarnation holders
+					// cannot. Accepting them blindly would place a copy that
+					// can never fetch and pin the source finalizer forever.
+					if cl.healthyNode(n) && cl.holds(src, n, src.Status.Committed.ID) {
 						holders = append(holders, n)
 					}
 				}
 				if len(holders) == 0 {
-					return fmt.Sprintf("no node holds copy source %q", src.Name), false, nil
+					// No node can serve the source right now. A node may
+					// recover, so retry for the same bounded window as an
+					// unplaceable copy, then fail terminally and release the
+					// source finalizer.
+					msg := fmt.Sprintf("no healthy holder of copy source %q; retrying", src.Name)
+					if s.UnplaceableSince == nil {
+						now := metav1.NewTime(cl.now)
+						s.UnplaceableSince = &now
+						return msg, true, nil
+					}
+					if cl.now.Sub(s.UnplaceableSince.Time) < pendingTimeout {
+						return msg, true, nil
+					}
+					s.Phase = v1.StateFailed
+					s.UnplaceableSince = nil
+					return fmt.Sprintf("copy source %q has no healthy holder after %s", src.Name, pendingTimeout), false, nil
 				}
 				s.CopiedFrom = &v1.CopySource{StateUID: string(src.UID), CommitID: src.Status.Committed.ID, Nodes: holders}
 			}
+			s.UnplaceableSince = nil
 			if s.ImageConfig == nil && src.Status.ImageConfig != nil {
 				s.ImageConfig = src.Status.ImageConfig.DeepCopy()
 			}

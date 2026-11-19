@@ -121,7 +121,14 @@ func planBuild(v *view, p *plan, s *v1alpha1.BlipState) bool {
 	case s.Status.CopiedFrom != nil:
 		cf := s.Status.CopiedFrom
 		if !v.holds(cf.CommitID) {
-			if src := v.copySource(cf); src != nil && !v.busy[cf.CommitID] {
+			if src := v.copySource(cf); src == nil {
+				// The controller only creates a committed copy pending when
+				// some current-incarnation node holds the source commit. If
+				// none is readable now, report it instead of planning
+				// nothing: the controller can then bound the copy and
+				// release the source finalizer.
+				p.errs[string(s.UID)] = fmt.Sprintf("no healthy holder of copy source commit %s", cf.CommitID)
+			} else if !v.busy[cf.CommitID] {
 				p.fetches = append(p.fetches, fetch{owner: string(s.UID), src: *src})
 			}
 			return true
@@ -227,7 +234,10 @@ func (v *view) copyBase(s *v1alpha1.BlipState, generation int64) bool {
 }
 
 func (v *view) copySource(cf *v1alpha1.CopySource) *source {
-	if src := v.holder(v.stateByUID[cf.StateUID], cf.CommitID, ""); src != nil {
+	// A committed source may be served by a healthy draining node: draining
+	// forbids new placements, not reading a commit the node already sealed.
+	// Unhealthy nodes and stale incarnations are still rejected.
+	if src := v.servingHolder(v.stateByUID[cf.StateUID], cf.CommitID); src != nil {
 		src.purpose = "copy"
 		return src
 	}
@@ -238,7 +248,7 @@ func (v *view) copySource(cf *v1alpha1.CopySource) *source {
 		if n == v.node {
 			continue
 		}
-		if v.healthyNode(n, v.observedIncarnation(cf.StateUID, n)) == nil {
+		if v.servingNode(n, v.observedIncarnation(cf.StateUID, n)) == nil {
 			continue
 		}
 		return &source{node: n, purpose: "copy", stateUID: cf.StateUID,

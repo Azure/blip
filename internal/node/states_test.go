@@ -769,7 +769,10 @@ func TestCopySourceIncarnation(t *testing.T) {
 	}
 }
 
-func TestCopySourceRequiresHealthyPeer(t *testing.T) {
+// TestCopySourceRequiresServingPeer: an unhealthy or stale peer cannot serve
+// a copy. Draining alone does not disqualify one (see
+// TestCopySourceServingHolder), but every other liveness condition does.
+func TestCopySourceRequiresServingPeer(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		damage func(*v1alpha1.BlipNode)
@@ -778,7 +781,6 @@ func TestCopySourceRequiresHealthyPeer(t *testing.T) {
 		{"invalid endpoint", func(n *v1alpha1.BlipNode) { n.Status.Endpoint = "node.example" }},
 		{"missing identity", func(n *v1alpha1.BlipNode) { n.Status.TLSPublicKey = "" }},
 		{"invalid identity", func(n *v1alpha1.BlipNode) { n.Status.TLSPublicKey = "invalid" }},
-		{"draining", func(n *v1alpha1.BlipNode) { n.Spec.Drain = true }},
 		{"missing heartbeat", func(n *v1alpha1.BlipNode) { n.Status.Heartbeat = nil }},
 		{"stale heartbeat", func(n *v1alpha1.BlipNode) {
 			old := metav1.NewTime(testNow.Add(-2 * nodeHeartbeatTTL))
@@ -798,6 +800,78 @@ func TestCopySourceRequiresHealthyPeer(t *testing.T) {
 				t.Fatalf("selected unhealthy copy source = %+v", got)
 			}
 		})
+	}
+}
+
+// TestCopySourceServingHolder: a committed copy source held only by a healthy
+// draining node still serves the copy. Draining forbids new placements, not
+// reading a commit the node already sealed. The captured-node fallback follows
+// the same rule.
+func TestCopySourceServingHolder(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		drain      bool
+		sourceGone bool
+	}{
+		{name: "healthy holder"},
+		{name: "draining holder", drain: true},
+		{name: "draining captured holder", drain: true, sourceGone: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := newView()
+			src := state("src")
+			src.Status.Committed = &v1alpha1.Commit{ID: "c1", Generation: 1}
+			src.Status.Placements = []string{"n2"}
+			src.Status.Nodes = []v1alpha1.NodeObservation{holding("n2", "c1")}
+			cf := &v1alpha1.CopySource{StateUID: string(src.UID), CommitID: "c1", Nodes: []string{"n2"}}
+			if tc.sourceGone {
+				cf.StateUID = "uid-gone"
+			}
+			cp := state("cp")
+			cp.Status.CopiedFrom = cf
+			cp.Status.Pending = &v1alpha1.PendingCommit{CommitID: "k1", Generation: 1, SourceNode: self, Replicas: []string{self}}
+			v.states = []*v1alpha1.BlipState{src, cp}
+			if tc.drain {
+				v.blipNodes["n2"].Spec.Drain = true
+			}
+
+			p := compute(v)
+			if len(p.builds) != 0 || len(p.fetches) != 1 || p.fetches[0].owner != "uid-cp" ||
+				p.fetches[0].src.node != "n2" || p.fetches[0].src.commitID != "c1" {
+				t.Fatalf("plan builds=%+v fetches=%+v errs=%v", p.builds, p.fetches, p.errs)
+			}
+			if p.errs["uid-cp"] != "" {
+				t.Fatalf("unexpected copy source error: %q", p.errs["uid-cp"])
+			}
+		})
+	}
+}
+
+// TestCopySourceUnavailableReportsError: a copy whose committed source has no
+// readable holder must report why instead of planning nothing, so the
+// controller can surface a bounded failure rather than a silent wait.
+func TestCopySourceUnavailableReportsError(t *testing.T) {
+	v := newView()
+	src := state("src")
+	src.Status.Committed = &v1alpha1.Commit{ID: "c1", Generation: 1}
+	src.Status.Placements = []string{"n2"}
+	src.Status.Nodes = []v1alpha1.NodeObservation{holding("n2", "c1")}
+	cp := state("cp")
+	cp.Status.CopiedFrom = &v1alpha1.CopySource{StateUID: string(src.UID), CommitID: "c1", Nodes: []string{"n2"}}
+	cp.Status.Pending = &v1alpha1.PendingCommit{CommitID: "k1", Generation: 1, SourceNode: self, Replicas: []string{self}}
+	v.states = []*v1alpha1.BlipState{src, cp}
+	old := metav1.NewTime(testNow.Add(-2 * nodeHeartbeatTTL))
+	v.blipNodes["n2"].Status.Heartbeat = &old
+
+	p := compute(v)
+	if len(p.builds) != 0 || len(p.fetches) != 0 {
+		t.Fatalf("planned work without a readable source: builds=%+v fetches=%+v", p.builds, p.fetches)
+	}
+	if msg := p.errs["uid-cp"]; !strings.Contains(msg, "copy source") {
+		t.Fatalf("copy source error = %q", msg)
+	}
+	if e := entryFor(p, "cp"); e == nil || !strings.Contains(e.Error, "copy source") {
+		t.Fatalf("copy entry = %+v", e)
 	}
 }
 
