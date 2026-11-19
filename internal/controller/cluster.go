@@ -92,6 +92,14 @@ func (c *cluster) holds(st *v1.BlipState, name, commitID string) bool {
 	return false
 }
 
+// currentObservation reports whether o was written by the node's current
+// incarnation. An entry from another incarnation is stale: the node lost the
+// storage it described, so its commits and errors no longer apply.
+func (c *cluster) currentObservation(o v1.NodeObservation) bool {
+	bn := c.nodes[o.Node]
+	return bn != nil && o.Incarnation == bn.Status.Incarnation
+}
+
 // choose returns up to n usable nodes, excluding exclude: nodes in prefer
 // first (in order), then by free space, then by name.
 func (c *cluster) choose(n int, selector map[string]string, prefer, exclude []string) []string {

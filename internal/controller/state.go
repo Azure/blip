@@ -760,7 +760,7 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 			waiting = append(waiting, n)
 		}
 		for _, o := range st.Status.Nodes {
-			if o.Node == n && o.Error != "" {
+			if o.Node == n && o.Error != "" && cl.currentObservation(o) {
 				errs = append(errs, fmt.Sprintf("%s: %s", n, o.Error))
 			}
 		}
@@ -814,7 +814,8 @@ func resolveFailedReplicas(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) (
 	}
 	errs := map[string]string{}
 	for _, o := range st.Status.Nodes {
-		if o.Error != "" && (o.Node == p.SourceNode || slices.Contains(p.Replicas, o.Node)) {
+		if o.Error != "" && (o.Node == p.SourceNode || slices.Contains(p.Replicas, o.Node)) &&
+			cl.currentObservation(o) {
 			errs[o.Node] = o.Error
 		}
 	}
@@ -861,7 +862,7 @@ func initialSourceSettled(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bo
 		return true
 	}
 	for _, o := range st.Status.Nodes {
-		if o.Node == p.SourceNode && o.Error != "" {
+		if o.Node == p.SourceNode && o.Error != "" && cl.currentObservation(o) {
 			return true
 		}
 	}

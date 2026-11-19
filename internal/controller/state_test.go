@@ -473,6 +473,49 @@ func TestInitialReplicaErrorAfterSourceFailsState(t *testing.T) {
 	}
 }
 
+// TestStaleIncarnationErrorIgnored keeps an error from an earlier node
+// incarnation from settling or failing a healthy initial build. The entry is
+// stale: the node lost the storage it described.
+func TestStaleIncarnationErrorIgnored(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.newState("s", func(st *v1.BlipState) { st.Spec.Replicas = 2 })
+	e.run(e.state, ns, "s")
+	p := e.getState("s").Status.Pending
+	if p == nil {
+		t.Fatal("no pending initial version")
+	}
+	replica := "n1"
+	if p.SourceNode == replica {
+		replica = "n2"
+	}
+	e.report("s", p.SourceNode, func(o *v1.NodeObservation) {
+		o.Incarnation = "old-inc"
+		o.Error = "boom from the previous incarnation"
+		o.Commits = nil
+	})
+	e.report("s", replica, func(o *v1.NodeObservation) {
+		o.Error = "storage: no space left on device"
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase == v1.StateFailed {
+		t.Fatalf("stale incarnation error settled the initial source: %+v", st.Status)
+	}
+	if strings.Contains(st.Status.LastError, "previous incarnation") {
+		t.Fatalf("lastError exposed a stale incarnation error: %q", st.Status.LastError)
+	}
+
+	// Without the replica's own error nothing should fail: the source is
+	// still healthy and simply has not published the commit yet.
+	e.report("s", replica, func(o *v1.NodeObservation) { o.Error = "" })
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if st.Status.Phase != v1.StatePending || !strings.Contains(st.Status.Message, "waiting") || st.Status.LastError != "" {
+		t.Fatalf("stale incarnation error failed a healthy build: %+v", st.Status)
+	}
+}
+
 func TestPendingReplicaReplaced(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2", "n3")
@@ -688,6 +731,36 @@ func TestSaveFallsBackAfterReplicaErrorBound(t *testing.T) {
 	}
 	if !strings.Contains(st.Status.Message, "fewer replicas") || !strings.Contains(st.Status.Message, "resource busy") {
 		t.Fatalf("fallback did not explain the dropped replica: %q", st.Status.Message)
+	}
+}
+
+// TestStaleIncarnationErrorDoesNotDropSaveReplica checks that a stale error
+// cannot make a save drop a replica after the error bound.
+func TestStaleIncarnationErrorDoesNotDropSaveReplica(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.readyState("s", "n1", "n2")
+	const saved = "stale-incarnation-save"
+	since := metav1.NewTime(e.now.Add(-replicaErrorFallback - time.Second))
+	st := e.getState("s")
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID: saved, Generation: 2, SourceNode: "n1",
+		AttachmentID: "save", Replicas: []string{"n1", "n2"}, Since: &since,
+	}
+	e.must(e.c.Status().Update(e.ctx, st))
+	e.hold("s", saved, "n1")
+	e.report("s", "n2", func(o *v1.NodeObservation) {
+		o.Incarnation = "old-inc"
+		o.Error = "boom from the previous incarnation"
+		o.Commits = nil
+	})
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if st.Status.Pending == nil || !slices.Equal(st.Status.Pending.Replicas, []string{"n1", "n2"}) {
+		t.Fatalf("stale incarnation error dropped a save replica: %+v", st.Status)
+	}
+	if strings.Contains(st.Status.LastError, "previous incarnation") {
+		t.Fatalf("lastError exposed a stale incarnation error: %q", st.Status.LastError)
 	}
 }
 
