@@ -21,6 +21,8 @@ func TestProductionCoreBoundaries(t *testing.T) {
 		"node/planner.go",
 		"runtime/machine.go",
 		"runtime/snapshot.go",
+		"stream/stream.go",
+		"workspace/fork.go",
 		// guest stdio is exercised by internal/guest tests.
 	} {
 		t.Run(name, func(t *testing.T) {

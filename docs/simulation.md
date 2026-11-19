@@ -132,6 +132,8 @@ cleanup path and must be represented when asserting end-to-end release.
 
 ## Coverage map
 
+This coverage map is the simulation coverage ledger: each row names the production code under model and the boundary left to other tests, while `internal/simtest` provides shared replay and exploration conformance checks for component models.
+
 | Tests | Production code exercised | Important scope boundary |
 | --- | --- | --- |
 | `internal/atomicfile` | Durable replacement operation and real filesystem adapter | Simulated power-loss contract; subprocess tests cover actual process death |
@@ -139,8 +141,10 @@ cleanup path and must be represented when asserting end-to-end release.
 | `internal/controller/simulation_test.go` | Allocation, state publication, claims, cleanup and optimistic API writes | Fake API with explicit cache delivery; lost replies followed by restart after normal error handling |
 | `internal/node/{plan,scheduler}_test.go` | Snapshot planning, GC, admission, source reservations, retries and completion generations | External device and API operations have separate tests |
 | `internal/runtime` | Production claim/mount/detach/freeze/stop machine and hypervisor confirmation helper | Guest, network and hypervisor service represented by effect outcomes |
-| `internal/guest`, `internal/session`, `internal/wire` | Guest control/session decisions, freeze lifecycle, protocol framing and ambiguous session opens | Guest filesystem/process behavior needs real-host qualification |
+| `internal/guest`, `internal/wire` | Guest command/session control, process environment and stdio decisions, freeze/thaw lease expiry and stale-result handling, protocol framing and ambiguous session opens | Real guest filesystem/process behavior and host signal delivery need real-host qualification |
 | `internal/peer`, `internal/nvme` | Lease lifecycle, persistence, retry policy and connection workflows | Real transport/device semantics additionally tested by privileged suites |
+| `internal/stream/{stream_test.go,simulation_test.go}` | Ring append, whole-record trim, restart recovery, torn-tail rejection, reader gap reporting, and bounded-depth exhaustive exploration of a crash model with injected before/torn/lost writes | The model uses an in-memory `ReadWriterAt`; real volume I/O, concurrent failover and power-loss persistence need device tests |
+| `internal/workspace/{fork_test.go,simulation_test.go}` | Production `Fork` snapshot, preflight, child/root creation, owner patching, UID-guarded rollback, and rejected/transport/server/lost-response faults at each operation | Fake API with injected rejected and ambiguous responses; live API-server races, controller-driven snapshots and filesystem copy behavior are out of scope |
 | `internal/simapp` | Composed allocation, production node planning/admission, runtime, lease sequencing, save/replication and reacquisition | See its README for exact simulated services and exploration windows |
 | `internal/sim`, `internal/simlive` | Replay, shrinking, exploration bounds, crash delivery and fair-cycle witnesses | Checker tests include deliberately broken models; production properties live in component/world tests |
 
