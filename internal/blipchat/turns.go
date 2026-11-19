@@ -223,20 +223,52 @@ func reportFields(text string) (map[string]string, string) {
 	return attrs, summary
 }
 
+// escapeLine renders an untrusted field so control characters cannot end the
+// current prompt line and forge a new section. Ordinary text is unchanged for
+// readability; quotes, backslashes, tabs, and line separators are escaped.
+func escapeLine(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\u2028':
+			b.WriteString(`\u2028`)
+		case '\u2029':
+			b.WriteString(`\u2029`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&b, `\x%02x`, r)
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // renderTurn renders one turn for the coordinator prompt.
 func renderTurn(t *v1.BlipTurn) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "#%d %s/%s %s", t.Status.Seq, t.Spec.Author.Kind, t.Spec.Author.Name, t.Spec.Topic)
+	fmt.Fprintf(&b, "#%d %s/%s %s", t.Status.Seq, escapeLine(t.Spec.Author.Kind), escapeLine(t.Spec.Author.Name), escapeLine(t.Spec.Topic))
 	if len(t.Spec.Subjects) > 0 {
 		names := make([]string, 0, len(t.Spec.Subjects))
 		for _, s := range t.Spec.Subjects {
 			switch {
 			case s.Name != "" && s.Kind != "":
-				names = append(names, s.Kind+"/"+s.Name)
+				names = append(names, escapeLine(s.Kind+"/"+s.Name))
 			case s.Name != "":
-				names = append(names, s.Name)
+				names = append(names, escapeLine(s.Name))
 			default:
-				names = append(names, s.URI)
+				names = append(names, escapeLine(s.URI))
 			}
 		}
 		fmt.Fprintf(&b, " [%s]", strings.Join(names, " "))
@@ -247,7 +279,7 @@ func renderTurn(t *v1.BlipTurn) string {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		fmt.Fprintf(&b, " %s=%q", k, t.Spec.Attributes[k])
+		fmt.Fprintf(&b, " %s=%q", escapeLine(k), t.Spec.Attributes[k])
 	}
 	if t.Spec.InReplyTo != 0 {
 		fmt.Fprintf(&b, " re=#%d", t.Spec.InReplyTo)

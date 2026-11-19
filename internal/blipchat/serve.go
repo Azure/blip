@@ -894,9 +894,9 @@ func limitRunes(s string, n int) string {
 // the full text still shows the coordinator that the turn happened.
 func summarizeTurn(t *v1.BlipTurn, excerpt int) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "#%d %s/%s %s", t.Status.Seq, t.Spec.Author.Kind, t.Spec.Author.Name, t.Spec.Topic)
+	fmt.Fprintf(&b, "#%d %s/%s %s", t.Status.Seq, escapeLine(t.Spec.Author.Kind), escapeLine(t.Spec.Author.Name), escapeLine(t.Spec.Topic))
 	if t.Spec.Text != "" && excerpt > 0 {
-		fmt.Fprintf(&b, ": %s", truncateRunes(t.Spec.Text, excerpt))
+		fmt.Fprintf(&b, ": %s", escapeLine(truncateRunes(t.Spec.Text, excerpt)))
 	}
 	b.WriteString("\n")
 	return b.String()
