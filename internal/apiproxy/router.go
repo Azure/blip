@@ -160,7 +160,7 @@ func newAPIProxy(api *API, podName, podNamespace string) (http.Handler, *http.Tr
 	if err != nil {
 		return nil, nil, err
 	}
-	handler, transport, err := newUpstreamProxy(upstreamOptions{
+	handler, transport, ca, err := newUpstreamProxy(upstreamOptions{
 		address:    address,
 		serverName: host,
 		hostHeader: address,
@@ -174,7 +174,10 @@ func newAPIProxy(api *API, podName, podNamespace string) (http.Handler, *http.Tr
 	}
 	if podName != "" {
 		scopeCfg := Config{API: api, PodName: podName, PodNamespace: podNamespace}
-		handler = newOwnerScope(scopeCfg, transport, handler)
+		// The scope client must share the CA-aware transport, not the base
+		// one, so its identity reads drop idle connections when the projected
+		// CA rotates or is revoked.
+		handler = newOwnerScope(scopeCfg, ca, handler)
 	}
 	return handler, transport, nil
 }
@@ -191,7 +194,7 @@ func newEndpointProxy(endpoint Endpoint) (http.Handler, *http.Transport, error) 
 	if port == "" {
 		port = "443"
 	}
-	return newUpstreamProxy(upstreamOptions{
+	handler, transport, _, err := newUpstreamProxy(upstreamOptions{
 		address:     net.JoinHostPort(u.Hostname(), port),
 		serverName:  u.Hostname(),
 		hostHeader:  u.Host,
@@ -201,6 +204,7 @@ func newEndpointProxy(endpoint Endpoint) (http.Handler, *http.Transport, error) 
 		tokenFile:   endpoint.TokenFile,
 		errorBody:   "endpoint unavailable",
 	})
+	return handler, transport, err
 }
 
 func parseEndpoints(raw string) ([]Endpoint, error) {

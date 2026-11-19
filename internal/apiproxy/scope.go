@@ -104,7 +104,10 @@ type ownerScope struct {
 	next       http.Handler
 }
 
-func newOwnerScope(cfg Config, transport *http.Transport, next http.Handler) http.Handler {
+// newOwnerScope wraps next with owner scoping. transport is the CA-aware
+// round tripper for the Kubernetes API, not the base transport: identity reads
+// must follow a projected CA rotation like proxied requests do.
+func newOwnerScope(cfg Config, transport http.RoundTripper, next http.Handler) http.Handler {
 	return &ownerScope{
 		namespace:  cfg.PodNamespace,
 		podName:    cfg.PodName,

@@ -248,14 +248,14 @@ type upstreamOptions struct {
 	errorBody   string
 }
 
-func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error) {
+func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, http.RoundTripper, error) {
 	pool := newCAPool(cfg.caFile, cfg.caLabel, cfg.systemRoots)
 	if _, _, err := pool.current(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if cfg.tokenFile != "" {
 		if _, err := projectedToken(cfg.tokenFile); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
@@ -299,7 +299,8 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error
 		}
 		return tlsConn, nil
 	}
-	var roundTripper http.RoundTripper = &caTransport{base: transport, pool: pool}
+	ca := &caTransport{base: transport, pool: pool}
+	var roundTripper http.RoundTripper = ca
 	if cfg.tokenFile != "" {
 		roundTripper = tokenTransport{base: roundTripper, tokenFile: cfg.tokenFile}
 	}
@@ -337,7 +338,7 @@ func newUpstreamProxy(cfg upstreamOptions) (http.Handler, *http.Transport, error
 		}
 		proxy.ServeHTTP(w, r)
 	})
-	return handler, transport, nil
+	return handler, transport, ca, nil
 }
 
 // caPool reads the configured CA bundle on demand. A projected ConfigMap
@@ -416,7 +417,11 @@ func (t *caTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	t.mu.Lock()
-	if t.gen != 0 && t.gen != gen {
+	// The initial generation is 0 ("unset"). It must still compare unequal to
+	// a pool that has already loaded a bundle, so the first request is checked
+	// for a change too; otherwise an idle connection warmed outside this
+	// transport could survive the first rotation.
+	if t.gen != gen {
 		t.base.CloseIdleConnections()
 	}
 	t.gen = gen
