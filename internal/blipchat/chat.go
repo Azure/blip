@@ -2,6 +2,8 @@ package blipchat
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -350,13 +352,34 @@ func isReadOnlyBranchOption(arg string) bool {
 	return false
 }
 
+// shortUser derives a deterministic DNS-1123-safe fragment from an identity
+// for use in a turn name. Identities are arbitrary header values: they may
+// contain uppercase, backslashes (DOMAIN\user), spaces, or non-ASCII, and
+// Kubernetes would reject those names. The short hash keeps distinct
+// identities distinct after sanitizing (for example "Alice" and "alice").
 func shortUser(user string) string {
-	replacer := strings.NewReplacer("/", "-", ":", "-", "@", "-", ".", "-")
-	s := replacer.Replace(user)
-	if len(s) > 40 {
-		s = s[len(s)-40:]
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(user) {
+		if b.Len() >= 28 {
+			break
+		}
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			dash = false
+			continue
+		}
+		if b.Len() > 0 && !dash {
+			b.WriteByte('-')
+			dash = true
+		}
 	}
-	return s
+	s := strings.Trim(b.String(), "-")
+	if s == "" {
+		s = "user"
+	}
+	sum := sha256.Sum256([]byte(user))
+	return s + "-" + hex.EncodeToString(sum[:4])
 }
 
 // recentTurns returns up to limit turns with a sequence above since.
