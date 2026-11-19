@@ -232,32 +232,168 @@ func (s *Session) Recv() (Frame, error) {
 // ErrDisconnected means the stream ended before the session exited.
 var ErrDisconnected = errors.New("connection to the session was lost")
 
+// outputReadAhead bounds output that the client has received from the guest
+// but not yet written to the caller. Reading the transport while a local
+// stdout consumer is stalled keeps the transport from going idle (some
+// transports tear an idle exec stream down after a few seconds) and lets the
+// client retain output the command already produced. Beyond this bound the
+// transport is backpressured exactly as before, so memory stays bounded.
+const outputReadAhead = 8 << 20
+
+// outputQueue decouples the transport reader from the caller's writer. Only
+// the reader goroutine calls put and only Copy calls get.
+type outputQueue struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	frames []Frame
+	bytes  int
+	max    int
+	done   bool
+	err    error
+}
+
+func newOutputQueue(max int) *outputQueue {
+	q := &outputQueue{max: max}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+func frameBytes(f Frame) int {
+	if f.Type == wire.TStdout || f.Type == wire.TStderr {
+		return len(f.Data)
+	}
+	return 0
+}
+
+// put appends one frame, waiting while the writer is behind. It reports false
+// when the queue was stopped because the writer failed.
+func (q *outputQueue) put(f Frame) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := frameBytes(f)
+	for !q.done && q.bytes+n > q.max && len(q.frames) > 0 {
+		q.cond.Wait()
+	}
+	if q.done {
+		return false
+	}
+	q.frames = append(q.frames, f)
+	q.bytes += n
+	q.cond.Signal()
+	return true
+}
+
+// get removes the next frame. It returns the reader's error once every
+// received frame has been consumed, so no complete frame is discarded by a
+// transport failure.
+func (q *outputQueue) get() (Frame, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.frames) == 0 && !q.done {
+		q.cond.Wait()
+	}
+	if len(q.frames) > 0 {
+		f := q.frames[0]
+		q.frames = q.frames[1:]
+		q.bytes -= frameBytes(f)
+		q.cond.Broadcast()
+		return f, nil
+	}
+	if q.err != nil {
+		return Frame{}, q.err
+	}
+	return Frame{}, io.EOF
+}
+
+// finish records the reader's terminal error and wakes the consumer.
+func (q *outputQueue) finish(err error) {
+	q.mu.Lock()
+	q.done = true
+	q.err = err
+	q.cond.Broadcast()
+	q.mu.Unlock()
+}
+
+// stop abandons the queue because the caller's writer failed. It returns the
+// number of data frames that were queued but never written, so pending-output
+// accounting is released.
+func (q *outputQueue) stop() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := 0
+	for _, f := range q.frames {
+		if frameBytes(f) > 0 {
+			n++
+		}
+	}
+	q.frames = nil
+	q.bytes = 0
+	q.done = true
+	q.err = io.EOF
+	q.cond.Broadcast()
+	return n
+}
+
 // Copy writes output until the session exits and returns its exit status.
 // notice may be nil.
+//
+// A reader goroutine drains the transport into a bounded queue so a slow local
+// stdout consumer cannot make the transport idle (which used to lose the tail
+// of a command that had already exited) and so every complete frame received
+// before a transport failure is still delivered. If the queue bound is
+// reached, the transport is backpressured: a live consumer drains it and gets
+// every byte, while a dead peer still fails with ErrDisconnected instead of
+// silently reporting success.
 func (s *Session) Copy(stdout, stderr io.Writer, notice func(string)) (*wire.Exit, error) {
-	for {
-		f, err := s.Recv()
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, ErrDisconnected
+	q := newOutputQueue(outputReadAhead)
+	go func() {
+		for {
+			f, err := s.Recv()
+			if err != nil {
+				q.finish(err)
+				return
+			}
+			if f.Type == wire.TStdout || f.Type == wire.TStderr {
+				// Count frames the reader has received but the caller has
+				// not written yet, so signal-grace progress tracking knows a
+				// stalled writer is still delivering output.
+				s.pending.Add(1)
+				if !q.put(f) {
+					s.pending.Add(-1)
+					return
+				}
+				continue
+			}
+			q.put(f)
+			if f.Type == wire.TExited {
+				q.finish(nil)
+				return
+			}
 		}
+	}()
+	for {
+		f, err := q.get()
 		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, ErrDisconnected
+			}
 			return nil, err
 		}
 		switch f.Type {
 		case wire.TStdout:
-			s.pending.Add(1)
 			_, err := stdout.Write(f.Data)
 			s.pending.Add(-1)
 			s.progress.Add(1)
 			if err != nil {
+				s.pending.Add(-int64(q.stop()))
 				return nil, err
 			}
 		case wire.TStderr:
-			s.pending.Add(1)
 			_, err := stderr.Write(f.Data)
 			s.pending.Add(-1)
 			s.progress.Add(1)
 			if err != nil {
+				s.pending.Add(-int64(q.stop()))
 				return nil, err
 			}
 		case wire.TNotice:

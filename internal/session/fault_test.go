@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Azure/blip/internal/session"
 	"github.com/Azure/blip/internal/wire"
@@ -87,6 +89,123 @@ func TestCopyRequiresCompleteExitFrame(t *testing.T) {
 		} else if err != nil || status.Code != 17 {
 			t.Fatalf("complete exit: %+v %v", status, err)
 		}
+	}
+}
+
+// idleConn models a transport that tears the exec stream down when it is not
+// read for idle. The real pod-exec path can drop an idle stream while the
+// local stdout consumer is stalled, which used to lose the tail of a command
+// that had already exited.
+type idleConn struct {
+	r    *bytes.Reader
+	last time.Time
+	idle time.Duration
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	if time.Since(c.last) > c.idle {
+		return 0, io.ErrUnexpectedEOF
+	}
+	n, err := c.r.Read(p)
+	c.last = time.Now()
+	return n, err
+}
+
+func (c *idleConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *idleConn) Close() error                { return nil }
+
+// stallWriter blocks the first write until gate is closed, modelling a local
+// stdout consumer that is not reading.
+type stallWriter struct {
+	gate chan struct{}
+	once sync.Once
+	mu   sync.Mutex
+	buf  bytes.Buffer
+}
+
+func (w *stallWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { <-w.gate })
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *stallWriter) Len() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Len()
+}
+
+// A local consumer that stalls for a while must not lose output the guest
+// already sent, even if the transport would have torn down an idle stream.
+// The client reads ahead into a bounded queue while the writer is blocked, so
+// a command that exits 0 still delivers every byte and rc 0.
+func TestCopyKeepsOutputThroughStalledConsumer(t *testing.T) {
+	const total = 5_000_000
+	data := bytes.Repeat([]byte("a"), total)
+	var transcript bytes.Buffer
+	transcript.Write(encodedFrame(t, wire.TOpened, wire.Opened{Session: "s"}))
+	for off := 0; off < total; off += 32 << 10 {
+		end := min(off+(32<<10), total)
+		transcript.Write(encodedFrame(t, wire.TStdout, data[off:end]))
+	}
+	transcript.Write(encodedFrame(t, wire.TExited, wire.Exit{Code: 0}))
+
+	c := &session.Client{Connect: func(context.Context, string, string) (io.ReadWriteCloser, error) {
+		return &idleConn{r: bytes.NewReader(transcript.Bytes()), last: time.Now(), idle: 200 * time.Millisecond}, nil
+	}}
+	s, err := c.Open(context.Background(), "ns", "pod", wire.Open{Mode: wire.OpenExec, Argv: []string{"cat"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	w := &stallWriter{gate: make(chan struct{})}
+	closed := make(chan struct{})
+	time.AfterFunc(600*time.Millisecond, func() {
+		close(w.gate)
+		close(closed)
+	})
+	exit, err := s.Copy(w, io.Discard, nil)
+	<-closed
+	if err != nil {
+		t.Fatalf("Copy returned %v, want success", err)
+	}
+	if exit == nil || exit.Code != 0 {
+		t.Fatalf("exit = %+v, want code 0", exit)
+	}
+	if got := w.Len(); got != total {
+		t.Fatalf("delivered %d of %d output bytes", got, total)
+	}
+}
+
+// A transport failure before the exit status must still be reported (never a
+// silent rc 0), while every frame that was received is delivered first.
+func TestCopyReportsLostExitAfterDeliveringQueuedFrames(t *testing.T) {
+	const total = 1 << 20
+	data := bytes.Repeat([]byte("b"), total)
+	var transcript bytes.Buffer
+	transcript.Write(encodedFrame(t, wire.TOpened, wire.Opened{Session: "s"}))
+	for off := 0; off < total; off += 32 << 10 {
+		end := min(off+(32<<10), total)
+		transcript.Write(encodedFrame(t, wire.TStdout, data[off:end]))
+	}
+	c := &session.Client{Connect: func(context.Context, string, string) (io.ReadWriteCloser, error) {
+		// No TExited: the stream ends after the output.
+		return &transcriptConn{Reader: bytes.NewReader(transcript.Bytes())}, nil
+	}}
+	s, err := c.Open(context.Background(), "ns", "pod", wire.Open{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var out bytes.Buffer
+	exit, err := s.Copy(&out, io.Discard, nil)
+	if !errors.Is(err, session.ErrDisconnected) || exit != nil {
+		t.Fatalf("exit=%+v err=%v, want ErrDisconnected and no exit", exit, err)
+	}
+	if out.Len() != total {
+		t.Fatalf("delivered %d of %d received bytes", out.Len(), total)
 	}
 }
 
