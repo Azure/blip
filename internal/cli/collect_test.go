@@ -59,7 +59,7 @@ func TestCollectFiles(t *testing.T) {
 
 	t.Run("single file", func(t *testing.T) {
 		dst := filepath.Join(t.TempDir(), "a.log")
-		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/a.log:"+dst)
+		code, _, errOut := h.collect("w1", "/home/dev/out/a.log:"+dst)
 		if code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
@@ -75,7 +75,7 @@ func TestCollectFiles(t *testing.T) {
 	t.Run("relative destination creates parents", func(t *testing.T) {
 		dir := t.TempDir()
 		t.Chdir(dir)
-		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/a.log:nested/deep/a.log")
+		code, _, errOut := h.collect("w1", "/home/dev/out/a.log:nested/deep/a.log")
 		if code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
@@ -92,7 +92,7 @@ func TestCollectFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Chdir(child)
-		if code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/a.log:../out/a.log"); code != 0 {
+		if code, _, errOut := h.collect("w1", "/home/dev/out/a.log:../out/a.log"); code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
 		if got := readFile(t, filepath.Join(base, "out/a.log")); got != "hello\n" {
@@ -103,7 +103,7 @@ func TestCollectFiles(t *testing.T) {
 
 	t.Run("directory", func(t *testing.T) {
 		dst := filepath.Join(t.TempDir(), "artifacts")
-		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out:"+dst)
+		code, _, errOut := h.collect("w1", "/home/dev/out:"+dst)
 		if code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
@@ -145,7 +145,7 @@ func TestCollectFiles(t *testing.T) {
 		t.Cleanup(func() { os.Chmod(roSrc, 0o755) })
 
 		dst := filepath.Join(t.TempDir(), "ro")
-		code, _, errOut := h.run("", "collect", "w1", "/home/dev/ro:"+dst)
+		code, _, errOut := h.collect("w1", "/home/dev/ro:"+dst)
 		if code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
@@ -179,7 +179,7 @@ func TestCollectFiles(t *testing.T) {
 		if err := os.Symlink(outside, filepath.Join(dest, "sub")); err != nil {
 			t.Fatal(err)
 		}
-		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/a.log:"+filepath.Join(dest, "sub/x"))
+		code, _, errOut := h.collect("w1", "/home/dev/out/a.log:"+filepath.Join(dest, "sub/x"))
 		if code != 1 || !strings.Contains(errOut, "symlink") {
 			t.Fatalf("code %d stderr %q", code, errOut)
 		}
@@ -188,7 +188,7 @@ func TestCollectFiles(t *testing.T) {
 		}
 		// A file copied to a symlinked directory follows it when stat'ing
 		// the destination, so the parent check has to run after that.
-		if code, _, _ := h.run("", "collect", "w1", "/home/dev/out/a.log:"+filepath.Join(dest, "sub")); code != 1 {
+		if code, _, _ := h.collect("w1", "/home/dev/out/a.log:"+filepath.Join(dest, "sub")); code != 1 {
 			t.Fatalf("code %d, want 1", code)
 		}
 		if _, err := os.Stat(filepath.Join(outside, "a.log")); !os.IsNotExist(err) {
@@ -202,7 +202,7 @@ func TestCollectFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		dst := filepath.Join(t.TempDir(), "passwd")
-		code, _, errOut := h.run("", "collect", "w1", "/home/dev/evil/passwd:"+dst)
+		code, _, errOut := h.collect("w1", "/home/dev/evil/passwd:"+dst)
 		if code != 1 || !strings.Contains(errOut, "escapes state") {
 			t.Fatalf("code %d stderr %q", code, errOut)
 		}
@@ -215,7 +215,7 @@ func TestCollectFiles(t *testing.T) {
 		if err := os.WriteFile(dst, []byte("old"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/a.log:"+dst); code != 0 {
+		if code, _, errOut := h.collect("w1", "/home/dev/out/a.log:"+dst); code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
 		if got := readFile(t, dst); got != "hello\n" {
@@ -223,7 +223,7 @@ func TestCollectFiles(t *testing.T) {
 		}
 		assertCollectReleased(t, h, "alice.box", "alice.w1")
 		// A file copied into an existing directory keeps its name.
-		if code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/a.log:"+dir); code != 0 {
+		if code, _, errOut := h.collect("w1", "/home/dev/out/a.log:"+dir); code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
 		if got := readFile(t, filepath.Join(dir, "a.log")); got != "hello\n" {
@@ -234,7 +234,7 @@ func TestCollectFiles(t *testing.T) {
 
 	t.Run("missing source releases mount", func(t *testing.T) {
 		dst := filepath.Join(t.TempDir(), "missing")
-		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/missing:"+dst)
+		code, _, errOut := h.collect("w1", "/home/dev/out/missing:"+dst)
 		if code != 1 || !strings.Contains(errOut, "collect /home/dev/out/missing") {
 			t.Fatalf("code %d stderr %q", code, errOut)
 		}
@@ -246,7 +246,7 @@ func TestCollectFiles(t *testing.T) {
 		if err := os.WriteFile(dst, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out:"+dst)
+		code, _, errOut := h.collect("w1", "/home/dev/out:"+dst)
 		if code != 1 || !strings.Contains(errOut, "not a directory") {
 			t.Fatalf("code %d stderr %q", code, errOut)
 		}
@@ -394,13 +394,9 @@ func TestCollectOwnRootState(t *testing.T) {
 	writeCollectFile(t, root, "alice.home", "/home/dev/x", "self\n", 0o644)
 
 	dst := filepath.Join(t.TempDir(), "x")
-	env := h.env(strings.NewReader(""), io.Discard, io.Discard)
-	var errOut strings.Builder
-	env.Err = &errOut
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if code := Main(ctx, env, []string{"collect", "w1", "/home/dev/x:" + dst}); code != 0 {
-		t.Fatalf("code %d: %s", code, errOut.String())
+	code, _, errOut := h.collect("w1", "/home/dev/x:"+dst)
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
 	}
 	if got := readFile(t, dst); got != "self\n" {
 		t.Fatalf("content = %q", got)
@@ -427,7 +423,7 @@ func TestCollectMultipleStatesAndOps(t *testing.T) {
 
 	dir := t.TempDir()
 	dst1, dst2 := filepath.Join(dir, "log"), filepath.Join(dir, "out.txt")
-	code, _, errOut := h.run("", "collect", "w1",
+	code, _, errOut := h.collect("w1",
 		"/home/dev/log:"+dst1, "/work/out.txt:"+dst2)
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
@@ -486,14 +482,15 @@ func TestCollectWaitsForState(t *testing.T) {
 
 	dst := filepath.Join(t.TempDir(), "done")
 	waiting := make(chan struct{}, 1)
-	env := h.env(strings.NewReader(""), io.Discard, writerFunc(func(p []byte) (int, error) {
+	var errOut strings.Builder
+	a := h.app(strings.NewReader(""), io.Discard, io.MultiWriter(writerFunc(func(p []byte) (int, error) {
 		select {
 		case waiting <- struct{}{}:
 		default:
 		}
 		return len(p), nil
-	}))
-	env.ProgressDelay = 0
+	}), &errOut))
+	a.env.ProgressDelay = 0
 	type result struct {
 		code   int
 		errOut string
@@ -502,9 +499,15 @@ func TestCollectWaitsForState(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	go func() {
-		var errOut strings.Builder
-		env.Err = io.MultiWriter(env.Err, &errOut)
-		done <- result{Main(ctx, env, []string{"collect", "w1", "/home/dev/done:" + dst}), errOut.String()}
+		code := 0
+		if err := a.collect(ctx, "w1", []string{"/home/dev/done:" + dst}); err != nil {
+			code = 1
+			var exit *ExitError
+			if errors.As(err, &exit) {
+				code = exit.Code
+			}
+		}
+		done <- result{code, errOut.String()}
 	}()
 	select {
 	case <-waiting:
@@ -964,7 +967,7 @@ func TestCollectBackToBackLoops(t *testing.T) {
 	dir := t.TempDir()
 	for i := range 10 {
 		dst := filepath.Join(dir, fmt.Sprintf("f%d", i))
-		code, _, errOut := h.run("", "collect", "w1", "/home/dev/out/f.txt:"+dst)
+		code, _, errOut := h.collect("w1", "/home/dev/out/f.txt:"+dst)
 		if code != 0 {
 			t.Fatalf("cycle %d: code %d: %s", i, code, errOut)
 		}

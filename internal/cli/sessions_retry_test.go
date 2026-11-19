@@ -6,13 +6,11 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Azure/blip/internal/session"
-	"github.com/Azure/blip/internal/session/fakeguest"
 	"github.com/Azure/blip/internal/wire"
 )
 
@@ -26,14 +24,12 @@ func shortenOpenRetry(t *testing.T, window, first time.Duration) {
 	})
 }
 
-func TestRunRetriesTransientVMErrors(t *testing.T) {
+// TestSessionsAttachRetriesTransientErrors covers the attach path that
+// gather --follow uses: temporary VM lifecycle failures are retried until the
+// session opens.
+func TestSessionsAttachRetriesTransientErrors(t *testing.T) {
 	shortenOpenRetry(t, 2*time.Second, time.Millisecond)
-	h := newHarness(t, state("workspace"))
-	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
-		s.Stdout("replay")
-		h.ctrl.set(func(c *fakeController) { c.exited["agent"] = 0 })
-		return wire.Exit{}
-	}
+	h := newHarness(t, runningBlip("agent"))
 	base := h.guest.Connect
 	var calls atomic.Int32
 	h.connect = func(ctx context.Context, namespace, pod string) (io.ReadWriteCloser, error) {
@@ -45,46 +41,40 @@ func TestRunRetriesTransientVMErrors(t *testing.T) {
 		return base(ctx, namespace, pod)
 	}
 
-	code, out, errOut := h.run("", "run", "agent", "--state", "workspace", "--", "true")
-	if code != 0 || out != "replay" {
-		t.Fatalf("code %d out %q err %q", code, out, errOut)
+	a := h.app(strings.NewReader(""), io.Discard, io.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, err := a.openPrimary(ctx, "agent", "pod-agent")
+	if err != nil {
+		t.Fatalf("openPrimary: %v", err)
 	}
+	s.Close()
 	if got := calls.Load(); got != 3 {
 		t.Fatalf("connect calls = %d, want 3", got)
 	}
-	if opens := h.guest.Opens(); len(opens) != 1 || opens[0].Open.Mode != wire.OpenAttach {
+	if opens := h.guest.Opens(); len(opens) != 1 || opens[0].Open.Mode != wire.OpenAttach || opens[0].Open.Session != wire.PrimarySession {
 		t.Fatalf("opens = %+v", opens)
 	}
 }
 
-func TestAttachRetryGivesUpWithLastError(t *testing.T) {
+func TestSessionsAttachRetryGivesUpWithLastError(t *testing.T) {
 	shortenOpenRetry(t, 40*time.Millisecond, 5*time.Millisecond)
-	h := newHarness(t, state("workspace"))
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		h.ctrl.set(func(c *fakeController) { c.exited["agent"] = 0 })
-	}()
-	var mu sync.Mutex
+	h := newHarness(t, runningBlip("agent"))
 	var attempts atomic.Int32
 	last := ""
 	h.connect = func(context.Context, string, string) (io.ReadWriteCloser, error) {
-		mu.Lock()
 		last = fmt.Sprintf("pod pod-agent exec: attempt %d: OCI runtime exec failed: error executing setns process: exit status 1", attempts.Add(1))
-		mu.Unlock()
 		return nil, errors.New(last)
 	}
 
+	a := h.app(strings.NewReader(""), io.Discard, io.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	start := time.Now()
-	code, _, errOut := h.run("", "run", "agent", "--state", "workspace", "--", "true")
+	_, err := a.openPrimary(ctx, "agent", "pod-agent")
 	elapsed := time.Since(start)
-	if code != 0 {
-		t.Fatalf("code %d err %q", code, errOut)
-	}
-	mu.Lock()
-	want := last
-	mu.Unlock()
-	if !strings.Contains(errOut, want) {
-		t.Fatalf("stderr %q does not contain the last error %q", errOut, want)
+	if err == nil || !strings.Contains(err.Error(), last) {
+		t.Fatalf("err %v does not contain the last error %q", err, last)
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("retry took %v, want a bounded wait", elapsed)

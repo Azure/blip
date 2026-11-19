@@ -2,13 +2,14 @@ package cli
 
 import (
 	"context"
-	"errors"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/Azure/blip/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
@@ -19,97 +20,182 @@ func TestRunForkOutsideGuestSnapshotsWorkspace(t *testing.T) {
 	base.Spec.Runtime = &v1alpha1.RuntimeDefaults{User: "dev", WorkingDir: "/work", Env: []v1alpha1.EnvVar{{Name: "A", Value: "base"}}}
 	base.Spec.Mounts = []v1alpha1.Mount{{State: "repo", Path: "/work", Writable: true}, {State: "tools", Path: "/tools"}, {State: "temporary", Path: "/tmp/collect", BlipUID: "previous"}}
 	h := newHarness(t, base, readyState("repo"), readyState("tools"))
-	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
+	code, out, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--env", "A=execution", "--user", "root", "--workdir", "/override", "--", "true")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if strings.TrimSpace(out) != "worker" {
+		t.Fatalf("output %q", out)
+	}
+	b, root := h.blip("worker"), h.state("worker")
+	if b.Spec.State != "worker" || b.Spec.User != "root" || root.Spec.CopyFrom != "base" || root.Spec.Runtime.User != "dev" || root.Spec.Runtime.Env[0].Value != "base" || root.Spec.Runtime.WorkingDir != "/work" {
+		t.Fatalf("blip %+v workspace %+v", b.Spec, root.Spec)
+	}
+	if len(root.Spec.Mounts) != 2 || root.Spec.Mounts[0].State == "repo" || root.Spec.Mounts[1].State != "tools" {
+		t.Fatalf("mounts: %+v", root.Spec.Mounts)
+	}
+	// The blip owns the copies, so its deletion frees them.
+	child := h.state(root.Spec.Mounts[0].State)
+	for _, st := range []*v1alpha1.BlipState{root, child} {
+		if len(st.OwnerReferences) != 1 || st.OwnerReferences[0].Name != "worker" {
+			t.Fatalf("workspace ownership: %+v", st.OwnerReferences)
+		}
+	}
+	// The snapshot exists before run returns, so a following fork starts from
+	// the same version.
+	if root.Status.Committed == nil {
+		t.Fatalf("workspace has no snapshot: %+v", root.Status)
+	}
+}
+
+func TestRunCreatesBlipBeforeItsOwnedStates(t *testing.T) {
+	h := newHarness(t, readyState("base"))
 	var creates []string
 	h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-		if b, ok := obj.(*v1alpha1.Blip); ok {
-			root := &v1alpha1.BlipState{}
-			if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: b.Spec.State}, root); err != nil {
-				t.Fatalf("execution before state: %v", err)
-			}
+		if _, ok := obj.(*v1alpha1.Blip); ok {
 			creates = append(creates, "blip")
 		} else {
 			creates = append(creates, "state")
 		}
 		return c.Create(ctx, obj, opts...)
 	}})
-	code, _, errOut := h.run("", "run", "worker", "--fork", "base", "--env", "A=execution", "--user", "root", "--workdir", "/override", "--", "true")
-	if code != 0 {
+	if code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--", "true"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	if !reflect.DeepEqual(creates, []string{"state", "state", "blip"}) {
+	if !reflect.DeepEqual(creates, []string{"blip", "state"}) {
 		t.Fatalf("create ordering: %v", creates)
 	}
-	b, root := h.blip("worker"), h.state("worker")
-	if b.Spec.State != "worker" || b.Spec.User != "root" || root.Spec.CopyFrom != "base" || root.Spec.Runtime.User != "dev" || root.Spec.Runtime.Env[0].Value != "base" || root.Spec.Runtime.WorkingDir != "/work" {
-		t.Fatalf("execution %+v workspace %+v", b.Spec, root.Spec)
+	// The states are owned by the blip, so deleting it frees them.
+	root := h.state("worker")
+	if len(root.OwnerReferences) != 1 || root.OwnerReferences[0].Name != "worker" || root.OwnerReferences[0].Kind != "Blip" {
+		t.Fatalf("owner references: %+v", root.OwnerReferences)
 	}
-	if len(root.Spec.Mounts) != 2 || root.Spec.Mounts[0].State == "repo" || root.Spec.Mounts[1].State != "tools" {
-		t.Fatalf("mounts: %+v", root.Spec.Mounts)
-	}
-	child := h.state(root.Spec.Mounts[0].State)
-	if child.Spec.CopyFrom != "repo" || len(child.OwnerReferences) != 0 || len(root.OwnerReferences) != 0 {
-		t.Fatalf("workspace ownership: %+v %+v", root, child)
-	}
-	if err := h.kube.Delete(context.Background(), b); err != nil {
-		t.Fatal(err)
-	}
-	h.state(root.Name)
-	h.state(child.Name)
 }
 
 func TestRunImportedBaseRequiresFork(t *testing.T) {
 	base := readyState("base")
 	base.Spec.Image = "registry/base:v1"
 	h := newHarness(t, base)
-	code, _, errOut := h.run("", "run", "worker", "--state", "base", "--", "true")
-	if code != 1 || !strings.Contains(errOut, "use --fork base") {
+	code, _, errOut := h.run("", "run", "--name", "worker", "--state", "base", "--", "true")
+	if code != 1 || !strings.Contains(errOut, "use --from base") {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	var b v1alpha1.Blip
 	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "worker"}, &b); !apierrors.IsNotFound(err) {
-		t.Fatalf("execution created: %v", err)
+		t.Fatalf("blip created: %v", err)
 	}
 }
 
-func TestRunForkKeepsWorkspaceOnExecutionCreateFailure(t *testing.T) {
-	h := newHarness(t, readyState("base"))
-	h.kube = interceptor.NewClient(h.kube, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-		if _, ok := obj.(*v1alpha1.Blip); ok {
-			return errors.New("execution denied")
-		}
-		return c.Create(ctx, obj, opts...)
-	}})
-	code, _, errOut := h.run("", "run", "worker", "--fork", "base", "--", "true")
-	if code != 1 || !strings.Contains(errOut, "execution denied") {
+func TestRunWithoutSourceOutsideBlip(t *testing.T) {
+	h := newHarness(t)
+	code, _, errOut := h.run("", "run", "--", "true")
+	if code != 1 || !strings.Contains(errOut, "--from or --state") {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	if root := h.state("worker"); root.Spec.CopyFrom != "base" || len(root.OwnerReferences) != 0 {
-		t.Fatalf("workspace %+v", root)
+}
+
+func TestRunForkFailureRemovesBlip(t *testing.T) {
+	// The source exists but is being deleted, so the fork is rejected.
+	gone := readyState("gone")
+	now := metav1.Now()
+	gone.DeletionTimestamp = &now
+	gone.Finalizers = []string{"test"}
+	h := newHarness(t, gone)
+	code, _, errOut := h.run("", "run", "--name", "worker", "--from", "gone", "--", "true")
+	if code != 1 || !strings.Contains(errOut, "being deleted") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	var b v1alpha1.Blip
+	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "worker"}, &b); !apierrors.IsNotFound(err) {
+		t.Fatalf("blip kept after failed fork: %v", err)
 	}
 }
 
-func TestOwnedForkSourceResolution(t *testing.T) {
-	for _, own := range []bool{false, true} {
-		t.Run(map[bool]string{false: "shared", true: "owned preferred"}[own], func(t *testing.T) {
-			base := readyState("base")
-			base.Spec.Image = "registry/base:v1"
-			objects := []client.Object{ownedBlip("alice.box", "alice.home"), base}
-			want := "base"
-			if own {
-				objects = append(objects, readyState("alice.base"))
-				want = "alice.base"
-			}
-			h := newHarness(t, objects...)
-			h.self = "alice.box"
-			h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
-			code, _, errOut := h.run("", "run", "worker", "--fork", "base", "--", "true")
-			if code != 0 {
-				t.Fatalf("code %d: %s", code, errOut)
-			}
-			if st := h.state("alice.worker"); st.Spec.CopyFrom != want || st.Labels[v1alpha1.LabelOwner] != "alice" {
-				t.Fatalf("fork %+v", st)
-			}
-		})
+func TestRunInsideBlipDefaultsToCallerRoot(t *testing.T) {
+	box := ownedBlip("alice.box", "alice.home")
+	box.Spec.Pool = "big"
+	h := newHarness(t, box)
+	h.self = "alice.box"
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := h.run("", "run", "--", "true")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	name := strings.TrimSpace(out)
+	if !strings.HasPrefix(name, "box-") {
+		t.Fatalf("auto name %q", name)
+	}
+	b := h.blip("alice." + name)
+	if b.Spec.State != "alice."+name || b.Spec.Pool != "big" || b.Spec.WorkingDir != cwd {
+		t.Fatalf("blip %+v", b.Spec)
+	}
+	if b.Spec.Command[0] != "true" {
+		t.Fatalf("command %v", b.Spec.Command)
+	}
+	if b.Labels[v1alpha1.LabelParent] != "box" || b.Labels[v1alpha1.LabelOwner] != "alice" {
+		t.Fatalf("labels %v", b.Labels)
+	}
+	if len(b.OwnerReferences) != 1 || b.OwnerReferences[0].Name != "alice.box" {
+		t.Fatalf("owner references %+v", b.OwnerReferences)
+	}
+	root := h.state("alice." + name)
+	if root.Spec.CopyFrom != "alice.home" || len(root.OwnerReferences) != 1 || root.OwnerReferences[0].Name != "alice."+name {
+		t.Fatalf("fork %+v", root)
+	}
+	if b.Spec.ActiveDeadlineSeconds == nil || *b.Spec.ActiveDeadlineSeconds != int64(defaultForkTimeout.Seconds()) {
+		t.Fatalf("deadline %v", b.Spec.ActiveDeadlineSeconds)
+	}
+	if b.Spec.TTLSecondsAfterFinished == nil || *b.Spec.TTLSecondsAfterFinished != int32(defaultForkTTL.Seconds()) {
+		t.Fatalf("ttl %v", b.Spec.TTLSecondsAfterFinished)
+	}
+}
+
+func TestRunKeepLeavesWorkspaceOwnedByNobody(t *testing.T) {
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"))
+	h.self = "alice.box"
+	h.run("", "run", "--name", "w1", "--keep", "--ttl", "0", "--timeout", "0", "--", "true")
+	b := h.blip("alice.w1")
+	if len(b.OwnerReferences) != 0 {
+		t.Fatalf("blip owner references %+v", b.OwnerReferences)
+	}
+	if b.Spec.TTLSecondsAfterFinished != nil || b.Spec.ActiveDeadlineSeconds != nil {
+		t.Fatalf("lifetime %+v", b.Spec)
+	}
+	if root := h.state("alice.w1"); len(root.OwnerReferences) != 0 {
+		t.Fatalf("state owner references %+v", root.OwnerReferences)
+	}
+}
+
+func TestRunLabelsAndNameCollision(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	if code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--label", "team=a", "--", "true"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if b := h.blip("worker"); b.Labels["team"] != "a" {
+		t.Fatalf("labels %v", b.Labels)
+	}
+	code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--", "true")
+	if code != 1 || !strings.Contains(errOut, "already exists") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	code, _, errOut = h.run("", "run", "--name", "worker2", "--label", "blip.dev/owner=x", "--", "true")
+	if code != 1 || !strings.Contains(errOut, "reserved") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+}
+
+func TestRunSurfacesForkStateFailure(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	h.ctrl.set(func(c *fakeController) { c.stateFail = "no space left" })
+	code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--", "true")
+	if code != 1 || !strings.Contains(errOut, "no space left") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	var b v1alpha1.Blip
+	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "worker"}, &b); !apierrors.IsNotFound(err) {
+		t.Fatalf("blip kept after failed fork: %v", err)
 	}
 }

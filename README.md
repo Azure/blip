@@ -4,9 +4,10 @@
 
 Blip runs workloads in VMs backed by durable **BlipStates**. A **Blip** is one
 execution of one required command; deleting it saves and releases its writable
-filesystems. States remain until you explicitly delete them.
+filesystems. States remain until you delete them, or are removed with the Blip
+that owns them.
 
-## Pull, fork, and reuse
+## Run, gather, and reuse
 
 With Blip installed on your cluster and `kubectl-blip` on your `PATH`:
 
@@ -14,23 +15,54 @@ With Blip installed on your cluster and `kubectl-blip` on your `PATH`:
 # Import an OCI image once as a read-only template.
 kubectl blip pull base ubuntu:24.04
 
-# Fork a private root state named workspace and run a command in it.
-kubectl blip run workspace --fork base -- sh -c 'echo kept > /root/notes.txt'
+# Start a command in a fork of base. run returns at once with the blip's name.
+kubectl blip run --name hello --from base -- sh -c 'echo kept > /root/notes.txt'
 
-# Delete the execution, then use the same root in a differently named execution.
-kubectl delete blip workspace
-kubectl blip run next --state workspace -- cat /root/notes.txt
+# Wait for it, report its exit code, collect results, and delete it with its
+# workspace.
+kubectl blip gather hello
+
+# Keep a durable workspace instead: --keep leaves the fork behind.
+kubectl blip run --name workspace --from base --keep -- sleep infinity
+kubectl delete blip workspace    # the workspace state survives
+kubectl blip run --name next --state workspace -- cat /root/notes.txt
+kubectl blip gather next
 
 # Explicit cleanup when the workspace is no longer needed.
-kubectl delete blip next
 kubectl delete blipstate workspace base
 ```
 
-Every run selects either `--fork SOURCE_STATE` to create a private workspace named
-after the new Blip, or `--state WORKSPACE` to reuse an existing writable root.
-Import OCI images with `blip pull BASE OCI_REF`; imported image states are
-read-only templates and must be copied before use as a root or writable mount.
-Only one execution can write a given state at a time.
+`run` selects `--from SOURCE` to create a private workspace named after the new
+Blip, or `--state WORKSPACE` to reuse an existing writable root. Import OCI
+images with `blip pull BASE OCI_REF`; imported image states are read-only
+templates and must be copied before use as a root or writable mount. Only one
+execution can write a given state at a time.
+
+A Blip owns the workspace it forks, so deleting the Blip frees it. `--keep`
+leaves the workspace in place. Inside a blip, `--timeout` (default 2h) stops a
+command whose caller disappeared, and `--ttl` (default 1h after it finishes)
+deletes a blip nobody gathered.
+
+## Fanning out from a blip
+
+Inside a blip, `run` needs no source: it forks the caller's own root, keeps the
+caller's working directory and pool, and names the blip after the caller.
+`gather` with no arguments then targets the forks that blip started:
+
+```sh
+for i in 1 2 3; do
+  blip run --name "w$i" --from / -w "$PWD" -- sh -c "./task $i"
+done
+blip gather --collect "git:$PWD:{name}" --collect "$PWD/out:./out/{name}"
+```
+
+Each `run` returns as soon as its fork's snapshot is committed, each fork sees
+the same starting files, and changes stay private to their fork. `gather`
+waits for all of them, prints `blip/NAME Phase (exit N)` for each, fetches each
+blip's branch or files, and deletes each blip with its workspace. `-f` streams
+a running fork's output; `--any` returns on the first finish; `--wait` bounds
+the wait; a fork whose command failed or whose results could not be collected
+is kept for inspection until its TTL (1h by default) deletes it.
 
 ## Durable workspace configuration
 
@@ -45,7 +77,7 @@ metadata:
 spec:
   copyFrom: base
   mounts:
-    - state: data # Create this state first, e.g. blip create blipstate data.
+    - state: data # Create it first, e.g. blip mount --new data:/work:rw --size 20Gi.
       path: /work
       writable: true
   runtime:
@@ -57,15 +89,19 @@ spec:
     network: {} # Deny outbound traffic; omit to inherit the pool policy.
 ```
 
-`blip mount data workspace --path /work --write` adds a persistent mount;
-`blip unmount data workspace` removes it. Mounts follow the root state into later
-executions, including differently named Blips. Runtime
-defaults override imported image metadata; per-execution overrides take
-precedence. `network` narrows the pool's egress policy.
+`blip mount data:/work:rw --root workspace` adds a persistent mount;
+`blip mount --rm data --root workspace` removes it. `blip mount
+--new cache:/cache:rw --size 20Gi --root workspace` creates a state and mounts
+it, and `blip mount --root workspace` lists the mounts. Inside a blip, `--root`
+defaults to that blip's own root. Mounts follow the root state into later
+executions, including differently named Blips. Runtime defaults override
+imported image metadata; per-execution overrides take precedence. `network`
+narrows the pool's egress policy.
 
 Forking a workspace copies its root, runtime defaults, and writable auxiliary
-states, and shares read-only auxiliary states. These states also survive deletion
-of the fork's execution. A Blip manifest selects its root with `spec.state`.
+states, and shares read-only auxiliary states. These states are owned by the
+fork's Blip, so they are removed with it. A Blip manifest selects its root with
+`spec.state`.
 
 ## Implementation outline
 
@@ -83,7 +119,8 @@ Pod as node-local, replicated, encrypted block storage.
   3), `nodeSelector`. `mounts` and `runtime` persist across executions.
   Image states are read-only templates held by every eligible node.
 - **`Blip`** — one VM lifetime: root `state`, one required command, env, workdir,
-  user, TTY, `stop` flag, and per-execution network narrowing.
+  user, TTY, `stop` flag, `activeDeadlineSeconds` and `ttlSecondsAfterFinished`
+  expiry, and per-execution network narrowing.
 - **`BlipNode`** — cluster-scoped node inventory: endpoint, hypervisors,
   incarnation, heartbeat, drain and safe-to-remove state.
 
@@ -169,23 +206,30 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 
 ### CLI
 
-- Every Blip runs one required command. `kubectl-blip run NAME -- CMD [ARG...]`
-  creates the Blip, streams the command's output, and exits with its exit code.
-  `--fork SOURCE_STATE` copies a workspace and `--state WORKSPACE` reuses one.
-  `exec` runs additional commands in a running Blip; `wait`, `pull`,
-  `create blipstate`, `mount`, `unmount`, and `collect` cover the rest. It
-  reaches a VM through Kubernetes pod exec (`blip-runtime bridge 1025`,
-  WebSocket with SPDY fallback), then the framed vsock protocol.
+- `kubectl-blip run` creates a Blip and returns its name as soon as its
+  workspace snapshot is committed; `gather` waits for blips, reports their exit
+  codes, collects files and git commits, and deletes them. `exec` runs
+  additional commands in a running Blip, `mount` manages states and mounts, and
+  `pull` imports images. It reaches a VM through Kubernetes pod exec
+  (`blip-runtime bridge 1025`, WebSocket with SPDY fallback), then the framed
+  vsock protocol.
+- `gather -f` tails a running command's output, and the guest mirrors the
+  primary command's output to the VM serial console, so `kubectl logs` shows it
+  too. Output is not retained beyond the 1 MiB replay ring.
 - A finished Blip is kept as Succeeded or Failed so its status and exit code
-  remain visible. The controller garbage-collects old finished Blips past a
-  count threshold (1000 by default), oldest `status.finishTime` first; states
-  remain until you delete them.
+  remain visible, and `gather` reports the command's exit code. The controller
+  deletes a Blip `spec.ttlSecondsAfterFinished` after it finishes and
+  garbage-collects old finished Blips past a count threshold (1000 by default),
+  oldest `status.finishTime` first; states remain until you delete them or their
+  owning Blip is deleted.
+- `spec.activeDeadlineSeconds` stops a command that has run too long, as if
+  `spec.stop` were set. `blip run` sets it from `--timeout`.
 - `blip-controller` is its own image; the node agent, VM runtime, and dev
   sandbox are separate images.
 
 ## Local development
 
 `hack/kind-up.sh` builds and installs a local kind cluster and prints connection
-examples. `hack/e2e.sh` exercises durable workspace reuse, forks, collection,
-and command exit codes against that cluster. Tear it down with `hack/kind-down.sh`
+examples. `hack/e2e.sh` exercises durable workspace reuse, concurrent forks,
+gathering, deadlines, and command exit codes against that cluster. Tear it down with `hack/kind-down.sh`
 (`--purge` also discards local storage).

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end tests against the kind cluster from hack/kind-up.sh. Everything
-# runs from the host through the CLI in the default namespace: pull and fork, a
-# plain command with exit-code propagation, a durable workspace whose files and
-# mount topology survive deletion of its execution, and collection of commits
-# and files from forked workers.
+# runs from the host through the CLI in the default namespace: pull a base,
+# run commands in forked workspaces, gather their exit codes and results, a
+# durable workspace whose files and mount topology survive deletion of its
+# execution, and concurrent forks gathered by the blip that started them.
 # Guest commands intentionally expand variables inside the VM.
 # shellcheck disable=SC2016
 set -euo pipefail
@@ -19,47 +19,18 @@ blip() { timeout "$T" bin/kubectl-blip --context "$CONTEXT" "$@"; }
 k() { timeout "$T" kubectl --context "$CONTEXT" "$@"; }
 t0=$SECONDS
 step() { printf '\n== [%3ds] %s\n' "$((SECONDS - t0))" "$*"; }
+work=$(mktemp -d)
 
-# Background `blip run` processes. They stream the primary command, so an
-# exec-style check starts a long-running command instead of detaching.
-pids=()
-pid=
 cleanup() {
-	local p
-	for p in "${pids[@]:-}"; do
-		[ -n "$p" ] || continue
-		kill "$p" 2>/dev/null || true
-		wait "$p" 2>/dev/null || true
-	done
 	k delete blip --ignore-not-found --timeout="${T}s" \
-		"$P-hello" "$P-agent" "$P-resumed" "$P-collector" "$P-w1" "$P-w2" >/dev/null 2>&1 || true
+		"$P-hello" "$P-agent" "$P-resumed" "$P-collector" "$P-w1" "$P-w2" "$P-slow" "$P-stopped" >/dev/null 2>&1 || true
 	k delete blipstate --ignore-not-found --timeout="${T}s" \
-		"$P-base" "$P-hello" "$P-workspace" "$P-data" "$P-collector" "$P-w1" "$P-w2" >/dev/null 2>&1 || true
-}
-stop_run() {
-	[ -n "${pid:-}" ] || return 0
-	kill "$pid" 2>/dev/null || true
-	wait "$pid" 2>/dev/null || true
-	pid=
+		"$P-base" "$P-hello" "$P-workspace" "$P-data" "$P-collector" "$P-w1" "$P-w2" "$P-slow" "$P-stopped" >/dev/null 2>&1 || true
 }
 
 cleanup
 trap 'echo FAILED' ERR
-trap 'stop_run; cleanup' EXIT
-
-wait_running() {
-	local name=$1 i
-	for ((i = 0; i < 120; i++)); do
-		if [ "$(k get blip "$name" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ] &&
-			[ -n "$(k get blip "$name" -o jsonpath='{.status.pod}' 2>/dev/null)" ]; then
-			return 0
-		fi
-		sleep 1
-	done
-	echo "blip $name did not start"
-	k get blip "$name" -o yaml >&2 || true
-	return 1
-}
+trap 'cleanup; rm -rf "$work"' EXIT
 
 wait_state() {
 	local name=$1 i
@@ -72,29 +43,42 @@ wait_state() {
 	return 1
 }
 
-step "pull a template and fork it for a plain command"
-blip pull "$P-base" "$IMG"
-if out=$(blip run "$P-hello" --fork "$P-base" -- sh -c 'echo hello from $(hostname); exit 7' 2>&1); then
-	echo "expected the command to fail"
-	exit 1
-else
-	code=$?
-fi
-test "$code" -eq 7
-grep -q '^hello from ' <<<"$out"
-k delete blip "$P-hello" >/dev/null
-test "$(k get blipstate "$P-hello" -o jsonpath='{.spec.copyFrom}')" = "$P-base"
-test -z "$(k get blipstate "$P-hello" -o jsonpath='{.metadata.ownerReferences}')"
+# wait_state_gone waits for garbage collection to remove a state.
+wait_state_gone() {
+	local name=$1 i
+	for ((i = 0; i < 120; i++)); do
+		k get blipstate "$name" >/dev/null 2>&1 || return 0
+		sleep 1
+	done
+	echo "state $name was not removed"
+	k get blipstate "$name" -o yaml >&2 || true
+	return 1
+}
 
-step "configure a durable root with writable and read-only mounts"
-blip create blipstate "$P-workspace" --from "$P-base"
-blip create blipstate "$P-data" --size 1Gi
+step "pull a template"
+blip pull "$P-base" "$IMG"
+
+step "run a command, then gather its exit code and free its workspace"
+out=$(blip run --name "$P-hello" --from "$P-base" -- sh -c 'echo hello from $(hostname); exit 7')
+test "$out" = "$P-hello"
+test "$(k get blipstate "$P-hello" -o jsonpath='{.metadata.ownerReferences[0].kind}')" = Blip
+test "$(k get blipstate "$P-hello" -o jsonpath='{.status.committed.id}')" != ""
+if blip gather "$P-hello" >"$work/gather.out" 2>&1; then
+	echo "expected gather to report a failed command"
+	exit 1
+fi
+grep -q 'Failed (exit 7)' "$work/gather.out"
+wait_state_gone "$P-hello"
+
+step "create a durable workspace that outlives its execution"
+test "$(blip run --name "$P-workspace" --from "$P-base" --keep -- sleep infinity)" = "$P-workspace"
+k delete blip "$P-workspace" >/dev/null
+wait_state "$P-workspace"
+blip mount --new "$P-data:/work:rw" --size 1Gi --root "$P-workspace"
+blip mount "$P-base:/opt/base:ro" --root "$P-workspace"
+blip mount --root "$P-workspace" | grep -q "$P-data:/work (writable)"
 k patch blipstate "$P-workspace" --type merge -p "{
   \"spec\": {
-    \"mounts\": [
-      {\"state\": \"$P-data\", \"path\": \"/work\", \"writable\": true},
-      {\"state\": \"$P-base\", \"path\": \"/opt/base\", \"writable\": false}
-    ],
     \"runtime\": {
       \"env\": [{\"name\": \"DURABLE_WORKSPACE\", \"value\": \"kept\"}],
       \"workingDir\": \"/work\",
@@ -108,10 +92,9 @@ data_uid=$(k get blipstate "$P-data" -o jsonpath='{.metadata.uid}')
 root_commit=$(k get blipstate "$P-workspace" -o jsonpath='{.status.committed.id}')
 data_commit=$(k get blipstate "$P-data" -o jsonpath='{.status.committed.id}')
 config=$(k get blipstate "$P-workspace" -o jsonpath='{.spec.mounts}{.spec.runtime}')
-blip run "$P-agent" --state "$P-workspace" -- sleep infinity &
-pid=$!
-pids+=("$pid")
-wait_running "$P-agent"
+
+step "run the workspace, then delete the execution; its states remain"
+blip run --name "$P-agent" --state "$P-workspace" -- sleep infinity
 blip exec "$P-agent" -- sh -ec '
   test "$DURABLE_WORKSPACE" = kept
   test "$PWD" = /work
@@ -121,10 +104,7 @@ blip exec "$P-agent" -- sh -ec '
   test -x /opt/base/bin/sh
   sync
 '
-
-step "delete the live execution; its root and auxiliary states remain"
 k delete blip "$P-agent" >/dev/null
-stop_run
 wait_state "$P-workspace"
 wait_state "$P-data"
 test "$(k get blipstate "$P-workspace" -o jsonpath='{.metadata.uid}')" = "$root_uid"
@@ -134,10 +114,7 @@ test "$(k get blipstate "$P-data" -o jsonpath='{.status.committed.id}')" != "$da
 test "$(k get blipstate "$P-workspace" -o jsonpath='{.spec.mounts}{.spec.runtime}')" = "$config"
 
 step "a differently named execution restores files, topology, and runtime defaults"
-blip run "$P-resumed" --state "$P-workspace" -- sleep infinity &
-pid=$!
-pids+=("$pid")
-wait_running "$P-resumed"
+blip run --name "$P-resumed" --state "$P-workspace" -- sleep infinity
 blip exec "$P-resumed" -- sh -ec '
   test "$(cat /root/kept.txt)" = root-kept
   test "$(cat /work/kept.txt)" = rw-kept
@@ -156,14 +133,10 @@ test "$(k get blipstate "$P-workspace" -o jsonpath='{.status.writer.blipName}')"
 test "$(k get blipstate "$P-data" -o jsonpath='{.status.writer.blipName}')" = "$P-resumed"
 test -z "$(k get blipstate "$P-base" -o jsonpath='{.status.writer}')"
 k delete blip "$P-resumed" >/dev/null
-stop_run
 wait_state "$P-workspace"
 
-step "fork workers from a long-running collector and collect their branches and files"
-blip run "$P-collector" --fork "$P-base" -- sleep infinity &
-pid=$!
-pids+=("$pid")
-wait_running "$P-collector"
+step "fork concurrently inside a blip and gather branches, files, and logs"
+blip run --name "$P-collector" --from "$P-base" -- sleep infinity
 blip exec "$P-collector" -e FORK_MAX="$FORK_MAX" -e W="$P" -- bash -ec '
   set -euo pipefail
   git config --global user.email a@example.com
@@ -173,44 +146,43 @@ blip exec "$P-collector" -e FORK_MAX="$FORK_MAX" -e W="$P" -- bash -ec '
   head -c 1G /dev/urandom > big.bin
   git -c core.compression=0 add -A && git commit -qm init
   echo uncommitted > notes.txt
-  setsid sleep 100000 </dev/null >/dev/null 2>&1 &
-  echo $! > ~/sleeper
-  workers=
+  # run returns once the fork is snapshotted; the command itself keeps going.
+  declare -A start=()
   for i in 1 2; do
-    (
-      start=$(date +%s%N)
-      echo "$start" > ~/start.w$i
-      # The commit message records when the command started inside the worker.
-      blip run "$W-w$i" --fork / -w "$PWD" -- sh -c "t=\$(date +%s%N) && test \"\$(cat notes.txt)\" = uncommitted && git switch -qc w$i && ./task.sh $i && git add tasks.txt && git commit -qm \$t"
-      echo "$W-w$i done after $((($(date +%s%N) - start) / 1000000))ms (including save)"
-    ) &
-    workers="$workers $!"
+    start[$i]=$(date +%s%N)
+    blip run --name "$W-w$i" --from / -w "$PWD" -- sh -c "t=\$(date +%s%N) && test \"\$(cat notes.txt)\" = uncommitted && git switch -qc w$i && ./task.sh $i && git add tasks.txt && git commit -qm \$t"
   done
-  for p in $workers; do wait "$p"; done
+  # A follower sees the output of a command that is still running.
+  blip run --name "$W-slow" --from / -w "$PWD" -- sh -c "sleep 2; echo slow-output"
+  blip gather "$W-slow" -f > slow.log
+  grep -q "slow| slow-output" slow.log
+  # A server-side deadline stops a fork nobody waits for forever.
+  blip run --name "$W-stopped" --timeout 2s --from / -w "$PWD" -- sh -c "git switch -qc stopped && sleep 100"
+  blip gather "$W-stopped" --collect "git:$PWD:stopped" > stopped.out
+  grep -q "DeadlineExceeded" stopped.out
+  # Gather waits for the workers, fetches each branch, and deletes each blip
+  # with its workspace.
+  blip gather "$W-w1" --collect "git:$PWD:w1" --collect "$PWD/tasks.txt:./tasks.w1.txt" \
+    --collect "$PWD/task.sh:./collected/task.sh"
+  blip gather "$W-w2" --collect "git:$PWD:w2"
   for i in 1 2; do
-    blip collect "$W-w$i" "git:$PWD:w$i"
     test "$(git show w$i:tasks.txt)" = "task $i"
-    ms=$((($(git log -1 --format=%s w$i) - $(cat ~/start.w$i)) / 1000000))
-    rm ~/start.w$i
-    echo "fork $W-w$i: command started after ${ms}ms"
-    [ "$ms" -le $((FORK_MAX * 1000)) ] || { echo "fork $W-w$i took longer than ${FORK_MAX}s"; exit 1; }
+    ms=$((($(git log -1 --format=%s w$i) - ${start[$i]}) / 1000000))
+    echo "fork w$i: command started after ${ms}ms"
+    [ "$ms" -le $((FORK_MAX * 1000)) ] || { echo "fork w$i took longer than ${FORK_MAX}s"; exit 1; }
   done
   test ! -e tasks.txt
   test "$(git status --porcelain)" = "?? notes.txt"
-  # Collect a file and a directory out of a worker state.
-  blip collect "$W-w1" "$PWD/tasks.txt:./tasks.w1.txt"
   test "$(cat tasks.w1.txt)" = "task 1"
-  mkdir -p collected
-  blip collect "$W-w1" "$PWD/task.sh:./collected/task.sh"
   test -x collected/task.sh
-  rm -rf tasks.w1.txt collected
+  rm -rf tasks.w1.txt collected slow.log stopped.out
   git log --oneline --all
-  kill -0 "$(cat ~/sleeper)"
-  if blip collect "$W-w9" "git:$PWD:w9" 2>/dev/null; then echo "collect from a missing worker succeeded"; exit 1; fi
+  if blip gather "$W-w9" --collect "git:$PWD:w9" 2>/dev/null; then echo "gather of a missing worker succeeded"; exit 1; fi
 '
 k delete blip "$P-collector" >/dev/null
-stop_run
-# Finished executions are kept for their status and garbage-collected later.
-k wait --for=jsonpath='{.status.phase}'=Succeeded --timeout "${T}s" blip "$P-w1" "$P-w2" >/dev/null
+# The workers were deleted by gather, and their owned states go with them.
+for w in w1 w2 slow stopped; do
+	wait_state_gone "$P-$w"
+done
 
 echo "PASSED in $((SECONDS - t0))s"

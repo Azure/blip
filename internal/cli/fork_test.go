@@ -30,24 +30,26 @@ func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	h := newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.repo"))
 	h.self = "alice.box"
 	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
-	code, _, errOut := h.run("", "run", "w1", "--state", "repo", "--", "true")
+	code, out, errOut := h.run("", "run", "--name", "w1", "--state", "repo", "--", "true")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if strings.TrimSpace(out) != "w1" {
+		t.Fatalf("output %q", out)
 	}
 	b := h.blip("alice.w1")
 	if b.Labels[v1alpha1.LabelOwner] != "alice" || b.Spec.State != "alice.repo" {
 		t.Fatalf("labels %v spec %+v", b.Labels, b.Spec)
 	}
-	code, out, _ := h.run("", "wait", "alice.w1")
-	if code != 0 || !strings.HasPrefix(out, "blip/w1 Succeeded") {
-		t.Fatalf("code %d out %q", code, out)
+	if fin := h.waitBlip("alice.w1"); fin.Status.Phase != v1alpha1.BlipSucceeded {
+		t.Fatalf("phase %q", fin.Status.Phase)
 	}
 
 	// The separator is always ".", whatever the caller's own name.
 	h2 := newHarness(t, ownedBlip("alice-box", "alice.home"))
 	h2.self = "alice-box"
 	h2.ctrl.set(func(c *fakeController) { c.autoFinish = true })
-	if code, _, errOut := h2.run("", "run", "w1", "--fork", "home", "--", "true"); code != 0 {
+	if code, _, errOut := h2.run("", "run", "--name", "w1", "--from", "home", "--", "true"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	h2.blip("alice.w1")
@@ -56,7 +58,7 @@ func TestSelfScopesNamesAndLabelsObjects(t *testing.T) {
 	h3 := newHarness(t, runningBlip("agent"))
 	h3.self = "agent"
 	h3.ctrl.set(func(c *fakeController) { c.autoFinish = true })
-	if code, _, errOut := h3.run("", "run", "w1", "--fork", "agent-root", "--", "true"); code != 0 {
+	if code, _, errOut := h3.run("", "run", "--name", "w1", "--from", "agent-root", "--", "true"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	if b := h3.blip("w1"); b.Labels[v1alpha1.LabelOwner] != "" {
@@ -72,20 +74,30 @@ func TestForkRoot(t *testing.T) {
 	h := newHarness(t, self, home)
 	h.self = "alice.box"
 	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
-	code, _, errOut := h.run("", "run", "w1", "--fork", "/", "--", "sh", "-c", "make")
+	code, _, errOut := h.run("", "run", "--name", "w1", "--from", "/", "--", "sh", "-c", "make")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 	b := h.blip("alice.w1")
-	if b.Spec.State != "alice.w1" || b.Spec.Pool != "big" || b.Spec.User != "" || b.Spec.WorkingDir != "" {
+	// Inside a blip the working directory defaults to the caller's cwd.
+	if b.Spec.State != "alice.w1" || b.Spec.Pool != "big" || b.Spec.User != "" || b.Spec.WorkingDir != cwd {
 		t.Fatalf("spec = %+v", b.Spec)
 	}
 	s := h.state("alice.w1")
 	if s.Spec.CopyFrom != "alice.home" || s.Spec.Replicas != 0 || s.Labels[v1alpha1.LabelOwner] != "alice" || s.Spec.Runtime.User != "workspace-user" {
 		t.Fatalf("state = %+v %v", s.Spec, s.Labels)
 	}
-	if refs := s.OwnerReferences; len(refs) != 0 {
+	// The fork is owned by the blip so deleting it frees the workspace.
+	if refs := s.OwnerReferences; len(refs) != 1 || refs[0].Kind != "Blip" || refs[0].Name != "alice.w1" {
 		t.Fatalf("owner refs = %+v", refs)
+	}
+	// run returns only after the fork's first snapshot is committed.
+	if s.Status.Committed == nil {
+		t.Fatalf("workspace has no snapshot: %+v", s.Status)
 	}
 }
 
@@ -93,8 +105,8 @@ func TestForkCreatesNothingOnStateFailure(t *testing.T) {
 	// An existing state of the worker's name is not reused.
 	h := newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.home"), readyState("alice.w1"))
 	h.self = "alice.box"
-	code, _, errOut := h.run("", "run", "w1", "--fork", "/", "--", "true")
-	if code != 1 || !strings.Contains(errOut, `workspace "w1" already exists`) {
+	code, _, errOut := h.run("", "run", "--name", "w1", "--from", "/", "--", "true")
+	if code != 1 || !strings.Contains(errOut, `state for blip "w1" already exists`) {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	var b v1alpha1.Blip
@@ -111,7 +123,7 @@ func TestForkCreatesNothingOnStateFailure(t *testing.T) {
 		}
 		return c.Create(ctx, obj, opts...)
 	}})
-	code, _, errOut = h.run("", "run", "w1", "--fork", "/", "--", "true")
+	code, _, errOut = h.run("", "run", "--name", "w1", "--from", "/", "--", "true")
 	if code != 1 || !strings.Contains(errOut, "denied") {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
@@ -127,10 +139,10 @@ func TestForkRejections(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"", []string{"run", "x", "--fork", "/", "--", "true"}, "--fork / only works inside a blip"},
-		{"alice.box", []string{"run", "x", "--fork", "/", "--state", "s", "--", "true"}, "exactly one of --state"},
-		{"alice.box", []string{"run", "x", "--fork", "/", "--image", "i", "--", "true"}, "unknown flag: --image"},
-		{"alice.box", []string{"run", "x", "--fork", "missing", "--", "true"}, `state "missing" not found`},
+		{"", []string{"run", "--name", "x", "--from", "/", "--", "true"}, "--from / only works inside a blip; use --from SOURCE"},
+		{"alice.box", []string{"run", "--name", "x", "--from", "/", "--state", "s", "--", "true"}, "set only one of --from and --state"},
+		{"alice.box", []string{"run", "--name", "x", "--from", "/", "--image", "i", "--", "true"}, "unknown flag: --image"},
+		{"alice.box", []string{"run", "--name", "x", "--from", "missing", "--", "true"}, `state "missing" not found`},
 	} {
 		h.self = tc.self
 		code, _, errOut := h.run("", tc.args...)
@@ -147,15 +159,15 @@ func TestForkRejections(t *testing.T) {
 
 func TestMountDefaultsToSelf(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"), readyState("repo"))
-	code, _, errOut := h.run("", "mount", "repo", "--path", "/work")
-	if code != 1 || !strings.Contains(errOut, "ROOT_STATE is required outside a blip") {
+	code, _, errOut := h.run("", "mount", "repo:/work")
+	if code != 1 || !strings.Contains(errOut, "--root is required outside a blip") {
 		t.Fatalf("code %d err %q", code, errOut)
 	}
 	h.self = "agent"
-	if code, _, errOut := h.run("", "mount", "repo", "--path", "/work"); code != 0 {
+	if code, _, errOut := h.run("", "mount", "repo:/work"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
-	if code, _, errOut := h.run("", "unmount", "repo"); code != 0 {
+	if code, _, errOut := h.run("", "mount", "--rm", "repo"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 }
@@ -172,7 +184,7 @@ func TestFindSelfReportsForbidden(t *testing.T) {
 			return c.Get(ctx, key, obj, opts...)
 		},
 	})
-	code, _, errOut := h.run("", "mount", "repo", "--path", "/work")
+	code, _, errOut := h.run("", "mount", "repo:/work")
 	if code != 1 || !strings.Contains(errOut, `cannot read blip "agent"`) || !strings.Contains(errOut, "forbidden") {
 		t.Fatalf("code %d stderr %q", code, errOut)
 	}
@@ -279,7 +291,7 @@ func TestCollectMountSharesAndReusesMounts(t *testing.T) {
 	waitForCond(t, func() bool { return len(h.blip("alice.box").Status.Mounts) == 0 })
 
 	// A mount of the caller's own is used and kept.
-	if code, _, errOut := h.run("", "mount", "w1", "--path", "/w1", "--write"); code != 0 {
+	if code, _, errOut := h.run("", "mount", "w1:/w1:rw"); code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
 	dir, done := checkout()
@@ -363,7 +375,7 @@ func TestCollectGit(t *testing.T) {
 		h := newHarness(t, gitObjects()...)
 		h.self = "alice.box"
 		t.Chdir(dst)
-		code, _, errOut := h.run("", "collect", "w1", "git:.:w1")
+		code, _, errOut := h.collect("w1", "git:.:w1")
 		if code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
@@ -391,7 +403,7 @@ func TestCollectGit(t *testing.T) {
 		h := newHarness(t, gitObjects()...)
 		h.self = "alice.box"
 		t.Chdir(sub)
-		code, _, errOut := h.run("", "collect", "w1", "git:.:w1")
+		code, _, errOut := h.collect("w1", "git:.:w1")
 		if code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
@@ -409,7 +421,7 @@ func TestCollectGit(t *testing.T) {
 		h := newHarness(t, gitObjects()...)
 		h.self = "alice.box"
 		t.Chdir(dst)
-		code, _, errOut := h.run("", "collect", "w1", "git:/home/dev/src:w1")
+		code, _, errOut := h.collect("w1", "git:/home/dev/src:w1")
 		if code != 0 {
 			t.Fatalf("code %d: %s", code, errOut)
 		}
@@ -437,7 +449,7 @@ func TestCollectGit(t *testing.T) {
 		h := newHarness(t, gitObjects()...)
 		h.self = "alice.box"
 		t.Chdir(dst)
-		code, _, errOut := h.run("", "collect", "w1", "git:/repo:w1")
+		code, _, errOut := h.collect("w1", "git:/repo:w1")
 		if code != 1 || !strings.Contains(errOut, "git directory outside state") {
 			t.Fatalf("code %d stderr %q", code, errOut)
 		}
@@ -462,7 +474,7 @@ func TestCollectGit(t *testing.T) {
 		h := newHarness(t, gitObjects()...)
 		h.self = "alice.box"
 		t.Chdir(dst)
-		code, _, errOut := h.run("", "collect", "w1", "git:/repo:w1")
+		code, _, errOut := h.collect("w1", "git:/repo:w1")
 		if code != 1 || !strings.Contains(errOut, "git common directory outside state") {
 			t.Fatalf("code %d stderr %q", code, errOut)
 		}
@@ -496,7 +508,7 @@ func TestCollectGit(t *testing.T) {
 		h := newHarness(t, gitObjects()...)
 		h.self = "alice.box"
 		t.Chdir(dst)
-		code, _, errOut := h.run("", "collect", "w1", "git:/repo:w1")
+		code, _, errOut := h.collect("w1", "git:/repo:w1")
 		if code != 1 || !strings.Contains(errOut, "git alternates outside state") {
 			t.Fatalf("code %d stderr %q", code, errOut)
 		}
@@ -514,7 +526,7 @@ func TestCollectGit(t *testing.T) {
 		h := newHarness(t, gitObjects()...)
 		h.self = "alice.box"
 		t.Chdir(dst)
-		code, _, errOut := h.run("", "collect", "w1", "git:"+dst+":nope")
+		code, _, errOut := h.collect("w1", "git:"+dst+":nope")
 		if code == 0 {
 			t.Fatalf("fetch of a nonexistent ref succeeded: %s", errOut)
 		}
@@ -535,27 +547,27 @@ func TestCollectRejections(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"outside a blip", gitObjects(), "", []string{"collect", "w1", "/:./out"},
+		{"outside a blip", gitObjects(), "", []string{"w1", "/:./out"},
 			"collect only works inside a blip"},
-		{"self", gitObjects(), "alice.box", []string{"collect", "box", "/:./out"},
+		{"self", gitObjects(), "alice.box", []string{"box", "/:./out"},
 			"cannot collect from box, the blip running this collect"},
-		{"missing worker", gitObjects(), "alice.box", []string{"collect", "nope", "/:./out"},
+		{"missing worker", gitObjects(), "alice.box", []string{"nope", "/:./out"},
 			`blip "alice.nope" not found`},
-		{"blip with path", gitObjects(), "alice.box", []string{"collect", "w1:/src", "/:./out"},
+		{"blip with path", gitObjects(), "alice.box", []string{"w1:/src", "/:./out"},
 			`invalid blip "w1:/src"`},
-		{"invalid operation", gitObjects(), "alice.box", []string{"collect", "w1", "nonsense"},
+		{"invalid operation", gitObjects(), "alice.box", []string{"w1", "nonsense"},
 			`invalid operation "nonsense"`},
 		{"failed state", []client.Object{ownedBlip("alice.box", "alice.home"), worker, failed},
-			"alice.box", []string{"collect", "w1", "/:./out"},
+			"alice.box", []string{"w1", "/:./out"},
 			`state "alice.w1" failed: disk broke`},
 		{"missing state", []client.Object{ownedBlip("alice.box", "alice.home"), worker},
-			"alice.box", []string{"collect", "w1", "/:./out"},
+			"alice.box", []string{"w1", "/:./out"},
 			`state "alice.w1" not found`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, tc.objs...)
 			h.self = tc.self
-			code, _, errOut := h.run("", tc.args...)
+			code, _, errOut := h.collect(tc.args...)
 			if code != 1 || !strings.Contains(errOut, tc.want) {
 				t.Fatalf("code %d stderr %q, want %q", code, errOut, tc.want)
 			}

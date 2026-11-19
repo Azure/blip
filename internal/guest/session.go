@@ -53,6 +53,10 @@ type session struct {
 	// overflow the replay ring before anyone can read it.
 	pumpsReady chan struct{}
 	pumpsOnce  sync.Once
+
+	// mirror copies the primary command's output to the VM serial console.
+	// It is nil for other sessions and when /dev/console cannot be opened.
+	mirror *consoleMirror
 }
 
 // maxPendingInput bounds stdin queued for a process that is not reading it.
@@ -109,6 +113,12 @@ func newSession(g *Guest, id string, argv []string, tty bool) *session {
 	s.cond = sync.NewCond(&s.mu)
 	s.inCond = sync.NewCond(&s.inMu)
 	s.pumpsReady = make(chan struct{})
+	if id == wire.PrimarySession {
+		// The pod log is the VM serial console; mirroring the primary
+		// command's output there makes it readable without an attached
+		// client. A guest that cannot open the console simply disables it.
+		s.mirror = openConsoleMirror()
+	}
 	return s
 }
 
@@ -330,6 +340,10 @@ func (s *session) pump(f *os.File, t wire.Type) {
 // client pins unsent frames; waiting here propagates backpressure to the
 // process's output pipe without coupling it to session control/input frames.
 func (s *session) appendOutput(t wire.Type, data []byte) {
+	// Mirror at the byte level before the ring takes ownership. feed never
+	// blocks: when the console queue is full it drops lines instead of
+	// propagating backpressure to the command.
+	s.mirror.feed(data)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.out.addPinned(t, data, s.pinLocked())
@@ -534,6 +548,9 @@ func (s *session) clearReplayLocked() {
 
 func (s *session) finish(st wire.Exit) {
 	s.closeInput()
+	// The process can no longer write, so the mirror has nothing left to
+	// follow. stop drains the console queue and joins its goroutine.
+	s.mirror.stop()
 	s.mu.Lock()
 	s.exited, s.status = true, st
 	// A command that fails or finishes before its caller attaches keeps its
@@ -637,21 +654,27 @@ func (s *session) info() sessionInfo {
 	return sessionInfo{ID: s.id, Argv: s.argv, TTY: s.tty, Clients: s.clients, Exited: s.exited}
 }
 
-// serve attaches a client until it disconnects or the session ends.
-func (s *session) serve(c *wire.Conn, conn io.Closer) {
+// serve attaches a client until it disconnects or the session ends. A
+// follower receives retained and live output but is not registered as a
+// reader, so its cursor never pins the replay ring and never backpressures
+// the command.
+func (s *session) serve(c *wire.Conn, conn io.Closer, follow bool) {
 	cl := &client{}
 	s.mu.Lock()
 	s.clients++
 	s.attached = true
-	if s.readers == nil {
-		s.readers = map[*client]struct{}{}
+	if !follow {
+		if s.readers == nil {
+			s.readers = map[*client]struct{}{}
+		}
+		s.readers[cl] = struct{}{}
 	}
-	s.readers[cl] = struct{}{}
 	s.mu.Unlock()
 	s.g.addClients(1)
 	// Register the reader before releasing held pumps. pinLocked must see
 	// it, or output produced during the handshake could overflow the replay
-	// ring before write starts draining it.
+	// ring before write starts draining it. A follower deliberately has no
+	// such pin, so held pumps still release but output may be trimmed.
 	s.releasePumps()
 	defer func() {
 		conn.Close()
@@ -819,7 +842,7 @@ func (g *Guest) serveSession(f io.ReadWriteCloser) {
 			f.Close()
 			return
 		}
-		s.serve(c, f)
+		s.serve(c, f, o.Follow)
 	case wire.OpenExec:
 		s, err := g.openExec(o)
 		if err != nil {
@@ -831,7 +854,7 @@ func (g *Guest) serveSession(f io.ReadWriteCloser) {
 			s.releasePumps()
 			return
 		}
-		s.serve(c, f)
+		s.serve(c, f, o.Follow)
 	default:
 		reject(c, f, errors.New("unknown mode "+strconv.Quote(o.Mode)))
 	}

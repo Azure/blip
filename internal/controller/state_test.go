@@ -502,13 +502,19 @@ func TestStateDeletionBlockedByActiveWriter(t *testing.T) {
 		t.Fatalf("deletion not blocked by active writer: %+v", st.Status)
 	}
 
-	// The writer commits its last version before the state is released.
+	// A deleting state does not keep the saving Blip alive: its seal can
+	// never be recorded against the state. The state keeps its finalizer
+	// until the node reports the seal, then the last save is discarded.
 	e.observe(b.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
 	e.run(e.blip, ns, "b")
-	expectPhase(t, e.getBlip("b"), v1.BlipSaving, ReasonStopped)
-	e.saveWriter("s", "c2c2c2c2c2c2c2c2")
-	e.run(e.blip, ns, "b")
 	expectPhase(t, e.getBlip("b"), v1.BlipSucceeded, ReasonStopped)
+	e.run(e.state, ns, "s")
+	if st := e.getState("s"); !strings.Contains(st.Status.Message, "writer b") || len(st.Finalizers) == 0 {
+		t.Fatalf("writer released without a seal: %+v", st.Status)
+	}
+	w := e.getState("s").Status.Writer
+	e.seal("s", w.Node, v1.SealResult{AttachmentID: w.AttachmentID, CommitID: "c2c2c2c2c2c2c2c2"})
+	e.hold("s", "c2c2c2c2c2c2c2c2", w.Node)
 	e.run(e.state, ns, "s")
 	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "s"}, &v1.BlipState{}); err == nil {
 		t.Fatal("state not deleted after its writer finished")
@@ -544,15 +550,21 @@ func TestQueuedBlipDoesNotBlockStateDeletion(t *testing.T) {
 		t.Fatalf("deletion not blocked by the holder: %+v", st.Status)
 	}
 
-	// Stop the holder and commit its last version.
+	// Stop the holder. A deleting root does not keep the saving Blip alive,
+	// so it finishes immediately; the state still waits for its writer.
 	e.observe(holder.Status.Pod, podapi.Observed{Phase: podapi.PhaseExited, Exit: &podapi.Exit{Reason: ReasonStopped}})
 	e.run(e.blip, ns, "holder")
-	e.saveWriter("s", "d2d2d2d2d2d2d2d2")
-	e.run(e.blip, ns, "holder")
 	expectPhase(t, e.getBlip("holder"), v1.BlipSucceeded, ReasonStopped)
+	e.run(e.state, ns, "s")
+	if st := e.getState("s"); !strings.Contains(st.Status.Message, "writer holder") || len(st.Finalizers) == 0 {
+		t.Fatalf("writer released without a seal: %+v", st.Status)
+	}
 
-	// Reconcile only the state: the queued Blip has not reconciled the
-	// deletion yet, and must not block the finalizer.
+	// The node seals the last version; the deleting state discards the
+	// pending commit and its finalizer must not wait for the queued Blip.
+	w := e.getState("s").Status.Writer
+	e.seal("s", w.Node, v1.SealResult{AttachmentID: w.AttachmentID, CommitID: "d2d2d2d2d2d2d2d2"})
+	e.hold("s", "d2d2d2d2d2d2d2d2", w.Node)
 	e.run(e.state, ns, "s")
 	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "s"}, &v1.BlipState{}); err == nil {
 		t.Fatal("state still waiting for the queued blip")

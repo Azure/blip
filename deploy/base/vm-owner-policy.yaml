@@ -11,13 +11,14 @@
 # and delete blips and states named "<owner>.<name>" and labelled
 # blip.dev/owner=<owner> (before and after the change) that reference only
 # such states (or copy/read-only mount shared bases), set no imagePullSecrets,
-# and create blips only in pools of
-# its own service account. A VM pod without an entry (vacant, or unknown) is
-# denied, as is any other pod that uses a VM service account. Service account
-# keys are pruned only once no pool or VM pod uses the account, and a missing
-# table denies all blip and state changes made with pod-bound tokens. Grant
-# VM service accounts RBAC only in their own namespace: the table is per
-# namespace.
+# and create blips only in pools of its own service account. Every
+# ownerReference it sets must name a Blip of the same owner: fork blips may
+# only be owned by blips of the same owner, and states may only be owned by
+# such blips. A VM pod without an entry (vacant, or unknown) is denied, as is
+# any other pod that uses a VM service account. Service account keys are pruned
+# only once no pool or VM pod uses the account, and a missing table denies all
+# blip and state changes made with pod-bound tokens. Grant VM service accounts
+# RBAC only in their own namespace: the table is per namespace.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -115,6 +116,17 @@ spec:
         object.metadata.labels['blip.dev/owner'] == variables.owner)
       messageExpression: >-
         'owner ' + variables.owner + ' must label its objects blip.dev/owner=' + variables.owner
+      reason: Forbidden
+    - expression: >-
+        !variables.restricted || !variables.writes ||
+        !has(object.metadata.ownerReferences) ||
+        object.metadata.ownerReferences.all(o,
+          o.apiVersion == 'blip.dev/v1alpha1' && o.kind == 'Blip' &&
+          (!has(o.controller) || o.controller != true) &&
+          (!has(o.blockOwnerDeletion) || o.blockOwnerDeletion != true) &&
+          o.name.startsWith(variables.prefix))
+      messageExpression: >-
+        'owner ' + variables.owner + ' may only set ownerReferences to blips named ' + variables.prefix + '*'
       reason: Forbidden
     - expression: >-
         !variables.restricted || !variables.writes || request.resource.resource != 'blips' || !has(object.spec) ||

@@ -317,3 +317,59 @@ func TestVMOwnerPolicy(t *testing.T) {
 		t.Fatalf("empty table denied: %s", msg)
 	}
 }
+
+func ownerReference(name string, mutate ...func(map[string]any)) map[string]any {
+	ref := map[string]any{"apiVersion": "blip.dev/v1alpha1", "kind": "Blip", "name": name, "uid": "uid-parent"}
+	for _, m := range mutate {
+		m(ref)
+	}
+	return ref
+}
+
+func withOwnerReferences(o map[string]any, refs ...map[string]any) map[string]any {
+	o["metadata"].(map[string]any)["ownerReferences"] = refs
+	return o
+}
+
+func TestVMOwnerPolicyOwnerReferences(t *testing.T) {
+	v := loadVMOwnerPolicy(t)
+	const o, x = "u-0123456789abcdef0123456789abcdef", "u-fedcba9876543210fedcba9876543210"
+	params := map[string]string{"sa.vm": "default gpu", "default-mine": o, "default-admin": "-"}
+	mine, admin := vmUser("vm", "default-mine"), vmUser("vm", "default-admin")
+	set := func(key string, value any) func(map[string]any) {
+		return func(ref map[string]any) { ref[key] = value }
+	}
+
+	for _, tc := range []struct {
+		name  string
+		req   policyRequest
+		allow bool
+		msg   string
+	}{
+		{"fork blip of own blip", policyRequest{user: mine, op: admission.Create, resource: "blips",
+			name: o + ".fork", object: withOwnerReferences(blipObj(o+".fork", o), ownerReference(o+".parent"))}, true, ""},
+		{"state of own blip", policyRequest{user: mine, op: admission.Create, resource: "blipstates",
+			name: o + ".s", object: withOwnerReferences(stateObj(o+".s", o, ""), ownerReference(o+".fork"))}, true, ""},
+		{"no ownerReferences", policyRequest{user: mine, op: admission.Create, resource: "blips",
+			name: o + ".a", object: blipObj(o+".a", o)}, true, ""},
+		{"other owner's blip", policyRequest{user: mine, op: admission.Create, resource: "blips",
+			name: o + ".fork", object: withOwnerReferences(blipObj(o+".fork", o), ownerReference(x+".parent"))}, false, "ownerReferences"},
+		{"wrong apiVersion", policyRequest{user: mine, op: admission.Create, resource: "blips",
+			name: o + ".fork", object: withOwnerReferences(blipObj(o+".fork", o), ownerReference(o+".parent", set("apiVersion", "v1")))}, false, "ownerReferences"},
+		{"wrong kind", policyRequest{user: mine, op: admission.Create, resource: "blips",
+			name: o + ".fork", object: withOwnerReferences(blipObj(o+".fork", o), ownerReference(o+".parent", set("kind", "Pod")))}, false, "ownerReferences"},
+		{"controller owner", policyRequest{user: mine, op: admission.Create, resource: "blips",
+			name: o + ".fork", object: withOwnerReferences(blipObj(o+".fork", o), ownerReference(o+".parent", set("controller", true)))}, false, "ownerReferences"},
+		{"blocking deletion", policyRequest{user: mine, op: admission.Create, resource: "blipstates",
+			name: o + ".s", object: withOwnerReferences(stateObj(o+".s", o, ""), ownerReference(o+".fork", set("blockOwnerDeletion", true)))}, false, "ownerReferences"},
+		{"unrestricted foreign owner", policyRequest{user: admin, op: admission.Create, resource: "blips",
+			name: "a", object: withOwnerReferences(blipObj("a", ""), ownerReference(x+".parent"))}, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allow, msg := tc.req.evaluate(t, v, params)
+			if allow != tc.allow || !strings.Contains(msg, tc.msg) {
+				t.Fatalf("allow %v (%q), want %v (%q)", allow, msg, tc.allow, tc.msg)
+			}
+		})
+	}
+}

@@ -12,6 +12,9 @@ const (
 	LabelEnrolled         = "blip.dev/enrolled"
 	LabelHypervisorPrefix = "blip.dev/hypervisor-"
 	LabelOwner            = "blip.dev/owner"
+	// LabelParent is the short name of the blip a fork was started from. It
+	// scopes "blip gather" with no arguments to that blip's forks.
+	LabelParent = "blip.dev/parent"
 
 	AnnotationBlip            = "blip.dev/blip"
 	AnnotationObserved        = "blip.dev/observed"
@@ -21,11 +24,15 @@ const (
 	AnnotationTemplateHash    = "blip.dev/template-hash"
 	AnnotationEnrollmentDrain = "blip.dev/enrollment-drain"
 	AnnotationPinnedNode      = "blip.dev/pinned-node"
+	// AnnotationStopReason records why the controller set spec.stop, for the
+	// client to report when it gathers the blip.
+	AnnotationStopReason = "blip.dev/stop-reason"
 
 	// AnnotationWaitForClient on a Blip asks the guest to hold the primary
-	// command's output until a client attaches. `kubectl blip run` sets it
-	// because it always attaches; a Blip created directly through the API may
-	// omit it, and then the command starts itself.
+	// command's output until a client attaches. A Blip created directly
+	// through the API may omit it, and then the command starts itself.
+	// `blip gather -f` attaches to a command that is already running, so the
+	// CLI does not set it.
 	AnnotationWaitForClient = "blip.dev/wait-for-client"
 
 	Finalizer = "blip.dev/finalizer"

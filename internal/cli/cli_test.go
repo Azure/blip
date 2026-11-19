@@ -8,19 +8,36 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/session/fakeguest"
 	"github.com/Azure/blip/internal/wire"
 )
 
-func TestRunCreatesBlipFromFlags(t *testing.T) {
-	h := newHarness(t, state("workspace"))
-	h.ctrl.set(func(c *fakeController) { c.autoFinish = true })
-	code, _, errOut := h.run("", "run", "worker-1", "--state", "workspace",
+// isBlipGone reports whether the blip no longer exists. Garbage collection is
+// not part of the fake controller, so tests check deletions directly.
+func isBlipGone(t *testing.T, h *harness, name string) bool {
+	t.Helper()
+	err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &v1alpha1.Blip{})
+	return apierrors.IsNotFound(err)
+}
+
+func TestRunCreatesBlipAndReturnsName(t *testing.T) {
+	h := newHarness(t, readyState("workspace"))
+	code, out, errOut := h.run("", "run", "--name", "worker-1", "--state", "workspace",
 		"-w", "/work/repo", "-e", "A=B", "-u", "dev", "--pool", "big",
 		"--", "sh", "-lc", "make test")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
+	}
+	// run prints the new blip's short name and returns without attaching.
+	if strings.TrimSpace(out) != "worker-1" {
+		t.Fatalf("output %q", out)
+	}
+	if opens := h.guest.Opens(); len(opens) != 0 {
+		t.Fatalf("run attached to the blip: %+v", opens)
 	}
 	b := h.blip("worker-1")
 	s := b.Spec
@@ -30,15 +47,12 @@ func TestRunCreatesBlipFromFlags(t *testing.T) {
 	if strings.Join(s.Command, "|") != "sh|-lc|make test" || len(s.Env) != 1 || s.Env[0] != (v1alpha1.EnvVar{Name: "A", Value: "B"}) {
 		t.Fatalf("command/env = %v %v", s.Command, s.Env)
 	}
-	if b.Annotations[v1alpha1.AnnotationWaitForClient] != "true" {
-		t.Fatalf("run does not wait for the client: %v", b.Annotations)
-	}
 }
 
 func TestRunRequiresCommand(t *testing.T) {
 	h := newHarness(t)
-	code, _, errOut := h.run("", "run", "x")
-	if code != 1 || !strings.Contains(errOut, "a command is required") {
+	code, _, errOut := h.run("", "run")
+	if code != 1 || !strings.Contains(errOut, "requires at least 1 arg") {
 		t.Fatalf("code %d err %q", code, errOut)
 	}
 }
@@ -49,12 +63,14 @@ func TestRunRejectsBadFlags(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"run", "x", "--", "true"}, "exactly one of --state"},
-		{[]string{"run", "x", "--fork", "base", "--state", "s", "--", "true"}, "exactly one of --state"},
-		{[]string{"run", "x", "--image", "i", "--", "true"}, "unknown flag: --image"},
-		{[]string{"run", "x", "--state", "s", "--mount", "s:/w", "--", "true"}, "unknown flag: --mount"},
-		{[]string{"run", "x", "--state", "s", "--detach", "--", "true"}, "unknown flag: --detach"},
-		{[]string{"run", "x", "--state", "s", "--idle-timeout", "5m", "--", "true"}, "unknown flag: --idle-timeout"},
+		{[]string{"run", "--name", "x", "--", "true"}, "set --from or --state"},
+		{[]string{"run", "--name", "x", "--from", "base", "--state", "s", "--", "true"}, "set only one of --from and --state"},
+		{[]string{"run", "--name", "x", "--from", "/", "--", "true"}, "--from / only works inside a blip"},
+		{[]string{"run", "--name", "x", "--fork", "base", "--", "true"}, "unknown flag: --fork"},
+		{[]string{"run", "--name", "x", "--image", "i", "--", "true"}, "unknown flag: --image"},
+		{[]string{"run", "--name", "x", "--state", "s", "--mount", "s:/w", "--", "true"}, "unknown flag: --mount"},
+		{[]string{"run", "--name", "x", "--state", "s", "--detach", "--", "true"}, "unknown flag: --detach"},
+		{[]string{"run", "--name", "x", "--state", "s", "--idle-timeout", "5m", "--", "true"}, "unknown flag: --idle-timeout"},
 	} {
 		code, _, errOut := h.run("", tc.args...)
 		if code != 1 || !strings.Contains(errOut, tc.want) {
@@ -63,28 +79,34 @@ func TestRunRejectsBadFlags(t *testing.T) {
 	}
 }
 
-func TestRunAttachesToCommandAndExitsWithItsCode(t *testing.T) {
-	h := newHarness(t, readyState("workspace"))
+func TestRunReturnsNameWithoutAttaching(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	ran := false
 	h.guest.Run = func(s *fakeguest.Session) wire.Exit {
+		ran = true
 		s.Stdout("hello\n")
 		s.Stderr("oops\n")
-		h.ctrl.set(func(c *fakeController) { c.exited["job"] = 3 })
 		return wire.Exit{Code: 3}
 	}
-	code, out, errOut := h.run("", "run", "job", "--state", "workspace", "--", "false")
-	if code != 3 || out != "hello\n" {
+	code, out, errOut := h.run("", "run", "--name", "job", "--from", "base", "--", "false")
+	// run neither streams the command's output nor returns its exit code.
+	if code != 0 || out != "job\n" || errOut != "" {
 		t.Fatalf("code %d out %q err %q", code, out, errOut)
 	}
-	mustContain(t, errOut, "oops", "waiting for a VM")
-	o := h.guest.Opens()[0]
-	if o.Pod != "pod-job" || o.Open.Mode != wire.OpenAttach || o.Open.Session != wire.PrimarySession {
-		t.Fatalf("open = %+v", o)
+	if ran || len(h.guest.Opens()) != 0 {
+		t.Fatalf("run attached to the command: opens %+v", h.guest.Opens())
 	}
-	if b := h.blip("job"); b.Status.Phase != v1alpha1.BlipFailed {
-		t.Fatalf("run returned before the blip finished: %s", b.Status.Phase)
+	b := h.blip("job")
+	if b.Spec.State != "job" || strings.Join(b.Spec.Command, " ") != "false" {
+		t.Fatalf("blip %+v", b.Spec)
 	}
-	if b := h.blip("job"); b.Annotations[v1alpha1.AnnotationWaitForClient] != "true" {
-		t.Fatalf("attached run does not wait for the client: %v", b.Annotations)
+	// The fork is created before run returns and is owned by the new blip.
+	root := h.state("job")
+	if root.Spec.CopyFrom != "base" || root.Status.Committed == nil {
+		t.Fatalf("root state %+v", root)
+	}
+	if len(root.OwnerReferences) != 1 || root.OwnerReferences[0].Name != "job" {
+		t.Fatalf("workspace ownership %+v", root.OwnerReferences)
 	}
 }
 
@@ -145,26 +167,31 @@ func TestExecOnFinishedOrMissingBlipIsFriendly(t *testing.T) {
 	}
 }
 
-func TestWaitFailsIfAnyFailed(t *testing.T) {
+func TestGatherFailsIfAnyFailed(t *testing.T) {
 	ok, bad := runningBlip("ok"), runningBlip("bad")
 	ok.Status.Phase, bad.Status.Phase = v1alpha1.BlipSucceeded, v1alpha1.BlipFailed
 	zero, one := int32(0), int32(1)
 	ok.Status.ExitCode, bad.Status.ExitCode = &zero, &one
 	bad.Status.Message = "command failed"
 	h := newHarness(t, ok, bad)
-	code, out, _ := h.run("", "wait", "ok", "bad")
+	code, out, errOut := h.run("", "gather", "ok", "bad")
 	if code != 1 {
 		t.Fatalf("code %d", code)
 	}
-	mustContain(t, out, "blip/ok Succeeded (exit 0)", "blip/bad Failed (exit 1): command failed")
+	mustContain(t, out, "blip/ok Succeeded (exit 0)", "blip/bad Failed (exit 1)")
+	mustContain(t, errOut, "command failed")
+	// Successful blips are deleted; failed ones are kept for inspection.
+	if !isBlipGone(t, h, "ok") || isBlipGone(t, h, "bad") {
+		t.Fatalf("ok gone=%v bad gone=%v", isBlipGone(t, h, "ok"), isBlipGone(t, h, "bad"))
+	}
 }
 
-func TestWaitShowsStopReason(t *testing.T) {
+func TestGatherShowsStopReason(t *testing.T) {
 	stopped := runningBlip("stopped")
 	stopped.Status.Phase = v1alpha1.BlipSucceeded
 	stopped.Status.Reason = "Stopped"
 	h := newHarness(t, stopped)
-	code, out, _ := h.run("", "wait", "stopped")
+	code, out, _ := h.run("", "gather", "stopped")
 	if code != 0 {
 		t.Fatalf("code %d", code)
 	}
@@ -173,7 +200,7 @@ func TestWaitShowsStopReason(t *testing.T) {
 
 func TestMountAddsSpecAndWaitsMounted(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"), readyState("repo"))
-	code, out, errOut := h.run("", "mount", "repo", "agent-root", "--path", "/work", "--write")
+	code, out, errOut := h.run("", "mount", "repo:/work:rw", "--root", "agent-root")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
@@ -183,10 +210,10 @@ func TestMountAddsSpecAndWaitsMounted(t *testing.T) {
 		t.Fatalf("mounts = %+v", root.Spec.Mounts)
 	}
 	// Mounting again is a no-op; a different path is an error.
-	if code, _, _ := h.run("", "mount", "repo", "agent-root", "--path", "/work", "--write"); code != 0 {
+	if code, _, _ := h.run("", "mount", "repo:/work:rw", "--root", "agent-root"); code != 0 {
 		t.Fatal(code)
 	}
-	code, _, errOut = h.run("", "mount", "repo", "agent-root", "--path", "/other")
+	code, _, errOut = h.run("", "mount", "repo:/other", "--root", "agent-root")
 	if code != 1 || !strings.Contains(errOut, "already mounted") {
 		t.Fatal(errOut)
 	}
@@ -237,7 +264,7 @@ func TestMountWaitsForOldAttachmentDetach(t *testing.T) {
 func TestMountSwitchesExistingMode(t *testing.T) {
 	h := newHarness(t, runningBlip("agent", v1alpha1.Mount{State: "repo", Path: "/work"}), readyState("repo"))
 
-	code, out, errOut := h.run("", "mount", "repo", "agent-root", "--path", "/work", "--write")
+	code, out, errOut := h.run("", "mount", "repo:/work:rw", "--root", "agent-root")
 	if code != 0 {
 		t.Fatalf("promote code %d: %s", code, errOut)
 	}
@@ -247,7 +274,7 @@ func TestMountSwitchesExistingMode(t *testing.T) {
 		t.Fatalf("promoted mounts = %+v %+v", mounts, b.Status.Mounts)
 	}
 
-	code, out, errOut = h.run("", "mount", "repo", "agent-root", "--path", "/work", "--read-only")
+	code, out, errOut = h.run("", "mount", "repo:/work:ro", "--root", "agent-root")
 	if code != 0 {
 		t.Fatalf("demote code %d: %s", code, errOut)
 	}
@@ -260,8 +287,8 @@ func TestMountSwitchesExistingMode(t *testing.T) {
 		t.Fatalf("state did not commit demoted version: %+v", st.Status)
 	}
 
-	// No flag leaves the existing mode alone.
-	code, out, errOut = h.run("", "mount", "repo", "agent-root", "--path", "/work")
+	// No mode leaves the existing mode alone.
+	code, out, errOut = h.run("", "mount", "repo:/work", "--root", "agent-root")
 	if code != 0 {
 		t.Fatalf("unchanged code %d: %s", code, errOut)
 	}
@@ -271,7 +298,7 @@ func TestMountSwitchesExistingMode(t *testing.T) {
 func TestMountSwitchBusyRetainsIntent(t *testing.T) {
 	h := newHarness(t, runningBlip("agent", v1alpha1.Mount{State: "repo", Path: "/work", Writable: true}), readyState("repo"))
 	h.ctrl.set(func(c *fakeController) { c.unmountFail = "target is busy" })
-	code, _, errOut := h.run("", "mount", "repo", "agent-root", "--path", "/work", "--read-only")
+	code, _, errOut := h.run("", "mount", "repo:/work:ro", "--root", "agent-root")
 	if code != 1 || !strings.Contains(errOut, "processes are still using /work") {
 		t.Fatalf("code %d err %q", code, errOut)
 	}
@@ -284,7 +311,7 @@ func TestMountSwitchBusyRetainsIntent(t *testing.T) {
 func TestMountFailureIsReported(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"), readyState("repo"))
 	h.ctrl.set(func(c *fakeController) { c.mountFail = "no space left on device" })
-	code, _, errOut := h.run("", "mount", "repo", "agent-root", "--path", "/work")
+	code, _, errOut := h.run("", "mount", "repo:/work", "--root", "agent-root")
 	if code != 1 || !strings.Contains(errOut, `mount of state "repo" on blip "agent" failed: no space left on device`) {
 		t.Fatalf("code %d err %q", code, errOut)
 	}
@@ -295,19 +322,19 @@ func TestMountBusyAndBadPath(t *testing.T) {
 	s.Status.Writer = &v1alpha1.Writer{BlipName: "other"}
 	h := newHarness(t, runningBlip("agent"), s)
 	h.ctrl.set(func(c *fakeController) { c.mountFail = "state is busy" })
-	code, _, errOut := h.run("", "mount", "repo", "agent-root", "--path", "/work", "--write")
+	code, _, errOut := h.run("", "mount", "repo:/work:rw", "--root", "agent-root")
 	if code != 1 || !strings.Contains(errOut, "processes are still using /work") {
 		t.Fatal(errOut)
 	}
-	code, _, errOut = h.run("", "mount", "repo", "agent-root", "--path", "work")
-	if code != 1 || !strings.Contains(errOut, "invalid path") {
+	code, _, errOut = h.run("", "mount", "repo:work", "--root", "agent-root")
+	if code != 1 || !strings.Contains(errOut, "clean absolute path") {
 		t.Fatal(errOut)
 	}
 }
 
 func TestUnmountWaitsUntilSaved(t *testing.T) {
 	h := newHarness(t, runningBlip("agent", v1alpha1.Mount{State: "repo", Path: "/work", Writable: true}), readyState("repo"))
-	code, out, errOut := h.run("", "unmount", "repo", "agent-root")
+	code, out, errOut := h.run("", "mount", "--rm", "repo", "--root", "agent-root")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errOut)
 	}
@@ -317,7 +344,7 @@ func TestUnmountWaitsUntilSaved(t *testing.T) {
 	if mounts := h.rootState("agent").Spec.Mounts; len(mounts) != 0 || len(b.Status.Mounts) != 0 {
 		t.Fatalf("mounts = %+v %+v", mounts, b.Status.Mounts)
 	}
-	code, _, errOut = h.run("", "unmount", "repo", "agent-root")
+	code, _, errOut = h.run("", "mount", "--rm", "repo", "--root", "agent-root")
 	if code != 1 || !strings.Contains(errOut, "not mounted") {
 		t.Fatal(errOut)
 	}
@@ -328,7 +355,7 @@ func TestUnmountBusy(t *testing.T) {
 		t.Run(modeName(writable), func(t *testing.T) {
 			h := newHarness(t, runningBlip("agent", v1alpha1.Mount{State: "repo", Path: "/work", Writable: writable}), readyState("repo"))
 			h.ctrl.set(func(c *fakeController) { c.unmountFail = "target is busy" })
-			code, _, errOut := h.run("", "unmount", "repo", "agent-root")
+			code, _, errOut := h.run("", "mount", "--rm", "repo", "--root", "agent-root")
 			if code != 1 || !strings.Contains(errOut, `could not unmount state "repo" from blip "agent": processes are still using /work`) {
 				t.Fatalf("code %d err %q", code, errOut)
 			}
@@ -360,7 +387,7 @@ func TestUnmountBusy(t *testing.T) {
 func TestUnmountFailedMountClearsState(t *testing.T) {
 	h := newHarness(t, runningBlip("agent"), readyState("repo"))
 	h.ctrl.set(func(c *fakeController) { c.mountFail = "no space left on device" })
-	code, _, errOut := h.run("", "mount", "repo", "agent-root", "--path", "/work")
+	code, _, errOut := h.run("", "mount", "repo:/work", "--root", "agent-root")
 	if code != 1 || !strings.Contains(errOut, "no space left on device") {
 		t.Fatalf("mount code %d err %q", code, errOut)
 	}
@@ -371,7 +398,7 @@ func TestUnmountFailedMountClearsState(t *testing.T) {
 	// Removing a mount that never attached drops its failed entry, so the
 	// unmount completes instead of reporting the old attach error forever.
 	h.ctrl.set(func(c *fakeController) { c.mountFail = "" })
-	code, out, errOut := h.run("", "unmount", "repo", "agent-root")
+	code, out, errOut := h.run("", "mount", "--rm", "repo", "--root", "agent-root")
 	if code != 0 {
 		t.Fatalf("unmount code %d: %s", code, errOut)
 	}
@@ -381,7 +408,7 @@ func TestUnmountFailedMountClearsState(t *testing.T) {
 	}
 
 	// The state can now be mounted again at another path.
-	code, out, errOut = h.run("", "mount", "repo", "agent-root", "--path", "/other")
+	code, out, errOut = h.run("", "mount", "repo:/other", "--root", "agent-root")
 	if code != 0 {
 		t.Fatalf("remount code %d: %s", code, errOut)
 	}
@@ -401,26 +428,23 @@ func TestGitWorkflow(t *testing.T) {
 	repo := state("repo")
 	worker := state("worker-1")
 	worker.Spec.CopyFrom = "repo"
-	steps := []struct {
-		apply *v1alpha1.BlipState
-		args  []string
-	}{
-		{apply: repo},
-		{args: []string{"mount", "repo", "agent-root", "--path", "/work", "--write"}},
-		{args: []string{"exec", "agent", "--", "sh", "-lc", "git clone https://example.com/repo /work/repo"}},
-		{args: []string{"unmount", "repo", "agent-root"}},
-		{apply: worker},
-		{args: []string{"run", "worker-1", "--state", "worker-1", "-w", "/work/repo", "--", "sh", "-lc", "make fix"}},
-		{args: []string{"wait", "worker-1"}},
+	h.apply(repo)
+	steps := [][]string{
+		{"mount", "repo:/work:rw", "--root", "agent-root"},
+		{"exec", "agent", "--", "sh", "-lc", "git clone https://example.com/repo /work/repo"},
+		{"mount", "--rm", "repo", "--root", "agent-root"},
 	}
-	for _, s := range steps {
-		if s.apply != nil {
-			h.apply(s.apply)
-			continue
+	for _, args := range steps {
+		if code, _, errOut := h.run("", args...); code != 0 {
+			t.Fatalf("%v: code %d: %s", args, code, errOut)
 		}
-		if code, _, errOut := h.run("", s.args...); code != 0 {
-			t.Fatalf("%v: code %d: %s", s.args, code, errOut)
-		}
+	}
+	h.apply(worker)
+	if code, _, errOut := h.run("", "run", "--name", "worker-1", "--state", "worker-1", "-w", "/work/repo", "--", "sh", "-lc", "make fix"); code != 0 {
+		t.Fatalf("run: code %d: %s", code, errOut)
+	}
+	if w := h.waitBlip("worker-1"); w.Status.Phase != v1alpha1.BlipSucceeded {
+		t.Fatalf("worker phase = %s", w.Status.Phase)
 	}
 
 	// Collect the worker's changes from its durable root filesystem.
@@ -429,7 +453,7 @@ func TestGitWorkflow(t *testing.T) {
 	commit := gitRepo(t, filepath.Join(collectMountRoot, "worker-1", "work", "repo"))
 	h.self = "agent"
 	t.Chdir(dst)
-	if code, _, errOut := h.run("", "collect", "worker-1", "git:/work/repo:w1"); code != 0 {
+	if code, _, errOut := h.collect("worker-1", "git:/work/repo:w1"); code != 0 {
 		t.Fatalf("collect: code %d: %s", code, errOut)
 	}
 	if got := gitRun(t, dst, "rev-parse", "w1"); got != commit {
@@ -444,12 +468,12 @@ func TestGitWorkflow(t *testing.T) {
 
 func TestRunReportsMissingPoolAndState(t *testing.T) {
 	h := newHarness(t)
-	code, _, errOut := h.run("", "run", "x", "--pool", "nope", "--fork", "base", "--", "true")
+	code, _, errOut := h.run("", "run", "--name", "x", "--pool", "nope", "--from", "base", "--", "true")
 	if code == 0 {
 		t.Fatal("run succeeded without a pool")
 	}
 	mustContain(t, errOut, `pool "nope" not found`)
-	code, _, errOut = h.run("", "run", "x", "--state", "home", "--", "true")
+	code, _, errOut = h.run("", "run", "--name", "x", "--state", "home", "--", "true")
 	if code == 0 {
 		t.Fatal("run succeeded without a state")
 	}

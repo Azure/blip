@@ -299,6 +299,16 @@ func (in *BlipSpec) DeepCopyInto(out *BlipSpec) {
 		*out = make([]EnvVar, len(*in))
 		copy(*out, *in)
 	}
+	if in.ActiveDeadlineSeconds != nil {
+		in, out := &in.ActiveDeadlineSeconds, &out.ActiveDeadlineSeconds
+		*out = new(int64)
+		**out = **in
+	}
+	if in.TTLSecondsAfterFinished != nil {
+		in, out := &in.TTLSecondsAfterFinished, &out.TTLSecondsAfterFinished
+		*out = new(int32)
+		**out = **in
+	}
 	if in.Network != nil {
 		in, out := &in.Network, &out.Network
 		*out = new(NetworkPolicy)

@@ -8,7 +8,11 @@ import (
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/Azure/blip/api/v1alpha1"
 )
 
 type pullFlags struct {
@@ -23,10 +27,10 @@ func (a *app) pullCommand() *cobra.Command {
 		Use:   "pull BASE OCI_REF",
 		Short: "Import an OCI image as a shared base state",
 		Long: `Import an OCI image into a named, read-only base state. Wait for the
-initial version to be ready unless --detach is set. Run --fork BASE creates an
+initial version to be ready unless --detach is set. Run --from BASE creates an
 independent writable workspace from it.`,
 		Example: `  kubectl blip pull base ghcr.io/me/dev:latest --size 20Gi
-  kubectl blip run dev --fork base`,
+  blip run --from base -- bash`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return a.pull(cmd.Context(), args[0], args[1], f)
@@ -46,11 +50,20 @@ func (a *app) pull(ctx context.Context, name, image string, f *pullFlags) error 
 		return err
 	}
 	c, _ := a.clients()
-	st, err := stateFromFlags(name, c.Namespace, &createStateFlags{size: f.size}, nil, false)
-	if err != nil {
-		return err
+	st := &v1alpha1.BlipState{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace},
+		Spec:       v1alpha1.BlipStateSpec{Image: image},
 	}
-	st.Spec.Image = image
+	if f.size != "" {
+		size, err := resource.ParseQuantity(f.size)
+		if err != nil {
+			return fmt.Errorf("invalid --size %q: %w", f.size, err)
+		}
+		if size.Sign() <= 0 {
+			return fmt.Errorf("invalid --size %q: must be positive", f.size)
+		}
+		st.Spec.Size = &size
+	}
 	for _, secret := range f.secrets {
 		if problems := validation.IsDNS1123Subdomain(secret); len(problems) > 0 {
 			return fmt.Errorf("invalid --image-pull-secret %q: %s", secret, strings.Join(problems, "; "))
@@ -68,7 +81,7 @@ func (a *app) pull(ctx context.Context, name, image string, f *pullFlags) error 
 		fmt.Fprintf(a.env.Out, "blipstate/%s created\n", a.short(name))
 		return nil
 	}
-	st, err = a.waitStateCommitted(ctx, name)
+	st, err := a.waitStateCommitted(ctx, name)
 	if err != nil {
 		return err
 	}

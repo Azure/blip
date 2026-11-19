@@ -171,14 +171,17 @@ cat <<EOF
 blip-dev is ready. Always pass the context explicitly:
 
   bin/kubectl-blip --context ${CTX} pull dev-base ${REGISTRY}:5000/blip/dev:latest
-  bin/kubectl-blip --context ${CTX} run hello --fork dev-base -- uname -a
-  bin/kubectl-blip --context ${CTX} run sandbox --fork dev-base -- sh -c 'echo kept > ~/notes.txt'
+  bin/kubectl-blip --context ${CTX} run --name hello --from dev-base -- uname -a
+  bin/kubectl-blip --context ${CTX} gather hello
+  bin/kubectl-blip --context ${CTX} run --name sandbox --from dev-base --keep -- sh -c 'echo kept > ~/notes.txt'
   kubectl --context ${CTX} delete blip sandbox
-  bin/kubectl-blip --context ${CTX} run resumed --state sandbox -- cat /home/dev/notes.txt
+  bin/kubectl-blip --context ${CTX} run --name resumed --state sandbox -- cat /home/dev/notes.txt
+  bin/kubectl-blip --context ${CTX} gather resumed
   kubectl --context ${CTX} get blippools,blips,blipstates -A
 
 Root BlipState.spec.mounts and spec.runtime hold durable workspace configuration.
-Delete BlipStates explicitly when their data is no longer needed.
+A Blip owns the workspace it forks, so gathering or deleting it frees the
+workspace; --keep leaves it in place for later runs.
 
 Tear down with hack/kind-down.sh [--purge].
 EOF

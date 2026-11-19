@@ -497,6 +497,17 @@ type BlipSpec struct {
 	TTY bool `json:"tty,omitempty"`
 	// Stop asks the blip to shut down gracefully and save.
 	Stop bool `json:"stop,omitempty"`
+	// ActiveDeadlineSeconds stops the blip's command when it has run this
+	// long. The VM is stopped as if spec.stop were set. `blip run --timeout`
+	// sets it.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
+	// TTLSecondsAfterFinished deletes the blip this long after it finished,
+	// whether or not anyone gathered its results. `blip run --ttl` sets it.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 	// Network narrows the pool's egress policy. Omitted inherits the root
 	// state's runtime network policy, or the pool if neither is set.
 	// Explicitly empty denies all. Changes apply to running blips.

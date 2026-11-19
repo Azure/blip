@@ -1,0 +1,155 @@
+package cli
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Azure/blip/api/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// finishedBlip is a blip that already ran a command.
+func finishedBlip(name string, phase string, code int32) *v1alpha1.Blip {
+	b := runningBlip(name)
+	b.Status.Phase = phase
+	b.Status.ExitCode = &code
+	b.Status.FinishTime = &metav1.Time{Time: time.Now()}
+	b.Status.StartTime = &metav1.Time{Time: time.Now().Add(-3 * time.Second)}
+	return b
+}
+
+func (h *harness) gone(name string) bool {
+	h.t.Helper()
+	err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &v1alpha1.Blip{})
+	return apierrors.IsNotFound(err)
+}
+
+func TestGatherDeletesSucceededBlips(t *testing.T) {
+	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
+	code, out, errOut := h.run("", "gather", "w1")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/w1 Succeeded (exit 0)")
+	if !h.gone("w1") {
+		t.Fatal("blip kept")
+	}
+}
+
+func TestGatherKeepsFailedBlips(t *testing.T) {
+	b := finishedBlip("w1", v1alpha1.BlipFailed, 2)
+	b.Status.Message = "tests failed"
+	h := newHarness(t, b)
+	code, out, errOut := h.run("", "gather", "w1")
+	if code != 1 {
+		t.Fatalf("code %d", code)
+	}
+	mustContain(t, out, "blip/w1 Failed (exit 2)")
+	mustContain(t, errOut, "tests failed")
+	if h.gone("w1") {
+		t.Fatal("failed blip deleted")
+	}
+}
+
+func TestGatherKeep(t *testing.T) {
+	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
+	if code, _, errOut := h.run("", "gather", "w1", "--keep"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if h.gone("w1") {
+		t.Fatal("blip deleted with --keep")
+	}
+}
+
+func TestGatherDefaultsToCallerForks(t *testing.T) {
+	mine := finishedBlip("alice.w1", v1alpha1.BlipSucceeded, 0)
+	mine.Labels = map[string]string{v1alpha1.LabelOwner: "alice", v1alpha1.LabelParent: "box"}
+	other := finishedBlip("alice.w2", v1alpha1.BlipSucceeded, 0)
+	other.Labels = map[string]string{v1alpha1.LabelOwner: "alice", v1alpha1.LabelParent: "other"}
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), mine, other)
+	h.self = "alice.box"
+	code, out, errOut := h.run("", "gather")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/w1 Succeeded")
+	if !h.gone("alice.w1") {
+		t.Fatal("caller's fork kept")
+	}
+	if h.gone("alice.w2") {
+		t.Fatal("another blip's fork gathered")
+	}
+}
+
+func TestGatherOutsideBlipNeedsNames(t *testing.T) {
+	h := newHarness(t)
+	code, _, errOut := h.run("", "gather")
+	if code != 1 || !strings.Contains(errOut, "needs blip names or --selector") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+}
+
+func TestGatherSelector(t *testing.T) {
+	a := finishedBlip("w1", v1alpha1.BlipSucceeded, 0)
+	a.Labels = map[string]string{"team": "nightly"}
+	b := finishedBlip("w2", v1alpha1.BlipSucceeded, 0)
+	b.Labels = map[string]string{"team": "nightly"}
+	c := finishedBlip("w3", v1alpha1.BlipSucceeded, 0)
+	c.Labels = map[string]string{"team": "other"}
+	h := newHarness(t, a, b, c)
+	code, out, errOut := h.run("", "gather", "--selector", "team=nightly")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/w1", "blip/w2")
+	if !h.gone("w1") || !h.gone("w2") || h.gone("w3") {
+		t.Fatal("wrong blips gathered")
+	}
+}
+
+func TestGatherWaitGivesUpOnRunningBlips(t *testing.T) {
+	h := newHarness(t, runningBlip("w1"))
+	code, _, errOut := h.run("", "gather", "w1", "--wait", "50ms")
+	if code != 1 || !strings.Contains(errOut, "still running: w1") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if h.gone("w1") {
+		t.Fatal("running blip deleted")
+	}
+}
+
+func TestGatherAnyReturnsOnFirstFinish(t *testing.T) {
+	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0), runningBlip("w2"))
+	code, _, errOut := h.run("", "gather", "w1", "w2", "--any")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if !h.gone("w1") || h.gone("w2") {
+		t.Fatal("wrong blips gathered")
+	}
+}
+
+func TestGatherCollectFailureKeepsBlip(t *testing.T) {
+	// The blip's root state is gone, so collecting cannot mount it.
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), finishedBlip("alice.w1", v1alpha1.BlipSucceeded, 0))
+	h.self = "alice.box"
+	code, _, errOut := h.run("", "gather", "w1", "--collect", "/out:./out")
+	if code != 1 || !strings.Contains(errOut, "collect from w1") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if h.gone("alice.w1") {
+		t.Fatal("blip deleted after failed collect")
+	}
+}
+
+func TestGatherCollectNeedsBlip(t *testing.T) {
+	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
+	code, _, errOut := h.run("", "gather", "w1", "--collect", "/out:./out")
+	if code != 1 || !strings.Contains(errOut, "only works inside") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+}

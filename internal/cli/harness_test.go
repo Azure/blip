@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -346,4 +348,45 @@ func mustContain(t *testing.T, got string, want ...string) {
 
 func state(name string) *v1alpha1.BlipState {
 	return &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
+}
+
+// app returns a CLI app bound to the harness, for tests that drive one
+// subcommand core directly.
+func (h *harness) app(in io.Reader, out, errOut io.Writer) *app {
+	return &app{env: h.env(in, out, errOut)}
+}
+
+// collect drives the collect core that "gather --collect" shares.
+func (h *harness) collect(args ...string) (int, string, string) {
+	h.t.Helper()
+	if len(args) == 0 {
+		h.t.Fatal("collect needs a blip name")
+	}
+	var out, errb bytes.Buffer
+	a := h.app(strings.NewReader(""), &out, &errb)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := a.collect(ctx, args[0], args[1:]); err != nil {
+		var exit *ExitError
+		if errors.As(err, &exit) {
+			return exit.Code, out.String(), errb.String()
+		}
+		fmt.Fprintf(&errb, "error: %v\n", err)
+		return 1, out.String(), errb.String()
+	}
+	return 0, out.String(), errb.String()
+}
+
+// waitBlip waits for a blip to finish through the same watch the CLI uses.
+func (h *harness) waitBlip(name string) *v1alpha1.Blip {
+	h.t.Helper()
+	var out, errb bytes.Buffer
+	a := h.app(strings.NewReader(""), &out, &errb)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	b, err := a.waitFinished(ctx, name, true)
+	if err != nil {
+		h.t.Fatalf("wait %s: %v", name, err)
+	}
+	return b
 }

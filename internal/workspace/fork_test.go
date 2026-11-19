@@ -58,7 +58,7 @@ func TestForkWorkspaceSnapshot(t *testing.T) {
 	size := resource.MustParse("20Gi")
 	dest.Spec.Size, dest.Spec.Replicas = &size, 2
 	dest.Spec.NodeSelector = map[string]string{"disk": "ssd"}
-	if err := Fork(ctx, c, src, dest); err != nil {
+	if err := Fork(ctx, c, src, dest, nil); err != nil {
 		t.Fatal(err)
 	}
 	if dest.Spec.CopyFrom != src.Name || dest.Spec.Image != "" || len(dest.Spec.Mounts) != 3 || !reflect.DeepEqual(dest.Spec.Runtime, src.Spec.Runtime) {
@@ -120,7 +120,7 @@ func TestForkRollbackPreservesExistingStates(t *testing.T) {
 				}
 				return c.Create(ctx, obj, opts...)
 			}})
-			if err := Fork(ctx, c, src, dest); !apierrors.IsAlreadyExists(err) {
+			if err := Fork(ctx, c, src, dest, nil); !apierrors.IsAlreadyExists(err) {
 				t.Fatalf("error: %v", err)
 			}
 			var states v1alpha1.BlipStateList
@@ -143,7 +143,7 @@ func TestForkPreflightAndReplacementSafety(t *testing.T) {
 	src, dest := testState("source"), testState("worker")
 	src.Spec.Mounts = []v1alpha1.Mount{{State: "a", Path: "/a", Writable: true}}
 	c := testClient(t, src, testState("a"), dest)
-	if err := Fork(ctx, c, src, dest); !apierrors.IsAlreadyExists(err) {
+	if err := Fork(ctx, c, src, dest, nil); !apierrors.IsAlreadyExists(err) {
 		t.Fatalf("existing root: %v", err)
 	}
 	var states v1alpha1.BlipStateList
@@ -181,7 +181,7 @@ func TestForkPreflightAndReplacementSafety(t *testing.T) {
 			return c.Create(ctx, obj, opts...)
 		},
 	})
-	if err := Fork(ctx, c, src, dest); !errors.Is(err, failure) {
+	if err := Fork(ctx, c, src, dest, nil); !errors.Is(err, failure) {
 		t.Fatalf("fork failure: %v", err)
 	}
 	if !cleanupAttempted {
@@ -233,7 +233,7 @@ func TestForkPreservesStatesAfterAmbiguousCreate(t *testing.T) {
 						return nil
 					},
 				})
-				if err := Fork(ctx, c, src, dest); !errors.Is(err, tc.err) {
+				if err := Fork(ctx, c, src, dest, nil); !errors.Is(err, tc.err) {
 					t.Fatalf("error: %v, want %v", err, tc.err)
 				}
 				for _, key := range persisted {
@@ -277,7 +277,7 @@ func TestForkRollsBackValidationRejection(t *testing.T) {
 				}
 				return c.Create(ctx, obj, opts...)
 			}})
-			if err := Fork(ctx, c, src, dest); !apierrors.IsInvalid(err) {
+			if err := Fork(ctx, c, src, dest, nil); !apierrors.IsInvalid(err) {
 				t.Fatalf("error: %v", err)
 			}
 			var states v1alpha1.BlipStateList
@@ -307,5 +307,35 @@ func TestChildNamesBoundedAndDistinct(t *testing.T) {
 	root.Name += "x"
 	if name == childName(root, mount) {
 		t.Fatal("truncated names collide")
+	}
+}
+
+func TestForkOwnerReference(t *testing.T) {
+	ctx := context.Background()
+	src := testState("base")
+	src.Spec.Mounts = []v1alpha1.Mount{{State: "repo", Path: "/work", Writable: true}, {State: "tools", Path: "/tools"}}
+	c := testClient(t, src, testState("repo"), testState("tools"))
+	dest := testState("w1")
+	owner := metav1.OwnerReference{APIVersion: v1alpha1.GroupVersion.String(), Kind: "Blip", Name: "w1", UID: types.UID("uid-w1")}
+	if err := Fork(ctx, c, src, dest, &ForkOptions{Owner: &owner}); err != nil {
+		t.Fatal(err)
+	}
+	refs := dest.OwnerReferences
+	if len(refs) != 1 || refs[0] != owner {
+		t.Fatalf("root owner references: %+v", refs)
+	}
+	var child v1alpha1.BlipState
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: dest.Spec.Mounts[0].State}, &child); err != nil {
+		t.Fatal(err)
+	}
+	if len(child.OwnerReferences) != 1 || child.OwnerReferences[0] != owner {
+		t.Fatalf("child owner references: %+v", child.OwnerReferences)
+	}
+
+	// The caller passes ownership through options, never through dest.
+	dest = testState("w2")
+	dest.OwnerReferences = refs
+	if err := Fork(ctx, c, src, dest, nil); err == nil || !strings.Contains(err.Error(), "owner references") {
+		t.Fatalf("dest owner references accepted: %v", err)
 	}
 }

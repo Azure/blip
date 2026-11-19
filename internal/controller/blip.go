@@ -155,7 +155,7 @@ func (r *BlipReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		return reconcile.Result{}, err
 	}
 	if v1.Finished(b) {
-		return reconcile.Result{}, r.cleanup(ctx, b)
+		return r.finished(ctx, b)
 	}
 	if b.DeletionTimestamp == nil && !controllerutil.ContainsFinalizer(b, v1.Finalizer) {
 		base := b.DeepCopy()
@@ -163,6 +163,13 @@ func (r *BlipReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		if err := patchObject(ctx, r.Client, b, base); err != nil {
 			return reconcile.Result{}, err
 		}
+	}
+	if r.deadlineExceeded(b) {
+		if err := r.stopForDeadline(ctx, b); err != nil {
+			return reconcile.Result{}, err
+		}
+		// Re-enter so the normal stop path stops the VM and finishes.
+		return r.Reconcile(ctx, rq)
 	}
 
 	base := b.DeepCopy()
@@ -189,9 +196,43 @@ func (r *BlipReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		return reconcile.Result{}, err
 	}
 	if v1.Finished(b) {
+		// This reconcile finished the Blip. TTL deletion starts on the next
+		// reconcile, which the status update triggers, so a TTL of 0 still
+		// leaves the result readable once.
 		return reconcile.Result{}, r.cleanup(ctx, b)
 	}
 	return result, nil
+}
+
+// finished cleans up a finished Blip and deletes it once its TTL elapses.
+func (r *BlipReconciler) finished(ctx context.Context, b *v1.Blip) (reconcile.Result, error) {
+	if err := r.cleanup(ctx, b); err != nil {
+		return reconcile.Result{}, err
+	}
+	// cleanup removed the finalizer of a Blip that is already being deleted.
+	if b.DeletionTimestamp != nil {
+		return reconcile.Result{}, nil
+	}
+	deadline, ok := r.ttlDeadline(b)
+	if !ok {
+		return reconcile.Result{}, nil
+	}
+	if left := deadline.Sub(r.now()); left > 0 {
+		return reconcile.Result{RequeueAfter: left}, nil
+	}
+	if err := r.Delete(ctx, b); err != nil && !apierrors.IsNotFound(err) {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, nil
+}
+
+// ttlDeadline is when spec.ttlSecondsAfterFinished deletes a finished Blip.
+// A TTL of 0 is already due.
+func (r *BlipReconciler) ttlDeadline(b *v1.Blip) (time.Time, bool) {
+	if b.Spec.TTLSecondsAfterFinished == nil || b.Status.FinishTime == nil {
+		return time.Time{}, false
+	}
+	return b.Status.FinishTime.Add(time.Duration(*b.Spec.TTLSecondsAfterFinished) * time.Second), true
 }
 
 // flush writes b.Status if it changed since base and makes base current.
@@ -244,20 +285,68 @@ func (r *BlipReconciler) finish(b *v1.Blip, phase, reason, msg string) {
 	b.Status.FinishTime = &now
 }
 
-// startDeadline is when the bounded startup of b expires. Pending Blips
-// without a pod get pendingTimeout to build images or copies; claimed ones
-// get startTimeout to prepare disks. Running Blips get one check at the same
-// deadline in case their pod never reports an observation.
+// deadlineExceeded reports whether a started, unfinished Blip has outlived
+// spec.activeDeadlineSeconds. A Blip that is already stopping is left to that
+// stop so the deadline cannot restart it, and Saving means the command already
+// stopped.
+func (r *BlipReconciler) deadlineExceeded(b *v1.Blip) bool {
+	if v1.Finished(b) || stopping(b) || b.Status.Phase == v1.BlipSaving ||
+		b.Spec.ActiveDeadlineSeconds == nil || b.Status.StartTime == nil {
+		return false
+	}
+	return !r.now().Before(b.Status.StartTime.Add(time.Duration(*b.Spec.ActiveDeadlineSeconds) * time.Second))
+}
+
+// stopForDeadline sets spec.stop as an expired deadline would. A conflict is
+// retried against the latest object, so a concurrent spec edit is not lost.
+func (r *BlipReconciler) stopForDeadline(ctx context.Context, b *v1.Blip) error {
+	key := client.ObjectKeyFromObject(b)
+	for attempt := 0; ; attempt++ {
+		base := b.DeepCopy()
+		b.Spec.Stop = true
+		// Record only the first cause: a later stop must not overwrite why
+		// the Blip was already stopping.
+		if b.Annotations[v1.AnnotationStopReason] == "" {
+			if b.Annotations == nil {
+				b.Annotations = map[string]string{}
+			}
+			b.Annotations[v1.AnnotationStopReason] = "DeadlineExceeded"
+		}
+		err := patchObject(ctx, r.Client, b, base)
+		if err == nil || !apierrors.IsConflict(err) || attempt >= 4 {
+			return err
+		}
+		if err := r.Get(ctx, key, b); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+	}
+}
+
+// startDeadline is the earliest bound on a Blip's current phase. Pending Blips
+// without a pod get pendingTimeout to build images or copies; claimed ones get
+// startTimeout to prepare disks. Running Blips get one check at the same
+// deadline in case their pod never reports an observation. An active deadline
+// is a second bound on the start time and is also requeued here so it fires
+// without another event.
 func (r *BlipReconciler) startDeadline(b *v1.Blip) (time.Time, bool) {
+	var deadline time.Time
+	add := func(t time.Time) {
+		if deadline.IsZero() || t.Before(deadline) {
+			deadline = t
+		}
+	}
 	switch {
 	case b.Status.Phase == v1.BlipRunning && b.Status.StartTime != nil:
-		return b.Status.StartTime.Add(startTimeout), true
+		add(b.Status.StartTime.Add(startTimeout))
 	case b.Status.Phase == v1.BlipPending && b.Status.Pod != "" && b.Status.StartTime != nil:
-		return b.Status.StartTime.Add(startTimeout), true
+		add(b.Status.StartTime.Add(startTimeout))
 	case b.Status.Phase == v1.BlipPending && b.Status.Pod == "" && !b.CreationTimestamp.IsZero():
-		return b.CreationTimestamp.Add(pendingTimeout), true
+		add(b.CreationTimestamp.Add(pendingTimeout))
 	}
-	return time.Time{}, false
+	if !v1.Finished(b) && b.Spec.ActiveDeadlineSeconds != nil && b.Status.StartTime != nil {
+		add(b.Status.StartTime.Add(time.Duration(*b.Spec.ActiveDeadlineSeconds) * time.Second))
+	}
+	return deadline, !deadline.IsZero()
 }
 
 // pending acquires the Blip's states and claims a warm pod.
@@ -933,6 +1022,12 @@ func (r *BlipReconciler) attachment(ctx context.Context, ns, state, id string) (
 			return true, "state was deleted", nil
 		}
 		return false, "", err
+	}
+	if st.DeletionTimestamp != nil {
+		// The state finalizer resolves a deleting state's writer, and its
+		// seal may never be recorded here. Waiting for one would keep both
+		// the Blip and the state's finalizer stuck forever.
+		return true, "", nil
 	}
 	s := st.Status
 	if s.Writer != nil && s.Writer.AttachmentID == id || s.Pending != nil && s.Pending.AttachmentID == id {

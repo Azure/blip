@@ -31,15 +31,25 @@ func pruneTemporaryMounts(ctx context.Context, c client.Client, live client.Read
 	}
 	var mounts []v1.Mount
 	for _, m := range root.Spec.Mounts {
-		keep := m.BlipUID == "" || active[m.BlipUID]
+		if m.BlipUID == "" {
+			mounts = append(mounts, m)
+			continue
+		}
+		// Check the target state even while its Blip is active: a deleted
+		// collector can leave a temporary mount of a fork state behind, and
+		// that mount would otherwise block deleting the state.
+		st := &v1.BlipState{}
+		err := live.Get(ctx, types.NamespacedName{Namespace: root.Namespace, Name: m.State}, st)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		if st.DeletionTimestamp != nil {
+			continue
+		}
+		keep := active[m.BlipUID]
 		if !keep {
 			// A failed/deleted execution can still have a node sealing its
 			// writer. Do not erase intent until those saves have resolved.
-			st := &v1.BlipState{}
-			err := live.Get(ctx, types.NamespacedName{Namespace: root.Namespace, Name: m.State}, st)
-			if err != nil && !apierrors.IsNotFound(err) {
-				return err
-			}
 			keep = st.Status.Writer != nil && st.Status.Writer.BlipUID == m.BlipUID ||
 				st.Status.Pending != nil && st.Status.Pending.AttachmentID != ""
 		}

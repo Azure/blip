@@ -323,7 +323,7 @@ func TestSessionExitBeforeOpenRecordLink(t *testing.T) {
 		// The original caller still owns s and must receive its replay/status.
 		host, guest := net.Pipe()
 		defer host.Close()
-		go s.serve(wire.NewConn(guest), guest)
+		go s.serve(wire.NewConn(guest), guest, false)
 		c := wire.NewConn(host)
 		typ, data, err := c.Read()
 		if err != nil || typ != wire.TStdout || string(data) != "ran once" {
@@ -429,6 +429,63 @@ func TestSessionBackpressureDetachAndReplayGap(t *testing.T) {
 			t.Fatal(err)
 		}
 		retry.Close()
+	})
+}
+
+// A follower tails the session without pinning its output: a burst larger
+// than the ring is trimmed instead of blocking the command, and the follower
+// still receives the retained tail after a replay-gap notice.
+func TestSessionFollowDoesNotPinRing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g, _ := lifecycleGuest(t)
+		s := newSession(g, "output", nil, false)
+		s.out.max = 8
+		g.sessions[s.id] = s
+		c := &sessionclient.Client{Connect: lifecycleConnector(t, g)}
+		follower, err := c.Open(context.Background(), "ns", "pod", wire.Open{Mode: wire.OpenAttach, Session: s.id, Follow: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		s.mu.Lock()
+		readers := len(s.readers)
+		s.mu.Unlock()
+		if readers != 0 {
+			t.Fatalf("follower was registered as a ring reader: %d", readers)
+		}
+
+		done := make(chan struct{})
+		go func() {
+			s.appendOutput(wire.TStdout, []byte("first123"))
+			s.appendOutput(wire.TStdout, []byte("second45"))
+			close(done)
+		}()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("follower backpressured the output pump")
+		}
+		s.mu.Lock()
+		first, size := s.out.first, s.out.size
+		s.mu.Unlock()
+		if first == 0 || size > s.out.max {
+			t.Fatalf("follower pinned trimmed output: first=%d size=%d", first, size)
+		}
+
+		f, err := follower.Recv()
+		if err != nil || f.Type != wire.TNotice || f.Notice != "earlier output was dropped" {
+			t.Fatalf("follower replay gap was silent: %+v %v", f, err)
+		}
+		f, err = follower.Recv()
+		if err != nil || string(f.Data) != "second45" {
+			t.Fatalf("follower retained replay: %+v %v", f, err)
+		}
+		s.finish(wire.Exit{})
+		if _, err := follower.Copy(io.Discard, io.Discard, nil); err != nil {
+			t.Fatal(err)
+		}
+		follower.Close()
 	})
 }
 

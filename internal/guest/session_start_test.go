@@ -129,7 +129,7 @@ func attachAndRead(t *testing.T, s *session) (string, wire.Exit) {
 			}
 			serveDone <- nil
 		}()
-		s.serve(wire.NewConn(srv), srv)
+		s.serve(wire.NewConn(srv), srv, false)
 	}()
 
 	c := wire.NewConn(cli)

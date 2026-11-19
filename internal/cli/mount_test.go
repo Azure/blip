@@ -37,7 +37,7 @@ func TestMountOfflineRootEdits(t *testing.T) {
 	a.env.Out = &out
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if code := Main(ctx, a.env, []string{"mount", "data", "home", "--path", "/data", "--write"}); code != 0 {
+	if code := Main(ctx, a.env, []string{"mount", "data:/data:rw", "--root", "home"}); code != 0 {
 		t.Fatalf("mount returned %d", code)
 	}
 	s, err := a.getState(ctx, root.Name)
@@ -55,7 +55,7 @@ func TestMountOfflineRootEdits(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Reset()
-	if code := Main(ctx, a.env, []string{"unmount", "data", "home"}); code != 0 {
+	if code := Main(ctx, a.env, []string{"mount", "--rm", "data", "--root", "home"}); code != 0 {
 		t.Fatalf("unmount returned %d", code)
 	}
 	s, _ = a.getState(ctx, root.Name)
@@ -150,17 +150,17 @@ func TestMountGuestRootAndSharedImport(t *testing.T) {
 	var errOut bytes.Buffer
 	a.env.Err = &errOut
 	ctx := context.Background()
-	if code := Main(ctx, a.env, []string{"mount", "base", "--path", "/base"}); code != 0 {
+	if code := Main(ctx, a.env, []string{"mount", "base:/base"}); code != 0 {
 		t.Fatalf("mount code %d: %s", code, errOut.String())
 	}
 	s, _ := a.getState(ctx, root.Name)
 	if len(s.Spec.Mounts) != 1 || s.Spec.Mounts[0].State != "base" {
 		t.Fatalf("mounts %+v", s.Spec.Mounts)
 	}
-	if code := Main(ctx, a.env, []string{"mount", "base", "--path", "/base", "--write"}); code != 1 || !strings.Contains(errOut.String(), "imported base") {
+	if code := Main(ctx, a.env, []string{"mount", "base:/base:rw"}); code != 1 || !strings.Contains(errOut.String(), "imported base") {
 		t.Fatalf("writable imported base: %d %s", code, errOut.String())
 	}
-	if code := Main(ctx, a.env, []string{"unmount", "base"}); code != 0 {
+	if code := Main(ctx, a.env, []string{"mount", "--rm", "base"}); code != 0 {
 		t.Fatalf("unmount: %d %s", code, errOut.String())
 	}
 	s, _ = a.getState(ctx, root.Name)
@@ -329,7 +329,7 @@ func TestMountWritableBusyStateFailsFast(t *testing.T) {
 	}
 
 	start := time.Now()
-	code, _, errOut := h.run("", "mount", "data", b.Spec.State, "--path", "/data", "--write")
+	code, _, errOut := h.run("", "mount", "data:/data:rw", "--root", b.Spec.State)
 	if code == 0 {
 		t.Fatalf("busy writable mount succeeded: %s", errOut)
 	}
@@ -358,7 +358,7 @@ func TestMountWritableUnrelatedMessageKeepsWaiting(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	code := Main(ctx, env, []string{"mount", "data", b.Spec.State, "--path", "/data", "--write"})
+	code := Main(ctx, env, []string{"mount", "data:/data:rw", "--root", b.Spec.State})
 	if code == 0 {
 		t.Fatal("mount succeeded")
 	}
@@ -446,5 +446,214 @@ func TestWaitMountIgnoresRevivedAttachment(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("waitMount did not accept the fresh attachment")
+	}
+}
+
+func TestMountListsRootMounts(t *testing.T) {
+	root := readyState("home")
+	root.Spec.Mounts = []v1alpha1.Mount{
+		{State: "data", Path: "/data"},
+		{State: "work", Path: "/work", Writable: true},
+		{State: "temporary", Path: "/temporary", BlipUID: "old-execution"},
+	}
+	h := newHarness(t, root, readyState("empty"))
+	code, out, errOut := h.run("", "mount", "--root", "home")
+	if code != 0 {
+		t.Fatalf("list code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "data:/data (read-only)", "work:/work (writable)")
+	if strings.Contains(out, "temporary") {
+		t.Fatalf("temporary collect mount listed: %q", out)
+	}
+
+	code, out, errOut = h.run("", "mount", "--root", "empty")
+	if code != 0 {
+		t.Fatalf("empty list code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state empty has no mounts")
+
+	// A running root also shows each attachment's phase.
+	running := newHarness(t, runningBlip("agent", v1alpha1.Mount{State: "repo", Path: "/work"}))
+	code, out, errOut = running.run("", "mount", "--root", "agent-root")
+	if code != 0 {
+		t.Fatalf("attached list code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "repo:/work (read-only) Mounted")
+}
+
+func TestMountNewCreatesAndMountsEmptyState(t *testing.T) {
+	h := newHarness(t, readyState("home"))
+	code, out, errOut := h.run("", "mount", "--new", "cache:/cache", "--root", "home")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state cache mounted on root state home at /cache (writable)", "next execution")
+	s := h.state("cache")
+	if s.Spec.Image != "" || s.Spec.CopyFrom != "" || s.Spec.Size != nil || s.Spec.Replicas != 0 {
+		t.Fatalf("unexpected spec %+v", s.Spec)
+	}
+	if s.Status.Committed == nil {
+		t.Fatal("state has no first commit")
+	}
+	root := h.state("home")
+	if len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0] != (v1alpha1.Mount{State: "cache", Path: "/cache", Writable: true}) {
+		t.Fatalf("mounts %+v", root.Spec.Mounts)
+	}
+}
+
+func TestMountNewFromWithSize(t *testing.T) {
+	h := newHarness(t, readyState("home"), readyState("base"))
+	code, out, errOut := h.run("", "mount", "--new", "dev:/work", "--from", "base", "--size", "20Gi", "--root", "home")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state dev mounted on root state home at /work (writable)")
+	s := h.state("dev")
+	if s.Spec.CopyFrom != "base" || s.Spec.Size == nil || s.Spec.Size.String() != "20Gi" || s.Spec.Replicas != 0 {
+		t.Fatalf("state %+v", s.Spec)
+	}
+	if s.Status.Committed == nil {
+		t.Fatal("copied state has no first commit")
+	}
+	if root := h.state("home"); len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0].State != "dev" || !root.Spec.Mounts[0].Writable {
+		t.Fatalf("mounts %+v", root.Spec.Mounts)
+	}
+}
+
+func TestMountNewReadOnly(t *testing.T) {
+	h := newHarness(t, readyState("home"))
+	code, out, errOut := h.run("", "mount", "--new", "cache:/cache:ro", "--root", "home")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state cache mounted on root state home at /cache (read-only)")
+	root := h.state("home")
+	if len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0] != (v1alpha1.Mount{State: "cache", Path: "/cache"}) {
+		t.Fatalf("mounts %+v", root.Spec.Mounts)
+	}
+}
+
+func TestMountRejectsDuplicateMounts(t *testing.T) {
+	t.Run("duplicate state", func(t *testing.T) {
+		h := newHarness(t, readyState("home"), readyState("data"))
+		code, _, errOut := h.run("", "mount", "data:/a", "data:/b", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `state "data" is already mounted on root state "home" at /a`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+	})
+	t.Run("duplicate path", func(t *testing.T) {
+		h := newHarness(t, readyState("home"), readyState("data"), readyState("other"))
+		code, _, errOut := h.run("", "mount", "data:/a", "other:/a", "--root", "home")
+		if code != 1 || !strings.Contains(errOut, `root state "home" already has state "data" mounted at /a`) {
+			t.Fatalf("code %d: %s", code, errOut)
+		}
+	})
+}
+
+func TestMountValidationErrors(t *testing.T) {
+	h := newHarness(t, readyState("home"), readyState("data"))
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"root required", []string{"mount", "data:/data"}, "--root is required outside a blip"},
+		{"missing path", []string{"mount", "data", "--root", "home"}, `invalid mount "data"`},
+		{"relative path", []string{"mount", "data:work", "--root", "home"}, `invalid mount "data:work"`},
+		{"unclean path", []string{"mount", "data:/a/../b", "--root", "home"}, `invalid mount "data:/a/../b"`},
+		{"root path", []string{"mount", "data:/", "--root", "home"}, `invalid mount "data:/"`},
+		{"mode", []string{"mount", "data:/w:rx", "--root", "home"}, `invalid mount "data:/w:rx"`},
+		{"self mount", []string{"mount", "home:/data", "--root", "home"}, "a root state cannot mount itself"},
+		{"bad size", []string{"mount", "--new", "x:/data", "--size", "nope", "--root", "home"}, "invalid --size"},
+		{"zero size", []string{"mount", "--new", "x:/data", "--size", "0", "--root", "home"}, "must be positive"},
+		{"missing source", []string{"mount", "--new", "x:/data", "--from", "missing", "--root", "home"}, `state "missing" not found`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, errOut := h.run("", tc.args...)
+			if code != 1 || !strings.Contains(errOut, tc.want) {
+				t.Fatalf("code %d: %s", code, errOut)
+			}
+		})
+	}
+}
+
+// TestMountNewFromWithReplicasAndOwner ports the old create from-owned-state
+// coverage: --from and --replicas still configure the new state, and a guest's
+// owner label follows it into the cluster.
+func TestMountNewFromWithReplicasAndOwner(t *testing.T) {
+	h := newHarness(t, ownedBlip("alice.box", "alice.home"), readyState("alice.base"))
+	h.self = "alice.box"
+	code, out, errOut := h.run("", "mount", "--new", "repo:/data", "--from", "base", "--replicas", "2")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state repo mounted on blip box at /data (writable)")
+	s := h.state("alice.repo")
+	if s.Spec.CopyFrom != "alice.base" || s.Spec.Replicas != 2 || s.Labels[v1alpha1.LabelOwner] != "alice" {
+		t.Fatalf("state %+v labels %v", s.Spec, s.Labels)
+	}
+	root := h.state("alice.home")
+	if len(root.Spec.Mounts) != 1 || root.Spec.Mounts[0] != (v1alpha1.Mount{State: "alice.repo", Path: "/data", Writable: true}) {
+		t.Fatalf("root mounts %+v", root.Spec.Mounts)
+	}
+}
+
+func TestMountNewRejectsExisting(t *testing.T) {
+	h := newHarness(t, readyState("home"), readyState("taken"))
+	code, _, errOut := h.run("", "mount", "--new", "taken:/data", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `state "taken" already exists`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+}
+
+func TestMountNewSurfacesStateFailure(t *testing.T) {
+	h := newHarness(t, readyState("home"))
+	h.ctrl.set(func(c *fakeController) { c.stateFail = "no space left" })
+	code, _, errOut := h.run("", "mount", "--new", "bad:/data", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `state "bad" failed: no space left`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if root := h.state("home"); len(root.Spec.Mounts) != 0 {
+		t.Fatalf("failed state mounted: %+v", root.Spec.Mounts)
+	}
+}
+
+func TestMountNewWaitsThroughRecoverableFailure(t *testing.T) {
+	h := newHarness(t, readyState("home"))
+	h.ctrl.set(func(c *fakeController) {
+		c.stateFail = "initial version failed: retrying"
+		c.stateFailPending = true
+	})
+	code, out, errOut := h.run("", "mount", "--new", "flaky:/data", "--root", "home")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "state flaky mounted on root state home at /data")
+	if s := h.state("flaky"); s.Status.Committed == nil {
+		t.Fatal("state has no first commit")
+	}
+}
+
+func TestMountNewRejectsFailedSource(t *testing.T) {
+	bad := state("bad")
+	bad.Status.Phase, bad.Status.Message = v1alpha1.StateFailed, "image too large"
+	h := newHarness(t, readyState("home"), bad)
+	code, _, errOut := h.run("", "mount", "--new", "copy:/data", "--from", "bad", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, `copy source "bad" failed: image too large`) {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+}
+
+// TestMountNewMountFailureLeavesState ports create's attach-failure coverage:
+// the created state keeps its first commit even when mounting it fails.
+func TestMountNewMountFailureLeavesState(t *testing.T) {
+	h := newHarness(t, runningBlip("agent"))
+	h.ctrl.set(func(c *fakeController) { c.mountFail = "device gone" })
+	code, _, errOut := h.run("", "mount", "--new", "data:/work", "--root", "agent-root")
+	if code != 1 || !strings.Contains(errOut, "device gone") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if s := h.state("data"); s.Status.Committed == nil {
+		t.Fatal("state has no first commit")
 	}
 }

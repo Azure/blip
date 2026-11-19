@@ -15,25 +15,36 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// ForkOptions customizes the objects Fork creates.
+type ForkOptions struct {
+	// Owner, when set, is the owner reference of the root and every copy, so
+	// that deleting the owning object also removes the workspace. A nil
+	// Owner makes the workspace durable: it outlives every execution.
+	Owner *metav1.OwnerReference
+}
+
 // Fork snapshots the source workspace configuration and creates a root copy
 // plus an independent filesystem copy for each persistent writable mount.
 // Read-only references are retained; temporary mounts and the configuration of
 // mounted states are not inherited. Filesystem snapshots are taken independently
 // by the state controller, rather than as an atomic multi-filesystem snapshot.
 //
-// The caller supplies dest's name, namespace, labels and provisioning overrides
-// (size, replicas and nodeSelector). Fork sets copyFrom, runtime and mounts. It
-// creates the root last and never sets owner references: the workspace outlives
-// every execution. Only a definitive API rejection triggers removal of states
-// created by this call, with UID preconditions protecting replaced objects.
-// Ambiguous failures preserve them: the failed create may have persisted a root
-// referencing those children even though its response was lost.
-func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest *v1alpha1.BlipState) error {
+// The caller supplies dest's name, namespace, labels, provisioning overrides
+// (size, replicas and nodeSelector) and, in opts, the owner of the new states.
+// Fork sets copyFrom, runtime and mounts. It creates the root last. Only a
+// definitive API rejection triggers removal of states created by this call,
+// with UID preconditions protecting replaced objects. Ambiguous failures
+// preserve them: the failed create may have persisted a root referencing those
+// children even though its response was lost.
+func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest *v1alpha1.BlipState, opts *ForkOptions) error {
 	if source == nil || dest == nil || source.Name == "" || dest.Name == "" || source.Namespace != dest.Namespace {
 		return errors.New("fork requires named source and destination states in the same namespace")
 	}
 	if dest.Spec.Image != "" || len(dest.Spec.ImagePullSecrets) != 0 || len(dest.OwnerReferences) != 0 {
 		return errors.New("fork destination cannot have an image, image pull secrets, or owner references")
+	}
+	if opts == nil {
+		opts = &ForkOptions{}
 	}
 	if err := CheckSource(source); err != nil {
 		return err
@@ -59,10 +70,16 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 				ObjectMeta: metav1.ObjectMeta{Name: childName(root, mount), Namespace: root.Namespace, Labels: maps.Clone(root.Labels)},
 				Spec:       v1alpha1.BlipStateSpec{CopyFrom: mount.State, Replicas: root.Spec.Replicas, NodeSelector: maps.Clone(root.Spec.NodeSelector)},
 			}
+			if opts.Owner != nil {
+				child.OwnerReferences = []metav1.OwnerReference{*opts.Owner}
+			}
 			mount.State = child.Name
 			copies = append(copies, child)
 		}
 		root.Spec.Mounts = append(root.Spec.Mounts, mount)
+	}
+	if opts.Owner != nil {
+		root.OwnerReferences = []metav1.OwnerReference{*opts.Owner}
 	}
 	copies = append(copies, root)
 	// Preflight every destination before any create, including root. A racing

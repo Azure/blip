@@ -3,11 +3,9 @@ package cli
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
@@ -202,44 +200,4 @@ func (a *app) waitFinished(ctx context.Context, name string, quiet bool) (*v1alp
 		return false, nil
 	})
 	return got, err
-}
-
-func (a *app) waitCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "wait NAME...",
-		Short: "Wait until blips finish (including saves); fails if any failed",
-		Args:  cobra.MinimumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			failed := false
-			for _, name := range args {
-				if err := a.scope(&name); err != nil {
-					return err
-				}
-				fin, err := a.waitFinished(cmd.Context(), name, true)
-				if err != nil {
-					return err
-				}
-				line := fmt.Sprintf("blip/%s %s", a.short(name), fin.Status.Phase)
-				if fin.Status.ExitCode != nil {
-					line += fmt.Sprintf(" (exit %d)", *fin.Status.ExitCode)
-				}
-				if fin.Status.Phase == v1alpha1.BlipSucceeded && fin.Status.Reason != "" && fin.Status.Reason != "Completed" {
-					line += fmt.Sprintf(" (%s)", fin.Status.Reason)
-				}
-				if fin.Status.Phase == v1alpha1.BlipFailed {
-					failed = true
-					if msg := fin.Status.Message; strings.Contains(msg, "\n") {
-						line += ":\n    " + strings.ReplaceAll(msg, "\n", "\n    ")
-					} else if msg != "" {
-						line += ": " + msg
-					}
-				}
-				fmt.Fprintln(a.env.Out, line)
-			}
-			if failed {
-				return &ExitError{Code: 1}
-			}
-			return nil
-		},
-	}
 }

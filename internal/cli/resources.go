@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -66,26 +65,6 @@ func findSpecMount(list []v1alpha1.Mount, state string) *v1alpha1.Mount {
 		}
 	}
 	return nil
-}
-
-// parseMount parses STATE:/path[:rw|:ro].
-func parseMount(s string) (v1alpha1.Mount, error) {
-	parts := strings.Split(s, ":")
-	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || !strings.HasPrefix(parts[1], "/") ||
-		parts[1] == "/" || path.Clean(parts[1]) != parts[1] {
-		return v1alpha1.Mount{}, fmt.Errorf("invalid mount %q: want STATE:/clean/absolute/path[:rw]", s)
-	}
-	m := v1alpha1.Mount{State: parts[0], Path: parts[1]}
-	if len(parts) == 3 {
-		switch parts[2] {
-		case "rw":
-			m.Writable = true
-		case "ro":
-		default:
-			return v1alpha1.Mount{}, fmt.Errorf("invalid mount %q: mode must be rw or ro", s)
-		}
-	}
-	return m, nil
 }
 
 // parseEnv parses KEY=VALUE; a bare KEY takes the local value.

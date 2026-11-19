@@ -59,6 +59,14 @@ spec:
               BlipSpec is one VM lifetime: one command that runs as the primary session.
               The blip ends when the command exits.
             properties:
+              activeDeadlineSeconds:
+                description: |-
+                  ActiveDeadlineSeconds stops the blip's command when it has run this
+                  long. The VM is stopped as if spec.stop were set. `blip run --timeout`
+                  sets it.
+                format: int64
+                minimum: 1
+                type: integer
               command:
                 description: Command runs as the primary session. The blip ends when
                   it exits.
@@ -345,6 +353,13 @@ spec:
               stop:
                 description: Stop asks the blip to shut down gracefully and save.
                 type: boolean
+              ttlSecondsAfterFinished:
+                description: |-
+                  TTLSecondsAfterFinished deletes the blip this long after it finished,
+                  whether or not anyone gathered its results. `blip run --ttl` sets it.
+                format: int32
+                minimum: 0
+                type: integer
               tty:
                 description: TTY gives the primary command a terminal.
                 type: boolean

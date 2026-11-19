@@ -11,8 +11,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/spf13/cobra"
-
 	"github.com/Azure/blip/api/v1alpha1"
 )
 
@@ -24,42 +22,6 @@ var collectMountRoot = "/run/blip-collect"
 // the caller's root is already in use by the caller, so it cannot be mounted;
 // its contents are here instead.
 var collectSelfRoot = "/"
-
-// collectCommand copies files out of a finished blip's state and fetches
-// git commits into the repository in the caller's working directory.
-func (a *app) collectCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "collect BLIP OP...",
-		Short: "Copy files and fetch commits from a blip's state",
-		Long: `Collect files or git commits from a blip's state. A state collect attaches
-is mounted read-only in the blip this command runs in.
-
-Each OP is one of:
-  SRC:DEST              copy a file or directory from SRC in BLIP to DEST here
-  git:SRC:BRANCH        fetch BRANCH from the repository at SRC into the
-                        repository in the current directory, as local BRANCH
-
-SRC is an absolute path in BLIP, or a path relative to the current directory.
-DEST is a path here; directories are copied recursively. A file copied to an
-existing directory keeps its name. Existing files are overwritten.
-
-If a referenced state is still being written, collect waits until it is
-available. An existing mount of that state in the calling blip is reused; if
-it is read-only and behind the latest version, unmount it first.`,
-		Example: `  blip collect w1 /home/dev/out/report.pdf:./report.pdf
-  blip collect w1 /home/dev/out:./artifacts
-  blip collect w1 git:/home/dev/src:w1
-  blip collect w1 git:/work/repo:w1 /home/dev/out:./artifacts`,
-		Args: cobra.MinimumNArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.collect(cmd.Context(), args[0], args[1:])
-		},
-	}
-	// Everything after the blip name is a copy operation, including paths
-	// that start with "-".
-	cmd.Flags().SetInterspersed(false)
-	return cmd
-}
 
 func (a *app) collect(ctx context.Context, name string, raw []string) error {
 	cwd, err := os.Getwd()

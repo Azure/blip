@@ -200,6 +200,9 @@ type Open struct {
 	// a session it may already have started instead of running the command
 	// twice. Old clients leave it empty, which preserves the old behavior.
 	OpenID string `json:"openID,omitempty"`
+	// Follow tails the session without holding it open: the client receives
+	// retained output but never pins the replay ring or blocks the command.
+	Follow bool `json:"follow,omitempty"`
 }
 
 type Opened struct {

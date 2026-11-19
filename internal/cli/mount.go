@@ -11,10 +11,13 @@ import (
 
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/api/v1alpha1"
+	"github.com/Azure/blip/internal/workspace"
 )
 
 // updateState applies a single atomic edit to the latest state, including any
@@ -426,85 +429,225 @@ func (a *app) mountTarget(root *string) error {
 	}
 	if *root == "" {
 		if a.self == nil {
-			return errors.New("ROOT_STATE is required outside a blip")
+			return errors.New("--root is required outside a blip")
 		}
 		*root = a.self.Spec.State
 	}
 	return nil
 }
 
+type mountFlags struct {
+	root     string
+	remove   []string
+	create   []string
+	from     string
+	size     string
+	replicas int32
+}
+
 func (a *app) mountCommand() *cobra.Command {
-	var mountPath string
-	var write, readOnly bool
+	f := &mountFlags{}
 	cmd := &cobra.Command{
-		Use:     "mount STATE [ROOT_STATE] --path PATH [--write|--read-only]",
-		Short:   "Mount a state into a root state, including while offline",
-		Example: "  kubectl blip mount repo home --path /work --write",
-		Args:    cobra.RangeArgs(1, 2),
+		Use:   "mount [STATE:PATH[:rw|ro]]... [flags]",
+		Short: "Mount states, remove mounts, or create a state to mount",
+		Long: `Mount a state into a root state, remove a mount, create a state to mount, or
+list the root's mounts.
+
+  blip mount STATE:PATH[:rw|ro]     mount STATE at PATH (read-only by default)
+  blip mount --rm STATE             remove the mount and wait for its save
+  blip mount --new NAME:PATH[:rw|ro] [--from SRC] [--size SIZE] [--replicas N]
+                                    create a state and mount it (writable by
+                                    default)
+  blip mount                        list the root's mounts
+
+Inside a blip the root defaults to its own root state, so a mount takes effect
+in the running command. Outside one, --root names the state to edit.`,
+		Example: `  blip mount repo:/work:rw
+  blip mount --rm repo
+  blip mount --new cache:/cache:rw --size 20Gi
+  kubectl blip mount repo:/work --root home`,
+		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var root string
-			if len(args) == 2 {
-				root = args[1]
-			}
-			if err := a.mountTarget(&root); err != nil {
-				return err
-			}
-			source, err := a.resolveState(cmd.Context(), args[0])
-			if err != nil {
-				return err
-			}
-			if write && readOnly {
-				return errors.New("--write and --read-only cannot be used together")
-			}
-			var target *bool
-			if cmd.Flags().Changed("write") {
-				target = &write
-			} else if cmd.Flags().Changed("read-only") {
-				v := false
-				target = &v
-			}
-			return a.mountState(cmd.Context(), source.Name, root, mountPath, target)
+			return a.mount(cmd.Context(), args, f, cmd.Flags().Changed("replicas"))
 		},
 	}
-	cmd.Flags().StringVar(&mountPath, "path", "", "absolute mount path in the blip (required)")
-	cmd.Flags().BoolVar(&write, "write", false, "mount writable (takes the state's writer and saves on unmount)")
-	cmd.Flags().BoolVar(&readOnly, "read-only", false, "mount read-only (the default for a new mount)")
-	_ = cmd.MarkFlagRequired("path")
+	fl := cmd.Flags()
+	fl.StringVar(&f.root, "root", "", "root state to edit (default: the current blip's root state)")
+	fl.StringArrayVar(&f.remove, "rm", nil, "remove this state's mount (repeatable)")
+	fl.StringArrayVar(&f.create, "new", nil, "create STATE and mount it at PATH as NAME:PATH[:rw|ro] (repeatable)")
+	fl.StringVar(&f.from, "from", "", "for --new: copy an existing workspace or imported base")
+	fl.StringVar(&f.size, "size", "", "for --new: filesystem size, e.g. 20Gi")
+	fl.Int32Var(&f.replicas, "replicas", 0, "for --new: nodes holding each committed version, 1-3 (default 3)")
 	return cmd
 }
 
-func (a *app) unmountCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "unmount STATE [ROOT_STATE]",
-		Short: "Remove a mount from a root state and wait for an active blip to save it",
-		Args:  cobra.RangeArgs(1, 2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			var root string
-			if len(args) == 2 {
-				root = args[1]
+// parseMountSpec parses STATE:PATH[:rw|ro]. A nil mode leaves an existing
+// mount's mode unchanged and makes a new mount read-only.
+func parseMountSpec(s string) (state, mountPath string, writable *bool, err error) {
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) < 2 || parts[0] == "" {
+		return "", "", nil, fmt.Errorf("invalid mount %q: want STATE:PATH[:rw|ro]", s)
+	}
+	state, mountPath = parts[0], parts[1]
+	if !path.IsAbs(mountPath) || path.Clean(mountPath) != mountPath || mountPath == "/" {
+		return "", "", nil, fmt.Errorf("invalid mount %q: PATH must be a clean absolute path other than /", s)
+	}
+	if len(parts) == 3 {
+		want := false
+		switch parts[2] {
+		case "rw":
+			want = true
+		case "ro":
+		default:
+			return "", "", nil, fmt.Errorf("invalid mount %q: mode must be rw or ro", s)
+		}
+		writable = &want
+	}
+	return state, mountPath, writable, nil
+}
+
+func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasSet bool) error {
+	if err := a.mountTarget(&f.root); err != nil {
+		return err
+	}
+	if len(args) == 0 && len(f.remove) == 0 && len(f.create) == 0 {
+		return a.listMounts(ctx, f.root)
+	}
+	for _, spec := range f.create {
+		if err := a.newMountedState(ctx, spec, f, replicasSet); err != nil {
+			return err
+		}
+	}
+	for _, arg := range args {
+		state, mountPath, writable, err := parseMountSpec(arg)
+		if err != nil {
+			return err
+		}
+		source, err := a.resolveState(ctx, state)
+		if err != nil {
+			return err
+		}
+		if err := a.mountState(ctx, source.Name, f.root, mountPath, writable); err != nil {
+			return err
+		}
+	}
+	for _, state := range f.remove {
+		if err := a.unmountArg(ctx, state, f.root); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// newMountedState creates a state and mounts it on the root. An empty state
+// gets its first version from the state controller; --from copies a workspace
+// or imported base into a new one.
+func (a *app) newMountedState(ctx context.Context, spec string, f *mountFlags, replicasSet bool) error {
+	name, mountPath, mode, err := parseMountSpec(spec)
+	if err != nil {
+		return err
+	}
+	writable := true
+	if mode != nil {
+		writable = *mode
+	}
+	if replicasSet && (f.replicas < 1 || f.replicas > 3) {
+		return errors.New("--replicas must be between 1 and 3")
+	}
+	if err := a.scope(&name); err != nil {
+		return err
+	}
+	c, err := a.clients()
+	if err != nil {
+		return err
+	}
+	st := &v1alpha1.BlipState{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace}}
+	if replicasSet {
+		st.Spec.Replicas = f.replicas
+	}
+	if f.size != "" {
+		size, err := resource.ParseQuantity(f.size)
+		if err != nil {
+			return fmt.Errorf("invalid --size %q: %w", f.size, err)
+		}
+		if size.Sign() <= 0 {
+			return fmt.Errorf("invalid --size %q: must be positive", f.size)
+		}
+		st.Spec.Size = &size
+	}
+	a.label(st)
+	if f.from != "" {
+		src, err := a.resolveState(ctx, f.from)
+		if err != nil {
+			return err
+		}
+		if err := workspace.Fork(ctx, c.Kube, src, st, nil); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return fmt.Errorf("state %q already exists; choose another name", a.short(name))
 			}
-			if err := a.mountTarget(&root); err != nil {
-				return err
+			return err
+		}
+	} else if err := c.Kube.Create(ctx, st); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("state %q already exists; choose another name", a.short(name))
+		}
+		return err
+	}
+	if _, err := a.waitStateCommitted(ctx, name); err != nil {
+		return err
+	}
+	return a.mountState(ctx, name, f.root, mountPath, &writable)
+}
+
+func (a *app) listMounts(ctx context.Context, root string) error {
+	s, err := a.getState(ctx, root)
+	if err != nil {
+		return err
+	}
+	b, err := a.rootWriter(ctx, s)
+	if err != nil {
+		return err
+	}
+	printed := 0
+	for _, m := range s.Spec.Mounts {
+		if m.BlipUID != "" {
+			continue
+		}
+		printed++
+		line := fmt.Sprintf("%s:%s (%s)", a.short(m.State), m.Path, modeName(m.Writable))
+		if b != nil {
+			if st := findMount(b.Status.Mounts, m.State); st != nil {
+				line += " " + string(st.Phase)
 			}
-			s, err := a.getState(cmd.Context(), root)
+		}
+		fmt.Fprintln(a.env.Out, line)
+	}
+	if printed == 0 {
+		fmt.Fprintf(a.env.Out, "state %s has no mounts\n", a.short(root))
+	}
+	return nil
+}
+
+// unmountArg removes a mount, accepting an owner-local name or the qualified
+// name that is actually in the root's spec.
+func (a *app) unmountArg(ctx context.Context, arg, root string) error {
+	s, err := a.getState(ctx, root)
+	if err != nil {
+		return err
+	}
+	state := a.full(arg)
+	if state != arg && findSpecMount(s.Spec.Mounts, state) == nil {
+		if findSpecMount(s.Spec.Mounts, arg) != nil {
+			state = arg
+		} else {
+			b, err := a.rootWriter(ctx, s)
 			if err != nil {
 				return err
 			}
-			state := a.full(args[0])
-			if state != args[0] && findSpecMount(s.Spec.Mounts, state) == nil {
-				if findSpecMount(s.Spec.Mounts, args[0]) != nil {
-					state = args[0]
-				} else {
-					b, err := a.rootWriter(cmd.Context(), s)
-					if err != nil {
-						return err
-					}
-					if b != nil && findMount(b.Status.Mounts, state) == nil && findMount(b.Status.Mounts, args[0]) != nil {
-						state = args[0]
-					}
-				}
+			if b != nil && findMount(b.Status.Mounts, state) == nil && findMount(b.Status.Mounts, arg) != nil {
+				state = arg
 			}
-			return a.unmountState(cmd.Context(), state, root)
-		},
+		}
 	}
+	return a.unmountState(ctx, state, root)
 }
