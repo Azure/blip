@@ -342,14 +342,19 @@ func (a *app) follow(ctx context.Context, name string) {
 	}
 	s, err := a.openRetrying(ctx, name, pod, wire.Open{Mode: wire.OpenAttach, Session: wire.PrimarySession, Follow: true}, true)
 	if err != nil {
-		if (ending || a.blipEnding(ctx, name)) && ctx.Err() == nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if ending || a.blipEnding(ctx, name) {
 			// The replay ring died with the VM. The guest still mirrored the
 			// command to the serial console, which the pod keeps as its log.
 			if a.replayLogs(ctx, pod, short) || a.printRetained(ctx, name, short) {
 				return
 			}
 			a.progress("%s: output is no longer available: %v", short, err)
+			return
 		}
+		a.progress("%s: could not follow output: %v", short, err)
 		return
 	}
 	defer s.Close()
@@ -359,8 +364,8 @@ func (a *app) follow(ctx context.Context, name string) {
 	out.flush()
 	errw.flush()
 	if !out.wrote && !errw.wrote && (ending || a.blipEnding(ctx, name)) {
-		if !a.replayLogs(ctx, pod, short) {
-			a.printRetained(ctx, name, short)
+		if !a.replayLogs(ctx, pod, short) && !a.printRetained(ctx, name, short) {
+			a.progress("%s: output is no longer available", short)
 		}
 	}
 }
@@ -373,21 +378,35 @@ func (a *app) blipEnding(ctx context.Context, name string) bool {
 	return err == nil && (v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving)
 }
 
+// retainedOutputWait bounds how long gather waits for the controller to
+// publish status.output after the VM pod is gone. The controller patches the
+// output before deleting the pod, but the client's view can lag behind a fast
+// completion, and a fixed short wait used to give up silently.
+var retainedOutputWait = 15 * time.Second
+
 // printRetained prints the command output the controller saved in Blip status
 // before deleting the VM pod. The controller and a finishing Blip race the
-// follower, so wait briefly for the status write. It returns whether it
-// printed anything.
+// follower, so poll for the status write until retainedOutputWait expires. It
+// returns whether it printed anything.
 func (a *app) printRetained(ctx context.Context, name, short string) bool {
-	deadline := time.Now().Add(3 * time.Second)
+	c, err := a.clients()
+	if err != nil {
+		return false
+	}
+	deadline := time.Now().Add(retainedOutputWait)
 	for {
-		b, err := a.getBlip(ctx, name)
-		if err == nil && b.Status.Output != "" {
+		b := &v1alpha1.Blip{}
+		err := c.Kube.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: name}, b)
+		switch {
+		case err == nil && b.Status.Output != "":
 			w := &prefixWriter{out: a.env.Out, prefix: short + "|"}
 			_, _ = w.Write([]byte(b.Status.Output))
 			w.flush()
 			return w.wrote
-		}
-		if err != nil || !time.Now().Before(deadline) {
+		case apierrors.IsNotFound(err):
+			// The Blip is gone, so no later status write can arrive.
+			return false
+		case ctx.Err() != nil || !time.Now().Before(deadline):
 			return false
 		}
 		select {

@@ -25,6 +25,26 @@ func finishedBlip(name string, phase string, code int32) *v1alpha1.Blip {
 	return b
 }
 
+// withRetainedOutputWait shortens gather's status.output fallback wait so a
+// test does not have to wait for the production timeout.
+func withRetainedOutputWait(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := retainedOutputWait
+	retainedOutputWait = d
+	t.Cleanup(func() { retainedOutputWait = old })
+}
+
+// setOutput writes status.output directly, like the controller does.
+func (h *harness) setOutput(name, output string) {
+	h.t.Helper()
+	var b v1alpha1.Blip
+	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &b); err != nil {
+		return
+	}
+	b.Status.Output = output
+	_ = h.kube.Status().Update(context.Background(), &b)
+}
+
 func (h *harness) gone(name string) bool {
 	h.t.Helper()
 	err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &v1alpha1.Blip{})
@@ -214,6 +234,7 @@ func TestGatherFollowReplaysSerialLogWhenSessionIsGone(t *testing.T) {
 // When the pod is gone there is nothing left to replay; say so instead of
 // silently printing only the status line.
 func TestGatherFollowSaysFinishedOutputIsGone(t *testing.T) {
+	withRetainedOutputWait(t, 50*time.Millisecond)
 	b := finishedBlip("gone", v1alpha1.BlipSucceeded, 0)
 	b.Status.Pod = ""
 	h := newHarness(t, b)
@@ -226,6 +247,58 @@ func TestGatherFollowSaysFinishedOutputIsGone(t *testing.T) {
 	if !h.gone("gone") {
 		t.Fatal("blip kept")
 	}
+}
+
+// A fast command can end before its replay reaches the follower. The
+// controller publishes status.output moments later; gather must keep polling
+// instead of printing only the summary.
+func TestGatherFollowWaitsForDelayedStatusOutput(t *testing.T) {
+	b := finishedBlip("lagged", v1alpha1.BlipSucceeded, 0)
+	b.Status.Pod = ""
+	h := newHarness(t, b)
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		h.setOutput("lagged", "LATEOUT\n")
+	}()
+	code, out, errOut := h.run("", "gather", "lagged", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "lagged| LATEOUT", "blip/lagged Succeeded (exit 0)")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}
+
+// If a session attach yields no output and the pod log is unavailable, gather
+// still waits for the retained status output rather than losing it silently.
+func TestGatherFollowUsesDelayedRetainedOutputAfterEmptyReplay(t *testing.T) {
+	h := newHarness(t, finishedBlip("empty", v1alpha1.BlipSucceeded, 0))
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		h.setOutput("empty", "RETAINED\n")
+	}()
+	code, out, errOut := h.run("", "gather", "empty", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "empty| RETAINED", "blip/empty Succeeded (exit 0)")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}
+
+// An empty replay with no retained output must warn instead of printing only
+// the summary line.
+func TestGatherFollowWarnsWhenEmptyReplayHasNoOutput(t *testing.T) {
+	withRetainedOutputWait(t, 50*time.Millisecond)
+	h := newHarness(t, finishedBlip("empty", v1alpha1.BlipSucceeded, 0))
+	code, out, errOut := h.run("", "gather", "empty", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "blip/empty Succeeded (exit 0)")
+	mustContain(t, errOut, "output is no longer available")
 }
 
 // The hint must name the object as the API knows it, not the caller-scoped
