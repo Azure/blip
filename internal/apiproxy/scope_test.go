@@ -706,6 +706,71 @@ func TestOwnerScopeThreadLabelIsBoundToOwner(t *testing.T) {
 	}
 }
 
+// Singular and short resource names are valid Kubernetes aliases for a
+// scoped resource. The scope only understands the canonical plural routes, so
+// it must deny an alias instead of forwarding it unscoped and relying on RBAC.
+func TestParseScopePathDeniesResourceAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		path     string
+		action   scopeAction
+		resource string
+		target   string
+	}{
+		{"pod alias", "/api/v1/namespaces/blip-sandbox/pod/alice-vm", scopedDeny, "", ""},
+		{"po alias", "/api/v1/namespaces/blip-sandbox/po/alice-vm", scopedDeny, "", ""},
+		{"blip alias", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blip/alice.a", scopedDeny, "", ""},
+		{"blipthread alias", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipthread/alice-proj", scopedDeny, "", ""},
+		{"blipstate alias", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blipstate/alice.home", scopedDeny, "", ""},
+		{"bst short name", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/bst/alice.home", scopedDeny, "", ""},
+		{"all-namespace pod alias", "/api/v1/pod", scopedDeny, "", ""},
+		{"all-namespace blip alias", "/apis/blip.dev/v1alpha1/blip", scopedDeny, "", ""},
+		{"legacy watch pod alias", "/api/v1/watch/namespaces/blip-sandbox/pod", scopedDeny, "", ""},
+		{"legacy watch blip alias", "/apis/blip.dev/v1alpha1/watch/namespaces/blip-sandbox/blip", scopedDeny, "", ""},
+		{"control pod plural", "/api/v1/namespaces/blip-sandbox/pods/alice-vm", scopedRead, "pods", "alice-vm"},
+		{"control blip plural", "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips/alice.a", scopedRead, "blips", "alice.a"},
+		{"unrelated resource", "/apis/apps/v1/namespaces/blip-sandbox/deployments/x", passThrough, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, action := parseScopePath(tc.path)
+			if action != tc.action || req.resource != tc.resource || req.name != tc.target {
+				t.Fatalf("parseScopePath(%q) = (%+v, %v), want resource %q name %q action %v",
+					tc.path, req, action, tc.resource, tc.target, tc.action)
+			}
+		})
+	}
+}
+
+// The aliases must be stopped by the proxy itself, not only by RBAC, while
+// the canonical plural routes keep their owner scope.
+func TestOwnerScopeDeniesResourceAliases(t *testing.T) {
+	kube := scopedFixture()
+	p := startScoped(t, kube, "alice-vm")
+
+	for _, path := range []string{
+		"/api/v1/namespaces/blip-sandbox/pod/alice-vm",
+		"/api/v1/namespaces/blip-sandbox/po/alice-vm",
+		"/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blip/alice.a",
+	} {
+		if status, _ := proxyGet(t, p, path); status != http.StatusForbidden {
+			t.Errorf("%s status = %d, want 403", path, status)
+		}
+	}
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips/alice.a"); status != http.StatusOK {
+		t.Errorf("canonical own Blip status = %d, want 200", status)
+	}
+	if status, _ := proxyGet(t, p, "/apis/blip.dev/v1alpha1/namespaces/blip-sandbox/blips/bob.b"); status != http.StatusNotFound {
+		t.Errorf("canonical other Blip status = %d, want 404", status)
+	}
+	for _, path := range pathsFor(kube) {
+		for _, alias := range []string{"/pod/", "/po/", "/blip/"} {
+			if strings.Contains(path, alias) {
+				t.Errorf("alias path reached the upstream: %q", path)
+			}
+		}
+	}
+}
+
 func TestOwnerScopeSelectorAndPaths(t *testing.T) {
 	kube := scopedFixture()
 	p := startScoped(t, kube, "alice-vm")

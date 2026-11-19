@@ -540,9 +540,20 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 	scopedResource := func(s string) bool {
 		return s == "pods" || s == "blips" || s == "blipstates" || s == "blipthreads" || s == "blipturns"
 	}
+	// Singular names and short names are real Kubernetes aliases for a scoped
+	// resource. The parser only understands the canonical plural routes, so
+	// any alias shape is denied rather than forwarded unscoped where only RBAC
+	// happens to reject the alias resource name.
+	aliasResource := func(s string) bool {
+		switch s {
+		case "pod", "po", "blip", "blipstate", "bst", "blipthread", "blipturn":
+			return true
+		}
+		return false
+	}
 	namesScopedResource := func(parts []string) bool {
 		for _, s := range parts {
-			if scopedResource(s) {
+			if scopedResource(s) || aliasResource(s) {
 				return true
 			}
 		}
@@ -568,8 +579,13 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 		}
 	}
 	if seg[0] == "api" {
-		if len(seg) >= 5 && seg[2] == "namespaces" && scopedResource(seg[4]) {
-			return namespaced(4)
+		if len(seg) >= 5 && seg[2] == "namespaces" {
+			if scopedResource(seg[4]) {
+				return namespaced(4)
+			}
+			if aliasResource(seg[4]) {
+				return scopeRequest{}, scopedDeny
+			}
 		}
 		// Legacy namespaced watches, /api/v1/watch/namespaces/{ns}/{res},
 		// are reads of the same collection and must be scoped like the list.
@@ -586,15 +602,21 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 			}
 			return scopeRequest{}, passThrough
 		}
-		// /api/v1/pods (all namespaces) or another shape naming pods.
-		if len(seg) >= 3 && seg[2] == "pods" {
+		// /api/v1/pods (all namespaces), an alias, or another shape naming a
+		// scoped resource.
+		if len(seg) >= 3 && (seg[2] == "pods" || aliasResource(seg[2])) {
 			return scopeRequest{}, scopedDeny
 		}
 		return scopeRequest{}, passThrough
 	}
 	if seg[0] == "apis" && len(seg) >= 2 && seg[1] == "blip.dev" {
-		if len(seg) >= 6 && seg[3] == "namespaces" && scopedResource(seg[5]) {
-			return namespaced(5)
+		if len(seg) >= 6 && seg[3] == "namespaces" {
+			if scopedResource(seg[5]) {
+				return namespaced(5)
+			}
+			if aliasResource(seg[5]) {
+				return scopeRequest{}, scopedDeny
+			}
 		}
 		// Legacy namespaced watches,
 		// /apis/blip.dev/v1alpha1/watch/namespaces/{ns}/{res}, are scoped like
@@ -609,8 +631,9 @@ func parseScopePath(p string) (scopeRequest, scopeAction) {
 				return scopeRequest{}, scopedDeny
 			}
 		}
-		// /apis/blip.dev/v1alpha1/blips (all namespaces) or another shape.
-		if len(seg) >= 4 && scopedResource(seg[3]) {
+		// /apis/blip.dev/v1alpha1/blips (all namespaces), an alias, or
+		// another shape naming a scoped resource.
+		if len(seg) >= 4 && (scopedResource(seg[3]) || aliasResource(seg[3])) {
 			return scopeRequest{}, scopedDeny
 		}
 	}
