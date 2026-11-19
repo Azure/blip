@@ -41,6 +41,15 @@ func TestDefaultAllowsInternetAndKubeDNS(t *testing.T) {
 		{"10.96.0.10", "TCP", 53, true},
 		{"10.96.0.10", "UDP", 53, true},
 		{"10.96.0.10", "TCP", 443, false},
+		{"169.254.10.10", "UDP", 53, true},
+		{"169.254.10.10", "TCP", 53, true},
+		{"169.254.10.11", "UDP", 53, true},
+		{"169.254.20.10", "UDP", 53, true},
+		{"169.254.20.11", "UDP", 53, false},
+		{"169.254.10.12", "UDP", 53, false},
+		{"169.254.10.10", "TCP", 443, false},
+		{"169.254.10.10", "UDP", 123, false},
+		{"169.254.169.254", "UDP", 53, false},
 		{"172.16.0.1", "TCP", 443, false},
 		{"192.168.1.1", "TCP", 443, false},
 		{"169.254.169.254", "TCP", 80, false},
@@ -52,6 +61,37 @@ func TestDefaultAllowsInternetAndKubeDNS(t *testing.T) {
 		{"168.63.129.16", "TCP", 443, false},
 		{"127.0.0.1", "TCP", 443, false},
 		{"100.100.100.200", "TCP", 80, false},
+	} {
+		if got := allows(policy, tt.address, tt.protocol, tt.port); got != tt.allowed {
+			t.Errorf("allows(%s, %s/%d) = %v, want %v", tt.address, tt.protocol, tt.port, got, tt.allowed)
+		}
+	}
+}
+
+// TestDefaultAllowsOnlyKnownLocalDNS pins the node-local resolver exception.
+// AKS LocalDNS (169.254.10.10/.11) and NodeLocal DNSCache (169.254.20.10) can
+// be the nameserver in a pod's resolv.conf, so they must be reachable on 53.
+// The rest of link-local, including cloud metadata, and non-DNS ports stay
+// denied.
+func TestDefaultAllowsOnlyKnownLocalDNS(t *testing.T) {
+	policy := mustCompile(t, "apps", Default(), nil, Destinations{})
+	for _, tt := range []struct {
+		address  string
+		protocol string
+		port     int32
+		allowed  bool
+	}{
+		{"169.254.10.10", "UDP", 53, true},
+		{"169.254.10.11", "UDP", 53, true},
+		{"169.254.20.10", "UDP", 53, true},
+		{"169.254.10.10", "TCP", 53, true},
+		{"169.254.10.11", "TCP", 53, true},
+		{"169.254.20.10", "TCP", 53, true},
+		{"169.254.20.11", "UDP", 53, false},
+		{"169.254.10.12", "UDP", 53, false},
+		{"169.254.10.10", "TCP", 443, false},
+		{"169.254.169.254", "UDP", 53, false},
+		{"168.63.129.16", "UDP", 53, false},
 	} {
 		if got := allows(policy, tt.address, tt.protocol, tt.port); got != tt.allowed {
 			t.Errorf("allows(%s, %s/%d) = %v, want %v", tt.address, tt.protocol, tt.port, got, tt.allowed)

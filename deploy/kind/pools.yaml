@@ -29,6 +29,21 @@ spec:
             port: 53
           - protocol: TCP
             port: 53
+      # Node-local DNS proxies (AKS LocalDNS and NodeLocal DNSCache) use
+      # link-local addresses that the 169.254.0.0/16 exception below denies,
+      # so allow the exact resolvers a pod's resolv.conf may name.
+      - to:
+          - ipBlock:
+              cidr: 169.254.10.10/32
+          - ipBlock:
+              cidr: 169.254.10.11/32
+          - ipBlock:
+              cidr: 169.254.20.10/32
+        ports:
+          - protocol: UDP
+            port: 53
+          - protocol: TCP
+            port: 53
       - to:
           - ipBlock:
               cidr: 0.0.0.0/0

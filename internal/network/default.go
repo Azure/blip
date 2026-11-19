@@ -27,11 +27,29 @@ var privateCIDRs = []string{
 	"240.0.0.0/4",
 }
 
+// localDNSCIDRs are node-local cluster DNS addresses that pods can find in
+// resolv.conf instead of the kube-dns Service ClusterIP: AKS LocalDNS uses
+// 169.254.10.10 and 169.254.10.11, and NodeLocal DNSCache uses
+// 169.254.20.10. The rest of the link-local range stays excluded, including
+// cloud metadata.
+var localDNSCIDRs = []string{
+	"169.254.10.10/32",
+	"169.254.10.11/32",
+	"169.254.20.10/32",
+}
+
 // Default is the policy used when a BlipPool omits spec.network: public
 // internet egress on any protocol and port, with LAN and other non-public
 // ranges excluded. Cluster DNS usually lives in a private service CIDR, so
-// kube-dns is explicitly allowed on both TCP and UDP port 53.
+// kube-dns is explicitly allowed on both TCP and UDP port 53. Node-local DNS
+// proxies sit in link-local space and are allowed by their exact addresses.
 func Default() *v1alpha1.NetworkPolicy {
+	var dnsPeers []v1alpha1.NetworkPeer
+	for _, cidr := range localDNSCIDRs {
+		dnsPeers = append(dnsPeers, v1alpha1.NetworkPeer{
+			IPBlock: &v1alpha1.NetworkIPBlock{CIDR: cidr},
+		})
+	}
 	return &v1alpha1.NetworkPolicy{Egress: []v1alpha1.NetworkEgressRule{
 		{
 			To: []v1alpha1.NetworkPeer{{
@@ -42,6 +60,13 @@ func Default() *v1alpha1.NetworkPolicy {
 					"k8s-app": "kube-dns",
 				}},
 			}},
+			Ports: []v1alpha1.NetworkPort{
+				{Protocol: corev1.ProtocolUDP, Port: 53},
+				{Protocol: corev1.ProtocolTCP, Port: 53},
+			},
+		},
+		{
+			To: dnsPeers,
 			Ports: []v1alpha1.NetworkPort{
 				{Protocol: corev1.ProtocolUDP, Port: 53},
 				{Protocol: corev1.ProtocolTCP, Port: 53},
