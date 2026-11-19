@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -21,7 +22,14 @@ func (a *app) validateName(kind, name string) error {
 		return fmt.Errorf("invalid %s name %q: must not be empty", kind, name)
 	}
 	if problems := validation.IsDNS1123Subdomain(name); len(problems) > 0 {
-		return fmt.Errorf("invalid %s name %q: %s", kind, a.short(name), strings.Join(problems, "; "))
+		msg := fmt.Sprintf("invalid %s name %q: %s", kind, name, strings.Join(problems, "; "))
+		// A scoped name is checked with its owner prefix. If the name the
+		// user typed would be valid on its own, say why scoping rejected it
+		// instead of quoting the short form against a limit it meets.
+		if short := a.short(name); short != name && len(validation.IsDNS1123Subdomain(short)) == 0 {
+			msg += fmt.Sprintf("; the %q owner prefix is part of the name and counts toward the limit, so use a shorter name", a.prefix)
+		}
+		return errors.New(msg)
 	}
 	return nil
 }
