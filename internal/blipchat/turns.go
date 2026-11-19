@@ -18,7 +18,11 @@ import (
 
 // turnSpec describes a turn a producer wants to create.
 type turnSpec struct {
-	Thread     string
+	Thread string
+	// ThreadUID, when set, pins the turn to one incarnation of Thread. A
+	// turn that would be owned by a recreated thread of the same name is
+	// rejected instead of being adopted by it.
+	ThreadUID  string
 	AuthorKind string
 	AuthorName string
 	Topic      string
@@ -54,8 +58,11 @@ func createTurnIn(ctx context.Context, c client.Client, namespace, name string, 
 	// sequencer stamps its thread UID.
 	if spec.Thread != "" {
 		var thread v1.BlipThread
-		if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: spec.Thread}, &thread); err == nil &&
-			thread.UID != "" {
+		err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: spec.Thread}, &thread)
+		if spec.ThreadUID != "" && (err != nil || string(thread.UID) != spec.ThreadUID) {
+			return errStaleIncarnation
+		}
+		if err == nil && thread.UID != "" {
 			meta.OwnerReferences = []metav1.OwnerReference{
 				*metav1.NewControllerRef(&thread, v1.GroupVersion.WithKind("BlipThread")),
 			}

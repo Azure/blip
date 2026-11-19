@@ -2,6 +2,7 @@ package blipchat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -32,6 +33,24 @@ const (
 )
 
 var timeNow = time.Now
+
+// errStaleIncarnation means the thread name now belongs to a different
+// incarnation than the snapshot a step or prune pass started from. The
+// snapshot's turns, board, timers and spend must not be written to it.
+var errStaleIncarnation = errors.New("thread incarnation changed")
+
+// currentThread re-reads a thread and rejects it when the name was deleted
+// and recreated since snapshot was taken.
+func (s *Server) currentThread(ctx context.Context, snapshot *v1.BlipThread) (*v1.BlipThread, error) {
+	current := &v1.BlipThread{}
+	if err := s.Get(ctx, client.ObjectKeyFromObject(snapshot), current); err != nil {
+		return nil, err
+	}
+	if snapshot.UID != "" && current.UID != snapshot.UID {
+		return nil, errStaleIncarnation
+	}
+	return current, nil
+}
 
 // logError logs when a logger was configured. Tests construct Server values
 // without one, and a zero logr.Logger panics on use.
@@ -255,7 +274,7 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 	}
 	if thread.Spec.DailyTokens > 0 && tokensToday >= thread.Spec.DailyTokens {
 		st.paused = budgetPauseReason
-		return s.commit(ctx, st, thread.Status.ConsumedSeq, pending, started)
+		return s.commitStep(ctx, st, thread.Status.ConsumedSeq, pending, started)
 	}
 
 	// Consume due timers: their notes are part of this step's input.
@@ -323,22 +342,39 @@ func (s *Server) step(ctx context.Context, thread *v1.BlipThread) error {
 			break
 		}
 	}
-	if err := s.commit(ctx, st, target, pending, started); err != nil {
+	if err := s.commitStep(ctx, st, target, pending, started); err != nil {
 		s.chargeUsage(ctx, thread, st.usage)
 		return err
 	}
 	return nil
 }
 
+// commitStep commits a finished step. A thread deleted and recreated while
+// the completion was in flight is left untouched: the step belongs to the
+// previous incarnation, whose turn history and board are already gone.
+func (s *Server) commitStep(ctx context.Context, st *step, target int64, pending []v1.BlipTurn, started time.Time) error {
+	err := s.commit(ctx, st, target, pending, started)
+	if errors.Is(err, errStaleIncarnation) {
+		return nil
+	}
+	return err
+}
+
 // commit writes the step's coordinator turns and then one thread status
 // update. Turns are named by step start so retries are idempotent.
 func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.BlipTurn, started time.Time) error {
+	// Abandon before creating any coordinator turn when the name already
+	// belongs to another incarnation. createTurnIn repeats the UID check so a
+	// deletion racing this commit cannot attach replies to the new thread.
+	if _, err := s.currentThread(ctx, st.thread); err != nil {
+		return err
+	}
 	key := &ThreadKey{Namespace: st.thread.Namespace, Name: st.thread.Name}
 	prefix := fmt.Sprintf("coord-%s-%d", Owner(key), started.Unix())
 	for i := range st.replies {
 		spec := st.replies[i]
 		if err := createTurnIn(ctx, s.Client, st.thread.Namespace, fmt.Sprintf("%s-%d", prefix, i), turnSpec{
-			Thread: spec.Thread, AuthorKind: spec.Author.Kind, AuthorName: spec.Author.Name,
+			Thread: spec.Thread, ThreadUID: string(st.thread.UID), AuthorKind: spec.Author.Kind, AuthorName: spec.Author.Name,
 			Topic: spec.Topic, Text: spec.Text, InReplyTo: spec.InReplyTo, Wake: v1.WakeNone,
 		}); err != nil {
 			return err
@@ -348,8 +384,8 @@ func (s *Server) commit(ctx context.Context, st *step, target int64, _ []v1.Blip
 	today := started.UTC().Format("2006-01-02")
 	next := nextWake(st, started)
 	for attempt := 0; attempt < 5; attempt++ {
-		current := &v1.BlipThread{}
-		if err := s.Get(ctx, client.ObjectKeyFromObject(st.thread), current); err != nil {
+		current, err := s.currentThread(ctx, st.thread)
+		if err != nil {
 			return err
 		}
 		current.Status.ConsumedSeq = target
@@ -387,8 +423,8 @@ func (s *Server) chargeUsage(ctx context.Context, thread *v1.BlipThread, usage i
 	}
 	today := timeNow().UTC().Format("2006-01-02")
 	for attempt := 0; attempt < 5; attempt++ {
-		current := &v1.BlipThread{}
-		if err := s.Get(ctx, client.ObjectKeyFromObject(thread), current); err != nil {
+		current, err := s.currentThread(ctx, thread)
+		if err != nil {
 			return
 		}
 		if current.Status.TokenDay != today {
