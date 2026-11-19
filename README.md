@@ -162,7 +162,9 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 - **States** build image filesystems per node, resolve `copyFrom` to a committed
   version or a live snapshot of a running writer, replicate pending versions to
   `replicas` nodes, and use finalizers to block deletion while writers or
-  dependent copies exist. Newly eligible nodes receive existing image states.
+  dependent copies exist. A copy waits for an in-flight source save and pins
+  the new committed version; it does not capture the version current when the
+  copy object was created. Newly eligible nodes receive existing image states.
 - There is no admission webhook. A CEL `ValidatingAdmissionPolicy` plus a
   controller-maintained ConfigMap (`blip-vm-owners`) restrict pod-bound service
   account tokens to the owning Blip, its pool, and owner-prefixed resources.
