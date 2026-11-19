@@ -8,10 +8,11 @@ import (
 )
 
 // privateCIDRs are loopback, link-local, shared address space, and the private
-// IPv4 ranges. They also cover the cloud metadata endpoint at 169.254.169.254
-// and the Azure WireServer at 168.63.129.16, which looks public but serves
-// host metadata to guests. Multicast and reserved space are excluded too
-// because neither is internet.
+// IPv4 ranges. They also cover the cloud metadata endpoint at 169.254.169.254,
+// the Azure WireServer at 168.63.129.16, which looks public but serves host
+// metadata to guests, and the OCI metadata service in 192.0.0.0/24 (for
+// example 192.0.0.192). Multicast and reserved space are excluded too because
+// neither is internet.
 var privateCIDRs = []string{
 	"0.0.0.0/8",
 	"10.0.0.0/8",
@@ -20,6 +21,7 @@ var privateCIDRs = []string{
 	"168.63.129.16/32",
 	"169.254.0.0/16",
 	"172.16.0.0/12",
+	"192.0.0.0/24",
 	"192.168.0.0/16",
 	"224.0.0.0/4",
 	"240.0.0.0/4",
