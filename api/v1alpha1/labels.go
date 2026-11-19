@@ -46,6 +46,10 @@ const (
 	AnnotationTemplateHash    = "blip.dev/template-hash"
 	AnnotationEnrollmentDrain = "blip.dev/enrollment-drain"
 	AnnotationPinnedNode      = "blip.dev/pinned-node"
+	// AnnotationRelocated marks a warm pod the pool created by moving a spare
+	// to a hot node. Relocation cannot see free capacity, so a rejection of
+	// such a pod backs the node off for longer than a rejected demand pod.
+	AnnotationRelocated = "blip.dev/relocated"
 	// AnnotationStopReason records why the controller set spec.stop, for the
 	// client to report when it gathers the blip.
 	AnnotationStopReason = "blip.dev/stop-reason"

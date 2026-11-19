@@ -82,6 +82,13 @@ const expectTimeout = time.Minute
 // recreate another unschedulable one there.
 const blockedGrace = time.Minute
 
+// relocationBackoff bounds how long a node is kept out of relocation after the
+// scheduler rejected a spare the pool moved there. Relocation cannot see free
+// capacity, so retrying after blockedGrace would delete a healthy spare every
+// minute to re-pin it to a node that still has no room. The longer grace stops
+// that churn while still retrying a node whose capacity came back.
+const relocationBackoff = 5 * time.Minute
+
 // warmTimeout bounds how long a spare may stay unready before the pool retires
 // it. A pod that never becomes ready (image pull failure, VM boot failure, or
 // a crash-looping sidecar) cannot accept a claim, so keeping it would consume
@@ -345,12 +352,21 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// rejected pod is not capacity: another pinned pod on the same node
 	// would be rejected too, so demand for that node moves to another home
 	// node (or an unpinned VM) instead. The nodes are remembered for
-	// blockedGrace because the rejected pod itself is deleted.
-	observed := map[string]bool{}
+	// blockedGrace because the rejected pod itself is deleted. A spare the
+	// pool moved there is remembered for relocationBackoff: relocation chose
+	// the node without knowing its free capacity.
+	observed := map[string]time.Time{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.DeletionTimestamp == nil && unschedulable(p) && p.Annotations[v1.AnnotationPinnedNode] != "" {
-			observed[podNode(p)] = true
+			grace := blockedGrace
+			if p.Annotations[v1.AnnotationRelocated] != "" {
+				grace = relocationBackoff
+			}
+			node := podNode(p)
+			if until := r.now().Add(grace); until.After(observed[node]) {
+				observed[node] = until
+			}
 		}
 	}
 	blocked := r.poolBlocked(rq.NamespacedName, observed, r.now())
@@ -684,7 +700,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			}
 			deleted[p.Name] = true
 			warm[podNode(p)]--
-			if err := r.createPod(ctx, pool, avoid, node); err != nil {
+			if err := r.createPodWith(ctx, pool, avoid, node, map[string]string{v1.AnnotationRelocated: "true"}); err != nil {
 				return reconcile.Result{}, err
 			}
 			warm[node]++
@@ -786,8 +802,10 @@ func pickWarmNode(hot, warm map[string]int, blocked map[string]bool) string {
 // poolBlocked merges the nodes the scheduler rejected in this pass with the
 // nodes still inside their retry grace, and drops expired entries. Keeping the
 // memory across passes matters because the rejected pod is deleted: without it
-// the next pass would immediately pin a new pod to the same node.
-func (r *PoolReconciler) poolBlocked(pool types.NamespacedName, observed map[string]bool, now time.Time) map[string]bool {
+// the next pass would immediately pin a new pod to the same node. A longer
+// existing entry wins, so a relocation backoff is not shortened by a later
+// demand rejection.
+func (r *PoolReconciler) poolBlocked(pool types.NamespacedName, observed map[string]time.Time, now time.Time) map[string]bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	nodes := r.blocked[pool]
@@ -798,8 +816,10 @@ func (r *PoolReconciler) poolBlocked(pool types.NamespacedName, observed map[str
 		}
 		r.blocked[pool] = nodes
 	}
-	for node := range observed {
-		nodes[node] = now.Add(blockedGrace)
+	for node, until := range observed {
+		if until.After(nodes[node]) {
+			nodes[node] = until
+		}
 	}
 	out := map[string]bool{}
 	for node, until := range nodes {
@@ -888,7 +908,16 @@ func (r *PoolReconciler) expect(m *map[types.NamespacedName]map[string]expectati
 // createPod creates a VM pod. A pod for a node is pinned to it; others avoid
 // nodes that cannot run one, including draining and unhealthy ones.
 func (r *PoolReconciler) createPod(ctx context.Context, pool *v1.BlipPool, avoid map[string]bool, node string) error {
+	return r.createPodWith(ctx, pool, avoid, node, nil)
+}
+
+// createPodWith is createPod with extra annotations, which mark a pod the pool
+// derived rather than one that serves demand directly.
+func (r *PoolReconciler) createPodWith(ctx context.Context, pool *v1.BlipPool, avoid map[string]bool, node string, annotations map[string]string) error {
 	pod := r.podFor(pool, r.newPodName(pool.Name))
+	for k, v := range annotations {
+		pod.Annotations[k] = v
+	}
 	var match *corev1.NodeSelectorRequirement
 	switch {
 	case node != "":
