@@ -36,10 +36,41 @@ func TestValidateNameEdges(t *testing.T) {
 	}
 }
 
-// An owner-scoped caller checks "<owner>.<name>". When the prefix is what
-// pushed it over 253, the error must quote the name that was checked and
-// explain that the prefix counts, not quote the short name against a limit it
-// meets. This covers each command that scopes a name before validating it.
+// State references are checked like names the CLI creates: a malformed one
+// fails with the short message before client-go sees it.
+func TestStateReferencesAreValidated(t *testing.T) {
+	tooLong := strings.Repeat("a", 254)
+	longest := strings.Repeat("a", 253)
+	h := newHarness(t, readyState("base"))
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"from slash", []string{"run", "--name", "s1", "--from", "a/b", "--", "true"}, `invalid state name "a/b"`},
+		{"state slash", []string{"run", "--name", "s2", "--state", "a/b", "--", "true"}, `invalid state name "a/b"`},
+		{"from dotdot", []string{"run", "--name", "s3", "--from", "..", "--", "true"}, `invalid state name ".."`},
+		{"from 254", []string{"run", "--name", "s4", "--from", tooLong, "--", "true"}, `invalid state name "` + tooLong + `"`},
+		{"mount root slash", []string{"mount", "--root", "a/b"}, `invalid state name "a/b"`},
+		{"mount rm slash", []string{"mount", "--rm", "a/b", "--root", "base"}, `invalid state name "a/b"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, errOut := h.run("", tc.args...)
+			if code != 1 || !strings.Contains(errOut, tc.want) {
+				t.Fatalf("code %d stderr %q, want %q", code, errOut, tc.want)
+			}
+			if strings.Contains(errOut, "invalid resource name") {
+				t.Fatalf("stderr %q leaked client-go validation", errOut)
+			}
+		})
+	}
+	// The longest legal name passes validation and fails only at the lookup.
+	code, _, errOut := h.run("", "run", "--name", "s5", "--from", longest, "--", "true")
+	if code != 1 || !strings.Contains(errOut, `state "`+longest+`" not found`) || strings.Contains(errOut, "invalid state name") {
+		t.Fatalf("253-char state: code %d stderr %q", code, errOut)
+	}
+}
+
 func TestOwnerScopedNamesReportFullCheckedName(t *testing.T) {
 	long := strings.Repeat("a", 250)
 	full := "alice." + long

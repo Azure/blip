@@ -212,6 +212,9 @@ func (a *app) full(name string) string {
 // Only NotFound triggers fallback: authorization and transport failures must
 // not silently select another source.
 func (a *app) resolveState(ctx context.Context, name string) (*v1alpha1.BlipState, error) {
+	if err := a.validateStateName(name); err != nil {
+		return nil, err
+	}
 	c, err := a.clients()
 	if err != nil {
 		return nil, err

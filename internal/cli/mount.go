@@ -1015,6 +1015,11 @@ func (a *app) unmountState(ctx context.Context, state, root string) error {
 // mountTarget scopes state names; inside a guest the root defaults to self's
 // root state rather than its execution name.
 func (a *app) mountTarget(root *string) error {
+	if *root != "" {
+		if err := a.validateStateName(*root); err != nil {
+			return err
+		}
+	}
 	if err := a.scope(root); err != nil {
 		return err
 	}
@@ -1023,6 +1028,7 @@ func (a *app) mountTarget(root *string) error {
 			return errors.New("--root is required outside a blip")
 		}
 		*root = a.self.Spec.State
+		return a.validateName("state", *root)
 	}
 	return nil
 }
@@ -1129,6 +1135,16 @@ func (a *app) mount(ctx context.Context, args []string, f *mountFlags, replicasS
 	}
 	if err := checkNewOnlyFlags(f, replicasSet); err != nil {
 		return err
+	}
+	for _, arg := range f.remove {
+		if err := a.validateStateName(arg); err != nil {
+			return err
+		}
+	}
+	if f.from != "" {
+		if err := a.validateStateName(f.from); err != nil {
+			return err
+		}
 	}
 	if len(args) == 0 && len(f.remove) == 0 && len(f.create) == 0 {
 		return a.listMounts(ctx, f.root)

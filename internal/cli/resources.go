@@ -34,6 +34,18 @@ func (a *app) validateName(kind, name string) error {
 	return nil
 }
 
+// validateStateName checks a state name a user referenced and the owner-scoped
+// name it resolves to, so a malformed reference fails before any API call.
+func (a *app) validateStateName(name string) error {
+	if err := a.validateName("state", name); err != nil {
+		return err
+	}
+	if full := a.full(name); full != name {
+		return a.validateName("state", full)
+	}
+	return nil
+}
+
 // get fetches the named object into obj. It returns the API error unchanged, so
 // callers can fall back or ignore NotFound before reporting it with notFound.
 func get[T client.Object](ctx context.Context, c *Clients, name string, obj T) (T, error) {
