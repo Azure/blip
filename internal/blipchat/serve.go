@@ -772,10 +772,9 @@ func boardTurns(b *strings.Builder, turns []v1.BlipTurn, budget int) int64 {
 	}
 	// The omitted turns cannot be shown in any form. Rendering the newest
 	// suffix would consume them without ever presenting them, so render the
-	// oldest turns and leave the newer ones for a later step instead. Any
-	// wake turn in the pending suffix is still shown compactly, but the
-	// returned sequence stops at the rendered prefix so it stays pending.
-	omittedStart := start
+	// oldest turns and leave the newer ones for a later step instead. The
+	// count notice is the only disclosure: emitting one summary per omitted
+	// wake turn would let a large wake suffix bypass the budget again.
 	start = 0
 	used = 0
 	for start < len(turns) {
@@ -798,12 +797,6 @@ func boardTurns(b *strings.Builder, turns []v1.BlipTurn, budget int) int64 {
 	}
 	for i := 0; i < start; i++ {
 		b.WriteString(lines[i])
-	}
-	for i := omittedStart; i < len(turns); i++ {
-		if turns[i].Spec.Wake != v1.WakeNone {
-			fmt.Fprintf(b, "(wake turn %d shown, left for a later step)\n", turns[i].Status.Seq)
-			b.WriteString(summarizeTurn(&turns[i], 0))
-		}
 	}
 	return turns[start-1].Status.Seq
 }
@@ -862,13 +855,20 @@ func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, b
 				}
 			}
 		} else {
-			// Keep every wake turn, but never consume across a gap.
-			for i := 0; i <= keepEnd; i++ {
-				if turns[i].Spec.Wake != v1.WakeNone {
-					rendered[i] = true
-					out[i] = lines[i]
-				}
+			// The prefix is too large even as metadata-only summaries (for
+			// example a backlog of thousands of wake turns). Emitting every
+			// wake turn in full bypasses the prompt budget, so render a
+			// bounded contiguous prefix instead: summarize what fits, leave
+			// the newer turns pending, and consume exactly the prefix shown.
+			n, text := boundedTurnPrefix(turns, budget)
+			if n == 0 || !prefixHasWake(turns[:n]) {
+				// Nothing fits, or only non-wake context fits while the wake
+				// turn this step exists for is still ahead. Keep everything
+				// pending; the caller defers instead of repeating the input.
+				return 0
 			}
+			b.WriteString(text)
+			return turns[n-1].Status.Seq
 		}
 	}
 	lastRendered := int64(0)
@@ -898,6 +898,53 @@ func renderWakePrefix(b *strings.Builder, turns []v1.BlipTurn, lines []string, b
 		fmt.Fprintf(b, "(%d newer turns omitted)\n", gap)
 	}
 	return lastRendered
+}
+
+// boundedTurnPrefix returns the longest contiguous prefix of turns that can be
+// rendered within budget, plus the rendered text with an accurate notice. It
+// summarizes turns so a backlog whose full lines do not fit can still make
+// progress; the caller leaves the omitted suffix pending.
+func boundedTurnPrefix(turns []v1.BlipTurn, budget int) (int, string) {
+	if len(turns) == 0 || budget <= 0 {
+		return 0, ""
+	}
+	render := func(n int) (string, bool) {
+		var head, tail string
+		if n == len(turns) {
+			head = fmt.Sprintf("(%d turns summarized to fit the prompt budget)\n", n)
+		} else {
+			head = fmt.Sprintf("(%d older turns summarized)\n", n)
+			tail = fmt.Sprintf("(%d newer turns omitted)\n", len(turns)-n)
+		}
+		summaries, ok := summarizeTurns(turns[:n], budget-len(head)-len(tail))
+		if !ok {
+			return "", false
+		}
+		return head + summaries + tail, true
+	}
+	lo, hi := 1, len(turns)
+	best, text := 0, ""
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if rendered, ok := render(mid); ok {
+			best, text = mid, rendered
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best, text
+}
+
+// prefixHasWake reports whether any of the turns asks to wake the
+// coordinator.
+func prefixHasWake(turns []v1.BlipTurn) bool {
+	for i := range turns {
+		if turns[i].Spec.Wake != v1.WakeNone {
+			return true
+		}
+	}
+	return false
 }
 
 // suffixTurns returns the index where the newest suffix of lines that fits

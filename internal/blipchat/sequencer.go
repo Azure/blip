@@ -41,7 +41,19 @@ const orphanGrace = 10 * time.Minute
 // so even a second process with its own mutex cannot hand out the same number.
 type Sequencer struct {
 	client.Client
-	mu sync.Map // namespace/name -> *sync.Mutex
+	// Live is an uncached reader used to resolve an ambiguous turn write:
+	// the cache may not show a status update that the API server committed
+	// just before returning an error. It defaults to the manager's
+	// APIReader; tests fall back to Client.
+	Live client.Reader
+	mu   sync.Map // namespace/name -> *sync.Mutex
+}
+
+func (s *Sequencer) liveReader() client.Reader {
+	if s.Live != nil {
+		return s.Live
+	}
+	return s.Client
 }
 
 func (s *Sequencer) lock(namespace, name string) func() {
@@ -163,9 +175,35 @@ func (s *Sequencer) sequence(ctx context.Context, thread *v1.BlipThread, turn *v
 			return nil
 		}
 		if !apierrors.IsConflict(err) || attempt+1 >= seqRetries {
-			s.releaseSeq(ctx, thread, seq)
-			return err
+			return s.abandonSeq(ctx, thread, turn, seq, err)
 		}
+	}
+}
+
+// abandonSeq handles a failed turn-status write. The write is ambiguous: the
+// API server may have committed it and only the response was lost, so the
+// number may already be recorded on the turn. Re-read before giving the
+// reservation back. A number is released only when the turn provably does not
+// carry it; a failed re-read keeps it reserved, because a hole is recoverable
+// but a duplicate sequence is not.
+func (s *Sequencer) abandonSeq(ctx context.Context, thread *v1.BlipThread, turn *v1.BlipTurn, seq int64, cause error) error {
+	var current v1.BlipTurn
+	err := s.liveReader().Get(ctx, client.ObjectKeyFromObject(turn), &current)
+	switch {
+	case err == nil && current.Status.Seq == seq:
+		// Our write landed; only the reply was lost. Keep the counter.
+		return nil
+	case err == nil:
+		// The turn does not carry our number (still unsequenced, or a peer
+		// numbered it differently), so this reservation is unused.
+		s.releaseSeq(ctx, thread, seq)
+		return cause
+	case apierrors.IsNotFound(err):
+		// The turn is gone, so no live turn can carry the number.
+		s.releaseSeq(ctx, thread, seq)
+		return cause
+	default:
+		return cause
 	}
 }
 
@@ -341,6 +379,9 @@ func (s *Sequencer) turnsForThread(ctx context.Context, obj client.Object) []rec
 // duplicate that is stamped after the coordinator consumed that number is
 // silently skipped forever.
 func (s *Sequencer) SetupWithManager(mgr ctrl.Manager) error {
+	if s.Live == nil {
+		s.Live = mgr.GetAPIReader()
+	}
 	needLeaderElection := true
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(controller.Options{NeedLeaderElection: &needLeaderElection}).
