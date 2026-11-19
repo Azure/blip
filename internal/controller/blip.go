@@ -518,6 +518,11 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	if claimed == nil {
+		if err := r.forgetLostClaim(ctx, b); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
 	if claimed != nil {
 		return reconcile.Result{}, r.startRunning(ctx, b, claimed)
 	}
@@ -845,6 +850,32 @@ func claimedPod(ctx context.Context, c client.Reader, b *v1.Blip) (*corev1.Pod, 
 	return &pods.Items[0], nil
 }
 
+// forgetLostClaim clears the status of a claimed pod that disappeared before
+// its guest started. A forced pod deletion can leave no claim and no pod that
+// the Blip can talk to, so without this the Blip keeps reporting a dead pod
+// and charges the waiting time against a replacement VM's start deadline. The
+// cache may be stale around a claim, so the live reader decides whether the pod
+// is really gone.
+func (r *BlipReconciler) forgetLostClaim(ctx context.Context, b *v1.Blip) error {
+	if b.Status.Pod == "" {
+		return nil
+	}
+	pod := &corev1.Pod{}
+	err := r.Live.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.Pod}, pod)
+	switch {
+	case err == nil && string(pod.UID) == b.Status.PodUID:
+		// Still a live claim; keep its pod and start time.
+		return nil
+	case err != nil && !apierrors.IsNotFound(err):
+		return err
+	}
+	b.Status.Pod = ""
+	b.Status.PodUID = ""
+	b.Status.Node = ""
+	b.Status.StartTime = nil
+	return nil
+}
+
 // observed decodes the node's observation annotation, if present.
 func observed(pod *corev1.Pod) podapi.Observed {
 	var obs podapi.Observed
@@ -976,10 +1007,13 @@ func (r *BlipReconciler) syncPodOwner(ctx context.Context, b *v1.Blip, pod *core
 }
 
 func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *corev1.Pod) error {
+	// A different pod is a fresh claim: it gets its own start window instead of
+	// inheriting the time already spent on a pod that is gone.
+	reclaimed := b.Status.Pod != pod.Name || b.Status.PodUID != string(pod.UID)
 	b.Status.Pod = pod.Name
 	b.Status.PodUID = string(pod.UID)
 	b.Status.Node = pod.Spec.NodeName
-	if b.Status.StartTime == nil {
+	if reclaimed || b.Status.StartTime == nil {
 		now := metav1.NewTime(r.now())
 		b.Status.StartTime = &now
 	}
