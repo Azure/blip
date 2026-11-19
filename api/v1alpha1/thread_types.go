@@ -41,6 +41,7 @@ type BlipThreadSpec struct {
 	DailyTokens int64 `json:"dailyTokens,omitempty"`
 	// Heartbeat wakes the coordinator while it has open tasks. The default
 	// is 30 minutes.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="heartbeat must be a non-negative duration"
 	Heartbeat *metav1.Duration `json:"heartbeat,omitempty"`
 	// Retention bounds the history blipchat keeps for this thread.
 	Retention ThreadRetention `json:"retention,omitempty"`
@@ -50,11 +51,13 @@ type BlipThreadSpec struct {
 // defaults: turns 168h, keepTurns 200, closedTasks 72h, maxTasks 200.
 type ThreadRetention struct {
 	// Turns is how long processed turns are kept.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="retention.turns must be a non-negative duration"
 	Turns *metav1.Duration `json:"turns,omitempty"`
 	// KeepTurns is the minimum number of turns kept per thread.
 	// +kubebuilder:validation:Minimum=0
 	KeepTurns int32 `json:"keepTurns,omitempty"`
 	// ClosedTasks is how long closed tasks are kept after their last update.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="retention.closedTasks must be a non-negative duration"
 	ClosedTasks *metav1.Duration `json:"closedTasks,omitempty"`
 	// MaxTasks caps the task board. The oldest closed tasks are pruned first.
 	// +kubebuilder:validation:Minimum=0

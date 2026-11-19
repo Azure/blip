@@ -360,6 +360,55 @@ func TestBlipTurnImmutable(t *testing.T) {
 	}
 }
 
+// TestBlipThreadDurationRules guards admission of every duration in
+// BlipThread.spec. The typed client decodes metav1.Duration while watching
+// threads, so one malformed value used to break the informer for every thread
+// and stall blipchat in all namespaces.
+func TestBlipThreadDurationRules(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipthreads.yaml")
+	retention, ok := spec.Properties["retention"]
+	if !ok {
+		t.Fatal("generated CRD has no spec.retention property")
+	}
+	const want = "duration(self) >= duration('0s')"
+	for _, tc := range []struct {
+		field   crdSchema
+		message string
+	}{
+		{spec.Properties["heartbeat"], "heartbeat must be a non-negative duration"},
+		{retention.Properties["turns"], "retention.turns must be a non-negative duration"},
+		{retention.Properties["closedTasks"], "retention.closedTasks must be a non-negative duration"},
+	} {
+		if got := ruleFor(t, tc.field.XValidations, tc.message); got != want {
+			t.Errorf("%s rule %q, want %q", tc.message, got, want)
+		}
+	}
+
+	validate := admissionValidator(t, "blipthreads")
+	for _, object := range []string{
+		`{"spec":{"pool":"p","heartbeat":"not-a-duration"}}`,
+		`{"spec":{"pool":"p","heartbeat":"-1s"}}`,
+		`{"spec":{"pool":"p","retention":{"turns":"bogus"}}}`,
+		`{"spec":{"pool":"p","retention":{"turns":"-1h"}}}`,
+		`{"spec":{"pool":"p","retention":{"closedTasks":"bogus"}}}`,
+		`{"spec":{"pool":"p","retention":{"closedTasks":"-5m"}}}`,
+	} {
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted thread with an invalid duration: %s", object)
+		}
+	}
+	for _, object := range []string{
+		`{"spec":{"pool":"p"}}`,
+		`{"spec":{"pool":"p","heartbeat":"0s"}}`,
+		`{"spec":{"pool":"p","heartbeat":"30m"}}`,
+		`{"spec":{"pool":"p","retention":{"turns":"168h","closedTasks":"72h"}}}`,
+	} {
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected thread with a valid duration: %s: %v", object, errs.ToAggregate())
+		}
+	}
+}
+
 // TestBlipThreadTaskIDPattern guards that task ids are safe to use as labels.
 func TestBlipThreadTaskIDPattern(t *testing.T) {
 	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipthreads.yaml")

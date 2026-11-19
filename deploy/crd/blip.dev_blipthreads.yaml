@@ -77,6 +77,9 @@ spec:
                   Heartbeat wakes the coordinator while it has open tasks. The default
                   is 30 minutes.
                 type: string
+                x-kubernetes-validations:
+                - message: heartbeat must be a non-negative duration
+                  rule: duration(self) >= duration('0s')
               maxRunning:
                 default: 1
                 description: MaxRunning caps concurrently running blips labelled with
@@ -100,6 +103,9 @@ spec:
                     description: ClosedTasks is how long closed tasks are kept after
                       their last update.
                     type: string
+                    x-kubernetes-validations:
+                    - message: retention.closedTasks must be a non-negative duration
+                      rule: duration(self) >= duration('0s')
                   keepTurns:
                     description: KeepTurns is the minimum number of turns kept per
                       thread.
@@ -115,6 +121,9 @@ spec:
                   turns:
                     description: Turns is how long processed turns are kept.
                     type: string
+                    x-kubernetes-validations:
+                    - message: retention.turns must be a non-negative duration
+                      rule: duration(self) >= duration('0s')
                 type: object
               systemPrompt:
                 description: |-
