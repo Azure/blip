@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -48,6 +49,7 @@ type Server struct {
 	Config     Config
 	LLM        *LLM
 	RestConfig *rest.Config
+	Cache      cache.Cache
 	Log        logr.Logger
 
 	stepMu     sync.Mutex // one coordinator step at a time
