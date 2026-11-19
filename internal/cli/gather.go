@@ -110,8 +110,15 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		}
 	}
 	// labels.Parse treats whitespace as a selector that matches everything,
-	// and an unset shell variable is easy to pass by accident.
+	// and an unset shell variable is easy to pass by accident. An explicitly
+	// set but blank selector is a mistake in every path: outside a blip it
+	// used to look like a missing target, and with names it used to be
+	// silently ignored. Inside a blip the default is every fork of the
+	// caller, which gather would delete, so it must not fall back to that.
 	selector := strings.TrimSpace(f.selector)
+	if f.selectorSet && selector == "" {
+		return errors.New("--selector must not be empty")
+	}
 	if len(names) > 0 && selector != "" {
 		return errors.New("gather takes blip names or --selector, not both")
 	}
@@ -119,12 +126,6 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 	if len(names) == 0 && selector == "" {
 		if a.self == nil {
 			return errors.New("gather needs blip names or --selector outside a blip")
-		}
-		// An explicitly empty selector is a mistake, not a request for the
-		// default set: inside a blip the default is every fork of the
-		// caller, which gather would delete.
-		if f.selectorSet {
-			return errors.New("--selector must not be empty")
 		}
 		selector = v1alpha1.LabelParent + "=" + v1alpha1.ParentLabel(a.short(a.self.Name))
 		defaultSelector = true

@@ -276,16 +276,44 @@ func TestGatherValidatesCollectWithoutTargets(t *testing.T) {
 }
 
 // A blank shell variable expands to whitespace, which labels.Parse treats as
-// "select everything". Outside a blip it must be rejected.
+// "select everything". An explicitly set blank selector must report the same
+// empty-selector error everywhere, not a missing-target error outside a blip.
 func TestGatherRejectsWhitespaceSelector(t *testing.T) {
 	for _, sel := range []string{"", " "} {
 		h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
 		code, _, errOut := h.run("", "gather", "--selector", sel)
-		if code != 1 || !strings.Contains(errOut, "needs blip names or --selector") {
+		if code != 1 || !strings.Contains(errOut, "--selector must not be empty") {
 			t.Fatalf("selector %q: code %d: %s", sel, code, errOut)
 		}
 		if h.gone("w1") {
 			t.Fatalf("selector %q gathered a blip", sel)
+		}
+	}
+}
+
+// An explicit blank selector must not be silently ignored when blip names are
+// also given, inside or outside a blip.
+func TestGatherRejectsEmptySelectorWithNames(t *testing.T) {
+	for _, inside := range []bool{false, true} {
+		for _, sel := range []string{"", "   "} {
+			name := "w1"
+			var h *harness
+			if inside {
+				name = "alice.w1"
+				b := finishedBlip(name, v1alpha1.BlipSucceeded, 0)
+				b.Labels = map[string]string{v1alpha1.LabelOwner: "alice", v1alpha1.LabelParent: "box"}
+				h = newHarness(t, ownedBlip("alice.box", "alice.home"), b)
+				h.self = "alice.box"
+			} else {
+				h = newHarness(t, finishedBlip(name, v1alpha1.BlipSucceeded, 0))
+			}
+			code, out, errOut := h.run("", "gather", name, "--selector", sel)
+			if code != 1 || !strings.Contains(errOut, "--selector must not be empty") {
+				t.Fatalf("inside=%v selector %q: code %d out %q stderr %q", inside, sel, code, out, errOut)
+			}
+			if h.gone(name) {
+				t.Fatalf("inside=%v selector %q gathered the named blip", inside, sel)
+			}
 		}
 	}
 }
