@@ -111,7 +111,7 @@ func Setup(ctx context.Context, mgr ctrl.Manager, cfg Config) error {
 		return err
 	}
 	audiences := discoverAPIServerAudiences(ctx, mgr.GetConfig())
-	if err := (&PoolReconciler{Client: c, Config: cfg, APIAudiences: audiences}).SetupWithManager(mgr); err != nil {
+	if err := (&PoolReconciler{Client: c, APIReader: mgr.GetAPIReader(), Config: cfg, APIAudiences: audiences}).SetupWithManager(mgr); err != nil {
 		return err
 	}
 	if err := (&StateReconciler{Client: c, Live: mgr.GetAPIReader(), Config: cfg}).SetupWithManager(mgr); err != nil {

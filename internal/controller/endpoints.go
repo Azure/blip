@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -76,11 +77,19 @@ func validateEndpoint(pool *v1.BlipPool, e *v1.PoolEndpoint, clusterAudiences []
 	return nil
 }
 
+// invalidEndpointCAError marks a CA problem that will not change until the
+// pool or ConfigMap is updated. Callers record it in pool status instead of
+// retrying; any other read error is transient and returned as-is.
+type invalidEndpointCAError struct{ err error }
+
+func (e invalidEndpointCAError) Error() string { return e.err.Error() }
+func (e invalidEndpointCAError) Unwrap() error { return e.err }
+
 // validateEndpointCAs checks that each referenced CA ConfigMap exists in the
 // pool's namespace and contains a parseable ca.crt. validateEndpoints can only
 // check the reference's shape; without this check an unparseable bundle makes
 // the sidecar exit and the pool silently never becomes ready.
-func validateEndpointCAs(ctx context.Context, c client.Client, pool *v1.BlipPool) error {
+func validateEndpointCAs(ctx context.Context, reader client.Reader, pool *v1.BlipPool) error {
 	seen := map[string]bool{}
 	for i := range pool.Spec.Endpoints {
 		e := &pool.Spec.Endpoints[i]
@@ -89,11 +98,22 @@ func validateEndpointCAs(ctx context.Context, c client.Client, pool *v1.BlipPool
 		}
 		seen[e.CAConfigMap] = true
 		var cm corev1.ConfigMap
-		if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: e.CAConfigMap}, &cm); err != nil {
-			return fmt.Errorf("endpoints[%d] %q: caConfigMap %q: %w", i, e.Name, e.CAConfigMap, err)
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: e.CAConfigMap}, &cm); err != nil {
+			if !apierrors.IsNotFound(err) {
+				// RBAC, rate limiting, or an unavailable API server: retry
+				// rather than declaring the pool permanently invalid.
+				return fmt.Errorf("read caConfigMap %q: %w", e.CAConfigMap, err)
+			}
+			return invalidEndpointCAError{fmt.Errorf("endpoints[%d] %q: caConfigMap %q: %w", i, e.Name, e.CAConfigMap, err)}
 		}
-		if !x509.NewCertPool().AppendCertsFromPEM([]byte(cm.Data["ca.crt"])) {
-			return fmt.Errorf("endpoints[%d] %q: caConfigMap %q has no parseable ca.crt", i, e.Name, e.CAConfigMap)
+		// A projected ConfigMap volume reads binaryData too, so a CA stored
+		// there is as valid as one in data.
+		pem := cm.Data["ca.crt"]
+		if pem == "" {
+			pem = string(cm.BinaryData["ca.crt"])
+		}
+		if !x509.NewCertPool().AppendCertsFromPEM([]byte(pem)) {
+			return invalidEndpointCAError{fmt.Errorf("endpoints[%d] %q: caConfigMap %q has no parseable ca.crt", i, e.Name, e.CAConfigMap)}
 		}
 	}
 	return nil

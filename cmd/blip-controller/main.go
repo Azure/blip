@@ -93,7 +93,10 @@ func run(runtimeImage, insecure, namespace string, leaderElect bool, gcThreshold
 		HealthProbeBindAddress:        ":8081",
 		Metrics:                       metricsserver.Options{BindAddress: "0"},
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&corev1.Pod{}:       {Label: labels.NewSelector().Add(*vmPods)},
+			&corev1.Pod{}: {Label: labels.NewSelector().Add(*vmPods)},
+			// Only the admission policy's parameter table is cached. Endpoint
+			// CA ConfigMaps are read uncached via mgr.GetAPIReader(), so this
+			// field selector does not hide them from pool validation.
 			&corev1.ConfigMap{}: {Field: fields.OneTermEqualSelector("metadata.name", controller.VMOwnersConfigMap)},
 		}},
 	})

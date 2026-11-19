@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -126,6 +127,11 @@ type PoolReconciler struct {
 	// discovered at startup. validateEndpoints rejects an endpoint token
 	// projected for any of them.
 	APIAudiences []string
+	// APIReader reads objects uncached. The manager cache only watches the
+	// blip-vm-owners ConfigMap, so CA ConfigMaps must bypass it or every CA
+	// reference looks missing. SetupWithManager sets it; direct callers that
+	// leave it nil fall back to Client.
+	APIReader client.Reader
 
 	mu sync.Mutex
 	// created and deleted hold pod names (per pool) whose change the
@@ -183,6 +189,15 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// caReader returns the reader used for CA ConfigMaps. The default direct
+// client backs tests and callers that reconcile without a manager.
+func (r *PoolReconciler) caReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 // State imports and deletions, and thread changes, refresh the authorization
 // table even when no Blip currently waits for a VM.
 func (r *PoolReconciler) namespacePools(ctx context.Context, o client.Object) []reconcile.Request {
@@ -234,7 +249,14 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	}
 	// The API checks the ConfigMap reference's shape; its contents must also
 	// be a usable CA bundle or the sidecar crash-loops before the pod is ready.
-	if err := validateEndpointCAs(ctx, r.Client, pool); err != nil {
+	// Read through the API reader: the manager cache only watches
+	// blip-vm-owners, so a cached Get would report every other ConfigMap as
+	// missing. A transient read failure is retried, not pinned in status.
+	if err := validateEndpointCAs(ctx, r.caReader(), pool); err != nil {
+		var invalid invalidEndpointCAError
+		if !errors.As(err, &invalid) {
+			return reconcile.Result{}, err
+		}
 		return reconcile.Result{}, r.invalidPool(ctx, pool, "InvalidEndpointCA", err)
 	}
 	var pods corev1.PodList
