@@ -374,7 +374,10 @@ func TestMkdirInRoot(t *testing.T) {
 	}
 	must(os.MkdirAll(filepath.Join(root, "run"), 0o755))
 	must(os.MkdirAll(filepath.Join(root, "var"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "var/spool"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "mail"), 0o755))
 	must(os.Symlink("/run", filepath.Join(root, "var/run")))
+	must(os.Symlink("../mail", filepath.Join(root, "var/spool/mail")))
 	must(os.Symlink(outside, filepath.Join(root, "escape")))
 
 	fd, err := mkdirInRoot(root, "/a/b/c", false)
@@ -386,6 +389,12 @@ func TestMkdirInRoot(t *testing.T) {
 	}
 	if _, err := mkdirInRoot(root, "/var/run/x", false); err == nil {
 		t.Fatalf("symlink component accepted without follow")
+	}
+	// The standard base image's /var/spool/mail -> ../mail is the same
+	// class of directory symlink, so the guest rejects a mount below it.
+	if _, err := mkdirInRoot(root, "/var/spool/mail/x", false); err == nil ||
+		!strings.Contains(err.Error(), "/var/spool/mail is a symlink or not a directory") {
+		t.Fatalf("mail spool symlink: %v", err)
 	}
 	if _, err := mkdirInRoot(root, "/escape/x", false); err == nil {
 		t.Fatalf("escaping symlink accepted without follow")

@@ -1271,7 +1271,7 @@ func TestMountPathsMayContainColons(t *testing.T) {
 // guest itself or lies below a symlink in the image. The mount must be
 // rejected before desired intent is written, or the root cannot start again.
 func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
-	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/lib64/w2", "/bin/w2", "/var/run/w2"} {
+	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/lib64/w2", "/bin/w2", "/var/run/w2", "/var/spool/mail", "/var/spool/mail/w2", "/usr/local/man/w2", "/usr/lib/ssl/certs/w2", "/usr/share/perl/5.38/w2"} {
 		t.Run(path, func(t *testing.T) {
 			h := newHarness(t, readyState("home"), readyState("data"))
 			code, _, errOut := h.run("", "mount", "data:"+path, "--root", "home")
@@ -1301,6 +1301,60 @@ func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
 	}
 	if code, _, errOut := h.run("", "mount", "b:/procdata", "--root", "home"); code != 0 {
 		t.Fatalf("legitimate nested path rejected: %d %s", code, errOut)
+	}
+}
+
+// TestMountRejectsMailSpoolSymlink reproduces the base image's
+// /var/spool/mail -> ../mail directory symlink. Both a running root and an
+// offline root must reject the path at preflight, before creating a state or
+// writing desired intent. Otherwise the next execution fails while creating
+// the mount point in the guest, and the root never starts again.
+func TestMountRejectsMailSpoolSymlink(t *testing.T) {
+	const guestErr = "/var/spool/mail is a symlink or not a directory"
+	for _, live := range []bool{false, true} {
+		name := "offline"
+		if live {
+			name = "live"
+		}
+		t.Run(name, func(t *testing.T) {
+			var root *v1alpha1.BlipState
+			objs := []client.Object{readyState("data")}
+			if live {
+				b := runningBlip("agent")
+				root = readyState(b.Spec.State)
+				objs = append(objs, b, root)
+			} else {
+				root = readyState("home")
+				objs = append(objs, root)
+			}
+			h := newHarness(t, objs...)
+			if live {
+				// Model the guest's dynamic rejection: without a
+				// preflight the mount becomes durable intent and the
+				// root fails on every later execution.
+				h.ctrl.set(func(c *fakeController) { c.mountFail = guestErr })
+			}
+			for _, path := range []string{"/var/spool/mail", "/var/spool/mail/w3"} {
+				code, _, errOut := h.run("", "mount", "data:"+path, "--root", root.Name)
+				if code != 1 || !strings.Contains(errOut, "symlink in the image") {
+					t.Fatalf("mount %s: code %d: %s", path, code, errOut)
+				}
+				if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+					t.Fatalf("mount %s left desired intent: %+v", path, mounts)
+				}
+			}
+			// --new must reject before creating the state it would mount.
+			code, _, errOut := h.run("", "mount", "--new", "spool:/var/spool/mail/w3", "--root", root.Name)
+			if code != 1 || !strings.Contains(errOut, "symlink in the image") {
+				t.Fatalf("--new code %d: %s", code, errOut)
+			}
+			if !stateNotFound(t, h, "spool") {
+				t.Fatal("rejected --new left state spool behind")
+			}
+			if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+				t.Fatalf("rejected --new left desired intent: %+v", mounts)
+			}
+		})
 	}
 }
 
