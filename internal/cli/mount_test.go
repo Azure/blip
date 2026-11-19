@@ -931,6 +931,73 @@ func TestWaitMountWaitsForDemotedCommit(t *testing.T) {
 	}
 }
 
+// TestWaitMountFinishesWhenPromotionCancelled reproduces a read-only request
+// racing a promotion to writable. The controller cancels the promotion without
+// saving: the mount is read-only at the committed version, so the wait must
+// finish instead of waiting for a generation that will never advance. The
+// transient entry may be a switch in progress, or a writable mount that never
+// attached and was dropped.
+func TestWaitMountFinishesWhenPromotionCancelled(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status v1alpha1.MountStatus
+	}{
+		{
+			name: "switch in progress",
+			status: v1alpha1.MountStatus{
+				Phase: v1alpha1.MountMounted, Switching: true,
+			},
+		},
+		{
+			name: "writable mount never attached",
+			status: v1alpha1.MountStatus{
+				Phase: v1alpha1.MountPending, Writable: true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBlip("writer")
+			root := readyState(b.Spec.State)
+			root.Status.Writer = &v1alpha1.Writer{BlipName: b.Name, BlipUID: string(b.UID)}
+			root.Spec.Mounts = []v1alpha1.Mount{{State: "data", Path: "/data"}}
+			data := readyState("data")
+			transient := tc.status
+			transient.State, transient.Path = "data", "/data"
+			transient.CommitID = data.Status.Committed.ID
+			b.Status.Mounts = []v1alpha1.MountStatus{transient}
+			a := mountTestApp(t, b, root, data)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			done := make(chan error, 1)
+			go func() {
+				done <- a.waitMount(ctx, b, "data", "/data", false, data.Status.Committed.Generation, "")
+			}()
+
+			// The controller cancels the promotion. The mount is read-only
+			// again at the same committed version, so no save will land.
+			cur, err := a.getBlip(ctx, b.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cur.Status.Mounts = []v1alpha1.MountStatus{{
+				State: "data", Path: "/data", Phase: v1alpha1.MountMounted, CommitID: data.Status.Committed.ID,
+			}}
+			if err := a.c.Kube.Status().Update(ctx, cur); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("waitMount failed after the cancelled promotion: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("waitMount waited for a save that cannot happen after the promotion was cancelled")
+			}
+		})
+	}
+}
+
 func TestMountListsRootMounts(t *testing.T) {
 	root := readyState("home")
 	root.Spec.Mounts = []v1alpha1.Mount{

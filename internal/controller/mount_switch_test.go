@@ -297,6 +297,7 @@ func TestMountSwitchPromoteCancelled(t *testing.T) {
 	e.run(e.blip, ns, "git")
 
 	e.updateRoot("git", func(b *v1.BlipState) { b.Spec.Mounts[0].Writable = true })
+	before := e.getState("repo").Status.Committed
 	e.run(e.blip, ns, "git")
 	if w := e.getState("repo").Status.Writer; w == nil {
 		t.Fatal("promotion did not acquire writer")
@@ -310,6 +311,11 @@ func TestMountSwitchPromoteCancelled(t *testing.T) {
 	}
 	if w := e.getState("repo").Status.Writer; w != nil {
 		t.Fatalf("cancelled promotion leaked writer %+v", w)
+	}
+	// The cancellation must not save: the mount stays read-only at the
+	// version it had before the promotion.
+	if c := e.getState("repo").Status.Committed; c == nil || c.ID != before.ID || c.Generation != before.Generation {
+		t.Fatalf("cancelled promotion advanced the state from %+v to %+v", before, c)
 	}
 }
 
