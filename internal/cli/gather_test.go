@@ -293,3 +293,20 @@ func TestGatherSelectorExcludesCaller(t *testing.T) {
 		t.Fatal("caller gathered itself")
 	}
 }
+
+// A finished command whose pod is already gone still reports the output the
+// controller retained in status.
+func TestGatherFollowUsesRetainedStatusOutput(t *testing.T) {
+	b := finishedBlip("retained", v1alpha1.BlipSucceeded, 0)
+	b.Status.Pod = ""
+	b.Status.Output = "FASTOUT\nLASTLINE\n"
+	h := newHarness(t, b)
+	code, out, errOut := h.run("", "gather", "retained", "-f")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "retained| FASTOUT", "retained| LASTLINE", "blip/retained Succeeded (exit 0)")
+	if strings.Contains(errOut, "output is no longer available") {
+		t.Fatalf("unexpected unavailable message: %q", errOut)
+	}
+}

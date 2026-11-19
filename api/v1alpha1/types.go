@@ -554,6 +554,12 @@ type BlipStatus struct {
 	// Report is the last report the workload submitted through
 	// BLIP_REPORT_URL. It is retained after the pod is gone.
 	Report *BlipReport `json:"report,omitempty"`
+	// Output is the tail of the command output recovered from the VM serial
+	// console when the Blip finishes. It lets gather -f show a command that
+	// ended before the client could attach. It is bounded and may be empty
+	// if the pod log was unavailable.
+	// +kubebuilder:validation:MaxLength=65536
+	Output string `json:"output,omitempty"`
 }
 
 // BlipReport is one bounded progress or result string published by a

@@ -1,14 +1,18 @@
 package controller
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 	"github.com/Azure/blip/internal/podapi"
@@ -555,5 +559,33 @@ func TestFinishedBlipClearsSavingMountPhase(t *testing.T) {
 	expectPhase(t, b, v1.BlipSucceeded, ReasonStopped)
 	if m := mountOf(b, "data"); m == nil || m.Phase != v1.MountMounted || m.Message != "" || m.Switching {
 		t.Fatalf("finished Blip left mount in saving state: %+v", m)
+	}
+}
+
+// TestFinishedBlipRetainsCommandOutput covers gather -f for a command that
+// ended before the client attached: the tail of the guest-mirrored output is
+// saved in status before the pod is deleted.
+func TestFinishedBlipRetainsCommandOutput(t *testing.T) {
+	e := newEnv(t)
+	e.blip.Config.PodLogs = func(context.Context, string, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("boot noise\nblip: FASTOUT\nblip: LASTLINE\nmore noise\n")), nil
+	}
+	b := &v1.Blip{
+		ObjectMeta: metav1.ObjectMeta{Name: "b", UID: types.UID("uid-b")},
+		Status: v1.BlipStatus{
+			Phase: v1.BlipSucceeded, Pod: "pod-b", PodUID: "uid-p",
+		},
+	}
+	e.create(b)
+	e.create(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-b", UID: types.UID("uid-p")}})
+	b = e.getBlip("b")
+	e.must(e.blip.cleanup(e.ctx, b))
+
+	got := e.getBlip("b")
+	if got.Status.Output != "FASTOUT\nLASTLINE\n" {
+		t.Fatalf("output %q", got.Status.Output)
+	}
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "pod-b"}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("pod not deleted: %v", err)
 	}
 }

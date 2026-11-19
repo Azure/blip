@@ -4,8 +4,10 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -14,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -32,6 +35,7 @@ import (
 // +kubebuilder:rbac:groups=blip.dev,resources=blips/status;blipstates/status;blippools/status;blipnodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=blip.dev,resources=blips/finalizers;blipstates/finalizers;blippools/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -110,9 +114,20 @@ func run(runtimeImage, insecure, namespace string, leaderElect bool, gcThreshold
 	if err := diskkey.Ensure(ctx, direct, namespace); err != nil {
 		return err
 	}
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return err
+	}
+	tail := int64(10000)
 	cfg := controller.Config{
 		RuntimeImage: runtimeImage,
 		Registry:     controller.RemoteRegistry{Insecure: registries, Reader: mgr.GetAPIReader()},
+		PodLogs: func(ctx context.Context, namespace, pod string) (io.ReadCloser, error) {
+			return clientset.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{
+				Container: "vm",
+				TailLines: &tail,
+			}).Stream(ctx)
+		},
 	}
 	if err := controller.Setup(ctx, mgr, cfg); err != nil {
 		return err

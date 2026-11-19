@@ -330,19 +330,22 @@ func (a *app) follow(ctx context.Context, name string) {
 		return
 	}
 	short := a.short(name)
+	ending := v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving
 	pod := b.Status.Pod
 	if pod == "" {
-		if v1alpha1.Finished(b) {
-			a.progress("%s: output is no longer available (the VM pod is gone)", short)
+		if ending {
+			if !a.printRetained(ctx, name, short) {
+				a.progress("%s: output is no longer available (the VM pod is gone)", short)
+			}
 		}
 		return
 	}
 	s, err := a.openRetrying(ctx, name, pod, wire.Open{Mode: wire.OpenAttach, Session: wire.PrimarySession, Follow: true}, true)
 	if err != nil {
-		if v1alpha1.Finished(b) && ctx.Err() == nil {
+		if (ending || a.blipEnding(ctx, name)) && ctx.Err() == nil {
 			// The replay ring died with the VM. The guest still mirrored the
 			// command to the serial console, which the pod keeps as its log.
-			if a.replayLogs(ctx, pod, short) {
+			if a.replayLogs(ctx, pod, short) || a.printRetained(ctx, name, short) {
 				return
 			}
 			a.progress("%s: output is no longer available: %v", short, err)
@@ -355,8 +358,43 @@ func (a *app) follow(ctx context.Context, name string) {
 	_, _ = s.Copy(out, errw, func(m string) { a.progress("%s: %s", short, m) })
 	out.flush()
 	errw.flush()
-	if !out.wrote && !errw.wrote && v1alpha1.Finished(b) {
-		a.replayLogs(ctx, pod, short)
+	if !out.wrote && !errw.wrote && (ending || a.blipEnding(ctx, name)) {
+		if !a.replayLogs(ctx, pod, short) {
+			a.printRetained(ctx, name, short)
+		}
+	}
+}
+
+// blipEnding reports whether the blip is saving or finished now. A follower
+// may attach while the command is running and learn only later that the
+// session ended without delivering output.
+func (a *app) blipEnding(ctx context.Context, name string) bool {
+	b, err := a.getBlip(ctx, name)
+	return err == nil && (v1alpha1.Finished(b) || b.Status.Phase == v1alpha1.BlipSaving)
+}
+
+// printRetained prints the command output the controller saved in Blip status
+// before deleting the VM pod. The controller and a finishing Blip race the
+// follower, so wait briefly for the status write. It returns whether it
+// printed anything.
+func (a *app) printRetained(ctx context.Context, name, short string) bool {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		b, err := a.getBlip(ctx, name)
+		if err == nil && b.Status.Output != "" {
+			w := &prefixWriter{out: a.env.Out, prefix: short + "|"}
+			_, _ = w.Write([]byte(b.Status.Output))
+			w.flush()
+			return w.wrote
+		}
+		if err != nil || !time.Now().Before(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 

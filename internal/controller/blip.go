@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -247,14 +248,70 @@ func (r *BlipReconciler) flush(ctx context.Context, b, base *v1.Blip) error {
 	return nil
 }
 
-// cleanup deletes the pod of a finished Blip and removes the finalizer
-// once it is being deleted.
+// podOutput reads the serial console of a VM pod and returns the tail of the
+// lines the guest mirrored from the command, without boot noise. It is best
+// effort: a missing log or a read error simply leaves the output empty.
+func (r *BlipReconciler) podOutput(ctx context.Context, namespace, pod string) (string, bool) {
+	if r.Config.PodLogs == nil {
+		return "", false
+	}
+	rc, err := r.Config.PodLogs(ctx, namespace, pod)
+	if err != nil {
+		return "", false
+	}
+	defer rc.Close()
+	var lines []string
+	total := 0
+	sc := bufio.NewScanner(rc)
+	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	for sc.Scan() {
+		line, ok := strings.CutPrefix(sc.Text(), "blip: ")
+		if !ok {
+			continue
+		}
+		lines = append(lines, line)
+		total += len(line) + 1
+		for total > maxRetainedOutput && len(lines) > 1 {
+			total -= len(lines[0]) + 1
+			lines = lines[1:]
+		}
+	}
+	if len(lines) == 0 {
+		return "", false
+	}
+	out := strings.Join(lines, "\n") + "\n"
+	if len(out) > maxRetainedOutput {
+		start := len(out) - (maxRetainedOutput - len(outputTruncated))
+		if i := strings.IndexByte(out[start:], '\n'); i >= 0 {
+			start += i + 1
+		}
+		out = outputTruncated + out[start:]
+	}
+	return out, true
+}
+
+// maxRetainedOutput bounds the command output copied from the serial console
+// into Blip status. The full output is in the pod log until it is deleted;
+// this tail is what survives.
+const maxRetainedOutput = 64 << 10
+
+const outputTruncated = "[earlier output was truncated]\n"
+
+// cleanup preserves the tail of a finished command, deletes its pod, and
+// removes the finalizer once the Blip is being deleted.
 func (r *BlipReconciler) cleanup(ctx context.Context, b *v1.Blip) error {
 	var err error
 	if b.Status.Pod != "" {
 		pod := &corev1.Pod{}
 		err = r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.Pod}, pod)
 		if err == nil && string(pod.UID) == b.Status.PodUID && pod.DeletionTimestamp == nil {
+			if out, ok := r.podOutput(ctx, b.Namespace, pod.Name); ok && b.Status.Output == "" {
+				base := b.DeepCopy()
+				b.Status.Output = out
+				if err = patchStatus(ctx, r.Client, b, base); err != nil {
+					return err
+				}
+			}
 			err = r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID})
 		}
 	}

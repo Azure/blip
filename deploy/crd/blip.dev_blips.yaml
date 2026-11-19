@@ -465,6 +465,14 @@ spec:
                 x-kubernetes-list-type: map
               node:
                 type: string
+              output:
+                description: |-
+                  Output is the tail of the command output recovered from the VM serial
+                  console when the Blip finishes. It lets gather -f show a command that
+                  ended before the client could attach. It is bounded and may be empty
+                  if the pod log was unavailable.
+                maxLength: 65536
+                type: string
               phase:
                 type: string
               pod:

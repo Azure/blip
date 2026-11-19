@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"io"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +38,9 @@ type Config struct {
 	NewID func() string
 	// NewPodName defaults to the pool name plus a random five-character suffix.
 	NewPodName func(pool string) string
+	// PodLogs opens the serial console of a VM pod. It is used once when a
+	// Blip finishes to preserve the tail of its command output.
+	PodLogs func(ctx context.Context, namespace, pod string) (io.ReadCloser, error)
 }
 
 func (c *Config) now() time.Time {
