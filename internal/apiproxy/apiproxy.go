@@ -33,6 +33,23 @@ import (
 
 const serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 
+// maxConcurrentRequests bounds the requests that may be in a handler at once.
+// Watches, log streams, exec/attach upgrades, and plain long responses hold a
+// request (and an upstream connection) until the stream ends, so an unbounded
+// number of them exhausts the sidecar's 64Mi memory limit and gets the whole
+// process OOM-killed. 256 is well below the ~400-500 concurrent held streams
+// that exhausted the sidecar in testing, leaving memory headroom. The cap is
+// global: kube-apiserver and endpoint routes share it. A request that cannot
+// get a slot is rejected with 503 instead of queued, so excess streams never
+// allocate upstream buffers.
+//
+// A graceful full close of a guest stream that follows a half-close may not be
+// visible until the peer's orphaned FIN_WAIT2 socket expires and keepalive
+// fails (~77s with default tcp_fin_timeout). That is a bounded delay rather
+// than a leak; see clientGone in internal/guest/api.go. A held stream keeps its
+// slot for that interval.
+const maxConcurrentRequests = 256
+
 // API is the Kubernetes API upstream and the credential the sidecar uses.
 type API struct {
 	// Address is the Kubernetes HTTPS authority, including its port.
@@ -174,6 +191,31 @@ type proxyServer struct {
 	cleanup func()
 }
 
+// requestLimiter is a counting semaphore for requests that hold a handler.
+// Acquire is deliberately non-blocking: when every slot is taken, the request
+// is rejected rather than waiting, because waiting still holds a client
+// connection and its read buffer.
+type requestLimiter struct {
+	slots chan struct{}
+}
+
+func newRequestLimiter(limit int) *requestLimiter {
+	return &requestLimiter{slots: make(chan struct{}, limit)}
+}
+
+func (l *requestLimiter) acquire() bool {
+	select {
+	case l.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *requestLimiter) release() {
+	<-l.slots
+}
+
 // connectionLifetimeKey carries the connection-scoped context. A client may
 // half-close its write side after sending a complete request; net/http
 // cancels the per-request context when the read side reaches EOF, even
@@ -196,8 +238,19 @@ func newProxyServer(ctx context.Context, socketPath string, handler http.Handler
 		return nil, err
 	}
 	tracked := &trackedListener{Listener: listener, connections: make(map[*trackedConn]struct{})}
+	limiter := newRequestLimiter(maxConcurrentRequests)
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The slot is held for the whole request, including watches,
+			// streams, and hijacked upgrades, and released on every return
+			// path: normal completion, client cancellation, and upstream
+			// errors all end ServeHTTP.
+			if !limiter.acquire() {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "too many concurrent requests", http.StatusServiceUnavailable)
+				return
+			}
+			defer limiter.release()
 			if lifetime, ok := r.Context().Value(connectionLifetimeKey{}).(context.Context); ok {
 				r = r.WithContext(lifetime)
 			}
