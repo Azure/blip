@@ -58,8 +58,11 @@ func (r *httpRunnable) NeedLeaderElection() bool { return false }
 
 // HTTP server bounds. The read timeout stops slow-body and slow-header
 // clients, the idle timeout closes unused keep-alive connections, and the
-// write timeout bounds a client that stops reading. The write timeout is kept
-// at the LLM client's own timeout so a slow completion is not cut off.
+// write timeout bounds a client that stops reading. The write timeout stays
+// above Config.ChatTimeout: the handler's own budget cancels the model loop
+// and lets it send a response before the connection is closed, even after a
+// tool call committed a turn. It is also the LLM client's per-call timeout so
+// one slow completion is not cut off by the transport.
 const (
 	readHeaderTimeout = 10 * time.Second
 	readTimeout       = 30 * time.Second

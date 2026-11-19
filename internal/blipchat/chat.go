@@ -147,7 +147,11 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("history is too long: %d characters, limit %d", historyRunes, maxHistoryRunes), http.StatusBadRequest)
 		return
 	}
-	ctx := r.Context()
+	// Bound the whole lookup, model loop, and tool work. The server's write
+	// timeout is higher, so an expired chat still gets a response instead
+	// of an EOF after a tool already committed work.
+	ctx, cancel := context.WithTimeout(r.Context(), c.Server.Config.chatTimeout())
+	defer cancel()
 	namespace := r.URL.Query().Get("namespace")
 	if namespace == "" {
 		namespace = "default"
@@ -185,6 +189,10 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// looks the thread up again and must not deliver the old
 			// project's directive to the new one.
 			http.Error(w, "thread changed; retry", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "chat request timed out", http.StatusGatewayTimeout)
 			return
 		}
 		http.Error(w, "chat backend unavailable", http.StatusBadGateway)
@@ -250,14 +258,15 @@ func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
 			map[string]any{"argv": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}},
 		), "blip")),
 	}
-	for calls := 0; calls < 10; calls++ {
+	maxRounds := c.s.Config.chatMaxRounds()
+	for calls := 0; calls < maxRounds; calls++ {
 		// The model may have deleted or recreated the thread during the
 		// previous round. Abandon rather than reading or writing the new
 		// incarnation's board, turns, or blips.
 		if err := c.assertCurrent(ctx); err != nil {
 			return "", err
 		}
-		reply, _, err := c.s.LLM.Chat(ctx, model, messages, tools)
+		reply, _, err := c.chatRound(ctx, model, messages, tools)
 		if err != nil {
 			return "", err
 		}
@@ -277,6 +286,18 @@ func (c *chatStep) run(ctx context.Context, req chatRequest) (string, error) {
 		}
 	}
 	return "I could not finish that in time. Please try again.", nil
+}
+
+// chatRound makes one model call under the per-round budget, which is
+// shorter than the overall request budget so one stalled completion cannot
+// consume every remaining round.
+func (c *chatStep) chatRound(ctx context.Context, model string, messages []Message, tools []Tool) (Message, Usage, error) {
+	if d := c.s.Config.chatRoundTimeout(); d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+	return c.s.LLM.Chat(ctx, model, messages, tools)
 }
 
 // assertCurrent rejects a chat snapshot whose thread name was deleted or

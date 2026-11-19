@@ -33,9 +33,29 @@ type Config struct {
 	MaxToolCalls int
 	// Listen is the chat HTTP listen address.
 	Listen string
-	// HTTPClient is used for LLM requests.
+	// HTTPClient is used for LLM requests. Its Timeout bounds one call; a
+	// chat round is further bounded by ChatRoundTimeout and the whole chat
+	// request by ChatTimeout.
 	HTTPClient *http.Client
+	// ChatTimeout bounds one /chat request from thread lookup through the
+	// last model round and tool call. It must stay below the HTTP server's
+	// write timeout so a slow request is answered instead of having its
+	// connection closed.
+	ChatTimeout time.Duration
+	// ChatRoundTimeout bounds one model call in a chat request.
+	ChatRoundTimeout time.Duration
+	// ChatMaxRounds bounds model round-trips in one chat request.
+	ChatMaxRounds int
 }
+
+// Default chat budgets. The overall budget leaves the HTTP server room to
+// send an error response before writeTimeout closes the connection, even when
+// a tool call already committed a turn.
+const (
+	defaultChatTimeout      = 4 * time.Minute
+	defaultChatRoundTimeout = 2 * time.Minute
+	defaultChatMaxRounds    = 8
+)
 
 func (c *Config) defaults() {
 	if c.Debounce <= 0 {
@@ -56,9 +76,39 @@ func (c *Config) defaults() {
 	if c.HTTPClient == nil {
 		c.HTTPClient = &http.Client{Timeout: 5 * time.Minute}
 	}
+	if c.ChatTimeout <= 0 {
+		c.ChatTimeout = defaultChatTimeout
+	}
+	if c.ChatRoundTimeout <= 0 {
+		c.ChatRoundTimeout = defaultChatRoundTimeout
+	}
+	if c.ChatMaxRounds <= 0 {
+		c.ChatMaxRounds = defaultChatMaxRounds
+	}
 	if len(c.AgentCommand) == 0 {
 		c.AgentCommand = []string{"blip-pi"}
 	}
+}
+
+func (c Config) chatTimeout() time.Duration {
+	if c.ChatTimeout > 0 {
+		return c.ChatTimeout
+	}
+	return defaultChatTimeout
+}
+
+func (c Config) chatRoundTimeout() time.Duration {
+	if c.ChatRoundTimeout > 0 {
+		return c.ChatRoundTimeout
+	}
+	return defaultChatRoundTimeout
+}
+
+func (c Config) chatMaxRounds() int {
+	if c.ChatMaxRounds > 0 {
+		return c.ChatMaxRounds
+	}
+	return defaultChatMaxRounds
 }
 
 // Owner is the ownership label for objects a thread creates. It is derived
