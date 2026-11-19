@@ -1854,6 +1854,28 @@ func TestMountTerminalGuestRejectionsRollBack(t *testing.T) {
 	}
 }
 
+// TestMountSourceFailedWhileWaitingRollsBack covers a source that becomes
+// Failed while the mount waits. The controller reports it as a terminal
+// MountFailed entry, so the desired mount this command added must be removed.
+func TestMountSourceFailedWhileWaitingRollsBack(t *testing.T) {
+	const failedMsg = `state "data" failed: image not found`
+	b := runningBlip("agent")
+	root := readyState(b.Spec.State)
+	h := newHarness(t, b, root, readyState("data"))
+	h.ctrl.set(func(c *fakeController) { c.mountFail = failedMsg })
+
+	code, _, errOut := h.run("", "mount", "data:/data", "--root", root.Name)
+	if code != 1 || !strings.Contains(errOut, failedMsg) || !strings.Contains(errOut, "desired mount was removed") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if strings.Contains(errOut, "remains applied") {
+		t.Fatalf("failed source rollback message contradicts itself: %s", errOut)
+	}
+	if mounts := h.state(root.Name).Spec.Mounts; len(mounts) != 0 {
+		t.Fatalf("failed source left desired intent: %+v", mounts)
+	}
+}
+
 // TestMountMoveRejectedRestoresPreviousPath reproduces a move whose new path
 // the guest rejects. The old path must be restored, or every later execution
 // of the root fails at the rejected path.

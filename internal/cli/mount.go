@@ -527,6 +527,21 @@ func mountPointRejected(msg string) bool {
 	return false
 }
 
+// mountSourceFailed reports the part of a mount status message that says the
+// source state became Failed while the mount waited. Only the controller's
+// fixed `state "NAME" failed:` segment matches, so unrelated mount and save
+// failures keep their desired intent.
+func mountSourceFailed(msg, state string) string {
+	prefix := "state " + strconv.Quote(state) + " failed"
+	for _, part := range strings.Split(msg, "; ") {
+		part = strings.TrimSpace(part)
+		if strings.Contains(part, prefix) {
+			return part
+		}
+	}
+	return ""
+}
+
 // mountBusy reports the part of a top-level Blip status message that says the
 // wanted state is already written by another Blip. The controller records a
 // writable mount rejected for that reason on the Blip itself, not as a mount
@@ -755,6 +770,11 @@ func (a *app) waitMount(ctx context.Context, writer *v1alpha1.Blip, state, mount
 				return false, fmt.Errorf("could not switch state %q on blip %q: processes are still using %s; desired mount remains applied", state, b.Name, mountPath)
 			}
 			msg := fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, m.Message)
+			if failed := mountSourceFailed(m.Message, state); failed != "" {
+				// The source can never commit, so the mount can never
+				// attach. Roll it back like a rejected mount point.
+				return false, &mountRejectedError{msg: fmt.Sprintf("mount of state %q on blip %q failed: %s", state, b.Name, failed)}
+			}
 			if mountPointRejected(m.Message) {
 				// mountState appends the accurate outcome after attempting
 				// its rollback; claiming here that the mount remains applied
