@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -232,6 +233,75 @@ func TestCheckDirAccessResolvesSymlinkedWorkdir(t *testing.T) {
 	}
 	if want := "chdir /link: permission denied for uid"; !strings.Contains(err.Error(), want) {
 		t.Fatalf("error = %q, want it to contain %q", err, want)
+	}
+}
+
+// A ".." after an unsearchable directory must not hide that directory from the
+// workdir preflight. The kernel searches /locked before it applies "..", so
+// chdir fails there even though the canonical workdir (what the old check
+// walked) is accessible. Both the literal and the symlinked spelling must name
+// the workdir instead of failing later as "start <program>: permission denied".
+func TestCheckDirAccessChecksComponentsRemovedByDotDot(t *testing.T) {
+	root := testRoot(t)
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(root, "tmp", "w4")
+	if err := os.MkdirAll(filepath.Join(base, "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(base, "locked"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/tmp/w4/locked", filepath.Join(base, "lockedlnk")); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no stat ownership information")
+	}
+	outsider := &account{uid: st.Uid + 1, gid: st.Gid + 1, groups: []uint32{st.Gid + 1}}
+
+	// The bug's premise: the canonical workdir no longer contains "locked".
+	resolved, err := resolveInRoot(root, "/tmp/w4/locked/../real")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != "/tmp/w4/real" {
+		t.Fatalf("resolved workdir = %q, want /tmp/w4/real", resolved)
+	}
+
+	for _, dir := range []string{"/tmp/w4/locked/../real", "/tmp/w4/lockedlnk/../real"} {
+		err := checkDirAccess(root, dir, outsider)
+		if err == nil {
+			t.Fatalf("checkDirAccess(%q) accepted a workdir behind an unsearchable component", dir)
+		}
+		if want := "chdir " + dir + ": permission denied for uid " + strconv.Itoa(int(outsider.uid)); !strings.Contains(err.Error(), want) {
+			t.Fatalf("checkDirAccess(%q) error = %q, want it to contain %q", dir, err, want)
+		}
+	}
+
+	// The same workdir must still start far enough to be reported as a chdir
+	// failure (126) rather than as a failure of the executable.
+	g := testGuest(t)
+	g.root = root
+	_, _, err = g.startProc(procSpec{
+		argv: []string{"/bin/sh"},
+		dir:  "/tmp/w4/locked/../real",
+		user: strconv.FormatUint(uint64(outsider.uid), 10),
+	}, nil)
+	if err == nil {
+		t.Fatal("startProc accepted a workdir behind an unsearchable component")
+	}
+	if want := "chdir /tmp/w4/locked/../real: permission denied for uid"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("startProc error = %q, want it to contain %q", err, want)
+	}
+	if code := startExitCode(err); code != 126 {
+		t.Fatalf("startProc exit code = %d, want 126", code)
 	}
 }
 

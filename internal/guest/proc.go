@@ -175,37 +175,76 @@ func workdirInRoot(dir string) string {
 	return dir
 }
 
-// checkDirAccess verifies that the target account can search every component
-// of dir inside root. Without this, os.StartProcess fails in the child with
-// "fork/exec <program>: permission denied", which makes an inaccessible
-// working directory look like a missing or unexecutable program. The
-// components come from the resolved path, not the spelling: a symlink can
-// point through a directory the account cannot search even when the target
-// itself is accessible.
+// checkDirAccess verifies that the target account can search every directory
+// the kernel traverses to reach dir inside root. Without this, os.StartProcess
+// fails in the child with "fork/exec <program>: permission denied", which
+// makes an inaccessible working directory look like a missing or unexecutable
+// program.
+//
+// The walk follows the path as written, resolving each cumulative prefix the
+// way chdir(2) does. Checking only the canonical components is not enough: in
+// "/locked/../real" the kernel must search /locked before ".." removes it from
+// the canonical path, so an account can be denied even though the resolved
+// workdir is searchable. Resolving each prefix also covers directories that a
+// symlink points through, since every prefix is resolved before it is checked.
 func checkDirAccess(root, dir string, acct *account) error {
 	if acct.uid == 0 {
 		return nil
 	}
-	resolved, err := resolveInRoot(root, dir)
-	if err != nil {
-		return fmt.Errorf("chdir %s: %w", dir, err)
+	prefixes := []string{"/"}
+	var parts []string
+	for _, part := range strings.Split(strings.TrimPrefix(dir, "/"), "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		parts = append(parts, part)
+		prefixes = append(prefixes, "/"+strings.Join(parts, "/"))
 	}
+	checked := map[string]bool{}
+	for _, prefix := range prefixes {
+		resolved, err := resolveInRoot(root, prefix)
+		if err != nil {
+			return fmt.Errorf("chdir %s: %w", dir, err)
+		}
+		for _, p := range resolvedDirs(resolved) {
+			if checked[p] {
+				continue
+			}
+			checked[p] = true
+			if err := checkSearchable(root, p, acct); err != nil {
+				return fmt.Errorf("chdir %s: %w", dir, err)
+			}
+		}
+	}
+	return nil
+}
+
+// resolvedDirs returns the canonical directory paths on resolved, starting at
+// the root.
+func resolvedDirs(resolved string) []string {
+	dirs := []string{"/"}
 	p := "/"
 	for _, part := range strings.Split(strings.TrimPrefix(resolved, "/"), "/") {
 		if part == "" {
 			continue
 		}
 		p = path.Join(p, part)
-		fi, err := statInRoot(root, p)
-		if err != nil {
-			return fmt.Errorf("chdir %s: %w", dir, err)
-		}
-		if !fi.IsDir() {
-			return fmt.Errorf("chdir %s: %w", dir, unix.ENOTDIR)
-		}
-		if !canSearchDir(fi, acct) {
-			return fmt.Errorf("chdir %s: %w for uid %d", dir, unix.EACCES, acct.uid)
-		}
+		dirs = append(dirs, p)
+	}
+	return dirs
+}
+
+// checkSearchable verifies that acct may search directory p inside root.
+func checkSearchable(root, p string, acct *account) error {
+	fi, err := statInRoot(root, p)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return unix.ENOTDIR
+	}
+	if !canSearchDir(fi, acct) {
+		return fmt.Errorf("%w for uid %d", unix.EACCES, acct.uid)
 	}
 	return nil
 }
