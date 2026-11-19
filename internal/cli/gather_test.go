@@ -122,6 +122,17 @@ func TestGatherWaitGivesUpOnRunningBlips(t *testing.T) {
 	}
 }
 
+func TestGatherRejectsNegativeWait(t *testing.T) {
+	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0))
+	code, _, errOut := h.run("", "gather", "w1", "--wait", "-1s")
+	if code != 1 || !strings.Contains(errOut, "--wait must not be negative") {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if h.gone("w1") {
+		t.Fatal("negative wait gathered the blip")
+	}
+}
+
 func TestGatherAnyReturnsOnFirstFinish(t *testing.T) {
 	h := newHarness(t, finishedBlip("w1", v1alpha1.BlipSucceeded, 0), runningBlip("w2"))
 	code, _, errOut := h.run("", "gather", "w1", "w2", "--any")

@@ -282,3 +282,43 @@ func TestRunInterruptedWithStateKeepsWorkspace(t *testing.T) {
 	// The workspace existed before the run and is still owned by its owner.
 	h.state("ws")
 }
+
+func TestRunRejectsInvalidDurations(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--timeout", "-5s"}, "--timeout must not be negative"},
+		{[]string{"--ttl", "-7s"}, "--ttl must not be negative"},
+		{[]string{"--timeout", "3500ms"}, "--timeout must be a whole number of seconds"},
+		{[]string{"--ttl", "1500ms"}, "--ttl must be a whole number of seconds"},
+		{[]string{"--timeout", "500ms"}, "--timeout must be a whole number of seconds"},
+	}
+	for _, tc := range cases {
+		h := newHarness(t, readyState("base"))
+		args := append([]string{"run", "--name", "worker", "--from", "base"}, tc.args...)
+		args = append(args, "--", "true")
+		code, _, errOut := h.run("", args...)
+		if code != 1 || !strings.Contains(errOut, tc.want) {
+			t.Fatalf("%v: code %d: %s", tc.args, code, errOut)
+		}
+		if !h.gone("worker") {
+			t.Fatalf("%v: blip created despite the invalid duration", tc.args)
+		}
+	}
+}
+
+func TestRunAcceptsWholeSecondDurations(t *testing.T) {
+	h := newHarness(t, readyState("base"))
+	code, _, errOut := h.run("", "run", "--name", "worker", "--from", "base", "--timeout", "90s", "--ttl", "60s", "--", "true")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	b := h.blip("worker")
+	if b.Spec.ActiveDeadlineSeconds == nil || *b.Spec.ActiveDeadlineSeconds != 90 {
+		t.Fatalf("deadline %v", b.Spec.ActiveDeadlineSeconds)
+	}
+	if b.Spec.TTLSecondsAfterFinished == nil || *b.Spec.TTLSecondsAfterFinished != 60 {
+		t.Fatalf("ttl %v", b.Spec.TTLSecondsAfterFinished)
+	}
+}

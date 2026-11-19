@@ -67,6 +67,9 @@ blips are deleted with their workspaces.`,
 }
 
 func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error {
+	if f.wait < 0 {
+		return fmt.Errorf("--wait must not be negative: %s", f.wait)
+	}
 	c, err := a.clients()
 	if err != nil {
 		return err

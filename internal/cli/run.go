@@ -170,15 +170,28 @@ func labelFlags(b *v1alpha1.Blip, values []string) error {
 	return nil
 }
 
+// wholeSeconds validates a duration that is stored in whole seconds. A
+// negative value would silently disable the field that the flag is meant to
+// set, and a fractional value would be truncated, so both are rejected.
+func wholeSeconds(flag string, d time.Duration) error {
+	switch {
+	case d < 0:
+		return fmt.Errorf("%s must not be negative: %s", flag, d)
+	case d%time.Second != 0:
+		return fmt.Errorf("%s must be a whole number of seconds: %s", flag, d)
+	}
+	return nil
+}
+
 func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	if len(command) == 0 {
 		return errors.New("a command is required: blip run -- CMD [ARG...]")
 	}
-	if f.timeout > 0 && f.timeout < time.Second {
-		return errors.New("--timeout must be at least 1s")
+	if err := wholeSeconds("--timeout", f.timeout); err != nil {
+		return err
 	}
-	if f.ttl > 0 && f.ttl < time.Second {
-		return errors.New("--ttl must be at least 1s")
+	if err := wholeSeconds("--ttl", f.ttl); err != nil {
+		return err
 	}
 	if f.from != "" && f.state != "" {
 		return errors.New("set only one of --from and --state")
