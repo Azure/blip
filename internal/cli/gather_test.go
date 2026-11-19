@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -219,6 +220,35 @@ func TestGatherGitCollectFailureKeepsBlipError(t *testing.T) {
 	mustContain(t, errOut, "blip w1 failed: exit code 9", "collect from w1", "git fetch")
 	if h.gone("alice.w1") {
 		t.Fatal("blip deleted after a failed collect")
+	}
+}
+
+// Two blips collecting to the same destination would silently overwrite each
+// other. gather must reject the ambiguous set before collecting or deleting.
+func TestGatherRejectsDuplicateCollectDestinations(t *testing.T) {
+	root := withCollectMountRoot(t)
+	w1 := ownedBlip("alice.w1", "alice.w1")
+	w1.Status.Phase = v1alpha1.BlipSucceeded
+	w2 := ownedBlip("alice.w2", "alice.w2")
+	w2.Status.Phase = v1alpha1.BlipSucceeded
+	h := newHarness(t,
+		ownedBlip("alice.box", "alice.home"), w1, w2,
+		readyState("alice.w1"), readyState("alice.w2"))
+	h.self = "alice.box"
+	writeCollectFile(t, root, "alice.w1", "/home/dev/a", "one", 0o644)
+	writeCollectFile(t, root, "alice.w2", "/home/dev/a", "two", 0o644)
+	dst := filepath.Join(t.TempDir(), "a")
+
+	code, _, errOut := h.run("", "gather", "w1", "w2", "--collect", "/home/dev/a:"+dst)
+	if code != 1 {
+		t.Fatalf("code %d, want 1: %s", code, errOut)
+	}
+	mustContain(t, errOut, "destination", "w1", "w2")
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("a destination was written despite the collision: %v", err)
+	}
+	if h.gone("alice.w1") || h.gone("alice.w2") {
+		t.Fatal("blips were deleted despite the collision")
 	}
 }
 

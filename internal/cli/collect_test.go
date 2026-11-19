@@ -442,6 +442,33 @@ func TestCopyFileAtomicOnCancel(t *testing.T) {
 
 // A directory copy that fails on a later child must not have replaced an
 // earlier child of an existing destination.
+// A destination already held by another collect must fail clearly instead of
+// silently overwriting it.
+func TestCopyPathLocksDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.WriteFile(src, []byte("NEW"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "dst")
+	if err := os.WriteFile(dst, []byte("OLD"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := lockDestination(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	err = copyPath(context.Background(), src, dst)
+	if err == nil || !strings.Contains(err.Error(), "already being collected") {
+		t.Fatalf("err = %v, want a destination-in-use error", err)
+	}
+	if got := readFile(t, dst); got != "OLD" {
+		t.Fatalf("locked destination changed: %q", got)
+	}
+}
+
 func TestCopyTreeAtomicOnFailure(t *testing.T) {
 	base := t.TempDir()
 	src := filepath.Join(base, "src")

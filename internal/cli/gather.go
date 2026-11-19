@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -45,7 +47,9 @@ With --collect, each operation is applied to every finished blip. Operations
 are the same as the collect syntax, and {name} is replaced with the blip's
 short name, so "git:/work/repo:{name}" gives each blip its own branch. A git
 operation fetches commits only; uncommitted and untracked changes are not
-collected, and a warning is printed when a worktree has them.
+collected, and a warning is printed when a worktree has them. Two operations
+that expand to the same destination are rejected instead of overwriting each
+other; {name} keeps each blip's destination distinct.
 
 A blip whose command failed, or whose results could not be collected, is kept
 for inspection; its TTL (1h for forks by default) still deletes it. Successful
@@ -141,12 +145,60 @@ func (a *app) gather(ctx context.Context, names []string, f *gatherFlags) error 
 		followWG.Wait()
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Name < done[j].Name })
+	if err := a.checkCollectDestinations(done, f.collect); err != nil {
+		// Do not collect or delete anything: the user cannot tell whose data
+		// would survive.
+		errs = append(errs, err)
+		return errors.Join(errs...)
+	}
 	for _, b := range done {
 		if err := a.gatherOne(ctx, c, b, f); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// checkCollectDestinations rejects a gather whose expanded operations would
+// copy two blips to the same path. {name} makes each destination unique.
+func (a *app) checkCollectDestinations(done []*v1alpha1.Blip, raw []string) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	type use struct {
+		blip, source string
+	}
+	seen := map[string]use{}
+	for _, b := range done {
+		ops := make([]string, len(raw))
+		for i, op := range raw {
+			ops[i] = strings.ReplaceAll(op, "{name}", a.short(b.Name))
+		}
+		parsed, err := parseCollectOps(ops, cwd)
+		if err != nil {
+			// The per-blip collect reports parse errors with its name.
+			continue
+		}
+		for _, op := range parsed {
+			if op.git {
+				continue
+			}
+			dst, err := filepath.Abs(op.dest)
+			if err != nil {
+				dst = op.dest
+			}
+			dst = filepath.Clean(dst)
+			if prev, ok := seen[dst]; ok {
+				return fmt.Errorf("collect destination %s is the same for blip %s (%s) and blip %s (%s); add {name} or give each blip a distinct DEST", dst, prev.blip, prev.source, a.short(b.Name), op.source)
+			}
+			seen[dst] = use{blip: a.short(b.Name), source: op.source}
+		}
+	}
+	return nil
 }
 
 // gatherTargets resolves the blips named on the command line and the ones that

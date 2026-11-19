@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +33,11 @@ func copyPath(ctx context.Context, src, dst string) error {
 		if err := checkDestParents(dst); err != nil {
 			return err
 		}
+		unlock, err := lockDestination(dst)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		return copyTree(ctx, src, dst, info)
 	}
 	if di, err := os.Stat(dst); err == nil && di.IsDir() {
@@ -46,7 +53,50 @@ func copyPath(ctx context.Context, src, dst string) error {
 	if err := checkDestParents(dst); err != nil {
 		return err
 	}
+	unlock, err := lockDestination(dst)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return copyEntry(ctx, src, dst, info)
+}
+
+// lockDestination takes a non-blocking exclusive lock keyed by the resolved
+// destination, so two gathers writing the same path fail loudly instead of
+// racing to overwrite each other.
+func lockDestination(dst string) (func(), error) {
+	key, err := resolvePath(dst)
+	if err != nil {
+		key, err = filepath.Abs(dst)
+		if err != nil {
+			return nil, err
+		}
+	}
+	sum := sha256.Sum256([]byte(key))
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("blip-collect-locks-%d", os.Getuid()))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, hex.EncodeToString(sum[:])), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, fmt.Errorf("destination %s is already being collected by another gather; wait for it to finish or use a distinct destination", dst)
+		}
+		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+			// Not every filesystem supports flock. Collection still works;
+			// atomic replacement avoids mixed output.
+			return func() {}, nil
+		}
+		return nil, fmt.Errorf("lock destination %s: %w", dst, err)
+	}
+	return func() {
+		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 // sameFile reports whether src and dst are the same existing file, including
