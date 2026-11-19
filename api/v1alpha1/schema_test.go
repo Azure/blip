@@ -369,6 +369,12 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 		"/etc/passwd",
 		"/etc/passwd/x",
 		"/etc/hosts",
+		// /lib is the usr-merge alias of /usr/lib, so this is the image
+		// file /usr/lib/os-release under another spelling.
+		"/usr/lib/os-release",
+		"/usr/lib/os-release/x",
+		"/lib/os-release",
+		"/lib/os-release/x",
 	} {
 		if errs := validate(object(p), ""); len(errs) == 0 {
 			t.Errorf("admission accepted mount path no guest can create (%d bytes): %q", len(p), p)
