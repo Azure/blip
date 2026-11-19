@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"strings"
@@ -100,6 +101,14 @@ func (c *Chat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if n := utf8.RuneCountInString(user); n > maxUserRunes {
 		http.Error(w, fmt.Sprintf("X-Forwarded-User is too long: %d characters, limit %d", n, maxUserRunes), http.StatusBadRequest)
+		return
+	}
+	// The body is JSON. Requiring the JSON media type also restores the
+	// browser's cross-origin barrier: a form or text/plain "simple"
+	// request is not parsed, and a cross-origin JSON fetch needs a CORS
+	// preflight that this server does not answer.
+	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mediaType != "application/json" {
+		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 		return
 	}
 	var req chatRequest

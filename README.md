@@ -258,10 +258,13 @@ restricts which namespaces each user may reach (a NetworkPolicy or an
 authenticating proxy). Do not expose the Service directly. Requests with zero
 or multiple `X-Forwarded-User` headers are rejected.
 
-The chat endpoint accepts at most 1 MiB of JSON, an 8000-character message, 40
-history messages, and 32000 characters of total history; larger requests get
-`400`. The HTTP server bounds read, write, and idle time and closes unused
-keep-alive connections, so a slow client cannot pin a handler. Chat inspection
+The chat endpoint requires `Content-Type: application/json` and answers `415`
+otherwise; form and `text/plain` bodies are not parsed. A cross-origin JSON
+fetch therefore needs a CORS preflight, which the chat endpoint does not
+answer. The chat endpoint accepts at most 1 MiB of JSON, an 8000-character
+message, 40 history messages, and 32000 characters of total history; larger
+requests get `400`. The HTTP server bounds read, write, and idle time and closes
+unused keep-alive connections, so a slow client cannot pin a handler. Chat inspection
 is read-only:
 running blips accept a small allowlist (`git status|log|diff|show`, `ls`,
 `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `pwd`) and finished blips

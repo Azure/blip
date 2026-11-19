@@ -62,6 +62,7 @@ func TestChatDoesNotReflectBodyErrors(t *testing.T) {
 			s := &Server{Client: testClient(t, testThread())}
 			req := httptest.NewRequest(http.MethodPost, "/chat?namespace=ns", nil)
 			req.Header.Set("X-Forwarded-User", "alice")
+			req.Header.Set("Content-Type", "application/json")
 			req.Body = io.NopCloser(tt.body)
 			rec := httptest.NewRecorder()
 			(&Chat{Server: s}).ServeHTTP(rec, req)

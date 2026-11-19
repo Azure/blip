@@ -24,6 +24,7 @@ func chatRequestFor(t *testing.T, c client.Client, upstream *httptest.Server, us
 	}
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("X-Forwarded-User", user)
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	(&Chat{Server: s}).ServeHTTP(rec, req)
 	return rec

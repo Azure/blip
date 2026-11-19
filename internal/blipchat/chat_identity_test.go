@@ -80,6 +80,7 @@ func TestChatValidatesForwardedUserLength(t *testing.T) {
 			s := &Server{Client: c, Config: Config{Model: "test"}, LLM: &LLM{BaseURL: upstream.URL, HTTP: upstream.Client()}}
 			req := httptest.NewRequest(http.MethodPost, "/chat?namespace=ns", strings.NewReader(`{"thread":"proj","message":"hi"}`))
 			req.Header["X-Forwarded-User"] = []string{tt.user}
+			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
 			(&Chat{Server: s}).ServeHTTP(rec, req)
 			if rec.Code != tt.want {

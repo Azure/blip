@@ -846,6 +846,7 @@ func TestChatSendCreatesUserTurn(t *testing.T) {
 	body := `{"thread":"proj","message":"can you add tests?"}`
 	req := httptest.NewRequest(http.MethodPost, "/chat?namespace=ns", strings.NewReader(body))
 	req.Header.Set("X-Forwarded-User", "bob@example.com")
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	(&Chat{Server: s}).ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
