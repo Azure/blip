@@ -272,13 +272,42 @@ func (g *Guest) procEnv(acct *account, s procSpec, base []string) []string {
 		noProxy = append(noProxy, "kube-apiserver")
 	}
 	noProxy = append(noProxy, g.endpoints...)
-	base = append([]string{
-		"NO_PROXY=" + strings.Join(noProxy, ","),
-		"no_proxy=" + strings.Join(noProxy, ","),
-	}, base...)
 	// Reserved variables are applied after every caller-supplied list, so an
-	// exec caller's -e (s.env) cannot redirect a guest-owned service.
-	return mergeEnv(env, base, s.env, reservedEnv())
+	// exec caller's -e (s.env) cannot redirect a guest-owned service or drop
+	// the guest-local proxy bypass.
+	return mergeEnv(env, base, s.env, reservedEnv(), proxyEnv(noProxy, base, s.env))
+}
+
+// proxyEnv merges the guest-local names with a workload's NO_PROXY/no_proxy
+// and returns both spellings applied after every caller-supplied list, so a
+// workload proxy setting can add bypasses but can never proxy blip or
+// kube-apiserver. Go reads NO_PROXY while other tools merge both spellings;
+// keeping them identical avoids the two disagreeing inside one shell.
+func proxyEnv(reserved []string, lists ...[]string) []string {
+	var names []string
+	seen := map[string]bool{}
+	add := func(value string) {
+		for _, name := range strings.Split(value, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	for _, name := range reserved {
+		add(name)
+	}
+	for _, list := range lists {
+		for _, kv := range list {
+			if key, value, ok := strings.Cut(kv, "="); ok && (key == "NO_PROXY" || key == "no_proxy") {
+				add(value)
+			}
+		}
+	}
+	merged := strings.Join(names, ",")
+	return []string{"NO_PROXY=" + merged, "no_proxy=" + merged}
 }
 
 // reservedEnv is the environment the guest owns. Callers, including exec -e,

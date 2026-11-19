@@ -152,8 +152,11 @@ func TestProcEnvNoProxy(t *testing.T) {
 		{"kubernetes", &Guest{kubeNamespace: "sandbox"}, nil, nil, [2]string{"blip,kube-apiserver", "blip,kube-apiserver"}},
 		{"endpoints", &Guest{endpoints: []string{"api.default", "db.default"}}, nil, nil, [2]string{"blip,api.default,db.default", "blip,api.default,db.default"}},
 		{"all", &Guest{kubeNamespace: "sandbox", endpoints: []string{"api.default"}}, nil, nil, [2]string{"blip,kube-apiserver,api.default", "blip,kube-apiserver,api.default"}},
-		{"claim override", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=corp.example"}, nil, [2]string{"corp.example", "blip,kube-apiserver"}},
-		{"session override", &Guest{kubeNamespace: "sandbox"}, nil, []string{"no_proxy=corp.example"}, [2]string{"blip,kube-apiserver", "corp.example"}},
+		{"claim override", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=corp.example"}, nil, [2]string{"blip,kube-apiserver,corp.example", "blip,kube-apiserver,corp.example"}},
+		{"session override", &Guest{kubeNamespace: "sandbox"}, nil, []string{"no_proxy=corp.example"}, [2]string{"blip,kube-apiserver,corp.example", "blip,kube-apiserver,corp.example"}},
+		{"both spellings merge", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=claim.example"}, []string{"no_proxy=session.example"}, [2]string{"blip,kube-apiserver,claim.example,session.example", "blip,kube-apiserver,claim.example,session.example"}},
+		{"duplicates and spaces", &Guest{kubeNamespace: "sandbox", endpoints: []string{"api.default"}}, []string{"NO_PROXY= blip, ,corp.example ,api.default"}, nil, [2]string{"blip,kube-apiserver,api.default,corp.example", "blip,kube-apiserver,api.default,corp.example"}},
+		{"explicit empty keeps guest names", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY="}, []string{"no_proxy="}, [2]string{"blip,kube-apiserver", "blip,kube-apiserver"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := tc.g.procEnv(acct, procSpec{env: tc.session}, tc.base)
