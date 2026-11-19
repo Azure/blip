@@ -79,7 +79,7 @@ they finish, so an abandoned fork cannot leak its workspace.`,
 	fl.StringVar(&f.name, "name", "", "blip name (default <caller>-<random>)")
 	fl.StringVar(&f.from, "from", "", "copy workspace SRC into a new one (inside a blip, / is the caller's root)")
 	fl.StringVar(&f.state, "state", "", "run in existing workspace WS")
-	fl.StringVar(&f.pool, "pool", "", "VM pool (default \"default\")")
+	fl.StringVar(&f.pool, "pool", "", "VM pool (default \"default\"; inside a blip, the caller's pool)")
 	fl.StringVarP(&f.workdir, "workdir", "w", "", "working directory (inside a blip, the current directory)")
 	fl.StringVarP(&f.user, "user", "u", "", "user name or uid")
 	fl.StringArrayVarP(&f.env, "env", "e", nil, "environment variable KEY=VALUE (repeatable)")

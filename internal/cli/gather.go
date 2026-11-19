@@ -50,6 +50,8 @@ operation fetches commits only; uncommitted and untracked changes are not
 collected, and a warning is printed when a worktree has them. Two operations
 that expand to the same destination are rejected instead of overwriting each
 other; {name} keeps each blip's destination distinct.
+--collect only works inside a blip, because it copies into the caller's
+workspace; use --keep and collect with kubectl elsewhere.
 
 A blip whose command failed, or whose results could not be collected, is kept
 for inspection; its TTL (1h for forks by default) still deletes it. Successful
@@ -66,8 +68,8 @@ blips are deleted with their workspaces.`,
 	}
 	fl := cmd.Flags()
 	fl.StringVarP(&f.selector, "selector", "l", "", "label selector of blips to gather")
-	fl.StringArrayVar(&f.collect, "collect", nil, "copy out of each blip: SRC:DEST (split at the last ':') or git:SRC:BRANCH (commits only; {name} is the blip's name; repeatable)")
-	fl.BoolVar(&f.any, "any", false, "return as soon as one blip finishes")
+	fl.StringArrayVar(&f.collect, "collect", nil, "copy out of each blip: SRC:DEST (split at the last ':') or git:SRC:BRANCH (inside a blip only; commits only; {name} is the blip's name; repeatable)")
+	fl.BoolVar(&f.any, "any", false, "return as soon as one blip finishes or cannot be observed")
 	fl.DurationVar(&f.wait, "wait", 0, "give up waiting after this long (0 waits forever)")
 	fl.BoolVarP(&f.follow, "follow", "f", false, "stream the output of blips while they run")
 	fl.BoolVar(&f.keep, "keep", false, "keep the blips and their workspaces")
