@@ -97,6 +97,93 @@ func TestPoolScaling(t *testing.T) {
 	}
 }
 
+// TestPoolReapsTerminatedClaimedPods covers a finished claimed VM whose Blip
+// is stuck: the pod must stop consuming maxCount so the pool can boot the next
+// VM, and it must be deleted once its exit status is recorded.
+func TestPoolReapsTerminatedClaimedPods(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 1)
+
+	e.newBlip("stuck")
+	e.setBlipStatus("stuck", func(b *v1.Blip) { b.Status.Phase = v1.BlipSaving })
+	stuck := e.getBlip("stuck")
+	stuck.Finalizers = []string{v1.Finalizer}
+	e.must(e.c.Update(e.ctx, stuck))
+	e.must(e.c.Delete(e.ctx, stuck))
+	stuck = e.getBlip("stuck")
+	e.pendingBlip("next", e.withImage("reg/img:v1"))
+
+	pool := e.getPool("default")
+	done := e.pool.podFor(pool, "default-done")
+	done.Spec.NodeName = "n1"
+	done.Labels[v1.LabelBlipUID] = string(stuck.UID)
+	done.Status.Phase = corev1.PodSucceeded
+	e.create(done)
+
+	e.run(e.pool, ns, "default")
+	if !e.podGone(done.Name) {
+		t.Errorf("captured terminated claimed pod %s not reaped", done.Name)
+	}
+	if n := len(e.pods()); n != 1 {
+		t.Errorf("%d pods, want the replacement VM for the waiting Blip", n)
+	}
+	if got := e.getPool("default").Status.Claimed; got != 0 {
+		t.Errorf("terminated pod counted as claimed: %d", got)
+	}
+}
+
+// TestPoolDoesNotReapBeforeStatusCapture keeps a terminated claimed pod whose
+// Blip is still Running, so its exit status and output can be copied, but no
+// longer counts it against maxCount.
+func TestPoolDoesNotReapBeforeStatusCapture(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 0, 1)
+
+	e.newBlip("live")
+	e.setBlipStatus("live", func(b *v1.Blip) {
+		b.Status.Phase = v1.BlipRunning
+		b.Status.Pod = "default-live"
+	})
+	live := e.getBlip("live")
+	e.pendingBlip("next", e.withImage("reg/img:v1"))
+
+	pool := e.getPool("default")
+	done := e.pool.podFor(pool, "default-live")
+	done.Spec.NodeName = "n1"
+	done.Labels[v1.LabelBlipUID] = string(live.UID)
+	done.Status.Phase = corev1.PodSucceeded
+	done.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: podapi.VMContainer,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			FinishedAt: metav1.NewTime(e.now),
+		}},
+	}}
+	e.create(done)
+
+	e.run(e.pool, ns, "default")
+	if e.podGone(done.Name) {
+		t.Fatal("pod reaped before its Blip captured the exit status")
+	}
+	if n := len(e.pods()); n != 2 {
+		t.Fatalf("%d pods, want the terminated pod kept and a replacement booted", n)
+	}
+
+	e.setBlipStatus("live", func(b *v1.Blip) { b.Status.Phase = v1.BlipSaving })
+	e.run(e.pool, ns, "default")
+	if e.podGone(done.Name) {
+		t.Fatal("pod reaped before podReapGrace after its Blip captured the exit status")
+	}
+
+	e.now = e.now.Add(podReapGrace + time.Second)
+	e.heartbeat()
+	e.run(e.pool, ns, "default")
+	if !e.podGone(done.Name) {
+		t.Fatal("pod not reaped after podReapGrace")
+	}
+}
+
 func TestPoolAvoidsDrainingNodes(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2")
