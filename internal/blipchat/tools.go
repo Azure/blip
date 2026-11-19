@@ -53,13 +53,13 @@ func (s *step) tools() []Tool {
 		FunctionTool("task_create", "Create a task on the project board. Ids are short and DNS-safe.", schema(props(
 			map[string]any{"id": str("Task id, lowercase letters, digits and dashes, at most 16 characters")},
 			map[string]any{"title": str("Human-readable title")},
-			map[string]any{"attributes": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "Free-form task fields"}},
+			map[string]any{"attributes": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "Free-form task fields, at most 16 attributes"}},
 			map[string]any{"note": str("Short note")},
 		), "id")),
 		FunctionTool("task_update", "Change a task. Omitted fields are unchanged; an attribute set to an empty string is deleted.", schema(props(
 			map[string]any{"id": str("Task id")},
 			map[string]any{"title": str("New title")},
-			map[string]any{"attributes": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "Attribute changes to merge"}},
+			map[string]any{"attributes": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "Attribute changes to merge; the task may have at most 16 attributes"}},
 			map[string]any{"note": str("New note")},
 			map[string]any{"open": map[string]any{"type": "boolean", "description": "Whether the task is open"}},
 		), "id")),
@@ -120,6 +120,15 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 				return "", fmt.Errorf("task %q already exists", id)
 			}
 		}
+		attrs := map[string]string{}
+		if raw, ok := args["attributes"].(map[string]any); ok {
+			for k, v := range raw {
+				attrs[k] = fmt.Sprint(v)
+			}
+		}
+		if len(attrs) > maxTaskAttributes {
+			return "", fmt.Errorf("task %q has %d attributes; the maximum is %d", id, len(attrs), maxTaskAttributes)
+		}
 		if len(s.tasks) >= taskBoardLimit {
 			// The create cap equals the default retention cap, so without
 			// evicting here a board of recently closed tasks would reject
@@ -128,12 +137,6 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 			// never touch open work.
 			if !s.evictOldestClosed() {
 				return "", fmt.Errorf("task board is full")
-			}
-		}
-		attrs := map[string]string{}
-		if raw, ok := args["attributes"].(map[string]any); ok {
-			for k, v := range raw {
-				attrs[k] = fmt.Sprint(v)
 			}
 		}
 		s.tasks = append(s.tasks, v1.ThreadTask{ID: id, Title: truncateRunes(strArg("title"), 120), Open: true, Attributes: cleanAttributes(attrs), Note: truncateRunes(strArg("note"), 256), Updated: nowTime()})
@@ -168,8 +171,8 @@ func (s *step) call(ctx context.Context, name, arguments string) (string, error)
 				}
 				merged[key] = truncateRunes(fmt.Sprint(value), 256)
 			}
-			if len(merged) > 16 {
-				return "", fmt.Errorf("task %q would have %d attributes; the maximum is 16", t.ID, len(merged))
+			if len(merged) > maxTaskAttributes {
+				return "", fmt.Errorf("task %q would have %d attributes; the maximum is %d", t.ID, len(merged), maxTaskAttributes)
 			}
 			attrs = merged
 		}
@@ -270,6 +273,9 @@ func (s *step) task(id string) *v1.ThreadTask {
 
 // taskBoardLimit is the CRD's MaxItems for thread.status.tasks.
 const taskBoardLimit = 200
+
+// maxTaskAttributes is the CRD's MaxProperties for task attributes.
+const maxTaskAttributes = 16
 
 // evictOldestClosed drops the closed task prune would remove first. It
 // reports false when every task is open.
