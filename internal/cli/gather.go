@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -339,6 +340,11 @@ func (a *app) follow(ctx context.Context, name string) {
 	s, err := a.openRetrying(ctx, name, pod, wire.Open{Mode: wire.OpenAttach, Session: wire.PrimarySession, Follow: true}, true)
 	if err != nil {
 		if v1alpha1.Finished(b) && ctx.Err() == nil {
+			// The replay ring died with the VM. The guest still mirrored the
+			// command to the serial console, which the pod keeps as its log.
+			if a.replayLogs(ctx, pod, short) {
+				return
+			}
 			a.progress("%s: output is no longer available: %v", short, err)
 		}
 		return
@@ -349,6 +355,34 @@ func (a *app) follow(ctx context.Context, name string) {
 	_, _ = s.Copy(out, errw, func(m string) { a.progress("%s: %s", short, m) })
 	out.flush()
 	errw.flush()
+	if !out.wrote && !errw.wrote && v1alpha1.Finished(b) {
+		a.replayLogs(ctx, pod, short)
+	}
+}
+
+// replayLogs prints the command output preserved on the VM serial console.
+// The guest prefixes mirrored output with "blip: ", which separates it from
+// kernel and runtime boot messages. It returns whether it printed anything.
+func (a *app) replayLogs(ctx context.Context, pod, short string) bool {
+	c, err := a.clients()
+	if err != nil || c.Logs == nil {
+		return false
+	}
+	rc, err := c.Logs(ctx, pod)
+	if err != nil {
+		return false
+	}
+	defer rc.Close()
+	w := &prefixWriter{out: a.env.Out, prefix: short + "|"}
+	sc := bufio.NewScanner(rc)
+	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	for sc.Scan() {
+		if line, ok := strings.CutPrefix(sc.Text(), "blip: "); ok {
+			_, _ = w.Write([]byte(line + "\n"))
+		}
+	}
+	w.flush()
+	return w.wrote
 }
 
 // prefixWriter turns arbitrary output chunks into whole prefixed lines. Each
@@ -358,6 +392,7 @@ type prefixWriter struct {
 	out    io.Writer
 	prefix string
 	buf    []byte
+	wrote  bool
 }
 
 const prefixLineMax = 64 << 10
@@ -381,6 +416,7 @@ func (w *prefixWriter) Write(p []byte) (int, error) {
 
 func (w *prefixWriter) emit(line []byte) {
 	fmt.Fprintf(w.out, "%s %s\n", w.prefix, strings.TrimSuffix(string(line), "\r"))
+	w.wrote = true
 }
 
 func (w *prefixWriter) flush() {

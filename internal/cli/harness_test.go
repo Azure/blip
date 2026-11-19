@@ -33,6 +33,8 @@ type harness struct {
 	// connect overrides the fake guest connector when set, so tests can
 	// inject transport failures.
 	connect session.Connector
+	// logs overrides the VM serial-console reader.
+	logs func(context.Context, string) (io.ReadCloser, error)
 	// self is the blip the CLI runs in, if any.
 	self string
 }
@@ -96,7 +98,7 @@ func (h *harness) env(in io.Reader, out, errOut io.Writer) *Env {
 		connect = h.connect
 	}
 	env := &Env{In: in, Out: out, Err: errOut, Connect: func(KubeFlags) (*Clients, error) {
-		return &Clients{Kube: h.kube, Sessions: &session.Client{Connect: connect}, Namespace: ns}, nil
+		return &Clients{Kube: h.kube, Sessions: &session.Client{Connect: connect}, Namespace: ns, Logs: h.logs}, nil
 	}}
 	if h.self != "" {
 		env.NamespaceFile = filepath.Join(h.t.TempDir(), "namespace")

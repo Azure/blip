@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -188,6 +189,25 @@ func TestGatherFollowReplaysFastFinishedBlip(t *testing.T) {
 	if len(opens) != 1 || opens[0].Open.Mode != wire.OpenAttach ||
 		opens[0].Open.Session != wire.PrimarySession || !opens[0].Open.Follow {
 		t.Fatalf("opens = %+v", opens)
+	}
+}
+
+// A finished VM cannot accept a session attach. Its serial console keeps the
+// command's mirrored output, so -f must fall back to the pod log instead of
+// reporting that output is gone.
+func TestGatherFollowReplaysSerialLogWhenSessionIsGone(t *testing.T) {
+	h := newHarness(t, finishedBlip("fastlog", v1alpha1.BlipSucceeded, 0))
+	h.guest.OpenError = "no session"
+	h.logs = func(context.Context, string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("[ 1.0] boot\nblip: FASTOUT\nblip: LASTLINE\nblip-guest: done\n")), nil
+	}
+	code, out, errOut := h.run("", "gather", "fastlog", "--follow")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	mustContain(t, out, "fastlog| FASTOUT", "fastlog| LASTLINE", "blip/fastlog Succeeded (exit 0)")
+	if strings.Contains(out, "boot") || strings.Contains(out, "blip-guest") {
+		t.Fatalf("serial noise leaked into output: %q", out)
 	}
 }
 

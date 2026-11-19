@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,6 +54,10 @@ type Clients struct {
 	Kube      client.WithWatch
 	Sessions  *session.Client
 	Namespace string
+	// Logs streams the serial console of a VM pod. It is the fallback for
+	// a command that finished before a follower could attach to its replay
+	// ring.
+	Logs func(context.Context, string) (io.ReadCloser, error)
 }
 
 // ExitError makes the process exit with Code without printing anything.
@@ -99,7 +105,14 @@ func connect(f KubeFlags) (*Clients, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Clients{Kube: kube, Sessions: sessions, Namespace: ns}, nil
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	logs := func(ctx context.Context, pod string) (io.ReadCloser, error) {
+		return clientset.CoreV1().Pods(ns).GetLogs(pod, &corev1.PodLogOptions{Container: "vm"}).Stream(ctx)
+	}
+	return &Clients{Kube: kube, Sessions: sessions, Namespace: ns, Logs: logs}, nil
 }
 
 type app struct {
