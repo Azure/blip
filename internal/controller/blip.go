@@ -45,6 +45,7 @@ const (
 	ReasonError         = "Error"
 	ReasonPodLost       = "PodLost"
 	ReasonRuntimeFailed = "RuntimeFailed"
+	ReasonNetworkFailed = "NetworkFailed"
 	ReasonSaveFailed    = "SaveFailed"
 )
 
@@ -969,6 +970,13 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip) (reconcile.Res
 				return reconcile.Result{RequeueAfter: retryAfter}, nil
 			}
 			b.Status.Reason = ""
+			// A live policy that fails to compile is replaced with default
+			// deny. The node records the cause on the pod; surface it so a
+			// Running Blip does not look healthy while all egress is blocked.
+			if perr := pod.Annotations[v1.AnnotationPrepareError]; strings.HasPrefix(perr, "network policy:") {
+				b.Status.Reason = ReasonNetworkFailed
+				b.Status.Message = perr
+			}
 			if err := r.syncMounts(ctx, b, mounts, pod, &obs); err != nil {
 				return reconcile.Result{}, err
 			}
