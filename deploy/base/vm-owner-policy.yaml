@@ -7,7 +7,7 @@
 #   bases: <states>                space-separated shared, ownerless image states
 # A caller authenticated with a pod-bound token of a VM service account may
 # only connect to pods with `blip-runtime bridge 1025` in container vm (a blip
-# session; no other exec, attach, or port-forward). A restricted owner may
+# session; no other exec, attach, proxy, or port-forward). A restricted owner may
 # only do so into VM pods of the same owner, and may only create, change,
 # and delete blips and states named "<owner>.<name>" and labelled
 # blip.dev/owner=<owner> (before and after the change) that reference only
@@ -39,7 +39,7 @@ spec:
         operations: [CREATE, UPDATE, DELETE]
       - apiGroups: [""]
         apiVersions: [v1]
-        resources: [pods/exec, pods/attach, pods/portforward]
+        resources: [pods/exec, pods/attach, pods/portforward, pods/proxy]
         operations: [CONNECT]
   matchConditions:
     - name: pod-bound-service-account-token
@@ -228,5 +228,5 @@ spec:
     resourceRules:
       - apiGroups: [""]
         apiVersions: [v1]
-        resources: [pods/exec, pods/attach, pods/portforward]
+        resources: [pods/exec, pods/attach, pods/portforward, pods/proxy]
         operations: [CONNECT]

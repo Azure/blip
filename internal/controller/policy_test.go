@@ -325,7 +325,7 @@ func (p policyRequest) evaluate(t *testing.T, v validating.Validator, params map
 		if obj == nil {
 			obj = sessionExec()
 		}
-		gvk.Kind = map[string]string{"exec": "PodExecOptions", "attach": "PodAttachOptions", "portforward": "PodPortForwardOptions"}[sub]
+		gvk.Kind = map[string]string{"exec": "PodExecOptions", "attach": "PodAttachOptions", "portforward": "PodPortForwardOptions", "proxy": "PodProxyOptions"}[sub]
 	}
 	attrs := admission.NewAttributesRecord(obj, old, gvk, ns, p.name, gvr, sub, p.op, nil, false, p.user)
 	versioned := &admission.VersionedAttributes{Attributes: attrs, VersionedKind: gvk, VersionedObject: obj, VersionedOldObject: old}
@@ -450,6 +450,8 @@ func TestVMOwnerPolicy(t *testing.T) {
 		{"unrestricted shell", policyRequest{user: admin, op: admission.Connect, resource: "pods/exec", name: "default-other", connect: shell}, false, "blip sessions"},
 		{"attach own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/attach", name: "default-mine", connect: &corev1.PodAttachOptions{Container: "vm", Stdin: true}}, false, "blip sessions"},
 		{"unrestricted port-forward", policyRequest{user: admin, op: admission.Connect, resource: "pods/portforward", name: "default-other", connect: &corev1.PodPortForwardOptions{Ports: []int32{22}}}, false, "blip sessions"},
+		{"proxy to own pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/proxy", name: "default-mine", connect: &corev1.PodProxyOptions{Path: "/"}}, false, "blip sessions"},
+		{"unrestricted proxy", policyRequest{user: admin, op: admission.Connect, resource: "pods/proxy", name: "default-other", connect: &corev1.PodProxyOptions{Path: "/"}}, false, "blip sessions"},
 		{"attach other's pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/attach", name: "default-other", connect: &corev1.PodAttachOptions{Container: "vm"}}, false, "blip sessions"},
 		{"exec other's pod", policyRequest{user: other, op: admission.Connect, resource: "pods/exec", name: "default-mine"}, false, "connect"},
 		{"exec unrestricted pod", policyRequest{user: mine, op: admission.Connect, resource: "pods/exec", name: "default-admin"}, false, "connect"},
