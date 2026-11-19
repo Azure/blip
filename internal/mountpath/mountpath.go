@@ -17,6 +17,30 @@ const CollectRoot = "/run/blip-collect"
 // must not be at, below, or above one of them.
 var Reserved = []string{"/proc", "/sys", "/dev", "/run/blip", CollectRoot}
 
+// Aliases are directory symlinks commonly present in the base image. The guest
+// resolves them before it checks a mount target, so the preflight must resolve
+// them too: /var/run/blip/x reaches the reserved /run/blip/x even though the
+// spelling is not lexically reserved. Only well-known system aliases belong
+// here; image-specific symlinks cannot be known offline.
+var Aliases = []struct{ Path, Target string }{
+	{"/var/run", "/run"},
+	{"/var/lock", "/run/lock"},
+}
+
+// resolveAlias rewrites a path whose first component is a known alias. It does
+// not resolve image-specific symlinks, which only the guest can see.
+func resolveAlias(p string) string {
+	for _, a := range Aliases {
+		if p == a.Path {
+			return a.Target
+		}
+		if strings.HasPrefix(p, a.Path+"/") {
+			return a.Target + strings.TrimPrefix(p, a.Path)
+		}
+	}
+	return p
+}
+
 const (
 	// NameMax is the maximum length in bytes of one Linux path component.
 	NameMax = 255
@@ -85,13 +109,27 @@ func ValidateLength(p string) error {
 }
 
 // Validate reports why p cannot be a guest mount point. It is a lexical
-// preflight: the guest additionally resolves symlinks inside the root, so an
-// image directory alias can still be accepted here without an image-specific
-// list of symlinks.
+// preflight: image-specific symlinks can only be resolved inside the root, so
+// they may still be accepted here. Known system aliases such as /var/run are
+// resolved first, and the target is checked against the same rules, because
+// the guest follows those symlinks before it validates the mount target.
 func Validate(p string) error {
 	if err := ValidateLength(p); err != nil {
 		return err
 	}
+	if err := validatePath(p); err != nil {
+		return err
+	}
+	if target := resolveAlias(p); target != p {
+		if err := validatePath(target); err != nil {
+			return fmt.Errorf("mount path %s resolves to %s: %w", p, target, err)
+		}
+	}
+	return nil
+}
+
+// validatePath applies the reserved and non-directory file rules to one path.
+func validatePath(p string) error {
 	for _, r := range Reserved {
 		if Overlap(p, r) {
 			return fmt.Errorf("mount path %s overlaps %s, which the guest reserves", p, r)

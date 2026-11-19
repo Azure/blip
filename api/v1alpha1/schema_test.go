@@ -311,6 +311,9 @@ func TestMountPathAdmissionLimits(t *testing.T) {
 		"/run/blip/x",
 		"/run/blip-collect",
 		"/run/blip-collect/data/deep",
+		// /var/run is the standard image alias of /run.
+		"/var/run",
+		"/var/run/blip/x",
 		"/etc/passwd",
 		"/etc/passwd/x",
 		"/etc/hosts",

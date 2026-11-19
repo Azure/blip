@@ -1496,7 +1496,7 @@ func TestMountPathsMayContainColons(t *testing.T) {
 // must be rejected before desired intent is written, or the root cannot start
 // again.
 func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
-	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/run/blip-collect/w2", "/etc/mtab/x"} {
+	for _, path := range []string{"/proc/w2", "/sys", "/dev/w2", "/run/blip/w2", "/run/blip-collect/w2", "/var/run/blip/w2", "/var/run", "/etc/mtab/x"} {
 		t.Run(path, func(t *testing.T) {
 			h := newHarness(t, readyState("home"), readyState("data"))
 			code, _, errOut := h.run("", "mount", "data:"+path, "--root", "home")
@@ -1517,6 +1517,20 @@ func TestMountRejectsGuestReservedAndSymlinkPaths(t *testing.T) {
 	}
 	if !stateNotFound(t, h, "reserved") {
 		t.Fatal("rejected --new left state reserved behind")
+	}
+
+	// A known system alias that resolves into a reserved tree must be
+	// rejected offline before desired intent or a --new state is written.
+	h = newHarness(t, readyState("home"))
+	code, _, errOut = h.run("", "mount", "--new", "aliased:/var/run/blip/w2", "--root", "home")
+	if code != 1 || !strings.Contains(errOut, "mount path") {
+		t.Fatalf("aliased --new code %d: %s", code, errOut)
+	}
+	if !stateNotFound(t, h, "aliased") {
+		t.Fatal("rejected aliased --new left state aliased behind")
+	}
+	if mounts := h.state("home").Spec.Mounts; len(mounts) != 0 {
+		t.Fatalf("rejected aliased --new left desired intent: %+v", mounts)
 	}
 
 	// Prefix-sharing non-overlapping paths stay legal.

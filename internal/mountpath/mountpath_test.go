@@ -33,6 +33,16 @@ func TestValidate(t *testing.T) {
 		{"/etc/mtab/x", false},
 		{"/etc/os-release/x", false},
 		{"/etc/hostname", false},
+		// /var/run is the standard alias of /run, so a path below it that
+		// resolves into a reserved tree must be rejected offline. The alias
+		// itself resolves to /run, an ancestor of /run/blip, and the legal
+		// sibling /var/run/x still resolves to an unreserved directory.
+		{"/var/run/blip", false},
+		{"/var/run/blip/x", false},
+		{"/var/run/blip-collect/x", false},
+		{"/var/run", false},
+		{"/var/lock", true},
+		{"/var/lock/x", true},
 		{"/run/data", true},
 		{"/run/blip-collector", true},
 		{"/procdata", true},

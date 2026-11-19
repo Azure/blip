@@ -136,7 +136,8 @@ spec:
                         rule: '!self.matches(''[\\x00-\\x1f\\x7f]'')'
                       - message: path must not be at, below, or above a guest-reserved
                           path, except a temporary collect mount
-                        rule: '![''/proc'', ''/sys'', ''/dev'', ''/run/blip'', ''/run/blip-collect''].exists(r,
+                        rule: '![''/proc'', ''/sys'', ''/dev'', ''/run/blip'', ''/run/blip-collect'',
+                          ''/var/run/blip'', ''/var/run/blip-collect''].exists(r,
                           self == r || self.startsWith(r + ''/'') || r.startsWith(self
                           + ''/'')) || (self.startsWith(''/run/blip-collect/'') &&
                           self.split(''/'').size() == 4)'
