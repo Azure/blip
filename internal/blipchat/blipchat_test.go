@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -368,6 +369,148 @@ func TestSequencerFailedWritesDoNotAdvanceLastSeq(t *testing.T) {
 	}
 	if turn.Status.Seq != 0 {
 		t.Errorf("turn seq = %d, want 0", turn.Status.Seq)
+	}
+}
+
+// Two sequencer processes have independent per-thread mutexes. Even if both
+// read lastSeq before either publishes, the counter CAS must give them
+// different numbers; otherwise two turns can share a seq and one can be
+// skipped after consumedSeq advances past it.
+func TestConcurrentSequencersCannotAssignDuplicateSeq(t *testing.T) {
+	thread := testThread()
+	thread.UID = types.UID("thread-uid")
+	one, two := testTurn("one", "proj"), testTurn("two", "proj")
+
+	// Hold both turn writes until both sequencers have read the thread. That
+	// is the interleaving a second replica produced in the wild: each one
+	// believed lastSeq was still 0.
+	var barrier sync.WaitGroup
+	barrier.Add(2)
+	c := testClientWith(t, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := obj.(*v1.BlipTurn); ok {
+				barrier.Done()
+				barrier.Wait()
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}, thread, one, two)
+
+	ctx := context.Background()
+	threads := []*v1.BlipThread{{}, {}}
+	turns := []*v1.BlipTurn{{}, {}}
+	for i, key := range []client.ObjectKey{
+		{Namespace: "ns", Name: "proj"},
+		{Namespace: "ns", Name: "proj"},
+	} {
+		if err := c.Get(ctx, key, threads[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, name := range []string{"one", "two"} {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: name}, turns[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sequencers := []*Sequencer{{Client: c}, {Client: c}}
+	errs := make(chan error, len(sequencers))
+	for i := range sequencers {
+		go func(i int) { errs <- sequencers[i].sequence(ctx, threads[i], turns[i]) }(i)
+	}
+	for range sequencers {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen := map[int64]string{}
+	for _, name := range []string{"one", "two"} {
+		var turn v1.BlipTurn
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: name}, &turn); err != nil {
+			t.Fatal(err)
+		}
+		if turn.Status.Seq == 0 {
+			t.Fatalf("%s was not sequenced", name)
+		}
+		if other, ok := seen[turn.Status.Seq]; ok {
+			t.Fatalf("duplicate seq %d on %s and %s", turn.Status.Seq, other, name)
+		}
+		seen[turn.Status.Seq] = name
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "proj"}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.LastSeq != 2 {
+		t.Errorf("lastSeq = %d, want 2", updated.Status.LastSeq)
+	}
+}
+
+// A sequencer holding a stale thread object must re-read lastSeq after the
+// CAS conflict, not reuse the number it already saw.
+func TestReserveSeqRetriesWithFreshLastSeq(t *testing.T) {
+	thread := testThread()
+	c := testClient(t, thread)
+	s := &Sequencer{Client: c}
+	ctx := context.Background()
+	// Two independent readers of the same lastSeq=0 thread, as two replicas
+	// would hold them.
+	first := thread.DeepCopy()
+	second := thread.DeepCopy()
+	seqA, err := s.reserveSeq(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seqB, err := s.reserveSeq(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seqA != 1 || seqB != 2 {
+		t.Fatalf("reserved seqs = %d, %d; want 1, 2", seqA, seqB)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "proj"}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.LastSeq != 2 {
+		t.Errorf("lastSeq = %d, want 2", updated.Status.LastSeq)
+	}
+}
+
+// The watcher deliberately runs on every replica. Concurrent watchers must
+// still converge on one turn per report/finished phase because turn names are
+// deterministic and an identical re-create is treated as success.
+func TestConcurrentWatchersCreateOneTurnPerReport(t *testing.T) {
+	b := &v1.Blip{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "blip-a", Namespace: "ns", UID: types.UID("uid-a"),
+			Labels: map[string]string{v1.LabelThread: "proj", v1.LabelOwner: v1.ThreadOwner("ns", "proj")},
+		},
+		Spec: v1.BlipSpec{Pool: "default", State: "s", Command: []string{"true"}},
+		Status: v1.BlipStatus{
+			Phase:  v1.BlipSucceeded,
+			Report: &v1.BlipReport{Seq: 3, Text: `{"summary":"done"}`},
+		},
+	}
+	c := testClient(t, testThread(), b)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "blip-a"}}
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		w := &Watcher{Client: c}
+		go func() { _, err := w.Reconcile(ctx, req); errs <- err }()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var turns v1.BlipTurnList
+	if err := c.List(ctx, &turns, client.InNamespace("ns")); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(turns.Items); got != 2 {
+		t.Fatalf("got %d turns, want one report and one finished turn: %v", got, names(turns.Items))
 	}
 }
 

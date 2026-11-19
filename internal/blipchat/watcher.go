@@ -18,6 +18,11 @@ import (
 // Watcher turns observable blip state into turns: every accepted workload
 // report, and the final phase of the blip. It deduplicates with deterministic
 // turn names, so it may run on every reconcile.
+//
+// It intentionally runs on every replica: createTurnIn treats an
+// AlreadyExists error with an identical spec as success, so concurrent
+// watchers converge on one turn per report/phase instead of needing leader
+// election. Only the sequencer is singular.
 type Watcher struct {
 	client.Client
 }
