@@ -33,6 +33,7 @@ type crdSchema struct {
 	Pattern      string               `json:"pattern"`
 	MaxLength    int64                `json:"maxLength"`
 	MinItems     int64                `json:"minItems"`
+	MaxItems     int64                `json:"maxItems"`
 	Required     []string             `json:"required"`
 	Properties   map[string]crdSchema `json:"properties"`
 	Items        *crdSchema           `json:"items"`
@@ -70,6 +71,31 @@ func loadCRDSpec(t *testing.T, file string) crdSchema {
 			t.Fatalf("%s has no spec property", file)
 		}
 		return spec
+	}
+	t.Fatalf("%s has no v1alpha1 version", file)
+	return crdSchema{}
+}
+
+// loadCRDStatus reads the generated CRD and returns the v1alpha1 status schema.
+func loadCRDStatus(t *testing.T, file string) crdSchema {
+	t.Helper()
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read generated CRD: %v", err)
+	}
+	var doc crdDocument
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse generated CRD: %v", err)
+	}
+	for _, version := range doc.Spec.Versions {
+		if version.Name != "v1alpha1" {
+			continue
+		}
+		status, ok := version.Schema.OpenAPIV3Schema.Properties["status"]
+		if !ok {
+			t.Fatalf("%s has no status property", file)
+		}
+		return status
 	}
 	t.Fatalf("%s has no v1alpha1 version", file)
 	return crdSchema{}
@@ -301,5 +327,65 @@ func admissionValidator(t *testing.T, name string) func(object, old string) fiel
 			errs = append(errs, celErrors...)
 		}
 		return errs
+	}
+}
+
+// TestBlipTurnSchemaCaps guards the bounded turn payload: the engine renders
+// every turn into a coordinator step, so text and attributes must stay small.
+func TestBlipTurnSchemaCaps(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipturns.yaml")
+	if got := spec.Properties["text"].MaxLength; got != 2048 {
+		t.Errorf("spec.text maxLength = %d, want 2048", got)
+	}
+	if got := spec.Properties["subjects"].MaxLength; got != 0 {
+		t.Errorf("spec.subjects unexpectedly has maxLength %d", got)
+	}
+	if got := spec.Properties["subjects"].MaxItems; got != 8 {
+		t.Errorf("spec.subjects maxItems = %d, want 8", got)
+	}
+	if !slices.Contains(spec.Required, "author") || !slices.Contains(spec.Required, "thread") {
+		t.Errorf("spec required = %v, want author and thread", spec.Required)
+	}
+	ruleFor(t, spec.Properties["attributes"].XValidations, "attribute keys are at most 63 and values at most 256 characters")
+}
+
+// TestBlipTurnImmutable guards that a producer cannot rewrite history.
+func TestBlipTurnImmutable(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/crd/blip.dev_blipturns.yaml")
+	if err != nil {
+		t.Fatalf("read generated CRD: %v", err)
+	}
+	if !strings.Contains(string(data), "self.spec == oldSelf.spec") {
+		t.Error("BlipTurn CRD does not make spec immutable")
+	}
+}
+
+// TestBlipThreadTaskIDPattern guards that task ids are safe to use as labels.
+func TestBlipThreadTaskIDPattern(t *testing.T) {
+	status := loadCRDStatus(t, "../../deploy/crd/blip.dev_blipthreads.yaml")
+	tasks, ok := status.Properties["tasks"]
+	if !ok || tasks.Items == nil {
+		t.Fatal("generated CRD has no status.tasks schema")
+	}
+	id, ok := tasks.Items.Properties["id"]
+	if !ok {
+		t.Fatal("generated CRD has no status.tasks[].id schema")
+	}
+	re, err := regexp.Compile(id.Pattern)
+	if err != nil {
+		t.Fatalf("compile task id pattern: %v", err)
+	}
+	for _, good := range []string{"t1", "auth-2", "a"} {
+		if !re.MatchString(good) {
+			t.Errorf("task id %q rejected", good)
+		}
+	}
+	for _, bad := range []string{"T1", "a_b", "-a", "a-"} {
+		if re.MatchString(bad) {
+			t.Errorf("task id %q accepted", bad)
+		}
+	}
+	if id.MaxLength != 16 {
+		t.Errorf("task id maxLength = %d, want 16", id.MaxLength)
 	}
 }

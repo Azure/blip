@@ -15,6 +15,10 @@ const (
 	// LabelParent is the short name of the blip a fork was started from. It
 	// scopes "blip gather" with no arguments to that blip's forks.
 	LabelParent = "blip.dev/parent"
+	// LabelThread marks blips and other objects owned by a BlipThread.
+	LabelThread = "blip.dev/thread"
+	// LabelTask marks a blip as work for one ThreadTask.
+	LabelTask = "blip.dev/task"
 
 	AnnotationBlip            = "blip.dev/blip"
 	AnnotationObserved        = "blip.dev/observed"

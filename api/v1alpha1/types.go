@@ -28,7 +28,8 @@ var (
 
 func init() {
 	SchemeBuilder.Register(&Blip{}, &BlipList{}, &BlipState{}, &BlipStateList{},
-		&BlipPool{}, &BlipPoolList{}, &BlipNode{}, &BlipNodeList{})
+		&BlipPool{}, &BlipPoolList{}, &BlipNode{}, &BlipNodeList{},
+		&BlipThread{}, &BlipThreadList{}, &BlipTurn{}, &BlipTurnList{})
 }
 
 // ---------------------------------------------------------------------------

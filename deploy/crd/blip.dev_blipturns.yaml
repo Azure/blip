@@ -1,0 +1,173 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: blipturns.blip.dev
+spec:
+  group: blip.dev
+  names:
+    kind: BlipTurn
+    listKind: BlipTurnList
+    plural: blipturns
+    singular: blipturn
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.thread
+      name: Thread
+      type: string
+    - jsonPath: .status.seq
+      name: Seq
+      type: integer
+    - jsonPath: .spec.author.kind
+      name: Author
+      type: string
+    - jsonPath: .spec.topic
+      name: Topic
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          BlipTurn is one event in a thread's coordinator history: a user message, a
+          blip report, a finished blip, or a coordinator step. Blipchat stamps
+          status.seq to give every turn one global order. Turns are immutable.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: BlipTurnSpec is written by the turn's producer.
+            properties:
+              attributes:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Attributes carry structured fields from the producer. The coordinator
+                  reads them; the engine does not.
+                maxProperties: 16
+                type: object
+                x-kubernetes-validations:
+                - message: attribute keys are at most 63 and values at most 256 characters
+                  rule: self.all(k, k.size() <= 63) && self.all(k, v, v.size() <=
+                    256)
+              author:
+                description: TurnAuthor identifies who produced a turn.
+                properties:
+                  kind:
+                    enum:
+                    - User
+                    - Blip
+                    - ServiceAccount
+                    - Coordinator
+                    - System
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
+              inReplyTo:
+                description: InReplyTo is the sequence number of the turn this one
+                  answers.
+                format: int64
+                minimum: 0
+                type: integer
+              subjects:
+                description: Subjects name the objects this turn is about.
+                items:
+                  description: |-
+                    TurnSubject names something a turn refers to: a blip, a task, a state, or
+                    an external object addressed by URI.
+                  properties:
+                    kind:
+                      description: |-
+                        Kind names the subject type, such as Blip, BlipState, BlipThread,
+                        Task, or URL.
+                      maxLength: 32
+                      type: string
+                    name:
+                      maxLength: 253
+                      type: string
+                    uri:
+                      maxLength: 512
+                      type: string
+                  type: object
+                  x-kubernetes-validations:
+                  - message: a subject sets exactly one of name and uri
+                    rule: has(self.name) != has(self.uri)
+                maxItems: 8
+                type: array
+              text:
+                description: Text is the bounded human-readable payload.
+                maxLength: 2048
+                type: string
+              thread:
+                description: Thread is the name of the BlipThread this turn belongs
+                  to.
+                maxLength: 253
+                minLength: 1
+                type: string
+              topic:
+                description: |-
+                  Topic is a free-form dotted label such as blip.report, chat.propose,
+                  or engine.capacity. Nothing in the engine interprets it.
+                maxLength: 63
+                type: string
+              wake:
+                default: Batch
+                description: |-
+                  Wake asks blipchat to run a step: Now before the next turn, Batch
+                  after a short debounce, None never.
+                enum:
+                - Now
+                - Batch
+                - None
+                type: string
+            required:
+            - author
+            - thread
+            type: object
+          status:
+            description: BlipTurnStatus is written only by blipchat.
+            properties:
+              acceptedTime:
+                description: AcceptedTime is when blipchat sequenced the turn.
+                format: date-time
+                type: string
+              seq:
+                description: Seq is the turn's position in the thread's single global
+                  order.
+                format: int64
+                type: integer
+            type: object
+        type: object
+        x-kubernetes-validations:
+        - message: turns are immutable
+          rule: self.spec == oldSelf.spec
+    served: true
+    storage: true
+    subresources:
+      status: {}

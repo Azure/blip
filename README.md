@@ -122,6 +122,15 @@ Pod as node-local, replicated, encrypted block storage.
   expiry, and per-execution network narrowing.
 - **`BlipNode`** — cluster-scoped node inventory: endpoint, hypervisors,
   incarnation, heartbeat, drain and safe-to-remove state.
+- **`BlipThread`** — one project's long-running coordinator. Administrators
+  write the charter, pool, base state, concurrency cap, model, daily token
+  budget, heartbeat, and retention. Blipchat writes status: turn sequence,
+  rolling summary, timers, task board, token spend, and pause state.
+- **`BlipTurn`** — one event in a thread: a user message, a blip report, a
+  finished blip, or a coordinator step. Turns are immutable, carry a bounded
+  text and free-form attributes, and blipchat stamps `status.seq` to put all
+  turns in one order. In-cluster producers create turns; the API server
+  validates that a non-blipchat producer names its own service account.
 
 Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
 `BlipState` status; each node agent server-side-applies only its own
@@ -205,6 +214,20 @@ Users write `spec`. The controller writes `Blip`/`BlipPool` status and most of
   `BLIP_REPORT_URL`. A workload POSTs up to 1 KiB of UTF-8 text and receives
   `{"seq": n}`; the text becomes `status.report` on the Blip and survives the
   pod. Reports are spaced at least 10 seconds apart and are never coalesced.
+
+### Coordinator (`blipchat`, `cmd/blipchat` and `internal/blipchat`)
+
+Blipchat is a stateless Deployment with one elected leader. The leader
+sequences turns, turns blip reports and finished blips into turns, and runs
+coordinator steps; every replica serves the engineer chat. Steps are driven by
+`wake=Now` turns, a short debounce for `wake=Batch`, status timers, and a
+heartbeat while tasks are open. A step reads the charter, a compact task board,
+the rolling summary and new turns, may call asynchronous tools (start, watch,
+exec and stop blips; manage tasks and timers), and then writes its turns and
+one status update. One worker per thread serializes status writes. The model
+is any OpenAI-compatible endpoint selected with `--llm-base-url`; the chat
+front end authenticates users and blipchat reads the identity from
+`X-Forwarded-User`.
 
 ### CLI
 

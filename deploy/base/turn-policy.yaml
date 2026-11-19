@@ -1,0 +1,38 @@
+# BlipTurns are the only way to talk to a project's coordinator. They are
+# written by in-cluster producers only: blipchat itself, and service accounts
+# acting for an external front end. A producer that is not blipchat must name
+# its own identity, so a turn can never claim to be a user without going
+# through the authenticated front end.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-turn-author
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: ["*"]
+        resources: [blipturns]
+        operations: [CREATE]
+  variables:
+    - name: blipchat
+      expression: "'system:serviceaccount:' + request.namespace + ':blipchat'"
+  validations:
+    - expression: >-
+        request.userInfo.username == variables.blipchat ||
+        (request.object.spec.author.kind == 'ServiceAccount' &&
+        request.object.spec.author.name == request.userInfo.username)
+      messageExpression: >-
+        'turns must be created by blipchat or by a service account that names
+        itself; ' + request.userInfo.username + ' must set
+        author.kind=ServiceAccount and author.name to its own username'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-turn-author
+spec:
+  policyName: blip-turn-author
+  validationActions: [Deny]
