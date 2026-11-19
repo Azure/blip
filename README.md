@@ -243,8 +243,8 @@ coordinator steps; every replica serves the engineer chat. Steps are driven by
 `wake=Now` turns, a short debounce for `wake=Batch`, status timers, and a
 heartbeat while tasks are open. A step reads its system prompt (the thread's
 `spec.systemPrompt`, or the built-in default) and charter, a compact task board,
-the rolling summary and new turns, may call asynchronous tools (start, watch,
-exec and stop blips; manage tasks and timers), and then writes its turns and
+the rolling summary and new turns, may call asynchronous tools (start, exec
+and stop blips; manage tasks and timers), and then writes its turns and
 one status update. One worker per thread serializes status writes. The model
 is any OpenAI-compatible endpoint selected with `--llm-base-url`; the chat
 front end authenticates users and blipchat reads the identity from
