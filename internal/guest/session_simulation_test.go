@@ -507,7 +507,7 @@ func TestSessionInputCloseWakesBackpressuredWriter(t *testing.T) {
 	})
 }
 
-func TestSessionInputStallThroughWire(t *testing.T) {
+func TestSessionInputWaitsForReaderThroughWire(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g, _ := lifecycleGuest(t)
 		s := newSession(g, "input", nil, false)
@@ -523,22 +523,30 @@ func TestSessionInputStallThroughWire(t *testing.T) {
 			t.Fatal(err)
 		}
 		synctest.Wait()
-		if _, err := attached.Write([]byte("overflow")); err != nil {
-			t.Fatal(err)
+		if s.inBytes != maxPendingInput {
+			t.Fatalf("queued %d bytes, want %d", s.inBytes, maxPendingInput)
 		}
+		// The guest keeps the queue bounded instead of dropping the excess:
+		// the next frame waits for the pump to make space. No notice about
+		// discarded input may be sent for a byte stream.
+		written := make(chan error, 1)
+		go func() {
+			_, err := attached.Write([]byte("overflow"))
+			written <- err
+		}()
 		synctest.Wait()
-		time.Sleep(inputStallTimeout)
-		f, err := attached.Recv()
-		if err != nil || f.Type != wire.TNotice {
-			t.Fatalf("stall notice: %+v %v", f, err)
+		if s.takeDropped() {
+			t.Fatal("a non-terminal byte stream was dropped")
 		}
-		if err := attached.CloseStdin(); err != nil {
-			t.Fatal(err)
+		if s.inBytes != maxPendingInput {
+			t.Fatalf("queue grew past its limit: %d bytes", s.inBytes)
 		}
-		synctest.Wait()
-		if !s.inEOF || !s.inStalled || s.inBytes != maxPendingInput {
-			t.Fatalf("control lost behind stdin: eof=%v stalled=%v queued=%d", s.inEOF, s.inStalled, s.inBytes)
-		}
+		// A process that exits releases the waiter so the session cannot wedge.
 		s.closeInput()
+		select {
+		case <-written:
+		case <-time.After(time.Second):
+			t.Fatal("write did not return after the session closed")
+		}
 	})
 }

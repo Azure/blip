@@ -153,64 +153,65 @@ func TestNonTTYInputWaitsInsteadOfDropping(t *testing.T) {
 	}
 }
 
-// TestNonTTYInputStallDropsAndKeepsSignalsResponsive verifies that a bulk
-// client feeding a process which never reads cannot block the frame loop
-// forever. Once the 8 MiB queue stops making progress, further input is
-// dropped (with a notice) so a later SIGINT/SIGTERM is still delivered.
-func TestNonTTYInputStallDropsAndKeepsSignalsResponsive(t *testing.T) {
+// TestNonTTYInputWaitsForSlowReader verifies that a byte stream is never
+// truncated when the command pauses before reading it. A full queue makes the
+// writer wait for the pump to free space; a command that starts reading after
+// a pause still receives every byte.
+func TestNonTTYInputWaitsForSlowReader(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	cmd := exec.Command("sleep", "30")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = cmd.Process.Kill() }()
 
-	s := newInputTestSession(w, cmd.Process.Pid)
-	defer s.closeInput()
-
-	// Queue well past maxPendingInput. sleep never reads, so the pump blocks
-	// in write and the queue can only drain the first pipe-sized batch.
-	block := bytes.Repeat([]byte("x"), 1<<20)
-	queued := make(chan struct{})
+	const total = 20 << 20
+	const chunkSize = 1 << 20
+	var (
+		mu       sync.Mutex
+		received int
+	)
+	readDone := make(chan struct{})
 	go func() {
-		for i := 0; i < 32; i++ {
-			if err := s.queueInput(block); err != nil {
-				break
+		defer close(readDone)
+		// The bug reproduced with a command that did not read for two
+		// seconds after startup; nothing may be discarded while it waits.
+		time.Sleep(2 * time.Second)
+		buf := make([]byte, 64<<10)
+		for {
+			n, rerr := r.Read(buf)
+			mu.Lock()
+			received += n
+			mu.Unlock()
+			if rerr != nil {
+				return
 			}
 		}
-		close(queued)
 	}()
-	select {
-	case <-queued:
-	case <-time.After(4 * time.Second):
-		t.Fatal("non-terminal input wedged behind a process that is not reading")
-	}
-	if !s.takeDropped() {
-		t.Fatal("input overflow was not reported")
-	}
 
-	payload, _ := json.Marshal(wire.Signal{Name: "TERM"})
-	done := make(chan struct{})
-	go func() {
-		_ = s.input(wire.TSignal, payload)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("signal frame blocked behind stalled stdin")
+	s := newInputTestSession(w, 0)
+	defer s.closeInput()
+
+	block := bytes.Repeat([]byte("x"), chunkSize)
+	for sent := 0; sent < total; sent += chunkSize {
+		if err := s.queueInput(block); err != nil {
+			t.Fatal(err)
+		}
 	}
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
+	s.queueEOF()
+
 	select {
-	case <-exited:
-	case <-time.After(2 * time.Second):
-		t.Fatal("process did not receive the signal after stdin stalled")
+	case <-readDone:
+	case <-time.After(60 * time.Second):
+		t.Fatal("slow reader never reached EOF")
+	}
+	mu.Lock()
+	n := received
+	mu.Unlock()
+	if n != total {
+		t.Fatalf("slow reader received %d of %d stdin bytes: input was truncated", n, total)
+	}
+	if s.takeDropped() {
+		t.Fatal("stdin was dropped for a slow but steadily reading process")
 	}
 }
 
@@ -665,26 +666,31 @@ func TestNonTTYSlowReaderReceivesWholeStream(t *testing.T) {
 	}
 }
 
-// TestNonTTYInputLossIsNotReportedAsSuccess verifies that if the guest really
-// must discard a non-terminal byte stream, the command does not report success
-// as if the whole stream had been delivered.
-func TestNonTTYInputLossIsNotReportedAsSuccess(t *testing.T) {
-	g := &Guest{sessions: map[string]*session{}}
-	s := &session{g: g, id: "exec-lost", out: ring{max: ringSize}}
-	s.cond = sync.NewCond(&s.mu)
+// TestNonTTYInputIsNeverDropped verifies that a full non-terminal queue makes
+// the writer wait instead of discarding bytes. The wait ends when the session
+// closes, so a command that exits cannot wedge the client.
+func TestNonTTYInputIsNeverDropped(t *testing.T) {
+	s := &session{out: ring{max: ringSize}}
 	s.inCond = sync.NewCond(&s.inMu)
-	// No pump and a full queue: the next frame makes no progress and is
-	// discarded after inputStallTimeout.
 	s.inBytes = maxPendingInput
-	if err := s.queueInput([]byte("tail")); err != nil {
-		t.Fatal(err)
+	done := make(chan error, 1)
+	go func() { done <- s.queueInput([]byte("tail")) }()
+	select {
+	case err := <-done:
+		t.Fatalf("queueInput returned %v instead of waiting for space", err)
+	case <-time.After(200 * time.Millisecond):
 	}
-	if !s.takeDropped() {
-		t.Fatal("lost input was not reported")
+	if s.takeDropped() {
+		t.Fatal("non-terminal input was dropped")
 	}
-	s.finish(wire.Exit{Code: 0})
-	if s.status.Code == 0 {
-		t.Fatal("a command that lost stdin reported exit status 0")
+	s.closeInput()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queueInput did not return after the session closed")
 	}
 }
 
