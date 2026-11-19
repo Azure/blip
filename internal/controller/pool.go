@@ -41,6 +41,23 @@ func (r *PoolReconciler) recordWarning(obj client.Object, reason string, err err
 	}
 }
 
+// invalidPool records an endpoint validation failure in pool status and, when
+// a recorder is configured, as a Warning Event. Status is written only when it
+// changes, so the error-driven requeue does not patch forever.
+func (r *PoolReconciler) invalidPool(ctx context.Context, pool *v1.BlipPool, reason string, err error) error {
+	err = fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
+	if pool.Status.Reason != poolInvalidConfiguration || pool.Status.Message != err.Error() {
+		base := pool.DeepCopy()
+		pool.Status.Reason = poolInvalidConfiguration
+		pool.Status.Message = err.Error()
+		if patchErr := r.Status().Patch(ctx, pool, client.MergeFrom(base)); patchErr != nil {
+			return fmt.Errorf("%w (status update: %v)", err, patchErr)
+		}
+	}
+	r.recordWarning(pool, reason, err)
+	return err
+}
+
 // expectTimeout bounds how long a created or deleted pod that the cache does
 // not reflect yet is accounted for.
 const expectTimeout = time.Minute
@@ -75,6 +92,10 @@ const (
 	terminationGracePeriod = int64(90)
 
 	defaultVMCPUs = int32(2)
+
+	// poolInvalidConfiguration is the BlipPool.status.reason for a spec that
+	// admission accepted but the controller cannot turn into VMs.
+	poolInvalidConfiguration = "InvalidConfiguration"
 )
 
 var (
@@ -199,19 +220,16 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		return reconcile.Result{}, nil
 	}
 	// Refuse to create pods whose api-proxy sidecar would exit at startup.
-	// The failure is recorded as an Event on the pool, so an operator can see
-	// why no VM becomes ready instead of only finding it in the controller log.
+	// The failure is recorded in pool status and as an Event on the pool, so
+	// an operator can see why no VM becomes ready instead of only finding it
+	// in the controller log.
 	if err := validateEndpoints(pool, r.APIAudiences...); err != nil {
-		err = fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
-		r.recordWarning(pool, "InvalidEndpoints", err)
-		return reconcile.Result{}, err
+		return reconcile.Result{}, r.invalidPool(ctx, pool, "InvalidEndpoints", err)
 	}
 	// The API checks the ConfigMap reference's shape; its contents must also
 	// be a usable CA bundle or the sidecar crash-loops before the pod is ready.
 	if err := validateEndpointCAs(ctx, r.Client, pool); err != nil {
-		err = fmt.Errorf("invalid endpoints for pool %s/%s: %w", pool.Namespace, pool.Name, err)
-		r.recordWarning(pool, "InvalidEndpointCA", err)
-		return reconcile.Result{}, err
+		return reconcile.Result{}, r.invalidPool(ctx, pool, "InvalidEndpointCA", err)
 	}
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels{v1.LabelPool: pool.Name}); err != nil {

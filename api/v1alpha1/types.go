@@ -59,6 +59,7 @@ type BlipPoolSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(e, !(e.name in ['blip', 'kube-apiserver', 'localhost']))",message="endpoint name is reserved"
 	Endpoints []PoolEndpoint `json:"endpoints,omitempty"`
 	// NodeSelector selects the nodes that run this pool's VMs. It must be
 	// non-empty: matching nodes are enrolled automatically and run the node
@@ -102,6 +103,14 @@ type BlipPoolStatus struct {
 	Ready   int32 `json:"ready,omitempty"`
 	Vacant  int32 `json:"vacant,omitempty"`
 	Claimed int32 `json:"claimed,omitempty"`
+	// Reason is a CamelCase cause set when the pool configuration cannot
+	// produce VMs, for example InvalidConfiguration for an endpoint that
+	// admission could not reject.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// Message is a human-readable explanation of Reason.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true

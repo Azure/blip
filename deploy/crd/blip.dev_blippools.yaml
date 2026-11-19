@@ -96,6 +96,9 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: endpoint name is reserved
+                  rule: self.all(e, !(e.name in ['blip', 'kube-apiserver', 'localhost']))
               hypervisor:
                 default: kvm
                 enum:
@@ -447,10 +450,19 @@ spec:
               claimed:
                 format: int32
                 type: integer
+              message:
+                description: Message is a human-readable explanation of Reason.
+                type: string
               ready:
                 description: Ready counts vacant VMs that finished booting.
                 format: int32
                 type: integer
+              reason:
+                description: |-
+                  Reason is a CamelCase cause set when the pool configuration cannot
+                  produce VMs, for example InvalidConfiguration for an endpoint that
+                  admission could not reject.
+                type: string
               vacant:
                 format: int32
                 type: integer
