@@ -1055,3 +1055,50 @@ func (e *env) setBlipStatus(name string, mutate func(b *v1.Blip)) {
 	mutate(b)
 	e.must(e.c.Status().Update(e.ctx, b))
 }
+
+func TestReadyRequiresPodReadyCondition(t *testing.T) {
+	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.LabelWarm: "true"}}}
+	p.Status.Phase = corev1.PodRunning
+	if !ready(p) {
+		t.Fatal("a warm running pod without a condition is not ready")
+	}
+	p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady"}}
+	if ready(p) {
+		t.Fatal("a warm pod with a failing sidecar is ready")
+	}
+	p.Status.Conditions[0].Status = corev1.ConditionTrue
+	if !ready(p) {
+		t.Fatal("a ready warm pod is not ready")
+	}
+	p.Status.Phase = corev1.PodPending
+	if ready(p) {
+		t.Fatal("a pending pod is ready")
+	}
+}
+
+func TestBrokenSidecarIsNotReadyOrClaimable(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 1, 0)
+	e.run(e.pool, ns, "default")
+	e.warmOn("n1")
+	pods := e.pods()
+	if len(pods) != 1 {
+		t.Fatalf("pods = %d, want 1", len(pods))
+	}
+	p := pods[0]
+	p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady"}}
+	e.must(e.c.Status().Update(e.ctx, &p))
+
+	e.run(e.pool, ns, "default")
+	if pool := e.getPool("default"); pool.Status.Ready != 0 || pool.Status.Vacant != 1 {
+		t.Fatalf("pool status = %+v, want ready 0 vacant 1", pool.Status)
+	}
+
+	e.newBlip("b", e.withImage("reg/img:v1"))
+	e.run(e.blip, ns, "b")
+	b := e.getBlip("b")
+	if b.Status.Pod != "" || b.Status.Phase != v1.BlipPending {
+		t.Fatalf("blip claimed a pod with a broken sidecar: phase %s pod %q", b.Status.Phase, b.Status.Pod)
+	}
+}

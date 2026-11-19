@@ -453,8 +453,24 @@ func sortForRemoval(pods []*corev1.Pod) {
 	})
 }
 
+// ready reports whether a warm pod can accept a claim. A warm pod is only
+// usable when every container is ready: the api-proxy native sidecar can
+// crash-loop (for example on an invalid endpoint CA) while the privileged vm
+// container keeps the pod phase Running, and claiming such a pod gives the
+// guest a dead API/endpoint path. The kubelet's Ready condition covers the
+// native sidecar as well as the VM container.
 func ready(p *corev1.Pod) bool {
-	return p.Labels[v1.LabelWarm] == "true" && p.Status.Phase == corev1.PodRunning && p.DeletionTimestamp == nil
+	if p.Labels[v1.LabelWarm] != "true" || p.Status.Phase != corev1.PodRunning || p.DeletionTimestamp != nil {
+		return false
+	}
+	for _, condition := range p.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	// A pod that the kubelet has not yet described keeps the previous
+	// behavior; phase and warm already say it booted.
+	return true
 }
 
 // pickWarmNode picks the node where a warm spare is most useful: a node
