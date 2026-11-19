@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -168,5 +170,96 @@ func TestPruneSkipsRecreatedThreadIncarnation(t *testing.T) {
 	}
 	if len(thread.Status.Tasks) != 1 || thread.Status.Tasks[0].ID != "newtask" {
 		t.Errorf("stale prune overwrote the new board with %+v", thread.Status.Tasks)
+	}
+}
+
+// When the prompt is over budget, the newest turns still win, but the
+// Wake=Now turn that caused the step must be rendered and the step must not
+// consume the context turns it skipped.
+func TestOverBudgetPromptKeepsWakingTurn(t *testing.T) {
+	fresh := metav1.NewTime(timeNow())
+	objs := []client.Object{testThread()}
+	for i := 1; i <= 30; i++ {
+		turn := testTurn(fmt.Sprintf("turn-%02d", i), "proj")
+		turn.Status.Seq = int64(i)
+		turn.Status.AcceptedTime = &fresh
+		turn.Spec.Wake = v1.WakeNone
+		turn.Spec.Text = fmt.Sprintf("TURN%02d-MARKER %s", i, strings.Repeat("x", 1900))
+		if i == 1 {
+			turn.Spec.Wake = v1.WakeNow
+		}
+		objs = append(objs, turn)
+	}
+	c := testClient(t, objs...)
+	server, requests := llmServerWithRequests(t, Message{Role: "assistant", Content: "ok"})
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 100000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	ctx := context.Background()
+	if err := s.step(ctx, objs[0].(*v1.BlipThread)); err != nil {
+		t.Fatal(err)
+	}
+	prompt := requestPrompt(t, (*requests)[0])
+	if !strings.Contains(prompt, "TURN01-MARKER") {
+		t.Errorf("the Wake=Now turn that caused the step is missing:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "TURN30-MARKER") {
+		t.Errorf("the newest turn is missing:\n%s", prompt)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKeyFromObject(objs[0]), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.ConsumedSeq != 1 {
+		t.Errorf("consumedSeq = %d, want only the rendered waking turn", updated.Status.ConsumedSeq)
+	}
+	pending, err := s.pendingTurns(ctx, &updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 29 {
+		t.Errorf("pending turns = %d, want the 29 skipped context turns retained", len(pending))
+	}
+}
+
+// When the context before the waking turn is itself over budget, the step
+// must keep the waking turn but consume nothing across the gap.
+func TestOverBudgetPromptKeepsLateWakingTurnWithoutConsuming(t *testing.T) {
+	fresh := metav1.NewTime(timeNow())
+	objs := []client.Object{testThread()}
+	for i := 1; i <= 100; i++ {
+		turn := testTurn(fmt.Sprintf("turn-%03d", i), "proj")
+		turn.Status.Seq = int64(i)
+		turn.Status.AcceptedTime = &fresh
+		turn.Spec.Wake = v1.WakeNone
+		turn.Spec.Text = fmt.Sprintf("TURN%03d-MARKER %s", i, strings.Repeat("x", 1900))
+		if i == 51 {
+			turn.Spec.Wake = v1.WakeNow
+		}
+		objs = append(objs, turn)
+	}
+	c := testClient(t, objs...)
+	server, requests := llmServerWithRequests(t, Message{Role: "assistant", Content: "ok"})
+	s := &Server{
+		Client: c,
+		Config: Config{Model: "test", Debounce: time.Second, Heartbeat: 30 * time.Minute, StepTokenLimit: 100000, MaxToolCalls: 20},
+		LLM:    &LLM{BaseURL: server.URL, HTTP: server.Client()},
+	}
+	ctx := context.Background()
+	if err := s.step(ctx, objs[0].(*v1.BlipThread)); err != nil {
+		t.Fatal(err)
+	}
+	prompt := requestPrompt(t, (*requests)[0])
+	if !strings.Contains(prompt, "TURN051-MARKER") {
+		t.Errorf("the Wake=Now turn is missing:\n%s", prompt)
+	}
+	var updated v1.BlipThread
+	if err := c.Get(ctx, client.ObjectKeyFromObject(objs[0]), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.ConsumedSeq != 0 {
+		t.Errorf("consumedSeq = %d, want 0 when the prefix was not rendered", updated.Status.ConsumedSeq)
 	}
 }
