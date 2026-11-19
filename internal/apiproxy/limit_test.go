@@ -8,17 +8,48 @@ import (
 	"time"
 )
 
-// TestConcurrentRequestLimit fills every request slot with a held stream,
-// checks that further streams are rejected with a cheap 503 rather than being
-// admitted, and then checks that closing the held streams releases every slot.
+// limitNamespace and limitPodName make the limit test take the same owner-scope
+// path as the deployed sidecar. testConfig deliberately leaves the pod
+// identity empty, because many other tests exercise unscoped pass-through
+// routes; this test opts in and holds scoped watch streams, so every admitted
+// request performs its two identity GETs before it starts holding a slot.
+const (
+	limitNamespace = "test-ns"
+	limitPodName   = "test-pod"
+	limitHoldPath  = "/apis/blip.dev/v1alpha1/namespaces/" + limitNamespace + "/blips?watch=true"
+
+	// safeConcurrentRequests is the largest cap that fits the 64Mi sidecar
+	// with headroom. 256 held streams peaked at 60.2MiB and OOM-killed the
+	// process, so this regression keeps the cap at or below a quarter of the
+	// measured-failing stream count.
+	safeConcurrentRequests = 64
+)
+
+// TestConcurrentRequestLimit fills every request slot with a held scoped
+// watch, checks that further streams are rejected with a cheap 503 rather than
+// being admitted, and then checks that closing the held streams releases every
+// slot.
 func TestConcurrentRequestLimit(t *testing.T) {
 	const excess = 16
 	var inFlight atomic.Int64
 	var maxInFlight atomic.Int64
+	var identityReads atomic.Int64
 
 	upstream := tlsUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/short" {
+		switch r.URL.Path {
+		case "/short":
 			w.WriteHeader(http.StatusNoContent)
+			return
+		case "/api/v1/namespaces/" + limitNamespace + "/pods/" + limitPodName:
+			identityReads.Add(1)
+			_, _ = io.WriteString(w, `{"metadata":{"name":"test-pod",`+
+				`"annotations":{"blip.dev/blip":"test-blip"},`+
+				`"labels":{"blip.dev/blip-uid":"uid-test"}}}`)
+			return
+		case "/apis/blip.dev/v1alpha1/namespaces/" + limitNamespace + "/blips/test-blip":
+			identityReads.Add(1)
+			_, _ = io.WriteString(w, `{"metadata":{"name":"test-blip","uid":"uid-test",`+
+				`"labels":{"blip.dev/owner":"test-owner"}}}`)
 			return
 		}
 		current := inFlight.Add(1)
@@ -35,11 +66,13 @@ func TestConcurrentRequestLimit(t *testing.T) {
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	})
-	p := startProxy(t, testConfig(t, upstream))
+	cfg := testConfig(t, upstream)
+	cfg.PodName, cfg.PodNamespace = limitPodName, limitNamespace
+	p := startProxy(t, cfg)
 
 	held := make([]*http.Response, 0, maxConcurrentRequests)
 	for i := 0; i < maxConcurrentRequests; i++ {
-		resp, err := p.client.Get("http://kube-apiserver/hold")
+		resp, err := p.client.Get("http://kube-apiserver" + limitHoldPath)
 		if err != nil {
 			t.Fatalf("held request %d: %v", i, err)
 		}
@@ -51,11 +84,14 @@ func TestConcurrentRequestLimit(t *testing.T) {
 	if got := inFlight.Load(); got != maxConcurrentRequests {
 		t.Fatalf("upstream requests in flight = %d, want %d", got, maxConcurrentRequests)
 	}
+	if identityReads.Load() == 0 {
+		t.Fatal("scoped requests never performed their owner-scope identity GETs")
+	}
 
 	// Every slot is held, so these must be rejected without reaching the
 	// upstream.
 	for i := 0; i < excess; i++ {
-		resp, err := p.client.Get("http://kube-apiserver/hold")
+		resp, err := p.client.Get("http://kube-apiserver" + limitHoldPath)
 		if err != nil {
 			t.Fatalf("excess request %d: %v", i, err)
 		}
@@ -94,6 +130,16 @@ func TestConcurrentRequestLimit(t *testing.T) {
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("short request %d status = %d, want 204", i, resp.StatusCode)
 		}
+	}
+}
+
+// TestConcurrentRequestCapFitsSidecarMemory is the regression for the 64Mi
+// api-proxy sidecar: at 256 held streams it reached 60.2MiB and was
+// OOM-killed, so the cap must stay at or below a quarter of that.
+func TestConcurrentRequestCapFitsSidecarMemory(t *testing.T) {
+	if maxConcurrentRequests > safeConcurrentRequests {
+		t.Fatalf("maxConcurrentRequests = %d, want <= %d for the 64Mi sidecar",
+			maxConcurrentRequests, safeConcurrentRequests)
 	}
 }
 

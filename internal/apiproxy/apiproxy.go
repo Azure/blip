@@ -36,19 +36,28 @@ const serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 // maxConcurrentRequests bounds the requests that may be in a handler at once.
 // Watches, log streams, exec/attach upgrades, and plain long responses hold a
 // request (and an upstream connection) until the stream ends, so an unbounded
-// number of them exhausts the sidecar's 64Mi memory limit and gets the whole
-// process OOM-killed. 256 is well below the ~400-500 concurrent held streams
-// that exhausted the sidecar in testing, leaving memory headroom. The cap is
-// global: kube-apiserver and endpoint routes share it. A request that cannot
-// get a slot is rejected with 503 instead of queued, so excess streams never
-// allocate upstream buffers.
+// number of them exhausts the sidecar's memory limit and gets the whole
+// process OOM-killed.
+//
+// The cap is derived from the api-proxy sidecar's 64Mi limit
+// (internal/controller/pool.go). In live runs, 256 held watch streams reached
+// 60.2MiB and were OOM-killed in 4 of 5 attempts: about 230KiB per stream once
+// the runtime baseline is subtracted, including the two owner-scope GETs each
+// scoped request performs and its relay buffers. 64 streams cost about 14MiB
+// at that rate, leaving ~50MiB for the Go runtime, TLS state for the added
+// scope connections, and transient payloads. limit_test.go holds every slot
+// and guards the cap against being raised past this safe budget.
+//
+// The cap is global: kube-apiserver and endpoint routes share it. A request
+// that cannot get a slot is rejected with 503 instead of queued, so excess
+// streams never allocate upstream buffers.
 //
 // A graceful full close of a guest stream that follows a half-close may not be
 // visible until the peer's orphaned FIN_WAIT2 socket expires and keepalive
 // fails (~77s with default tcp_fin_timeout). That is a bounded delay rather
 // than a leak; see clientGone in internal/guest/api.go. A held stream keeps its
 // slot for that interval.
-const maxConcurrentRequests = 256
+const maxConcurrentRequests = 64
 
 // API is the Kubernetes API upstream and the credential the sidecar uses.
 type API struct {
