@@ -156,14 +156,14 @@ type BlipPoolList struct {
 // filesystem or an auxiliary mount. Provisioning fields are immutable;
 // mounts and runtime defaults can be updated for subsequent or running blips.
 //
-// +kubebuilder:validation:XValidation:rule="!(has(self.image) && has(self.copyFrom))",message="set at most one of image and copyFrom"
-// +kubebuilder:validation:XValidation:rule="!(has(self.image) && has(self.replicas))",message="replicas cannot be set for image states; they are held by every eligible node"
-// +kubebuilder:validation:XValidation:rule="has(self.image) == has(oldSelf.image) && (!has(self.image) || self.image == oldSelf.image)",message="image is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.copyFrom) == has(oldSelf.copyFrom) && (!has(self.copyFrom) || self.copyFrom == oldSelf.copyFrom)",message="copyFrom is immutable"
+// +kubebuilder:validation:XValidation:rule="!(has(self.image) && size(self.image) > 0 && has(self.copyFrom) && size(self.copyFrom) > 0)",message="set at most one of image and copyFrom"
+// +kubebuilder:validation:XValidation:rule="!(has(self.image) && size(self.image) > 0 && has(self.replicas))",message="replicas cannot be set for image states; they are held by every eligible node"
+// +kubebuilder:validation:XValidation:rule="(has(self.image) && size(self.image) > 0) == (has(oldSelf.image) && size(oldSelf.image) > 0) && (!has(self.image) || size(self.image) == 0 || self.image == oldSelf.image)",message="image is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.copyFrom) && size(self.copyFrom) > 0) == (has(oldSelf.copyFrom) && size(oldSelf.copyFrom) > 0) && (!has(self.copyFrom) || size(self.copyFrom) == 0 || self.copyFrom == oldSelf.copyFrom)",message="copyFrom is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size == oldSelf.size)",message="size is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas) || self.replicas == oldSelf.replicas)",message="replicas is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.nodeSelector) == has(oldSelf.nodeSelector) && (!has(self.nodeSelector) || self.nodeSelector == oldSelf.nodeSelector)",message="nodeSelector is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.imagePullSecrets) == has(oldSelf.imagePullSecrets) && (!has(self.imagePullSecrets) || self.imagePullSecrets == oldSelf.imagePullSecrets)",message="imagePullSecrets is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.nodeSelector) && size(self.nodeSelector) > 0) == (has(oldSelf.nodeSelector) && size(oldSelf.nodeSelector) > 0) && (!has(self.nodeSelector) || size(self.nodeSelector) == 0 || self.nodeSelector == oldSelf.nodeSelector)",message="nodeSelector is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.imagePullSecrets) && size(self.imagePullSecrets) > 0) == (has(oldSelf.imagePullSecrets) && size(oldSelf.imagePullSecrets) > 0) && (!has(self.imagePullSecrets) || size(self.imagePullSecrets) == 0 || self.imagePullSecrets == oldSelf.imagePullSecrets)",message="imagePullSecrets is immutable"
 type BlipStateSpec struct {
 	// Image initializes the filesystem from a container image, which each
 	// node converts to ext4 itself. Every eligible node (matching

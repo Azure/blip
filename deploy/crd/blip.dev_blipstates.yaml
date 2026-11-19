@@ -441,16 +441,19 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: set at most one of image and copyFrom
-              rule: '!(has(self.image) && has(self.copyFrom))'
+              rule: '!(has(self.image) && size(self.image) > 0 && has(self.copyFrom)
+                && size(self.copyFrom) > 0)'
             - message: replicas cannot be set for image states; they are held by every
                 eligible node
-              rule: '!(has(self.image) && has(self.replicas))'
+              rule: '!(has(self.image) && size(self.image) > 0 && has(self.replicas))'
             - message: image is immutable
-              rule: has(self.image) == has(oldSelf.image) && (!has(self.image) ||
-                self.image == oldSelf.image)
+              rule: (has(self.image) && size(self.image) > 0) == (has(oldSelf.image)
+                && size(oldSelf.image) > 0) && (!has(self.image) || size(self.image)
+                == 0 || self.image == oldSelf.image)
             - message: copyFrom is immutable
-              rule: has(self.copyFrom) == has(oldSelf.copyFrom) && (!has(self.copyFrom)
-                || self.copyFrom == oldSelf.copyFrom)
+              rule: (has(self.copyFrom) && size(self.copyFrom) > 0) == (has(oldSelf.copyFrom)
+                && size(oldSelf.copyFrom) > 0) && (!has(self.copyFrom) || size(self.copyFrom)
+                == 0 || self.copyFrom == oldSelf.copyFrom)
             - message: size is immutable
               rule: has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size
                 == oldSelf.size)
@@ -458,11 +461,14 @@ spec:
               rule: has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas)
                 || self.replicas == oldSelf.replicas)
             - message: nodeSelector is immutable
-              rule: has(self.nodeSelector) == has(oldSelf.nodeSelector) && (!has(self.nodeSelector)
-                || self.nodeSelector == oldSelf.nodeSelector)
+              rule: (has(self.nodeSelector) && size(self.nodeSelector) > 0) == (has(oldSelf.nodeSelector)
+                && size(oldSelf.nodeSelector) > 0) && (!has(self.nodeSelector) ||
+                size(self.nodeSelector) == 0 || self.nodeSelector == oldSelf.nodeSelector)
             - message: imagePullSecrets is immutable
-              rule: has(self.imagePullSecrets) == has(oldSelf.imagePullSecrets) &&
-                (!has(self.imagePullSecrets) || self.imagePullSecrets == oldSelf.imagePullSecrets)
+              rule: (has(self.imagePullSecrets) && size(self.imagePullSecrets) > 0)
+                == (has(oldSelf.imagePullSecrets) && size(oldSelf.imagePullSecrets)
+                > 0) && (!has(self.imagePullSecrets) || size(self.imagePullSecrets)
+                == 0 || self.imagePullSecrets == oldSelf.imagePullSecrets)
           status:
             properties:
               committed:

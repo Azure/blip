@@ -901,3 +901,90 @@ func TestBlipTurnThreadFitsOwnerTable(t *testing.T) {
 		t.Error("admitted a turn for a 247-character thread")
 	}
 }
+
+// TestBlipStateEmptyImageIsUnset guards that an explicitly empty image is the
+// same as an omitted image, matching the controller's `Image != ""` check. An
+// empty image used to be treated as a configured image, forbidding copyFrom
+// and replicas and making a real image immutable.
+func TestBlipStateEmptyImageIsUnset(t *testing.T) {
+	validate := admissionValidator(t, "blipstates")
+	for _, object := range []string{
+		`{"spec":{"image":""}}`,
+		`{"spec":{"image":"","copyFrom":"source"}}`,
+		`{"spec":{"image":"","replicas":2}}`,
+		`{"spec":{"copyFrom":"source"}}`,
+		`{"spec":{"replicas":2}}`,
+	} {
+		if errs := validate(object, ""); len(errs) != 0 {
+			t.Errorf("rejected empty-image state %s: %v", object, errs.ToAggregate())
+		}
+	}
+
+	// A real image is still exclusive with copyFrom and replicas.
+	for _, object := range []string{
+		`{"spec":{"image":"busybox:1","copyFrom":"source"}}`,
+		`{"spec":{"image":"busybox:1","replicas":2}}`,
+	} {
+		if errs := validate(object, ""); len(errs) == 0 {
+			t.Errorf("admitted %s", object)
+		}
+	}
+
+	// Empty is interchangeable with absent, and a real image stays immutable.
+	for _, tc := range []struct {
+		name          string
+		before, after string
+		ok            bool
+	}{
+		{"empty to empty", `{"spec":{"image":""}}`, `{"spec":{"image":""}}`, true},
+		{"empty to absent", `{"spec":{"image":""}}`, `{"spec":{}}`, true},
+		{"absent to empty", `{"spec":{}}`, `{"spec":{"image":""}}`, true},
+		{"real unchanged", `{"spec":{"image":"busybox:1"}}`, `{"spec":{"image":"busybox:1"}}`, true},
+		{"empty to real", `{"spec":{"image":""}}`, `{"spec":{"image":"busybox:1"}}`, false},
+		{"real to empty", `{"spec":{"image":"busybox:1"}}`, `{"spec":{"image":""}}`, false},
+		{"real changed", `{"spec":{"image":"busybox:1"}}`, `{"spec":{"image":"busybox:2"}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validate(tc.after, tc.before)
+			if tc.ok && len(errs) != 0 {
+				t.Errorf("rejected %s -> %s: %v", tc.before, tc.after, errs.ToAggregate())
+			}
+			if !tc.ok && len(errs) == 0 {
+				t.Errorf("admitted %s -> %s", tc.before, tc.after)
+			}
+		})
+	}
+
+	// nodeSelector and imagePullSecrets are removable when empty, but a real
+	// value cannot be removed or changed. copyFrom's pattern already rejects
+	// an explicit empty value, so only absent/real transitions apply.
+	for _, tc := range []struct {
+		name          string
+		before, after string
+		ok            bool
+	}{
+		{"copyFrom real to absent", `{"spec":{"copyFrom":"source"}}`, `{"spec":{}}`, false},
+		{"copyFrom absent to real", `{"spec":{}}`, `{"spec":{"copyFrom":"source"}}`, false},
+		{"copyFrom unchanged", `{"spec":{"copyFrom":"source"}}`, `{"spec":{"copyFrom":"source"}}`, true},
+		{"copyFrom changed", `{"spec":{"copyFrom":"source"}}`, `{"spec":{"copyFrom":"other"}}`, false},
+		{"nodeSelector empty removed", `{"spec":{"nodeSelector":{}}}`, `{"spec":{}}`, true},
+		{"nodeSelector added empty", `{"spec":{}}`, `{"spec":{"nodeSelector":{}}}`, true},
+		{"nodeSelector changed", `{"spec":{"nodeSelector":{"a":"b"}}}`, `{"spec":{"nodeSelector":{"a":"c"}}}`, false},
+		{"nodeSelector real removed", `{"spec":{"nodeSelector":{"a":"b"}}}`, `{"spec":{}}`, false},
+		{"imagePullSecrets empty removed", `{"spec":{"imagePullSecrets":[]}}`, `{"spec":{}}`, true},
+		{"imagePullSecrets added empty", `{"spec":{}}`, `{"spec":{"imagePullSecrets":[]}}`, true},
+		{"imagePullSecrets changed", `{"spec":{"imagePullSecrets":[{"name":"a"}]}}`, `{"spec":{"imagePullSecrets":[{"name":"b"}]}}`, false},
+		{"replicas real removed", `{"spec":{"replicas":2}}`, `{"spec":{}}`, false},
+		{"replicas changed", `{"spec":{"replicas":1}}`, `{"spec":{"replicas":2}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validate(tc.after, tc.before)
+			if tc.ok && len(errs) != 0 {
+				t.Errorf("rejected %s -> %s: %v", tc.before, tc.after, errs.ToAggregate())
+			}
+			if !tc.ok && len(errs) == 0 {
+				t.Errorf("admitted %s -> %s", tc.before, tc.after)
+			}
+		})
+	}
+}
