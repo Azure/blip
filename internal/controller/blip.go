@@ -412,22 +412,24 @@ func discardedSave(st *v1.BlipState, b *v1.Blip) string {
 	return fmt.Sprintf("state %q was deleted while in use; the save was discarded", st.Name)
 }
 
-// deletingMount returns the first desired writable mount whose state is being
-// deleted while b is not. Its disk is about to be removed while this Blip
-// writes to it.
-func (r *BlipReconciler) deletingMount(ctx context.Context, b *v1.Blip, mounts []v1.Mount) (*v1.BlipState, error) {
+// deletingMount returns the first desired mount whose state is being deleted
+// while b is not, together with whether that mount is writable. A writable
+// disk is about to be removed while this Blip writes to it; a read-only disk
+// can be hot-removed, but the reader must still be told instead of silently
+// staying Running while the state's finalizer waits for it.
+func (r *BlipReconciler) deletingMount(ctx context.Context, b *v1.Blip, mounts []v1.Mount) (*v1.BlipState, bool, error) {
 	seen := map[string]bool{}
 	for _, m := range mounts {
-		if !m.Writable || seen[m.State] {
+		if seen[m.State] {
 			continue
 		}
 		seen[m.State] = true
 		st, err := r.deletingState(ctx, b, m.State)
 		if err != nil || st != nil {
-			return st, err
+			return st, m.Writable, err
 		}
 	}
-	return nil, nil
+	return nil, false, nil
 }
 
 func wait(b *v1.Blip, reason, msg string) {
@@ -1227,14 +1229,16 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 				b.Status.Reason, b.Status.Message = reason, msg
 				return reconcile.Result{RequeueAfter: retryAfter}, nil
 			}
-			if st, err := r.deletingMount(ctx, b, mounts); err != nil {
+			if st, writable, err := r.deletingMount(ctx, b, mounts); err != nil {
 				return reconcile.Result{}, err
 			} else if st != nil {
-				// A writable mount is being removed, whether by its
-				// owner or directly. Its deletion also removes the
-				// data this Blip is writing, so stop now and fail the
-				// save instead of reporting success for a discarded
-				// result.
+				// A mount is being removed, whether by its owner or
+				// directly. A writable disk takes the data this Blip
+				// is writing with it, so fail the save instead of
+				// reporting success for a discarded result. A
+				// read-only disk can be hot-removed, but the reader
+				// must be stopped with a reason instead of silently
+				// pinning the state's finalizer.
 				if err := r.stop(ctx, b, reasonStateDeleting); err != nil {
 					return reconcile.Result{}, err
 				}
@@ -1243,8 +1247,13 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 				if deletedByOwner(st, b) {
 					by = " by its owner"
 				}
-				b.Status.Reason, b.Status.Message = ReasonStateNotFound,
-					fmt.Sprintf("mount state %q is being deleted%s; stopping before the workspace is removed", st.Name, by)
+				if writable {
+					b.Status.Reason, b.Status.Message = ReasonStateNotFound,
+						fmt.Sprintf("mount state %q is being deleted%s; stopping before the workspace is removed", st.Name, by)
+				} else {
+					b.Status.Reason, b.Status.Message = ReasonStateNotFound,
+						fmt.Sprintf("mount state %q is being deleted%s; stopping because it can no longer be read", st.Name, by)
+				}
 				return reconcile.Result{}, nil
 			}
 			b.Status.Reason = ""
