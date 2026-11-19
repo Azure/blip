@@ -63,6 +63,14 @@ func TestPoolReplacesGenericUnschedulableSpare(t *testing.T) {
 	e.must(e.c.Update(e.ctx, bn))
 	e.heartbeat()
 
+	// The rejected generic spare is kept for blockedGrace so an unplaceable
+	// pool cannot churn pods at scheduler speed. The first pass observes the
+	// rejection and starts the grace; once it expires the pool replaces the
+	// pod once with a freshly computed placement.
+	e.run(e.pool, ns, "default")
+	e.now = e.now.Add(blockedGrace + time.Second)
+	e.heartbeat()
+
 	e.run(e.pool, ns, "default")
 	e.run(e.pool, ns, "default")
 	pods = e.pods()
@@ -74,6 +82,50 @@ func TestPoolReplacesGenericUnschedulableSpare(t *testing.T) {
 	}
 	if unschedulableExcludes(&pods[0], "n2") {
 		t.Fatalf("replacement keeps the stale avoid affinity: %+v", pods[0].Spec.Affinity)
+	}
+}
+
+// TestPoolBoundsGenericUnschedulableChurn reproduces the unbounded create/delete
+// loop: an always-unplaceable generic spare used to be deleted and recreated on
+// every reconcile, at scheduler-event speed. The pool must keep the rejected pod
+// for blockedGrace and replace it only once per grace instead.
+func TestPoolBoundsGenericUnschedulableChurn(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.newPool("default", 1, 1)
+	e.run(e.pool, ns, "default")
+	if n := len(e.pods()); n != 1 {
+		t.Fatalf("%d pods, want one warm spare", n)
+	}
+
+	// Two-second reconciles over three minutes: the pod never has a node.
+	const step = 2 * time.Second
+	seen := map[string]bool{}
+	for range 90 {
+		for _, p := range e.pods() {
+			if p.Spec.NodeName != "" || unschedulable(&p) {
+				continue
+			}
+			w317MarkUnschedulable(t, e, &p)
+		}
+		e.run(e.pool, ns, "default")
+		pods := e.pods()
+		if len(pods) > 1 {
+			t.Fatalf("%d live pods, want maxCount=1 to hold: %+v", len(pods), pods)
+		}
+		for _, p := range pods {
+			seen[p.Name] = true
+		}
+		e.now = e.now.Add(step)
+	}
+	// The first pod is created, and each expired grace replaces it once. Three
+	// minutes with a one-minute grace yields about three pods; the old loop
+	// yielded one per reconcile.
+	if len(seen) < 2 {
+		t.Fatalf("only %d pod in three minutes: the rejected spare was never replaced", len(seen))
+	}
+	if len(seen) > 5 {
+		t.Fatalf("%d pods in three minutes, want blockedGrace to bound churn: %v", len(seen), seen)
 	}
 }
 

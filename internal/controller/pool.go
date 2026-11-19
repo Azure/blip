@@ -162,6 +162,18 @@ type PoolReconciler struct {
 	// rejected may be tried again. A rejected pod is deleted, so the nodes
 	// cannot be re-derived from the pod list on the next pass.
 	blocked map[types.NamespacedName]map[string]time.Time
+	// rejectedGeneric holds, per pool, the generic spare the scheduler
+	// rejected and when the pool may replace it. The pod is kept meanwhile,
+	// so the rejection is remembered by name rather than re-derived.
+	rejectedGeneric map[types.NamespacedName]genericRejection
+}
+
+// genericRejection is the state of a generic spare the scheduler rejected.
+// The pod name keys it so a replacement (or a pod an operator deleted) gets a
+// fresh grace instead of inheriting the old one.
+type genericRejection struct {
+	pod   string
+	until time.Time
 }
 
 type expectation struct {
@@ -253,6 +265,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			delete(r.created, rq.NamespacedName)
 			delete(r.deleted, rq.NamespacedName)
 			delete(r.blocked, rq.NamespacedName)
+			delete(r.rejectedGeneric, rq.NamespacedName)
 			r.mu.Unlock()
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
@@ -464,6 +477,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	used := map[string]bool{}
 	var vacant []*corev1.Pod
 	var status v1.BlipPoolStatus
+	// held counts generic spares the scheduler rejected that the pool keeps
+	// as non-productive capacity until their grace expires. They hold a
+	// maxCount slot and count toward the sizing target, but cannot satisfy a
+	// claim and are not reported as vacant.
+	held := 0
 	// hot counts the nodes that run a claimed VM of this pool. Warm spares
 	// are placed there first: a fork's data lives on the node its parent
 	// runs on, so a warm VM there starts the fork without booting a VM on
@@ -524,13 +542,23 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			// and must not hold a maxCount slot: booting the replacement
 			// elsewhere is the whole point. Keep a pinned pod while a Blip
 			// still waits locally (the scheduler may place it once the node
-			// has room); once the Blip fell back, replace it. A generic spare
-			// has no node to wait for, and its stale avoid affinity may
-			// exclude nodes that are usable again, so delete it and let
-			// createPod recompute the placement.
+			// has room); once the Blip fell back, replace it.
 			if p.Annotations[v1.AnnotationPinnedNode] != "" && localWaiters[node] > 0 {
 				// The pod stays for its local waiter, but it is not capacity.
 				total--
+				break
+			}
+			// A generic spare has no node to wait for, and its stale avoid
+			// affinity may exclude nodes that are usable again. Deleting it on
+			// every pass would recreate an equally unplaceable replacement at
+			// scheduler speed (hundreds of pods per minute). Keep it as
+			// non-productive capacity for blockedGrace, then replace it once so
+			// placement and avoidance are recomputed, and repeat only after
+			// another grace. The kept pod holds its maxCount slot through
+			// total/have, so no replacement is created in the same pass.
+			generic := p.Annotations[v1.AnnotationPinnedNode] == ""
+			if generic && r.keepRejectedGeneric(rq.NamespacedName, p.Name, r.now()) {
+				held++
 				break
 			}
 			gone, err := del(p)
@@ -538,9 +566,12 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 				return reconcile.Result{}, err
 			}
 			// A lost delete did not free the slot, so a replacement would
-			// exceed maxCount.
+			// exceed maxCount. Count a generic pod that stays as held, too:
+			// an uncapped pool must not create a duplicate either.
 			if gone {
 				total--
+			} else if generic {
+				held++
 			}
 		case warmingOverdue(p, r.now()):
 			// A spare that never became ready cannot accept a claim. Retire
@@ -612,7 +643,10 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	// spare must not stand in for demand and suppress the replacement that the
 	// waiting Blip needs.
 	claimable := int(status.Ready)
-	have := len(vacant) + created
+	// have sizes the pool: claimable/booting spares plus rejected generic
+	// spares kept for their grace. Excluding held pods would make the sizing
+	// loops boot a duplicate next to the rejected one.
+	have := len(vacant) + created + held
 	log.FromContext(ctx).V(1).Info("pool sizing", "demand", demand, "deferred", deferred, "claimed", len(claimed), "pinned", pinned, "vacant", len(vacant), "created", created, "target", target, "have", have, "total", total, "blocked", blocked)
 	room := func() bool { return maxCount <= 0 || total < maxCount }
 	for _, node := range slices.Sorted(maps.Keys(short)) {
@@ -851,6 +885,27 @@ func (r *PoolReconciler) poolBlocked(pool types.NamespacedName, observed map[str
 		delete(r.blocked, pool)
 	}
 	return out
+}
+
+// keepRejectedGeneric reports whether the generic spare pod, whose scheduler
+// rejection was observed now, should be kept as non-productive capacity. The
+// first rejection starts blockedGrace; when it expires the caller deletes and
+// recreates the pod once, which recomputes its placement and avoid affinity.
+// The pod name keys the entry: a replacement starts a fresh grace, so an
+// always-unplaceable pool churns at most one pod per grace instead of per
+// reconcile.
+func (r *PoolReconciler) keepRejectedGeneric(pool types.NamespacedName, pod string, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rejectedGeneric == nil {
+		r.rejectedGeneric = map[types.NamespacedName]genericRejection{}
+	}
+	cur := r.rejectedGeneric[pool]
+	if cur.pod != pod {
+		cur = genericRejection{pod: pod, until: now.Add(blockedGrace)}
+		r.rejectedGeneric[pool] = cur
+	}
+	return now.Before(cur.until)
 }
 
 // countsAsDemand reports whether b is waiting for a VM from this pool. Blips

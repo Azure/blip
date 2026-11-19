@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,6 +34,12 @@ func TestW622LostDeleteUnschedulableKeepsMaxCount(t *testing.T) {
 	spare.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable}}
 	e.create(spare)
 
+	// A rejected generic spare is kept for blockedGrace before the pool tries
+	// to replace it. The first pass starts the grace; after it the optimistic
+	// delete loses. The pod survives, so its slot must not be reused.
+	e.run(e.pool, ns, "default")
+	e.now = e.now.Add(blockedGrace + time.Second)
+	e.heartbeat()
 	e.run(e.pool, ns, "default")
 	if conflicts != 1 {
 		t.Fatalf("conflicts = %d, want the simulated lost delete", conflicts)
@@ -99,6 +106,39 @@ func TestW622LostDeleteShrinkKeepsCapacity(t *testing.T) {
 	}
 	if got := e.getPool("default").Status; got.Vacant != 1 || got.Ready != 1 {
 		t.Fatalf("status %+v, want Vacant=1 Ready=1 for the surviving spare", got)
+	}
+}
+
+// TestW622LostDeleteUnschedulableUncappedKeepsOne covers an uncapped pool: a
+// rejected generic spare whose replace-time delete loses must still count as
+// held, or have would see zero spares and boot a duplicate in the same pass.
+func TestW622LostDeleteUnschedulableUncappedKeepsOne(t *testing.T) {
+	e := newEnv(t)
+	conflicts := 0
+	e.c = interceptor.NewClient(e.c.(client.WithWatch), w622ConflictOn("default-spare", &conflicts))
+	e.pool.Client = e.c
+	e.addNodes("n1")
+	e.newPool("default", 1, 0)
+	pool := e.getPool("default")
+
+	spare := e.pool.podFor(pool, "default-spare")
+	spare.Status.Phase = corev1.PodPending
+	spare.Labels[v1.LabelWarm] = "true"
+	spare.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable}}
+	e.create(spare)
+
+	e.run(e.pool, ns, "default")
+	e.now = e.now.Add(blockedGrace + time.Second)
+	e.heartbeat()
+	e.run(e.pool, ns, "default")
+	if conflicts != 1 {
+		t.Fatalf("conflicts = %d, want the simulated lost delete", conflicts)
+	}
+	if n := len(e.pods()); n != 1 {
+		t.Fatalf("%d live pods after a lost delete in an uncapped pool, want the rejected spare only: %+v", n, e.pods())
+	}
+	if !unschedulable(&e.pods()[0]) {
+		t.Fatalf("rejected spare was replaced despite the lost delete: %+v", e.pods()[0])
 	}
 }
 
