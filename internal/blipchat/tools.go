@@ -1,7 +1,6 @@
 package blipchat
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -408,8 +407,8 @@ func (s *Server) execIn(ctx context.Context, thread *v1.BlipThread, name string,
 		return "", err
 	}
 	defer sess.Close()
-	var stdout, stderr bytes.Buffer
-	exit, err := sess.Copy(&stdout, &stderr, nil)
+	stdout, stderr := newTailWriter(execTailBytes), newTailWriter(execTailBytes)
+	exit, err := sess.Copy(stdout, stderr, nil)
 	if err != nil {
 		return "", err
 	}
@@ -423,21 +422,55 @@ func (s *Server) execIn(ctx context.Context, thread *v1.BlipThread, name string,
 	if reason != "" {
 		out += " reason=" + reason
 	}
-	if s := tailWords(&stdout, 8192); s != "" {
+	if s := stdout.String(); s != "" {
 		out += "\nstdout:\n" + s
 	}
-	if s := tailWords(&stderr, 4096); s != "" {
+	if s := stderr.String(); s != "" {
 		out += "\nstderr:\n" + s
 	}
 	return out, nil
 }
 
-func tailWords(b *bytes.Buffer, n int) string {
-	s := strings.TrimSpace(b.String())
-	if len(s) <= n {
-		return s
+// execTailBytes is how much of each output stream execIn keeps. The writer is
+// bounded so a command cannot consume the coordinator's memory by writing an
+// arbitrary amount before the exec deadline.
+const execTailBytes = 8 << 10
+
+// tailWriter keeps only the last max bytes written to it. It never fails, so
+// Session.Copy keeps draining the guest even when a command writes far more
+// output than execIn returns.
+type tailWriter struct {
+	buf   []byte
+	max   int
+	total int64
+}
+
+func newTailWriter(max int) *tailWriter {
+	return &tailWriter{max: max}
+}
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	w.total += int64(len(p))
+	if len(p) >= w.max {
+		w.buf = append(w.buf[:0], p[len(p)-w.max:]...)
+		return len(p), nil
 	}
-	return "..." + s[len(s)-n:]
+	if drop := len(w.buf) + len(p) - w.max; drop > 0 {
+		copy(w.buf, w.buf[drop:])
+		w.buf = w.buf[:len(w.buf)-drop]
+	}
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+// String returns the retained tail, prefixed with a notice when earlier
+// output was dropped.
+func (w *tailWriter) String() string {
+	s := strings.TrimSpace(string(w.buf))
+	if w.total > int64(w.max) {
+		return fmt.Sprintf("[output truncated; showing the last %d bytes]\n%s", w.max, s)
+	}
+	return s
 }
 
 // blipList renders blips of this thread for the chat and coordinator prompts.
