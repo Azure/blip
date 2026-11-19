@@ -8,11 +8,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
+	ociv1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
@@ -83,6 +87,53 @@ func TestRemoteRegistry(t *testing.T) {
 	ref, _ = insecure.parse("registry.example:5000/blip/base:v1")
 	if ref.Context().Scheme() != "https" {
 		t.Errorf("secure registry scheme %s", ref.Context().Scheme())
+	}
+}
+
+// TestPlatformMismatchIsTerminal: an index whose only child targets another
+// architecture can never resolve on this node. It must be classified as a
+// permanent image error rather than retried forever.
+func TestPlatformMismatchIsTerminal(t *testing.T) {
+	srv := httptest.NewServer(registry.New(registry.Logger(log.New(io.Discard, "", 0))))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	repo, err := name.NewRepository(u.Host + "/blip/base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := random.Image(1024, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{
+		Add: img,
+		Descriptor: ociv1.Descriptor{Platform: &ociv1.Platform{
+			OS:           "linux",
+			Architecture: runtime.GOARCH + "-other",
+		}},
+	})
+	if err := remote.WriteIndex(repo.Tag("other"), idx); err != nil {
+		t.Fatal(err)
+	}
+
+	r := RemoteRegistry{}
+	ctx := context.Background()
+	pinned, err := r.Digest(ctx, repo.Tag("other").String(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.ImageConfig(ctx, pinned, "", nil)
+	if !errors.Is(err, ErrUnsupportedImage) {
+		t.Fatalf("platform mismatch = %v, want ErrUnsupportedImage", err)
+	}
+	if !terminalImageError(err) {
+		t.Fatalf("platform mismatch classified as retryable: %v", err)
+	}
+	if !terminalImageError(errors.New("no child with platform linux/amd64 in index x")) {
+		t.Fatal("plain platform mismatch classified as retryable")
+	}
+	if !strings.Contains(err.Error(), "no child with platform") {
+		t.Fatalf("platform mismatch lost the registry detail: %v", err)
 	}
 }
 

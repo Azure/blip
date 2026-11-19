@@ -108,6 +108,37 @@ func (imageConfigNotFound) ImageConfig(_ context.Context, ref, _ string, _ []cor
 	return nil, fmt.Errorf("image config %s: %w", ref, ErrImageNotFound)
 }
 
+// imageConfigUnsupported resolves any digest but reports that the pinned image
+// has no manifest for the node platform.
+type imageConfigUnsupported struct{}
+
+func (imageConfigUnsupported) Digest(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (string, error) {
+	return ref, nil
+}
+
+func (imageConfigUnsupported) ImageConfig(_ context.Context, ref, _ string, _ []corev1.LocalObjectReference) (*v1.ImageConfig, error) {
+	return nil, fmt.Errorf("%w: image config %s: no child with platform linux/amd64", ErrUnsupportedImage, ref)
+}
+
+func TestStatePlatformMismatchFailsTerminally(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	e.state.Registry = imageConfigUnsupported{}
+	ref := "reg/img@sha256:" + strings.Repeat("1", 64)
+	e.newState("s", func(st *v1.BlipState) {
+		st.Spec.Image, st.Spec.Replicas = ref, 0
+	})
+	e.run(e.state, ns, "s")
+	st := e.getState("s")
+	if st.Status.Phase != v1.StateFailed || st.Status.Pending != nil {
+		t.Fatalf("platform mismatch not terminal: %+v", st.Status)
+	}
+	if !strings.Contains(st.Status.Message, "no manifest for this platform") ||
+		!strings.Contains(st.Status.Message, "no child with platform") {
+		t.Fatalf("message %q does not explain the platform mismatch", st.Status.Message)
+	}
+}
+
 func TestStateMissingDigestFails(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2")
