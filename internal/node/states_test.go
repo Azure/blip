@@ -627,12 +627,24 @@ func TestHolderFailover(t *testing.T) {
 		})
 	}
 
-	// With no healthy holder the fetch is not planned and the failure is
-	// visible in this node's observation.
-	v, _ := setup()
+	// A draining pending source still serves the commit it sealed: draining
+	// forbids new placements, not reading an existing commit. Without this a
+	// drain during a save would leave every replica on "no healthy holder".
+	v, st := setup()
 	v.blipNodes["n2"].Spec.Drain = true
 	v.blipNodes["n3"].Spec.Drain = true
 	p := compute(v)
+	if len(p.fetches) != 1 || p.fetches[0].src.node != "n2" || p.fetches[0].src.commitID != "c2" {
+		t.Fatalf("fetch from draining pending source = %+v", p.fetches)
+	}
+
+	// The exception is limited to the pending source. A different draining
+	// holder does not stand in for a source that lacks the commit.
+	v, st = setup()
+	v.blipNodes["n2"].Spec.Drain = true
+	v.blipNodes["n3"].Spec.Drain = true
+	st.Status.Nodes = []v1alpha1.NodeObservation{holding("n3", "c2")}
+	p = compute(v)
 	if len(p.fetches) != 0 {
 		t.Fatalf("fetches = %+v", p.fetches)
 	}

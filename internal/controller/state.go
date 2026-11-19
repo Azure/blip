@@ -33,6 +33,13 @@ const (
 	// retryAfter paces retries of failures that no watch event resolves
 	// (registry errors).
 	retryAfter = 30 * time.Second
+	// drainSaveFallback bounds how long a save waits for replicas when its
+	// source node is draining but still healthy and holds the sealed commit.
+	// Draining nodes may refuse new placements, so a replica fetch can be
+	// impossible; after this bound the state commits on the source alone and
+	// repair replicates it once a usable node can read it. This keeps a drain
+	// from wedging the Blip and both finalizers forever.
+	drainSaveFallback = 5 * time.Minute
 	// maxSeals is the API limit for BlipState.status.seals.
 	maxSeals = 32
 	// recentSeals is how many seal results are kept even when no Blip
@@ -631,10 +638,27 @@ func replicas(st *v1.BlipState) int {
 func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *cluster) (string, error) {
 	s := &st.Status
 	p := s.Pending
+	if p.Since == nil {
+		now := metav1.NewTime(cl.now)
+		p.Since = &now
+	}
 	if stop, msg, err := r.pendingSource(ctx, st, cl); err != nil {
 		return "", err
 	} else if stop {
 		return msg, nil
+	}
+	if drainSaveExpired(st, cl, p) {
+		// The source sealed the commit and is only draining, but no replica
+		// could fetch it. Commit with the source and any replica that did
+		// fetch: the data is durable on the source and repair can replicate
+		// it once a usable node can read it.
+		kept := slices.DeleteFunc(slices.Clone(p.Replicas), func(n string) bool {
+			return n != p.SourceNode && !cl.holds(st, n, p.CommitID)
+		})
+		if !slices.Contains(kept, p.SourceNode) {
+			kept = append([]string{p.SourceNode}, kept...)
+		}
+		p.Replicas = kept
 	}
 	for i, n := range p.Replicas {
 		if n == p.SourceNode || !cl.bad(n) || cl.holds(st, n, p.CommitID) {
@@ -799,6 +823,18 @@ func (r *StateReconciler) pendingSource(ctx context.Context, st *v1.BlipState, c
 // cannot take new placements. Replica loss must not strand that existing save.
 func servingSource(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
 	return cl.healthyNode(p.SourceNode) && cl.holds(st, p.SourceNode, p.CommitID)
+}
+
+// drainSaveExpired reports whether a save has waited past drainSaveFallback
+// for replicas of a commit that a healthy draining source already holds. Such
+// replicas may be unable to fetch at all (draining nodes are not sources for
+// new placements), so waiting longer only wedges the save.
+func drainSaveExpired(st *v1.BlipState, cl *cluster, p *v1.PendingCommit) bool {
+	if p.Generation <= 1 || p.Since == nil || cl.now.Sub(p.Since.Time) < drainSaveFallback {
+		return false
+	}
+	bn := cl.nodes[p.SourceNode]
+	return bn != nil && bn.Spec.Drain && servingSource(st, cl, p)
 }
 
 // usableHolder returns a usable replica that holds the pending commit.

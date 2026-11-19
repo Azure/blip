@@ -635,6 +635,13 @@ spec:
                     items:
                       type: string
                     type: array
+                  since:
+                    description: |-
+                      Since is when the controller first observed this pending version. It
+                      bounds how long a save may wait for replicas before it falls back to
+                      committing on a source that still holds it.
+                    format: date-time
+                    type: string
                   sourceNode:
                     description: SourceNode builds or already holds the version.
                     type: string

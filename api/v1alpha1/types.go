@@ -227,6 +227,10 @@ type PendingCommit struct {
 	AttachmentID string `json:"attachmentID,omitempty"`
 	// Replicas are the nodes that must hold the version before commit.
 	Replicas []string `json:"replicas"`
+	// Since is when the controller first observed this pending version. It
+	// bounds how long a save may wait for replicas before it falls back to
+	// committing on a source that still holds it.
+	Since *metav1.Time `json:"since,omitempty"`
 }
 
 // CopySource is the exact version a copy was created from.

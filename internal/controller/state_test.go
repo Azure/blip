@@ -484,6 +484,84 @@ func TestDrainingSaveSourceCommitsWithLostReplica(t *testing.T) {
 	}
 }
 
+// TestDrainingSaveFallsBackAfterBound covers a save whose replicas cannot
+// fetch from the draining source the controller considers serving. Waiting for
+// a node that can never fetch would wedge the save, the Blip, and the state
+// finalizer; after drainSaveFallback the state commits on the source and
+// repair replicates it later.
+func TestDrainingSaveFallsBackAfterBound(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	st := e.readyState("s", "n1", "n2")
+	const saved = "draining-bound-save"
+	since := metav1.NewTime(e.now)
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID: saved, Generation: 2, SourceNode: "n1",
+		AttachmentID: "save", Replicas: []string{"n1", "n2"}, Since: &since,
+	}
+	e.must(e.c.Status().Update(e.ctx, st))
+	e.hold("s", saved, "n1")
+	e.setDrain("n1")
+
+	e.run(e.state, ns, "s")
+	if st = e.getState("s"); st.Status.Pending == nil || st.Status.Committed.ID == saved {
+		t.Fatalf("save committed before the fallback bound: %+v", st.Status)
+	}
+
+	e.now = e.now.Add(drainSaveFallback + time.Second)
+	e.heartbeat()
+	e.run(e.state, ns, "s")
+	st = e.getState("s")
+	if st.Status.Pending != nil || st.Status.Committed == nil || st.Status.Committed.ID != saved {
+		t.Fatalf("draining save did not fall back after %s: %+v", drainSaveFallback, st.Status)
+	}
+	if !slices.Equal(st.Status.Placements, []string{"n1"}) {
+		t.Fatalf("fallback placements %v, want the source that holds the commit", st.Status.Placements)
+	}
+}
+
+// TestDrainingSaveFallbackClearsFinalizer checks the end-to-end unblock: once
+// the fallback commit resolves the attachment, deleting the Blip removes its
+// finalizer instead of waiting forever on the stuck save.
+func TestDrainingSaveFallbackClearsFinalizer(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1", "n2")
+	st := e.readyState("s", "n1", "n2")
+	const saved = "draining-finalizer-save"
+	since := metav1.NewTime(e.now.Add(-drainSaveFallback - time.Second))
+	st.Status.Pending = &v1.PendingCommit{
+		CommitID: saved, Generation: 2, SourceNode: "n1",
+		AttachmentID: "save", Replicas: []string{"n1", "n2"}, Since: &since,
+	}
+	st.Status.Seals = []v1.SealResult{{AttachmentID: "save", CommitID: saved}}
+	e.must(e.c.Status().Update(e.ctx, st))
+	e.hold("s", saved, "n1")
+	e.setDrain("n1")
+
+	code := int32(0)
+	e.newBlip("b", withRoot("s"))
+	b := e.getBlip("b")
+	b.Finalizers = []string{v1.Finalizer}
+	b.Status.Phase = v1.BlipSaving
+	b.Status.RootAttachmentID = "save"
+	b.Status.ExitCode = &code
+	e.must(e.c.Update(e.ctx, b))
+	e.must(e.c.Status().Update(e.ctx, b))
+	e.must(e.c.Delete(e.ctx, b))
+
+	e.run(e.state, ns, "s")
+	if st = e.getState("s"); st.Status.Pending != nil || st.Status.Committed.ID != saved {
+		t.Fatalf("state did not resolve the save: %+v", st.Status)
+	}
+	e.run(e.blip, ns, "b")
+	b = &v1.Blip{}
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "b"}, b); err == nil {
+		if len(b.Finalizers) != 0 {
+			t.Fatalf("stuck save kept the Blip finalizer: %v", b.Finalizers)
+		}
+	}
+}
+
 // TestInitialVersionCommitsWithLostReplica covers the same node loss for a
 // generation-1 build: the survivors build from empty and can commit without
 // the node that disappeared.
