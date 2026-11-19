@@ -2,6 +2,7 @@ package blipchat
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -74,7 +75,42 @@ func (s *Sequencer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 		// (or owned) this turn. Leave it for pruning; never adopt it.
 		return ctrl.Result{}, nil
 	}
-	return ctrl.Result{}, s.sequence(ctx, &thread, &turn)
+	return ctrl.Result{}, s.sequenceThread(ctx, &thread)
+}
+
+// sequenceThread numbers every waiting turn of a thread in creation order.
+// Turns may be created before their thread exists, and the order in which
+// their requeues fire is arbitrary; sorting by creation time (then name and
+// UID) makes the assigned order deterministic.
+func (s *Sequencer) sequenceThread(ctx context.Context, thread *v1.BlipThread) error {
+	var turns v1.BlipTurnList
+	if err := s.List(ctx, &turns, client.InNamespace(thread.Namespace), client.MatchingFields{turnField: thread.Name}); err != nil {
+		return err
+	}
+	pending := make([]v1.BlipTurn, 0, len(turns.Items))
+	for i := range turns.Items {
+		t := &turns.Items[i]
+		if t.Status.Seq != 0 || t.DeletionTimestamp != nil || !turnBelongsToThread(t, thread) {
+			continue
+		}
+		pending = append(pending, *t)
+	}
+	sort.SliceStable(pending, func(i, j int) bool {
+		a, b := &pending[i], &pending[j]
+		if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+			return a.CreationTimestamp.Before(&b.CreationTimestamp)
+		}
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		return a.UID < b.UID
+	})
+	for i := range pending {
+		if err := s.sequence(ctx, thread, &pending[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // sequence assigns the next sequence number to turn. The turn write happens

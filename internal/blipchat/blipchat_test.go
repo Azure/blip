@@ -246,6 +246,73 @@ func TestSequencerOrdersTurns(t *testing.T) {
 	}
 }
 
+// Turns that arrive before their thread are numbered by creation time when
+// the thread appears, not by the arbitrary order their requeues fire.
+func TestSequencerOrdersWaitingTurnsByCreationTime(t *testing.T) {
+	base := metav1.NewTime(time.Now().Add(-time.Minute))
+	at := func(name string, offset time.Duration) *v1.BlipTurn {
+		turn := testTurn(name, "proj")
+		turn.CreationTimestamp = metav1.NewTime(base.Add(offset))
+		return turn
+	}
+	oldest := at("oldest", 0)
+	middle := at("middle", time.Second)
+	newest := at("newest", 2*time.Second)
+	c := testClient(t, newest, oldest, middle)
+	s := &Sequencer{Client: c}
+	ctx := context.Background()
+	req := func(name string) ctrl.Request {
+		return ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: name}}
+	}
+	// No thread yet: every turn waits.
+	for _, name := range []string{"oldest", "middle", "newest"} {
+		if result, err := s.Reconcile(ctx, req(name)); err != nil || result.RequeueAfter == 0 {
+			t.Fatalf("%s: result %+v err %v, want a requeue", name, result, err)
+		}
+	}
+	if err := c.Create(ctx, testThread()); err != nil {
+		t.Fatal(err)
+	}
+	// Any single turn event must sequence the whole backlog in order.
+	if _, err := s.Reconcile(ctx, req("newest")); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int64{"oldest": 1, "middle": 2, "newest": 3}
+	for name, seq := range want {
+		var turn v1.BlipTurn
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: name}, &turn); err != nil {
+			t.Fatal(err)
+		}
+		if turn.Status.Seq != seq {
+			t.Errorf("%s seq = %d, want %d", name, turn.Status.Seq, seq)
+		}
+	}
+}
+
+// Equal creation timestamps fall back to name order.
+func TestSequencerOrdersTiedTurnsByName(t *testing.T) {
+	ts := metav1.NewTime(time.Now())
+	b := testTurn("b", "proj")
+	b.CreationTimestamp = ts
+	a := testTurn("a", "proj")
+	a.CreationTimestamp = ts
+	c := testClient(t, testThread(), b, a)
+	s := &Sequencer{Client: c}
+	if _, err := s.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "b"}}); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int64{"a": 1, "b": 2}
+	for name, seq := range want {
+		var turn v1.BlipTurn
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: name}, &turn); err != nil {
+			t.Fatal(err)
+		}
+		if turn.Status.Seq != seq {
+			t.Errorf("%s seq = %d, want %d", name, turn.Status.Seq, seq)
+		}
+	}
+}
+
 // A conflict while writing the turn status must not consume a sequence
 // number: the old code advanced lastSeq first, leaving a permanent hole.
 func TestSequencerConflictDoesNotBurnSeq(t *testing.T) {
