@@ -1300,7 +1300,11 @@ func (r *BlipReconciler) fenced(b *v1.Blip, pod *corev1.Pod, obs *podapi.Observe
 		if left := exitAnnotationGrace - r.now().Sub(finishedAt(pod)); left > 0 {
 			return false, left
 		}
-		setReason(ReasonPodLost, "the VM exited without an exit status")
+		if stopping(b) {
+			setReason(ReasonStopped, "")
+		} else {
+			setReason(ReasonPodLost, "the VM exited without an exit status")
+		}
 		return true, 0
 	}
 	return false, 0
