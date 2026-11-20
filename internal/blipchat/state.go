@@ -212,6 +212,7 @@ func (v *chatView) observe(rec streamLogRecord) {
 		v.StartSeq = rec.Offset
 		v.Started = true
 	case recordEnd:
+		v.retireQuestion(rec.Gen)
 		v.Ended = true
 		v.Started = false
 		v.Inflight = nil
@@ -231,6 +232,9 @@ func (v *chatView) observe(rec streamLogRecord) {
 func (v *chatView) startGeneration(gen uint64) {
 	if gen == v.Gen && v.Started {
 		return
+	}
+	if gen > v.Gen {
+		v.retireQuestion(v.Gen)
 	}
 	v.Gen = gen
 	v.Started = false
@@ -526,6 +530,7 @@ func (v *chatView) observeNote(rec streamLogRecord) {
 			v.Question = nil
 		}
 	case noteCancel:
+		v.retireQuestion(rec.Gen)
 		if rec.Offset > v.CancelSeq {
 			v.CancelSeq = rec.Offset
 		}
@@ -546,10 +551,20 @@ func (v *chatView) observeNote(rec streamLogRecord) {
 		}
 		v.Queued = kept
 	case noteStop:
+		v.retireQuestion(rec.Gen)
 		if rec.Offset > v.StopSeq {
 			v.StopSeq = rec.Offset
 		}
 		v.dropPrompts(func(ref promptRef) bool { return ref.Offset < rec.Offset })
+	}
+}
+
+// retireQuestion closes a question whose waiting turn has gone away. Keep its
+// history and answers for replay, and never close a newer generation's question.
+func (v *chatView) retireQuestion(gen uint64) {
+	if v.Question != nil && v.QuestionGen <= gen {
+		v.Expired[v.Question.ID] = true
+		v.Question = nil
 	}
 }
 

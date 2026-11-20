@@ -1334,7 +1334,7 @@ func eventsFor(rec streamLogRecord, view *chatView) []Event {
 			out = append(out, Event{Offset: rec.Offset, Type: "acp", Message: message})
 		}
 		switch note.Type {
-		case noteQuestion, noteAnswer, noteConsumed, noteExpire:
+		case noteQuestion, noteAnswer, noteConsumed, noteExpire, noteCancel, noteStop:
 			out = append(out, Event{Offset: rec.Offset, Type: "status", Status: &Status{Running: view.Started, Question: view.Question}})
 		}
 		return out

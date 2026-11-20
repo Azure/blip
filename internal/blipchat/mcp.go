@@ -492,6 +492,11 @@ func (s *Server) toolAskUser(ctx context.Context, caller *Caller, question strin
 	for {
 		select {
 		case <-ctx.Done():
+			// The request is already cancelled, but its question must not
+			// capture the next user message. Only expire this call's QID.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelTimeout)
+			_, _ = s.writeNote(cleanupCtx, st.Name, noteRecord{Type: noteExpire, QID: q.ID})
+			cancel()
 			return "", ctx.Err()
 		case <-time.After(statusPoll):
 		}
