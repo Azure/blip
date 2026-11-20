@@ -164,17 +164,21 @@ func scanLogEnd(body io.Reader) (uint64, error) {
 }
 
 func wireError(err error) error {
-	switch {
-	case err == nil:
+	if err == nil {
 		return nil
-	case apierrors.IsConflict(err):
-		return fmt.Errorf("%w: %v", ErrNotRunning, err)
-	case apierrors.IsServiceUnavailable(err), apierrors.IsTooManyRequests(err):
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
+	// DoRaw builds a generic error from the HTTP status code, labeling a
+	// POST 409 AlreadyExists rather than preserving the server's reason.
 	var status apierrors.APIStatus
-	if errors.As(err, &status) && status.Status().Code == http.StatusPreconditionFailed {
-		return fmt.Errorf("%w: %v", ErrPrecondition, err)
+	if errors.As(err, &status) {
+		switch status.Status().Code {
+		case http.StatusConflict:
+			return fmt.Errorf("%w: %v", ErrNotRunning, err)
+		case http.StatusServiceUnavailable, http.StatusTooManyRequests:
+			return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		case http.StatusPreconditionFailed:
+			return fmt.Errorf("%w: %v", ErrPrecondition, err)
+		}
 	}
 	return err
 }
