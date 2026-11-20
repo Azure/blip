@@ -156,9 +156,10 @@ step "run a blip on the default pool and check its egress policy"
 blip_shell "$P-netpol" --from "$P-base"
 expect_ok_grep "default egress policy" "netpol-default-ok" blip_exec "$P-netpol" '
 	set -eu
-	# Cluster DNS is allowed; private ranges and metadata are not; the
-	# public 443 probe is the only outside dependency and is retried.
-	timeout 15 getent ahostsv4 kubernetes.default.svc >/dev/null
+	# The default pool uses public resolvers, so public DNS is allowed while
+	# cluster DNS, private ranges, and metadata are not. The public 443 probe
+	# is the only outside dependency and is retried.
+	timeout 15 getent ahostsv4 example.com >/dev/null
 	code=$(timeout 8 curl -sS -o /dev/null -w "%{http_code}" --max-time 5 http://10.96.0.1/ 2>/dev/null || true)
 	test "$code" = 000
 	code=$(timeout 8 curl -sS -o /dev/null -w "%{http_code}" --max-time 5 http://169.254.169.254/ 2>/dev/null || true)
@@ -191,8 +192,8 @@ expect_ok_grep "denied egress policy" "netpol-denied-ok" blip_exec "$P-netpol" '
 		sleep 1
 	done
 	test "$i" -lt 30
-	if timeout 10 getent ahostsv4 kubernetes.default.svc >/dev/null 2>&1; then
-		echo "DNS still resolves after denial"
+	if timeout 10 getent ahostsv4 example.com >/dev/null 2>&1; then
+		echo "public DNS still resolves after denial"
 		exit 1
 	fi
 	code=$(timeout 8 curl -sS -o /dev/null -w "%{http_code}" --max-time 5 http://10.96.0.1/ 2>/dev/null || true)
