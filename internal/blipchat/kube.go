@@ -7,12 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -29,6 +31,8 @@ type Cluster interface {
 	ForkSession(ctx context.Context, namespace string, source, dest *v1.BlipState, owner *metav1.OwnerReference) error
 	ListChildSessions(ctx context.Context, namespace, parent string) ([]v1.BlipState, error)
 	PatchSession(ctx context.Context, namespace, name string, labels, annotations map[string]string) error
+	// RecordStop advances the durable, exclusive queue cancellation boundary.
+	RecordStop(ctx context.Context, namespace, name string, before uint64) error
 	ListSessionBlips(ctx context.Context, namespace string) ([]v1.Blip, error)
 	ListStateBlips(ctx context.Context, namespace, state string) ([]v1.Blip, error)
 	CreateBlip(ctx context.Context, namespace string, blip *v1.Blip) error
@@ -132,6 +136,24 @@ func (k *kubeCluster) ListSessionBlips(ctx context.Context, namespace string) ([
 		return nil, err
 	}
 	return list.Items, nil
+}
+
+func (k *kubeCluster) RecordStop(ctx context.Context, namespace, name string, before uint64) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var st v1.BlipState
+		if err := k.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &st); err != nil {
+			return err
+		}
+		if stopBefore(&st) >= before {
+			return nil
+		}
+		base := st.DeepCopy()
+		if st.Annotations == nil {
+			st.Annotations = map[string]string{}
+		}
+		st.Annotations[AnnotationStopBefore] = strconv.FormatUint(before, 10)
+		return k.c.Patch(ctx, &st, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
 }
 
 func (k *kubeCluster) ListStateBlips(ctx context.Context, namespace, state string) ([]v1.Blip, error) {

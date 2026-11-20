@@ -210,6 +210,9 @@ func (e *chatEngine) run() {
 }
 
 func (e *chatEngine) applyState(st *v1.BlipState) {
+	if e.view != nil {
+		e.view.applyStopBefore(stopBefore(st))
+	}
 	if session := st.Annotations[AnnotationACPSession]; session != "" {
 		e.sessionID = session
 		e.savedACP = session
@@ -333,6 +336,9 @@ func (e *chatEngine) converge(ctx context.Context) error {
 		return nil
 	}
 	gen := generationOf(active)
+	if gen <= int64(e.view.Gen) && e.view.Started && e.view.StopSeq > e.view.StartSeq {
+		return e.s.stopBlip(ctx, e.name)
+	}
 	switch {
 	case gen > int64(e.view.Gen):
 		// The log has not caught up with the blip yet.
@@ -355,6 +361,18 @@ func (e *chatEngine) converge(ctx context.Context) error {
 		e.eofSent = false
 		e.cancelSentAt = time.Time{}
 		e.permissionID = ""
+	}
+	// Setup can hang too. Check before the readiness gates below, otherwise
+	// an agent that never answers session/new can never reach its watchdog.
+	if !e.stalled && ((e.view.InitSent && !e.view.InitDone) ||
+		(e.view.SessionSent && !e.view.SessionReady) || e.view.busy()) &&
+		!e.progressAt.IsZero() && time.Since(e.progressAt) > promptTimeout {
+		e.s.log.Warn("chat agent stopped responding", "session", e.name, "generation", e.view.Gen)
+		if err := e.s.stopBlip(ctx, e.name); err != nil {
+			return err
+		}
+		e.stalled = true
+		return nil
 	}
 
 	if !e.view.InitDone {
@@ -414,18 +432,6 @@ func (e *chatEngine) converge(ctx context.Context) error {
 			return err
 		}
 		e.savedTitle = e.view.TitleSeq
-	}
-	if e.view.StopSeq > e.view.StartSeq {
-		return e.s.stopBlip(ctx, e.name)
-	}
-	// A lost request or a hung agent would otherwise wedge the chat until the
-	// blip's idle timeout. Silence on the ring for promptTimeout means the
-	// turn is dead; stopping the blip lets the next generation retry it.
-	if !e.stalled && ((e.view.SessionSent && !e.view.SessionReady) || e.view.busy()) &&
-		!e.progressAt.IsZero() && time.Since(e.progressAt) > promptTimeout {
-		e.stalled = true
-		e.s.log.Warn("chat agent stopped responding", "session", e.name, "generation", e.view.Gen)
-		return e.s.stopBlip(ctx, e.name)
 	}
 	if e.view.Permission != nil && rawID(e.view.Permission.ID) != e.permissionID {
 		frame := permissionReply(e.view.Permission.ID, e.view.Permission.Method, e.view.Permission.Params, e.s.autoApprove)
@@ -616,6 +622,12 @@ func (s *Server) ensureRunning(ctx context.Context, st *v1.BlipState, profile Pr
 				if err != nil {
 					return nil, err
 				}
+				if running := runningBlip(blips); running != nil {
+					return running, nil
+				}
+				if active := activeBlip(blips); active != nil {
+					return s.waitRunning(ctx, active.Name)
+				}
 				maxGen = 0
 				for i := range blips {
 					if g := generationOf(&blips[i]); g > maxGen {
@@ -760,7 +772,7 @@ func (s *Server) invalidateView(name string) {
 }
 
 func (s *Server) readView(ctx context.Context, st *v1.BlipState) *chatView {
-	if v := s.cachedView(st.Name); v != nil {
+	if v := s.cachedView(st.Name); v != nil && v.stopBefore >= stopBefore(st) {
 		return v
 	}
 	v := newChatView(st.Annotations[AnnotationACPSession])
@@ -781,6 +793,7 @@ func (s *Server) readView(ctx context.Context, st *v1.BlipState) *chatView {
 		}
 		v.observe(rec)
 	}
+	v.applyStopBefore(stopBefore(st))
 	s.viewsMu.Lock()
 	if len(s.views) > 512 {
 		clear(s.views)

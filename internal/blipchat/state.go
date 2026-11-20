@@ -12,8 +12,9 @@ import (
 )
 
 // A chat's durable state is the trajectory ring of its BlipState. Blipchat
-// writes user intent as "note" records next to the ACP traffic and derives
-// everything else by replaying the log. No state lives in the blipchat pod.
+// writes user intent as "note" records next to the ACP traffic. When no writer
+// is attached, a stop boundary on the BlipState cancels older queued work.
+// No durable state lives in the blipchat pod.
 const (
 	maxTranscriptMessages = 10000
 	maxTranscriptBytes    = 16 << 20
@@ -160,6 +161,7 @@ type chatView struct {
 	CancelSeq    uint64
 	LastCancelIn uint64
 	StopSeq      uint64
+	stopBefore   uint64
 
 	Title     string
 	TitleSeq  uint64
@@ -226,6 +228,7 @@ func (v *chatView) observe(rec streamLogRecord) {
 		v.appendTranscript(outputFrame("stderr", string(rec.Data)))
 	case recordNote:
 		v.observeNote(rec)
+		v.applyStopBefore(v.stopBefore)
 	}
 }
 
@@ -566,6 +569,29 @@ func (v *chatView) retireQuestion(gen uint64) {
 		v.Expired[v.Question.ID] = true
 		v.Question = nil
 	}
+}
+
+// applyStopBefore also applies to records replayed after the boundary was
+// loaded. A stopped queue must not reappear when an engine catches up or moves
+// to another replica. A new prompt exactly at the boundary remains eligible.
+func (v *chatView) applyStopBefore(before uint64) {
+	if before > v.stopBefore {
+		v.stopBefore = before
+	}
+	if v.stopBefore == 0 {
+		return
+	}
+	if v.stopBefore > v.StopSeq {
+		v.StopSeq = v.stopBefore
+	}
+	v.dropPrompts(func(ref promptRef) bool { return ref.Offset < v.stopBefore })
+	kept := v.Answers[:0]
+	for _, answer := range v.Answers {
+		if answer.Offset >= v.stopBefore {
+			kept = append(kept, answer)
+		}
+	}
+	v.Answers = kept
 }
 
 func (v *chatView) dropPrompts(drop func(promptRef) bool) {

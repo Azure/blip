@@ -1176,28 +1176,27 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	st, err := s.authorizedChat(r.Context(), forwardedUser(r), name)
+	_, err := s.authorizedChat(r.Context(), forwardedUser(r), name)
 	if err != nil {
 		writeClusterError(w, err)
 		return
 	}
 	writeCtx, cancel := messageContext(r)
 	defer cancel()
-	if view := s.readView(r.Context(), st); view.hasWork() {
-		// With queued work a blip may not be attached right now. Recording
-		// the stop through appendNote starts one if needed, so the queued
-		// prompts are actually dropped instead of running after the stop.
-		if profile, perr := s.profileFor(st); perr == nil {
-			if err := s.appendNote(writeCtx, st, profile, noteRecord{Type: noteStop}); err != nil {
-				s.log.Warn("record stop", "session", name, "error", err)
-			}
-		}
-	} else {
-		if _, err := s.writeNote(writeCtx, name, noteRecord{Type: noteStop}); err != nil && !errors.Is(err, ErrNotRunning) {
-			s.log.Warn("record stop", "session", name, "error", err)
+	_, recordErr := s.writeNote(writeCtx, name, noteRecord{Type: noteStop})
+	if errors.Is(recordErr, ErrNotRunning) {
+		// No writer is attached. Persist the ring boundary instead of
+		// starting (and waiting for) a VM just to cancel its queued work.
+		var before uint64
+		before, recordErr = s.wire.LogEnd(writeCtx, s.namespace, name)
+		if recordErr == nil {
+			recordErr = s.cluster.RecordStop(writeCtx, s.namespace, name, before)
+			s.invalidateView(name)
 		}
 	}
-	if err := s.stopBlip(writeCtx, name); err != nil {
+	// A recording failure must not prevent the immediate stop, nor may it
+	// be reported as success: without durable intent the queue could retry.
+	if err := errors.Join(recordErr, s.stopBlip(writeCtx, name)); err != nil {
 		writeClusterError(w, err)
 		return
 	}

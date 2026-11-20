@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -49,6 +50,53 @@ func TestKubeStopBlip(t *testing.T) {
 	}
 	if !blip.Spec.Stop {
 		t.Fatal("spec.stop was not set")
+	}
+}
+
+// A newer stop races the first conditional patch. Retrying must preserve the
+// newer boundary, rather than allowing cancelled prompts to reappear.
+type stopConflictClient struct {
+	client.Client
+	conflicted bool
+}
+
+func (c *stopConflictClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if !c.conflicted {
+		c.conflicted = true
+		var newer v1.BlipState
+		if err := c.Client.Get(ctx, client.ObjectKeyFromObject(obj), &newer); err != nil {
+			return err
+		}
+		newer.Annotations[AnnotationStopBefore] = "200"
+		if err := c.Client.Update(ctx, &newer); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestKubeRecordStopPreservesNewerBoundaryOnConflict(t *testing.T) {
+	c := &stopConflictClient{Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(&v1.BlipState{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "chat-1", Annotations: map[string]string{AnnotationStopBefore: "10", AnnotationTitle: "keep"}},
+	}).Build()}
+	k := &kubeCluster{c: c}
+	ctx := context.Background()
+	if err := k.RecordStop(ctx, "team", "chat-1", 100); err != nil {
+		t.Fatal(err)
+	}
+	st, err := k.GetSession(ctx, "team", "chat-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.conflicted || stopBefore(st) != 200 || st.Annotations[AnnotationTitle] != "keep" {
+		t.Fatalf("concurrent stop not preserved: conflicted=%v annotations=%v", c.conflicted, st.Annotations)
+	}
+	if err := k.RecordStop(ctx, "team", "chat-1", 300); err != nil {
+		t.Fatal(err)
+	}
+	st, err = k.GetSession(ctx, "team", "chat-1")
+	if err != nil || stopBefore(st) != 300 {
+		t.Fatalf("stop boundary did not advance: state=%v err=%v", st, err)
 	}
 }
 

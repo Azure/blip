@@ -15,9 +15,9 @@ import (
 
 // Labels and annotations blipchat keeps on a chat's BlipState. They are
 // low-churn metadata: the title the agent reports, the ACP session to resume,
-// the ring offset the chat starts at, and the tree position. Everything else,
-// including every message, prompt, note, and question, lives in the trajectory
-// ring.
+// the ring offsets the chat starts and stops at, and the tree position.
+// Everything else, including every message, prompt, note, and question, lives
+// in the trajectory ring.
 const (
 	LabelSession = v1.LabelChatSession
 	LabelParent  = v1.AnnotationChatParent
@@ -29,6 +29,7 @@ const (
 	AnnotationBase          = "chat.blip.dev/base"
 	AnnotationACPSession    = "chat.blip.dev/acp-session"
 	AnnotationStart         = "chat.blip.dev/start"
+	AnnotationStopBefore    = "chat.blip.dev/stop-before"
 	AnnotationGeneration    = "chat.blip.dev/generation"
 	AnnotationParent        = v1.AnnotationChatParent
 	AnnotationRoot          = v1.AnnotationChatRoot
@@ -36,6 +37,11 @@ const (
 	AnnotationParentProfile = v1.AnnotationChatParentProfile
 	AnnotationParentDepth   = v1.AnnotationChatParentDepth
 )
+
+func stopBefore(st *v1.BlipState) uint64 {
+	n, _ := strconv.ParseUint(st.Annotations[AnnotationStopBefore], 10, 64)
+	return n
+}
 
 // Errors the handlers map to HTTP statuses and tool results.
 var (

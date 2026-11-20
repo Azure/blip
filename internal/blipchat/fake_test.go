@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -180,6 +181,22 @@ func (f *fakeCluster) ListSessionBlips(_ context.Context, ns string) ([]v1.Blip,
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeCluster) RecordStop(_ context.Context, ns, name string, before uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.states[key(ns, name)]
+	if !ok {
+		return apierrors.NewNotFound(schema.GroupResource{Group: "blip.dev", Resource: "blipstates"}, name)
+	}
+	if before > stopBefore(st) {
+		if st.Annotations == nil {
+			st.Annotations = map[string]string{}
+		}
+		st.Annotations[AnnotationStopBefore] = strconv.FormatUint(before, 10)
+	}
+	return nil
 }
 
 func (f *fakeCluster) ListStateBlips(_ context.Context, ns, state string) ([]v1.Blip, error) {
