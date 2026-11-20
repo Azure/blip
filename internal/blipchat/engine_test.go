@@ -177,6 +177,53 @@ func TestEnginePromptFlow(t *testing.T) {
 	}
 }
 
+func TestEngineFramesEndWithNewline(t *testing.T) {
+	f := newEngineFixture(t)
+	f.startGeneration(t, 1)
+	f.wire.note(noteRecord{Type: notePrompt, ID: "n1", Text: "hello", Original: "hello"})
+	f.start(t)
+
+	waitFor(t, "prompt p-n1", func() bool {
+		ids := f.wire.promptIDs()
+		return len(ids) > 0 && ids[0] == "p-n1"
+	})
+
+	f.wire.emitACP(1, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "perm-1",
+		"method":  "session/request_permission",
+		"params": map[string]any{
+			"sessionId": "acp-session-1",
+			"options": []any{
+				map[string]string{"optionId": "allow-1", "kind": "allow_once"},
+			},
+		},
+	})
+	waitFor(t, "permission reply", func() bool {
+		_, ok := engineSent(f.wire, "perm-1")
+		return ok
+	})
+
+	f.wire.note(noteRecord{Type: noteCancel})
+	waitFor(t, "cancel", func() bool {
+		for _, msg := range f.wire.messages() {
+			if msg.method == "session/cancel" {
+				return true
+			}
+		}
+		return false
+	})
+
+	for _, msg := range f.wire.messages() {
+		if msg.eof || msg.note {
+			continue
+		}
+		if len(msg.raw) == 0 || msg.raw[len(msg.raw)-1] != '\n' {
+			t.Fatalf("%s frame %q does not end with a newline", msg.method, msg.raw)
+		}
+	}
+}
+
 func TestEngineComparesStateWriteGeneration(t *testing.T) {
 	for _, tt := range []struct {
 		name      string

@@ -46,7 +46,9 @@ func promptRequestID(noteID string) string { return "p-" + noteID }
 func answerRequestID(offset uint64) string { return fmt.Sprintf("p-answer-%d", offset) }
 
 // sendLine writes one newline-delimited JSON frame. ACP is NDJSON, and some
-// agents do not dispatch a request until they see the terminating newline.
+// agents (notably opencode) do not dispatch a request until they see the
+// terminating newline. Every frame written to the agent's stdin must pass
+// through this helper.
 func sendLine(frame []byte) []byte {
 	if len(frame) == 0 || frame[len(frame)-1] == '\n' {
 		return frame

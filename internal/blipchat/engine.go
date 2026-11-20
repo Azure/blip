@@ -519,9 +519,12 @@ func (e *chatEngine) appendSeq() uint64 {
 	return 0
 }
 
-// send writes one ACP frame. ok is false when the write lost a race or the
-// generation is ending; both are retried after the view catches up.
+// send writes one ACP frame. It is the only path that forwards client frames
+// to the agent's stdin, so every frame is terminated here. ok is false when the
+// write lost a race or the generation is ending; both are retried after the
+// view catches up.
 func (e *chatEngine) send(ctx context.Context, data []byte, after uint64) (bool, error) {
+	data = sendLine(data)
 	for attempt := 0; attempt < 5; attempt++ {
 		offset, err := e.s.wire.Send(ctx, e.s.namespace, e.name, data, false, false, after)
 		switch {
