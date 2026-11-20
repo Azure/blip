@@ -1,0 +1,777 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+// Package v1alpha1 contains the blip.dev/v1alpha1 API.
+//
+// Ownership rules (see the README's implementation outline):
+//   - Users write spec.
+//   - The controller is the only writer of Blip.status, BlipPool.status,
+//     BlipNode.spec, and every BlipState.status field except status.nodes.
+//   - Each node agent writes only its own entry in BlipState.status.nodes
+//     (server-side apply, field manager "blip-node/<node>") and its own
+//     BlipNode.status.
+//
+// +kubebuilder:object:generate=true
+// +groupName=blip.dev
+package v1alpha1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/scheme"
+)
+
+var (
+	GroupVersion  = schema.GroupVersion{Group: "blip.dev", Version: "v1alpha1"}
+	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+	AddToScheme   = SchemeBuilder.AddToScheme
+)
+
+func init() {
+	SchemeBuilder.Register(&Blip{}, &BlipList{}, &BlipState{}, &BlipStateList{},
+		&BlipPool{}, &BlipPoolList{}, &BlipNode{}, &BlipNodeList{})
+}
+
+// ---------------------------------------------------------------------------
+// BlipPool
+
+// BlipPoolSpec describes a VM shape and how many warm VMs to keep. Pools are
+// image independent: a warm VM has no root disk until it is claimed.
+type BlipPoolSpec struct {
+	// +kubebuilder:validation:Enum=kvm
+	// +kubebuilder:default=kvm
+	Hypervisor string `json:"hypervisor,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2147483647
+	// +kubebuilder:default=2
+	CPUs int32 `json:"cpus,omitempty"`
+	// Memory is the guest RAM. It must be positive: the controller adds the
+	// VMM overhead, so a negative value would make the pod request negative
+	// memory and the pool would never create a VM.
+	// +kubebuilder:default="2Gi"
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="memory must be greater than 0"
+	Memory resource.Quantity `json:"memory,omitempty"`
+	// WarmCount is the number of vacant, booted VMs to keep ready.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	WarmCount int32 `json:"warmCount,omitempty"`
+	// MaxCount caps vacant plus claimed VM pods. 0 means no cap.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	MaxCount int32 `json:"maxCount,omitempty"`
+	// ServiceAccountName is the identity of VMs in this pool. It is capped
+	// below the generic 253-character DNS limit so the "sa.<name>" key in the
+	// VM owner ConfigMap fits the 253-character key limit.
+	// +kubebuilder:validation:MaxLength=250
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+	// Endpoints exposes fixed HTTPS endpoints to workloads at http://<name>/.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(e, !(e.name in ['blip', 'kube-apiserver', 'localhost']))",message="endpoint name is reserved"
+	Endpoints []PoolEndpoint `json:"endpoints,omitempty"`
+	// NodeSelector selects the nodes that run this pool's VMs. It must be
+	// non-empty: matching nodes are enrolled automatically and run the node
+	// agent.
+	// +kubebuilder:validation:MinProperties=1
+	NodeSelector map[string]string   `json:"nodeSelector"`
+	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
+	// ImagePullSecrets authenticate pulls of the pool's infrastructure pod
+	// images. Image states use their own imagePullSecrets.
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+	// Network is the maximum egress allowed for this pool. Omitted denies all
+	// egress. Changes apply to running blips.
+	Network *NetworkPolicy `json:"network,omitempty"`
+	// DNS configures the resolvers the guest uses. Omitted uses public
+	// resolvers, avoiding cluster DNS for workload traffic.
+	DNS *PoolDNS `json:"dns,omitempty"`
+}
+
+// PoolDNS configures the guest's resolv.conf. Search domains and resolver
+// options are intentionally unsupported.
+type PoolDNS struct {
+	// Nameservers are the IPv4 resolvers the guest queries, in order.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:default={"1.1.1.1","1.0.0.1"}
+	// +kubebuilder:validation:XValidation:rule="self.all(ns, isCIDR(ns + '/32') && cidr(ns + '/32').ip().family() == 4)",message="nameservers must be IPv4 addresses"
+	Nameservers []string `json:"nameservers,omitempty"`
+}
+
+// PoolEndpoint is one HTTPS endpoint the pool's sidecar routes guest requests
+// to. The guest reaches it at http://<name>/.
+type PoolEndpoint struct {
+	// Name is the guest hostname.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+	// URL is the HTTPS URL. Its host is dialed, used for TLS SNI and the
+	// outbound Host header.
+	// +kubebuilder:validation:Pattern=`^https://[a-z0-9]([-.a-z0-9]*[a-z0-9])?(:[0-9]{1,5})?$`
+	URL string `json:"url"`
+	// Audience is the projected service account token audience. It requires
+	// spec.serviceAccountName.
+	// +optional
+	Audience string `json:"audience,omitempty"`
+	// CAConfigMap holds a ca.crt key that verifies the endpoint. Omitted
+	// uses system roots.
+	// +optional
+	CAConfigMap string `json:"caConfigMap,omitempty"`
+}
+
+type BlipPoolStatus struct {
+	// Ready counts vacant VMs that finished booting.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	Ready int32 `json:"ready,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	Vacant int32 `json:"vacant,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	Claimed int32 `json:"claimed,omitempty"`
+	// Reason is a CamelCase cause set when the pool configuration cannot
+	// produce VMs, for example InvalidConfiguration for an endpoint that
+	// admission could not reject.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// Message is a human-readable explanation of Reason.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Warm",type=integer,JSONPath=`.spec.warmCount`
+// +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.ready`
+// +kubebuilder:printcolumn:name="Claimed",type=integer,JSONPath=`.status.claimed`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+type BlipPool struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              BlipPoolSpec   `json:"spec,omitempty"`
+	Status            BlipPoolStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type BlipPoolList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []BlipPool `json:"items"`
+}
+
+// ---------------------------------------------------------------------------
+// BlipState
+
+// BlipStateSpec is one durable ext4 filesystem. A state can be a blip's root
+// filesystem or an auxiliary mount. Provisioning fields are immutable;
+// mounts and runtime defaults can be updated for subsequent or running blips.
+//
+// +kubebuilder:validation:XValidation:rule="!(has(self.image) && size(self.image) > 0 && has(self.copyFrom) && size(self.copyFrom) > 0)",message="set at most one of image and copyFrom"
+// +kubebuilder:validation:XValidation:rule="!(has(self.image) && size(self.image) > 0 && has(self.replicas))",message="replicas cannot be set for image states; they are held by every eligible node"
+// +kubebuilder:validation:XValidation:rule="(has(self.image) && size(self.image) > 0) == (has(oldSelf.image) && size(oldSelf.image) > 0) && (!has(self.image) || size(self.image) == 0 || self.image == oldSelf.image)",message="image is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.copyFrom) && size(self.copyFrom) > 0) == (has(oldSelf.copyFrom) && size(oldSelf.copyFrom) > 0) && (!has(self.copyFrom) || size(self.copyFrom) == 0 || self.copyFrom == oldSelf.copyFrom)",message="copyFrom is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size == oldSelf.size)",message="size is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas) || self.replicas == oldSelf.replicas)",message="replicas is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.nodeSelector) && size(self.nodeSelector) > 0) == (has(oldSelf.nodeSelector) && size(oldSelf.nodeSelector) > 0) && (!has(self.nodeSelector) || size(self.nodeSelector) == 0 || self.nodeSelector == oldSelf.nodeSelector)",message="nodeSelector is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.imagePullSecrets) && size(self.imagePullSecrets) > 0) == (has(oldSelf.imagePullSecrets) && size(oldSelf.imagePullSecrets) > 0) && (!has(self.imagePullSecrets) || size(self.imagePullSecrets) == 0 || self.imagePullSecrets == oldSelf.imagePullSecrets)",message="imagePullSecrets is immutable"
+type BlipStateSpec struct {
+	// Image initializes the filesystem from a container image, which each
+	// node converts to ext4 itself. Every eligible node (matching
+	// nodeSelector) holds an image state. Without image or copyFrom the
+	// state starts as an empty ext4 filesystem. Image states may only be
+	// attached read-only; copy one to create a writable root.
+	Image string `json:"image,omitempty"`
+	// CopyFrom names a state in the same namespace. A copy either pins the
+	// source's committed version or, if the source has an active writer,
+	// takes a live snapshot of its disk. If the source is saving, the copy
+	// waits for that save and pins its new version. A committed copy is not
+	// affected by later source changes or deletion. A live snapshot is
+	// replanned onto the source's post-save commit if that writer stops or
+	// starts saving before the copy commits.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=253
+	CopyFrom string `json:"copyFrom,omitempty"`
+	// Size is the filesystem size. Defaults to the source state's size for
+	// copies and to 10Gi otherwise. An image state fails if the converted
+	// image does not fit.
+	//
+	// Size is an int-or-string in the schema, so the rules check the string
+	// form as a quantity and the integer form numerically. Admission rejects
+	// sizes above MaxStateSizeBytes, matching the command-line preflight and
+	// the controller's own terminal check.
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="size must be greater than 0"
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? !quantity(self).isGreaterThan(quantity('1Ti')) : self <= 1099511627776",message="size must be at most 1Ti"
+	Size *resource.Quantity `json:"size,omitempty"`
+	// StreamSize is the size of the trajectory ring that stores the blip's
+	// input and output after its filesystem. It defaults to 64Mi and is
+	// immutable. Copies inherit the source's ring size, so forked blips see
+	// the parent's conversation.
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="streamSize must be greater than 0"
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? !quantity(self).isGreaterThan(quantity('1Gi')) : self <= 1073741824",message="streamSize must be at most 1Gi"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="streamSize is immutable"
+	StreamSize *resource.Quantity `json:"streamSize,omitempty"`
+	// Replicas is the number of nodes that hold every committed version.
+	// Default 3. Must not be set for image states.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3
+	Replicas int32 `json:"replicas,omitempty"`
+	// NodeSelector limits which nodes may hold the state.
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	// ImagePullSecrets authenticate the image pull when Image is set.
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+	// Mounts attaches states when this state is used as a blip's root.
+	// Changes apply to the running blip.
+	//
+	// Paths must be unique and must not overlap, either lexically or after
+	// resolving a known base-image alias: the controller and guest would
+	// reject the topology on every execution. The rule visits ordered pairs,
+	// so it canonically rewrites only the first path; only the aliases in
+	// internal/mountpath.Aliases are known offline, and their targets are
+	// not themselves aliases, so one rewrite pass reaches their identity.
+	// +kubebuilder:validation:XValidation:rule="self.all(m, self.all(o, m.path == o.path || !((m.path + '/').startsWith(o.path + '/') || (o.path + '/').startsWith(m.path + '/') || (((m.path == '/var/run' || m.path.startsWith('/var/run/')) ? m.path.replace('/var/run', '/run', 1) : (m.path == '/var/lock' || m.path.startsWith('/var/lock/')) ? m.path.replace('/var/lock', '/run/lock', 1) : (m.path == '/bin' || m.path.startsWith('/bin/')) ? m.path.replace('/bin', '/usr/bin', 1) : (m.path == '/sbin' || m.path.startsWith('/sbin/')) ? m.path.replace('/sbin', '/usr/sbin', 1) : (m.path == '/lib' || m.path.startsWith('/lib/')) ? m.path.replace('/lib', '/usr/lib', 1) : (m.path == '/lib64' || m.path.startsWith('/lib64/')) ? m.path.replace('/lib64', '/usr/lib64', 1) : (m.path == '/var/spool/mail' || m.path.startsWith('/var/spool/mail/')) ? m.path.replace('/var/spool/mail', '/var/mail', 1) : m.path) + '/').startsWith(o.path + '/') || (o.path + '/').startsWith(((m.path == '/var/run' || m.path.startsWith('/var/run/')) ? m.path.replace('/var/run', '/run', 1) : (m.path == '/var/lock' || m.path.startsWith('/var/lock/')) ? m.path.replace('/var/lock', '/run/lock', 1) : (m.path == '/bin' || m.path.startsWith('/bin/')) ? m.path.replace('/bin', '/usr/bin', 1) : (m.path == '/sbin' || m.path.startsWith('/sbin/')) ? m.path.replace('/sbin', '/usr/sbin', 1) : (m.path == '/lib' || m.path.startsWith('/lib/')) ? m.path.replace('/lib', '/usr/lib', 1) : (m.path == '/lib64' || m.path.startsWith('/lib64/')) ? m.path.replace('/lib64', '/usr/lib64', 1) : (m.path == '/var/spool/mail' || m.path.startsWith('/var/spool/mail/')) ? m.path.replace('/var/spool/mail', '/var/mail', 1) : m.path) + '/'))))",message="mount paths must not overlap"
+	// +kubebuilder:validation:XValidation:rule="self.all(m, self.exists_one(o, o.path == m.path))",message="mount paths must be unique"
+	// +listType=map
+	// +listMapKey=state
+	// +kubebuilder:validation:MaxItems=16
+	Mounts []Mount `json:"mounts,omitempty"`
+	// Runtime supplies execution defaults over the imported image metadata.
+	// Blip execution overrides take precedence.
+	Runtime *RuntimeDefaults `json:"runtime,omitempty"`
+}
+
+// DefaultStreamSize is the default trajectory ring size.
+const DefaultStreamSize int64 = 64 << 20
+
+// MaxStateSizeBytes is the largest filesystem size a BlipState accepts. It
+// must be small enough that a node can provision it: an accepted state that
+// exceeds every node's free space reaches the node and starts a long mkfs that
+// exhausts the shared thin pool. The controller additionally rejects a state
+// larger than the free space of every node it would place it on.
+const MaxStateSizeBytes int64 = 1 << 40 // 1 TiB
+
+const (
+	StatePending = "Pending" // initial version not committed yet
+	StateReady   = "Ready"   // committed, no writer
+	StateInUse   = "InUse"   // a writer holds the state
+	StateSaving  = "Saving"  // a new version is replicating
+	StateFailed  = "Failed"  // initialization failed permanently
+)
+
+// Commit identifies one immutable, committed version of a state.
+type Commit struct {
+	// ID is unique across all states and versions.
+	ID         string      `json:"id"`
+	Generation int64       `json:"generation"`
+	SizeBytes  int64       `json:"sizeBytes"`
+	Time       metav1.Time `json:"time"`
+	// AttachmentID is the writer that produced this version; empty for
+	// the initial version.
+	AttachmentID string `json:"attachmentID,omitempty"`
+}
+
+// Writer is the single writable attachment of a state.
+type Writer struct {
+	// AttachmentID is unique per acquisition.
+	AttachmentID string `json:"attachmentID"`
+	BlipName     string `json:"blipName"`
+	BlipUID      string `json:"blipUID"`
+	// PodName/PodUID/Node are the claimed VM pod.
+	PodName string `json:"podName"`
+	PodUID  string `json:"podUID"`
+	Node    string `json:"node"`
+	// BaseCommit is the committed version the writer started from.
+	BaseCommit string `json:"baseCommit"`
+}
+
+// PendingCommit is a new version that is being replicated. It becomes
+// status.committed once every node in Replicas reports holding it.
+type PendingCommit struct {
+	CommitID   string `json:"commitID"`
+	Generation int64  `json:"generation"`
+	// SourceNode builds or already holds the version.
+	SourceNode string `json:"sourceNode"`
+	// AttachmentID is the writer that produced it; empty for the initial
+	// version.
+	AttachmentID string `json:"attachmentID,omitempty"`
+	// Replicas are the nodes that must hold the version before commit.
+	Replicas []string `json:"replicas"`
+	// Since is when the controller first observed this pending version. It
+	// bounds how long a save may wait for replicas before it falls back to
+	// committing on a source that still holds it.
+	Since *metav1.Time `json:"since,omitempty"`
+}
+
+// CopySource is the exact version a copy was created from.
+type CopySource struct {
+	StateUID string `json:"stateUID"`
+	// CommitID is the source's committed version, or empty for a live copy.
+	CommitID string `json:"commitID,omitempty"`
+	// AttachmentID is set for a live copy: a snapshot of the source's
+	// running writer attachment, taken on Nodes[0] while the guest keeps
+	// the filesystem frozen.
+	AttachmentID string `json:"attachmentID,omitempty"`
+	// Nodes held the source version when the copy was resolved.
+	Nodes []string `json:"nodes"`
+}
+
+// NodeObservation is written only by the node agent named by Node.
+type NodeObservation struct {
+	Node string `json:"node"`
+	// Incarnation must equal BlipNode.status.incarnation, otherwise the
+	// entry is ignored (the node lost its storage).
+	Incarnation string `json:"incarnation"`
+	// Commits are the commit IDs this node durably holds for this state.
+	Commits []string `json:"commits,omitempty"`
+	// Sealed reports the outcome of ending a writable attachment on this
+	// node. CommitID is empty when the data could not be saved.
+	Sealed []SealResult `json:"sealed,omitempty"`
+	// Fetching is the commit being copied to this node, with progress.
+	Fetching *Transfer `json:"fetching,omitempty"`
+	Error    string    `json:"error,omitempty"`
+}
+
+type SealResult struct {
+	AttachmentID string `json:"attachmentID"`
+	CommitID     string `json:"commitID,omitempty"`
+	SizeBytes    int64  `json:"sizeBytes,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// ImageConfig is the image metadata that affects how a container image root
+// is presented to the guest. It is copied into a state's status so copies and
+// image states do not need their original source or image after creation.
+type ImageConfig struct {
+	Env        []string `json:"env,omitempty"` // KEY=VALUE
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	Cmd        []string `json:"cmd,omitempty"`
+	WorkingDir string   `json:"workingDir,omitempty"`
+	User       string   `json:"user,omitempty"`
+}
+
+type Transfer struct {
+	CommitID   string `json:"commitID"`
+	DoneBytes  int64  `json:"doneBytes"`
+	TotalBytes int64  `json:"totalBytes"`
+}
+
+type BlipStateStatus struct {
+	// Phase is one of the documented BlipState phases. An unknown value is
+	// rejected at admission so a status writer cannot leave a state in a
+	// phase that no reconcile path can advance or clean up.
+	// +kubebuilder:validation:Enum=Pending;Ready;InUse;Saving;Failed
+	Phase   string `json:"phase,omitempty"`
+	Message string `json:"message,omitempty"`
+	// ImageDigest is the resolved container image (digest reference
+	// repo@sha256:...) for image-initialized states.
+	ImageDigest string `json:"imageDigest,omitempty"`
+	// ImageConfig is the container image metadata resolved when the state
+	// was created. It is copied into copies and remains valid after the
+	// original image or source state is gone.
+	ImageConfig *ImageConfig `json:"imageConfig,omitempty"`
+	CopiedFrom  *CopySource  `json:"copiedFrom,omitempty"`
+	SizeBytes   int64        `json:"sizeBytes,omitempty"`
+	// StreamSize is the effective trajectory ring size, resolved at
+	// initialization from the spec or the copy source.
+	StreamSize int64          `json:"streamSize,omitempty"`
+	Committed  *Commit        `json:"committed,omitempty"`
+	Writer     *Writer        `json:"writer,omitempty"`
+	Pending    *PendingCommit `json:"pending,omitempty"`
+	// Seals records the outcome of ended writer attachments, keyed by
+	// attachment ID. The controller keeps entries long enough for the Blip
+	// that wrote them to observe the result, so a later save cannot hide an
+	// earlier failure.
+	// +listType=map
+	// +listMapKey=attachmentID
+	// +kubebuilder:validation:MaxItems=32
+	Seals []SealResult `json:"seals,omitempty"`
+	// LastError is the latest node-side preparation error for this state.
+	LastError string `json:"lastError,omitempty"`
+	// Placements are the nodes that hold (or are being given) the
+	// committed version.
+	Placements []string `json:"placements,omitempty"`
+	// UnplaceableSince is when a copy first found no node matching its
+	// immutable nodeSelector. It bounds how long such a copy may pin its
+	// source's finalizer before failing terminally.
+	UnplaceableSince *metav1.Time `json:"unplaceableSince,omitempty"`
+	// +listType=map
+	// +listMapKey=node
+	Nodes []NodeObservation `json:"nodes,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=bst
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Gen",type=integer,JSONPath=`.status.committed.generation`
+// +kubebuilder:printcolumn:name="Writer",type=string,JSONPath=`.status.writer.blipName`
+// +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.spec.replicas`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+type BlipState struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              BlipStateSpec   `json:"spec"`
+	Status            BlipStateStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type BlipStateList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []BlipState `json:"items"`
+}
+
+// ---------------------------------------------------------------------------
+// Blip
+
+// NetworkPolicy allows IPv4 egress. Rules are ORed; an empty policy denies all.
+type NetworkPolicy struct {
+	// +kubebuilder:validation:MaxItems=64
+	Egress []NetworkEgressRule `json:"egress,omitempty"`
+}
+
+// NetworkEgressRule allows the intersection of its destinations and ports.
+type NetworkEgressRule struct {
+	// To selects IPv4 destination blocks. Omitted or empty means all IPv4
+	// destinations.
+	// +kubebuilder:validation:MaxItems=64
+	To []NetworkPeer `json:"to,omitempty"`
+	// Ports allows numeric TCP/UDP destination ports. Omitted or empty means
+	// all IP protocols and ports. Service ports are not translated here.
+	// +kubebuilder:validation:MaxItems=64
+	Ports []NetworkPort `json:"ports,omitempty"`
+}
+
+// NetworkPeer is an IPv4 destination block. Selectors are deliberately
+// unsupported: resolving cluster objects requires cluster-wide reads and can
+// go stale between reconciles.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.ipBlock)",message="a peer must select an IP block"
+type NetworkPeer struct {
+	// IPBlock allows an IPv4 CIDR minus its strictly smaller exception CIDRs.
+	IPBlock *NetworkIPBlock `json:"ipBlock,omitempty"`
+}
+
+// NetworkIPBlock is an IPv4 CIDR with optional, strictly smaller exceptions.
+//
+// +kubebuilder:validation:XValidation:rule="isCIDR(self.cidr) && cidr(self.cidr).ip().family() == 4",message="cidr must be a valid IPv4 CIDR"
+// Check containment with containsIP rather than containsCIDR: Kubernetes 1.31's
+// containsCIDR compares an unmasked PrefixFrom(exceptionAddr, parentBits), so it
+// rejects valid exceptions whose address is not the parent's network address.
+// +kubebuilder:validation:XValidation:rule="!has(self.except) || self.except.all(c, isCIDR(c) && cidr(c).ip().family() == 4 && cidr(self.cidr).containsIP(cidr(c).ip()) && cidr(c).prefixLength() > cidr(self.cidr).prefixLength())",message="exceptions must be IPv4 CIDRs strictly inside cidr"
+type NetworkIPBlock struct {
+	// CIDR is an IPv4 destination range, for example 192.0.2.0/24.
+	// +kubebuilder:validation:MaxLength=18
+	CIDR string `json:"cidr"`
+	// Except removes IPv4 subranges from CIDR.
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=18
+	// +listType=atomic
+	Except []string `json:"except,omitempty"`
+}
+
+// NetworkPort is a numeric destination port or inclusive port range.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.endPort) || self.endPort >= self.port",message="endPort must be at least port"
+type NetworkPort struct {
+	// +kubebuilder:validation:Enum=TCP;UDP
+	// +kubebuilder:default=TCP
+	Protocol corev1.Protocol `json:"protocol,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	EndPort *int32 `json:"endPort,omitempty"`
+}
+
+// Mount attaches a state's filesystem inside a running blip.
+//
+// A path reserved by the guest may not be used at, below, or above. The one
+// exception is a read-only temporary collect mount, scoped to one blip, at
+// exactly one level below the reserved collect root.
+//
+// +kubebuilder:validation:XValidation:rule="!['/proc', '/sys', '/dev', '/run/blip', '/run/blip-collect', '/var/run/blip', '/var/run/blip-collect'].exists(r, self.path == r || self.path.startsWith(r + '/') || r.startsWith(self.path + '/')) || (self.path.startsWith('/run/blip-collect/') && self.path.split('/').size() == 4 && has(self.blipUID) && self.blipUID.size() > 0 && (!has(self.writable) || !self.writable))",message="path must not be at, below, or above a guest-reserved path, except a read-only temporary collect mount"
+type Mount struct {
+	// State names a BlipState in the blip's namespace.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=253
+	State string `json:"state"`
+	// Path is an absolute path inside the guest root. It must be clean: no
+	// trailing slash, repeated slash, or . and .. segments. It must also be
+	// creatable by the Linux guest: at most 4086 bytes, the Linux PATH_MAX
+	// limit less the guest root prefix, with every component within NAME_MAX
+	// bytes, and not a reserved, guest-managed, or non-directory image path.
+	// These mirror internal/mountpath so kubectl
+	// apply cannot write intent that every later Blip on the root will fail
+	// to mount. Admission also caps the component count so the per-component
+	// byte check stays within the API server's CEL cost budget. A temporary
+	// collect mount (read-only and scoped to one blip) is the one allowed
+	// exception below the reserved collect root.
+	// +kubebuilder:validation:Pattern=`^/[^/]+(/[^/]+)*$`
+	// +kubebuilder:validation:MaxLength=4086
+	// +kubebuilder:validation:XValidation:rule="!self.split('/').exists(s, s == '.' || s == '..')",message="path must not contain . or .. segments"
+	// +kubebuilder:validation:XValidation:rule="bytes(self).size() <= 4086",message="path must be at most 4086 bytes: Linux PATH_MAX less the guest root prefix"
+	// +kubebuilder:validation:XValidation:rule="self.split('/').size() <= 256",message="path must have at most 255 components"
+	// +kubebuilder:validation:XValidation:rule="self.split('/', 256).all(s, bytes(s).size() <= 255)",message="path components must be at most 255 bytes, the Linux NAME_MAX limit"
+	// +kubebuilder:validation:XValidation:rule="!self.matches('[\\\\x00-\\\\x1f\\\\x7f]')",message="path must not contain control characters"
+	// +kubebuilder:validation:XValidation:rule="!['/etc/hosts', '/etc/resolv.conf', '/etc/passwd', '/etc/group', '/etc/shadow', '/etc/gshadow', '/etc/hostname', '/etc/hostid', '/etc/machine-id', '/etc/os-release', '/usr/lib/os-release', '/lib/os-release', '/etc/debian_version', '/etc/nsswitch.conf', '/etc/subuid', '/etc/subgid', '/etc/timezone', '/etc/shells', '/etc/ld.so.cache', '/etc/ld.so.conf', '/etc/bash.bashrc', '/etc/environment', '/etc/profile', '/etc/inputrc', '/etc/login.defs', '/etc/host.conf', '/etc/gai.conf', '/etc/mtab'].exists(f, self == f || self.startsWith(f + '/'))",message="path must not be at or below a file in the guest or base image"
+	Path string `json:"path"`
+	// Writable mounts take the state's single writer slot and save a new
+	// version when unmounted. Read-only mounts pin the committed version.
+	Writable bool `json:"writable,omitempty"`
+	// BlipUID scopes a temporary mount to one execution. Empty keeps the
+	// mount across executions of the root state.
+	BlipUID string `json:"blipUID,omitempty"`
+}
+
+type EnvVar struct {
+	Name  string `json:"name"`
+	Value string `json:"value,omitempty"`
+}
+
+// RuntimeDefaults supplies defaults for executions of a root state. Startup
+// values are resolved once at claim; Network changes apply to running blips
+// that do not override it.
+type RuntimeDefaults struct {
+	Env        []EnvVar `json:"env,omitempty"`
+	WorkingDir string   `json:"workingDir,omitempty"`
+	User       string   `json:"user,omitempty"`
+	// Network narrows the pool's egress policy. Omitted inherits the pool;
+	// explicitly empty denies all.
+	Network *NetworkPolicy `json:"network,omitempty"`
+}
+
+// BlipSpec is one VM lifetime: one command that runs as the primary session.
+// The blip ends when the command exits.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.command) == has(oldSelf.command) && (!has(self.command) || self.command == oldSelf.command)",message="command is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env == oldSelf.env)",message="env is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.workingDir) == has(oldSelf.workingDir)) && (!has(self.workingDir) || self.workingDir == oldSelf.workingDir)",message="workingDir is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user == oldSelf.user)",message="user is immutable"
+type BlipSpec struct {
+	// Pool names a BlipPool in the blip's namespace.
+	// +kubebuilder:default=default
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="pool is immutable"
+	Pool string `json:"pool,omitempty"`
+	// State gives the blip a durable root filesystem. A new version is
+	// saved when the blip stops. Mounts and runtime defaults come from this
+	// state in the blip's namespace.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="state is immutable"
+	State string `json:"state"`
+	// Command runs as the primary session. The blip ends when it exits.
+	// +kubebuilder:validation:MinItems=1
+	Command []string `json:"command"`
+	Env     []EnvVar `json:"env,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="workingDir is immutable"
+	WorkingDir string `json:"workingDir,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="user is immutable"
+	User string `json:"user,omitempty"`
+	// IdleTimeoutSeconds stops a blip whose command has produced no input or
+	// output for this long. It is a backstop for interactive agents, not a
+	// deadline: `blip run` leaves it unset and relies on
+	// activeDeadlineSeconds. The exit reason is Idle, which is treated like
+	// Stopped (the root is saved and the blip succeeds).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9223372036
+	// +optional
+	IdleTimeoutSeconds *int64 `json:"idleTimeoutSeconds,omitempty"`
+	// Stop asks the blip to shut down gracefully and save.
+	Stop bool `json:"stop,omitempty"`
+	// ActiveDeadlineSeconds stops the blip's command when it has run this
+	// long. The VM is stopped as if spec.stop were set. `blip run --timeout`
+	// sets it.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9223372036
+	// +optional
+	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
+	// TTLSecondsAfterFinished deletes the blip this long after it finished,
+	// whether or not anyone gathered its results. `blip run --ttl` sets it.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	// +optional
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+	// Network narrows the pool's egress policy. Omitted inherits the root
+	// state's runtime network policy, or the pool if neither is set.
+	// Explicitly empty denies all. Changes apply to running blips.
+	Network *NetworkPolicy `json:"network,omitempty"`
+}
+
+const (
+	BlipPending   = "Pending"   // waiting for a VM or for states
+	BlipRunning   = "Running"   // the VM is claimed and running
+	BlipSaving    = "Saving"    // the VM stopped; writable states are saving
+	BlipSucceeded = "Succeeded" // command exited 0 and all saves committed
+	BlipFailed    = "Failed"
+)
+
+const (
+	MountPending    = "Pending"
+	MountMounted    = "Mounted"
+	MountUnmounting = "Unmounting"
+	MountSaving     = "Saving"
+	MountFailed     = "Failed"
+)
+
+type MountStatus struct {
+	State    string `json:"state"`
+	Path     string `json:"path"`
+	Writable bool   `json:"writable,omitempty"`
+	// StateUID and CommitID pin the version: the mounted version for
+	// read-only mounts, the base version for writable mounts.
+	StateUID string `json:"stateUID,omitempty"`
+	CommitID string `json:"commitID,omitempty"`
+	// AttachmentID is unique per mount operation.
+	AttachmentID string `json:"attachmentID,omitempty"`
+	// InClaim records that this writable mount was part of the claim the
+	// guest accepted. The guest only accepts a claim after every such mount
+	// is attached, so its disk must be saved on stop even if the last
+	// observation predates the attachment. A mount added to a running Blip
+	// is not in the claim and may never attach.
+	InClaim bool `json:"inClaim,omitempty"`
+	// Phase is one of the documented mount phases. An unknown value is
+	// rejected at admission so the controller and CLI cannot be left
+	// waiting on a mount that is in no known phase.
+	// +kubebuilder:validation:Enum=Pending;Mounted;Unmounting;Saving;Failed
+	Phase   string `json:"phase"`
+	Message string `json:"message,omitempty"`
+	// Switching is set while the mount is being changed between read-only
+	// and writable. It remains set if the switch fails so the previous
+	// mode stays visible.
+	Switching bool `json:"switching,omitempty"`
+}
+
+type BlipStatus struct {
+	// Phase is one of the documented Blip phases. An unknown value is
+	// rejected at admission so a status writer cannot leave a Blip in a
+	// phase that no reconcile path can advance or clean up.
+	// +kubebuilder:validation:Enum=Pending;Running;Saving;Succeeded;Failed
+	Phase   string `json:"phase,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
+	Pod     string `json:"pod,omitempty"`
+	PodUID  string `json:"podUID,omitempty"`
+	Node    string `json:"node,omitempty"`
+	// StateGeneration is the observed desired generation of the root state.
+	StateGeneration int64 `json:"stateGeneration,omitempty"`
+	// RootStateUID is the UID of the root state once a pending Blip has seen
+	// it. A root that disappears after that was deleted; it is never
+	// recreated for this Blip, so waiting for it cannot succeed.
+	RootStateUID string `json:"rootStateUID,omitempty"`
+	// MountStateUIDs pins the mount states a pending Blip has seen. A state
+	// deleted and recreated under the same name is a different filesystem;
+	// attaching it would silently substitute data the Blip never saw.
+	MountStateUIDs map[string]string `json:"mountStateUIDs,omitempty"`
+	// RootAttachmentID is the writer attachment of a durable root.
+	RootAttachmentID string       `json:"rootAttachmentID,omitempty"`
+	StartTime        *metav1.Time `json:"startTime,omitempty"`
+	FinishTime       *metav1.Time `json:"finishTime,omitempty"`
+	// ExitCode is the command's exit status. It is 0-255 for a real process,
+	// but the bound is the int32 range so a malformed status cannot break the
+	// controller's typed list/watch decode.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	ExitCode *int32 `json:"exitCode,omitempty"`
+	// +listType=map
+	// +listMapKey=state
+	Mounts []MountStatus `json:"mounts,omitempty"`
+	// Locality is where a pending Blip's durable data lives. The pool
+	// boots a VM pinned to that node so the Blip does not start on a
+	// remote clone.
+	Locality *Locality `json:"locality,omitempty"`
+}
+
+// Locality records the node a pending Blip prefers and whether it still
+// waits for a VM there.
+type Locality struct {
+	// Node holds the root state (or the most writable mount states).
+	Node string `json:"node"`
+	// Since is when the Blip, with all its states usable, started waiting
+	// for a VM on Node.
+	Since *metav1.Time `json:"since,omitempty"`
+	// Fallback means the Blip stopped waiting and claims any warm VM.
+	Fallback bool `json:"fallback,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Root",type=string,JSONPath=`.spec.state`
+// +kubebuilder:printcolumn:name="Exit",type=integer,JSONPath=`.status.exitCode`
+// +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.node`
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.reason`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+type Blip struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              BlipSpec   `json:"spec"`
+	Status            BlipStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type BlipList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []Blip `json:"items"`
+}
+
+// ---------------------------------------------------------------------------
+// BlipNode (internal)
+
+type BlipNodeSpec struct {
+	// Drain stops writers on this node gracefully (durable states save and
+	// replicas are moved to other nodes) and prevents new claims. The node
+	// is safe to remove once it holds no needed replicas or writers. Admins
+	// set it to remove a node; the controller also sets it when no BlipPool
+	// selects the node.
+	Drain bool `json:"drain,omitempty"`
+}
+
+type BlipNodeStatus struct {
+	// Incarnation changes whenever the node's storage is recreated.
+	Incarnation string `json:"incarnation,omitempty"`
+	// TLSPublicKey is the base64-encoded Ed25519 public key used to authenticate
+	// peer TLS connections.
+	TLSPublicKey string `json:"tlsPublicKey,omitempty"`
+	// Endpoint is the node's host IPv4 address for HTTPS control and NVMe/TCP.
+	Endpoint string `json:"endpoint,omitempty"`
+	// Hypervisors are the hypervisors this node supports, for example
+	// ["kvm"]. The controller requires at least one before scheduling VMs or
+	// state replicas on the node.
+	Hypervisors []string     `json:"hypervisors,omitempty"`
+	FreeBytes   int64        `json:"freeBytes,omitempty"`
+	Heartbeat   *metav1.Time `json:"heartbeat,omitempty"`
+	// SafeToRemove is set by the controller once a draining node holds
+	// no needed replicas and runs no writers.
+	SafeToRemove bool `json:"safeToRemove,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
+// +kubebuilder:printcolumn:name="Drain",type=boolean,JSONPath=`.spec.drain`
+// +kubebuilder:printcolumn:name="SafeToRemove",type=boolean,JSONPath=`.status.safeToRemove`
+// +kubebuilder:printcolumn:name="Heartbeat",type=date,JSONPath=`.status.heartbeat`
+type BlipNode struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              BlipNodeSpec   `json:"spec,omitempty"`
+	Status            BlipNodeStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type BlipNodeList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []BlipNode `json:"items"`
+}

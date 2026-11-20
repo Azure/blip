@@ -1,0 +1,714 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: blipstates.blip.dev
+spec:
+  group: blip.dev
+  names:
+    kind: BlipState
+    listKind: BlipStateList
+    plural: blipstates
+    shortNames:
+    - bst
+    singular: blipstate
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.committed.generation
+      name: Gen
+      type: integer
+    - jsonPath: .status.writer.blipName
+      name: Writer
+      type: string
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BlipStateSpec is one durable ext4 filesystem. A state can be a blip's root
+              filesystem or an auxiliary mount. Provisioning fields are immutable;
+              mounts and runtime defaults can be updated for subsequent or running blips.
+            properties:
+              copyFrom:
+                description: |-
+                  CopyFrom names a state in the same namespace. A copy either pins the
+                  source's committed version or, if the source has an active writer,
+                  takes a live snapshot of its disk. If the source is saving, the copy
+                  waits for that save and pins its new version. A committed copy is not
+                  affected by later source changes or deletion. A live snapshot is
+                  replanned onto the source's post-save commit if that writer stops or
+                  starts saving before the copy commits.
+                maxLength: 253
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                type: string
+              image:
+                description: |-
+                  Image initializes the filesystem from a container image, which each
+                  node converts to ext4 itself. Every eligible node (matching
+                  nodeSelector) holds an image state. Without image or copyFrom the
+                  state starts as an empty ext4 filesystem. Image states may only be
+                  attached read-only; copy one to create a writable root.
+                type: string
+              imagePullSecrets:
+                description: ImagePullSecrets authenticate the image pull when Image
+                  is set.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+              mounts:
+                description: |-
+                  Mounts attaches states when this state is used as a blip's root.
+                  Changes apply to the running blip.
+
+                  Paths must be unique and must not overlap, either lexically or after
+                  resolving a known base-image alias: the controller and guest would
+                  reject the topology on every execution. The rule visits ordered pairs,
+                  so it canonically rewrites only the first path; only the aliases in
+                  internal/mountpath.Aliases are known offline, and their targets are
+                  not themselves aliases, so one rewrite pass reaches their identity.
+                items:
+                  description: |-
+                    Mount attaches a state's filesystem inside a running blip.
+
+                    A path reserved by the guest may not be used at, below, or above. The one
+                    exception is a read-only temporary collect mount, scoped to one blip, at
+                    exactly one level below the reserved collect root.
+                  properties:
+                    blipUID:
+                      description: |-
+                        BlipUID scopes a temporary mount to one execution. Empty keeps the
+                        mount across executions of the root state.
+                      type: string
+                    path:
+                      description: |-
+                        Path is an absolute path inside the guest root. It must be clean: no
+                        trailing slash, repeated slash, or . and .. segments. It must also be
+                        creatable by the Linux guest: at most 4086 bytes, the Linux PATH_MAX
+                        limit less the guest root prefix, with every component within NAME_MAX
+                        bytes, and not a reserved, guest-managed, or non-directory image path.
+                        These mirror internal/mountpath so kubectl
+                        apply cannot write intent that every later Blip on the root will fail
+                        to mount. Admission also caps the component count so the per-component
+                        byte check stays within the API server's CEL cost budget. A temporary
+                        collect mount (read-only and scoped to one blip) is the one allowed
+                        exception below the reserved collect root.
+                      maxLength: 4086
+                      pattern: ^/[^/]+(/[^/]+)*$
+                      type: string
+                      x-kubernetes-validations:
+                      - message: path must not contain . or .. segments
+                        rule: '!self.split(''/'').exists(s, s == ''.'' || s == ''..'')'
+                      - message: 'path must be at most 4086 bytes: Linux PATH_MAX
+                          less the guest root prefix'
+                        rule: bytes(self).size() <= 4086
+                      - message: path must have at most 255 components
+                        rule: self.split('/').size() <= 256
+                      - message: path components must be at most 255 bytes, the Linux
+                          NAME_MAX limit
+                        rule: self.split('/', 256).all(s, bytes(s).size() <= 255)
+                      - message: path must not contain control characters
+                        rule: '!self.matches(''[\\x00-\\x1f\\x7f]'')'
+                      - message: path must not be at or below a file in the guest
+                          or base image
+                        rule: '![''/etc/hosts'', ''/etc/resolv.conf'', ''/etc/passwd'',
+                          ''/etc/group'', ''/etc/shadow'', ''/etc/gshadow'', ''/etc/hostname'',
+                          ''/etc/hostid'', ''/etc/machine-id'', ''/etc/os-release'',
+                          ''/usr/lib/os-release'', ''/lib/os-release'', ''/etc/debian_version'',
+                          ''/etc/nsswitch.conf'', ''/etc/subuid'', ''/etc/subgid'',
+                          ''/etc/timezone'', ''/etc/shells'', ''/etc/ld.so.cache'',
+                          ''/etc/ld.so.conf'', ''/etc/bash.bashrc'', ''/etc/environment'',
+                          ''/etc/profile'', ''/etc/inputrc'', ''/etc/login.defs'',
+                          ''/etc/host.conf'', ''/etc/gai.conf'', ''/etc/mtab''].exists(f,
+                          self == f || self.startsWith(f + ''/''))'
+                    state:
+                      description: State names a BlipState in the blip's namespace.
+                      maxLength: 253
+                      pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                      type: string
+                    writable:
+                      description: |-
+                        Writable mounts take the state's single writer slot and save a new
+                        version when unmounted. Read-only mounts pin the committed version.
+                      type: boolean
+                  required:
+                  - path
+                  - state
+                  type: object
+                  x-kubernetes-validations:
+                  - message: path must not be at, below, or above a guest-reserved
+                      path, except a read-only temporary collect mount
+                    rule: '![''/proc'', ''/sys'', ''/dev'', ''/run/blip'', ''/run/blip-collect'',
+                      ''/var/run/blip'', ''/var/run/blip-collect''].exists(r, self.path
+                      == r || self.path.startsWith(r + ''/'') || r.startsWith(self.path
+                      + ''/'')) || (self.path.startsWith(''/run/blip-collect/'') &&
+                      self.path.split(''/'').size() == 4 && has(self.blipUID) && self.blipUID.size()
+                      > 0 && (!has(self.writable) || !self.writable))'
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - state
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: mount paths must not overlap
+                  rule: 'self.all(m, self.all(o, m.path == o.path || !((m.path + ''/'').startsWith(o.path
+                    + ''/'') || (o.path + ''/'').startsWith(m.path + ''/'') || (((m.path
+                    == ''/var/run'' || m.path.startsWith(''/var/run/'')) ? m.path.replace(''/var/run'',
+                    ''/run'', 1) : (m.path == ''/var/lock'' || m.path.startsWith(''/var/lock/''))
+                    ? m.path.replace(''/var/lock'', ''/run/lock'', 1) : (m.path ==
+                    ''/bin'' || m.path.startsWith(''/bin/'')) ? m.path.replace(''/bin'',
+                    ''/usr/bin'', 1) : (m.path == ''/sbin'' || m.path.startsWith(''/sbin/''))
+                    ? m.path.replace(''/sbin'', ''/usr/sbin'', 1) : (m.path == ''/lib''
+                    || m.path.startsWith(''/lib/'')) ? m.path.replace(''/lib'', ''/usr/lib'',
+                    1) : (m.path == ''/lib64'' || m.path.startsWith(''/lib64/''))
+                    ? m.path.replace(''/lib64'', ''/usr/lib64'', 1) : (m.path == ''/var/spool/mail''
+                    || m.path.startsWith(''/var/spool/mail/'')) ? m.path.replace(''/var/spool/mail'',
+                    ''/var/mail'', 1) : m.path) + ''/'').startsWith(o.path + ''/'')
+                    || (o.path + ''/'').startsWith(((m.path == ''/var/run'' || m.path.startsWith(''/var/run/''))
+                    ? m.path.replace(''/var/run'', ''/run'', 1) : (m.path == ''/var/lock''
+                    || m.path.startsWith(''/var/lock/'')) ? m.path.replace(''/var/lock'',
+                    ''/run/lock'', 1) : (m.path == ''/bin'' || m.path.startsWith(''/bin/''))
+                    ? m.path.replace(''/bin'', ''/usr/bin'', 1) : (m.path == ''/sbin''
+                    || m.path.startsWith(''/sbin/'')) ? m.path.replace(''/sbin'',
+                    ''/usr/sbin'', 1) : (m.path == ''/lib'' || m.path.startsWith(''/lib/''))
+                    ? m.path.replace(''/lib'', ''/usr/lib'', 1) : (m.path == ''/lib64''
+                    || m.path.startsWith(''/lib64/'')) ? m.path.replace(''/lib64'',
+                    ''/usr/lib64'', 1) : (m.path == ''/var/spool/mail'' || m.path.startsWith(''/var/spool/mail/''))
+                    ? m.path.replace(''/var/spool/mail'', ''/var/mail'', 1) : m.path)
+                    + ''/''))))'
+                - message: mount paths must be unique
+                  rule: self.all(m, self.exists_one(o, o.path == m.path))
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: NodeSelector limits which nodes may hold the state.
+                type: object
+              replicas:
+                description: |-
+                  Replicas is the number of nodes that hold every committed version.
+                  Default 3. Must not be set for image states.
+                format: int32
+                maximum: 3
+                minimum: 1
+                type: integer
+              runtime:
+                description: |-
+                  Runtime supplies execution defaults over the imported image metadata.
+                  Blip execution overrides take precedence.
+                properties:
+                  env:
+                    items:
+                      properties:
+                        name:
+                          type: string
+                        value:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  network:
+                    description: |-
+                      Network narrows the pool's egress policy. Omitted inherits the pool;
+                      explicitly empty denies all.
+                    properties:
+                      egress:
+                        items:
+                          description: NetworkEgressRule allows the intersection of
+                            its destinations and ports.
+                          properties:
+                            ports:
+                              description: |-
+                                Ports allows numeric TCP/UDP destination ports. Omitted or empty means
+                                all IP protocols and ports. Service ports are not translated here.
+                              items:
+                                description: NetworkPort is a numeric destination
+                                  port or inclusive port range.
+                                properties:
+                                  endPort:
+                                    format: int32
+                                    maximum: 65535
+                                    minimum: 1
+                                    type: integer
+                                  port:
+                                    format: int32
+                                    maximum: 65535
+                                    minimum: 1
+                                    type: integer
+                                  protocol:
+                                    default: TCP
+                                    description: Protocol defines network protocols
+                                      supported for things like container ports.
+                                    enum:
+                                    - TCP
+                                    - UDP
+                                    type: string
+                                required:
+                                - port
+                                type: object
+                                x-kubernetes-validations:
+                                - message: endPort must be at least port
+                                  rule: '!has(self.endPort) || self.endPort >= self.port'
+                              maxItems: 64
+                              type: array
+                            to:
+                              description: |-
+                                To selects IPv4 destination blocks. Omitted or empty means all IPv4
+                                destinations.
+                              items:
+                                description: |-
+                                  NetworkPeer is an IPv4 destination block. Selectors are deliberately
+                                  unsupported: resolving cluster objects requires cluster-wide reads and can
+                                  go stale between reconciles.
+                                properties:
+                                  ipBlock:
+                                    description: IPBlock allows an IPv4 CIDR minus
+                                      its strictly smaller exception CIDRs.
+                                    properties:
+                                      cidr:
+                                        description: CIDR is an IPv4 destination range,
+                                          for example 192.0.2.0/24.
+                                        maxLength: 18
+                                        type: string
+                                      except:
+                                        description: Except removes IPv4 subranges
+                                          from CIDR.
+                                        items:
+                                          maxLength: 18
+                                          type: string
+                                        maxItems: 32
+                                        type: array
+                                        x-kubernetes-list-type: atomic
+                                    required:
+                                    - cidr
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: cidr must be a valid IPv4 CIDR
+                                      rule: isCIDR(self.cidr) && cidr(self.cidr).ip().family()
+                                        == 4
+                                    - message: exceptions must be IPv4 CIDRs strictly
+                                        inside cidr
+                                      rule: '!has(self.except) || self.except.all(c,
+                                        isCIDR(c) && cidr(c).ip().family() == 4 &&
+                                        cidr(self.cidr).containsIP(cidr(c).ip()) &&
+                                        cidr(c).prefixLength() > cidr(self.cidr).prefixLength())'
+                                type: object
+                                x-kubernetes-validations:
+                                - message: a peer must select an IP block
+                                  rule: has(self.ipBlock)
+                              maxItems: 64
+                              type: array
+                          type: object
+                        maxItems: 64
+                        type: array
+                    type: object
+                  user:
+                    type: string
+                  workingDir:
+                    type: string
+                type: object
+              size:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  Size is the filesystem size. Defaults to the source state's size for
+                  copies and to 10Gi otherwise. An image state fails if the converted
+                  image does not fit.
+
+                  Size is an int-or-string in the schema, so the rules check the string
+                  form as a quantity and the integer form numerically. Admission rejects
+                  sizes above MaxStateSizeBytes, matching the command-line preflight and
+                  the controller's own terminal check.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: size must be greater than 0
+                  rule: 'type(self) == string ? quantity(self).isGreaterThan(quantity(''0''))
+                    : self > 0'
+                - message: size must be at most 1Ti
+                  rule: 'type(self) == string ? !quantity(self).isGreaterThan(quantity(''1Ti''))
+                    : self <= 1099511627776'
+              streamSize:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  StreamSize is the size of the trajectory ring that stores the blip's
+                  input and output after its filesystem. It defaults to 64Mi and is
+                  immutable. Copies inherit the source's ring size, so forked blips see
+                  the parent's conversation.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: streamSize must be greater than 0
+                  rule: 'type(self) == string ? quantity(self).isGreaterThan(quantity(''0''))
+                    : self > 0'
+                - message: streamSize must be at most 1Gi
+                  rule: 'type(self) == string ? !quantity(self).isGreaterThan(quantity(''1Gi''))
+                    : self <= 1073741824'
+                - message: streamSize is immutable
+                  rule: self == oldSelf
+            type: object
+            x-kubernetes-validations:
+            - message: set at most one of image and copyFrom
+              rule: '!(has(self.image) && size(self.image) > 0 && has(self.copyFrom)
+                && size(self.copyFrom) > 0)'
+            - message: replicas cannot be set for image states; they are held by every
+                eligible node
+              rule: '!(has(self.image) && size(self.image) > 0 && has(self.replicas))'
+            - message: image is immutable
+              rule: (has(self.image) && size(self.image) > 0) == (has(oldSelf.image)
+                && size(oldSelf.image) > 0) && (!has(self.image) || size(self.image)
+                == 0 || self.image == oldSelf.image)
+            - message: copyFrom is immutable
+              rule: (has(self.copyFrom) && size(self.copyFrom) > 0) == (has(oldSelf.copyFrom)
+                && size(oldSelf.copyFrom) > 0) && (!has(self.copyFrom) || size(self.copyFrom)
+                == 0 || self.copyFrom == oldSelf.copyFrom)
+            - message: size is immutable
+              rule: has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size
+                == oldSelf.size)
+            - message: replicas is immutable
+              rule: has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas)
+                || self.replicas == oldSelf.replicas)
+            - message: nodeSelector is immutable
+              rule: (has(self.nodeSelector) && size(self.nodeSelector) > 0) == (has(oldSelf.nodeSelector)
+                && size(oldSelf.nodeSelector) > 0) && (!has(self.nodeSelector) ||
+                size(self.nodeSelector) == 0 || self.nodeSelector == oldSelf.nodeSelector)
+            - message: imagePullSecrets is immutable
+              rule: (has(self.imagePullSecrets) && size(self.imagePullSecrets) > 0)
+                == (has(oldSelf.imagePullSecrets) && size(oldSelf.imagePullSecrets)
+                > 0) && (!has(self.imagePullSecrets) || size(self.imagePullSecrets)
+                == 0 || self.imagePullSecrets == oldSelf.imagePullSecrets)
+          status:
+            properties:
+              committed:
+                description: Commit identifies one immutable, committed version of
+                  a state.
+                properties:
+                  attachmentID:
+                    description: |-
+                      AttachmentID is the writer that produced this version; empty for
+                      the initial version.
+                    type: string
+                  generation:
+                    format: int64
+                    type: integer
+                  id:
+                    description: ID is unique across all states and versions.
+                    type: string
+                  sizeBytes:
+                    format: int64
+                    type: integer
+                  time:
+                    format: date-time
+                    type: string
+                required:
+                - generation
+                - id
+                - sizeBytes
+                - time
+                type: object
+              copiedFrom:
+                description: CopySource is the exact version a copy was created from.
+                properties:
+                  attachmentID:
+                    description: |-
+                      AttachmentID is set for a live copy: a snapshot of the source's
+                      running writer attachment, taken on Nodes[0] while the guest keeps
+                      the filesystem frozen.
+                    type: string
+                  commitID:
+                    description: CommitID is the source's committed version, or empty
+                      for a live copy.
+                    type: string
+                  nodes:
+                    description: Nodes held the source version when the copy was resolved.
+                    items:
+                      type: string
+                    type: array
+                  stateUID:
+                    type: string
+                required:
+                - nodes
+                - stateUID
+                type: object
+              imageConfig:
+                description: |-
+                  ImageConfig is the container image metadata resolved when the state
+                  was created. It is copied into copies and remains valid after the
+                  original image or source state is gone.
+                properties:
+                  cmd:
+                    items:
+                      type: string
+                    type: array
+                  entrypoint:
+                    items:
+                      type: string
+                    type: array
+                  env:
+                    items:
+                      type: string
+                    type: array
+                  user:
+                    type: string
+                  workingDir:
+                    type: string
+                type: object
+              imageDigest:
+                description: |-
+                  ImageDigest is the resolved container image (digest reference
+                  repo@sha256:...) for image-initialized states.
+                type: string
+              lastError:
+                description: LastError is the latest node-side preparation error for
+                  this state.
+                type: string
+              message:
+                type: string
+              nodes:
+                items:
+                  description: NodeObservation is written only by the node agent named
+                    by Node.
+                  properties:
+                    commits:
+                      description: Commits are the commit IDs this node durably holds
+                        for this state.
+                      items:
+                        type: string
+                      type: array
+                    error:
+                      type: string
+                    fetching:
+                      description: Fetching is the commit being copied to this node,
+                        with progress.
+                      properties:
+                        commitID:
+                          type: string
+                        doneBytes:
+                          format: int64
+                          type: integer
+                        totalBytes:
+                          format: int64
+                          type: integer
+                      required:
+                      - commitID
+                      - doneBytes
+                      - totalBytes
+                      type: object
+                    incarnation:
+                      description: |-
+                        Incarnation must equal BlipNode.status.incarnation, otherwise the
+                        entry is ignored (the node lost its storage).
+                      type: string
+                    node:
+                      type: string
+                    sealed:
+                      description: |-
+                        Sealed reports the outcome of ending a writable attachment on this
+                        node. CommitID is empty when the data could not be saved.
+                      items:
+                        properties:
+                          attachmentID:
+                            type: string
+                          commitID:
+                            type: string
+                          error:
+                            type: string
+                          sizeBytes:
+                            format: int64
+                            type: integer
+                        required:
+                        - attachmentID
+                        type: object
+                      type: array
+                  required:
+                  - incarnation
+                  - node
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - node
+                x-kubernetes-list-type: map
+              pending:
+                description: |-
+                  PendingCommit is a new version that is being replicated. It becomes
+                  status.committed once every node in Replicas reports holding it.
+                properties:
+                  attachmentID:
+                    description: |-
+                      AttachmentID is the writer that produced it; empty for the initial
+                      version.
+                    type: string
+                  commitID:
+                    type: string
+                  generation:
+                    format: int64
+                    type: integer
+                  replicas:
+                    description: Replicas are the nodes that must hold the version
+                      before commit.
+                    items:
+                      type: string
+                    type: array
+                  since:
+                    description: |-
+                      Since is when the controller first observed this pending version. It
+                      bounds how long a save may wait for replicas before it falls back to
+                      committing on a source that still holds it.
+                    format: date-time
+                    type: string
+                  sourceNode:
+                    description: SourceNode builds or already holds the version.
+                    type: string
+                required:
+                - commitID
+                - generation
+                - replicas
+                - sourceNode
+                type: object
+              phase:
+                description: |-
+                  Phase is one of the documented BlipState phases. An unknown value is
+                  rejected at admission so a status writer cannot leave a state in a
+                  phase that no reconcile path can advance or clean up.
+                enum:
+                - Pending
+                - Ready
+                - InUse
+                - Saving
+                - Failed
+                type: string
+              placements:
+                description: |-
+                  Placements are the nodes that hold (or are being given) the
+                  committed version.
+                items:
+                  type: string
+                type: array
+              seals:
+                description: |-
+                  Seals records the outcome of ended writer attachments, keyed by
+                  attachment ID. The controller keeps entries long enough for the Blip
+                  that wrote them to observe the result, so a later save cannot hide an
+                  earlier failure.
+                items:
+                  properties:
+                    attachmentID:
+                      type: string
+                    commitID:
+                      type: string
+                    error:
+                      type: string
+                    sizeBytes:
+                      format: int64
+                      type: integer
+                  required:
+                  - attachmentID
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - attachmentID
+                x-kubernetes-list-type: map
+              sizeBytes:
+                format: int64
+                type: integer
+              streamSize:
+                description: |-
+                  StreamSize is the effective trajectory ring size, resolved at
+                  initialization from the spec or the copy source.
+                format: int64
+                type: integer
+              unplaceableSince:
+                description: |-
+                  UnplaceableSince is when a copy first found no node matching its
+                  immutable nodeSelector. It bounds how long such a copy may pin its
+                  source's finalizer before failing terminally.
+                format: date-time
+                type: string
+              writer:
+                description: Writer is the single writable attachment of a state.
+                properties:
+                  attachmentID:
+                    description: AttachmentID is unique per acquisition.
+                    type: string
+                  baseCommit:
+                    description: BaseCommit is the committed version the writer started
+                      from.
+                    type: string
+                  blipName:
+                    type: string
+                  blipUID:
+                    type: string
+                  node:
+                    type: string
+                  podName:
+                    description: PodName/PodUID/Node are the claimed VM pod.
+                    type: string
+                  podUID:
+                    type: string
+                required:
+                - attachmentID
+                - baseCommit
+                - blipName
+                - blipUID
+                - node
+                - podName
+                - podUID
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

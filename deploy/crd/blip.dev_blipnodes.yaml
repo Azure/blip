@@ -1,0 +1,103 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: blipnodes.blip.dev
+spec:
+  group: blip.dev
+  names:
+    kind: BlipNode
+    listKind: BlipNodeList
+    plural: blipnodes
+    singular: blipnode
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.endpoint
+      name: Endpoint
+      type: string
+    - jsonPath: .spec.drain
+      name: Drain
+      type: boolean
+    - jsonPath: .status.safeToRemove
+      name: SafeToRemove
+      type: boolean
+    - jsonPath: .status.heartbeat
+      name: Heartbeat
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              drain:
+                description: |-
+                  Drain stops writers on this node gracefully (durable states save and
+                  replicas are moved to other nodes) and prevents new claims. The node
+                  is safe to remove once it holds no needed replicas or writers. Admins
+                  set it to remove a node; the controller also sets it when no BlipPool
+                  selects the node.
+                type: boolean
+            type: object
+          status:
+            properties:
+              endpoint:
+                description: Endpoint is the node's host IPv4 address for HTTPS control
+                  and NVMe/TCP.
+                type: string
+              freeBytes:
+                format: int64
+                type: integer
+              heartbeat:
+                format: date-time
+                type: string
+              hypervisors:
+                description: |-
+                  Hypervisors are the hypervisors this node supports, for example
+                  ["kvm"]. The controller requires at least one before scheduling VMs or
+                  state replicas on the node.
+                items:
+                  type: string
+                type: array
+              incarnation:
+                description: Incarnation changes whenever the node's storage is recreated.
+                type: string
+              safeToRemove:
+                description: |-
+                  SafeToRemove is set by the controller once a draining node holds
+                  no needed replicas and runs no writers.
+                type: boolean
+              tlsPublicKey:
+                description: |-
+                  TLSPublicKey is the base64-encoded Ed25519 public key used to authenticate
+                  peer TLS connections.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

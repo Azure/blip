@@ -1,0 +1,126 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Local-only authentication shim for the opencode browser E2E test.
+#
+# blipchat rejects API calls without X-Forwarded-User. This nginx pod forwards
+# to the blipchat Service and replaces any inbound header with the fixed user
+# "e2e". It is a test fixture for the local kind cluster, not a production
+# authentication design. Changing nginx.conf requires re-applying this file or
+# restarting deployment/blipchat-auth.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blipchat-auth-config
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blipchat-auth
+    app.kubernetes.io/part-of: blip
+data:
+  nginx.conf: |
+    # Local-only authentication shim for the opencode browser E2E test.
+    #
+    # This file is mounted at /etc/nginx/conf.d/default.conf, so it must contain
+    # only a server block: the image's own nginx.conf already provides the
+    # events/http context. It is not a production authentication design: it
+    # injects a fixed user for the local kind cluster. See ../README.md.
+
+    server {
+        listen 80;
+        server_name _;
+
+        # Readiness probe for the shim itself. Answering locally keeps the probe
+        # independent of blipchat, which the proxy_pass below requires at startup.
+        location = /healthz {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok";
+        }
+
+        location / {
+            proxy_pass http://blipchat.blip-system.svc.cluster.local:80;
+
+            proxy_http_version 1.1;
+            # proxy_set_header replaces any inbound header of the same name, so a
+            # client cannot choose the forwarded user.
+            proxy_set_header X-Forwarded-User e2e;
+            proxy_set_header Host $host;
+
+            # Server-sent events: keep the upstream connection open and do not
+            # buffer the agent's incremental output.
+            proxy_set_header Connection "";
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blipchat-auth
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blipchat-auth
+    app.kubernetes.io/part-of: blip
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blipchat-auth
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blipchat-auth
+        app.kubernetes.io/part-of: blip
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: nginx.conf
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: blipchat-auth-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blipchat-auth
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blipchat-auth
+    app.kubernetes.io/part-of: blip
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: blipchat-auth
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http

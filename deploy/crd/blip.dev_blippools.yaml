@@ -1,0 +1,365 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: blippools.blip.dev
+spec:
+  group: blip.dev
+  names:
+    kind: BlipPool
+    listKind: BlipPoolList
+    plural: blippools
+    singular: blippool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.warmCount
+      name: Warm
+      type: integer
+    - jsonPath: .status.ready
+      name: Ready
+      type: integer
+    - jsonPath: .status.claimed
+      name: Claimed
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BlipPoolSpec describes a VM shape and how many warm VMs to keep. Pools are
+              image independent: a warm VM has no root disk until it is claimed.
+            properties:
+              cpus:
+                default: 2
+                format: int32
+                maximum: 2147483647
+                minimum: 1
+                type: integer
+              dns:
+                description: |-
+                  DNS configures the resolvers the guest uses. Omitted uses public
+                  resolvers, avoiding cluster DNS for workload traffic.
+                properties:
+                  nameservers:
+                    default:
+                    - 1.1.1.1
+                    - 1.0.0.1
+                    description: Nameservers are the IPv4 resolvers the guest queries,
+                      in order.
+                    items:
+                      type: string
+                    maxItems: 3
+                    minItems: 1
+                    type: array
+                    x-kubernetes-validations:
+                    - message: nameservers must be IPv4 addresses
+                      rule: self.all(ns, isCIDR(ns + '/32') && cidr(ns + '/32').ip().family()
+                        == 4)
+                type: object
+              endpoints:
+                description: Endpoints exposes fixed HTTPS endpoints to workloads
+                  at http://<name>/.
+                items:
+                  description: |-
+                    PoolEndpoint is one HTTPS endpoint the pool's sidecar routes guest requests
+                    to. The guest reaches it at http://<name>/.
+                  properties:
+                    audience:
+                      description: |-
+                        Audience is the projected service account token audience. It requires
+                        spec.serviceAccountName.
+                      type: string
+                    caConfigMap:
+                      description: |-
+                        CAConfigMap holds a ca.crt key that verifies the endpoint. Omitted
+                        uses system roots.
+                      type: string
+                    name:
+                      description: Name is the guest hostname.
+                      maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    url:
+                      description: |-
+                        URL is the HTTPS URL. Its host is dialed, used for TLS SNI and the
+                        outbound Host header.
+                      pattern: ^https://[a-z0-9]([-.a-z0-9]*[a-z0-9])?(:[0-9]{1,5})?$
+                      type: string
+                  required:
+                  - name
+                  - url
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: endpoint name is reserved
+                  rule: self.all(e, !(e.name in ['blip', 'kube-apiserver', 'localhost']))
+              hypervisor:
+                default: kvm
+                enum:
+                - kvm
+                type: string
+              imagePullSecrets:
+                description: |-
+                  ImagePullSecrets authenticate pulls of the pool's infrastructure pod
+                  images. Image states use their own imagePullSecrets.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+              maxCount:
+                description: MaxCount caps vacant plus claimed VM pods. 0 means no
+                  cap.
+                format: int32
+                maximum: 2147483647
+                minimum: 0
+                type: integer
+              memory:
+                anyOf:
+                - type: integer
+                - type: string
+                default: 2Gi
+                description: |-
+                  Memory is the guest RAM. It must be positive: the controller adds the
+                  VMM overhead, so a negative value would make the pod request negative
+                  memory and the pool would never create a VM.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: memory must be greater than 0
+                  rule: 'type(self) == string ? quantity(self).isGreaterThan(quantity(''0''))
+                    : self > 0'
+              network:
+                description: |-
+                  Network is the maximum egress allowed for this pool. Omitted denies all
+                  egress. Changes apply to running blips.
+                properties:
+                  egress:
+                    items:
+                      description: NetworkEgressRule allows the intersection of its
+                        destinations and ports.
+                      properties:
+                        ports:
+                          description: |-
+                            Ports allows numeric TCP/UDP destination ports. Omitted or empty means
+                            all IP protocols and ports. Service ports are not translated here.
+                          items:
+                            description: NetworkPort is a numeric destination port
+                              or inclusive port range.
+                            properties:
+                              endPort:
+                                format: int32
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              port:
+                                format: int32
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              protocol:
+                                default: TCP
+                                description: Protocol defines network protocols supported
+                                  for things like container ports.
+                                enum:
+                                - TCP
+                                - UDP
+                                type: string
+                            required:
+                            - port
+                            type: object
+                            x-kubernetes-validations:
+                            - message: endPort must be at least port
+                              rule: '!has(self.endPort) || self.endPort >= self.port'
+                          maxItems: 64
+                          type: array
+                        to:
+                          description: |-
+                            To selects IPv4 destination blocks. Omitted or empty means all IPv4
+                            destinations.
+                          items:
+                            description: |-
+                              NetworkPeer is an IPv4 destination block. Selectors are deliberately
+                              unsupported: resolving cluster objects requires cluster-wide reads and can
+                              go stale between reconciles.
+                            properties:
+                              ipBlock:
+                                description: IPBlock allows an IPv4 CIDR minus its
+                                  strictly smaller exception CIDRs.
+                                properties:
+                                  cidr:
+                                    description: CIDR is an IPv4 destination range,
+                                      for example 192.0.2.0/24.
+                                    maxLength: 18
+                                    type: string
+                                  except:
+                                    description: Except removes IPv4 subranges from
+                                      CIDR.
+                                    items:
+                                      maxLength: 18
+                                      type: string
+                                    maxItems: 32
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - cidr
+                                type: object
+                                x-kubernetes-validations:
+                                - message: cidr must be a valid IPv4 CIDR
+                                  rule: isCIDR(self.cidr) && cidr(self.cidr).ip().family()
+                                    == 4
+                                - message: exceptions must be IPv4 CIDRs strictly
+                                    inside cidr
+                                  rule: '!has(self.except) || self.except.all(c, isCIDR(c)
+                                    && cidr(c).ip().family() == 4 && cidr(self.cidr).containsIP(cidr(c).ip())
+                                    && cidr(c).prefixLength() > cidr(self.cidr).prefixLength())'
+                            type: object
+                            x-kubernetes-validations:
+                            - message: a peer must select an IP block
+                              rule: has(self.ipBlock)
+                          maxItems: 64
+                          type: array
+                      type: object
+                    maxItems: 64
+                    type: array
+                type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: |-
+                  NodeSelector selects the nodes that run this pool's VMs. It must be
+                  non-empty: matching nodes are enrolled automatically and run the node
+                  agent.
+                minProperties: 1
+                type: object
+              serviceAccountName:
+                description: |-
+                  ServiceAccountName is the identity of VMs in this pool. It is capped
+                  below the generic 253-character DNS limit so the "sa.<name>" key in the
+                  VM owner ConfigMap fits the 253-character key limit.
+                maxLength: 250
+                type: string
+              tolerations:
+                items:
+                  description: |-
+                    The pod this Toleration is attached to tolerates any taint that matches
+                    the triple <key,value,effect> using the matching operator <operator>.
+                  properties:
+                    effect:
+                      description: |-
+                        Effect indicates the taint effect to match. Empty means match all taint effects.
+                        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                      type: string
+                    key:
+                      description: |-
+                        Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                      type: string
+                    operator:
+                      description: |-
+                        Operator represents a key's relationship to the value.
+                        Valid operators are Exists and Equal. Defaults to Equal.
+                        Exists is equivalent to wildcard for value, so that a pod can
+                        tolerate all taints of a particular category.
+                      type: string
+                    tolerationSeconds:
+                      description: |-
+                        TolerationSeconds represents the period of time the toleration (which must be
+                        of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                        it is not set, which means tolerate the taint forever (do not evict). Zero and
+                        negative values will be treated as 0 (evict immediately) by the system.
+                      format: int64
+                      type: integer
+                    value:
+                      description: |-
+                        Value is the taint value the toleration matches to.
+                        If the operator is Exists, the value should be empty, otherwise just a regular string.
+                      type: string
+                  type: object
+                type: array
+              warmCount:
+                description: WarmCount is the number of vacant, booted VMs to keep
+                  ready.
+                format: int32
+                maximum: 2147483647
+                minimum: 0
+                type: integer
+            required:
+            - nodeSelector
+            type: object
+          status:
+            properties:
+              claimed:
+                format: int32
+                maximum: 2147483647
+                minimum: 0
+                type: integer
+              message:
+                description: Message is a human-readable explanation of Reason.
+                type: string
+              ready:
+                description: Ready counts vacant VMs that finished booting.
+                format: int32
+                maximum: 2147483647
+                minimum: 0
+                type: integer
+              reason:
+                description: |-
+                  Reason is a CamelCase cause set when the pool configuration cannot
+                  produce VMs, for example InvalidConfiguration for an endpoint that
+                  admission could not reject.
+                type: string
+              vacant:
+                format: int32
+                maximum: 2147483647
+                minimum: 0
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

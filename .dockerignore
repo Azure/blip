@@ -1,0 +1,19 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Allowlist: image builds only need built binaries and guest artifacts.
+*
+!bin/
+bin/*
+!bin/blip-*
+!bin/blipchat
+!bin/kubectl-blip
+!build/
+build/*
+!build/guest/
+build/guest/*
+!build/guest/vmlinuz
+!build/guest/initramfs.gz
+!build/images/
+build/images/*
+!build/images/cloud-hypervisor

@@ -1,0 +1,262 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Cluster-wide policy for chat agents.
+#
+# Chat sessions are BlipStates owned by one blipchat conversation and labelled
+# chat.blip.dev/session. The blip-chat-session validating admission policy
+# restricts who may create, change, or delete them. The blip-chat-spawn policy
+# validates that a new chat's profile, parent, and depth obey this ConfigMap.
+# Both bindings read this one ConfigMap and deny requests when it is missing,
+# so it must exist before any chat is created.
+#
+# Lists are space-separated. "*" means any profile. "root" applies to a chat
+# with no chat.blip.dev/parent; "allow.<profile>" applies to a child of a chat
+# running <profile>. Writers are full Kubernetes usernames; writerGroups are
+# group names (normally system:masters for cluster administrators).
+#
+# The garbage collector and namespace controller are writers because they
+# delete chat objects through ownerReferences and namespace teardown.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blip-chat-policy
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blipchat
+    app.kubernetes.io/part-of: blip
+data:
+  maxDepth: "2"
+  root: "*"
+  allow.default: "worker reviewer"
+  allow.lead: "worker reviewer"
+  allow.worker: ""
+  writers: >-
+    system:serviceaccount:blip-system:blipchat
+    system:serviceaccount:blip-system:blip-controller
+    system:serviceaccount:kube-system:generic-garbage-collector
+    system:serviceaccount:kube-system:namespace-controller
+  writerGroups: "system:masters"
+---
+# Limits changes to chat Blips and BlipStates to the identities listed in the
+# policy ConfigMap. Without this, a chat VM's service account could edit or
+# delete another conversation's objects. Status subresources are excluded:
+# the controller writes status, and a chat object's status is not part of the
+# chat tree authorization model.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-chat-session
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: [v1alpha1]
+        resources: [blips, blipstates]
+        operations: [CREATE, UPDATE, DELETE]
+  # Only objects that are part of a chat session are restricted. DELETE sees
+  # only oldObject and CREATE sees only object, so each branch reads the one
+  # that exists. For UPDATE, either the old or the new labels are enough to
+  # keep an object under the policy while its label is removed.
+  matchConditions:
+    - name: chat-session
+      expression: >-
+        request.operation == 'DELETE' ?
+        (has(oldObject.metadata.labels) &&
+        'chat.blip.dev/session' in oldObject.metadata.labels) :
+        request.operation == 'CREATE' ?
+        (has(object.metadata.labels) &&
+        'chat.blip.dev/session' in object.metadata.labels) :
+        ((has(object.metadata.labels) &&
+        'chat.blip.dev/session' in object.metadata.labels) ||
+        (has(oldObject.metadata.labels) &&
+        'chat.blip.dev/session' in oldObject.metadata.labels))
+  variables:
+    - name: data
+      expression: "has(params.data) ? params.data : {}"
+    - name: writers
+      expression: >-
+        'writers' in variables.data ?
+        string(variables.data['writers']).split(' ') : []
+    - name: writerGroups
+      expression: >-
+        'writerGroups' in variables.data ?
+        string(variables.data['writerGroups']).split(' ') : []
+    - name: groups
+      expression: "has(request.userInfo.groups) ? request.userInfo.groups : []"
+  validations:
+    # An absent or empty writers list denies every caller, including the
+    # controller and blipchat. That is intentional: a broken policy must not
+    # silently leave chat objects writable by their VMs.
+    - expression: >-
+        request.userInfo.username in variables.writers ||
+        variables.groups.exists(g, g in variables.writerGroups)
+      messageExpression: >-
+        'user ' + request.userInfo.username +
+        ' may not modify chat sessions; only the configured writers may'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-chat-session
+spec:
+  policyName: blip-chat-session
+  validationActions: [Deny]
+  paramRef:
+    name: blip-chat-policy
+    namespace: blip-system
+    parameterNotFoundAction: Deny
+---
+# Validates a new chat's place in the tree. A root chat (no
+# chat.blip.dev/parent) must use a profile in "root". A child must name its
+# parent profile and use a profile in "allow.<parent-profile>". Its
+# chat.blip.dev/depth must be chat.blip.dev/parent-depth + 1 and no greater
+# than maxDepth. Administrators in writerGroups bypass these checks. Missing
+# or malformed policy keys deny. A session-labelled state without a profile
+# annotation is a hidden fork mount copy, not a spawn, and does not match.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: blip-chat-spawn
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [blip.dev]
+        apiVersions: [v1alpha1]
+        resources: [blipstates]
+        operations: [CREATE]
+  matchConditions:
+    - name: chat-spawn
+      expression: >-
+        has(object.metadata.labels) &&
+        'chat.blip.dev/session' in object.metadata.labels &&
+        has(object.metadata.annotations) &&
+        'chat.blip.dev/profile' in object.metadata.annotations
+  variables:
+    - name: data
+      expression: "has(params.data) ? params.data : {}"
+    - name: annotations
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: writerGroups
+      expression: >-
+        'writerGroups' in variables.data ?
+        string(variables.data['writerGroups']).split(' ') : []
+    - name: admin
+      expression: >-
+        has(request.userInfo.groups) &&
+        request.userInfo.groups.exists(g, g in variables.writerGroups)
+    - name: profile
+      expression: >-
+        'chat.blip.dev/profile' in variables.annotations ?
+        variables.annotations['chat.blip.dev/profile'] : ''
+    - name: parent
+      expression: >-
+        'chat.blip.dev/parent' in variables.annotations ?
+        variables.annotations['chat.blip.dev/parent'] : ''
+    - name: parentProfile
+      expression: >-
+        'chat.blip.dev/parent-profile' in variables.annotations ?
+        variables.annotations['chat.blip.dev/parent-profile'] : ''
+    - name: depthRaw
+      expression: >-
+        'chat.blip.dev/depth' in variables.annotations ?
+        variables.annotations['chat.blip.dev/depth'] : ''
+    - name: parentDepthRaw
+      expression: >-
+        'chat.blip.dev/parent-depth' in variables.annotations ?
+        variables.annotations['chat.blip.dev/parent-depth'] : ''
+    - name: isRoot
+      expression: "variables.parent == ''"
+    # Digits only and at most 18 of them, so int() cannot overflow. A root
+    # chat may omit depth, which is treated as 0.
+    - name: depthValid
+      expression: >-
+        variables.depthRaw == '' ?
+        variables.isRoot :
+        variables.depthRaw.matches('^[0-9]{1,18}$')
+    - name: parentDepthValid
+      expression: >-
+        variables.isRoot ? true :
+        variables.parentDepthRaw.matches('^[0-9]{1,18}$')
+    - name: depth
+      expression: >-
+        variables.depthValid ?
+        (variables.depthRaw == '' ? 0 : int(variables.depthRaw)) : 0
+    - name: parentDepth
+      expression: >-
+        variables.parentDepthValid ?
+        (variables.parentDepthRaw == '' ? 0 : int(variables.parentDepthRaw)) : 0
+    - name: rootPolicy
+      expression: >-
+        'root' in variables.data ?
+        string(variables.data['root']).split(' ') : []
+    - name: allowKey
+      expression: "'allow.' + variables.parentProfile"
+    - name: childPolicy
+      expression: >-
+        variables.allowKey in variables.data ?
+        string(variables.data[variables.allowKey]).split(' ') : []
+    - name: maxDepthRaw
+      expression: >-
+        'maxDepth' in variables.data ? string(variables.data['maxDepth']) : ''
+    - name: maxDepthValid
+      expression: "variables.maxDepthRaw.matches('^[0-9]{1,18}$')"
+    - name: maxDepth
+      expression: "variables.maxDepthValid ? int(variables.maxDepthRaw) : 0"
+  validations:
+    - expression: >-
+        variables.admin ||
+        !variables.isRoot ||
+        (variables.profile != '' &&
+        'root' in variables.data &&
+        ('*' in variables.rootPolicy ||
+        variables.profile in variables.rootPolicy))
+      message: "root chat profile is not allowed by the blip-chat-policy root list"
+      reason: Forbidden
+    - expression: >-
+        variables.admin ||
+        variables.isRoot ||
+        (variables.profile != '' &&
+        variables.parentProfile != '' &&
+        variables.allowKey in variables.data &&
+        ('*' in variables.childPolicy ||
+        variables.profile in variables.childPolicy))
+      message: >-
+        child chat profile is not allowed by the parent profile's
+        blip-chat-policy allow list
+      reason: Forbidden
+    - expression: >-
+        variables.admin ||
+        (variables.isRoot ?
+        (variables.depthValid && variables.depth == 0) :
+        (variables.parentDepthValid && variables.depthValid &&
+        variables.depth == variables.parentDepth + 1))
+      message: "chat depth is missing or inconsistent with chat.blip.dev/parent-depth"
+      reason: Forbidden
+    - expression: >-
+        variables.admin ||
+        (variables.depthValid && variables.maxDepthValid &&
+        variables.depth <= variables.maxDepth)
+      message: "chat depth exceeds the blip-chat-policy maxDepth"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: blip-chat-spawn
+spec:
+  policyName: blip-chat-spawn
+  validationActions: [Deny]
+  paramRef:
+    name: blip-chat-policy
+    namespace: blip-system
+    parameterNotFoundAction: Deny

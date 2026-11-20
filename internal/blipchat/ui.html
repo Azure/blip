@@ -1,0 +1,2068 @@
+<!doctype html>
+<!-- Copyright (c) Microsoft Corporation.
+Licensed under the MIT License. -->
+
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="blipchat-base-path" content="__BLIPCHAT_BASE_PATH__">
+<title>Blip Chat</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0e100f;
+    --sidebar: #121513;
+    --surface: #181c19;
+    --surface-soft: #1e231f;
+    --line: #272d28;
+    --line-strong: #3a423b;
+    --text: #e7ebe6;
+    --dim: #a7b0a8;
+    --muted: #7d877f;
+    --accent: #a9d977;
+    --accent-hover: #bce88c;
+    --accent-ink: #0e130b;
+    --user: #1a221b;
+    --danger: #e6a0a0;
+    --danger-bg: #2a1b1b;
+    --shadow: 0 18px 48px rgba(0, 0, 0, .45);
+    --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 var(--font);
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  button:disabled { cursor: default; }
+  ::selection { background: var(--accent); color: var(--accent-ink); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--line-strong);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 8px;
+  }
+
+  .app { display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
+
+  aside {
+    width: 288px;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    background: var(--sidebar);
+    border-right: 1px solid var(--line);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 17px 18px 13px;
+  }
+  .brand-mark {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    background: var(--accent);
+    flex: none;
+  }
+  .brand-name { font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+  .brand-sub { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
+
+  .side-form { padding: 4px 12px 14px; display: grid; gap: 9px; }
+  .tabs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px;
+    padding: 2px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+  }
+  .tabs button {
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 12.5px;
+    line-height: 1.2;
+  }
+  .tabs button:hover { color: var(--text); }
+  .tabs button[aria-selected="true"] {
+    background: var(--surface-soft);
+    color: var(--text);
+    font-weight: 550;
+  }
+
+  .btn {
+    padding: 7px 11px;
+    font-size: 12.5px;
+    font-weight: 500;
+    line-height: 1;
+    color: var(--dim);
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    transition: background-color .12s, border-color .12s, color .12s;
+  }
+  .btn:hover:not(:disabled) { color: var(--text); border-color: var(--line-strong); background: var(--surface); }
+  .btn:disabled { opacity: .4; }
+  .btn.primary {
+    color: var(--accent-ink);
+    background: var(--accent);
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  .btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-ink); }
+  .btn.ghost { border-color: transparent; }
+  .btn.ghost:hover:not(:disabled) { background: var(--surface); border-color: transparent; }
+  .btn.wide { width: 100%; }
+
+  .new { position: relative; }
+  .menu {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: calc(100% + 6px);
+    z-index: 30;
+    padding: 4px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+  }
+  .menu-item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    width: 100%;
+    padding: 8px 9px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+    font-size: 13px;
+  }
+  .menu-item:hover { background: var(--surface-soft); }
+  .menu-item:focus-visible { background: var(--surface-soft); outline: 2px solid var(--accent); outline-offset: -2px; }
+  .menu-tag { color: var(--dim); font-size: 11px; }
+
+  .side-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 18px 6px;
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+  .count { font-variant-numeric: tabular-nums; }
+
+  .sessions-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .sessions {
+    list-style: none;
+    margin: 0;
+    padding: 0 8px 12px;
+    overflow: auto;
+    flex: 1;
+  }
+  .sessions li {
+    display: block;
+    padding: 8px 10px;
+    margin-bottom: 1px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color .12s;
+  }
+  .sessions li[hidden] { display: none; }
+  .sessions li:hover { background: var(--surface); }
+  .sessions li.active { background: var(--surface-soft); }
+  .sessions li.active .session-meta { color: #b9c3bb; }
+  .session-row { display: flex; align-items: center; gap: 4px; min-width: 0; }
+  .session-toggle {
+    flex: none;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 10px;
+    line-height: 24px;
+    text-align: center;
+  }
+  .session-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .session-toggle:hover { color: var(--text); }
+  .session-toggle.placeholder { visibility: hidden; }
+  .session-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 550;
+  }
+  .session-open {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+  }
+  .session-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .session-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    margin-top: 2px;
+    padding-left: 18px;
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+  .session-meta time { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .sessions:empty::after {
+    content: attr(data-empty);
+    display: block;
+    padding: 8px 10px;
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+
+  .side-foot {
+    display: flex;
+    gap: 5px;
+    padding: 11px 18px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 11.5px;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .me { color: var(--dim); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+  main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; background: var(--bg); }
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 58px;
+    padding: 9px 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  .heading { flex: 1; min-width: 0; display: grid; gap: 1px; }
+  .heading h1 {
+    margin: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -.005em;
+  }
+  .heading-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+  .profile { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .actions { display: flex; gap: 6px; flex: none; }
+
+  .dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--line-strong);
+    flex: none;
+  }
+  .dot[data-state="running"] { background: var(--accent); }
+  .dot[data-state="error"] { background: var(--danger); }
+
+  .origin {
+    max-width: 760px;
+    width: calc(100% - 40px);
+    margin: 10px auto 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .origin a {
+    color: var(--dim);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .origin a:hover { color: var(--text); }
+
+  .transcript {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 18px 20px 30px;
+    outline: none;
+  }
+  .transcript:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .transcript > * { max-width: 760px; margin-left: auto; margin-right: auto; }
+
+  .empty {
+    margin-top: 18vh;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .empty-title { margin: 0 0 3px; color: var(--dim); font-size: 14px; }
+  .transcript-note {
+    margin: 8px auto 18px;
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 12.5px;
+    text-align: center;
+  }
+
+  .msg { margin-top: 0; margin-bottom: 18px; }
+  .msg-head {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    margin-bottom: 4px;
+    font-size: 11.5px;
+  }
+  .msg-sender { color: var(--dim); font-weight: 600; }
+  .msg-you { color: var(--accent); font-size: 10.5px; }
+  .msg.user .msg-head { padding-left: 12px; }
+  .msg-body {
+    font-size: 14px;
+    line-height: 1.58;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .msg.user .msg-body {
+    width: fit-content;
+    max-width: 100%;
+    padding: 9px 12px;
+    background: var(--user);
+    border-radius: 8px;
+  }
+  .msg.thought summary {
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    width: fit-content;
+  }
+  .msg.thought summary:hover { color: var(--dim); }
+  .msg.thought .msg-body {
+    margin-top: 5px;
+    padding-left: 16px;
+    color: var(--muted);
+    font-size: 13px;
+    font-style: italic;
+  }
+
+  .event {
+    display: flex;
+    gap: 9px;
+    margin-bottom: 11px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--muted);
+  }
+  .event-kind {
+    flex: none;
+    width: 52px;
+    padding-top: 1px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    text-align: right;
+  }
+  .event-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .event.error { color: var(--danger); }
+  .event.error .event-kind { color: var(--danger); opacity: .8; }
+
+  .jump {
+    position: absolute;
+    left: 50%;
+    /* Sit above the composer, which grows with a multiline draft. */
+    bottom: calc(var(--composer-h, 112px) + 12px);
+    transform: translateX(-50%);
+    z-index: 5;
+    padding: 6px 10px;
+    color: var(--dim);
+    background: var(--surface-soft);
+    border: 1px solid var(--line-strong);
+    border-radius: 6px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .3);
+    font-size: 12px;
+  }
+  .jump:hover { color: var(--text); }
+
+  .composer { padding: 10px 20px 18px; border-top: 1px solid var(--line); background: var(--bg); }
+  .composer-box {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 7px 8px 7px 12px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    transition: border-color .12s;
+  }
+  .composer-box:focus-within { border-color: var(--accent); }
+  #text {
+    display: block;
+    width: 100%;
+    min-height: 25px;
+    max-height: min(160px, calc(100dvh - 180px));
+    padding: 6px 0;
+    resize: none;
+    border: 0;
+    outline: none;
+    background: transparent;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  #text::placeholder { color: var(--muted); }
+  .composer-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
+  #send { margin-left: auto; }
+  .hint { color: var(--muted); font-size: 11px; }
+  .limit { margin-left: 8px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .limit[data-over="true"] { color: var(--danger); }
+  .status-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--danger); }
+  .skip-link {
+    position: fixed;
+    top: 8px;
+    left: 8px;
+    z-index: 100;
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    transform: translateY(-200%);
+  }
+  .skip-link:focus { transform: none; }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: calc(var(--composer-h, 22px) + 64px);
+    z-index: 50;
+    max-width: min(88vw, 560px);
+    padding: 9px 13px;
+    transform: translateX(-50%);
+    background: var(--surface-soft);
+    border: 1px solid var(--line-strong);
+    border-radius: 7px;
+    box-shadow: var(--shadow);
+    color: var(--text);
+    font-size: 12.5px;
+  }
+  .toast:empty { display: none; }
+
+  .scrim { display: none; }
+  .only-narrow { display: none; }
+
+  @media (max-width: 820px), (pointer: coarse) {
+    .only-narrow { display: inline-flex; }
+    aside {
+      position: fixed;
+      inset: 0 auto 0 0;
+      z-index: 40;
+      width: min(86vw, 320px);
+      padding-bottom: env(safe-area-inset-bottom);
+      visibility: hidden;
+      transform: translateX(-102%);
+      transition: transform .16s ease, visibility 0s linear .16s;
+      box-shadow: var(--shadow);
+    }
+    body.sidebar-open aside { visibility: visible; transform: none; transition: transform .16s ease; }
+    body.sidebar-open .scrim {
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 35;
+      background: rgba(0, 0, 0, .5);
+    }
+    .topbar {
+      padding-top: max(9px, env(safe-area-inset-top));
+      padding-left: max(12px, env(safe-area-inset-left));
+      padding-right: max(12px, env(safe-area-inset-right));
+    }
+    .actions .btn { padding: 7px 8px; }
+    .origin { width: calc(100% - 28px); }
+    .transcript { padding: 16px 14px 24px; }
+    .composer {
+      padding: 8px max(12px, env(safe-area-inset-right)) calc(14px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+    }
+    .hint { display: none; }
+    .event-kind { width: 44px; }
+    /* Touch targets: keep the primary controls at least 44px tall. */
+    .btn, #send, .tabs [role="tab"], .menu button, .jump { min-height: 44px; }
+    #sessions .session-open { min-height: 44px; }
+    .session-toggle { width: 44px; height: 44px; line-height: 44px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; scroll-behavior: auto !important; }
+  }
+</style>
+</head>
+<body>
+<a class="skip-link" href="#transcript">Skip to conversation</a>
+<div class="app">
+  <div id="scrim" class="scrim"></div>
+  <aside id="sidebar" aria-label="Chats">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">blip</span>
+      <span class="brand-sub">chat</span>
+    </div>
+    <div class="side-form">
+      <div class="tabs" role="tablist" aria-label="Chat visibility"><button id="tab-team" role="tab" data-scope="team" aria-selected="true" aria-controls="sessions-panel">Team</button><button id="tab-user" role="tab" data-scope="user" aria-selected="false" aria-controls="sessions-panel">Private</button></div>
+      <div id="new" class="new">
+        <button id="new-btn" class="btn primary wide" aria-haspopup="menu" aria-expanded="false" aria-controls="new-menu">New chat</button>
+        <div id="new-menu" class="menu" role="menu" aria-label="Choose a profile" hidden></div>
+      </div>
+    </div>
+    <div class="side-heading"><span>Chats</span><span id="count" class="count"></span></div>
+    <div id="sessions-panel" role="tabpanel" aria-labelledby="tab-team" class="sessions-panel">
+      <ul id="sessions" class="sessions" role="tree" aria-label="Chats" data-empty=""></ul>
+    </div>
+    <div class="side-foot"><span>Signed in as</span><span id="me" class="me"></span></div>
+  </aside>
+  <main>
+    <header class="topbar">
+      <button id="sidebar-btn" class="btn ghost only-narrow" aria-expanded="false" aria-controls="sidebar">Chats</button>
+      <div class="heading">
+        <h1 id="title">Blip Chat</h1>
+        <div class="heading-meta">
+          <span id="status-dot" class="dot" data-state="idle" aria-hidden="true"></span>
+          <span id="status" aria-live="polite">no chat</span>
+          <span id="status-detail" class="status-detail" hidden></span>
+          <span id="profile" class="profile" hidden></span>
+          <span id="scope-badge" class="profile" hidden>Private</span>
+        </div>
+      </div>
+      <div id="actions" class="actions" hidden>
+        <button id="cancel" class="btn" hidden disabled aria-label="Cancel turn" title="Ask the agent to stop this turn">Cancel</button>
+        <button id="stop" class="btn" hidden disabled aria-label="Stop agent" title="Stop the running agent process">Stop</button>
+      </div>
+    </header>
+    <div id="origin" class="origin" hidden></div>
+    <div id="transcript" class="transcript" tabindex="0" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Conversation">
+      <div id="empty" class="empty">
+        <p class="empty-title">No chat open</p>
+        <p>Pick a chat from the list, or start a new one.</p>
+      </div>
+    </div>
+    <button id="jump" class="jump" hidden>Jump to latest</button>
+    <form id="composer" class="composer">
+      <div class="composer-box">
+        <label class="sr-only" for="text">Message the agent</label>
+        <textarea id="text" rows="1" placeholder="Message the agent" aria-describedby="composer-hint limit" disabled></textarea>
+        <div class="composer-foot">
+          <span class="hint" id="composer-hint">Enter to send. Shift+Enter for a new line.</span>
+          <span id="limit" class="limit" hidden></span>
+          <button class="btn primary" id="send" disabled>Send</button>
+        </div>
+      </div>
+    </form>
+  </main>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script>
+const state = { scope: "team", current: null, source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", running: false, phase: "no chat", sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, clickShieldUntil: 0, breakAgent: false };
+let openSeq = 0;
+let listSeq = 0;
+let newMenuSeq = 0;
+let sessionsFingerprint = "";
+let sessionPollTimer = 0;
+let resyncing = false;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+const SESSION_POLL_MS = 2000;
+const collapsedSessions = new Set();
+const $ = (id) => document.getElementById(id);
+const transcript = $("transcript");
+const toolEvents = new Map();
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const BASE_PATH = document.querySelector('meta[name="blipchat-base-path"]').content;
+
+function toast(message) {
+  const t = $("toast");
+  t.textContent = message;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { t.textContent = ""; }, 5000);
+}
+
+async function api(path, options) {
+  options = options || {};
+  const init = { method: options.method || "GET", headers: {} };
+  if (options.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(options.body);
+  }
+  let res;
+  try {
+    res = await fetch(BASE_PATH + path, init);
+  } catch (err) {
+    // fetch rejects for connection failures and aborted responses. Mark them
+    // so callers can distinguish "could not reach the server" from a definite
+    // HTTP error such as a deleted chat's 404.
+    if (err && !err.status) err.status = 0;
+    throw err;
+  }
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) {
+    const err = new Error((data && data.error) || res.status + " " + res.statusText);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+function relativeTime(value) {
+  const t = new Date(value).getTime();
+  if (!value || Number.isNaN(t)) return "";
+  const diff = Math.max(0, Date.now() - t);
+  const minute = 60000, hour = 60 * minute, day = 24 * hour;
+  if (diff < minute) return "now";
+  if (diff < hour) return Math.floor(diff / minute) + "m";
+  if (diff < day) return Math.floor(diff / hour) + "h";
+  if (diff < 7 * day) return Math.floor(diff / day) + "d";
+  return new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function nearBottom() {
+  return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 60;
+}
+
+function scrollToBottom(smooth) {
+  // A smooth scroll across a very long transcript takes seconds and shows
+  // mostly blank space on the way. Fall back to an instant jump for long
+  // distances; short scrolls still animate.
+  const distance = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
+  const behavior = smooth && !reduceMotion && distance < transcript.clientHeight * 4 ? "smooth" : "auto";
+  jumpTarget = behavior === "smooth";
+  transcript.scrollTo({ top: transcript.scrollHeight, behavior });
+  state.atBottom = true;
+  $("jump").hidden = true;
+}
+
+function updateJump() {
+  const bottom = nearBottom();
+  if (jumpTarget && !bottom) {
+    // Smooth scrolling fires scroll events on the way down. Keep the button
+    // hidden until the programmatic scroll finishes.
+    state.atBottom = true;
+    $("jump").hidden = true;
+    return;
+  }
+  if (bottom) jumpTarget = false;
+  state.atBottom = bottom;
+  const hasContent = transcript.querySelector(".msg, .event");
+  $("jump").hidden = state.atBottom || !hasContent;
+}
+
+let jumpTarget = false;
+transcript.addEventListener("wheel", () => { jumpTarget = false; }, { passive: true });
+transcript.addEventListener("touchstart", () => { jumpTarget = false; }, { passive: true });
+
+let followFrame = 0;
+function followOutput() {
+  if (!state.atBottom) {
+    updateJump();
+    return;
+  }
+  if (followFrame) return;
+  followFrame = requestAnimationFrame(() => {
+    followFrame = 0;
+    if (!state.atBottom) return;
+    transcript.scrollTop = transcript.scrollHeight;
+    $("jump").hidden = true;
+  });
+}
+
+function clearTranscript() {
+  transcript.innerHTML = "";
+  toolEvents.clear();
+  state.atBottom = true;
+  $("jump").hidden = true;
+}
+
+function showEmpty(title, hint) {
+  const box = document.createElement("div");
+  box.className = "empty";
+  const h = document.createElement("p");
+  h.className = "empty-title";
+  h.textContent = title;
+  const p = document.createElement("p");
+  p.textContent = hint;
+  box.append(h, p);
+  transcript.appendChild(box);
+}
+
+function showTranscriptNotice(text) {
+  if (!text) return;
+  const note = document.createElement("div");
+  note.className = "transcript-note";
+  note.textContent = text;
+  transcript.prepend(note);
+}
+
+function createMessage(role, text, sender, chunk) {
+  let el, body;
+  transcript.querySelectorAll(".empty").forEach((e) => e.remove());
+  if (role === "user" || role === "agent") {
+    el = document.createElement("article");
+    el.className = "msg " + role;
+    const head = document.createElement("header");
+    head.className = "msg-head";
+    const who = document.createElement("span");
+    who.className = "msg-sender";
+    who.textContent = role === "agent" ? "Agent" : (sender || "unknown");
+    head.appendChild(who);
+    if (role === "user" && state.me && sender === state.me) {
+      const you = document.createElement("span");
+      you.className = "msg-you";
+      you.textContent = "you";
+      you.setAttribute("aria-hidden", "true");
+      head.setAttribute("aria-label", (sender || "unknown") + " (you)");
+      head.setAttribute("role", "group");
+      head.appendChild(you);
+    }
+    body = document.createElement("div");
+    body.className = "msg-body";
+    body.textContent = text;
+    el.append(head, body);
+  } else if (role === "thought") {
+    el = document.createElement("details");
+    el.className = "msg thought";
+    const summary = document.createElement("summary");
+    summary.textContent = "Thinking";
+    body = document.createElement("div");
+    body.className = "msg-body";
+    body.textContent = text;
+    el.append(summary, body);
+  } else {
+    el = document.createElement("div");
+    el.className = "event " + role;
+    const kind = document.createElement("span");
+    kind.className = "event-kind";
+    kind.textContent = role;
+    body = document.createElement("span");
+    body.className = "event-body";
+    body.textContent = text;
+    el.append(kind, body);
+  }
+  el.dataset.role = role;
+  el.dataset.sender = sender || "";
+  el.dataset.chunk = chunk ? "1" : "0";
+  transcript.appendChild(el);
+  followOutput();
+  return el;
+}
+
+function appendChunk(role, text, sender) {
+  if (!text) return;
+  const last = transcript.lastElementChild;
+  const same = role !== "user" && !state.breakAgent && last && last.dataset.role === role && last.dataset.chunk === "1" &&
+    (last.dataset.sender || "") === (sender || "");
+  if (same) {
+    const body = last.querySelector(".msg-body, .event-body");
+    if (body) {
+      body.appendChild(document.createTextNode(text));
+      followOutput();
+      return;
+    }
+  }
+  createMessage(role, text, sender, true);
+  if (role === "agent" || role === "thought") state.breakAgent = false;
+}
+
+function setStatus(phase, running, detail) {
+  const active = Boolean(state.current);
+  let text = active ? (phase || (running ? "running" : "idle")).toLowerCase() : "no chat";
+  // Succeeded/Stopped describe the VM's lifecycle, not the chat. Once a turn is
+  // over the chat is idle even though its last blip has terminated.
+  if (!running && /^(succeeded|stopped|ready|saving|inuse)$/.test(text)) text = "idle";
+  const canCancel = active && Boolean(running);
+  const canStop = active && (Boolean(running) || /^(starting|pending)$/.test(text));
+  $("status").textContent = text;
+  const dot = $("status-dot");
+  const failed = /error|failed/.test(text);
+  dot.dataset.state = running ? "running" : (failed ? "error" : "idle");
+  const detailText = detail || "";
+  $("status").title = detailText;
+  dot.title = detailText;
+  const showDetail = active && failed && detailText && !/^generation \d+$/.test(detailText);
+  $("status-detail").textContent = showDetail ? detailText : "";
+  $("status-detail").title = showDetail ? detailText : "";
+  $("status-detail").hidden = !showDetail;
+  if (!running) closeOpenTools("interrupted");
+  state.running = Boolean(running);
+  state.phase = text;
+  updateSessionStatus();
+  $("actions").hidden = !(canCancel || canStop);
+  $("cancel").hidden = !canCancel;
+  $("stop").hidden = !canStop;
+  $("cancel").disabled = !canCancel;
+  $("stop").disabled = !canStop;
+  if ((document.activeElement === $("cancel") && !canCancel) ||
+      (document.activeElement === $("stop") && !canStop)) {
+    $("transcript").focus();
+  }
+}
+
+function updateSessionStatus() {
+  if (!state.current) return;
+  const phase = $("status").textContent;
+  const known = state.sessions.find((s) => s.name === state.current);
+  if (known) {
+    known.running = state.running;
+    known.phase = phase;
+  }
+  const li = [...$("sessions").children].find((el) => el.dataset.name === state.current);
+  if (!li) return;
+  const meta = li.querySelector(".session-meta");
+  if (!meta) return;
+  meta.title = $("status").title;
+  const phaseEl = meta.querySelector(".session-phase");
+  if (phaseEl) phaseEl.textContent = phase;
+  let dot = meta.querySelector(".dot");
+  if (state.running && !dot) {
+    dot = document.createElement("span");
+    dot.className = "dot";
+    dot.dataset.state = "running";
+    meta.prepend(dot);
+  } else if (!state.running && dot) {
+    dot.remove();
+  }
+}
+
+function setTitle(title) {
+  const text = title || "New chat";
+  $("title").textContent = text;
+  $("title").title = text;
+  document.querySelectorAll("#sessions li").forEach((li) => {
+    if (li.dataset.name !== state.current) return;
+    const b = li.querySelector(".session-title");
+    if (b) { b.textContent = text; b.title = text; }
+  });
+  const known = state.sessions.find((s) => s.name === state.current);
+  if (known) known.title = title || "";
+  const origin = $("origin");
+  if (!origin.hidden && origin.dataset.parent) setOrigin(origin.dataset.parent);
+}
+
+function textOf(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(textOf).join("");
+  return content.text || "";
+}
+
+// Some ACP agents report a failed command as a completed tool call and put the
+// failure in rawOutput metadata instead of status. Treat both shapes as errors.
+function toolFailed(u) {
+  const raw = u && u.rawOutput ? u.rawOutput : {};
+  const meta = (raw && raw.metadata) || (u && u.metadata) || {};
+  if (u && u.status === "failed") return true;
+  if (meta.error === true) return true;
+  // The OpenCode execute tool batches child calls and keeps their failure in
+  // metadata.toolCalls while the outer call still reports "completed".
+  const calls = Array.isArray(meta.toolCalls) ? meta.toolCalls
+    : (Array.isArray(raw.toolCalls) ? raw.toolCalls : []);
+  if (calls.some((call) => call && (call.status === "error" || call.status === "failed"))) return true;
+  const exit = typeof meta.exit === "number" ? meta.exit : (typeof raw.exit === "number" ? raw.exit : undefined);
+  return exit !== undefined && exit !== 0;
+}
+
+// A turn can end without a terminal tool_call_update (the agent process may
+// be killed). Do not leave those rows showing in_progress forever.
+function closeOpenTools(label) {
+  toolEvents.forEach((el) => {
+    const status = el.dataset.toolStatus || "pending";
+    if (status === "completed" || status === "done" || status === "failed" || status === "error" || status === "interrupted") return;
+    const body = el.querySelector(".event-body");
+    const title = el.dataset.toolTitle || "tool";
+    if (body) body.textContent = title + " (" + label + ")";
+    el.classList.add("error");
+    el.dataset.toolStatus = "interrupted";
+  });
+}
+
+function renderACP(msg) {
+  if (!msg || typeof msg !== "object") return;
+  if (msg.method === "session/update") {
+    const u = (msg.params && (msg.params.update || msg.params)) || {};
+    switch (u.sessionUpdate) {
+      case "agent_message_chunk": appendChunk("agent", textOf(u.content)); return;
+      case "agent_thought_chunk": appendChunk("thought", textOf(u.content)); return;
+      case "user_message_chunk":
+        if (u.blipUser !== true && !u.sender) return;
+        state.breakAgent = true;
+        appendChunk("user", textOf(u.content), u.sender || "unknown");
+        return;
+      case "tool_call": {
+        const el = createMessage("tool", u.title || u.toolCallId || "call");
+        if (u.toolCallId) {
+          el.dataset.toolCallId = u.toolCallId;
+          el.dataset.toolTitle = u.title || "";
+          el.dataset.toolStatus = u.status || "pending";
+          toolEvents.set(u.toolCallId, el);
+        }
+        return;
+      }
+      case "tool_call_update": {
+        const el = u.toolCallId ? toolEvents.get(u.toolCallId) : null;
+        if (el) {
+          const title = u.title || el.dataset.toolTitle || "tool";
+          el.dataset.toolTitle = title;
+          const body = el.querySelector(".event-body");
+          const failed = toolFailed(u);
+          if (u.status) el.dataset.toolStatus = failed ? "failed" : u.status;
+          else if (failed) el.dataset.toolStatus = "failed";
+          if (body) body.textContent = title + (u.status ? " (" + (failed ? "failed" : u.status) + ")" : "");
+          el.classList.toggle("error", failed);
+          followOutput();
+          return;
+        }
+        if (u.title || (u.status && u.status !== "completed") || toolFailed(u)) {
+          const failed = toolFailed(u);
+          const label = failed ? "failed" : u.status;
+          const created = createMessage("tool", (u.title || "tool") + (label ? " (" + label + ")" : ""));
+          if (u.toolCallId) {
+            created.dataset.toolCallId = u.toolCallId;
+            created.dataset.toolTitle = u.title || "";
+            created.dataset.toolStatus = failed ? "failed" : (u.status || "done");
+            toolEvents.set(u.toolCallId, created);
+          }
+          if (failed) created.classList.add("error");
+        }
+        return;
+      }
+      case "plan":
+        (u.entries || []).forEach((e) => createMessage("tool", "plan: " + (e.content || e.status || "")));
+        return;
+      case "available_commands_update": return;
+      case "session_info_update":
+        if ("title" in u) setTitle(u.title);
+        return;
+    }
+  }
+  if (msg.result && msg.result.stopReason) {
+    // Each prompt response ends one logical turn. Queued prompts can finish
+    // back-to-back, so break the agent bubble even without a user message
+    // between them.
+    state.breakAgent = true;
+    return;
+  }
+  if (msg.method === "blip/output") {
+    const p = msg.params || {};
+    createMessage("system", (p.stream || "output") + ": " + (p.text || ""));
+    return;
+  }
+  if (msg.method === "session/request_permission") {
+    createMessage("tool", "permission requested: " + ((msg.params && msg.params.toolCall && msg.params.toolCall.title) || "tool"));
+    return;
+  }
+  if (msg.error) {
+    createMessage("error", msg.error.message || JSON.stringify(msg.error));
+  }
+}
+
+function handleEvent(ev) {
+  if (typeof ev.offset === "number") state.offset = ev.offset;
+  if (ev.type === "acp") renderACP(ev.message);
+  else if (ev.type === "status" && ev.status) setStatus(ev.status.phase, ev.status.running, ev.status.detail);
+  else if (ev.type === "gap") resyncSession();
+}
+
+function closeEvents() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  if (state.source) state.source.close();
+  state.source = null;
+}
+
+function openEvents() {
+  closeEvents();
+  if (!state.current) return;
+  const url = BASE_PATH + "/api/sessions/" + encodeURIComponent(state.current) +
+    "/events?offset=" + state.offset;
+  const source = new EventSource(url);
+  state.source = source;
+  source.onmessage = (m) => {
+    if (state.source !== source) return;
+    try { handleEvent(JSON.parse(m.data)); } catch (err) { console.error(err); }
+  };
+  source.onerror = () => {
+    if (state.source !== source) return;
+    if (source.readyState === EventSource.CLOSED) {
+      // Some proxies end an EventSource permanently with a non-200. The
+      // browser will not reconnect that object, so open a fresh one with
+      // bounded backoff.
+      state.source = null;
+      if (state.phase !== "reconnecting") setStatus("reconnecting", state.running, "event stream");
+      const delay = reconnectDelay;
+      reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (state.current) openEvents();
+      }, delay);
+      return;
+    }
+    if (state.phase !== "reconnecting") setStatus("reconnecting", state.running, "event stream");
+  };
+  source.onopen = () => {
+    if (state.source !== source) return;
+    reconnectDelay = 1000;
+    if (state.phase === "reconnecting") setStatus(state.running ? "running" : "idle", state.running, "event stream");
+  };
+}
+
+function saveDraft() {
+  // While a chat is loading, #text has already been cleared and belongs to no
+  // chat. Saving then would delete the draft we just stored for that chat.
+  if (!state.current || !state.sessionReady) return;
+  const text = $("text").value;
+  if (text) state.drafts[state.current] = text;
+  else delete state.drafts[state.current];
+}
+
+function restoreDraft(name) {
+  $("text").value = (name && state.drafts[name]) || "";
+  resizeText();
+  updateLimit();
+}
+
+function setDeepLink(name, replace) {
+  const hash = name ? "#" + encodeURIComponent(name) : "";
+  if (location.hash === hash) return;
+  const target = location.pathname + location.search + hash;
+  if (replace) history.replaceState(null, "", target);
+  else history.pushState(null, "", target);
+}
+
+async function openSession(name, fromHistory) {
+  saveDraft();
+  if (state.current) {
+    state.scrollPositions[state.current] = { top: transcript.scrollTop, atBottom: state.atBottom };
+  }
+  const token = ++openSeq;
+  state.pendingDeepLink = "";
+  state.current = name;
+  state.sessionReady = false;
+  state.offset = 0;
+  markActive();
+  state.atBottom = true;
+  // Do not leave the previous chat's draft live while this chat loads; a
+  // quick Send would otherwise post that text to the newly selected chat.
+  $("text").disabled = true;
+  $("send").disabled = true;
+  $("text").value = "";
+  resizeText();
+  updateLimit();
+  closeEvents();
+  // Do not leave the previous chat's transcript, running status, or Cancel /
+  // Stop buttons visible while this chat is loading. state.current already
+  // points at the new chat, so those actions would target the wrong chat.
+  clearTranscript();
+  showEmpty("Loading chat\u2026", "Fetching the conversation.");
+  setStatus("loading", false, "opening chat");
+  try {
+    const d = await api("/api/sessions/" + encodeURIComponent(name));
+    if (token !== openSeq) return;
+    const known = state.sessions.find((s) => s.name === name);
+    const chatScope = scopeOf(d.scope ? d : known);
+    if (adoptScope(chatScope)) reflowSessions();
+    setTitle(d.title);
+    setOrigin((known && known.parent) || d.parent || "");
+    const profile = d.profile ? "profile: " + d.profile : "";
+    $("profile").textContent = profile;
+    $("profile").title = profile;
+    $("profile").hidden = !profile;
+    $("scope-badge").hidden = chatScope !== "user";
+    setStatus(d.phase, d.running, d.statusMessage || "generation " + (d.generation || 0));
+    clearTranscript();
+    const transcriptData = d.transcript || [];
+    transcriptData.forEach(renderACP);
+    if (!d.running) closeOpenTools("interrupted");
+    if (!transcriptData.length) showEmpty("No messages yet", "Send a message to start the conversation.");
+    if (d.transcriptTruncated) {
+      showTranscriptNotice("Earlier messages are not loaded. Showing the most recent history.");
+    }
+    state.offset = d.offset || 0;
+    state.sessionReady = true;
+    $("text").disabled = false;
+    $("send").disabled = false;
+    restoreDraft(name);
+    openEvents();
+    markActive();
+    const active = document.querySelector("#sessions li.active");
+    if (active) active.scrollIntoView({ block: "nearest" });
+    const saved = state.scrollPositions[name];
+    if (saved && !saved.atBottom) {
+      transcript.scrollTop = saved.top;
+      state.atBottom = nearBottom();
+      updateJump();
+    } else {
+      scrollToBottom(false);
+    }
+    closeSidebar(false);
+    if (window.matchMedia("(max-width: 820px)").matches) $("transcript").focus();
+    else $("text").focus();
+    if (!fromHistory) setDeepLink(name, false);
+  } catch (err) {
+    if (token !== openSeq) return;
+    toast(err.message);
+    state.current = null;
+    state.sessionReady = false;
+    state.offset = 0;
+    closeEvents();
+    clearTranscript();
+    setOrigin("");
+    setTitle("Blip Chat");
+    $("text").disabled = true;
+    $("send").disabled = true;
+    $("profile").hidden = true;
+    $("scope-badge").hidden = true;
+    setStatus("no chat", false, "");
+    markActive();
+    const transient = !err.status || err.status >= 500;
+    if (transient) {
+      // Do not throw away a deep link just because the API was briefly down.
+      // loadSessions will retry it once the server is reachable again.
+      state.pendingDeepLink = name;
+      setDeepLink(name, true);
+      showEmpty("Could not open chat", "The server is unreachable. Retrying when it returns.");
+    } else {
+      setDeepLink("", true);
+      showEmpty("Could not open chat", err.message);
+    }
+  }
+}
+
+function markActive() {
+  document.querySelectorAll("#sessions li").forEach((li) => {
+    const active = li.dataset.name === state.current;
+    li.classList.toggle("active", active);
+    const open = li.querySelector(".session-open");
+    if (!open) return;
+    if (active) open.setAttribute("aria-current", "true");
+    else open.removeAttribute("aria-current");
+    li.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  updateTreeTabStop();
+}
+
+function scopeOf(chat) {
+  return chat && chat.scope === "user" ? "user" : "team";
+}
+
+function syncTabs() {
+  document.querySelectorAll('.tabs [role="tab"]').forEach((tab) => {
+    const on = tab.dataset.scope === state.scope;
+    tab.setAttribute("aria-selected", on ? "true" : "false");
+    tab.tabIndex = on ? 0 : -1;
+    if (on) $("sessions-panel").setAttribute("aria-labelledby", tab.id);
+  });
+}
+
+function saveScope() {
+  try { localStorage.setItem("blip.scope", state.scope); } catch (_) {}
+}
+
+// reflowSessions re-renders the sidebar for the active scope from the cached
+// full session list, so switching tabs needs no extra request.
+function reflowSessions() {
+  const visible = state.sessions.filter((s) => scopeOf(s) === state.scope);
+  sessionsFingerprint = JSON.stringify(visible);
+  renderSessions(visible);
+  $("count").textContent = visible.length ? String(visible.length) : "";
+  markActive();
+}
+
+function setScope(scope) {
+  const next = scope === "user" ? "user" : "team";
+  if (next !== state.scope) {
+    state.scope = next;
+    saveScope();
+    reflowSessions();
+    const known = state.current ? state.sessions.find((s) => s.name === state.current) : null;
+    if (state.current && (!known || scopeOf(known) !== state.scope)) resetChat();
+  }
+  syncTabs();
+}
+
+function adoptScope(scope) {
+  const next = scope === "user" ? "user" : "team";
+  if (next === state.scope) return false;
+  state.scope = next;
+  saveScope();
+  syncTabs();
+  return true;
+}
+
+function resetChat() {
+  saveDraft();
+  setDeepLink("", true);
+  openSeq++;
+  closeEvents();
+  state.current = null;
+  state.sessionReady = false;
+  state.pendingDeepLink = "";
+  $("text").value = "";
+  updateLimit();
+  state.offset = 0;
+  clearTranscript();
+  setOrigin("");
+  setTitle("Blip Chat");
+  showEmpty("No chat open", "Pick a chat from the list, or start a new one.");
+  $("text").disabled = true;
+  $("send").disabled = true;
+  $("profile").hidden = true;
+  $("scope-badge").hidden = true;
+  setStatus("no chat", false, "");
+  markActive();
+}
+
+function setOrigin(parent) {
+  const el = $("origin");
+  el.textContent = "";
+  el.hidden = true;
+  delete el.dataset.parent;
+  if (!parent) return;
+  const known = state.sessions.find((s) => s.name === parent);
+  // If the parent is gone (deleted or orphaned child), do not render a link
+  // that opens a 404 and unloads the still-usable child.
+  if (!known) return;
+  el.dataset.parent = parent;
+  el.textContent = "started by ";
+  const a = document.createElement("a");
+  a.href = "#" + encodeURIComponent(parent);
+  a.textContent = known.title || "New chat";
+  a.onclick = (e) => { e.preventDefault(); openSession(parent); };
+  el.appendChild(a);
+  el.hidden = false;
+}
+
+// buildTree turns the flat session list into a depth-first forest: top-level
+// chats first, each followed by its descendants in server order. A chat whose
+// parent is missing, unknown, or itself is treated as top-level, and chats
+// caught in a parent cycle are appended as orphans instead of being dropped.
+function buildTree(sessions) {
+  const known = new Set();
+  sessions.forEach((s) => { if (s && s.name) known.add(s.name); });
+  const children = new Map();
+  const roots = [];
+  sessions.forEach((s) => {
+    if (!s || !s.name) return;
+    const parent = s.parent;
+    if (!parent || parent === s.name || !known.has(parent)) {
+      roots.push(s);
+      return;
+    }
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(s);
+  });
+  const rows = [];
+  const seen = new Set();
+  const visit = (s, depth) => {
+    if (!s || seen.has(s.name)) return;
+    seen.add(s.name);
+    rows.push({ session: s, depth });
+    (children.get(s.name) || []).forEach((c) => visit(c, depth + 1));
+  };
+  roots.forEach((s) => visit(s, 0));
+  sessions.forEach((s) => { if (s && s.name && !seen.has(s.name)) visit(s, 0); });
+  return rows;
+}
+
+const MAX_INDENT = 6;
+
+function visibleSessionRows() {
+  return [...document.querySelectorAll("#sessions > li")].filter((li) => !li.hidden);
+}
+
+// Keep a single tab stop in the tree. Arrow keys move between rows; Tab enters
+// the tree once and leaves it instead of walking every chat button.
+function updateTreeTabStop() {
+  const rows = visibleSessionRows();
+  const focused = document.activeElement && document.activeElement.closest
+    ? document.activeElement.closest("#sessions > li")
+    : null;
+  const stop = (rows.includes(focused) && focused) ||
+    rows.find((li) => li.dataset.name === state.current) || rows[0] || null;
+  // Reset every row, including rows hidden by a collapsed ancestor. Otherwise a
+  // row that was the tab stop keeps tabIndex=0 and can be restored as a hidden
+  // stop when its parent is expanded again.
+  document.querySelectorAll("#sessions > li").forEach((li) => {
+    const open = li.querySelector(".session-open");
+    if (open) open.tabIndex = li === stop ? 0 : -1;
+    const toggle = li.querySelector(".session-toggle:not(:disabled)");
+    if (toggle) toggle.tabIndex = -1;
+  });
+}
+
+function renderSessions(sessions) {
+  const list = $("sessions");
+  const scrollTop = list.scrollTop;
+  const focused = list.contains(document.activeElement) ? document.activeElement : null;
+  const focusName = focused && focused.closest("li") ? focused.closest("li").dataset.name : "";
+  const focusToggle = !!(focused && focused.classList.contains("session-toggle"));
+  list.dataset.empty = state.scope === "user" ? "No private chats yet." : "No team chats yet.";
+  const known = new Set(state.sessions.map((s) => s && s.name).filter(Boolean));
+  for (const name of collapsedSessions) if (!known.has(name)) collapsedSessions.delete(name);
+  list.innerHTML = "";
+  const rows = buildTree(sessions);
+  const items = [];
+  // sync hides every descendant of a collapsed chat. Re-walking keeps nested
+  // collapse state intact when an outer chat is expanded again.
+  const sync = () => {
+    let hiddenDepth = Infinity;
+    items.forEach((item) => {
+      if (item.depth > hiddenDepth) { item.li.hidden = true; return; }
+      item.li.hidden = false;
+      hiddenDepth = item.collapsed ? item.depth : Infinity;
+    });
+  };
+  rows.forEach((row, index) => {
+    const s = row.session;
+    const li = document.createElement("li");
+    li.dataset.name = s.name;
+    li.setAttribute("role", "treeitem");
+    li.setAttribute("aria-level", String(row.depth + 1));
+    li.style.paddingLeft = (10 + 14 * Math.min(row.depth, MAX_INDENT)) + "px";
+    const head = document.createElement("div");
+    head.className = "session-row";
+    const next = rows[index + 1];
+    const hasChildren = !!next && next.depth > row.depth;
+    const item = { li, depth: row.depth, collapsed: collapsedSessions.has(s.name) };
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "session-toggle";
+    if (hasChildren) {
+      const setToggle = () => {
+        const expanded = item.collapsed ? "false" : "true";
+        toggle.setAttribute("aria-expanded", expanded);
+        li.setAttribute("aria-expanded", expanded);
+        toggle.setAttribute("aria-label", (item.collapsed ? "Expand" : "Collapse") + " child chats of " + (s.title || "New chat"));
+        toggle.textContent = item.collapsed ? "▸" : "▾";
+      };
+      setToggle();
+      toggle.onclick = (e) => {
+        e.stopPropagation();
+        item.collapsed = !item.collapsed;
+        if (item.collapsed) collapsedSessions.add(s.name);
+        else collapsedSessions.delete(s.name);
+        setToggle();
+        sync();
+        updateTreeTabStop();
+      };
+    } else {
+      toggle.classList.add("placeholder");
+      toggle.disabled = true;
+      toggle.tabIndex = -1;
+      toggle.setAttribute("aria-hidden", "true");
+    }
+    const title = document.createElement("button");
+    title.type = "button";
+    title.className = "session-title session-open";
+    title.textContent = s.title || "New chat";
+    title.title = s.title || "New chat";
+    title.setAttribute("aria-label", (s.title || "New chat") + " (" + s.name + ")");
+    title.onclick = (e) => {
+      e.stopPropagation();
+      if (performance.now() < state.clickShieldUntil) return;
+      openSession(s.name);
+    };
+    head.append(toggle, title);
+    const meta = document.createElement("span");
+    meta.className = "session-meta";
+    if (s.running) {
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      dot.dataset.state = "running";
+      meta.appendChild(dot);
+    }
+    const phase = document.createElement("span");
+    phase.className = "session-phase";
+    let phaseText = (s.phase || "idle").toLowerCase();
+    if (!s.running && /^(succeeded|stopped|ready|saving)$/.test(phaseText)) phaseText = "idle";
+    phase.textContent = phaseText;
+    phase.title = s.statusMessage || "";
+    meta.title = s.statusMessage || "";
+    meta.appendChild(phase);
+    const time = document.createElement("time");
+    time.dateTime = s.created;
+    time.textContent = relativeTime(s.created);
+    time.title = s.created ? new Date(s.created).toLocaleString() : "";
+    meta.appendChild(time);
+    li.append(head, meta);
+    li.onclick = (e) => {
+      if (e.target.closest(".session-toggle")) return;
+      if (performance.now() < state.clickShieldUntil) return;
+      openSession(s.name);
+    };
+    items.push(item);
+    list.appendChild(li);
+  });
+  sync();
+  updateTreeTabStop();
+  list.scrollTop = scrollTop;
+  if (focusName) {
+    const li = [...list.children].find((el) => el.dataset.name === focusName);
+    const target = li && (focusToggle ? li.querySelector(".session-toggle:not(:disabled)") : null);
+    const nextFocus = target || (li && li.querySelector(".session-open"));
+    if (nextFocus) nextFocus.focus({ preventScroll: true });
+    list.scrollTop = scrollTop;
+  }
+  updateTreeTabStop();
+}
+
+function refreshSessionTimes() {
+  document.querySelectorAll("#sessions time[datetime]").forEach((el) => {
+    el.textContent = relativeTime(el.dateTime);
+  });
+}
+
+async function loadSessions(opts) {
+  opts = opts || {};
+  const quiet = !!opts.quiet;
+  const token = ++listSeq;
+  try {
+    const sessions = await api("/api/sessions");
+    if (token !== listSeq) return;
+    state.sessions = Array.isArray(sessions) ? sessions : [];
+    if (state.current && !state.sessions.some((s) => s && s.name === state.current)) {
+      resetChat();
+      toast("That chat is no longer available.");
+    }
+    const visible = state.sessions.filter((s) => scopeOf(s) === state.scope);
+    const fingerprint = JSON.stringify(visible);
+    if (fingerprint !== sessionsFingerprint) {
+      sessionsFingerprint = fingerprint;
+      renderSessions(visible);
+    } else {
+      refreshSessionTimes();
+    }
+    $("count").textContent = visible.length ? String(visible.length) : "";
+    markActive();
+    // A child tab has no SSE stream for its parent, so the periodic list is
+    // the only place it can learn that the parent (or this chat) was renamed.
+    if (state.current) {
+      const current = state.sessions.find((s) => s && s.name === state.current);
+      if (current) setTitle(current.title);
+      // A child has no SSE stream for its parent. If the parent disappears
+      // (deleted, or garbage-collected), do not leave a live link that opens
+      // a 404 and unloads the still-usable child.
+      const origin = $("origin");
+      if (!origin.hidden && origin.dataset.parent &&
+          !state.sessions.some((s) => s && s.name === origin.dataset.parent)) {
+        origin.hidden = true;
+        delete origin.dataset.parent;
+      }
+    }
+    // A poll that started before the last status event can carry an older
+    // phase. Reapply the active chat's live status after every list render.
+    updateSessionStatus();
+    if (!state.me && !state.meLoading) loadMe();
+    if (!state.current && state.pendingDeepLink) {
+      const target = state.pendingDeepLink;
+      if (state.sessions.some((s) => s && s.name === target)) {
+        state.pendingDeepLink = "";
+        openSession(target, true);
+      }
+    }
+  } catch (err) {
+    if (token !== listSeq) return;
+    if (quiet) return;
+    sessionsFingerprint = "";
+    state.sessions = [];
+    renderSessions([]);
+    $("count").textContent = "";
+    toast(err.message);
+  }
+}
+
+function scheduleSessionPoll(delay) {
+  clearTimeout(sessionPollTimer);
+  sessionPollTimer = 0;
+  if (document.hidden) return;
+  sessionPollTimer = setTimeout(async () => {
+    sessionPollTimer = 0;
+    if (!document.hidden) await loadSessions({ quiet: true });
+    scheduleSessionPoll();
+  }, delay === undefined ? SESSION_POLL_MS : delay);
+}
+
+async function resyncSession() {
+  if (resyncing || !state.current) return;
+  resyncing = true;
+  const name = state.current;
+  const token = ++openSeq;
+  const wasAtBottom = state.atBottom;
+  const wasTop = transcript.scrollTop;
+  closeEvents();
+  try {
+    const d = await api("/api/sessions/" + encodeURIComponent(name));
+    if (token !== openSeq || state.current !== name) return;
+    setTitle(d.title);
+    $("scope-badge").hidden = scopeOf(d) !== "user";
+    setStatus(d.phase, d.running, d.statusMessage || "generation " + (d.generation || 0));
+    const transcriptData = d.transcript || [];
+    clearTranscript();
+    transcriptData.forEach(renderACP);
+    if (!d.running) closeOpenTools("interrupted");
+    if (!transcriptData.length) showEmpty("No messages yet", "Send a message to start the conversation.");
+    if (d.transcriptTruncated) {
+      showTranscriptNotice("Earlier messages are not loaded. Showing the most recent history.");
+    }
+    state.offset = d.offset || 0;
+    openEvents();
+    state.atBottom = wasAtBottom;
+    if (wasAtBottom) scrollToBottom(false);
+    else {
+      transcript.scrollTop = wasTop;
+      state.atBottom = nearBottom();
+      updateJump();
+    }
+  } catch (err) {
+    if (token === openSeq && state.current === name) {
+      setStatus("reconnecting", state.running, "event stream");
+      openEvents();
+    }
+  } finally {
+    resyncing = false;
+  }
+}
+
+function closeNewMenu(restoreFocus) {
+  // Invalidate any in-flight loadProfiles so a late response cannot reopen the
+  // menu after the user dismissed it or opened it again.
+  newMenuSeq++;
+  const focused = $("new-menu").contains(document.activeElement);
+  $("new-menu").hidden = true;
+  $("new-btn").setAttribute("aria-expanded", "false");
+  if (!focused) return;
+  if (restoreFocus) $("new-btn").focus();
+  else if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+}
+
+async function createSession(profile) {
+  if (state.creating) return;
+  state.creating = true;
+  state.clickShieldUntil = performance.now() + 800;
+  const scope = state.scope;
+  closeNewMenu();
+  // The previous chat stays current until openSession finishes. Disable the
+  // composer now so a fast send cannot post to the old chat while the new one
+  // is still being created.
+  $("text").disabled = true;
+  $("send").disabled = true;
+  try {
+    const created = await api("/api/sessions", {
+      method: "POST",
+      body: { profile, scope }
+    });
+    await loadSessions();
+    if (state.scope === scope) await openSession(created.name);
+    else toast("Chat created in " + (scope === "user" ? "Private" : "Team") + ".");
+  } catch (err) { toast(err.message); }
+  finally {
+    state.creating = false;
+    // A failed POST leaves the old chat current, so keep it usable. If
+    // openSession failed it has already disabled the composer and cleared the
+    // current chat; do not re-enable sending into nowhere.
+    if (state.current) {
+      $("text").disabled = false;
+      $("send").disabled = false;
+    }
+  }
+}
+
+async function loadProfiles(seq) {
+  try {
+    const profiles = await api("/api/profiles");
+    // Check before touching the DOM. A stale response that rewrites the menu
+    // would fire focusout and close a newer menu.
+    if (seq !== undefined && seq !== newMenuSeq) return false;
+    if (!Array.isArray(profiles) || !profiles.length) {
+      toast("No profiles configured.");
+      return false;
+    }
+    const menu = $("new-menu");
+    menu.innerHTML = "";
+    profiles.forEach((p) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "menu-item";
+      b.dataset.profile = p.name;
+      b.setAttribute("role", "menuitem");
+      const name = document.createElement("span");
+      name.textContent = p.title || p.name;
+      b.appendChild(name);
+      if (p.default) {
+        const tag = document.createElement("span");
+        tag.className = "menu-tag";
+        tag.textContent = "default";
+        b.appendChild(tag);
+      }
+      b.onclick = () => createSession(p.name);
+      menu.appendChild(b);
+    });
+    return true;
+  } catch (err) {
+    if (seq === undefined || seq === newMenuSeq) toast(err.message);
+    return false;
+  }
+}
+
+async function loadMe() {
+  if (state.meLoading) return;
+  state.meLoading = true;
+  try {
+    const me = await api("/api/me");
+    state.me = me.user || "";
+    $("me").textContent = state.me || "unknown";
+    $("me").title = state.me;
+  } catch (err) {
+    state.me = "";
+    $("me").textContent = "not signed in";
+    $("me").title = err.message;
+  } finally {
+    state.meLoading = false;
+  }
+}
+
+function syncComposerHeight() {
+  document.documentElement.style.setProperty("--composer-h", $("composer").offsetHeight + "px");
+}
+
+function resizeText() {
+  const el = $("text");
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 160) + "px";
+  syncComposerHeight();
+}
+
+function updateLimit() {
+  const bytes = new TextEncoder().encode($("text").value).length;
+  const el = $("limit");
+  el.hidden = bytes < 28000;
+  el.textContent = bytes ? bytes + " / 32000 bytes" : "";
+  el.dataset.over = bytes > 32000 ? "true" : "false";
+}
+
+function countDomUserText(text) {
+  return [...document.querySelectorAll("#transcript .msg.user .msg-body")]
+    .filter((el) => el.textContent === text).length;
+}
+
+function countRecordUserText(records, text) {
+  let count = 0;
+  (records || []).forEach((msg) => {
+    if (!msg || msg.method !== "session/update") return;
+    const u = (msg.params && (msg.params.update || msg.params)) || {};
+    if (u.sessionUpdate !== "user_message_chunk") return;
+    if (u.blipUser !== true && !u.sender) return;
+    if (textOf(u.content) === text) count++;
+  });
+  return count;
+}
+
+async function promptWasAccepted(name, text, prior) {
+  // A response can be lost after the server has already accepted the prompt.
+  // Poll briefly for the authoritative user record before treating it as a
+  // failed send and restoring the text for a duplicate resend.
+  for (let i = 0; i < 6; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    try {
+      const d = await api("/api/sessions/" + encodeURIComponent(name));
+      if (countRecordUserText(d.transcript, text) > prior) return true;
+    } catch (_) {}
+    if (state.current === name && countDomUserText(text) > prior) return true;
+  }
+  return false;
+}
+
+function restoreUnsent(name, text) {
+  const merge = (existing) => {
+    if (!existing) return text;
+    if (existing.includes(text)) return existing;
+    return text + "\n\n" + existing;
+  };
+  if (state.current === name) {
+    const next = merge($("text").value);
+    if (next !== $("text").value) {
+      $("text").value = next;
+      resizeText();
+      updateLimit();
+    }
+    state.drafts[name] = $("text").value;
+  } else {
+    state.drafts[name] = merge(state.drafts[name]);
+  }
+}
+
+async function send() {
+  if (state.creating) return;
+  const text = $("text").value.trim();
+  if (!text || !state.current || $("text").disabled) return;
+  const name = state.current;
+  const prior = countDomUserText(text);
+  $("text").value = "";
+  resizeText();
+  updateLimit();
+  state.atBottom = true;
+  try {
+    await api("/api/sessions/" + encodeURIComponent(name) + "/message", {
+      method: "POST",
+      body: { text }
+    });
+    // Only clear the draft we actually sent. A newer draft may have been
+    // saved after the user switched chats while this request was in flight.
+    if (state.drafts[name] === text) delete state.drafts[name];
+    // The agent may spawn child chats while handling this turn. Poll soon so
+    // they show up in the sidebar without waiting for the next interval.
+    scheduleSessionPoll(300);
+  } catch (err) {
+    if (await promptWasAccepted(name, text, prior)) {
+      if (state.drafts[name] === text) delete state.drafts[name];
+      toast("Message delivered.");
+    } else {
+      restoreUnsent(name, text);
+      toast(err.message);
+    }
+  }
+  if (state.current === name && !$("text").disabled) $("text").focus();
+}
+
+function openSidebar() {
+  document.body.classList.add("sidebar-open");
+  $("sidebar-btn").setAttribute("aria-expanded", "true");
+  document.querySelector("main").inert = true;
+  document.querySelector(".skip-link").inert = true;
+  requestAnimationFrame(() => {
+    const rows = [...document.querySelectorAll("#sessions li")].filter((li) => !li.hidden);
+    const target = rows.find((li) => li.classList.contains("active")) || rows[0];
+    const focus = target ? target.querySelector(".session-open") : document.querySelector('.tabs [role="tab"]');
+    if (focus) focus.focus();
+  });
+}
+
+function closeSidebar(restoreFocus) {
+  const wasOpen = document.body.classList.contains("sidebar-open");
+  document.body.classList.remove("sidebar-open");
+  $("sidebar-btn").setAttribute("aria-expanded", "false");
+  document.querySelector("main").inert = false;
+  document.querySelector(".skip-link").inert = false;
+  if (wasOpen && restoreFocus !== false) $("sidebar-btn").focus();
+}
+
+transcript.addEventListener("scroll", updateJump, { passive: true });
+$("jump").onclick = () => scrollToBottom(true);
+document.querySelector(".skip-link").addEventListener("click", (e) => {
+  e.preventDefault();
+  transcript.focus();
+});
+
+const tabs = [...document.querySelectorAll('.tabs [role="tab"]')];
+tabs.forEach((tab, index) => {
+  tab.addEventListener("click", () => setScope(tab.dataset.scope));
+  tab.addEventListener("keydown", (e) => {
+    let next = -1;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (index + 1) % tabs.length;
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = (index - 1 + tabs.length) % tabs.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = tabs.length - 1;
+    else return;
+    e.preventDefault();
+    tabs[next].focus();
+    setScope(tabs[next].dataset.scope);
+  });
+});
+
+$("sessions").addEventListener("keydown", (e) => {
+  const row = e.target.closest("#sessions > li");
+  if (!row) return;
+  const rows = visibleSessionRows();
+  const index = rows.indexOf(row);
+  if (index < 0) return;
+  const depthOf = (r) => Number(r.getAttribute("aria-level")) || 1;
+  const focusRow = (r) => {
+    if (!r) return false;
+    const open = r.querySelector(".session-open");
+    if (open) open.focus();
+    updateTreeTabStop();
+    return true;
+  };
+  const toggle = row.querySelector(".session-toggle:not(:disabled)");
+  const expanded = !!toggle && toggle.getAttribute("aria-expanded") === "true";
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    focusRow(rows[(index + 1) % rows.length]);
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    focusRow(rows[(index - 1 + rows.length) % rows.length]);
+  } else if (e.key === "Home") {
+    e.preventDefault();
+    focusRow(rows[0]);
+  } else if (e.key === "End") {
+    e.preventDefault();
+    focusRow(rows[rows.length - 1]);
+  } else if (e.key === "ArrowRight") {
+    if (toggle && !expanded) {
+      e.preventDefault();
+      toggle.click();
+      return;
+    }
+    const next = rows[index + 1];
+    if (next && depthOf(next) > depthOf(row)) {
+      e.preventDefault();
+      focusRow(next);
+    }
+  } else if (e.key === "ArrowLeft") {
+    if (toggle && expanded) {
+      e.preventDefault();
+      toggle.click();
+      return;
+    }
+    const depth = depthOf(row);
+    for (let i = index - 1; i >= 0; i--) {
+      if (depthOf(rows[i]) < depth) {
+        e.preventDefault();
+        focusRow(rows[i]);
+        return;
+      }
+    }
+  }
+});
+
+$("new-btn").onclick = async (e) => {
+  e.stopPropagation();
+  if (state.creating) return;
+  if (!$("new-menu").hidden) {
+    closeNewMenu();
+    return;
+  }
+  const menuSeq = ++newMenuSeq;
+  if (!(await loadProfiles(menuSeq))) return;
+  if (menuSeq !== newMenuSeq) return;
+  $("new-menu").hidden = false;
+  $("new-btn").setAttribute("aria-expanded", "true");
+  const first = $("new-menu").querySelector(".menu-item");
+  if (first) first.focus();
+};
+
+$("new-menu").addEventListener("keydown", (e) => {
+  const items = [...$("new-menu").querySelectorAll(".menu-item")];
+  if (!items.length) return;
+  const i = items.indexOf(document.activeElement);
+  if (e.key === "ArrowDown") { e.preventDefault(); items[(i + 1) % items.length].focus(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+  else if (e.key === "Home") { e.preventDefault(); items[0].focus(); }
+  else if (e.key === "End") { e.preventDefault(); items[items.length - 1].focus(); }
+  else if (e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation();
+    closeNewMenu(true);
+  }
+});
+
+document.addEventListener("click", (e) => {
+  if (!$("new").contains(e.target)) closeNewMenu();
+});
+$("new").addEventListener("focusout", (e) => {
+  if (!$("new").contains(e.relatedTarget)) closeNewMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    const wasMenu = !$("new-menu").hidden;
+    closeNewMenu();
+    closeSidebar();
+    if (wasMenu) $("new-btn").focus();
+  }
+});
+$("sidebar-btn").onclick = () => {
+  if (document.body.classList.contains("sidebar-open")) closeSidebar();
+  else openSidebar();
+};
+$("scrim").onclick = closeSidebar;
+
+// The drawer covers the page and main is inert while it is open. Keep Tab
+// inside the sidebar so focus cannot land on the skip link or the document.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab" || !document.body.classList.contains("sidebar-open")) return;
+  const sidebar = $("sidebar");
+  const nodes = [...sidebar.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+    .filter((el) => el.tabIndex >= 0 && el.offsetParent !== null && !el.closest("[hidden]"));
+  if (!nodes.length) { e.preventDefault(); return; }
+  const first = nodes[0];
+  const last = nodes[nodes.length - 1];
+  if (!sidebar.contains(document.activeElement)) {
+    e.preventDefault();
+    first.focus();
+  } else if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+});
+
+$("composer").onsubmit = (e) => { e.preventDefault(); send(); };
+$("text").addEventListener("input", () => { resizeText(); updateLimit(); });
+let resizeFrame = 0;
+function onViewportResize() {
+  resizeText();
+  updateLimit();
+  if (resizeFrame) return;
+  resizeFrame = requestAnimationFrame(() => {
+    resizeFrame = 0;
+    if (state.atBottom && transcript.querySelector(".msg, .event")) {
+      scrollToBottom(false);
+    } else {
+      jumpTarget = false;
+      updateJump();
+    }
+  });
+}
+window.addEventListener("resize", onViewportResize);
+if (window.visualViewport) window.visualViewport.addEventListener("resize", onViewportResize);
+$("text").addEventListener("keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("cancel").onclick = async () => {
+  if (!state.current) return;
+  try { await api("/api/sessions/" + encodeURIComponent(state.current) + "/cancel", { method: "POST", body: {} }); }
+  catch (err) { toast(err.message); }
+};
+$("stop").onclick = async () => {
+  if (!state.current) return;
+  try { await api("/api/sessions/" + encodeURIComponent(state.current) + "/stop", { method: "POST", body: {} }); }
+  catch (err) { toast(err.message); }
+};
+
+const narrowViewport = window.matchMedia("(max-width: 820px)");
+const drawerMode = window.matchMedia("(max-width: 820px), (pointer: coarse)");
+narrowViewport.addEventListener("change", (e) => {
+  if (!e.matches) {
+    const wasOpen = document.body.classList.contains("sidebar-open");
+    const hadFocus = $("sidebar").contains(document.activeElement);
+    document.body.classList.remove("sidebar-open");
+    document.querySelector("main").inert = false;
+    document.querySelector(".skip-link").inert = false;
+    $("sidebar-btn").setAttribute("aria-expanded", "false");
+    if (wasOpen && hadFocus) {
+      // On a coarse-pointer device the sidebar can still be an off-screen
+      // drawer after rotating to a width above 820px. Keep focus on the
+      // visible toggle rather than a hidden row.
+      if (drawerMode.matches) {
+        $("sidebar-btn").focus();
+      } else {
+        const target = $("sessions").querySelector(".session-open");
+        (target || $("tab-team")).focus();
+      }
+    }
+    return;
+  }
+  const menuHadFocus = $("new-menu").contains(document.activeElement);
+  closeNewMenu();
+  if (menuHadFocus || document.querySelector("aside").contains(document.activeElement)) {
+    // When the drawer is open, main (including the Chats toggle) is inert, so
+    // focus must go to a control inside the sidebar.
+    const drawerOpen = document.body.classList.contains("sidebar-open");
+    const target = drawerOpen ? ($("new-btn") || $("sessions").querySelector(".session-open")) : $("sidebar-btn");
+    if (target) target.focus();
+  }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearTimeout(sessionPollTimer);
+    sessionPollTimer = 0;
+    return;
+  }
+  loadSessions({ quiet: true });
+  scheduleSessionPoll();
+  refreshSessionTimes();
+});
+window.addEventListener("focus", () => {
+  if (!document.hidden) loadSessions({ quiet: true });
+});
+setInterval(() => {
+  if (!document.hidden) refreshSessionTimes();
+}, 60000);
+
+function hashName() {
+  try {
+    return decodeURIComponent((location.hash || "").replace(/^#/, ""));
+  } catch (_) {
+    return "";
+  }
+}
+
+window.addEventListener("popstate", () => {
+  const name = hashName();
+  // "transcript" is the skip-link fragment, not a chat name. Returning to it
+  // from a chat must also return the visible view to the no-chat state so the
+  // URL and the rendered chat cannot disagree after a reload.
+  if (name === "transcript") {
+    if (state.current) resetChat();
+    return;
+  }
+  if (name) openSession(name, true);
+  else resetChat();
+});
+
+async function boot() {
+  let saved = "";
+  try { saved = localStorage.getItem("blip.scope") || ""; } catch (_) {}
+  if (saved === "team" || saved === "user") state.scope = saved;
+  syncTabs();
+  await loadMe();
+  await loadSessions();
+  scheduleSessionPoll();
+  const linked = hashName();
+  if (linked && linked !== "transcript") await openSession(linked, true);
+}
+
+boot();
+</script>
+</body>
+</html>

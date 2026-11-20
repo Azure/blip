@@ -1,0 +1,58 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Images are pulled from the plain-HTTP registry container blip-registry on the
+# kind docker network (localhost:5001 from the host).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blip-controller
+  namespace: blip-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          args:
+            - --leader-elect
+            - --runtime-image=$(RUNTIME_IMAGE)
+            - --insecure-registry=blip-registry:5000
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: blip-node
+  namespace: blip-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: node
+          args:
+            - --insecure-registry=blip-registry:5000
+---
+# Chat profiles default to the read-only blip-chat pool in the local overlay.
+# The base deployment keeps "default" because production installs choose their
+# own pool; a chat profile should always name a pool whose service account is
+# read-only for blips and blipstates.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blipchat
+  namespace: blip-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: blipchat
+          args:
+            - --listen=:8080
+            - --namespace=default
+            - --profiles-configmap=blip-system/blip-chat-profiles
+            - --auto-approve=always
+            - --default-pool=blip-chat
+            - --mcp-listen=:8443
+            - --mcp-cert=/etc/blipchat-mcp/tls.crt
+            - --mcp-key=/etc/blipchat-mcp/tls.key
+            - --mcp-url=http://blipchat-mcp/mcp
+            - --log-level=info

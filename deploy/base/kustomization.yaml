@@ -1,0 +1,13 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../crd
+  - namespaces.yaml
+  - controller.yaml
+  - vm-owner-policy.yaml
+  - chat-agent-policy.yaml
+  - node.yaml
+  - blipchat.yaml

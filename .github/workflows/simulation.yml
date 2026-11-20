@@ -1,0 +1,67 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: Simulation campaign
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simulation-campaign
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Explore fresh reproducible lifecycle schedules
+        env:
+          BLIP_SIM_RUNS: '128'
+        run: |
+          export BLIP_SIM_SEED=$((GITHUB_RUN_NUMBER * BLIP_SIM_RUNS))
+          echo "Seeds start at ${BLIP_SIM_SEED}; runs=${BLIP_SIM_RUNS}"
+          set -o pipefail
+          go test -count=1 -timeout 15m -v -run '^TestSimulationLifecycleSeededReplayAndHealing$' ./internal/simapp 2>&1 | tee simulation.log
+      - name: Retain failure traces
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: simulation-traces
+          path: simulation.log
+          if-no-files-found: ignore
+
+  components:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Explore fresh reproducible component schedules
+        env:
+          BLIP_SIM_RUNS: '64'
+        run: |
+          export BLIP_SIM_SEED=$((GITHUB_RUN_NUMBER * BLIP_SIM_RUNS))
+          echo "Seeds start at ${BLIP_SIM_SEED}; runs=${BLIP_SIM_RUNS}"
+          set -o pipefail
+          make test-sim 2>&1 | tee simulation-components.log
+      - name: Retain failure traces
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: simulation-component-traces
+          path: simulation-components.log
+          if-no-files-found: ignore

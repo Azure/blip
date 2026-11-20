@@ -1,0 +1,63 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Local end-to-end pool for the opencode ACP browser test.
+#
+# The "unbounded" endpoint is logical: the pool sidecar dials the local
+# inference proxy and adds its CA, so neither the upstream gateway nor the
+# inference token is described here. The guest must not receive a
+# service-account token for it, so it has no audience.
+#
+# The "blipchat-mcp" endpoint lets the guest call the blipchat MCP server to
+# spawn child chats. It requests a pod-bound service-account token for the
+# blipchat audience, so only the MCP server can use it.
+#
+# maxCount leaves room for a parent and its two children to run at once.
+apiVersion: blip.dev/v1alpha1
+kind: BlipPool
+metadata:
+  name: opencode
+  namespace: default
+spec:
+  # Chat VMs only need read access. blipchat writes sessions and Blips with its
+  # own account, and the admission policies block direct writes from the guest.
+  serviceAccountName: blip-chat
+  nodeSelector:
+    blip.dev/node-pool: default
+  cpus: 1
+  memory: 1Gi
+  warmCount: 1
+  maxCount: 4
+  endpoints:
+    - name: unbounded
+      url: https://unbounded-proxy.blip-system.svc.cluster.local
+      caConfigMap: unbounded-proxy-ca
+    - name: blipchat-mcp
+      url: https://blipchat-mcp.blip-system.svc
+      audience: blipchat
+      caConfigMap: blipchat-mcp-ca
+---
+# The opencode browser test starts the opencode profile as a root chat and
+# spawns two children of the same profile (depth 1). This overrides the sample
+# blip-chat-policy from deploy/base. It lives here because run.sh always applies
+# this file, while it only patches blip-chat-profiles when that ConfigMap
+# already exists. The writers list must stay identical to the deployment
+# sample or blipchat and the controllers cannot create and clean up chats.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blip-chat-policy
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blipchat
+    app.kubernetes.io/part-of: blip
+data:
+  maxDepth: "1"
+  root: "*"
+  allow.opencode: "opencode"
+  writers: >-
+    system:serviceaccount:blip-system:blipchat
+    system:serviceaccount:blip-system:blip-controller
+    system:serviceaccount:kube-system:generic-garbage-collector
+    system:serviceaccount:kube-system:namespace-controller
+  writerGroups: "system:masters"

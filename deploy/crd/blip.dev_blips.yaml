@@ -1,0 +1,406 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: blips.blip.dev
+spec:
+  group: blip.dev
+  names:
+    kind: Blip
+    listKind: BlipList
+    plural: blips
+    singular: blip
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.state
+      name: Root
+      type: string
+    - jsonPath: .status.exitCode
+      name: Exit
+      type: integer
+    - jsonPath: .status.node
+      name: Node
+      type: string
+    - jsonPath: .status.reason
+      name: Reason
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BlipSpec is one VM lifetime: one command that runs as the primary session.
+              The blip ends when the command exits.
+            properties:
+              activeDeadlineSeconds:
+                description: |-
+                  ActiveDeadlineSeconds stops the blip's command when it has run this
+                  long. The VM is stopped as if spec.stop were set. `blip run --timeout`
+                  sets it.
+                format: int64
+                maximum: 9223372036
+                minimum: 1
+                type: integer
+              command:
+                description: Command runs as the primary session. The blip ends when
+                  it exits.
+                items:
+                  type: string
+                minItems: 1
+                type: array
+              env:
+                items:
+                  properties:
+                    name:
+                      type: string
+                    value:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              idleTimeoutSeconds:
+                description: |-
+                  IdleTimeoutSeconds stops a blip whose command has produced no input or
+                  output for this long. It is a backstop for interactive agents, not a
+                  deadline: `blip run` leaves it unset and relies on
+                  activeDeadlineSeconds. The exit reason is Idle, which is treated like
+                  Stopped (the root is saved and the blip succeeds).
+                format: int64
+                maximum: 9223372036
+                minimum: 1
+                type: integer
+              network:
+                description: |-
+                  Network narrows the pool's egress policy. Omitted inherits the root
+                  state's runtime network policy, or the pool if neither is set.
+                  Explicitly empty denies all. Changes apply to running blips.
+                properties:
+                  egress:
+                    items:
+                      description: NetworkEgressRule allows the intersection of its
+                        destinations and ports.
+                      properties:
+                        ports:
+                          description: |-
+                            Ports allows numeric TCP/UDP destination ports. Omitted or empty means
+                            all IP protocols and ports. Service ports are not translated here.
+                          items:
+                            description: NetworkPort is a numeric destination port
+                              or inclusive port range.
+                            properties:
+                              endPort:
+                                format: int32
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              port:
+                                format: int32
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              protocol:
+                                default: TCP
+                                description: Protocol defines network protocols supported
+                                  for things like container ports.
+                                enum:
+                                - TCP
+                                - UDP
+                                type: string
+                            required:
+                            - port
+                            type: object
+                            x-kubernetes-validations:
+                            - message: endPort must be at least port
+                              rule: '!has(self.endPort) || self.endPort >= self.port'
+                          maxItems: 64
+                          type: array
+                        to:
+                          description: |-
+                            To selects IPv4 destination blocks. Omitted or empty means all IPv4
+                            destinations.
+                          items:
+                            description: |-
+                              NetworkPeer is an IPv4 destination block. Selectors are deliberately
+                              unsupported: resolving cluster objects requires cluster-wide reads and can
+                              go stale between reconciles.
+                            properties:
+                              ipBlock:
+                                description: IPBlock allows an IPv4 CIDR minus its
+                                  strictly smaller exception CIDRs.
+                                properties:
+                                  cidr:
+                                    description: CIDR is an IPv4 destination range,
+                                      for example 192.0.2.0/24.
+                                    maxLength: 18
+                                    type: string
+                                  except:
+                                    description: Except removes IPv4 subranges from
+                                      CIDR.
+                                    items:
+                                      maxLength: 18
+                                      type: string
+                                    maxItems: 32
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - cidr
+                                type: object
+                                x-kubernetes-validations:
+                                - message: cidr must be a valid IPv4 CIDR
+                                  rule: isCIDR(self.cidr) && cidr(self.cidr).ip().family()
+                                    == 4
+                                - message: exceptions must be IPv4 CIDRs strictly
+                                    inside cidr
+                                  rule: '!has(self.except) || self.except.all(c, isCIDR(c)
+                                    && cidr(c).ip().family() == 4 && cidr(self.cidr).containsIP(cidr(c).ip())
+                                    && cidr(c).prefixLength() > cidr(self.cidr).prefixLength())'
+                            type: object
+                            x-kubernetes-validations:
+                            - message: a peer must select an IP block
+                              rule: has(self.ipBlock)
+                          maxItems: 64
+                          type: array
+                      type: object
+                    maxItems: 64
+                    type: array
+                type: object
+              pool:
+                default: default
+                description: Pool names a BlipPool in the blip's namespace.
+                maxLength: 253
+                minLength: 1
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                type: string
+                x-kubernetes-validations:
+                - message: pool is immutable
+                  rule: self == oldSelf
+              state:
+                description: |-
+                  State gives the blip a durable root filesystem. A new version is
+                  saved when the blip stops. Mounts and runtime defaults come from this
+                  state in the blip's namespace.
+                maxLength: 253
+                minLength: 1
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                type: string
+                x-kubernetes-validations:
+                - message: state is immutable
+                  rule: self == oldSelf
+              stop:
+                description: Stop asks the blip to shut down gracefully and save.
+                type: boolean
+              ttlSecondsAfterFinished:
+                description: |-
+                  TTLSecondsAfterFinished deletes the blip this long after it finished,
+                  whether or not anyone gathered its results. `blip run --ttl` sets it.
+                format: int32
+                maximum: 2147483647
+                minimum: 0
+                type: integer
+              user:
+                type: string
+                x-kubernetes-validations:
+                - message: user is immutable
+                  rule: self == oldSelf
+              workingDir:
+                type: string
+                x-kubernetes-validations:
+                - message: workingDir is immutable
+                  rule: self == oldSelf
+            required:
+            - command
+            - state
+            type: object
+            x-kubernetes-validations:
+            - message: command is immutable
+              rule: has(self.command) == has(oldSelf.command) && (!has(self.command)
+                || self.command == oldSelf.command)
+            - message: env is immutable
+              rule: (has(self.env) == has(oldSelf.env)) && (!has(self.env) || self.env
+                == oldSelf.env)
+            - message: workingDir is immutable
+              rule: (has(self.workingDir) == has(oldSelf.workingDir)) && (!has(self.workingDir)
+                || self.workingDir == oldSelf.workingDir)
+            - message: user is immutable
+              rule: (has(self.user) == has(oldSelf.user)) && (!has(self.user) || self.user
+                == oldSelf.user)
+          status:
+            properties:
+              exitCode:
+                description: |-
+                  ExitCode is the command's exit status. It is 0-255 for a real process,
+                  but the bound is the int32 range so a malformed status cannot break the
+                  controller's typed list/watch decode.
+                format: int32
+                maximum: 2147483647
+                minimum: 0
+                type: integer
+              finishTime:
+                format: date-time
+                type: string
+              locality:
+                description: |-
+                  Locality is where a pending Blip's durable data lives. The pool
+                  boots a VM pinned to that node so the Blip does not start on a
+                  remote clone.
+                properties:
+                  fallback:
+                    description: Fallback means the Blip stopped waiting and claims
+                      any warm VM.
+                    type: boolean
+                  node:
+                    description: Node holds the root state (or the most writable mount
+                      states).
+                    type: string
+                  since:
+                    description: |-
+                      Since is when the Blip, with all its states usable, started waiting
+                      for a VM on Node.
+                    format: date-time
+                    type: string
+                required:
+                - node
+                type: object
+              message:
+                type: string
+              mountStateUIDs:
+                additionalProperties:
+                  type: string
+                description: |-
+                  MountStateUIDs pins the mount states a pending Blip has seen. A state
+                  deleted and recreated under the same name is a different filesystem;
+                  attaching it would silently substitute data the Blip never saw.
+                type: object
+              mounts:
+                items:
+                  properties:
+                    attachmentID:
+                      description: AttachmentID is unique per mount operation.
+                      type: string
+                    commitID:
+                      type: string
+                    inClaim:
+                      description: |-
+                        InClaim records that this writable mount was part of the claim the
+                        guest accepted. The guest only accepts a claim after every such mount
+                        is attached, so its disk must be saved on stop even if the last
+                        observation predates the attachment. A mount added to a running Blip
+                        is not in the claim and may never attach.
+                      type: boolean
+                    message:
+                      type: string
+                    path:
+                      type: string
+                    phase:
+                      description: |-
+                        Phase is one of the documented mount phases. An unknown value is
+                        rejected at admission so the controller and CLI cannot be left
+                        waiting on a mount that is in no known phase.
+                      enum:
+                      - Pending
+                      - Mounted
+                      - Unmounting
+                      - Saving
+                      - Failed
+                      type: string
+                    state:
+                      type: string
+                    stateUID:
+                      description: |-
+                        StateUID and CommitID pin the version: the mounted version for
+                        read-only mounts, the base version for writable mounts.
+                      type: string
+                    switching:
+                      description: |-
+                        Switching is set while the mount is being changed between read-only
+                        and writable. It remains set if the switch fails so the previous
+                        mode stays visible.
+                      type: boolean
+                    writable:
+                      type: boolean
+                  required:
+                  - path
+                  - phase
+                  - state
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - state
+                x-kubernetes-list-type: map
+              node:
+                type: string
+              phase:
+                description: |-
+                  Phase is one of the documented Blip phases. An unknown value is
+                  rejected at admission so a status writer cannot leave a Blip in a
+                  phase that no reconcile path can advance or clean up.
+                enum:
+                - Pending
+                - Running
+                - Saving
+                - Succeeded
+                - Failed
+                type: string
+              pod:
+                type: string
+              podUID:
+                type: string
+              reason:
+                type: string
+              rootAttachmentID:
+                description: RootAttachmentID is the writer attachment of a durable
+                  root.
+                type: string
+              rootStateUID:
+                description: |-
+                  RootStateUID is the UID of the root state once a pending Blip has seen
+                  it. A root that disappears after that was deleted; it is never
+                  recreated for this Blip, so waiting for it cannot succeed.
+                type: string
+              startTime:
+                format: date-time
+                type: string
+              stateGeneration:
+                description: StateGeneration is the observed desired generation of
+                  the root state.
+                format: int64
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

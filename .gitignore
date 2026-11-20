@@ -1,0 +1,18 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+/bin/
+/build/
+/kubectl-blip
+/blip-*
+*.test
+/blipchat
+
+# Local-only inference proxy. It contains the upstream endpoint and auth
+# wiring; keep it out of the public repository.
+/inference-proxy/
+
+# Playwright test artifacts.
+/hack/e2e/opencode/browser/node_modules/
+/hack/e2e/opencode/browser/test-results/
+/hack/e2e/opencode/browser/playwright-report/

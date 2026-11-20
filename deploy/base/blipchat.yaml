@@ -1,0 +1,349 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# blipchat serves exactly ONE Kubernetes namespace, chosen at deployment time
+# with --namespace. That namespace holds every chat: there is no per-request,
+# per-chat, or per-tool namespace, and no request path, body, or argument may
+# select one. Create, read, write, and stream calls all use the configured
+# namespace. The blipchat Role and RoleBinding below must live in that same
+# namespace; the ClusterRole keeps only cluster-scoped access.
+#
+# Every chat carries the chat.blip.dev/scope annotation, which is either "team"
+# or "user". A private chat (scope "user") also carries chat.blip.dev/user set
+# to the owner's identity. A chat without the scope annotation is a team chat,
+# which keeps every chat created before scopes existed. The requesting identity
+# is always the asserted X-Forwarded-User; blipchat enforces the rule on every
+# chat endpoint: team chats are open to everyone who reaches blipchat, while a
+# private chat is served only to the identity named in chat.blip.dev/user. A
+# non-owner gets HTTP 404 with {"error":"not found"} so the chat's existence is
+# not revealed. This is a blipchat-level boundary only: an identity with direct
+# Kubernetes access to the namespace can still read the chat objects there, so
+# scope is not a substitute for Kubernetes RBAC.
+#
+# Agent profiles and child chats
+#
+# The blip-chat-profiles ConfigMap in blip-system holds one JSON profile per
+# key. A chat runs the profile named in its create request, or "default" when
+# it names none. A chat may spawn child chats, which are ordinary chats shown
+# in the session tree. For example:
+#
+#   {
+#     "pool": "blip-chat",
+#     "command": ["npx", "-y", "@zed-industries/claude-code-acp"],
+#     "title": "Lead",
+#     "description": "Plans the work and delegates",
+#     "workspace": "base"
+#   }
+#
+# "workspace" is "base" (the default) or "fork"; a fork starts with a copy of
+# the parent chat's workspace. A profile should name a pool whose service
+# account is read-only for blips and blipstates; a profile without "pool" uses
+# --default-pool. Profile names may contain letters, digits, ".", "-", and "_",
+# but not spaces or "*".
+#
+# Spawning is not configured per profile. The cluster-wide blip-chat-policy
+# ConfigMap in blip-system holds space-separated profile lists and limits:
+#
+#   maxDepth: "2"                    deepest allowed depth; a root chat is 0
+#   root: "*"                        profiles that may start a root chat
+#   allow.lead: "worker reviewer"    profiles a "lead" chat may spawn
+#   writers: >-                      identities that may change chat objects
+#     system:serviceaccount:blip-system:blipchat ...
+#   writerGroups: "system:masters"
+#
+# "*" means any profile. A root chat (no chat.blip.dev/parent annotation)
+# uses "root"; a child uses "allow.<parent-profile>". The blip-chat-spawn
+# validating admission policy enforces those lists and the depth rules, and
+# blip-chat-session limits changes to the configured writers. A missing or
+# malformed policy key denies the request, so keep the ConfigMap present in
+# blip-system. A session-labelled state without a profile annotation is a
+# hidden fork mount copy, not a chat spawn; blipchat never exposes one as a
+# chat. The policies read the ConfigMap on every request; changing it does not
+# require a restart. On upgrade, copy each profile's former agents.allow list
+# into allow.<profile> and choose a global maxDepth; the agents block is now
+# ignored, and a message template that references .Agents still parses but
+# always sees an empty list.
+#
+# Chat pool service accounts should be read-only for the Kubernetes API: grant
+# only get/list/watch on blips and blipstates (and get/list on pods) and never
+# create, update, or delete. blipchat performs the writes for a chat with its
+# own service account.
+#
+# "messageTemplate" is an optional Go text/template that wraps each message
+# before it reaches the agent. Its output must include {{.Text}} (for example,
+# {{.Text | len}} is rejected); an empty template sends the message unchanged.
+# Fields are .Text, .Session, .Namespace, .Profile, .Title, .Description,
+# .Base, .Parent, .Root, .Depth, and .Created; .Created is RFC3339 when known.
+# .Namespace is always the namespace blipchat serves (--namespace), never one
+# taken from the request.
+# .Agents is deprecated and always empty. .Base, .Parent, and .Root are empty
+# when the chat has no such value. The
+# rendered message is limited to 64 KiB, and a template that cannot fit a
+# 32000-byte message is rejected at startup. The template applies to messages
+# from the UI and to prompts sent through MCP spawn_agent and send_agent; it
+# does not change session setup or agent replies. Write newlines as \n.
+# Profiles are read at startup, so restart blipchat after changing the
+# ConfigMap. For example:
+#
+#   {
+#     "title": "Lead",
+#     "messageTemplate": "You are chat {{.Session}} in {{.Namespace}} running profile {{.Profile}}.\n\nUser message:\n{{.Text}}"
+#   }
+#
+# Base path
+#
+# --base-path=<path> serves the UI and API under a subroute, such as
+# /blipchat, so a reverse proxy can place blipchat beside other apps. The
+# handler answers both at the root and under the base path, and the
+# embedded UI prefixes every API and SSE request with it. A proxy may
+# therefore strip the prefix (proxy_pass http://blipchat/;) or keep it
+# (proxy_pass http://blipchat;). Leave the flag unset, or set it to /, for
+# no base path. The root routes stay live in every case, so the base path is
+# not an isolation boundary; restrict exposure with the proxy or network
+# policy. /healthz and /readyz stay at the root, so the probes below need no
+# change. MCP agents still use --mcp-url, which may itself include a prefix.
+#
+# The MCP endpoint is https://blipchat-mcp.blip-system.svc. A pool whose chats
+# may spawn children must expose it to the guest; the api-proxy sidecar adds
+# the projected token and the CA:
+#
+#   spec:
+#     serviceAccountName: blip-chat
+#     endpoints:
+#       - name: blipchat-mcp
+#         url: https://blipchat-mcp.blip-system.svc
+#         audience: blipchat
+#         caConfigMap: blipchat-mcp-ca
+#
+# The endpoint name is the in-guest hostname, so it must match --mcp-url above;
+# an audience also requires the pool's spec.serviceAccountName.
+#
+# The operator provisions the blipchat-mcp-tls Secret in blip-system
+# (tls.crt/tls.key for that Service) and a blipchat-mcp-ca ConfigMap holding
+# ca.crt in each pool namespace that declares the endpoint.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blipchat
+  namespace: blip-system
+---
+# blipchat creates one BlipState per chat and one Blip per generation. It
+# writes the stdin/stdout of a chat through the aggregated stream API.
+#
+# blipchat serves a single namespace, so blip, blipstate, pod, and stream
+# access lives in the blipchat Role in that namespace, not here. This
+# ClusterRole keeps only what cannot be namespaced: TokenReview for the MCP
+# endpoint and the non-resource stream URL rule.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blipchat
+rules:
+  # The MCP endpoint authenticates an agent's pod-bound projected token with a
+  # TokenReview, then reads the caller pod (through the namespaced Role) to map
+  # that token back to its chat Blip. TokenReview is cluster-scoped, so it
+  # stays here. The agent's pool grants the token through its endpoints.
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  # The stream API authorizes resource requests (blipstreams/log and
+  # blipstreams/stdin) through SubjectAccessReview; the non-resource rule
+  # covers discovery and any handler that authorizes the raw path. Non-resource
+  # authorization cannot be namespaced, so it stays on the ClusterRole.
+  - nonResourceURLs: ["/apis/stream.blip.dev/*"]
+    verbs: [get, post]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: blipchat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: blipchat
+subjects:
+  - kind: ServiceAccount
+    name: blipchat
+    namespace: blip-system
+---
+# Chat objects live in the namespace named by --namespace. This Role must be in
+# that same namespace; widening it (or moving it) would grant blipchat access to
+# chats in namespaces it does not serve.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blipchat
+  namespace: default
+rules:
+  - apiGroups: [blip.dev]
+    resources: [blipstates]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [blip.dev]
+    resources: [blips]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # The MCP endpoint reads the caller pod to map a reviewed token to its chat
+  # Blip.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get]
+  # Accepted-but-undelivered prompts survive a blipchat restart here.
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, update, delete]
+  - apiGroups: [stream.blip.dev]
+    resources: [blipstreams, blipstreams/log]
+    verbs: [get]
+  - apiGroups: [stream.blip.dev]
+    resources: [blipstreams, blipstreams/stdin]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blipchat
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blipchat
+subjects:
+  - kind: ServiceAccount
+    name: blipchat
+    namespace: blip-system
+---
+# Profiles live next to the deployment. A missing ConfigMap is allowed: the
+# built-in default profile remains available.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blipchat-profiles
+  namespace: blip-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blipchat-profiles
+  namespace: blip-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blipchat-profiles
+subjects:
+  - kind: ServiceAccount
+    name: blipchat
+    namespace: blip-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blipchat
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blipchat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blipchat
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blipchat
+    spec:
+      serviceAccountName: blipchat
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: blipchat
+          image: ghcr.io/azure/blip-blipchat:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --listen=:8080
+            # - --base-path=/blipchat
+            - --namespace=default
+            - --profiles-configmap=blip-system/blip-chat-profiles
+            - --auto-approve=always
+            - --default-pool=default
+            - --mcp-listen=:8443
+            - --mcp-cert=/etc/blipchat-mcp/tls.crt
+            - --mcp-key=/etc/blipchat-mcp/tls.key
+            - --mcp-url=http://blipchat-mcp/mcp
+            - --log-level=info
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: mcp
+              containerPort: 8443
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: mcp-tls
+              mountPath: /etc/blipchat-mcp
+              readOnly: true
+      # The operator provisions blipchat-mcp-tls (tls.crt/tls.key) in this
+      # namespace and the blipchat-mcp-ca ConfigMap (ca.crt) in each pool
+      # namespace. Pools that run chat agents must add the blipchat-mcp
+      # endpoint described at the top of this file.
+      volumes:
+        - name: mcp-tls
+          secret:
+            secretName: blipchat-mcp-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blipchat
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blipchat
+spec:
+  selector:
+    app.kubernetes.io/name: blipchat
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: mcp
+      port: 443
+      targetPort: 8443
+---
+# The guest-facing name for the MCP endpoint. --mcp-url is the in-guest URL
+# this Service gives a pool endpoint (http://blipchat-mcp/mcp), while the pool
+# dials https://blipchat-mcp.blip-system.svc through its api-proxy sidecar.
+apiVersion: v1
+kind: Service
+metadata:
+  name: blipchat-mcp
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: blipchat
+spec:
+  selector:
+    app.kubernetes.io/name: blipchat
+  ports:
+    - name: mcp
+      port: 443
+      targetPort: 8443

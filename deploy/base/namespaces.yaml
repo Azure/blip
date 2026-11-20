@@ -1,0 +1,9 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: blip-system
+  labels:
+    pod-security.kubernetes.io/enforce: privileged

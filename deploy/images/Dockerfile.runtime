@@ -1,0 +1,14 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Built by hack/build-images.sh from binaries prebuilt with `make build` and
+# guest assets from `make guest`. The script stages the (static) Cloud
+# Hypervisor binary in build/images/. The base suite matches the node image.
+FROM debian:trixie-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 nftables ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY build/images/cloud-hypervisor /usr/local/bin/cloud-hypervisor
+COPY build/guest/vmlinuz build/guest/initramfs.gz /opt/blip/
+COPY bin/blip-runtime /usr/local/bin/blip-runtime
+ENTRYPOINT ["/usr/local/bin/blip-runtime"]

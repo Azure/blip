@@ -1,0 +1,85 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: repository hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check copyright headers
+        run: python3 hack/headers.py check
+      - name: Check GitHub Actions are SHA-pinned
+        run: python3 hack/actions.py check
+  test:
+    name: go test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Test on both architectures: the image workflow publishes linux/amd64
+          # and linux/arm64 binaries, and the image tests use runtime.GOARCH.
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      # mke2fs/debugfs exercise the image-to-ext4 tests. (Ubuntu 24.04 ships
+      # e2fsprogs 1.47.0, which lacks tarball support, so TestMakeFS still
+      # skips there; newer runner images will run it.)
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cpio e2fsprogs kmod xz-utils zstd
+      - name: Run tests
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted files:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+      # The checked-in deepcopy functions and CRDs are generated from api/.
+      # Regenerate and fail if the working tree changes.
+      - name: Install controller-gen
+        run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.21.0
+      - name: Check generated code is current
+        run: |
+          make generate
+          git diff --exit-code
+      - name: Race-check simulation and production adapters
+        if: matrix.arch == 'amd64'
+        run: make test-sim
+      # Check that the published guest kernel source is available and provides
+      # the drivers the guest needs, before images are built on main.
+      - name: Build guest assets
+        run: |
+          eval "$(hack/guest/fetch-debian-kernel.sh "${{ matrix.arch }}" build/guest/kernel)"
+          make guest
