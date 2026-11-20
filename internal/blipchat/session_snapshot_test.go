@@ -24,6 +24,7 @@ func TestSessionSnapshotPhasePrecedence(t *testing.T) {
 		name       string
 		blipPhase  string
 		generation int64
+		streamGen  uint64
 		endedGen   uint64
 		wantPhase  string
 		wantRun    bool
@@ -31,12 +32,12 @@ func TestSessionSnapshotPhasePrecedence(t *testing.T) {
 	}{
 		{name: "ready without execution", wantPhase: v1.StateReady},
 		{name: "ready with retained end but no execution", endedGen: 1, wantPhase: v1.StateReady},
-		{name: "ready with failed execution", blipPhase: v1.BlipFailed, generation: 1, endedGen: 1, wantPhase: v1.BlipFailed, wantStatus: "agent exited with code 7"},
-		{name: "ready with successful execution", blipPhase: v1.BlipSucceeded, generation: 1, endedGen: 1, wantPhase: v1.BlipSucceeded},
-		{name: "running before trajectory is available", blipPhase: v1.BlipRunning, generation: 1, wantPhase: v1.BlipRunning, wantRun: true},
-		{name: "current execution ended before controller update", blipPhase: v1.BlipRunning, generation: 1, endedGen: 1, wantPhase: v1.BlipSaving},
-		{name: "older end cannot stop newer running execution", blipPhase: v1.BlipRunning, generation: 2, endedGen: 1, wantPhase: v1.BlipRunning, wantRun: true},
-		{name: "older end cannot stop newer pending execution", blipPhase: v1.BlipPending, generation: 2, endedGen: 1, wantPhase: v1.BlipPending, wantRun: true},
+		{name: "ready with failed execution", blipPhase: v1.BlipFailed, generation: 1, streamGen: 2, endedGen: 2, wantPhase: v1.BlipFailed, wantStatus: "agent exited with code 7"},
+		{name: "ready with successful execution", blipPhase: v1.BlipSucceeded, generation: 1, streamGen: 2, endedGen: 2, wantPhase: v1.BlipSucceeded},
+		{name: "running before trajectory is available", blipPhase: v1.BlipRunning, generation: 1, streamGen: 2, wantPhase: v1.BlipRunning, wantRun: true},
+		{name: "current execution ended before controller update", blipPhase: v1.BlipRunning, generation: 1, streamGen: 2, endedGen: 2, wantPhase: v1.BlipSaving},
+		{name: "older end cannot stop newer running execution", blipPhase: v1.BlipRunning, generation: 5, streamGen: 2, endedGen: 1, wantPhase: v1.BlipRunning, wantRun: true},
+		{name: "older end cannot stop newer pending execution", blipPhase: v1.BlipPending, generation: 5, streamGen: 2, endedGen: 1, wantPhase: v1.BlipPending, wantRun: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			const namespace, name = "team", "snapshot"
@@ -55,12 +56,20 @@ func TestSessionSnapshotPhasePrecedence(t *testing.T) {
 			if tt.blipPhase != "" {
 				b := &v1.Blip{ObjectMeta: metav1.ObjectMeta{
 					Name: name + "-g" + strconv.FormatInt(tt.generation, 10), Namespace: namespace,
+					UID:         "snapshot-uid",
 					Labels:      map[string]string{LabelSession: name},
 					Annotations: map[string]string{AnnotationGeneration: strconv.FormatInt(tt.generation, 10)},
 				}}
 				b.Status.Phase = tt.blipPhase
 				b.Status.Message = "agent exited with code 7"
+				b.Status.RootAttachmentID = "snapshot-root"
 				cluster.blips[key(namespace, b.Name)] = b
+				stored := cluster.states[key(namespace, name)]
+				stored.Status.Committed = &v1.Commit{ID: "snapshot-base", Generation: int64(tt.streamGen) - 1}
+				stored.Status.Writer = &v1.Writer{
+					BlipName: b.Name, BlipUID: string(b.UID),
+					AttachmentID: b.Status.RootAttachmentID, BaseCommit: "snapshot-base",
+				}
 			}
 			wire := newFakeWire()
 			if tt.endedGen != 0 {
@@ -117,7 +126,7 @@ func TestReconcileSessionSummary(t *testing.T) {
 		{name: "newer end", view: &chatView{Gen: 3, Ended: true}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			summary := sessionSummary{Phase: v1.BlipRunning, Running: true, Generation: 2}
+			summary := sessionSummary{Phase: v1.BlipRunning, Running: true, Generation: 7, streamGen: 2}
 			got := reconcileSessionSummary(summary, tt.view)
 			want := summary
 			if tt.end {

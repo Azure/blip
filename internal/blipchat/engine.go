@@ -336,18 +336,22 @@ func (e *chatEngine) converge(ctx context.Context) error {
 		e.lastAction = time.Now()
 		return nil
 	}
-	gen := generationOf(active)
-	if gen <= int64(e.view.Gen) && e.view.Started && e.view.StopSeq > e.view.StartSeq {
+	gen, ok := writeGeneration(st, active)
+	if !ok {
+		// State and Blip status can arrive independently. Do not act on a
+		// stream until its writer can be tied to this VM's root attachment.
+		return nil
+	}
+	if gen != e.view.Gen {
+		// The log and the writer's status can arrive in either order. A
+		// numeric mismatch is not evidence that this VM is stale; stopping on
+		// one used to kill every freshly started chat generation.
+		return nil
+	}
+	if e.view.Started && e.view.StopSeq > e.view.StartSeq {
 		return e.s.stopBlip(ctx, e.name)
 	}
 	switch {
-	case gen > int64(e.view.Gen):
-		// The log has not caught up with the blip yet.
-		return nil
-	case gen < int64(e.view.Gen):
-		// An older generation is still winding down. Stop it so its state
-		// lease does not keep this chat busy.
-		return e.s.stopBlip(ctx, e.name)
 	case active.Status.Phase == v1.BlipPending:
 		return nil
 	case active.Status.Phase != v1.BlipRunning:
@@ -760,6 +764,26 @@ func (s *Server) stopBlip(ctx context.Context, state string) error {
 		}
 	}
 	return nil
+}
+
+// writeGeneration follows the node's stream generation calculation. The chat
+// generation annotation only orders VM attempts; copied states and failed
+// attempts mean it need not equal the state's write generation.
+func writeGeneration(st *v1.BlipState, b *v1.Blip) (uint64, bool) {
+	w := st.Status.Writer
+	if w == nil || w.BlipName != b.Name || w.BlipUID == "" || w.BlipUID != string(b.UID) ||
+		w.AttachmentID == "" || w.AttachmentID != b.Status.RootAttachmentID {
+		return 0, false
+	}
+	if c := st.Status.Committed; c != nil {
+		// A changed base means the status no longer describes this writer's
+		// active stream (for example, its save has already committed).
+		if c.ID != w.BaseCommit || c.Generation < 0 {
+			return 0, false
+		}
+		return uint64(c.Generation) + 1, true
+	}
+	return 1, w.BaseCommit == ""
 }
 
 func (v *chatView) doneTotal() int { return len(v.Done) }

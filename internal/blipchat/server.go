@@ -509,6 +509,9 @@ type sessionSummary struct {
 	Created       metav1.Time `json:"created"`
 	// Question is set while the agent waits for the user's answer.
 	Question *Question `json:"question,omitempty"`
+	// streamGen is the trajectory generation written by the latest execution.
+	// Generation orders VM attempts and is not comparable to the stream's.
+	streamGen uint64
 }
 
 type sessionDetail struct {
@@ -544,6 +547,9 @@ func summarize(st *v1.BlipState, blips []v1.Blip) sessionSummary {
 			out.Phase = latest.Status.Phase
 		}
 		out.Generation = generationOf(latest)
+		if gen, ok := writeGeneration(st, latest); ok {
+			out.streamGen = gen
+		}
 		// Status messages carry useful failure detail, but successful and
 		// in-progress blips use the same field for scheduler internals such as
 		// node names. Only surface it when the turn actually failed.
@@ -563,7 +569,7 @@ func summarize(st *v1.BlipState, blips []v1.Blip) sessionSummary {
 // workspace) and summaries without a matching ended execution are unchanged.
 // It performs no reads and does not change the supplied view.
 func reconcileSessionSummary(summary sessionSummary, view *chatView) sessionSummary {
-	if view != nil && summary.Running && summary.Generation == int64(view.Gen) && !view.Started && view.Ended {
+	if view != nil && summary.Running && summary.streamGen != 0 && summary.streamGen == view.Gen && !view.Started && view.Ended {
 		summary.Running = false
 		summary.Phase = string(v1.BlipSaving)
 	}
@@ -642,20 +648,20 @@ type noBaseError struct{ message string }
 
 func (e noBaseError) Error() string { return e.message }
 
-// pickBase returns the name of the state a new chat copies, or "" for an
+// pickBase returns the state a new chat copies, or nil for an
 // empty state. The profile's selector chooses the newest Ready state; chat
 // states themselves are never used as a base.
-func (s *Server) pickBase(ctx context.Context, profileName string, profile Profile) (string, error) {
+func (s *Server) pickBase(ctx context.Context, profileName string, profile Profile) (*v1.BlipState, error) {
 	selector, err := profile.baseStateSelector()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if selector == nil {
-		return "", nil
+		return nil, nil
 	}
 	states, err := s.cluster.ListStates(ctx, s.namespace, selector)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	var best *v1.BlipState
 	for i := range states {
@@ -669,9 +675,9 @@ func (s *Server) pickBase(ctx context.Context, profileName string, profile Profi
 		}
 	}
 	if best == nil {
-		return "", noBaseError{fmt.Sprintf("profile %q: no Ready BlipState matches %s in namespace %s", profileName, selector, s.namespace)}
+		return nil, noBaseError{fmt.Sprintf("profile %q: no Ready BlipState matches %s in namespace %s", profileName, selector, s.namespace)}
 	}
-	return best.Name, nil
+	return best, nil
 }
 
 // httpError carries the status a handler returns for a request error.
@@ -785,13 +791,15 @@ func (s *Server) createChat(ctx context.Context, req chatRequest) (*v1.BlipState
 	}
 	fork := req.Parent != nil && profile.Workspace == WorkspaceFork
 	base := ""
+	var runtime *v1.RuntimeDefaults
 	if !fork {
-		var err error
-		base, err = s.pickBase(ctx, profileName, profile)
+		selected, err := s.pickBase(ctx, profileName, profile)
 		if err != nil {
 			return nil, err
 		}
-		if base != "" {
+		if selected != nil {
+			base = selected.Name
+			runtime = selected.Spec.Runtime
 			annotations[AnnotationBase] = base
 		}
 	}
@@ -805,7 +813,7 @@ func (s *Server) createChat(ctx context.Context, req chatRequest) (*v1.BlipState
 				Labels:      labels,
 				Annotations: annotations,
 			},
-			Spec: v1.BlipStateSpec{CopyFrom: base},
+			Spec: v1.BlipStateSpec{CopyFrom: base, Runtime: runtime.DeepCopy()},
 		}
 		var err error
 		if req.Parent != nil {

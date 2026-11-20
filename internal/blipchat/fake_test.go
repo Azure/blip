@@ -258,9 +258,23 @@ func (f *fakeCluster) CreateBlip(_ context.Context, ns string, b *v1.Blip) error
 	}
 	c := copyBlip(b)
 	c.Namespace = ns
+	if c.UID == "" {
+		c.UID = types.UID(c.Name + "-uid")
+	}
+	if c.Status.RootAttachmentID == "" {
+		c.Status.RootAttachmentID = c.Name + "-root"
+	}
 	c.Status.Phase = v1.BlipRunning
 	if f.pendingBlips {
 		c.Status.Phase = v1.BlipPending
+	}
+	if st := f.states[key(ns, c.Spec.State)]; st != nil {
+		st.Status.Writer = &v1.Writer{
+			BlipName: c.Name, BlipUID: string(c.UID), AttachmentID: c.Status.RootAttachmentID,
+		}
+		if st.Status.Committed != nil {
+			st.Status.Writer.BaseCommit = st.Status.Committed.ID
+		}
 	}
 	f.blips[k] = c
 	f.blipOrder = append(f.blipOrder, b.Name)

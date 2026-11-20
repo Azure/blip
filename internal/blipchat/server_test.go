@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +21,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -834,11 +836,112 @@ func TestServerMethodsNotFoundAndProbes(t *testing.T) {
 	}
 }
 
+// sharedBaseCluster leaves the listed runtime pointers shared so the test can
+// detect whether createChat copies them before creating a chat.
+type sharedBaseCluster struct {
+	*fakeCluster
+	bases []v1.BlipState
+}
+
+func (c *sharedBaseCluster) ListStates(_ context.Context, ns string, selector labels.Selector) ([]v1.BlipState, error) {
+	var out []v1.BlipState
+	for _, state := range c.bases {
+		if state.Namespace == ns && selector.Matches(labels.Set(state.Labels)) {
+			out = append(out, state)
+		}
+	}
+	return out, nil
+}
+
+func TestCreateChatBaseRuntime(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		selector bool
+		runtime  *v1.RuntimeDefaults
+	}{
+		{
+			name: "inherits runtime", selector: true,
+			runtime: &v1.RuntimeDefaults{
+				WorkingDir: "/root",
+				User:       "root",
+				Env:        []v1.EnvVar{{Name: "HOME", Value: "/root"}},
+				Network: &v1.NetworkPolicy{Egress: []v1.NetworkEgressRule{{
+					To: []v1.NetworkPeer{{IPBlock: &v1.NetworkIPBlock{
+						CIDR: "10.0.0.0/8", Except: []string{"10.1.0.0/16"},
+					}}},
+					Ports: []v1.NetworkPort{{Port: 443}},
+				}}},
+			},
+		},
+		{name: "nil runtime", selector: true},
+		{name: "no base", runtime: &v1.RuntimeDefaults{WorkingDir: "/root"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := v1.BlipState{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "base", Namespace: "team", Labels: map[string]string{"app": "agent"},
+					CreationTimestamp: metav1.Now(),
+				},
+				Spec: v1.BlipStateSpec{
+					Runtime: tc.runtime,
+					Mounts:  []v1.Mount{{State: "data", Path: "/data"}},
+				},
+				Status: v1.BlipStateStatus{Phase: v1.StateReady},
+			}
+			older := *base.DeepCopy()
+			older.Name = "older"
+			older.CreationTimestamp = metav1.NewTime(base.CreationTimestamp.Add(-time.Hour))
+			older.Spec.Runtime = &v1.RuntimeDefaults{WorkingDir: "/older"}
+			cluster := &sharedBaseCluster{fakeCluster: newFakeCluster(), bases: []v1.BlipState{older, base}}
+			profile := Profile{Command: []string{"agent"}}
+			if tc.selector {
+				profile.BaseSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "agent"}}
+			}
+			s, err := New(Options{
+				Namespace: "team", Cluster: cluster, Wire: newFakeWire(),
+				Profiles: Profiles{DefaultProfileName: profile},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(s.Close)
+			created, err := s.createChat(context.Background(), chatRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := v1.BlipStateSpec{}
+			if tc.selector {
+				want.CopyFrom = base.Name
+				want.Runtime = tc.runtime.DeepCopy()
+			}
+			if !reflect.DeepEqual(created.Spec, want) {
+				t.Fatalf("spec = %+v, want %+v", created.Spec, want)
+			}
+			if created.Annotations[AnnotationBase] != want.CopyFrom {
+				t.Fatalf("base annotation = %q, want %q", created.Annotations[AnnotationBase], want.CopyFrom)
+			}
+			if runtime := created.Spec.Runtime; runtime != nil {
+				runtime.WorkingDir = "/changed"
+				runtime.User = "changed"
+				runtime.Env[0].Value = "/changed"
+				runtime.Network.Egress[0].To[0].IPBlock.Except[0] = "10.2.0.0/16"
+				runtime.Network.Egress[0].Ports[0].Port = 80
+				if !reflect.DeepEqual(base.Spec.Runtime, want.Runtime) {
+					t.Fatalf("changing chat runtime changed base: %+v", base.Spec.Runtime)
+				}
+			}
+		})
+	}
+}
+
 func TestCreateChatForkStartsAfterParent(t *testing.T) {
 	fc := newFakeCluster()
 	profiles := Profiles{
 		DefaultProfileName: {Command: []string{"agent"}},
-		"forked":           {Command: []string{"agent"}, Workspace: WorkspaceFork},
+		"forked": {
+			Command: []string{"agent"}, Workspace: WorkspaceFork,
+			BaseSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "missing-base"}},
+		},
 	}
 	g := newGatewayWithCluster(t, fc, Options{Profiles: profiles})
 	ctx := context.Background()
@@ -870,6 +973,16 @@ func TestCreateChatForkStartsAfterParent(t *testing.T) {
 	created, err := g.srv.createChat(ctx, chatRequest{Profile: "forked", Parent: parent})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if created.Spec.Runtime != nil || created.Annotations[AnnotationBase] != "" {
+		t.Fatalf("parent fork inherited profile base: %+v", created)
+	}
+	forked, err := fc.GetSession(ctx, "team", created.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forked.Spec.CopyFrom != parent.Name {
+		t.Fatalf("fork source = %q, want parent %q", forked.Spec.CopyFrom, parent.Name)
 	}
 	start, err := strconv.ParseUint(created.Annotations[AnnotationStart], 10, 64)
 	if err != nil {

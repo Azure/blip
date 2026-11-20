@@ -232,29 +232,44 @@ func TestServerEventsLifecyclePreservesCursorQuestionAndDetail(t *testing.T) {
 }
 
 func TestServerEventsReconcileEndedGeneration(t *testing.T) {
-	for _, generation := range []int{1, 2} {
-		t.Run(strconv.Itoa(generation), func(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		generation int64
+		endGen     uint64
+		wantPhase  string
+		wantRun    bool
+	}{
+		// The stream generation is committed+1, so a copied state's first VM
+		// writes generation 2 even though its ordinal is 1.
+		{name: "current execution ended", generation: 1, endGen: 2, wantPhase: v1.BlipSaving},
+		// A stream that ends at an older generation says nothing about the
+		// current writer, which may still be running.
+		{name: "older execution ended", generation: 2, endGen: 1, wantPhase: v1.BlipRunning, wantRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			g := newGateway(t, Options{})
 			name := g.createChat(t, map[string]any{"profile": DefaultProfileName}, "alice")
-			// Simulate controller status ahead of the next guest attachment:
-			// the ring ends generation 1, but Kubernetes may already run 2.
+			// Simulate controller status ahead of the guest attachment: the
+			// state is committed at generation 1, so the current writer's
+			// stream generation is 2.
 			g.cluster.mu.Lock()
-			blipName := name + "-g" + strconv.Itoa(generation)
+			blipName := name + "-g" + strconv.FormatInt(tc.generation, 10)
 			g.cluster.blips[key("team", blipName)] = &v1.Blip{
-				ObjectMeta: metav1.ObjectMeta{Name: blipName, Namespace: "team", Labels: map[string]string{LabelSession: name}},
-				Status:     v1.BlipStatus{Phase: v1.BlipRunning},
+				ObjectMeta: metav1.ObjectMeta{Name: blipName, Namespace: "team", UID: "snapshot-uid", Labels: map[string]string{LabelSession: name}},
+				Status:     v1.BlipStatus{Phase: v1.BlipRunning, RootAttachmentID: "snapshot-root"},
+			}
+			st := g.cluster.states[key("team", name)]
+			st.Status.Committed = &v1.Commit{ID: "snapshot-base", Generation: 1}
+			st.Status.Writer = &v1.Writer{
+				BlipName: blipName, BlipUID: "snapshot-uid", AttachmentID: "snapshot-root", BaseCommit: "snapshot-base",
 			}
 			g.cluster.mu.Unlock()
-			g.wire.start(1)
-			g.wire.end(1)
+			g.wire.start(tc.endGen)
+			g.wire.end(tc.endGen)
 			events, readErr := openLifecycleEvents(t, g, name, 0)
 			ev := nextLifecycleEvent(t, events, readErr)
-			wantPhase, wantRunning := v1.BlipSaving, false
-			if generation == 2 {
-				wantPhase, wantRunning = v1.BlipRunning, true
-			}
-			if ev.Type != "status" || ev.Status == nil || ev.Status.Phase != wantPhase || ev.Status.Running != wantRunning {
-				t.Fatalf("generation %d lifecycle = %+v, want phase=%q running=%t", generation, ev.Status, wantPhase, wantRunning)
+			if ev.Type != "status" || ev.Status == nil || ev.Status.Phase != tc.wantPhase || ev.Status.Running != tc.wantRun {
+				t.Fatalf("generation %d lifecycle = %+v, want phase=%q running=%t", tc.generation, ev.Status, tc.wantPhase, tc.wantRun)
 			}
 		})
 	}
