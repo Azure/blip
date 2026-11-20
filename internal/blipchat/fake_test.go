@@ -89,7 +89,7 @@ func (f *fakeCluster) GetSession(_ context.Context, ns, name string) (*v1.BlipSt
 	return copyState(s), nil
 }
 
-func (f *fakeCluster) DeleteSession(_ context.Context, ns, name string, uid types.UID) error {
+func (f *fakeCluster) DeleteSession(_ context.Context, ns, name string, uid types.UID, resourceVersion ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	st, ok := f.states[key(ns, name)]
@@ -99,6 +99,16 @@ func (f *fakeCluster) DeleteSession(_ context.Context, ns, name string, uid type
 	if uid != "" && st.UID != "" && st.UID != uid {
 		return apierrors.NewConflict(schema.GroupResource{Group: "blip.dev", Resource: "blipstates"}, name,
 			fmt.Errorf("the UID in the precondition (%s) does not match the UID in record (%s)", uid, st.UID))
+	}
+	for _, version := range resourceVersion {
+		if version == "" {
+			continue
+		}
+		if st.ResourceVersion != version {
+			return apierrors.NewConflict(schema.GroupResource{Group: "blip.dev", Resource: "blipstates"}, name,
+				fmt.Errorf("the resource version in the precondition (%s) does not match the resource version in record (%s)", version, st.ResourceVersion))
+		}
+		break
 	}
 	delete(f.states, key(ns, name))
 	return nil
@@ -188,6 +198,8 @@ func (f *fakeCluster) PatchSession(_ context.Context, ns, name string, labels, a
 	for k, v := range annotations {
 		s.Annotations[k] = v
 	}
+	version, _ := strconv.ParseUint(s.ResourceVersion, 10, 64)
+	s.ResourceVersion = strconv.FormatUint(version+1, 10)
 	return nil
 }
 

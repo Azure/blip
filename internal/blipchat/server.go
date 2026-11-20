@@ -56,6 +56,9 @@ type Options struct {
 	// QuestionTimeout bounds how long ask_user waits for an answer. Zero uses
 	// 30 seconds.
 	QuestionTimeout time.Duration
+	// ChatRetention is how long to keep a chat after its latest Blip finishes.
+	// Zero disables automatic deletion.
+	ChatRetention time.Duration
 	// Service names the Kubernetes Service whose ready endpoints are the
 	// blipchat replicas. Empty disables sharding: every replica drives every
 	// chat, which the node's serialized appends make safe for a single pod.
@@ -69,18 +72,19 @@ type Options struct {
 
 // Server is the HTTP front end and the owner of the per-chat engines.
 type Server struct {
-	namespace   string
-	basePath    string
-	profiles    Profiles
-	defaultPool string
-	autoApprove string
-	cluster     Cluster
-	wire        Wire
-	log         *slog.Logger
-	callers     Callers
-	mcpURL      string
-	questionTTL time.Duration
-	shards      *sharder
+	namespace     string
+	basePath      string
+	profiles      Profiles
+	defaultPool   string
+	autoApprove   string
+	cluster       Cluster
+	wire          Wire
+	log           *slog.Logger
+	callers       Callers
+	mcpURL        string
+	questionTTL   time.Duration
+	chatRetention time.Duration
+	shards        *sharder
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -93,6 +97,9 @@ type Server struct {
 }
 
 func New(opts Options) (*Server, error) {
+	if opts.ChatRetention < 0 {
+		return nil, errors.New("--chat-retention must not be negative")
+	}
 	if opts.Cluster == nil || opts.Wire == nil {
 		return nil, errors.New("blipchat: cluster and wire are required")
 	}
@@ -147,21 +154,22 @@ func New(opts Options) (*Server, error) {
 		opts.ServiceNamespace = opts.Namespace
 	}
 	s := &Server{
-		namespace:   opts.Namespace,
-		basePath:    basePath,
-		profiles:    opts.Profiles,
-		defaultPool: opts.DefaultPool,
-		autoApprove: opts.AutoApprove,
-		cluster:     opts.Cluster,
-		wire:        opts.Wire,
-		log:         opts.Log,
-		callers:     opts.Callers,
-		mcpURL:      opts.MCPURL,
-		questionTTL: opts.QuestionTimeout,
-		ctx:         ctx,
-		cancel:      cancel,
-		engines:     make(map[string]*chatEngine),
-		views:       make(map[string]cachedChatView),
+		namespace:     opts.Namespace,
+		basePath:      basePath,
+		profiles:      opts.Profiles,
+		defaultPool:   opts.DefaultPool,
+		autoApprove:   opts.AutoApprove,
+		cluster:       opts.Cluster,
+		wire:          opts.Wire,
+		log:           opts.Log,
+		callers:       opts.Callers,
+		mcpURL:        opts.MCPURL,
+		questionTTL:   opts.QuestionTimeout,
+		chatRetention: opts.ChatRetention,
+		ctx:           ctx,
+		cancel:        cancel,
+		engines:       make(map[string]*chatEngine),
+		views:         make(map[string]cachedChatView),
 	}
 	if opts.Service != "" {
 		if opts.PodName == "" {
@@ -800,14 +808,21 @@ func (s *Server) createChat(ctx context.Context, req chatRequest) (*v1.BlipState
 			Spec: v1.BlipStateSpec{CopyFrom: base},
 		}
 		var err error
+		if req.Parent != nil {
+			if err := s.touchChat(ctx, req.Parent); err != nil {
+				return nil, err
+			}
+		}
+		createCtx, cancel := context.WithTimeout(ctx, chatAdmissionTimeout)
 		if fork {
-			err = s.cluster.ForkSession(ctx, s.namespace, req.Parent, state, owner)
+			err = s.cluster.ForkSession(createCtx, s.namespace, req.Parent, state, owner)
 		} else {
 			if owner != nil {
 				state.OwnerReferences = []metav1.OwnerReference{*owner}
 			}
-			err = s.cluster.CreateSession(ctx, s.namespace, state)
+			err = s.cluster.CreateSession(createCtx, s.namespace, state)
 		}
+		cancel()
 		if apierrors.IsAlreadyExists(err) {
 			// The name is random, so a collision is rare. A root's owner and
 			// root annotation must follow the replacement name.

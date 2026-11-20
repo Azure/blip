@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -33,7 +35,9 @@ const blipGCInterval = time.Minute
 // (missing finish times are oldest). Each namespace is collected against its
 // own threshold, so one namespace cannot evict another's finished Blips. It
 // returns how many Blips it deleted. A non-positive threshold disables
-// collection.
+// collection. The latest execution of each chat state is retained while that
+// state exists, preserving its retention clock and execution generation. These
+// protected executions do not count toward the threshold.
 func CollectTerminatedBlips(ctx context.Context, c client.Client, threshold int) (int, error) {
 	if threshold <= 0 {
 		return 0, nil
@@ -43,7 +47,14 @@ func CollectTerminatedBlips(ctx context.Context, c client.Client, threshold int)
 		return 0, err
 	}
 	byNamespace := map[string][]v1.Blip{}
+	latestChat := map[client.ObjectKey]*v1.Blip{}
 	for _, b := range list.Items {
+		if b.DeletionTimestamp == nil && b.Labels[v1.LabelChatSession] != "" && b.Spec.State != "" {
+			key := client.ObjectKey{Namespace: b.Namespace, Name: b.Spec.State}
+			if latest := latestChat[key]; latest == nil || newerChatBlip(&b, latest) {
+				latestChat[key] = &b
+			}
+		}
 		if b.DeletionTimestamp == nil && v1.Finished(&b) {
 			byNamespace[b.Namespace] = append(byNamespace[b.Namespace], b)
 		}
@@ -54,6 +65,24 @@ func CollectTerminatedBlips(ctx context.Context, c client.Client, threshold int)
 		if len(finished) <= threshold {
 			continue
 		}
+		collectible := finished[:0]
+		for i := range finished {
+			b := &finished[i]
+			key := client.ObjectKey{Namespace: namespace, Name: b.Spec.State}
+			if latest := latestChat[key]; latest != nil && latest.Name == b.Name {
+				var state v1.BlipState
+				err := c.Get(ctx, key, &state)
+				if err == nil {
+					continue
+				}
+				if !apierrors.IsNotFound(err) {
+					errs = append(errs, fmt.Errorf("get chat state %s/%s: %w", namespace, key.Name, err))
+					continue
+				}
+			}
+			collectible = append(collectible, *b)
+		}
+		finished = collectible
 		sort.Slice(finished, func(i, j int) bool {
 			a, b := &finished[i], &finished[j]
 			// A missing finish time sorts as the oldest.
@@ -84,6 +113,30 @@ func CollectTerminatedBlips(ctx context.Context, c client.Client, threshold int)
 		}
 	}
 	return deleted, errors.Join(errs...)
+}
+
+// Match chat's annotation and legacy -g<N> suffix generation ordering.
+func newerChatBlip(a, b *v1.Blip) bool {
+	ag, bg := chatBlipGeneration(a), chatBlipGeneration(b)
+	if ag != bg {
+		return ag > bg
+	}
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return b.CreationTimestamp.Before(&a.CreationTimestamp)
+	}
+	return a.Name > b.Name
+}
+
+func chatBlipGeneration(b *v1.Blip) int64 {
+	if n, err := strconv.ParseInt(b.Annotations["chat.blip.dev/generation"], 10, 64); err == nil {
+		return n
+	}
+	if i := strings.LastIndex(b.Name, "-g"); i >= 0 {
+		if n, err := strconv.ParseInt(b.Name[i+2:], 10, 64); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 // terminatedBlipGC periodically collects excess finished Blips in each

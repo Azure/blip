@@ -32,23 +32,24 @@ import (
 
 func main() {
 	var (
-		listen       string
-		basePath     string
-		namespace    string
-		profilesCM   string
-		profilesFile string
-		autoApprove  string
-		defaultPool  string
-		logLevel     string
-		mcpListen    string
-		mcpCert      string
-		mcpKey       string
-		mcpAudience  string
-		mcpURL       string
-		questionWait time.Duration
-		service      string
-		serviceNS    string
-		podName      string
+		listen        string
+		basePath      string
+		namespace     string
+		profilesCM    string
+		profilesFile  string
+		autoApprove   string
+		defaultPool   string
+		logLevel      string
+		mcpListen     string
+		mcpCert       string
+		mcpKey        string
+		mcpAudience   string
+		mcpURL        string
+		questionWait  time.Duration
+		chatRetention time.Duration
+		service       string
+		serviceNS     string
+		podName       string
 	)
 	flag.StringVar(&listen, "listen", ":8080", "HTTP listen address")
 	flag.StringVar(&basePath, "base-path", "", "URL path prefix for a reverse proxy, e.g. /blipchat (the root stays available)")
@@ -64,6 +65,7 @@ func main() {
 	flag.StringVar(&mcpAudience, "mcp-audience", "blipchat", "audience of the projected token agents use for MCP")
 	flag.StringVar(&mcpURL, "mcp-url", "", "URL agents use to reach MCP; the guest-facing pool endpoint URL plus /mcp")
 	flag.DurationVar(&questionWait, "question-timeout", 30*time.Second, "how long ask_user waits for an answer before the agent ends its turn")
+	flag.DurationVar(&chatRetention, "chat-retention", 24*time.Hour, "how long to retain completed or failed chats (zero disables automatic deletion)")
 	flag.StringVar(&service, "service", "", "Service whose endpoints shard chats across blipchat replicas (empty disables sharding)")
 	flag.StringVar(&serviceNS, "service-namespace", "", "namespace of --service (default the chat namespace)")
 	flag.StringVar(&podName, "pod-name", os.Getenv("POD_NAME"), "this replica's pod name, used for shard ownership")
@@ -78,7 +80,7 @@ func main() {
 		listen: listen, basePath: basePath, namespace: namespace, profilesCM: profilesCM, profilesFile: profilesFile,
 		autoApprove: autoApprove, defaultPool: defaultPool, mcpListen: mcpListen, mcpCert: mcpCert,
 		mcpKey: mcpKey, mcpAudience: mcpAudience, mcpURL: mcpURL, questionWait: questionWait,
-		service: service, serviceNS: serviceNS, podName: podName,
+		chatRetention: chatRetention, service: service, serviceNS: serviceNS, podName: podName,
 	}
 	if err := run(opts); err != nil {
 		fail(err.Error())
@@ -101,25 +103,29 @@ func parseLevel(s string) (slog.Level, error) {
 }
 
 type runOptions struct {
-	listen       string
-	basePath     string
-	namespace    string
-	profilesCM   string
-	profilesFile string
-	autoApprove  string
-	defaultPool  string
-	mcpListen    string
-	mcpCert      string
-	mcpKey       string
-	mcpAudience  string
-	mcpURL       string
-	questionWait time.Duration
-	service      string
-	serviceNS    string
-	podName      string
+	listen        string
+	basePath      string
+	namespace     string
+	profilesCM    string
+	profilesFile  string
+	autoApprove   string
+	defaultPool   string
+	mcpListen     string
+	mcpCert       string
+	mcpKey        string
+	mcpAudience   string
+	mcpURL        string
+	questionWait  time.Duration
+	chatRetention time.Duration
+	service       string
+	serviceNS     string
+	podName       string
 }
 
 func run(o runOptions) error {
+	if o.chatRetention < 0 {
+		return errors.New("--chat-retention must not be negative")
+	}
 	cfg, err := ctrl.GetConfig()
 	if err != nil {
 		return err
@@ -164,6 +170,7 @@ func run(o runOptions) error {
 		Log:              slog.Default(),
 		MCPURL:           o.mcpURL,
 		QuestionTimeout:  o.questionWait,
+		ChatRetention:    o.chatRetention,
 		Service:          o.service,
 		ServiceNamespace: o.serviceNS,
 		PodName:          o.podName,

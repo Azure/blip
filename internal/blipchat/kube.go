@@ -27,7 +27,7 @@ type Cluster interface {
 	ListSessions(ctx context.Context, namespace string) ([]v1.BlipState, error)
 	ListStates(ctx context.Context, namespace string, selector labels.Selector) ([]v1.BlipState, error)
 	GetSession(ctx context.Context, namespace, name string) (*v1.BlipState, error)
-	DeleteSession(ctx context.Context, namespace, name string, uid types.UID) error
+	DeleteSession(ctx context.Context, namespace, name string, uid types.UID, resourceVersion ...string) error
 	CreateSession(ctx context.Context, namespace string, state *v1.BlipState) error
 	ForkSession(ctx context.Context, namespace string, source, dest *v1.BlipState, owner *metav1.OwnerReference) error
 	ListChildSessions(ctx context.Context, namespace, parent string) ([]v1.BlipState, error)
@@ -92,9 +92,16 @@ func (k *kubeCluster) GetSession(ctx context.Context, namespace, name string) (*
 	return &state, nil
 }
 
-func (k *kubeCluster) DeleteSession(ctx context.Context, namespace, name string, uid types.UID) error {
+func (k *kubeCluster) DeleteSession(ctx context.Context, namespace, name string, uid types.UID, resourceVersion ...string) error {
 	obj := &v1.BlipState{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
-	return k.c.Delete(ctx, obj, client.Preconditions{UID: &uid})
+	preconditions := client.Preconditions{UID: &uid}
+	for _, version := range resourceVersion {
+		if version != "" {
+			preconditions.ResourceVersion = &version
+			break
+		}
+	}
+	return k.c.Delete(ctx, obj, preconditions)
 }
 
 func (k *kubeCluster) CreateSession(ctx context.Context, namespace string, state *v1.BlipState) error {

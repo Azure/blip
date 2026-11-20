@@ -73,6 +73,15 @@
 # chats. Any replica can answer the HTTP API and the MCP endpoint for any
 # chat, so the Services need no sticky sessions.
 #
+# --chat-retention is a duration (default 24h; 0 disables automatic cleanup).
+# Cleanup measures age from the latest terminal (Succeeded/Failed) Blip's
+# finishTime and retains active or saving chats. Cleanup deletes children before
+# parents so a parent's deletion cannot cascade to a chat still being retained.
+# Terminal-Blip garbage collection preserves each chat's latest execution while
+# its BlipState exists, so it cannot discard the retention clock.
+# Starting a new execution or child chat also grants a two-minute admission
+# grace period, protecting in-flight requests when retention is very short.
+#
 # Chat pool service accounts should be read-only for the Kubernetes API: grant
 # only get/list/watch on blips and blipstates (and get/list on pods) and never
 # create, update, or delete. blipchat performs the writes for a chat with its
@@ -305,6 +314,7 @@ spec:
             - --listen=:8080
             # - --base-path=/blipchat
             - --namespace=default
+            # - --chat-retention=24h
             - --profiles-configmap=blip-system/blip-chat-profiles
             - --auto-approve=always
             - --default-pool=default

@@ -176,4 +176,5 @@ func (s *Server) reconcile(ctx context.Context, full bool) {
 		}
 		s.ensureEngine(st.Name)
 	}
+	s.reapSessions(ctx, states, byState, time.Now())
 }

@@ -21,6 +21,14 @@ import (
 	"time"
 )
 
+func TestRunRejectsNegativeChatRetention(t *testing.T) {
+	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "missing-kubeconfig"))
+	err := run(runOptions{chatRetention: -time.Second})
+	if err == nil || err.Error() != "--chat-retention must not be negative" {
+		t.Fatalf("run() error = %v, want negative chat retention error", err)
+	}
+}
+
 func TestMCPTLSConfigReloadsCertificate(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "tls.crt")

@@ -25,17 +25,18 @@ import (
 // compare-and-append check so exactly one replica wins each step. Engines hold
 // no durable state; any replica can rebuild one by replaying the ring.
 const (
-	startTimeout  = 120 * time.Second
-	statusPoll    = 250 * time.Millisecond
-	engineTick    = time.Second
-	actionCooloff = 250 * time.Millisecond
-	readRetry     = time.Second
-	retryMinDelay = 15 * time.Second
-	retryMaxDelay = 60 * time.Second
-	initRetry     = 10 * time.Second
-	cancelTimeout = 5 * time.Second
-	promptTimeout = 10 * time.Minute
-	idleBlipWait  = 5 * time.Second
+	startTimeout         = 120 * time.Second
+	statusPoll           = 250 * time.Millisecond
+	engineTick           = time.Second
+	actionCooloff        = 250 * time.Millisecond
+	readRetry            = time.Second
+	retryMinDelay        = 15 * time.Second
+	retryMaxDelay        = 60 * time.Second
+	initRetry            = 10 * time.Second
+	cancelTimeout        = 5 * time.Second
+	promptTimeout        = 10 * time.Minute
+	idleBlipWait         = 5 * time.Second
+	chatAdmissionTimeout = 30 * time.Second
 )
 
 // errEngineIdle tells the engine loop that the chat needs no driver and the
@@ -574,6 +575,30 @@ func (s *Server) profileFor(st *v1.BlipState) (Profile, error) {
 	return profile.normalized(s.defaultPool), nil
 }
 
+// touchChat fences a reaper holding an older resource version before new work
+// starts. A patch can succeed on a terminating state, so reread its identity and
+// deletion status before proceeding.
+func (s *Server) touchChat(ctx context.Context, st *v1.BlipState) error {
+	if s.chatRetention <= 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, chatAdmissionTimeout)
+	defer cancel()
+	if err := s.cluster.PatchSession(ctx, s.namespace, st.Name, nil, map[string]string{
+		annotationActivityAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		return err
+	}
+	current, err := s.cluster.GetSession(ctx, s.namespace, st.Name)
+	if err != nil {
+		return err
+	}
+	if current.DeletionTimestamp != nil || current.UID != st.UID {
+		return fmt.Errorf("chat %s was deleted or replaced before new work could start", st.Name)
+	}
+	return nil
+}
+
 // ensureRunning returns a running blip for the state, creating the next
 // generation when none is active.
 func (s *Server) ensureRunning(ctx context.Context, st *v1.BlipState, profile Profile) (*v1.Blip, error) {
@@ -616,7 +641,13 @@ func (s *Server) ensureRunning(ctx context.Context, st *v1.BlipState, profile Pr
 				IdleTimeoutSeconds: &idle,
 			},
 		}
-		if err := s.cluster.CreateBlip(ctx, s.namespace, blip); err != nil {
+		if err := s.touchChat(ctx, st); err != nil {
+			return nil, err
+		}
+		createCtx, cancel := context.WithTimeout(ctx, chatAdmissionTimeout)
+		err := s.cluster.CreateBlip(createCtx, s.namespace, blip)
+		cancel()
+		if err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				blips, err = s.cluster.ListStateBlips(ctx, s.namespace, st.Name)
 				if err != nil {

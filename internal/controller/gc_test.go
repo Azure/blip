@@ -5,6 +5,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -208,6 +209,125 @@ func TestCollectTerminatedBlipsDisabled(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertDeleted(t, c, deleted, 0, "a", "b")
+	}
+}
+
+func TestCollectTerminatedBlipsChatRetention(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	for _, stateExists := range []bool{true, false} {
+		t.Run(map[bool]string{true: "state exists", false: "state deleted"}[stateExists], func(t *testing.T) {
+			old := gcBlip("chat-old", v1.BlipSucceeded, &t0)
+			latest := gcBlip("chat-latest", v1.BlipFailed, ptrTime(t0.Add(time.Minute)))
+			for _, b := range []*v1.Blip{old, latest} {
+				b.Spec.State = "chat-state"
+				b.Labels = map[string]string{v1.LabelChatSession: "session"}
+			}
+			old.Annotations = map[string]string{"chat.blip.dev/generation": "9"}
+			latest.Annotations = map[string]string{"chat.blip.dev/generation": "10"}
+			// Generation, not creation time or lexical name order, decides
+			// which chat execution carries the retention clock.
+			old.CreationTimestamp = metav1.NewTime(t0.Add(time.Hour))
+			latest.CreationTimestamp = metav1.NewTime(t0)
+			objects := []client.Object{old, latest,
+				gcBlip("new", v1.BlipSucceeded, ptrTime(t0.Add(2*time.Minute)))}
+			if stateExists {
+				objects = append(objects, &v1.BlipState{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "chat-state"}})
+			}
+			c := gcClient(t, objects...)
+			deleted, err := CollectTerminatedBlips(context.Background(), c, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stateExists {
+				assertDeleted(t, c, deleted, 1, "chat-latest", "new")
+			} else {
+				assertDeleted(t, c, deleted, 2, "new")
+			}
+		})
+	}
+}
+
+func TestCollectTerminatedBlipsProtectedChatDoesNotCountTowardThreshold(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	chat := gcBlip("chat", v1.BlipSucceeded, ptrTime(t0.Add(time.Minute)))
+	chat.Labels = map[string]string{v1.LabelChatSession: "session"}
+	chat.Spec.State = "chat-state"
+	c := gcClient(t, chat, gcBlip("old", v1.BlipSucceeded, &t0),
+		&v1.BlipState{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "chat-state"}})
+	deleted, err := CollectTerminatedBlips(context.Background(), c, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDeleted(t, c, deleted, 0, "chat", "old")
+}
+
+func TestCollectTerminatedBlipsChatWithRunningLatest(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	old := gcBlip("chat-old", v1.BlipSucceeded, &t0)
+	running := gcBlip("chat-running", v1.BlipRunning, nil)
+	for _, b := range []*v1.Blip{old, running} {
+		b.Spec.State = "chat-state"
+		b.Labels = map[string]string{v1.LabelChatSession: "session"}
+	}
+	running.CreationTimestamp = metav1.NewTime(t0.Add(time.Minute))
+	base := gcClient(t, old, running, gcBlip("new", v1.BlipSucceeded, ptrTime(t0.Add(time.Minute))))
+	c := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*v1.BlipState); ok {
+				t.Fatal("state lookup for an older chat generation")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	deleted, err := CollectTerminatedBlips(context.Background(), c, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDeleted(t, c, deleted, 1, "chat-running", "new")
+}
+
+func TestCollectTerminatedBlipsChatStateLookupError(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	chat := gcBlip("chat", v1.BlipSucceeded, &t0)
+	chat.Labels = map[string]string{v1.LabelChatSession: "session"}
+	chat.Spec.State = "chat-state"
+	base := gcClient(t, chat, gcBlip("new", v1.BlipSucceeded, ptrTime(t0.Add(time.Minute))))
+	wantErr := errors.New("state lookup unavailable")
+	c := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*v1.BlipState); ok {
+				return wantErr
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	deleted, err := CollectTerminatedBlips(context.Background(), c, 1)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	assertDeleted(t, c, deleted, 0, "chat", "new")
+}
+
+func TestNewerChatBlipFallback(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	a, b := gcBlip("a", v1.BlipSucceeded, nil), gcBlip("b", v1.BlipSucceeded, nil)
+	a.CreationTimestamp = metav1.NewTime(t0.Add(time.Minute))
+	b.CreationTimestamp = metav1.NewTime(t0)
+	a.Annotations = map[string]string{"chat.blip.dev/generation": "invalid"}
+	if !newerChatBlip(a, b) || newerChatBlip(b, a) {
+		t.Fatal("missing or malformed generations should fall back to creation time")
+	}
+	b.CreationTimestamp = a.CreationTimestamp
+	if newerChatBlip(a, b) || !newerChatBlip(b, a) {
+		t.Fatal("equal creation times should fall back to name")
+	}
+}
+
+func TestNewerChatBlipLegacyGeneration(t *testing.T) {
+	a := gcBlip("chat-g9", v1.BlipSucceeded, nil)
+	b := gcBlip("chat-g10", v1.BlipSucceeded, nil)
+	if newerChatBlip(a, b) || !newerChatBlip(b, a) {
+		t.Fatal("legacy generation suffixes must sort numerically")
 	}
 }
 
