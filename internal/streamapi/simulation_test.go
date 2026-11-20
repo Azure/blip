@@ -19,6 +19,9 @@ package streamapi
 //     restart, so an old cursor continues to refer to the same history.
 //   - EOF closes stdin. A later stdin request is rejected before any record is
 //     appended or forwarded.
+//   - A note is appended like stdin but is never forwarded to the guest. A
+//     non-zero after is a compare-and-append on the newest stdin/note offset;
+//     a mismatch is rejected before anything is appended.
 //   - A "lost reply" is modeled where the boundary can express it: stdin is
 //     appended before forwarding, and the forward then fails; a log response
 //     loses bytes after the status and part of a record. These are ambiguous
@@ -159,6 +162,17 @@ func (w *simWorld) trim() {
 	}
 	w.retained = w.retained[1:]
 	w.head = w.retained[0].offset
+}
+
+// lastSeq is the offset of the newest stdin or note record, as a conditional
+// write observes it.
+func (w *simWorld) lastSeq() uint64 {
+	for i := len(w.history) - 1; i >= 0; i-- {
+		if t := w.history[i].typ; t == stream.TypeIn || t == stream.TypeNote {
+			return w.history[i].offset
+		}
+	}
+	return 0
 }
 
 // simConsumer is the modeled client cursor. from is the offset sent on the next
@@ -303,21 +317,30 @@ func (b *simBackend) Log(ctx context.Context, namespace, name string, from uint6
 	}
 }
 
-func (b *simBackend) Stdin(ctx context.Context, namespace, name string, data []byte, eof bool) error {
+func (b *simBackend) Stdin(ctx context.Context, namespace, name string, data []byte, eof, note bool, after uint64) (uint64, error) {
 	w := &b.sim.world
 	w.stdinCalls++
 	if namespace != "ns" || name != "demo" {
-		return ErrNotFound
+		return 0, ErrNotFound
 	}
 	if w.phase == simRestarting {
-		return ErrNotReady
+		return 0, ErrNotReady
 	}
 	if w.phase == simExited || w.stdinClosed {
-		return ErrClosed
+		return 0, ErrClosed
 	}
+	if after != 0 && after != w.lastSeq() {
+		return 0, ErrPrecondition
+	}
+	off := w.lastSeq()
 	if len(data) > 0 {
-		w.appendRecord(w.gen, stream.TypeIn, data)
-		w.forwarded = append(w.forwarded, data...)
+		typ := stream.TypeIn
+		if note {
+			typ = stream.TypeNote
+		} else {
+			w.forwarded = append(w.forwarded, data...)
+		}
+		off = w.appendRecord(w.gen, typ, data).offset
 	}
 	if eof {
 		w.stdinClosed = true
@@ -325,9 +348,9 @@ func (b *simBackend) Stdin(ctx context.Context, namespace, name string, data []b
 	if b.op == "stdin/lost-reply" {
 		// The node records stdin before forwarding it. A failed forward is an
 		// ambiguous result: the record is durable but the API reports failure.
-		return errSimLostReply
+		return 0, errSimLostReply
 	}
-	return nil
+	return off, nil
 }
 
 type simAuth uint8
@@ -407,6 +430,8 @@ type simRequest struct {
 	body     io.Reader
 	auth     simAuth
 	follow   bool
+	note     bool
+	after    uint64
 	lost     bool
 	cancel   bool
 	wantCode int
@@ -497,7 +522,7 @@ func (m *apiSimulation) Step(action string) error {
 
 	case "stdin/write":
 		data := []byte(fmt.Sprintf("in-%d", len(m.world.history)))
-		return m.doStdin(simRequest{op: action, auth: simAuthAllow, wantCode: http.StatusOK}, data, false)
+		return m.doStdin(simRequest{op: action, auth: simAuthAllow, after: m.world.lastSeq(), wantCode: http.StatusOK}, data, false)
 	case "stdin/write-eof":
 		data := []byte(fmt.Sprintf("in-%d", len(m.world.history)))
 		return m.doStdin(simRequest{op: action, auth: simAuthAllow, wantCode: http.StatusOK}, data, true)
@@ -506,6 +531,13 @@ func (m *apiSimulation) Step(action string) error {
 	case "stdin/lost-reply":
 		data := []byte(fmt.Sprintf("in-%d", len(m.world.history)))
 		return m.doStdin(simRequest{op: action, auth: simAuthAllow, wantCode: http.StatusInternalServerError}, data, false)
+	case "stdin/note":
+		data := []byte(fmt.Sprintf("note-%d", len(m.world.history)))
+		return m.doStdin(simRequest{op: action, auth: simAuthAllow, note: true, wantCode: http.StatusOK}, data, false)
+	case "stdin/precondition":
+		// No stdin/note record can sit at offset 1: the first record starts at
+		// zero and every record is at least a header long.
+		return m.doStdin(simRequest{op: action, auth: simAuthAllow, after: 1, wantCode: http.StatusPreconditionFailed}, []byte("stale"), false)
 	case "stdin/stale":
 		code := http.StatusConflict
 		if m.world.phase == simRestarting {
@@ -627,8 +659,18 @@ func (m *apiSimulation) doLog(req simRequest) error {
 
 func (m *apiSimulation) doStdin(req simRequest, data []byte, eof bool) error {
 	target := simStdinPath()
+	var params []string
 	if eof {
-		target += "?eof=true"
+		params = append(params, "eof=true")
+	}
+	if req.note {
+		params = append(params, "note=true")
+	}
+	if req.after != 0 {
+		params = append(params, "after="+fmt.Sprint(req.after))
+	}
+	if len(params) > 0 {
+		target += "?" + strings.Join(params, "&")
 	}
 	req.method = http.MethodPost
 	req.target = target
@@ -696,14 +738,33 @@ func (m *apiSimulation) doStdin(req simRequest, data []byte, eof bool) error {
 	if len(m.world.history) != wantRecords {
 		return fmt.Errorf("%s: history has %d records, want %d", req.op, len(m.world.history), wantRecords)
 	}
+	var out struct {
+		Offset uint64 `json:"offset"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return fmt.Errorf("%s: decode stdin response: %w", req.op, err)
+	}
 	if len(data) > 0 {
 		last := m.world.history[len(m.world.history)-1]
-		if last.typ != stream.TypeIn || last.gen != m.world.gen || !bytes.Equal(last.data, data) {
+		wantType := stream.TypeIn
+		if req.note {
+			wantType = stream.TypeNote
+		}
+		if last.typ != wantType || last.gen != m.world.gen || !bytes.Equal(last.data, data) {
 			return fmt.Errorf("%s: appended record = %+v", req.op, last)
 		}
-		if !bytes.Equal(m.world.forwarded, append(slices.Clone(m.world.forwarded[:beforeForwarded]), data...)) {
+		if out.Offset != last.offset {
+			return fmt.Errorf("%s: response offset = %d, want %d", req.op, out.Offset, last.offset)
+		}
+		wantForwarded := slices.Clone(m.world.forwarded[:beforeForwarded])
+		if !req.note {
+			wantForwarded = append(wantForwarded, data...)
+		}
+		if !bytes.Equal(m.world.forwarded, wantForwarded) {
 			return fmt.Errorf("%s: forwarded bytes were not recorded exactly once", req.op)
 		}
+	} else if out.Offset != m.world.lastSeq() {
+		return fmt.Errorf("%s: response offset = %d, want %d", req.op, out.Offset, m.world.lastSeq())
 	}
 	if eof && !m.world.stdinClosed {
 		return fmt.Errorf("%s: eof did not close stdin", req.op)
@@ -879,6 +940,8 @@ func simTypeName(t stream.RecordType) string {
 		return "end"
 	case stream.TypeGap:
 		return "gap"
+	case stream.TypeNote:
+		return "note"
 	default:
 		return fmt.Sprintf("type-%d", t)
 	}
@@ -929,7 +992,7 @@ func (m *apiSimulation) Check() error {
 func checkWorldRecords(name string, records []simRecord, lower, upper uint64, bounded bool) error {
 	var prev, prevEnd uint64
 	for i, rec := range records {
-		if rec.typ < stream.TypeOut || rec.typ > stream.TypeGap {
+		if rec.typ < stream.TypeOut || rec.typ > stream.TypeNote {
 			return fmt.Errorf("%s record %d has invalid type %d", name, rec.offset, rec.typ)
 		}
 		if len(rec.data) > stream.MaxRecord {
@@ -1028,6 +1091,60 @@ func recordIn(rec simRecord, records []simRecord) bool {
 		}
 	}
 	return false
+}
+
+func TestStreamAPISimulationNotesAndPreconditions(t *testing.T) {
+	m := newAPISimulation()
+	m.budget = 16
+	step := func(action string) {
+		t.Helper()
+		if err := m.Step(action); err != nil {
+			t.Fatalf("%s: %v", action, err)
+		}
+		if err := m.Check(); err != nil {
+			t.Fatalf("%s: invariant: %v", action, err)
+		}
+	}
+
+	step("stdin/note")
+	// Reads arrive in batches of two, so it takes three to reach the note
+	// behind start, out and err.
+	step("log/read")
+	step("log/read")
+	step("log/read")
+
+	if len(m.world.forwarded) != 0 {
+		t.Fatalf("note was forwarded to the guest: %q", m.world.forwarded)
+	}
+	var note *simRecord
+	for i := range m.client.transcript {
+		if m.client.transcript[i].typ == stream.TypeNote {
+			note = &m.client.transcript[i]
+		}
+	}
+	if note == nil || string(note.data) != "note-3" {
+		t.Fatalf("note was not emitted by the log: %+v", m.client.transcript)
+	}
+	if m.world.lastSeq() != note.offset {
+		t.Fatalf("last stdin/note offset = %d, want the note at %d", m.world.lastSeq(), note.offset)
+	}
+
+	// A stale compare-and-append is rejected without touching the stream.
+	step("stdin/precondition")
+	if m.world.lastSeq() != note.offset {
+		t.Fatalf("rejected write moved the cursor to %d", m.world.lastSeq())
+	}
+
+	// A conditional write at the current offset succeeds and reaches the
+	// guest, while notes keep advancing the cursor without forwarding.
+	step("stdin/write")
+	if len(m.world.forwarded) == 0 {
+		t.Fatal("conditional write was not forwarded")
+	}
+	step("stdin/note")
+	if last := m.world.history[len(m.world.history)-1]; last.typ != stream.TypeNote {
+		t.Fatalf("last record = %+v", last)
+	}
 }
 
 // TestStreamAPISimulation exhaustively explores the bounded model and replays

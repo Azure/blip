@@ -34,6 +34,9 @@ type fakeBackend struct {
 	gotFollow    bool
 	gotData      []byte
 	gotEOF       bool
+	gotNote      bool
+	gotAfter     uint64
+	offset       uint64
 }
 
 func (f *fakeBackend) Log(ctx context.Context, namespace, name string, from uint64, follow bool, fn func(stream.Record) error) error {
@@ -49,13 +52,15 @@ func (f *fakeBackend) Log(ctx context.Context, namespace, name string, from uint
 	return err
 }
 
-func (f *fakeBackend) Stdin(ctx context.Context, namespace, name string, data []byte, eof bool) error {
+func (f *fakeBackend) Stdin(ctx context.Context, namespace, name string, data []byte, eof, note bool, after uint64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gotNamespace, f.gotName = namespace, name
 	f.gotData = append([]byte(nil), data...)
 	f.gotEOF = eof
-	return f.stdinErr
+	f.gotNote = note
+	f.gotAfter = after
+	return f.offset, f.stdinErr
 }
 
 func serve(s *Server, method, target string) *httptest.ResponseRecorder {
@@ -289,7 +294,9 @@ func (f fakeLogFunc) Log(ctx context.Context, namespace, name string, from uint6
 	return f(ctx, from, follow, fn)
 }
 
-func (fakeLogFunc) Stdin(context.Context, string, string, []byte, bool) error { return nil }
+func (fakeLogFunc) Stdin(context.Context, string, string, []byte, bool, bool, uint64) (uint64, error) {
+	return 0, nil
+}
 
 func TestLogErrors(t *testing.T) {
 	cases := []struct {
@@ -352,6 +359,66 @@ func TestStdin(t *testing.T) {
 	rec = serve(s, http.MethodPost, "/apis/"+GroupVersion+"/namespaces/ns/blipstreams/demo/stdin?eof=true")
 	if rec.Code != http.StatusOK || !fb.gotEOF || len(fb.gotData) != 0 {
 		t.Fatalf("empty eof: status %d, eof=%v data=%q", rec.Code, fb.gotEOF, fb.gotData)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content type = %q", ct)
+	}
+	var out struct {
+		Offset uint64 `json:"offset"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.Offset != 0 {
+		t.Fatalf("body = %q (%v)", rec.Body, err)
+	}
+}
+
+func TestStdinNoteAndAfter(t *testing.T) {
+	fb := &fakeBackend{offset: 42}
+	s := New(Options{Backend: fb, Insecure: true})
+	req := httptest.NewRequest(http.MethodPost,
+		"/apis/"+GroupVersion+"/namespaces/ns/blipstreams/demo/stdin?note=true&after=7", strings.NewReader("a note"))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content type = %q", ct)
+	}
+	var out struct {
+		Offset uint64 `json:"offset"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode body: %v\n%s", err, rec.Body)
+	}
+	if out.Offset != 42 {
+		t.Fatalf("offset = %d, want 42", out.Offset)
+	}
+	if !fb.gotNote || fb.gotAfter != 7 || string(fb.gotData) != "a note" {
+		t.Fatalf("backend got note=%v after=%d data=%q", fb.gotNote, fb.gotAfter, fb.gotData)
+	}
+}
+
+func TestStdinPrecondition(t *testing.T) {
+	s := New(Options{Backend: &fakeBackend{stdinErr: ErrPrecondition}, Insecure: true})
+	rec := serve(s, http.MethodPost, "/apis/"+GroupVersion+"/namespaces/ns/blipstreams/demo/stdin?after=7")
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if st := decodeStatus(t, rec); st.Reason != statusReasonPreconditionFailed || st.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %+v", st)
+	}
+}
+
+func TestBadStdinParams(t *testing.T) {
+	s := New(Options{Backend: &fakeBackend{}, Insecure: true})
+	for _, q := range []string{"eof=maybe", "note=maybe", "after=-1", "after=x"} {
+		rec := serve(s, http.MethodPost, "/apis/"+GroupVersion+"/namespaces/ns/blipstreams/demo/stdin?"+q)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status %d", q, rec.Code)
+		}
+		if st := decodeStatus(t, rec); st.Reason != metav1.StatusReasonBadRequest {
+			t.Fatalf("%s: %+v", q, st)
+		}
 	}
 }
 

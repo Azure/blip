@@ -26,7 +26,7 @@ import (
 // free of node imports.
 type StreamTarget interface {
 	StreamLog(ctx context.Context, namespace, name string, from uint64, follow bool, fn func(stream.Record) error) error
-	StreamStdin(ctx context.Context, namespace, name string, data []byte, eof bool) error
+	StreamStdin(ctx context.Context, namespace, name string, data []byte, eof, note bool, after uint64) (uint64, error)
 }
 
 // streamRecord is one NDJSON line of a log response. Data is base64 so a
@@ -122,7 +122,20 @@ func (s *Server) handleStreamLog(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleStreamStdin forwards raw stdin bytes to the state's guest.
+// streamErrorBody is the JSON body of a failed stdin request.
+type streamErrorBody struct {
+	Message string `json:"message"`
+}
+
+func streamJSONError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(streamErrorBody{Message: msg})
+}
+
+// handleStreamStdin forwards raw stdin bytes to the state's guest. A note is
+// persisted without forwarding, and after makes the write conditional on the
+// last stdin/note offset. Success reports the appended offset.
 func (s *Server) handleStreamStdin(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.caller(w, r); !ok {
 		return
@@ -130,32 +143,55 @@ func (s *Server) handleStreamStdin(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	namespace, name := q.Get("namespace"), q.Get("name")
 	if namespace == "" || name == "" {
-		streamTextError(w, http.StatusBadRequest, "namespace and name are required")
+		streamJSONError(w, http.StatusBadRequest, "namespace and name are required")
 		return
 	}
 	eof := false
 	if v := q.Get("eof"); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			streamTextError(w, http.StatusBadRequest, "eof must be a boolean")
+			streamJSONError(w, http.StatusBadRequest, "eof must be a boolean")
 			return
 		}
 		eof = b
 	}
+	note := false
+	if v := q.Get("note"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			streamJSONError(w, http.StatusBadRequest, "note must be a boolean")
+			return
+		}
+		note = b
+	}
+	var after uint64
+	if v := q.Get("after"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			streamJSONError(w, http.StatusBadRequest, "after must be a uint64")
+			return
+		}
+		after = n
+	}
 	if s.cfg.Stream == nil {
-		streamTextError(w, http.StatusServiceUnavailable, "stream service is not configured")
+		streamJSONError(w, http.StatusServiceUnavailable, "stream service is not configured")
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
 	if err != nil {
-		streamTextError(w, http.StatusBadRequest, err.Error())
+		streamJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.cfg.Stream.StreamStdin(r.Context(), namespace, name, body, eof); err != nil {
-		streamTextError(w, streamHTTPStatus(err), err.Error())
+	offset, err := s.cfg.Stream.StreamStdin(r.Context(), namespace, name, body, eof, note, after)
+	if err != nil {
+		streamJSONError(w, streamHTTPStatus(err), err.Error())
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(struct {
+		Offset uint64 `json:"offset"`
+	}{Offset: offset})
 }
 
 func streamBool(v string) (bool, error) {
@@ -267,24 +303,37 @@ func (c *Client) StreamLog(ctx context.Context, node, namespace, name string, fr
 }
 
 // StreamStdin writes raw bytes to a state's guest. eof closes the guest's
-// stdin after the bytes are delivered.
-func (c *Client) StreamStdin(ctx context.Context, node, namespace, name string, data []byte, eof bool) error {
+// stdin after the bytes are delivered, and note keeps the bytes in the
+// trajectory without forwarding them. A non-zero after makes the write
+// conditional on the last stdin/note offset. It returns the appended offset.
+func (c *Client) StreamStdin(ctx context.Context, node, namespace, name string, data []byte, eof, note bool, after uint64) (uint64, error) {
 	q := url.Values{}
 	q.Set("namespace", namespace)
 	q.Set("name", name)
 	if eof {
 		q.Set("eof", "true")
 	}
+	if note {
+		q.Set("note", "true")
+	}
+	if after != 0 {
+		q.Set("after", strconv.FormatUint(after, 10))
+	}
 	resp, done, err := c.streamRequest(ctx, node, http.MethodPost, "/v1/stream/stdin?"+q.Encode(), bytes.NewReader(data), "application/octet-stream")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer done()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return &responseError{status: resp.StatusCode,
+		return 0, &responseError{status: resp.StatusCode,
 			message: fmt.Sprintf("peer: %s /v1/stream/stdin: %s: %s", node, resp.Status, strings.TrimSpace(string(b)))}
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
+	var out struct {
+		Offset uint64 `json:"offset"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, fmt.Errorf("peer: decode stdin response: %w", err)
+	}
+	return out.Offset, nil
 }

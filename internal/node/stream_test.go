@@ -136,7 +136,7 @@ func TestStreamWriterAppendsGuestFrames(t *testing.T) {
 	if err := json.Unmarshal(recs[3].Data, &end); err != nil || end.Code != 3 || end.Reason != wire.ReasonCompleted {
 		t.Fatalf("end data = %s (%v)", recs[3].Data, err)
 	}
-	if err := m.Stdin(ctx, "default", "root", []byte("x"), false); !errors.Is(err, ErrStreamClosed) {
+	if _, err := m.Stdin(ctx, "default", "root", []byte("x"), false, false, 0); !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("stdin after exit = %v", err)
 	}
 	if err := m.closeWriter("a1"); err != nil {
@@ -195,10 +195,10 @@ func TestStreamStdinWaitsAndForwards(t *testing.T) {
 	if err := m.Open(ctx, "default", "root", pkey("p"), "a1", stream.MinSize, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Stdin(ctx, "default", "root", []byte("x"), false); !errors.Is(err, ErrStreamNotReady) {
+	if _, err := m.Stdin(ctx, "default", "root", []byte("x"), false, false, 0); !errors.Is(err, ErrStreamNotReady) {
 		t.Fatalf("stdin before connect = %v", err)
 	}
-	if err := m.Stdin(ctx, "default", "other", []byte("x"), false); !errors.Is(err, ErrStreamNotRunning) {
+	if _, err := m.Stdin(ctx, "default", "other", []byte("x"), false, false, 0); !errors.Is(err, ErrStreamNotRunning) {
 		t.Fatalf("stdin unknown state = %v", err)
 	}
 }
@@ -219,7 +219,10 @@ func TestStreamStdinAndEOF(t *testing.T) {
 	g := wire.NewConn(guest)
 
 	done := make(chan error, 1)
-	go func() { done <- m.Stdin(ctx, "default", "root", []byte("ls\n"), false) }()
+	go func() {
+		_, err := m.Stdin(ctx, "default", "root", []byte("ls\n"), false, false, 0)
+		done <- err
+	}()
 	typ, payload, err := g.Read()
 	if err != nil {
 		t.Fatal(err)
@@ -235,7 +238,10 @@ func TestStreamStdinAndEOF(t *testing.T) {
 		t.Fatalf("in = %+v", recs[1])
 	}
 
-	go func() { done <- m.Stdin(ctx, "default", "root", nil, true) }()
+	go func() {
+		_, err := m.Stdin(ctx, "default", "root", nil, true, false, 0)
+		done <- err
+	}()
 	typ, _, err = g.Read()
 	if err != nil {
 		t.Fatal(err)
@@ -246,8 +252,128 @@ func TestStreamStdinAndEOF(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Stdin(ctx, "default", "root", []byte("more"), false); !errors.Is(err, ErrStreamClosed) {
+	if _, err := m.Stdin(ctx, "default", "root", []byte("more"), false, false, 0); !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("stdin after eof = %v", err)
+	}
+	// Notes never reach the guest, so they are still recorded after EOF.
+	off, err := m.Stdin(ctx, "default", "root", []byte("note"), false, true, 0)
+	if err != nil {
+		t.Fatalf("note after eof = %v", err)
+	}
+	if off == 0 {
+		t.Fatal("note after eof returned no offset")
+	}
+}
+
+type stdinResult struct {
+	off uint64
+	err error
+}
+
+// goStdin runs a manager Stdin call that may block writing to the guest, so the
+// test can read the frame on the other side of the pipe.
+func goStdin(ctx context.Context, m *streamManager, data []byte, eof, note bool, after uint64) <-chan stdinResult {
+	ch := make(chan stdinResult, 1)
+	go func() {
+		off, err := m.Stdin(ctx, "default", "root", data, eof, note, after)
+		ch <- stdinResult{off: off, err: err}
+	}()
+	return ch
+}
+
+func TestStreamNoteStaysOutOfGuest(t *testing.T) {
+	rs := newRingStore()
+	rs.files["a1"] = ringFile(t)
+	conns := make(chan net.Conn, 1)
+	m := newStreamManager(rs, nil, self, func(string) string { return t.TempDir() }, nil)
+	m.dial = func(string) (net.Conn, error) { return <-conns, nil }
+	t.Cleanup(m.closeAll)
+	ctx := context.Background()
+	if err := m.Open(ctx, "default", "root", pkey("p"), "a1", stream.MinSize, 1); err != nil {
+		t.Fatal(err)
+	}
+	host, guest := net.Pipe()
+	conns <- host
+	g := wire.NewConn(guest)
+	select {
+	case <-m.pods[pkey("p")].ready:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not become ready")
+	}
+
+	off, err := m.Stdin(ctx, "default", "root", []byte("note text"), false, true, 0)
+	if err != nil || off == 0 {
+		t.Fatalf("note = %d, %v", off, err)
+	}
+	// The guest must never see a note.
+	_ = guest.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, _, err := g.Read(); err == nil {
+		t.Fatal("guest received a note frame")
+	}
+	_ = guest.SetReadDeadline(time.Time{})
+
+	recs := collect(t, m, 2)
+	if recs[1].Type != stream.TypeNote || string(recs[1].Data) != "note text" {
+		t.Fatalf("note record = %+v", recs[1])
+	}
+
+	// A note advances the conditional-write cursor like stdin does.
+	if _, err := m.Stdin(ctx, "default", "root", []byte("stale"), false, true, off+1); !errors.Is(err, ErrStreamPrecondition) {
+		t.Fatalf("stale note after = %v", err)
+	}
+	next, err := m.Stdin(ctx, "default", "root", []byte("second"), false, true, off)
+	if err != nil || next <= off {
+		t.Fatalf("conditional note = %d, %v", next, err)
+	}
+	if got := collect(t, m, 3); got[2].Type != stream.TypeNote || string(got[2].Data) != "second" {
+		t.Fatalf("second note = %+v", got[2])
+	}
+}
+
+func TestStreamStdinPrecondition(t *testing.T) {
+	rs := newRingStore()
+	rs.files["a1"] = ringFile(t)
+	conns := make(chan net.Conn, 1)
+	m := newStreamManager(rs, nil, self, func(string) string { return t.TempDir() }, nil)
+	m.dial = func(string) (net.Conn, error) { return <-conns, nil }
+	t.Cleanup(m.closeAll)
+	ctx := context.Background()
+	if err := m.Open(ctx, "default", "root", pkey("p"), "a1", stream.MinSize, 1); err != nil {
+		t.Fatal(err)
+	}
+	host, guest := net.Pipe()
+	conns <- host
+	g := wire.NewConn(guest)
+
+	ch := goStdin(ctx, m, []byte("one"), false, false, 0)
+	if typ, payload, err := g.Read(); err != nil || typ != wire.TStdin || string(payload) != "one" {
+		t.Fatalf("stdin frame = %d %q (%v)", typ, payload, err)
+	}
+	first := <-ch
+	if first.err != nil || first.off == 0 {
+		t.Fatalf("first write = %d, %v", first.off, first.err)
+	}
+
+	if _, err := m.Stdin(ctx, "default", "root", []byte("x"), false, false, first.off+1); !errors.Is(err, ErrStreamPrecondition) {
+		t.Fatalf("stale after = %v", err)
+	}
+	// The rejected write reached neither the ring nor the guest.
+	_ = guest.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, _, err := g.Read(); err == nil {
+		t.Fatal("guest received a rejected write")
+	}
+	_ = guest.SetReadDeadline(time.Time{})
+	if recs := collect(t, m, 2); len(recs) != 2 {
+		t.Fatalf("records after rejected write = %+v", recs)
+	}
+
+	ch = goStdin(ctx, m, []byte("two"), false, false, first.off)
+	if typ, payload, err := g.Read(); err != nil || typ != wire.TStdin || string(payload) != "two" {
+		t.Fatalf("stdin frame = %d %q (%v)", typ, payload, err)
+	}
+	second := <-ch
+	if second.err != nil || second.off <= first.off {
+		t.Fatalf("second write = %d, %v", second.off, second.err)
 	}
 }
 

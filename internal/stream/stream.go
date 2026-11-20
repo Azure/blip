@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 // Package stream implements the append-only record ring that carries a
-// blip's stdin, stdout, stderr and lifecycle events.
+// blip's stdin, stdout, stderr, notes and lifecycle events.
 //
 // The ring lives at a fixed offset inside a state's volume, after the ext4
 // filesystem. The node agent is its only writer; readers may be on any node.
@@ -53,6 +53,9 @@ const (
 	TypeEnd RecordType = 5
 	// TypeGap marks records the ring dropped before Offset.
 	TypeGap RecordType = 6
+	// TypeNote is a trajectory note. It is persisted for readers but never
+	// forwarded to the guest's stdin.
+	TypeNote RecordType = 7
 )
 
 const (
@@ -248,7 +251,7 @@ func (w *Writer) recordAt(off uint64) (Record, int, error) {
 	n := binary.LittleEndian.Uint32(hdr[20:])
 	typ := RecordType(hdr[24])
 	sum := binary.LittleEndian.Uint32(hdr[28:])
-	if logical != off || n > MaxRecord || typ < TypeOut || typ > TypeGap {
+	if logical != off || n > MaxRecord || typ < TypeOut || typ > TypeNote {
 		return Record{}, 0, nil
 	}
 	data := make([]byte, n)
@@ -431,7 +434,7 @@ func readRecord(r *Reader, off uint64) (Record, int, error) {
 	n := binary.LittleEndian.Uint32(hdr[20:])
 	typ := RecordType(hdr[24])
 	sum := binary.LittleEndian.Uint32(hdr[28:])
-	if logical != off || n > MaxRecord || typ < TypeOut || typ > TypeGap {
+	if logical != off || n > MaxRecord || typ < TypeOut || typ > TypeNote {
 		return Record{}, 0, nil
 	}
 	data := make([]byte, n)

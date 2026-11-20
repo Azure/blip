@@ -27,6 +27,9 @@ type fakeStreamTarget struct {
 	logCalls  int
 	stdin     []byte
 	eof       bool
+	note      bool
+	after     uint64
+	offset    uint64
 	stdinErr  error
 	stdinCall int
 }
@@ -42,11 +45,13 @@ func (f *fakeStreamTarget) StreamLog(ctx context.Context, namespace, name string
 	return f.logErr
 }
 
-func (f *fakeStreamTarget) StreamStdin(ctx context.Context, namespace, name string, data []byte, eof bool) error {
+func (f *fakeStreamTarget) StreamStdin(ctx context.Context, namespace, name string, data []byte, eof, note bool, after uint64) (uint64, error) {
 	f.stdinCall++
 	f.stdin = append([]byte(nil), data...)
 	f.eof = eof
-	return f.stdinErr
+	f.note = note
+	f.after = after
+	return f.offset, f.stdinErr
 }
 
 type testStreamStatusError struct {
@@ -153,7 +158,7 @@ func TestStreamLogRequiresAuthAndNames(t *testing.T) {
 }
 
 func TestStreamStdinForwardsBody(t *testing.T) {
-	target := &fakeStreamTarget{}
+	target := &fakeStreamTarget{offset: 11}
 	s, certs := newStreamTestServer(t, target)
 	rec := streamRequest(t, s, http.MethodPost, "/v1/stream/stdin?namespace=default&name=root&eof=true", strings.NewReader("ls\n"), certs["n1"])
 	if rec.Code != http.StatusOK {
@@ -161,6 +166,45 @@ func TestStreamStdinForwardsBody(t *testing.T) {
 	}
 	if target.stdinCall != 1 || string(target.stdin) != "ls\n" || !target.eof {
 		t.Fatalf("target = %+v", target)
+	}
+	var out struct {
+		Offset uint64 `json:"offset"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.Offset != 11 {
+		t.Fatalf("body = %q (%v)", rec.Body, err)
+	}
+}
+
+func TestStreamStdinNoteAndAfter(t *testing.T) {
+	target := &fakeStreamTarget{offset: 12}
+	s, certs := newStreamTestServer(t, target)
+	rec := streamRequest(t, s, http.MethodPost, "/v1/stream/stdin?namespace=default&name=root&note=true&after=11", strings.NewReader("note"), certs["n1"])
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d %s", rec.Code, rec.Body)
+	}
+	if !target.note || target.after != 11 || target.eof || string(target.stdin) != "note" {
+		t.Fatalf("target = %+v", target)
+	}
+	var out struct {
+		Offset uint64 `json:"offset"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.Offset != 12 {
+		t.Fatalf("body = %q (%v)", rec.Body, err)
+	}
+}
+
+func TestStreamStdinPreconditionPassthrough(t *testing.T) {
+	target := &fakeStreamTarget{stdinErr: testStreamStatusError{code: http.StatusPreconditionFailed, msg: "stream: stdin precondition failed"}}
+	s, certs := newStreamTestServer(t, target)
+	rec := streamRequest(t, s, http.MethodPost, "/v1/stream/stdin?namespace=default&name=root&after=7", strings.NewReader("x"), certs["n1"])
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d %s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("content type = %q", got)
+	}
+	if !strings.Contains(rec.Body.String(), "precondition") {
+		t.Fatalf("body = %q", rec.Body.String())
 	}
 }
 
@@ -214,6 +258,8 @@ func TestClientStreamLog(t *testing.T) {
 func TestClientStreamStdin(t *testing.T) {
 	var gotBody string
 	var gotEOF bool
+	var gotNote bool
+	var gotAfter string
 	c := newLifecycleTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/stream/stdin" {
 			t.Errorf("request = %s %s", r.Method, r.URL.Path)
@@ -223,14 +269,22 @@ func TestClientStreamStdin(t *testing.T) {
 			t.Errorf("query = %v", q)
 		}
 		gotEOF = q.Get("eof") == "true"
+		gotNote = q.Get("note") == "true"
+		gotAfter = q.Get("after")
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"offset":21}`)
 	}))
-	if err := c.StreamStdin(context.Background(), "exporter", "default", "root", []byte("hello"), true); err != nil {
+	off, err := c.StreamStdin(context.Background(), "exporter", "default", "root", []byte("hello"), true, true, 21)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if gotBody != "hello" || !gotEOF {
-		t.Fatalf("body = %q eof = %v", gotBody, gotEOF)
+	if gotBody != "hello" || !gotEOF || !gotNote || gotAfter != "21" {
+		t.Fatalf("body = %q eof = %v note = %v after = %q", gotBody, gotEOF, gotNote, gotAfter)
+	}
+	if off != 21 {
+		t.Fatalf("offset = %d, want 21", off)
 	}
 }
 
@@ -238,7 +292,7 @@ func TestClientStreamStdinErrorStatus(t *testing.T) {
 	c := newLifecycleTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "blip is not running", http.StatusConflict)
 	}))
-	err := c.StreamStdin(context.Background(), "exporter", "default", "root", []byte("x"), false)
+	_, err := c.StreamStdin(context.Background(), "exporter", "default", "root", []byte("x"), false, false, 0)
 	var re *responseError
 	if !errors.As(err, &re) || re.status != http.StatusConflict {
 		t.Fatalf("error = %v", err)

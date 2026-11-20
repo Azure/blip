@@ -64,6 +64,15 @@
 # ignored, and a message template that references .Agents still parses but
 # always sees an empty list.
 #
+# blipchat is stateless. A chat's messages, agent output, and control notes
+# (cancel, stop, questions) all live in the BlipState trajectory ring, so
+# nothing is kept in a ConfigMap or in process memory. Notes are written to
+# the ring with a compare-and-append, which serializes concurrent replicas
+# without a lock. The Deployment runs more than one replica: replicas watch
+# the endpoints of their Service and each owns a rendezvous-hash share of the
+# chats. Any replica can answer the HTTP API and the MCP endpoint for any
+# chat, so the Services need no sticky sessions.
+#
 # Chat pool service accounts should be read-only for the Kubernetes API: grant
 # only get/list/watch on blips and blipstates (and get/list on pods) and never
 # create, update, or delete. blipchat performs the writes for a chat with its
@@ -187,10 +196,6 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get]
-  # Accepted-but-undelivered prompts survive a blipchat restart here.
-  - apiGroups: [""]
-    resources: [configmaps]
-    verbs: [get, create, update, delete]
   - apiGroups: [stream.blip.dev]
     resources: [blipstreams, blipstreams/log]
     verbs: [get]
@@ -238,6 +243,32 @@ subjects:
     name: blipchat
     namespace: blip-system
 ---
+# Replicas shard chats by watching this Service's endpoints, so the Service
+# account needs to read EndpointSlices in the Service's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blipchat-shards
+  namespace: blip-system
+rules:
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blipchat-shards
+  namespace: blip-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blipchat-shards
+subjects:
+  - kind: ServiceAccount
+    name: blipchat
+    namespace: blip-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -246,7 +277,7 @@ metadata:
   labels:
     app.kubernetes.io/name: blipchat
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: blipchat
@@ -262,6 +293,13 @@ spec:
       containers:
         - name: blipchat
           image: ghcr.io/azure/blip-blipchat:latest
+          env:
+            # The pod name is the shard identity; replicas use the Service
+            # endpoints to agree on which chats each one drives.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           imagePullPolicy: IfNotPresent
           args:
             - --listen=:8080
@@ -270,6 +308,8 @@ spec:
             - --profiles-configmap=blip-system/blip-chat-profiles
             - --auto-approve=always
             - --default-pool=default
+            - --service=blipchat
+            - --service-namespace=blip-system
             - --mcp-listen=:8443
             - --mcp-cert=/etc/blipchat-mcp/tls.crt
             - --mcp-key=/etc/blipchat-mcp/tls.key

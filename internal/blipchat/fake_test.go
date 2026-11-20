@@ -4,6 +4,7 @@
 package blipchat
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -27,12 +28,14 @@ type fakeCluster struct {
 	states            map[string]*v1.BlipState
 	blips             map[string]*v1.Blip
 	pods              map[string]*corev1.Pod
+	endpoints         []string
 	blipOrder         []string
 	createBlip        int
 	createBlipAttempt int
 	createBlipErr     error
 	pendingBlips      bool
 	createSessionErr  error
+	onCreateBlip      func(*v1.Blip)
 	stopBlipStarted   chan struct{}
 	stopBlipGate      chan struct{}
 }
@@ -43,12 +46,8 @@ func newFakeCluster() *fakeCluster {
 
 func key(ns, name string) string { return ns + "/" + name }
 
-func copyState(s *v1.BlipState) *v1.BlipState {
-	c := s.DeepCopy()
-	return c
-}
-
-func copyBlip(b *v1.Blip) *v1.Blip { return b.DeepCopy() }
+func copyState(s *v1.BlipState) *v1.BlipState { return s.DeepCopy() }
+func copyBlip(b *v1.Blip) *v1.Blip            { return b.DeepCopy() }
 
 func (f *fakeCluster) ListSessions(_ context.Context, ns string) ([]v1.BlipState, error) {
 	f.mu.Lock()
@@ -197,13 +196,15 @@ func (f *fakeCluster) ListStateBlips(_ context.Context, ns, state string) ([]v1.
 
 func (f *fakeCluster) CreateBlip(_ context.Context, ns string, b *v1.Blip) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.createBlipAttempt++
 	if f.createBlipErr != nil {
-		return f.createBlipErr
+		err := f.createBlipErr
+		f.mu.Unlock()
+		return err
 	}
 	k := key(ns, b.Name)
 	if _, ok := f.blips[k]; ok {
+		f.mu.Unlock()
 		return apierrors.NewAlreadyExists(schema.GroupResource{Group: "blip.dev", Resource: "blips"}, b.Name)
 	}
 	c := copyBlip(b)
@@ -215,6 +216,11 @@ func (f *fakeCluster) CreateBlip(_ context.Context, ns string, b *v1.Blip) error
 	f.blips[k] = c
 	f.blipOrder = append(f.blipOrder, b.Name)
 	f.createBlip++
+	hook := f.onCreateBlip
+	f.mu.Unlock()
+	if hook != nil {
+		hook(c)
+	}
 	return nil
 }
 
@@ -268,12 +274,27 @@ func (f *fakeCluster) StopBlip(_ context.Context, ns, name string) error {
 		<-gate
 	}
 	f.mu.Lock()
-	// The real controller observes spec.stop and reaches a terminal phase.
-	// Tests do not run a controller, so emulate that transition here to keep
-	// StopBlip's wait for the state lease bounded.
 	b.Status.Phase = v1.BlipSucceeded
 	f.mu.Unlock()
 	return nil
+}
+
+func (f *fakeCluster) ListEndpointMembers(_ context.Context, ns, service string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.endpoints...), nil
+}
+
+// setActive marks every blip of the state as terminal, as a controller would
+// after the guest exits.
+func (f *fakeCluster) setActive(ns, state, phase string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, b := range f.blips {
+		if b.Namespace == ns && b.Labels[LabelSession] == state {
+			b.Status.Phase = phase
+		}
+	}
 }
 
 func (f *fakeCluster) blipNames() []string {
@@ -287,126 +308,221 @@ type sentMessage struct {
 	method string
 	id     string
 	eof    bool
+	note   bool
+	after  uint64
+	offset uint64
 }
 
+// fakeWire emulates the node's ring plus its stdin endpoint: appends are
+// serialized, conditional appends are checked against the generation's last
+// input offset, and agent replies are recorded as ordinary log records.
 type fakeWire struct {
 	mu             sync.Mutex
-	lines          chan []byte
-	sent           []sentMessage
+	cond           *sync.Cond
+	records        []streamLogRecord
 	offset         uint64
+	gen            uint64
+	lastSeq        uint64
+	sent           []sentMessage
 	failFirst      bool
 	failInitialize error
-	closed         bool
 	autoRespond    bool
+	closed         bool
+	// onPrompt, when set, runs after a prompt is recorded and may append
+	// records (for example a permission request) before the auto reply.
+	onPrompt func(gen uint64, text string)
 }
 
 func newFakeWire() *fakeWire {
-	return &fakeWire{lines: make(chan []byte, 128)}
+	f := &fakeWire{}
+	f.cond = sync.NewCond(&f.mu)
+	return f
 }
 
-func (f *fakeWire) Send(ctx context.Context, namespace, state string, data []byte, eof bool) error {
-	if eof {
-		f.mu.Lock()
-		f.sent = append(f.sent, sentMessage{eof: true})
+func (f *fakeWire) Send(_ context.Context, _, _ string, data []byte, eof, note bool, after uint64) (uint64, error) {
+	f.mu.Lock()
+	if f.closed {
 		f.mu.Unlock()
-		f.emitACP(map[string]any{"jsonrpc": "2.0", "method": "blip/output", "params": map[string]string{"stream": "eof"}})
-		return nil
+		return 0, ErrNotRunning
 	}
+	if after != 0 && after != f.lastSeq {
+		f.mu.Unlock()
+		return 0, ErrPrecondition
+	}
+	if eof {
+		seq := f.lastSeq
+		f.sent = append(f.sent, sentMessage{eof: true})
+		gen := f.gen
+		f.sent[len(f.sent)-1].after = gen
+		f.mu.Unlock()
+		return seq, nil
+	}
+	typ := recordIn
 	var msg map[string]any
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return err
+	if note {
+		typ = recordNote
+	} else if err := json.Unmarshal(data, &msg); err != nil {
+		f.mu.Unlock()
+		return 0, err
 	}
 	method, _ := msg["method"].(string)
 	id, _ := msg["id"].(string)
-	f.mu.Lock()
-	f.sent = append(f.sent, sentMessage{raw: append([]byte(nil), data...), method: method, id: id})
-	fail := f.failFirst && method == "session/prompt"
-	if fail {
+	if f.failFirst && method == "session/prompt" {
 		f.failFirst = false
+		f.mu.Unlock()
+		return 0, ErrNotRunning
 	}
+	off := f.appendLocked(f.gen, typ, data)
+	f.sent = append(f.sent, sentMessage{raw: append([]byte(nil), data...), method: method, id: id, note: note, after: after, offset: off})
+	f.lastSeq = off
 	f.mu.Unlock()
-	if fail {
-		return ErrNotRunning
+
+	if note {
+		return off, nil
 	}
 	switch method {
 	case "initialize":
 		f.mu.Lock()
-		fail := f.failInitialize
+		failure := f.failInitialize
 		f.mu.Unlock()
-		if fail != nil {
-			f.emitACP(map[string]any{
+		if failure != nil {
+			f.emitACP(f.gen, map[string]any{
 				"jsonrpc": "2.0",
 				"id":      id,
-				"error":   map[string]any{"code": -32603, "message": fail.Error()},
+				"error":   map[string]any{"code": -32603, "message": failure.Error()},
 			})
 			break
 		}
-		f.emitRPC(id, map[string]any{
-			"agentCapabilities": map[string]any{"loadSession": true},
+		f.emitACP(f.gen, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"result":  map[string]any{"agentCapabilities": map[string]any{"loadSession": true}},
 		})
 	case "session/new":
-		f.emitRPC(id, map[string]any{"sessionId": "acp-session-1"})
+		f.emitACP(f.gen, map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{"sessionId": "acp-session-1"}})
 	case "session/load", "session/resume":
-		f.emitRPC(id, map[string]any{})
+		f.emitACP(f.gen, map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{}})
 	case "session/prompt":
-		f.mu.Lock()
-		auto := f.autoRespond
-		f.mu.Unlock()
-		if auto {
-			f.emitACP(map[string]any{
-				"jsonrpc": "2.0",
-				"method":  "session/update",
-				"params": map[string]any{
-					"sessionId": "acp-session-1",
-					"update": map[string]any{
-						"sessionUpdate": "agent_message_chunk",
-						"content":       map[string]string{"type": "text", "text": "done: " + string(data)},
-					},
-				},
-			})
-			f.emitRPC(id, map[string]any{"stopReason": "end_turn"})
-		}
+		f.respondPrompt(f.gen, id, promptText(data))
 	}
-	return nil
+	return off, nil
 }
 
-func (f *fakeWire) OpenLog(ctx context.Context, namespace, state string, offset uint64) (io.ReadCloser, error) {
-	return &chanReader{ctx: ctx, ch: f.lines}, nil
+func (f *fakeWire) respondPrompt(gen uint64, id, text string) {
+	f.mu.Lock()
+	hook := f.onPrompt
+	auto := f.autoRespond
+	f.mu.Unlock()
+	if hook != nil {
+		hook(gen, text)
+	}
+	if !auto {
+		return
+	}
+	f.emitACP(gen, map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]any{
+			"sessionId": "acp-session-1",
+			"update": map[string]any{
+				"sessionUpdate": "agent_message_chunk",
+				"content":       map[string]string{"type": "text", "text": "done: " + text},
+			},
+		},
+	})
+	f.emitACP(gen, map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{"stopReason": "end_turn"}})
+}
+
+// start records the guest connection for a generation. Like the node, it resets
+// the generation's conditional-append sequence.
+func (f *fakeWire) start(gen uint64) {
+	f.mu.Lock()
+	f.gen = gen
+	f.lastSeq = 0
+	f.mu.Unlock()
+	f.appendRecord(gen, recordStart, nil)
+}
+
+func (f *fakeWire) end(gen uint64) {
+	f.appendRecord(gen, recordEnd, mustJSON(map[string]any{"code": 0, "reason": "exit"}))
+}
+
+func (f *fakeWire) note(note noteRecord) uint64 {
+	return f.appendRecord(f.gen, recordNote, mustJSON(note))
+}
+
+// MarshalJSON encodes a ring record in the same {o,g,t,d} shape UnmarshalJSON
+// reads. fake_test.go serializes streamLogRecord values with json.Marshal to
+// emulate the log endpoint; without this method the fields are capitalized and
+// decode as empty records, so the engine never sees a generation or a note.
+// This lives in a test file because only the fake ever marshals a record.
+func (r streamLogRecord) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		O uint64 `json:"o"`
+		G uint64 `json:"g"`
+		T int    `json:"t"`
+		D string `json:"d"`
+	}{
+		O: r.Offset,
+		G: r.Gen,
+		T: int(r.Type),
+		D: base64.StdEncoding.EncodeToString(r.Data),
+	})
+}
+func (f *fakeWire) appendRecord(gen uint64, typ streamRecordType, data []byte) uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.appendLocked(gen, typ, data)
+}
+
+func (f *fakeWire) appendLocked(gen uint64, typ streamRecordType, data []byte) uint64 {
+	off := f.offset
+	f.records = append(f.records, streamLogRecord{Offset: off, Gen: gen, Type: typ, Data: append([]byte(nil), data...)})
+	f.offset = off + streamRecordHeader + uint64(len(data))
+	f.cond.Broadcast()
+	return off
+}
+
+func (f *fakeWire) emitACP(gen uint64, msg any) {
+	data, _ := json.Marshal(msg)
+	data = append(data, '\n')
+	f.appendRecord(gen, recordOut, data)
+}
+
+func (f *fakeWire) OpenLog(ctx context.Context, _, _ string, offset uint64) (io.ReadCloser, error) {
+	return &fakeLogReader{wire: f, ctx: ctx, after: offset}, nil
+}
+
+func (f *fakeWire) ReadLog(ctx context.Context, namespace, state string, offset uint64) (io.ReadCloser, error) {
+	f.mu.Lock()
+	var buf bytes.Buffer
+	for _, rec := range f.records {
+		if rec.Offset < offset {
+			continue
+		}
+		line, _ := json.Marshal(rec)
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	f.mu.Unlock()
+	return io.NopCloser(&buf), nil
 }
 
 func (f *fakeWire) LogEnd(context.Context, string, string) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if len(f.records) == 0 {
+		return 0, nil
+	}
+	// Like the real ring, LogEnd returns a cursor just past the newest
+	// record, not the record's own start offset.
 	return f.offset, nil
-}
-
-func (f *fakeWire) emitRPC(id string, result any) {
-	f.emitACP(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
-}
-
-func (f *fakeWire) emitACP(msg any) {
-	data, _ := json.Marshal(msg)
-	data = append(data, '\n')
-	f.mu.Lock()
-	if f.closed {
-		f.mu.Unlock()
-		return
-	}
-	off := f.offset
-	f.offset += uint64(streamRecordHeader + len(data))
-	ch := f.lines
-	f.mu.Unlock()
-	rec := map[string]any{"o": off, "g": 1, "t": 1, "d": base64.StdEncoding.EncodeToString(data)}
-	line, _ := json.Marshal(rec)
-	select {
-	case ch <- append(line, '\n'):
-	default:
-	}
 }
 
 func (f *fakeWire) closeLog() {
 	f.mu.Lock()
 	f.closed = true
+	f.cond.Broadcast()
 	f.mu.Unlock()
 }
 
@@ -426,35 +542,103 @@ func (f *fakeWire) promptIDs() []string {
 	return ids
 }
 
-// streamRecordHeader is the ring's per-record header size. Offsets are logical
-// record starts, so the next record begins this far after the data. It is only
-// used to make test records realistic.
-const streamRecordHeader = 32
-
-type chanReader struct {
-	ctx context.Context
-	ch  <-chan []byte
-	buf []byte
-}
-
-func (r *chanReader) Read(p []byte) (int, error) {
-	for len(r.buf) == 0 {
-		select {
-		case <-r.ctx.Done():
-			return 0, io.EOF
-		case b, ok := <-r.ch:
-			if !ok {
-				return 0, io.EOF
-			}
-			r.buf = b
+func (f *fakeWire) notes() []noteRecord {
+	var out []noteRecord
+	for _, m := range f.messages() {
+		if !m.note {
+			continue
+		}
+		var note noteRecord
+		if json.Unmarshal(m.raw, &note) == nil {
+			out = append(out, note)
 		}
 	}
-	n := copy(p, r.buf)
-	r.buf = r.buf[n:]
-	return n, nil
+	return out
 }
 
-func (r *chanReader) Close() error { return nil }
+// fakeLogReader replays recorded lines from the requested offset and then
+// follows new ones until the context ends.
+type fakeLogReader struct {
+	wire  *fakeWire
+	ctx   context.Context
+	after uint64
+	idx   int
+	buf   []byte
+}
+
+func (r *fakeLogReader) Read(p []byte) (int, error) {
+	for {
+		if len(r.buf) > 0 {
+			n := copy(p, r.buf)
+			r.buf = r.buf[n:]
+			return n, nil
+		}
+		if r.ctx.Err() != nil {
+			return 0, io.EOF
+		}
+		r.wire.mu.Lock()
+		if r.idx >= len(r.wire.records) {
+			r.wire.mu.Unlock()
+			select {
+			case <-r.ctx.Done():
+				return 0, io.EOF
+			case <-time.After(5 * time.Millisecond):
+			}
+			continue
+		}
+		rec := r.wire.records[r.idx]
+		r.idx++
+		r.wire.mu.Unlock()
+		if rec.Offset < r.after {
+			continue
+		}
+		line, _ := json.Marshal(rec)
+		r.buf = append(line, '\n')
+	}
+}
+
+func (r *fakeLogReader) Close() error { return nil }
+
+func mustJSON(v any) []byte {
+	data, _ := json.Marshal(v)
+	return data
+}
+
+func promptText(data []byte) string {
+	var msg struct {
+		Params struct {
+			Prompt []struct {
+				Text string `json:"text"`
+			} `json:"prompt"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(data, &msg) != nil {
+		return ""
+	}
+	var out bytes.Buffer
+	for _, part := range msg.Params.Prompt {
+		out.WriteString(part.Text)
+	}
+	return out.String()
+}
+
+// newChat creates a chat state with the minimal annotations the handlers need.
+func newChat(cluster *fakeCluster, name, profile string) *v1.BlipState {
+	st := &v1.BlipState{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "default",
+			Name:              name,
+			Labels:            map[string]string{LabelSession: "true", v1.LabelOwner: name},
+			Annotations:       map[string]string{AnnotationProfile: profile, AnnotationRoot: name, AnnotationDepth: "0"},
+			CreationTimestamp: metav1.Now(),
+		},
+		Status: v1.BlipStateStatus{Phase: v1.StateReady},
+	}
+	cluster.mu.Lock()
+	cluster.states[key(st.Namespace, name)] = st
+	cluster.mu.Unlock()
+	return st
+}
 
 func waitFor(t *testing.T, what string, fn func() bool) {
 	t.Helper()

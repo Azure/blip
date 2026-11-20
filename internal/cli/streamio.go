@@ -129,6 +129,8 @@ func (t *streamKind) UnmarshalJSON(p []byte) error {
 		*t = streamKind(stream.TypeEnd)
 	case "gap":
 		*t = streamKind(stream.TypeGap)
+	case "note":
+		*t = streamKind(stream.TypeNote)
 	default:
 		return fmt.Errorf("unknown stream record type %q", s)
 	}
@@ -191,6 +193,8 @@ func (w *recordWriter) write(rec streamRecord) error {
 		w.status("end")
 	case stream.TypeGap:
 		w.status("gap")
+	case stream.TypeNote:
+		w.status("note")
 	}
 	return nil
 }

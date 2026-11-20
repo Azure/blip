@@ -67,6 +67,9 @@ var (
 	// ErrStreamNotReady reports that the guest stdio connection is not open
 	// yet. The caller may retry.
 	ErrStreamNotReady = &streamError{msg: "stream: guest stdio is not connected", status: 503}
+	// ErrStreamPrecondition reports that a conditional stdin write lost its
+	// race: the last stdin/note offset is no longer the expected one.
+	ErrStreamPrecondition = &streamError{msg: "stream: stdin precondition failed", status: 412}
 )
 
 // streamManager owns every running blip's stdio on this node. It keeps the
@@ -129,6 +132,9 @@ type streamAttachment struct {
 	closed bool
 	// eof reports that a caller already sent stdin EOF.
 	eof bool
+	// lastSeq is the ring offset of the most recently appended stdin or note
+	// record, used for conditional writes.
+	lastSeq uint64
 	// outNext and errNext are the next guest byte offsets to accept, used to
 	// resume after a dropped connection and to drop replayed frames.
 	outNext, errNext uint64
@@ -362,8 +368,10 @@ func (m *streamManager) Log(ctx context.Context, namespace, name string, from ui
 }
 
 // Stdin routes raw bytes to a running state's guest, forwarding to the
-// writer's node when it is not this one.
-func (m *streamManager) Stdin(ctx context.Context, namespace, name string, data []byte, eof bool) error {
+// writer's node when it is not this one. A note is persisted in the trajectory
+// without reaching the guest. A non-zero after makes the write conditional on
+// the last stdin/note offset. It returns the offset the write was appended at.
+func (m *streamManager) Stdin(ctx context.Context, namespace, name string, data []byte, eof, note bool, after uint64) (uint64, error) {
 	key := namespace + "/" + name
 	m.mu.Lock()
 	att := m.names[key]
@@ -371,18 +379,18 @@ func (m *streamManager) Stdin(ctx context.Context, namespace, name string, data 
 	if att == nil {
 		s, err := m.state(ctx, namespace, name)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if s == nil {
-			return ErrStreamNotRunning
+			return 0, ErrStreamNotRunning
 		}
 		if w := s.Status.Writer; w != nil {
 			if w.Node != m.node && m.peer != nil {
-				return m.peer.StreamStdin(ctx, w.Node, namespace, name, data, eof)
+				return m.peer.StreamStdin(ctx, w.Node, namespace, name, data, eof, note, after)
 			}
-			return ErrStreamNotReady
+			return 0, ErrStreamNotReady
 		}
-		return ErrStreamNotRunning
+		return 0, ErrStreamNotRunning
 	}
 
 	timer := time.NewTimer(m.readyTimeout)
@@ -390,44 +398,58 @@ func (m *streamManager) Stdin(ctx context.Context, namespace, name string, data 
 	select {
 	case <-att.ready:
 	case <-att.stop:
-		return ErrStreamClosed
+		return 0, ErrStreamClosed
 	case <-ctx.Done():
-		return ctx.Err()
+		return 0, ctx.Err()
 	case <-timer.C:
-		return ErrStreamNotReady
+		return 0, ErrStreamNotReady
 	}
 
 	att.mu.Lock()
 	defer att.mu.Unlock()
 	if att.closed {
-		return ErrStreamClosed
+		return 0, ErrStreamClosed
 	}
-	if att.eof {
-		return ErrStreamClosed
+	if att.eof && !note {
+		// The guest has its EOF, but notes never reach the guest and the ring
+		// is still writable. Recording one is how a new turn begins.
+		return 0, ErrStreamClosed
 	}
-	if att.conn == nil || att.net == nil {
-		return ErrStreamNotReady
+	if after != 0 && after != att.lastSeq {
+		return 0, ErrStreamPrecondition
 	}
+	if !note && (att.conn == nil || att.net == nil) {
+		return 0, ErrStreamNotReady
+	}
+	off := att.lastSeq
 	for len(data) > 0 {
 		n := min(len(data), stream.MaxRecord)
 		chunk := data[:n]
-		if _, err := att.writer.Append(stream.TypeIn, chunk); err != nil {
-			return err
+		typ := stream.TypeIn
+		if note {
+			typ = stream.TypeNote
 		}
-		if err := att.send(wire.TStdin, chunk); err != nil {
-			return err
+		pos, err := att.writer.Append(typ, chunk)
+		if err != nil {
+			return 0, err
+		}
+		att.lastSeq, off = pos, pos
+		if !note {
+			if err := att.send(wire.TStdin, chunk); err != nil {
+				return 0, err
+			}
 		}
 		att.lastActivity = time.Now()
 		data = data[n:]
 	}
 	if eof {
 		if err := att.send(wire.TStdinEOF, nil); err != nil {
-			return err
+			return 0, err
 		}
 		att.eof = true
 		att.lastActivity = time.Now()
 	}
-	return nil
+	return off, nil
 }
 
 func (m *streamManager) state(ctx context.Context, namespace, name string) (*v1alpha1.BlipState, error) {
@@ -802,12 +824,14 @@ func (a *Agent) StreamLog(ctx context.Context, namespace, state string, from uin
 	return a.streams.Log(ctx, namespace, state, from, follow, fn)
 }
 
-// StreamStdin writes to a BlipState's guest by name.
-func (a *Agent) StreamStdin(ctx context.Context, namespace, state string, data []byte, eof bool) error {
+// StreamStdin writes to a BlipState's guest by name. A note stays in the
+// trajectory, and after makes the write conditional on the last stdin/note
+// offset. It returns the offset the write was appended at.
+func (a *Agent) StreamStdin(ctx context.Context, namespace, state string, data []byte, eof, note bool, after uint64) (uint64, error) {
 	if a.streams == nil {
-		return ErrStreamNotRunning
+		return 0, ErrStreamNotRunning
 	}
-	return a.streams.Stdin(ctx, namespace, state, data, eof)
+	return a.streams.Stdin(ctx, namespace, state, data, eof, note, after)
 }
 
 // reconcileStreams opens writers for pods whose claims the guest accepted and

@@ -51,6 +51,8 @@ spec:
             - --profiles-configmap=blip-system/blip-chat-profiles
             - --auto-approve=always
             - --default-pool=blip-chat
+            - --service=blipchat
+            - --service-namespace=blip-system
             - --mcp-listen=:8443
             - --mcp-cert=/etc/blipchat-mcp/tls.crt
             - --mcp-key=/etc/blipchat-mcp/tls.key

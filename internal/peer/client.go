@@ -313,6 +313,10 @@ type responseError struct {
 
 func (e *responseError) Error() string { return e.message }
 
+// StreamHTTPStatus exposes the peer's HTTP status so a node agent can translate
+// a forwarded failure back into the stream API's error vocabulary.
+func (e *responseError) StreamHTTPStatus() int { return e.status }
+
 func (c *Client) post(ctx context.Context, node, path string, body, out any) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

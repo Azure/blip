@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -30,8 +31,9 @@ func (b streamBackend) Log(ctx context.Context, namespace, name string, from uin
 	return b.mapErr(b.a.StreamLog(ctx, namespace, name, from, follow, fn))
 }
 
-func (b streamBackend) Stdin(ctx context.Context, namespace, name string, data []byte, eof bool) error {
-	return b.mapErr(b.a.StreamStdin(ctx, namespace, name, data, eof))
+func (b streamBackend) Stdin(ctx context.Context, namespace, name string, data []byte, eof, note bool, after uint64) (uint64, error) {
+	off, err := b.a.StreamStdin(ctx, namespace, name, data, eof, note, after)
+	return off, b.mapErr(err)
 }
 
 func (b streamBackend) mapErr(err error) error {
@@ -46,9 +48,25 @@ func (b streamBackend) mapErr(err error) error {
 		return streamapi.ErrClosed
 	case errors.Is(err, ErrStreamNotReady):
 		return streamapi.ErrNotReady
-	default:
-		return err
+	case errors.Is(err, ErrStreamPrecondition):
+		return streamapi.ErrPrecondition
 	}
+	// A request may be forwarded to the node that owns the writer. Preserve
+	// the status it reported instead of turning every failure into a 500.
+	var status interface{ StreamHTTPStatus() int }
+	if errors.As(err, &status) {
+		switch status.StreamHTTPStatus() {
+		case http.StatusNotFound:
+			return streamapi.ErrNotFound
+		case http.StatusConflict:
+			return streamapi.ErrNotRunning
+		case http.StatusPreconditionFailed:
+			return streamapi.ErrPrecondition
+		case http.StatusServiceUnavailable:
+			return streamapi.ErrNotReady
+		}
+	}
+	return err
 }
 
 // clientCAPool loads a PEM CA bundle, returning nil when the file is absent.

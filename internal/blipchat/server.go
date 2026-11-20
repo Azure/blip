@@ -56,9 +56,18 @@ type Options struct {
 	// QuestionTimeout bounds how long ask_user waits for an answer. Zero uses
 	// 30 seconds.
 	QuestionTimeout time.Duration
+	// Service names the Kubernetes Service whose ready endpoints are the
+	// blipchat replicas. Empty disables sharding: every replica drives every
+	// chat, which the node's serialized appends make safe for a single pod.
+	Service string
+	// ServiceNamespace is the namespace of Service. Empty uses Namespace.
+	ServiceNamespace string
+	// PodName is this replica's name in the endpoint list. It comes from the
+	// POD_NAME downward-API variable.
+	PodName string
 }
 
-// Server is the HTTP front end and the owner of the per-session drivers.
+// Server is the HTTP front end and the owner of the per-chat engines.
 type Server struct {
 	namespace   string
 	basePath    string
@@ -67,16 +76,19 @@ type Server struct {
 	autoApprove string
 	cluster     Cluster
 	wire        Wire
-	pending     PendingStore
 	log         *slog.Logger
 	callers     Callers
 	mcpURL      string
 	questionTTL time.Duration
+	shards      *sharder
 
 	ctx     context.Context
 	cancel  context.CancelFunc
 	mu      sync.Mutex
-	drivers map[string]*driver
+	engines map[string]*chatEngine
+
+	viewsMu sync.Mutex
+	views   map[string]cachedChatView
 	ready   atomic.Bool
 }
 
@@ -131,6 +143,9 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	if opts.ServiceNamespace == "" {
+		opts.ServiceNamespace = opts.Namespace
+	}
 	s := &Server{
 		namespace:   opts.Namespace,
 		basePath:    basePath,
@@ -139,44 +154,50 @@ func New(opts Options) (*Server, error) {
 		autoApprove: opts.AutoApprove,
 		cluster:     opts.Cluster,
 		wire:        opts.Wire,
-		pending:     pendingStore(opts.Cluster),
 		log:         opts.Log,
 		callers:     opts.Callers,
 		mcpURL:      opts.MCPURL,
 		questionTTL: opts.QuestionTimeout,
 		ctx:         ctx,
 		cancel:      cancel,
-		drivers:     make(map[string]*driver),
+		engines:     make(map[string]*chatEngine),
+		views:       make(map[string]cachedChatView),
+	}
+	if opts.Service != "" {
+		if opts.PodName == "" {
+			// Without knowing which endpoint this replica is, every replica
+			// would think it owns every chat and duplicate work.
+			return nil, fmt.Errorf("pod name is required when service is set")
+		}
+		s.shards = newSharder(opts.Cluster, opts.ServiceNamespace, opts.Service, opts.PodName, opts.Log)
 	}
 	s.ready.Store(true)
 	return s, nil
 }
 
-func pendingStore(c Cluster) PendingStore {
-	if p, ok := c.(PendingStore); ok {
-		return p
-	}
-	return nil
-}
-
-// Start replaces the base context used by drivers. It is optional; New
-// installs a background context so tests can use the handler directly.
+// Start installs the serving context and starts the supervisor that keeps
+// engines running for this replica's chats. It is optional; New installs a
+// background context so tests can use the handler directly.
 func (s *Server) Start(ctx context.Context) {
 	s.cancel()
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	if s.shards != nil {
+		go s.shards.run(s.ctx)
+	}
+	go s.supervise(s.ctx)
 }
 
 func (s *Server) Close() {
 	s.cancel()
 	s.mu.Lock()
-	drivers := make([]*driver, 0, len(s.drivers))
-	for _, d := range s.drivers {
-		drivers = append(drivers, d)
+	engines := make([]*chatEngine, 0, len(s.engines))
+	for _, e := range s.engines {
+		engines = append(engines, e)
 	}
-	s.drivers = make(map[string]*driver)
+	s.engines = make(map[string]*chatEngine)
 	s.mu.Unlock()
-	for _, d := range drivers {
-		d.Close()
+	for _, e := range engines {
+		e.cancel()
 	}
 }
 
@@ -504,7 +525,6 @@ func summarize(st *v1.BlipState, blips []v1.Blip) sessionSummary {
 		Parent:       st.Annotations[AnnotationParent],
 		Root:         st.Annotations[AnnotationRoot],
 		Created:      st.CreationTimestamp,
-		Question:     questionFromAnnotation(st),
 	}
 	out.Depth = sessionDepth(st)
 	if latest := latestBlip(blips); latest != nil {
@@ -528,18 +548,14 @@ func summarize(st *v1.BlipState, blips []v1.Blip) sessionSummary {
 	return out
 }
 
-// questionFromAnnotation reads the durable open question. A malformed value is
-// treated as no question; the driver is the authority when it is live.
-func questionFromAnnotation(st *v1.BlipState) *Question {
-	raw := st.Annotations[AnnotationQuestion]
-	if raw == "" {
-		return nil
+// withQuestion fills in the open question for a live chat. The ring is the only
+// source of truth for questions.
+func withQuestion(ctx context.Context, s *Server, st *v1.BlipState, summary sessionSummary) sessionSummary {
+	if !summary.Running {
+		return summary
 	}
-	var q Question
-	if err := json.Unmarshal([]byte(raw), &q); err != nil || q.ID == "" {
-		return nil
-	}
-	return &q
+	summary.Question = s.readView(ctx, st).Question
+	return summary
 }
 
 // sessionDepth returns the distance from the root chat. A missing or invalid
@@ -581,7 +597,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		if !canAccess(&states[i], user) {
 			continue
 		}
-		out = append(out, summarize(&states[i], byState[states[i].Name]))
+		out = append(out, withQuestion(r.Context(), s, &states[i], summarize(&states[i], byState[states[i].Name])))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].Created.Equal(&out[j].Created) {
@@ -595,6 +611,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 type createRequest struct {
 	Profile string `json:"profile"`
 	Scope   string `json:"scope"`
+	Title   string `json:"title"`
 }
 
 // noBaseError reports that a profile's selector matched no usable state.
@@ -795,6 +812,42 @@ func (s *Server) createChat(ctx context.Context, req chatRequest) (*v1.BlipState
 	if created == nil {
 		return nil, httpError{code: http.StatusInternalServerError, message: "could not allocate a session name"}
 	}
+	// A fork or a copy inherits the source's trajectory. Record where that
+	// history ends, before the chat can accept a message, so the engine never
+	// mistakes the source's prompts for this chat's work. The copy is
+	// asynchronous, so wait for the state to be ready first: LogEnd fails
+	// until the node has committed the copied volume.
+	if fork || base != "" {
+		if err := s.waitStateReady(ctx, s.namespace, created.Name); err != nil {
+			return nil, err
+		}
+		var end uint64
+		var err error
+		for attempt := 0; attempt < 20; attempt++ {
+			end, err = s.wire.LogEnd(ctx, s.namespace, created.Name)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if err != nil {
+			// Starting the engine at zero would replay the source's prompts.
+			return nil, fmt.Errorf("read inherited trajectory for %s: %w", created.Name, err)
+		}
+		if end > 0 {
+			start := strconv.FormatUint(end, 10)
+			if err := s.cluster.PatchSession(ctx, s.namespace, created.Name, nil, map[string]string{AnnotationStart: start}); err != nil {
+				return nil, err
+			}
+			if created.Annotations == nil {
+				created.Annotations = map[string]string{}
+			}
+			created.Annotations[AnnotationStart] = start
+		}
+	}
 	return created, nil
 }
 
@@ -821,6 +874,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Profile: req.Profile,
 		Scope:   req.Scope,
 		Owner:   forwardedUser(r),
+		Title:   strings.TrimSpace(req.Title),
 	})
 	if err != nil {
 		writeChatError(w, err)
@@ -828,7 +882,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	// Do not start an agent here. A chat with no messages has no turn to
 	// run, and eager VMs make merely opening a chat consume a pool slot. The
-	// first POST .../message creates the driver and starts the agent.
+	// first POST .../message writes a note and starts the agent.
 	writeJSON(w, http.StatusCreated, map[string]string{"name": created.Name, "namespace": created.Namespace})
 }
 
@@ -877,40 +931,25 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail := sessionDetail{sessionSummary: summarize(st, blips)}
-	// Use the driver snapshot even when this is the first request for the chat.
-	// Creating the driver here seeds its transcript from the durable log and
-	// sets the offset to the hub's sequence. Returning a replay with offset 0
-	// instead would make the UI open SSE at 0 while the driver starts reading
-	// after the last record, losing the final events of a finished turn.
-	d, err := s.driverFor(r.Context(), name)
-	if err != nil {
-		writeClusterError(w, err)
-		return
-	}
-	var idle bool
-	detail.Transcript, detail.Offset, idle = d.Snapshot()
-	detail.TranscriptTruncated = d.TranscriptTruncated()
-	// The live driver is the authority: the annotation can lag while it is
-	// being cleared, and a just-restarted driver loads it before serving.
-	detail.Question = d.Question()
+	// The ring is the durable transcript and event log; there is no per-pod
+	// driver state to lose. Offset is the newest record so a client can open
+	// the event stream exactly where this snapshot ends.
+	view := s.readView(r.Context(), st)
+	detail.Transcript = view.Transcript
 	if detail.Transcript == nil {
 		detail.Transcript = []json.RawMessage{}
 	}
-	// A Blip can remain Running briefly after the driver has already
-	// delivered the terminal events. The SSE offset and transcript are
-	// authoritative; clear the stale running flag so a freshly opened page
-	// does not wait forever for a status event that is already behind it.
-	if idle {
+	detail.Offset = view.Newest
+	detail.TranscriptTruncated = view.Truncated || view.Gapped
+	detail.Question = view.Question
+	// A Blip can remain Running briefly after the log's end record. Read the
+	// log as the authority so a freshly opened page does not wait forever for
+	// a status event that is already behind it.
+	if detail.Running && !view.Started && view.Ended {
 		detail.Running = false
-		// The state can still be InUse/Saving while the last Blip finishes,
-		// and an early snapshot can point past the driver's initial Stopped
-		// status while the latest Blip is still Pending. Those are lifecycle
-		// phases, not an active chat turn. Normalize anything that is not a
-		// terminal success/failure to Saving so a freshly opened page is idle.
 		switch detail.Phase {
 		case string(v1.BlipFailed), "Error",
 			string(v1.BlipSucceeded), "Stopped":
-			// Keep terminal phases for status/detail.
 		default:
 			detail.Phase = string(v1.BlipSaving)
 		}
@@ -1014,119 +1053,14 @@ func (s *Server) backfillChat(ctx context.Context, st *v1.BlipState) {
 	}
 }
 
-func (s *Server) driverFor(ctx context.Context, name string) (*driver, error) {
-	s.mu.Lock()
-	if d := s.drivers[name]; d != nil {
-		s.mu.Unlock()
-		return d, nil
-	}
-	s.mu.Unlock()
-
-	st, err := s.chatState(ctx, s.namespace, name)
-	if err != nil {
-		return nil, err
-	}
-	s.backfillChat(ctx, st)
-	profileName := st.Annotations[AnnotationProfile]
-	if profileName == "" {
-		profileName = DefaultProfileName
-	}
-	offset, haveOffset := uint64(0), false
-	if v := st.Annotations[AnnotationOffset]; v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-			offset, haveOffset = n, true
-		}
-	}
-	profile, configured := s.profiles[profileName]
-	var unavailable error
-	if configured {
-		profile = profile.normalized(s.defaultPool)
-	} else {
-		unavailable = fmt.Errorf("%w: profile %q", errProfileUnavailable, profileName)
-	}
-	if !haveOffset {
-		// Existing chats may predate the persisted offset annotation, and a
-		// forked chat copies its parent's trajectory ring. Start after the
-		// records already in the log instead of replaying them into the agent.
-		if end, err := s.wire.LogEnd(ctx, s.namespace, name); err == nil && end > 0 {
-			offset, haveOffset = end, true
-			if err := s.cluster.PatchSession(ctx, s.namespace, name, nil, map[string]string{AnnotationOffset: strconv.FormatUint(end, 10)}); err != nil {
-				s.log.Debug("save initial offset", "session", name, "err", err)
-			}
-		} else if err != nil {
-			s.log.Warn("read log end", "session", name, "err", err)
-		}
-	}
-	// Seed from the durable log so a driver created after a restart still
-	// serves the conversation history. A forked chat's log begins with the
-	// parent's records copied at fork time and showed those in its transcript
-	// before the restart, so replay them too instead of losing the history.
-	var transcript []json.RawMessage
-	var transcriptTruncated bool
-	if offset > 0 {
-		transcript, transcriptTruncated = replayTranscript(ctx, s.wire, s.namespace, name)
-	}
-	var pending []PendingPrompt
-	if s.pending != nil {
-		pending, err = s.pending.LoadPending(ctx, s.namespace, name)
-		if err != nil {
-			s.log.Warn("load pending prompts", "session", name, "err", err)
-		}
-	}
-	d := newDriver(driverOptions{
-		Cluster:             s.cluster,
-		Wire:                s.wire,
-		Hub:                 NewHub(),
-		Log:                 s.log,
-		Namespace:           s.namespace,
-		State:               name,
-		ProfileName:         profileName,
-		Profile:             profile,
-		Unavailable:         unavailable,
-		Base:                st.Annotations[AnnotationBase],
-		Parent:              st.Annotations[AnnotationParent],
-		Root:                st.Annotations[AnnotationRoot],
-		Depth:               sessionDepth(st),
-		Created:             sessionCreated(st),
-		AutoApprove:         s.autoApprove,
-		SessionID:           st.Annotations[AnnotationACPSession],
-		Title:               st.Annotations[AnnotationTitle],
-		Offset:              offset,
-		HaveOffset:          haveOffset,
-		MCPServers:          s.mcpServers(),
-		Transcript:          transcript,
-		TranscriptTruncated: transcriptTruncated,
-		Pending:             s.pending,
-		PendingPrompts:      pending,
-		Question:            questionFromAnnotation(st),
-		QuestionTimeout:     s.questionTTL,
-	})
-
-	s.mu.Lock()
-	if existing := s.drivers[name]; existing != nil {
-		s.mu.Unlock()
-		d.Close()
-		return existing, nil
-	}
-	s.drivers[name] = d
-	s.mu.Unlock()
-	d.start(s.ctx)
-	d.resume()
-	return d, nil
-}
-
-func (s *Server) lookupDriver(name string) *driver {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.drivers[name]
-}
-
 func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	name, ok := s.sessionArgs(w, r)
 	if !ok {
 		return
 	}
-	if _, err := s.authorizedChat(r.Context(), forwardedUser(r), name); err != nil {
+	user := forwardedUser(r)
+	st, err := s.authorizedChat(r.Context(), user, name)
+	if err != nil {
 		writeClusterError(w, err)
 		return
 	}
@@ -1145,46 +1079,71 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "text is too long")
 		return
 	}
-	d, err := s.driverFor(r.Context(), name)
+	profile, err := s.profileFor(st)
 	if err != nil {
-		writeClusterError(w, err)
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
+	view := s.readView(r.Context(), st)
+	// Once accepted, the write must outlive the client connection: starting a
+	// VM can take longer than the browser waits.
+	writeCtx, cancel := messageContext(r)
+	defer cancel()
 	// While a question is open, a message from the composer is its answer.
-	// A message that arrives after the question was already answered is
-	// handled as an ordinary prompt below.
-	if d.Question() != nil {
-		err := d.Answer(forwardedUser(r), text)
-		if err == nil {
-			writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+	if view.Question != nil {
+		note := noteRecord{Type: noteAnswer, QID: view.Question.ID, Text: text, Sender: user, Gen: view.questionGen(view.Question.ID)}
+		if err := s.appendNote(writeCtx, st, profile, note); err != nil {
+			s.writeNoteError(w, "answer question", name, err)
 			return
 		}
-		if !errors.Is(err, errNoQuestion) {
-			switch {
-			case errors.Is(err, errSessionBusy):
-				writeError(w, http.StatusServiceUnavailable, "session is busy")
-			default:
-				s.log.Error("answer question", "namespace", s.namespace, "session", name, "err", err)
-				writeError(w, http.StatusInternalServerError, "could not deliver the answer")
-			}
-			return
-		}
-	}
-	if err := d.SubmitAs(forwardedUser(r), text); err != nil {
-		switch {
-		case errors.Is(err, errSessionBusy):
-			writeError(w, http.StatusServiceUnavailable, "session is busy")
-		case errors.Is(err, errMessageTooLong):
-			writeError(w, http.StatusBadRequest, "text is too long")
-		case errors.Is(err, errProfileUnavailable):
-			writeError(w, http.StatusConflict, err.Error())
-		default:
-			s.log.Error("prepare message", "namespace", s.namespace, "session", name, "err", err)
-			writeError(w, http.StatusInternalServerError, "could not prepare message")
-		}
+		s.ensureEngine(name)
+		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 		return
 	}
+	if len(view.Queued) >= maxQueue {
+		writeError(w, http.StatusServiceUnavailable, "session is busy")
+		return
+	}
+	note, err := s.promptNote(st, profile, user, text)
+	if err != nil {
+		if errors.Is(err, errMessageTooLong) {
+			writeError(w, http.StatusBadRequest, "text is too long")
+			return
+		}
+		s.log.Error("render message", "namespace", s.namespace, "session", name, "err", err)
+		writeError(w, http.StatusInternalServerError, "could not prepare message")
+		return
+	}
+	if err := s.appendNote(writeCtx, st, profile, note); err != nil {
+		s.writeNoteError(w, "submit message", name, err)
+		return
+	}
+	// The note and its running blip exist; start the driver now instead of
+	// waiting for the next supervisor pass.
+	s.ensureEngine(name)
 	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+}
+
+// messageContext detaches an accepted message from the client connection. A
+// note write can wait for a VM to start, and the client may disconnect (or the
+// browser may abort) while that is in flight; the message has already been
+// accepted and must still land in the ring.
+func messageContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), startTimeout+30*time.Second)
+}
+
+func (s *Server) writeNoteError(w http.ResponseWriter, action, name string, err error) {
+	switch {
+	case errors.Is(err, errSessionBusy), errors.Is(err, ErrNotRunning):
+		writeError(w, http.StatusServiceUnavailable, "session is busy")
+	case errors.Is(err, errMessageTooLong):
+		writeError(w, http.StatusBadRequest, "text is too long")
+	case errors.Is(err, errProfileUnavailable):
+		writeError(w, http.StatusConflict, err.Error())
+	default:
+		s.log.Error(action, "namespace", s.namespace, "session", name, "err", err)
+		writeError(w, http.StatusInternalServerError, "could not deliver the message")
+	}
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
@@ -1196,15 +1155,16 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		writeClusterError(w, err)
 		return
 	}
-	d, err := s.driverFor(r.Context(), name)
-	if err != nil {
-		writeClusterError(w, err)
+	// A cancel is a note, so it is delivered by whichever replica drives the
+	// chat. A chat that is not running has nothing to cancel.
+	writeCtx, cancel := messageContext(r)
+	defer cancel()
+	if _, err := s.writeNote(writeCtx, name, noteRecord{Type: noteCancel}); err != nil && !errors.Is(err, ErrNotRunning) {
+		s.log.Error("cancel turn", "namespace", s.namespace, "session", name, "err", err)
+		writeError(w, http.StatusInternalServerError, "could not cancel the turn")
 		return
 	}
-	if !d.Cancel() {
-		writeError(w, http.StatusServiceUnavailable, "session is busy")
-		return
-	}
+	s.ensureEngine(name)
 	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 }
 
@@ -1213,32 +1173,43 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := s.authorizedChat(r.Context(), forwardedUser(r), name); err != nil {
-		writeClusterError(w, err)
-		return
-	}
-	d, err := s.driverFor(r.Context(), name)
+	st, err := s.authorizedChat(r.Context(), forwardedUser(r), name)
 	if err != nil {
 		writeClusterError(w, err)
 		return
 	}
-	if !d.Stop() {
-		writeError(w, http.StatusServiceUnavailable, "session is busy")
+	writeCtx, cancel := messageContext(r)
+	defer cancel()
+	if view := s.readView(r.Context(), st); view.hasWork() {
+		// With queued work a blip may not be attached right now. Recording
+		// the stop through appendNote starts one if needed, so the queued
+		// prompts are actually dropped instead of running after the stop.
+		if profile, perr := s.profileFor(st); perr == nil {
+			if err := s.appendNote(writeCtx, st, profile, noteRecord{Type: noteStop}); err != nil {
+				s.log.Warn("record stop", "session", name, "error", err)
+			}
+		}
+	} else {
+		if _, err := s.writeNote(writeCtx, name, noteRecord{Type: noteStop}); err != nil && !errors.Is(err, ErrNotRunning) {
+			s.log.Warn("record stop", "session", name, "error", err)
+		}
+	}
+	if err := s.stopBlip(writeCtx, name); err != nil {
+		writeClusterError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 }
 
+// handleEvents follows the ring and converts each record to the same SSE event
+// shape the UI has always received. Offsets are ring offsets, so a client can
+// reconnect to any replica with its Last-Event-ID.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	name, ok := s.sessionArgs(w, r)
 	if !ok {
 		return
 	}
-	if _, err := s.authorizedChat(r.Context(), forwardedUser(r), name); err != nil {
-		writeClusterError(w, err)
-		return
-	}
-	d, err := s.driverFor(r.Context(), name)
+	st, err := s.authorizedChat(r.Context(), forwardedUser(r), name)
 	if err != nil {
 		writeClusterError(w, err)
 		return
@@ -1247,6 +1218,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	seen := after != 0
+	if !seen {
+		// A client with no cursor starts at this chat's first record, not at
+		// the base's records a fork inherited.
+		after = chatStart(st)
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1262,40 +1239,110 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// SSE outlives the server's normal write timeout. The heartbeat below
 	// detects a dead client instead.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
-
-	replay, ch, cancel := d.hub.Subscribe(after)
-	defer cancel()
 	if _, err := fmt.Fprint(w, "retry: 3000\n\n"); err != nil {
 		return
 	}
 	flusher.Flush()
-	for _, ev := range replay {
-		if !writeSSE(w, flusher, ev) {
-			return
-		}
-	}
+
+	ctx := r.Context()
+	view := newChatView(st.Annotations[AnnotationACPSession])
 	heartbeat := time.NewTicker(20 * time.Second)
 	defer heartbeat.Stop()
+	next := after
+	last := after
 	for {
+		rc, err := s.wire.OpenLog(ctx, s.namespace, name, next)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.log.Debug("open chat log", "session", name, "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-heartbeat.C:
+				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			case <-time.After(readRetry):
+			}
+			continue
+		}
+		records := streamRecords(ctx, rc)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-heartbeat.C:
+				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			case res, open := <-records:
+				if !open {
+					goto reconnect
+				}
+				if res.err != nil {
+					continue
+				}
+				if seen && res.rec.Offset <= last {
+					// The follow stream is inclusive: skip the event the
+					// client already received.
+					continue
+				}
+				view.observe(res.rec)
+				for _, ev := range eventsFor(res.rec, view) {
+					if !writeSSE(w, flusher, ev) {
+						return
+					}
+				}
+				seen = true
+				last = res.rec.Offset
+				next = res.rec.Offset
+			}
+		}
+	reconnect:
 		select {
-		case <-r.Context().Done():
+		case <-ctx.Done():
 			return
-		case <-d.ctx.Done():
-			return
-		case ev, open := <-ch:
-			if !open {
-				return
-			}
-			if !writeSSE(w, flusher, ev) {
-				return
-			}
-		case <-heartbeat.C:
-			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
-				return
-			}
-			flusher.Flush()
+		case <-time.After(readRetry):
 		}
 	}
+}
+
+// eventsFor renders one record as SSE events. Input frames other than a
+// session/prompt are client traffic the UI has never shown.
+func eventsFor(rec streamLogRecord, view *chatView) []Event {
+	switch rec.Type {
+	case recordStart:
+		return []Event{{Offset: rec.Offset, Type: "status", Status: &Status{Phase: string(v1.BlipRunning), Running: true}}}
+	case recordEnd:
+		return []Event{{Offset: rec.Offset, Type: "status", Status: &Status{Running: false}}}
+	case recordGap:
+		return []Event{{Offset: rec.Offset, Type: "gap"}}
+	case recordNote:
+		var note noteRecord
+		if err := json.Unmarshal(rec.Data, &note); err != nil {
+			return nil
+		}
+		out := make([]Event, 0, len(view.emitted)+1)
+		for _, message := range view.emitted {
+			out = append(out, Event{Offset: rec.Offset, Type: "acp", Message: message})
+		}
+		switch note.Type {
+		case noteQuestion, noteAnswer, noteConsumed, noteExpire:
+			out = append(out, Event{Offset: rec.Offset, Type: "status", Status: &Status{Running: view.Started, Question: view.Question}})
+		}
+		return out
+	case recordIn, recordOut, recordErr:
+		out := make([]Event, 0, len(view.emitted))
+		for _, message := range view.emitted {
+			out = append(out, Event{Offset: rec.Offset, Type: "acp", Message: message})
+		}
+		return out
+	}
+	return nil
 }
 
 func eventOffset(r *http.Request) (uint64, error) {

@@ -68,8 +68,9 @@ func TestRestWireLogEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if end != 40 {
-		t.Fatalf("end = %d, want 40", end)
+	// LogEnd is a cursor: the position just past the newest record.
+	if end != 72 {
+		t.Fatalf("end = %d, want 72", end)
 	}
 	if followed != "false" {
 		t.Fatalf("follow = %q", followed)

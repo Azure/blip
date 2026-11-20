@@ -44,6 +44,9 @@ func main() {
 		mcpAudience  string
 		mcpURL       string
 		questionWait time.Duration
+		service      string
+		serviceNS    string
+		podName      string
 	)
 	flag.StringVar(&listen, "listen", ":8080", "HTTP listen address")
 	flag.StringVar(&basePath, "base-path", "", "URL path prefix for a reverse proxy, e.g. /blipchat (the root stays available)")
@@ -59,6 +62,9 @@ func main() {
 	flag.StringVar(&mcpAudience, "mcp-audience", "blipchat", "audience of the projected token agents use for MCP")
 	flag.StringVar(&mcpURL, "mcp-url", "", "URL agents use to reach MCP; the guest-facing pool endpoint URL plus /mcp")
 	flag.DurationVar(&questionWait, "question-timeout", 30*time.Second, "how long ask_user waits for an answer before the agent ends its turn")
+	flag.StringVar(&service, "service", "", "Service whose endpoints shard chats across blipchat replicas (empty disables sharding)")
+	flag.StringVar(&serviceNS, "service-namespace", "", "namespace of --service (default the chat namespace)")
+	flag.StringVar(&podName, "pod-name", os.Getenv("POD_NAME"), "this replica's pod name, used for shard ownership")
 	flag.Parse()
 
 	level, err := parseLevel(logLevel)
@@ -70,6 +76,7 @@ func main() {
 		listen: listen, basePath: basePath, namespace: namespace, profilesCM: profilesCM, profilesFile: profilesFile,
 		autoApprove: autoApprove, defaultPool: defaultPool, mcpListen: mcpListen, mcpCert: mcpCert,
 		mcpKey: mcpKey, mcpAudience: mcpAudience, mcpURL: mcpURL, questionWait: questionWait,
+		service: service, serviceNS: serviceNS, podName: podName,
 	}
 	if err := run(opts); err != nil {
 		fail(err.Error())
@@ -105,6 +112,9 @@ type runOptions struct {
 	mcpAudience  string
 	mcpURL       string
 	questionWait time.Duration
+	service      string
+	serviceNS    string
+	podName      string
 }
 
 func run(o runOptions) error {
@@ -142,16 +152,19 @@ func run(o runOptions) error {
 		return errors.New("--question-timeout must be positive")
 	}
 	opts := blipchat.Options{
-		Namespace:       o.namespace,
-		BasePath:        o.basePath,
-		Profiles:        profiles,
-		DefaultPool:     o.defaultPool,
-		AutoApprove:     o.autoApprove,
-		Cluster:         cluster,
-		Wire:            wire,
-		Log:             slog.Default(),
-		MCPURL:          o.mcpURL,
-		QuestionTimeout: o.questionWait,
+		Namespace:        o.namespace,
+		BasePath:         o.basePath,
+		Profiles:         profiles,
+		DefaultPool:      o.defaultPool,
+		AutoApprove:      o.autoApprove,
+		Cluster:          cluster,
+		Wire:             wire,
+		Log:              slog.Default(),
+		MCPURL:           o.mcpURL,
+		QuestionTimeout:  o.questionWait,
+		Service:          o.service,
+		ServiceNamespace: o.serviceNS,
+		PodName:          o.podName,
 	}
 	if o.mcpListen != "" {
 		opts.Callers, err = blipchat.NewTokenReviewCallers(cfg, cluster, o.mcpAudience)
@@ -171,7 +184,7 @@ func run(o runOptions) error {
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      3 * time.Minute,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -323,13 +324,22 @@ func (s *Server) toolSpawnAgent(ctx context.Context, caller *Caller, profileName
 	if err := s.waitStateReady(ctx, caller.Namespace, created.Name); err != nil {
 		return "", err
 	}
-	d, err := s.driverFor(ctx, created.Name)
+	st, err := s.chatState(ctx, caller.Namespace, created.Name)
 	if err != nil {
 		return "", err
 	}
-	if err := d.SubmitAs(agentSender(caller), prompt); err != nil {
+	profile, err := s.profileFor(st)
+	if err != nil {
+		return "", err
+	}
+	note, err := s.promptNote(st, profile, agentSender(caller), prompt)
+	if err != nil {
 		return "", fmt.Errorf("could not send the prompt: %w", err)
 	}
+	if err := s.appendNote(ctx, st, profile, note); err != nil {
+		return "", fmt.Errorf("could not send the prompt: %w", err)
+	}
+	s.ensureEngine(created.Name)
 	return jsonText(map[string]any{"id": created.Name, "profile": profileName, "workspace": s.profiles[profileName].Workspace}), nil
 }
 
@@ -380,27 +390,17 @@ func (s *Server) toolListAgents(ctx context.Context, caller *Caller) (string, er
 			return "", err
 		}
 		summary := summarize(&children[i], blips)
-		phase, running := summary.Phase, summary.Running
-		question := summary.Question
-		// Use the driver, when available, as the authority for whether the
-		// child still has work. The control-plane Blip can lag a reconcile and
-		// report Running after the reply already arrived, which would make
-		// list_agents disagree with get_agent.
-		if d, derr := s.driverFor(ctx, children[i].Name); derr == nil {
-			running = d.Busy()
-			if q := d.Question(); q != nil {
-				question = q
-			}
-			if running && phase != string(v1.BlipRunning) {
-				phase = string(v1.BlipPending)
-			}
-			if !running && phase == string(v1.BlipRunning) {
-				phase = string(v1.BlipSaving)
-			}
+		view := s.readView(ctx, &children[i])
+		phase, running := summary.Phase, view.busy()
+		if running && phase != string(v1.BlipRunning) {
+			phase = string(v1.BlipPending)
+		}
+		if !running && phase == string(v1.BlipRunning) {
+			phase = string(v1.BlipSaving)
 		}
 		out = append(out, info{
 			Name: summary.Name, Title: summary.Title, Profile: summary.Profile, Phase: phase,
-			Running: running, Waiting: question != nil, Question: question,
+			Running: running, Waiting: view.Question != nil, Question: view.Question,
 		})
 	}
 	return jsonText(map[string]any{"agents": out}), nil
@@ -411,29 +411,31 @@ func (s *Server) toolGetAgent(ctx context.Context, caller *Caller, id string, wa
 	if err != nil {
 		return "", err
 	}
-	d, err := s.driverFor(ctx, id)
-	if err != nil {
-		return "", err
-	}
 	wait := time.Duration(waitSeconds) * time.Second
 	if wait > maxAgentWait {
 		wait = maxAgentWait
 	}
-	question := d.Question()
-	if wait > 0 && question == nil && d.Busy() {
-		d.WaitIdle(ctx, wait)
+	deadline := time.Now().Add(wait)
+	for {
+		view := s.readView(ctx, st)
+		// A prompt can be queued before the engine has sent it, so "busy"
+		// alone reports a child idle while it still has work to do.
+		if !view.hasWork() || view.Question != nil || wait == 0 || time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(statusPoll):
+		}
 	}
 	blips, err := s.cluster.ListStateBlips(ctx, caller.Namespace, id)
 	if err != nil {
 		return "", err
 	}
+	view := s.readView(ctx, st)
 	summary := summarize(st, blips)
-	// The driver is authoritative for whether the agent still has a turn to
-	// finish. The control-plane Blip can lag by a reconcile: it may still be
-	// Running after the reply arrived, or not exist yet after a prompt was
-	// accepted. Normalize the phase instead of returning a contradictory
-	// idle:true with running:true.
-	running := d.Busy()
+	running := view.busy()
 	phase := summary.Phase
 	if running && phase != string(v1.BlipRunning) {
 		phase = string(v1.BlipPending)
@@ -448,10 +450,10 @@ func (s *Server) toolGetAgent(ctx context.Context, caller *Caller, id string, wa
 		"phase":   phase,
 		"running": running,
 		"idle":    !running,
-		"reply":   d.Reply(),
+		"reply":   view.Reply,
 	}
-	if q := d.Question(); q != nil {
-		out["question"] = q
+	if view.Question != nil {
+		out["question"] = view.Question
 		out["note"] = "the child is waiting for the user's answer; send_agent answers it"
 	} else if running {
 		out["note"] = "the child is still working; call get_agent again with waitSeconds"
@@ -460,25 +462,52 @@ func (s *Server) toolGetAgent(ctx context.Context, caller *Caller, id string, wa
 }
 
 // toolAskUser asks the user a question and waits for the answer. A timeout is
-// reported as normal text that tells the agent to end its turn; the answer is
-// then delivered as the chat's next prompt.
+// reported as normal text that tells the agent to end its turn.
 func (s *Server) toolAskUser(ctx context.Context, caller *Caller, question string, options []string) (string, error) {
-	d, err := s.driverFor(ctx, caller.Session.Name)
+	question = strings.TrimSpace(question)
+	if question == "" {
+		return "", errors.New("question is required")
+	}
+	st := caller.Session
+	profile, err := s.profileFor(st)
 	if err != nil {
 		return "", err
 	}
-	answer, err := d.Ask(ctx, question, options)
-	switch {
-	case err == nil:
-		return answer, nil
-	case errors.Is(err, errQuestionPending):
-		return "The user hasn't answered yet. End your turn now; their answer will arrive as your next message.", nil
-	case errors.Is(err, errQuestionCancelled):
-		return "The user cancelled the question.", nil
-	case errors.Is(err, errQuestionOpen):
+	view := s.readView(ctx, st)
+	if view.Question != nil {
 		return "", errors.New("another question is already waiting for an answer")
-	default:
-		return "", err
+	}
+	q := Question{
+		ID:      "q" + strconv.FormatInt(time.Now().UnixNano(), 36) + randomSuffix(),
+		Text:    shorten(question, maxQuestionBytes),
+		Options: cleanOptions(options),
+		AskedAt: time.Now(),
+	}
+	note := noteRecord{Type: noteQuestion, ID: q.ID, Text: q.Text, Options: q.Options}
+	if err := s.appendNote(ctx, st, profile, note); err != nil {
+		return "", fmt.Errorf("could not ask the question: %w", err)
+	}
+	s.ensureEngine(st.Name)
+	deadline := time.Now().Add(s.questionTTL)
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(statusPoll):
+		}
+		view = s.readView(ctx, st)
+		for _, answer := range view.Answers {
+			if answer.QID == q.ID {
+				// Tell the driver this answer was delivered in-band so it is
+				// not replayed as a separate turn.
+				_, _ = s.writeNote(ctx, st.Name, noteRecord{Type: noteConsumed, QID: q.ID})
+				return answer.Text, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			_, _ = s.writeNote(ctx, st.Name, noteRecord{Type: noteExpire, QID: q.ID})
+			return "The user hasn't answered yet. End your turn now; their answer will arrive as your next message.", nil
+		}
 	}
 }
 
@@ -490,22 +519,31 @@ func (s *Server) toolSendAgent(ctx context.Context, caller *Caller, id, prompt s
 	if len(prompt) > 32000 {
 		return "", errors.New("prompt is too long")
 	}
-	if _, err := s.child(ctx, caller, id); err != nil {
-		return "", err
-	}
-	d, err := s.driverFor(ctx, id)
+	st, err := s.child(ctx, caller, id)
 	if err != nil {
 		return "", err
 	}
-	if d.Question() != nil {
-		if err := d.Answer(agentSender(caller), prompt); err != nil {
+	profile, err := s.profileFor(st)
+	if err != nil {
+		return "", err
+	}
+	view := s.readView(ctx, st)
+	if view.Question != nil {
+		note := noteRecord{Type: noteAnswer, QID: view.Question.ID, Text: prompt, Sender: agentSender(caller), Gen: view.questionGen(view.Question.ID)}
+		if err := s.appendNote(ctx, st, profile, note); err != nil {
 			return "", fmt.Errorf("could not answer the question: %w", err)
 		}
+		s.ensureEngine(id)
 		return jsonText(map[string]any{"id": id, "answered": true}), nil
 	}
-	if err := d.SubmitAs(agentSender(caller), prompt); err != nil {
+	note, err := s.promptNote(st, profile, agentSender(caller), prompt)
+	if err != nil {
 		return "", fmt.Errorf("could not send the prompt: %w", err)
 	}
+	if err := s.appendNote(ctx, st, profile, note); err != nil {
+		return "", fmt.Errorf("could not send the prompt: %w", err)
+	}
+	s.ensureEngine(id)
 	return jsonText(map[string]any{"id": id, "sent": true}), nil
 }
 
@@ -513,12 +551,11 @@ func (s *Server) toolStopAgent(ctx context.Context, caller *Caller, id string) (
 	if _, err := s.child(ctx, caller, id); err != nil {
 		return "", err
 	}
-	d, err := s.driverFor(ctx, id)
-	if err != nil {
-		return "", err
+	if _, err := s.writeNote(ctx, id, noteRecord{Type: noteStop}); err != nil && !errors.Is(err, ErrNotRunning) {
+		return "", fmt.Errorf("could not stop the child chat: %w", err)
 	}
-	if !d.Stop() {
-		return "", errors.New("the child chat is busy")
+	if err := s.stopBlip(ctx, id); err != nil {
+		return "", err
 	}
 	return jsonText(map[string]any{"id": id, "stopping": true}), nil
 }

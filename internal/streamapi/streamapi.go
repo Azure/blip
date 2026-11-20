@@ -7,7 +7,7 @@
 // stream.blip.dev/v1alpha1:
 //
 //	GET  .../namespaces/{ns}/blipstreams/{name}/log?offset=...
-//	POST .../namespaces/{ns}/blipstreams/{name}/stdin?eof=true
+//	POST .../namespaces/{ns}/blipstreams/{name}/stdin?eof=true&note=true&after=...
 //
 // Backends return (or wrap) this package's sentinel errors; the server uses
 // errors.Is.
@@ -46,13 +46,18 @@ const (
 	Resource = "blipstreams"
 )
 
+// statusReasonPreconditionFailed is the metav1 Status reason for HTTP 412.
+// metav1 has no constant for it.
+const statusReasonPreconditionFailed metav1.StatusReason = "PreconditionFailed"
+
 // Backend errors. A backend should return one of these (directly or wrapped)
 // so the API server can choose the matching Kubernetes status code:
 //
-//	ErrNotFound   404
-//	ErrNotRunning 409
-//	ErrClosed     409
-//	ErrNotReady   503
+//	ErrNotFound     404
+//	ErrNotRunning   409
+//	ErrClosed       409
+//	ErrNotReady     503
+//	ErrPrecondition 412
 //
 // Any other error becomes 500.
 var (
@@ -64,15 +69,23 @@ var (
 	ErrClosed = errors.New("streamapi: stream is closed")
 	// ErrNotReady means the node has not published the stream yet.
 	ErrNotReady = errors.New("streamapi: stream is not ready")
+	// ErrPrecondition means a conditional stdin write lost its race with
+	// another writer. The server answers 412.
+	ErrPrecondition = errors.New("streamapi: stdin precondition failed")
 )
 
 // Backend supplies the live data behind the API. Log calls fn for each record
 // from from onward. When follow is true Log must keep calling fn as records
 // appear and return only when ctx is canceled or the stream ends. Stdin writes
-// data and, when eof is true, closes stdin.
+// data and, when eof is true, closes stdin. When note is true Stdin persists
+// data in the trajectory without forwarding it to the guest's stdin. When
+// after is non-zero the write only succeeds if the offset of the most recent
+// stdin or note record in the trajectory is still exactly after; this
+// compare-and-append serializes several gateway replicas. Stdin returns the
+// offset at which it appended the write.
 type Backend interface {
 	Log(ctx context.Context, namespace, name string, from uint64, follow bool, fn func(stream.Record) error) error
-	Stdin(ctx context.Context, namespace, name string, data []byte, eof bool) error
+	Stdin(ctx context.Context, namespace, name string, data []byte, eof, note bool, after uint64) (uint64, error)
 }
 
 // Options configures a Server.
@@ -252,6 +265,20 @@ func (s *Server) serveStdin(w http.ResponseWriter, r *http.Request, namespace, n
 		writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest, "eof must be true or false")
 		return
 	}
+	note, err := boolParam(r.URL.Query().Get("note"))
+	if err != nil {
+		writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest, "note must be true or false")
+		return
+	}
+	var after uint64
+	if v := r.URL.Query().Get("after"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest, "after must be an unsigned integer")
+			return
+		}
+		after = n
+	}
 	if s.backend == nil {
 		s.writeBackendError(w, ErrNotReady)
 		return
@@ -261,11 +288,14 @@ func (s *Server) serveStdin(w http.ResponseWriter, r *http.Request, namespace, n
 		writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest, "could not read request body")
 		return
 	}
-	if err := s.backend.Stdin(r.Context(), namespace, name, data, eof); err != nil {
+	offset, err := s.backend.Stdin(r.Context(), namespace, name, data, eof, note, after)
+	if err != nil {
 		s.writeBackendError(w, err)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	writeJSON(w, http.StatusOK, struct {
+		Offset uint64 `json:"offset"`
+	}{Offset: offset})
 }
 
 // recordWriter owns the framing of the log response. It delays the response
@@ -357,6 +387,8 @@ func recordType(t stream.RecordType) (string, bool) {
 		return "start", true
 	case stream.TypeEnd:
 		return "end", true
+	case stream.TypeNote:
+		return "note", true
 	default:
 		return "", false
 	}
@@ -372,6 +404,8 @@ func (s *Server) writeBackendError(w http.ResponseWriter, err error) {
 		writeStatus(w, http.StatusConflict, metav1.StatusReasonConflict, err.Error())
 	case errors.Is(err, ErrNotReady):
 		writeStatus(w, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable, err.Error())
+	case errors.Is(err, ErrPrecondition):
+		writeStatus(w, http.StatusPreconditionFailed, statusReasonPreconditionFailed, err.Error())
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// The client is gone; there is nobody to answer.
 		return

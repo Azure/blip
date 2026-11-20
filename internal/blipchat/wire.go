@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strconv"
 
@@ -21,17 +22,27 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// ErrNotRunning means the state has no running agent (HTTP 409). The driver
+// ErrNotRunning means the state has no running agent (HTTP 409). The engine
 // starts a new generation and retries.
 var ErrNotRunning = errors.New("blipchat: blip is not running")
 
 // ErrUnavailable is a transient 503 from the aggregated stream API.
 var ErrUnavailable = errors.New("blipchat: stream API unavailable")
 
+// ErrPrecondition means another writer appended to the stream since the
+// caller's view was built (HTTP 412). The caller rereads the log and retries.
+var ErrPrecondition = errors.New("blipchat: stream changed")
+
 // Wire carries raw stdin and the trajectory log for one state.
 type Wire interface {
-	Send(ctx context.Context, namespace, state string, data []byte, eof bool) error
+	// Send appends data to stdin. note records are stored in the trajectory
+	// but not forwarded to the agent. after is the offset of the writer's
+	// newest input record; a non-zero after that no longer matches the stream
+	// returns ErrPrecondition. Send returns the offset of the newest record
+	// written (or the newest input record for an EOF-only send).
+	Send(ctx context.Context, namespace, state string, data []byte, eof, note bool, after uint64) (uint64, error)
 	OpenLog(ctx context.Context, namespace, state string, offset uint64) (io.ReadCloser, error)
+	ReadLog(ctx context.Context, namespace, state string, offset uint64) (io.ReadCloser, error)
 	LogEnd(ctx context.Context, namespace, state string) (uint64, error)
 }
 
@@ -58,15 +69,33 @@ func (w *restWire) path(namespace, state, action string) string {
 		url.PathEscape(namespace), url.PathEscape(state), action)
 }
 
-func (w *restWire) Send(ctx context.Context, namespace, state string, data []byte, eof bool) error {
+func (w *restWire) Send(ctx context.Context, namespace, state string, data []byte, eof, note bool, after uint64) (uint64, error) {
 	req := w.rc.Post().AbsPath(w.path(namespace, state, "stdin")).
 		SetHeader("Content-Type", "application/octet-stream").
 		Body(data)
 	if eof {
 		req = req.Param("eof", "true")
 	}
-	_, err := req.DoRaw(ctx)
-	return wireError(err)
+	if note {
+		req = req.Param("note", "true")
+	}
+	if after != 0 {
+		req = req.Param("after", strconv.FormatUint(after, 10))
+	}
+	raw, err := req.DoRaw(ctx)
+	if err != nil {
+		return 0, wireError(err)
+	}
+	var out struct {
+		Offset uint64 `json:"offset"`
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return 0, nil
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return 0, fmt.Errorf("blipchat: decode stdin response: %w", err)
+	}
+	return out.Offset, nil
 }
 
 func (w *restWire) OpenLog(ctx context.Context, namespace, state string, offset uint64) (io.ReadCloser, error) {
@@ -91,7 +120,7 @@ func (w *restWire) openLog(ctx context.Context, namespace, state string, offset 
 
 // LogEnd returns the offset of the newest record the state's ring holds. A
 // chat that copies its parent's workspace inherits the parent's records, so
-// its own driver starts reading after this offset instead of replaying them.
+// its own engine starts reading after this offset instead of replaying them.
 // A state with no records, or no running or saved writer, has no end.
 func (w *restWire) LogEnd(ctx context.Context, namespace, state string) (uint64, error) {
 	body, err := w.rc.Get().AbsPath(w.path(namespace, state, "log")).
@@ -101,6 +130,13 @@ func (w *restWire) LogEnd(ctx context.Context, namespace, state string) (uint64,
 		return 0, wireError(err)
 	}
 	defer body.Close()
+	return scanLogEnd(body)
+}
+
+// streamRecordHeader is the on-disk header size of one trajectory record.
+const streamRecordHeader = 32
+
+func scanLogEnd(body io.Reader) (uint64, error) {
 	var end uint64
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), acpMaxLine)
@@ -113,8 +149,12 @@ func (w *restWire) LogEnd(ctx context.Context, namespace, state string) (uint64,
 		if err := json.Unmarshal(line, &rec); err != nil {
 			continue
 		}
-		if rec.Type != recordGap && rec.Offset > end {
-			end = rec.Offset
+		if rec.Type != recordGap {
+			// LogEnd is a ring cursor, so it must be an exact record
+			// boundary. Return the position just past the newest record.
+			if tail := rec.Offset + streamRecordHeader + uint64(len(rec.Data)); tail > end {
+				end = tail
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -131,9 +171,12 @@ func wireError(err error) error {
 		return fmt.Errorf("%w: %v", ErrNotRunning, err)
 	case apierrors.IsServiceUnavailable(err), apierrors.IsTooManyRequests(err):
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
-	default:
-		return err
 	}
+	var status apierrors.APIStatus
+	if errors.As(err, &status) && status.Status().Code == http.StatusPreconditionFailed {
+		return fmt.Errorf("%w: %v", ErrPrecondition, err)
+	}
+	return err
 }
 
 // streamLogRecord is one NDJSON record from the log endpoint. The fields are
@@ -154,6 +197,7 @@ const (
 	recordStart streamRecordType = 4
 	recordEnd   streamRecordType = 5
 	recordGap   streamRecordType = 6
+	recordNote  streamRecordType = 7
 )
 
 // UnmarshalJSON accepts an object shaped {o,g,t,d} and also a four-element
@@ -215,6 +259,8 @@ func parseRecordType(raw json.RawMessage) (streamRecordType, error) {
 			return recordEnd, nil
 		case "gap":
 			return recordGap, nil
+		case "note":
+			return recordNote, nil
 		}
 	}
 	return 0, fmt.Errorf("unknown stream record type %s", raw)
