@@ -548,14 +548,28 @@ func summarize(st *v1.BlipState, blips []v1.Blip) sessionSummary {
 	return out
 }
 
-// withQuestion fills in the open question for a live chat. The ring is the only
-// source of truth for questions.
+// reconcileSessionSummary refines a cluster summary with a trajectory snapshot.
+// An end record can precede the controller's terminal status, but only ends its
+// own generation. Terminal execution results (including failures on a Ready
+// workspace) and summaries without a matching ended execution are unchanged.
+// It performs no reads and does not change the supplied view.
+func reconcileSessionSummary(summary sessionSummary, view *chatView) sessionSummary {
+	if view != nil && summary.Running && summary.Generation == int64(view.Gen) && !view.Started && view.Ended {
+		summary.Running = false
+		summary.Phase = string(v1.BlipSaving)
+	}
+	return summary
+}
+
+// withQuestion fills in the open question for a live chat and reconciles an
+// ended execution. The ring is the only source of truth for questions.
 func withQuestion(ctx context.Context, s *Server, st *v1.BlipState, summary sessionSummary) sessionSummary {
 	if !summary.Running {
 		return summary
 	}
-	summary.Question = s.readView(ctx, st).Question
-	return summary
+	view := s.readView(ctx, st)
+	summary.Question = view.Question
+	return reconcileSessionSummary(summary, view)
 }
 
 // sessionDepth returns the distance from the root chat. A missing or invalid
@@ -942,18 +956,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	detail.Offset = view.Newest
 	detail.TranscriptTruncated = view.Truncated || view.Gapped
 	detail.Question = view.Question
-	// A Blip can remain Running briefly after the log's end record. Read the
-	// log as the authority so a freshly opened page does not wait forever for
-	// a status event that is already behind it.
-	if detail.Running && !view.Started && view.Ended {
-		detail.Running = false
-		switch detail.Phase {
-		case string(v1.BlipFailed), "Error",
-			string(v1.BlipSucceeded), "Stopped":
-		default:
-			detail.Phase = string(v1.BlipSaving)
-		}
-	}
+	detail.sessionSummary = reconcileSessionSummary(detail.sessionSummary, view)
 	writeJSON(w, http.StatusOK, detail)
 }
 
