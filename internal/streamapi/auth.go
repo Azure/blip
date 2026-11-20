@@ -128,6 +128,10 @@ func (s *Server) tokenUser(ctx context.Context, token string) (user.Info, error)
 // authorize delegates to the configured authorizer. A missing authorizer
 // denies by default; Insecure is the tests-only exception.
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request, u user.Info, verb, subresource, namespace, name string) bool {
+	return s.authorizeResource(w, r, u, verb, GroupName, Version, Resource, subresource, namespace, name)
+}
+
+func (s *Server) authorizeResource(w http.ResponseWriter, r *http.Request, u user.Info, verb, group, version, resource, subresource, namespace, name string) bool {
 	if s.Authorizer == nil {
 		if s.insecure {
 			return true
@@ -140,9 +144,9 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, u user.Info, 
 		User:            u,
 		Verb:            verb,
 		Namespace:       namespace,
-		APIGroup:        GroupName,
-		APIVersion:      Version,
-		Resource:        Resource,
+		APIGroup:        group,
+		APIVersion:      version,
+		Resource:        resource,
 		Subresource:     subresource,
 		Name:            name,
 		ResourceRequest: true,

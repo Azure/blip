@@ -28,6 +28,42 @@ is_30_owner() {
 	[ "$(k get configmap blip-vm-owners -o jsonpath="{.data['$1']}" 2>/dev/null)" = "$2" ]
 }
 
+is_30_identity() {
+	# work is provided by hack/e2e.sh, which sources this scenario.
+	# shellcheck disable=SC2154
+	k get --raw "$identity_path?uid=$identity_pod_uid" >"$work/pod-identity.json" || return 1
+	python3 - "$work/pod-identity.json" "$identity_pod" "$identity_pod_uid" \
+		"$P-ep" "$identity_blip_uid" "$identity_state_uid" "$P-endpoint" <<'PY'
+import json
+import sys
+
+path, pod, pod_uid, name, blip_uid, state_uid, pool = sys.argv[1:]
+with open(path) as f:
+    identity = json.load(f)
+expected = {
+    "metadata": {"name": pod, "uid": pod_uid},
+    "blip": {
+        "name": name, "uid": blip_uid, "phase": "Running", "pool": pool,
+        "labels": {"e2e.blip.dev/identity": "blip"},
+        "annotations": {"e2e.blip.dev/identity": "blip-metadata"},
+    },
+    "state": {
+        "name": name, "uid": state_uid,
+        "labels": {"e2e.blip.dev/identity": "state"},
+        "annotations": {"e2e.blip.dev/identity": "state-metadata"},
+    },
+}
+for section, fields in expected.items():
+    for key, value in fields.items():
+        actual = identity.get(section, {}).get(key)
+        if isinstance(value, dict):
+            if not isinstance(actual, dict) or any(actual.get(k) != v for k, v in value.items()):
+                sys.exit(1)
+        elif actual != value:
+            sys.exit(1)
+PY
+}
+
 step "apply a temporary pool with a Kubernetes API endpoint"
 k apply -f - >/dev/null <<EOF
 apiVersion: blip.dev/v1alpha1
@@ -70,6 +106,34 @@ expect_ok_grep "endpoint proxy" "endpoint-ok" blip_exec "$P-ep" '
 		;;
 	esac
 	echo endpoint-ok
+'
+
+step "resolve the endpoint pod's current identity and metadata"
+k wait --for=condition=Available apiservice/v1alpha1.identity.blip.dev --timeout=120s
+identity_pod=$(blip_pod "$P-ep")
+test -n "$identity_pod"
+identity_pod_uid=$(k get pod "$identity_pod" -o jsonpath='{.metadata.uid}')
+identity_blip_uid=$(k get blip "$P-ep" -o jsonpath='{.metadata.uid}')
+identity_state_uid=$(k get blipstate "$P-ep" -o jsonpath='{.metadata.uid}')
+identity_path="/apis/identity.blip.dev/v1alpha1/namespaces/default/podidentities/$identity_pod"
+k label blip "$P-ep" e2e.blip.dev/identity=blip >/dev/null
+k annotate blip "$P-ep" e2e.blip.dev/identity=blip-metadata >/dev/null
+k label blipstate "$P-ep" e2e.blip.dev/identity=state >/dev/null
+k annotate blipstate "$P-ep" e2e.blip.dev/identity=state-metadata >/dev/null
+wait_for 120 "current pod identity and propagated metadata" is_30_identity
+
+step "reject a pod identity request with the wrong UID"
+expect_fail_grep "pod identity UID mismatch" NotFound \
+	k get --raw "$identity_path?uid=00000000-0000-0000-0000-000000000000"
+
+step "deny pod identity access to the VM service account"
+expect_ok_grep "VM cannot read pod identities" "identity-forbidden-ok" \
+	blip_exec "$P-ep" "IDENTITY_PATH=$identity_path?uid=$identity_pod_uid
+"'
+	set -eu
+	code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 "http://kube-apiserver$IDENTITY_PATH")
+	test "$code" = 403
+	echo identity-forbidden-ok
 '
 
 step "delete the endpoint blip and pool and verify cleanup"

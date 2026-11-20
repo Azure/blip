@@ -39,9 +39,15 @@ const (
 	StreamGroup = "stream.blip.dev"
 	// StreamVersion is the aggregated API version.
 	StreamVersion = "v1alpha1"
+	// IdentityAPIService is the identity APIService object name.
+	IdentityAPIService = "v1alpha1.identity.blip.dev"
+	// IdentityGroup is the aggregated identity API group.
+	IdentityGroup = "identity.blip.dev"
+	// IdentityVersion is the aggregated identity API version.
+	IdentityVersion = "v1alpha1"
 )
 
-// streamTLS keeps the serving certificate, its Secret, and the APIService in
+// streamTLS keeps the serving certificate, its Secret, and the APIServices in
 // sync. It runs on the leader only.
 type streamTLS struct {
 	client    client.Client
@@ -70,8 +76,11 @@ func (r *streamTLS) ensure(ctx context.Context) {
 		ctrl.Log.Error(err, "stream TLS")
 		return
 	}
-	if err := r.ensureAPIService(ctx); err != nil && ctx.Err() == nil {
+	if err := r.ensureAPIService(ctx, StreamAPIService, StreamGroup, StreamVersion); err != nil && ctx.Err() == nil {
 		ctrl.Log.Error(err, "stream APIService")
+	}
+	if err := r.ensureAPIService(ctx, IdentityAPIService, IdentityGroup, IdentityVersion); err != nil && ctx.Err() == nil {
+		ctrl.Log.Error(err, "identity APIService")
 	}
 }
 
@@ -102,17 +111,17 @@ func (r *streamTLS) ensureSecret(ctx context.Context) error {
 	return r.client.Update(ctx, &sec)
 }
 
-func (r *streamTLS) ensureAPIService(ctx context.Context) error {
+func (r *streamTLS) ensureAPIService(ctx context.Context, name, group, version string) error {
 	var sec corev1.Secret
 	if err := r.client.Get(ctx, client.ObjectKey{Namespace: r.namespace, Name: StreamTLSSecret}, &sec); err != nil {
 		return err
 	}
 	api := &unstructured.Unstructured{Object: map[string]any{}}
 	api.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiregistration.k8s.io", Version: "v1", Kind: "APIService"})
-	api.SetName(StreamAPIService)
+	api.SetName(name)
 	spec := map[string]any{
-		"group":                StreamGroup,
-		"version":              StreamVersion,
+		"group":                group,
+		"version":              version,
 		"groupPriorityMinimum": int64(100),
 		"versionPriority":      int64(100),
 		"service": map[string]any{
@@ -125,7 +134,7 @@ func (r *streamTLS) ensureAPIService(ctx context.Context) error {
 	}
 	var cur unstructured.Unstructured
 	cur.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiregistration.k8s.io", Version: "v1", Kind: "APIService"})
-	err := r.client.Get(ctx, client.ObjectKey{Name: StreamAPIService}, &cur)
+	err := r.client.Get(ctx, client.ObjectKey{Name: name}, &cur)
 	if apierrors.IsNotFound(err) {
 		if err := unstructured.SetNestedMap(api.Object, spec, "spec"); err != nil {
 			return err

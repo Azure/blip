@@ -22,7 +22,7 @@ rules:
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch, patch]
-  # The stream API's serving certificate Secret and APIService.
+  # The stream and identity APIs' shared serving certificate Secret and APIServices.
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, list, watch, create, update]

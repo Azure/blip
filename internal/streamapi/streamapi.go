@@ -91,6 +91,8 @@ type Backend interface {
 // Options configures a Server.
 type Options struct {
 	Backend Backend
+	// IdentityBackend supplies pod identity lookups and enables identity discovery.
+	IdentityBackend IdentityBackend
 	// Client is used for delegated SubjectAccessReview and token review. When
 	// nil, resource requests are denied unless Insecure is set.
 	Client kubernetes.Interface
@@ -100,7 +102,8 @@ type Options struct {
 	// TrustProxyHeaders accepts the kube-apiserver front-proxy identity
 	// headers (X-Remote-User, X-Remote-Group) when no verifiable certificate
 	// is available. Only enable it when direct network access to the listener
-	// is restricted to the API server.
+	// is restricted to the API server. Identity lookups always require a
+	// certificate verified against ClientCA before trusting these headers.
 	TrustProxyHeaders bool
 	// Insecure accepts requests without credentials and, when no Authorizer
 	// is available, allows them. It exists for tests only.
@@ -112,11 +115,12 @@ type Options struct {
 
 // Server is the stream API HTTP handler.
 type Server struct {
-	backend   Backend
-	client    kubernetes.Interface
-	clientCA  *x509.CertPool
-	insecure  bool
-	proxyAuth bool
+	backend         Backend
+	identityBackend IdentityBackend
+	client          kubernetes.Interface
+	clientCA        *x509.CertPool
+	insecure        bool
+	proxyAuth       bool
 
 	// Authorizer decides resource access. New sets it to a delegated
 	// SubjectAccessReview authorizer when Client is non-nil. A nil Authorizer
@@ -127,12 +131,13 @@ type Server struct {
 // New returns a stream API server.
 func New(opts Options) *Server {
 	s := &Server{
-		backend:    opts.Backend,
-		client:     opts.Client,
-		clientCA:   opts.ClientCA,
-		insecure:   opts.Insecure,
-		proxyAuth:  opts.TrustProxyHeaders,
-		Authorizer: opts.Authorizer,
+		backend:         opts.Backend,
+		identityBackend: opts.IdentityBackend,
+		client:          opts.Client,
+		clientCA:        opts.ClientCA,
+		insecure:        opts.Insecure,
+		proxyAuth:       opts.TrustProxyHeaders,
+		Authorizer:      opts.Authorizer,
 	}
 	if s.Authorizer == nil && s.client != nil {
 		s.Authorizer = sarAuthorizer{client: s.client}
@@ -140,8 +145,8 @@ func New(opts Options) *Server {
 	return s
 }
 
-// Handler returns the HTTP handler. It implements group discovery, log reads
-// and stdin writes.
+// Handler returns the HTTP handler. It implements group discovery, log reads,
+// stdin writes, and pod identity lookups.
 func (s *Server) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -152,7 +157,34 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !requireMethod(w, r, http.MethodGet) {
 			return
 		}
-		writeJSON(w, http.StatusOK, groupList())
+		groups := groupList()
+		if s.identityBackend != nil {
+			groups.Groups = append(groups.Groups, *identityGroup())
+		}
+		writeJSON(w, http.StatusOK, groups)
+		return
+
+	case len(seg) == 2 && seg[0] == "apis" && seg[1] == IdentityGroupName && s.identityBackend != nil:
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		writeJSON(w, http.StatusOK, identityGroup())
+		return
+
+	case len(seg) == 3 && seg[0] == "apis" && seg[1] == IdentityGroupName && seg[2] == IdentityVersion && s.identityBackend != nil:
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		writeJSON(w, http.StatusOK, identityResourceList())
+		return
+
+	case len(seg) == 7 && seg[0] == "apis" && seg[1] == IdentityGroupName && seg[2] == IdentityVersion &&
+		seg[3] == "namespaces" && seg[5] == IdentityResource:
+		w.Header().Set("Cache-Control", "no-store")
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		s.servePodIdentity(w, r, seg[4], seg[6])
 		return
 
 	case len(seg) == 2 && seg[0] == "apis" && seg[1] == GroupName:

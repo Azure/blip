@@ -97,6 +97,7 @@ func (a *Agent) serveStreamAPI(ctx context.Context, c client.Client, cs kubernet
 				if os.WriteFile(cert, data["tls.crt"], 0o600) == nil && os.WriteFile(key, data["tls.key"], 0o600) == nil {
 					srv := streamapi.New(streamapi.Options{
 						Backend:           streamBackend{a: a},
+						IdentityBackend:   identityBackend{client: a.client},
 						Client:            cs,
 						ClientCA:          clientCAPool(cfg.Stream.ClientCA),
 						TrustProxyHeaders: true,

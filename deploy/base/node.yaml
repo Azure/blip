@@ -141,8 +141,9 @@ spec:
             path: /sys/kernel/config
             type: Directory
         # The front-proxy CA verifies the API server's client certificate.
-        # It is absent on some distributions; the listener then trusts the
-        # X-Remote-User headers and must not be directly reachable.
+        # It is absent on some distributions; legacy stream requests then
+        # trust X-Remote-User headers and must not be directly reachable.
+        # Identity lookups require the CA to trust front-proxy headers.
         - name: front-proxy-ca
           hostPath:
             path: /etc/kubernetes/pki
