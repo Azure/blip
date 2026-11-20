@@ -7,20 +7,33 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/blip/internal/stream"
 	"github.com/Azure/blip/internal/streamapi"
+)
+
+const (
+	// authConfigMap is where the kube-apiserver publishes the client
+	// authentication settings for aggregated API servers.
+	authConfigMapNamespace = "kube-system"
+	authConfigMapName      = "extension-apiserver-authentication"
+	// clientAuthPollInterval is how often the published settings are
+	// re-read. They change only when the API server's certificates rotate.
+	clientAuthPollInterval = 30 * time.Second
 )
 
 // streamBackend adapts the agent to the aggregated stream API and maps the
@@ -69,20 +82,129 @@ func (b streamBackend) mapErr(err error) error {
 	return err
 }
 
-// clientCAPool loads a PEM CA bundle, returning nil when the file is absent.
-func clientCAPool(path string) *x509.CertPool {
+// clientAuthSettings is the subset of the kube-apiserver's published client
+// authentication settings that the node agent uses.
+type clientAuthSettings struct {
+	requestHeaderCA *x509.CertPool
+	clientCA        *x509.CertPool
+	allowedNames    []string
+}
+
+// parseClientAuth reads the ConfigMap keys that configure front-proxy
+// authentication. A missing request-header CA is not an error: it disables
+// proxy identity headers.
+func parseClientAuth(data map[string]string) (clientAuthSettings, error) {
+	var auth clientAuthSettings
+	var err error
+	if pemData := strings.TrimSpace(data["requestheader-client-ca-file"]); pemData != "" {
+		if auth.requestHeaderCA, err = certPoolFromPEM([]byte(pemData)); err != nil {
+			return clientAuthSettings{}, fmt.Errorf("requestheader-client-ca-file: %w", err)
+		}
+	}
+	if pemData := strings.TrimSpace(data["client-ca-file"]); pemData != "" {
+		if auth.clientCA, err = certPoolFromPEM([]byte(pemData)); err != nil {
+			return clientAuthSettings{}, fmt.Errorf("client-ca-file: %w", err)
+		}
+	}
+	for _, name := range strings.Split(data["requestheader-allowed-names"], ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			auth.allowedNames = append(auth.allowedNames, name)
+		}
+	}
+	return auth, nil
+}
+
+// certPoolFromPEM parses a PEM CA bundle.
+func certPoolFromPEM(pemData []byte) (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemData) {
+		return nil, errors.New("no certificates found")
+	}
+	return pool, nil
+}
+
+// clientCAFile loads an operator-supplied CA bundle. It replaces both the
+// request-header and client CAs, preserving the single-file override.
+func clientCAFile(path string) (clientAuthSettings, bool) {
 	if path == "" {
-		return nil
+		return clientAuthSettings{}, false
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil
+		return clientAuthSettings{}, false
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(data) {
-		return nil
+	pool, err := certPoolFromPEM(data)
+	if err != nil {
+		return clientAuthSettings{}, false
 	}
-	return pool
+	return clientAuthSettings{requestHeaderCA: pool, clientCA: pool}, true
+}
+
+// startClientAuth applies the API server's client authentication settings to
+// srv before it starts serving, then reloads them when the ConfigMap changes.
+func startClientAuth(ctx context.Context, cs kubernetes.Interface, srv *streamapi.Server, override string, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
+	if auth, ok := clientCAFile(override); ok {
+		srv.SetClientAuth(auth.requestHeaderCA, auth.clientCA, auth.allowedNames)
+		log.Info("using client CA file", "path", override)
+		return
+	}
+	if override != "" {
+		log.Warn("client CA file is not usable; using the API server ConfigMap", "path", override)
+	}
+
+	lastRV, err := reloadClientAuth(ctx, cs, srv, "", log)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Warn("load API server client authentication", "err", err)
+		}
+	}
+	go func() {
+		ticker := time.NewTicker(clientAuthPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			rv, err := reloadClientAuth(ctx, cs, srv, lastRV, log)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Warn("load API server client authentication", "err", err)
+				}
+				continue
+			}
+			lastRV = rv
+		}
+	}()
+}
+
+// reloadClientAuth reads kube-system/extension-apiserver-authentication and
+// swaps the server's credentials when the resource version changed.
+func reloadClientAuth(ctx context.Context, cs kubernetes.Interface, srv *streamapi.Server, lastRV string, log *slog.Logger) (string, error) {
+	cm, err := cs.CoreV1().ConfigMaps(authConfigMapNamespace).Get(ctx, authConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return lastRV, err
+	}
+	if lastRV != "" && cm.ResourceVersion == lastRV {
+		return lastRV, nil
+	}
+	auth, err := parseClientAuth(cm.Data)
+	if err != nil {
+		return lastRV, fmt.Errorf("%s/%s: %w", authConfigMapNamespace, authConfigMapName, err)
+	}
+	srv.SetClientAuth(auth.requestHeaderCA, auth.clientCA, auth.allowedNames)
+	if auth.requestHeaderCA == nil {
+		log.Warn("request-header client CA is missing; proxy identity headers are rejected",
+			"configmap", authConfigMapNamespace+"/"+authConfigMapName)
+	} else {
+		log.Info("applied API server client authentication",
+			"configmap", authConfigMapNamespace+"/"+authConfigMapName, "resourceVersion", cm.ResourceVersion)
+	}
+	return cm.ResourceVersion, nil
 }
 
 // serveStreamAPI waits for the serving certificate Secret, writes it below the
@@ -99,9 +221,9 @@ func (a *Agent) serveStreamAPI(ctx context.Context, c client.Client, cs kubernet
 						Backend:           streamBackend{a: a},
 						IdentityBackend:   identityBackend{client: a.client},
 						Client:            cs,
-						ClientCA:          clientCAPool(cfg.Stream.ClientCA),
 						TrustProxyHeaders: true,
 					})
+					startClientAuth(ctx, cs, srv, cfg.Stream.ClientCA, slog.Default())
 					if err := srv.ServeTLS(ctx, cfg.Stream.Listen, cert, key, slog.Default()); err != nil && ctx.Err() == nil {
 						slog.Error("stream api", "err", err)
 					}

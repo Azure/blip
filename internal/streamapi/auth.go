@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -22,7 +23,7 @@ import (
 var errNoCredentials = errors.New("no credentials presented")
 
 // authenticate returns the request's user. A TLS client certificate is
-// verified against ClientCA and becomes user.DefaultInfo{Name: CN,
+// verified against the client CA and becomes user.DefaultInfo{Name: CN,
 // Groups: Organizations}. Otherwise an Authorization: Bearer token is
 // reviewed with Client. Without a client CA, Insecure is the only mode that
 // accepts a certificate (used by tests).
@@ -42,21 +43,26 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (user.Info
 }
 
 func (s *Server) user(r *http.Request) (user.Info, error) {
+	requestHeaderCA, clientCA, allowedNames := s.clientAuth()
 	hasCert := r.TLS != nil && len(r.TLS.PeerCertificates) > 0
-	if s.proxyAuth && (s.clientCA == nil || hasCert) {
+	if s.proxyAuth && hasCert && requestHeaderCA != nil {
 		if name := r.Header.Get("X-Remote-User"); name != "" {
-			if hasCert {
-				// A configured CA must verify the proxy certificate before
-				// its identity headers are trusted.
-				if _, err := s.certUser(r.TLS.PeerCertificates); err != nil {
-					return nil, err
+			// Trust the identity headers only from a certificate the
+			// request-header CA issued, with an allowed common name. A
+			// certificate from another CA falls through to certificate or
+			// token authentication; one the front-proxy CA issued but with a
+			// disallowed name is rejected.
+			leaf, err := verifyClientCert(r.TLS.PeerCertificates, requestHeaderCA)
+			if err == nil {
+				if !certificateNameAllowed(leaf, allowedNames) {
+					return nil, fmt.Errorf("front-proxy certificate %q may not assert identity headers", leaf.Subject.CommonName)
 				}
+				return &user.DefaultInfo{Name: name, Groups: r.Header.Values("X-Remote-Group")}, nil
 			}
-			return &user.DefaultInfo{Name: name, Groups: r.Header.Values("X-Remote-Group")}, nil
 		}
 	}
 	if hasCert {
-		return s.certUser(r.TLS.PeerCertificates)
+		return clientCertUser(r.TLS.PeerCertificates, clientCA, s.insecure)
 	}
 	if tok, ok := bearerToken(r); ok {
 		return s.tokenUser(r.Context(), tok)
@@ -64,29 +70,45 @@ func (s *Server) user(r *http.Request) (user.Info, error) {
 	return nil, errNoCredentials
 }
 
-func (s *Server) certUser(chain []*x509.Certificate) (user.Info, error) {
+// clientCertUser verifies a direct client certificate chain against pool and
+// returns its identity.
+func clientCertUser(chain []*x509.Certificate, pool *x509.CertPool, insecure bool) (user.Info, error) {
 	leaf := chain[0]
-	if s.clientCA == nil {
-		if !s.insecure {
+	if pool == nil {
+		if !insecure {
 			return nil, errors.New("client certificates are not configured")
 		}
-	} else {
-		intermediates := x509.NewCertPool()
-		for _, cert := range chain[1:] {
-			intermediates.AddCert(cert)
-		}
-		if _, err := leaf.Verify(x509.VerifyOptions{
-			Roots:         s.clientCA,
-			Intermediates: intermediates,
-			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		}); err != nil {
-			return nil, fmt.Errorf("client certificate: %w", err)
-		}
+	} else if _, err := verifyClientCert(chain, pool); err != nil {
+		return nil, err
 	}
 	return &user.DefaultInfo{
 		Name:   leaf.Subject.CommonName,
 		Groups: append([]string(nil), leaf.Subject.Organization...),
 	}, nil
+}
+
+// verifyClientCert verifies a presented certificate chain for client
+// authentication against pool.
+func verifyClientCert(chain []*x509.Certificate, pool *x509.CertPool) (*x509.Certificate, error) {
+	leaf := chain[0]
+	intermediates := x509.NewCertPool()
+	for _, cert := range chain[1:] {
+		intermediates.AddCert(cert)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         pool,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return nil, fmt.Errorf("client certificate: %w", err)
+	}
+	return leaf, nil
+}
+
+// certificateNameAllowed reports whether a certificate may assert front-proxy
+// headers. An empty allowed list accepts any name the CA issued.
+func certificateNameAllowed(cert *x509.Certificate, allowed []string) bool {
+	return len(allowed) == 0 || slices.Contains(allowed, cert.Subject.CommonName)
 }
 
 func bearerToken(r *http.Request) (string, bool) {

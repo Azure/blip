@@ -51,23 +51,21 @@ type BlipIdentity struct {
 }
 
 func (s *Server) servePodIdentity(w http.ResponseWriter, r *http.Request, namespace, name string) {
-	// Unlike the stream listener, identity lookups never trust naked proxy
-	// headers. Without a CA, only bearer review can establish a supplied
-	// identity; do not treat an unverified peer certificate as credentials.
-	authServer := *s
+	// Unlike the stream listener, identity lookups never treat an unverified
+	// peer certificate as a credential. Without a request-header CA, proxy
+	// headers are rejected and only bearer review can establish a supplied
+	// identity.
+	requestHeaderCA, _, _ := s.clientAuth()
 	authRequest := r
-	if s.clientCA == nil {
-		authServer.proxyAuth = false
-		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-			if _, ok := bearerToken(r); !ok {
-				writeStatus(w, http.StatusUnauthorized, metav1.StatusReasonUnauthorized, "client certificates are not configured")
-				return
-			}
-			authRequest = r.Clone(r.Context())
-			authRequest.TLS = nil
+	if requestHeaderCA == nil && r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		if _, ok := bearerToken(r); !ok {
+			writeStatus(w, http.StatusUnauthorized, metav1.StatusReasonUnauthorized, "client certificates are not configured")
+			return
 		}
+		authRequest = r.Clone(r.Context())
+		authRequest.TLS = nil
 	}
-	u, ok := authServer.authenticate(w, authRequest)
+	u, ok := s.authenticate(w, authRequest)
 	if !ok {
 		return
 	}

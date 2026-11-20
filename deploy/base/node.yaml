@@ -7,6 +7,22 @@ metadata:
   name: blip-node
   namespace: blip-system
 ---
+# The node agent reads the kube-apiserver's published client authentication
+# settings (front-proxy and client CAs) from this ConfigMap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blip-node-extension-apiserver-authentication
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: blip-node
+    namespace: blip-system
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -119,9 +135,6 @@ spec:
               readOnly: true
             - name: configfs
               mountPath: /sys/kernel/config
-            - name: front-proxy-ca
-              mountPath: /var/run/blip-auth
-              readOnly: true
       volumes:
         - name: data
           hostPath:
@@ -140,14 +153,6 @@ spec:
           hostPath:
             path: /sys/kernel/config
             type: Directory
-        # The front-proxy CA verifies the API server's client certificate.
-        # It is absent on some distributions; legacy stream requests then
-        # trust X-Remote-User headers and must not be directly reachable.
-        # Identity lookups require the CA to trust front-proxy headers.
-        - name: front-proxy-ca
-          hostPath:
-            path: /etc/kubernetes/pki
-            type: DirectoryOrCreate
 ---
 # The aggregated API server runs on every node agent (hostNetwork), so the
 # Service selects the DaemonSet pods and forwards to their host port.

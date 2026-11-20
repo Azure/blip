@@ -25,10 +25,6 @@ for tool in docker kind kubectl go make modinfo openssl; do
   command -v "${tool}" >/dev/null || { echo "missing tool: ${tool}" >&2; exit 1; }
 done
 
-# kind nodes share the host kernel, so the modules blip needs are loaded on the
-# host.
-sudo modprobe -a configfs loop tun nvmet nvmet_tcp nvme_tcp nvme_fabrics dm_thin_pool dm_clone dm_crypt
-
 # load_images loads the given images into the workers. Old kind releases cannot
 # detect the containerd 2.x snapshotter ("failed to detect containerd
 # snapshotter"), so fall back to importing the archives directly with ctr.
@@ -97,18 +93,6 @@ fi
 if [[ "$(docker container inspect -f '{{json .NetworkSettings.Networks.kind}}' "${REGISTRY}")" == null ]]; then
   docker network connect kind "${REGISTRY}"
 fi
-
-# The node agent verifies the kube-apiserver's front-proxy client certificate
-# when it serves the aggregated stream API. Kind only populates this CA on the
-# control-plane; copy it to the workers before the node agent starts.
-node_restart=false
-for node in "${WORKERS[@]}"; do
-  if ! docker exec "${node}" test -s /etc/kubernetes/pki/front-proxy-ca.crt; then
-    docker exec "${CLUSTER}-control-plane" cat /etc/kubernetes/pki/front-proxy-ca.crt \
-      | docker exec -i "${node}" sh -c 'mkdir -p /etc/kubernetes/pki && cat > /etc/kubernetes/pki/front-proxy-ca.crt'
-    node_restart=true
-  fi
-done
 
 for node in "${WORKERS[@]}"; do
   docker exec "${node}" sh -c 'mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config'
@@ -194,10 +178,6 @@ k -n blip-system create secret tls blipchat-mcp-tls \
 k -n default create configmap blipchat-mcp-ca \
   --from-file=ca.crt="${mcp_tls}/ca.crt" \
   --dry-run=client -o yaml | k apply -f -
-
-if [[ "${node_restart}" == true ]]; then
-  k -n blip-system rollout restart daemonset/blip-node
-fi
 
 k -n blip-system rollout status deployment/blip-controller --timeout 3m
 k -n blip-system rollout status daemonset/blip-node --timeout 3m

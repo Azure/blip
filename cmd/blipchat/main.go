@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -188,7 +190,7 @@ func run(o runOptions) error {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		slog.Info("listening", "address", o.listen, "namespace", o.namespace)
 		errCh <- httpServer.ListenAndServe()
@@ -198,9 +200,15 @@ func run(o runOptions) error {
 		if o.mcpCert == "" || o.mcpKey == "" {
 			return errors.New("--mcp-listen requires --mcp-cert and --mcp-key")
 		}
+		tlsConfig, stopWatcher, err := mcpTLSConfig(ctx, o.mcpCert, o.mcpKey, errCh)
+		if err != nil {
+			return err
+		}
+		defer stopWatcher()
 		mcpServer = &http.Server{
 			Addr:              o.mcpListen,
 			Handler:           srv.MCPHandler(),
+			TLSConfig:         tlsConfig,
 			ReadHeaderTimeout: 10 * time.Second,
 			IdleTimeout:       60 * time.Second,
 			MaxHeaderBytes:    16 << 10,
@@ -224,6 +232,26 @@ func run(o runOptions) error {
 		_ = mcpServer.Shutdown(shutdown)
 	}
 	return httpServer.Shutdown(shutdown)
+}
+
+// mcpTLSConfig returns a TLS config that serves the certificate and key at
+// certPath and keyPath, reloading them when either file changes. The returned
+// stop function stops the watcher; watch errors are delivered on errCh.
+func mcpTLSConfig(ctx context.Context, certPath, keyPath string, errCh chan<- error) (*tls.Config, func(), error) {
+	cw, err := certwatcher.New(certPath, keyPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	watchCtx, stop := context.WithCancel(ctx)
+	go func() {
+		if err := cw.Start(watchCtx); err != nil {
+			errCh <- err
+		}
+	}()
+	return &tls.Config{
+		MinVersion:     tls.VersionTLS12,
+		GetCertificate: cw.GetCertificate,
+	}, stop, nil
 }
 
 func fail(message string) {

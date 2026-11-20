@@ -79,10 +79,14 @@ for namespaced `get` on `podidentities` in group `identity.blip.dev`. It does
 **not** validate the VM's JWT or authorize the VM's requested operation.
 
 Front-proxy identity headers require a client certificate verified against the
-node agent's configured front-proxy CA (`--stream-client-ca`). Unlike the legacy
-stream endpoints, this lookup never trusts those headers without a CA. Ensure
-the CA is available on every node serving the API; otherwise aggregated requests
-may be rejected. Direct bearer-token requests are verified with TokenReview.
+kube-apiserver's published front-proxy CA. The node agent reads
+`requestheader-client-ca-file`, `requestheader-allowed-names`, and
+`client-ca-file` from the `kube-system/extension-apiserver-authentication`
+ConfigMap, so every node can verify the API server without a host path. When
+that ConfigMap has no request-header CA, the node agent rejects proxy headers
+entirely and falls back to direct certificate or bearer-token authentication.
+`--stream-client-ca` can name a CA file to override both CAs on clusters that do
+not publish one. Direct bearer-token requests are verified with TokenReview.
 
 For example, grant the Envoy service account access only in `workloads`:
 

@@ -8,6 +8,7 @@
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
+// +kubebuilder:rbac:groups="",resources=configmaps,resourceNames=extension-apiserver-authentication,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
@@ -80,6 +81,7 @@ func rootCmd() *cobra.Command {
 			if err := writableSysfs(); err != nil {
 				return err
 			}
+			node.LoadKernelModules(ctx)
 			kc, err := client.New(restCfg, client.Options{})
 			if err != nil {
 				return err
@@ -116,6 +118,6 @@ func rootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&poolSize, "pool-size", "40Gi", "size of the thin pool data file")
 	cmd.Flags().StringSliceVar(&insecure, "insecure-registry", nil, "registries to reach over plain HTTP")
 	cmd.Flags().StringVar(&streamListen, "stream-listen", ":7891", "aggregated stream API listen address (empty disables)")
-	cmd.Flags().StringVar(&streamClientCA, "stream-client-ca", "/var/run/blip-auth/front-proxy-ca.crt", "optional front-proxy client CA")
+	cmd.Flags().StringVar(&streamClientCA, "stream-client-ca", "", "optional file with the front-proxy CA; defaults to the kube-apiserver's published ConfigMap")
 	return cmd
 }

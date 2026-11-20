@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/blip/internal/stream"
@@ -97,13 +98,18 @@ type Options struct {
 	// nil, resource requests are denied unless Insecure is set.
 	Client kubernetes.Interface
 	// ClientCA verifies TLS client certificates. It is normally the
-	// kube-apiserver front proxy's client CA.
+	// kube-apiserver's client CA. It also verifies front-proxy certificates
+	// for the identity headers, so a caller that needs distinct CAs should
+	// use SetClientAuth.
 	ClientCA *x509.CertPool
+	// RequestHeaderAllowedNames lists the certificate common names allowed to
+	// assert front-proxy identity headers. Empty means any name the
+	// request-header CA issued.
+	RequestHeaderAllowedNames []string
 	// TrustProxyHeaders accepts the kube-apiserver front-proxy identity
-	// headers (X-Remote-User, X-Remote-Group) when no verifiable certificate
-	// is available. Only enable it when direct network access to the listener
-	// is restricted to the API server. Identity lookups always require a
-	// certificate verified against ClientCA before trusting these headers.
+	// headers (X-Remote-User, X-Remote-Group). The headers are only trusted
+	// when the request carries a certificate that verifies against the
+	// request-header CA, so a listener without one never trusts them.
 	TrustProxyHeaders bool
 	// Insecure accepts requests without credentials and, when no Authorizer
 	// is available, allows them. It exists for tests only.
@@ -118,9 +124,15 @@ type Server struct {
 	backend         Backend
 	identityBackend IdentityBackend
 	client          kubernetes.Interface
-	clientCA        *x509.CertPool
 	insecure        bool
 	proxyAuth       bool
+
+	// credMu guards the client authentication credentials, which the node
+	// agent replaces when the API server republishes them.
+	credMu                    sync.RWMutex
+	requestHeaderCA           *x509.CertPool
+	clientCA                  *x509.CertPool
+	requestHeaderAllowedNames []string
 
 	// Authorizer decides resource access. New sets it to a delegated
 	// SubjectAccessReview authorizer when Client is non-nil. A nil Authorizer
@@ -131,18 +143,39 @@ type Server struct {
 // New returns a stream API server.
 func New(opts Options) *Server {
 	s := &Server{
-		backend:         opts.Backend,
-		identityBackend: opts.IdentityBackend,
-		client:          opts.Client,
-		clientCA:        opts.ClientCA,
-		insecure:        opts.Insecure,
-		proxyAuth:       opts.TrustProxyHeaders,
-		Authorizer:      opts.Authorizer,
+		backend:                   opts.Backend,
+		identityBackend:           opts.IdentityBackend,
+		client:                    opts.Client,
+		requestHeaderCA:           opts.ClientCA,
+		clientCA:                  opts.ClientCA,
+		requestHeaderAllowedNames: append([]string(nil), opts.RequestHeaderAllowedNames...),
+		insecure:                  opts.Insecure,
+		proxyAuth:                 opts.TrustProxyHeaders,
+		Authorizer:                opts.Authorizer,
 	}
 	if s.Authorizer == nil && s.client != nil {
 		s.Authorizer = sarAuthorizer{client: s.client}
 	}
 	return s
+}
+
+// SetClientAuth replaces the certificate authorities used for front-proxy
+// identity headers and direct client certificates. It is safe to call while
+// requests are in flight; a nil requestHeaderCA disables proxy headers.
+func (s *Server) SetClientAuth(requestHeaderCA, clientCA *x509.CertPool, allowedNames []string) {
+	s.credMu.Lock()
+	defer s.credMu.Unlock()
+	s.requestHeaderCA = requestHeaderCA
+	s.clientCA = clientCA
+	s.requestHeaderAllowedNames = append([]string(nil), allowedNames...)
+}
+
+// clientAuth snapshots the current certificate credentials. The returned
+// slice is immutable.
+func (s *Server) clientAuth() (requestHeaderCA, clientCA *x509.CertPool, allowedNames []string) {
+	s.credMu.RLock()
+	defer s.credMu.RUnlock()
+	return s.requestHeaderCA, s.clientCA, s.requestHeaderAllowedNames
 }
 
 // Handler returns the HTTP handler. It implements group discovery, log reads,
@@ -447,12 +480,19 @@ func (s *Server) writeBackendError(w http.ResponseWriter, err error) {
 }
 
 // ServeTLS listens on addr and serves the API until ctx is canceled. Client
-// certificates are requested, then verified against ClientCA by the handler;
-// bearer tokens are verified with Client when configured.
+// certificates are requested, then verified against the client CA by the
+// handler; bearer tokens are verified with Client when configured.
 func (s *Server) ServeTLS(ctx context.Context, addr, certFile, keyFile string, log *slog.Logger) error {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return err
+	}
+	// Advertise the request-header CA, which the API server's front proxy
+	// certificate chains to. The list is only a hint: certificates are
+	// verified by authenticate, so a bearer-only client can still connect.
+	requestHeaderCA, clientCA, _ := s.clientAuth()
+	if requestHeaderCA != nil {
+		clientCA = requestHeaderCA
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -464,7 +504,7 @@ func (s *Server) ServeTLS(ctx context.Context, addr, certFile, keyFile string, l
 		TLSConfig: &tls.Config{
 			MinVersion:   tls.VersionTLS12,
 			Certificates: []tls.Certificate{cert},
-			ClientCAs:    s.clientCA,
+			ClientCAs:    clientCA,
 			// Certificates are verified by authenticate so a bearer-only
 			// client can still connect.
 			ClientAuth: tls.RequestClientCert,

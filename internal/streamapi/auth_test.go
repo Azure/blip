@@ -211,6 +211,151 @@ func TestClientCertificateAuthentication(t *testing.T) {
 	}
 }
 
+func proxyLogRequest(cert *x509.Certificate, name string) *http.Request {
+	req := requestWithTLS(http.MethodGet, "/apis/"+GroupVersion+"/namespaces/ns/blipstreams/demo/log", cert)
+	req.Header.Set("X-Remote-User", name)
+	req.Header.Set("X-Remote-Group", "system:masters")
+	return req
+}
+
+func TestProxyHeadersRequireRequestHeaderCA(t *testing.T) {
+	ca, key := newCA(t)
+	proxy, _ := newLeaf(t, ca, key, "front-proxy-client", nil)
+	pool := x509.NewCertPool()
+	pool.AddCert(ca)
+
+	var got user.Info
+	allow := authorizer.AuthorizerFunc(func(_ context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
+		got = a.GetUser()
+		return authorizer.DecisionAllow, "", nil
+	})
+
+	// Without a request-header CA the headers are never trusted, even when
+	// the caller presents a certificate.
+	s := New(Options{Backend: &fakeBackend{}, TrustProxyHeaders: true, Authorizer: allow})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, proxyLogRequest(proxy, "admin"))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+
+	// A configured request-header CA verifies the proxy certificate.
+	s = New(Options{Backend: &fakeBackend{}, TrustProxyHeaders: true, ClientCA: pool, Authorizer: allow})
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, proxyLogRequest(proxy, "admin"))
+	if rec.Code != http.StatusOK || got == nil || got.GetName() != "admin" ||
+		!slices.Contains(got.GetGroups(), "system:masters") {
+		t.Fatalf("status %d, user %+v: %s", rec.Code, got, rec.Body)
+	}
+}
+
+func TestProxyHeaderAllowedNames(t *testing.T) {
+	ca, key := newCA(t)
+	allowedCert, _ := newLeaf(t, ca, key, "front-proxy-client", nil)
+	otherCert, _ := newLeaf(t, ca, key, "workload", nil)
+	headerPool := x509.NewCertPool()
+	headerPool.AddCert(ca)
+
+	var got user.Info
+	s := New(Options{
+		Backend: &fakeBackend{}, TrustProxyHeaders: true,
+		Authorizer: authorizer.AuthorizerFunc(func(_ context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
+			got = a.GetUser()
+			return authorizer.DecisionAllow, "", nil
+		}),
+	})
+	// Trust the same CA for direct client certificates so a disallowed
+	// proxy certificate has to be rejected by the allowed-names check rather
+	// than by certificate verification.
+	s.SetClientAuth(headerPool, headerPool, []string{"front-proxy-client"})
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, proxyLogRequest(allowedCert, "admin"))
+	if rec.Code != http.StatusOK || got == nil || got.GetName() != "admin" {
+		t.Fatalf("allowed CN: status %d, user %+v: %s", rec.Code, got, rec.Body)
+	}
+
+	got = nil
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, proxyLogRequest(otherCert, "admin"))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("disallowed CN: status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+func TestSetClientAuthSwapsCredentials(t *testing.T) {
+	ca1, key1 := newCA(t)
+	proxy1, _ := newLeaf(t, ca1, key1, "front-proxy-client", nil)
+	ca2, key2 := newCA(t)
+	proxy2, _ := newLeaf(t, ca2, key2, "front-proxy-client", nil)
+	pool1, pool2 := x509.NewCertPool(), x509.NewCertPool()
+	pool1.AddCert(ca1)
+	pool2.AddCert(ca2)
+
+	var got user.Info
+	s := New(Options{
+		Backend: &fakeBackend{}, TrustProxyHeaders: true, ClientCA: pool1,
+		Authorizer: authorizer.AuthorizerFunc(func(_ context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
+			got = a.GetUser()
+			return authorizer.DecisionAllow, "", nil
+		}),
+	})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, proxyLogRequest(proxy1, "admin"))
+	if rec.Code != http.StatusOK || got == nil || got.GetName() != "admin" {
+		t.Fatalf("before swap: status %d, user %+v: %s", rec.Code, got, rec.Body)
+	}
+
+	s.SetClientAuth(pool2, pool2, nil)
+	got = nil
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, proxyLogRequest(proxy1, "admin"))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("old CA after swap: status %d: %s", rec.Code, rec.Body)
+	}
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, proxyLogRequest(proxy2, "admin"))
+	if rec.Code != http.StatusOK || got == nil || got.GetName() != "admin" {
+		t.Fatalf("new CA after swap: status %d, user %+v: %s", rec.Code, got, rec.Body)
+	}
+}
+
+func TestDirectClientCertificateUsesClientCA(t *testing.T) {
+	headerCA, headerKey := newCA(t)
+	clientCA, clientKey := newCA(t)
+	proxy, _ := newLeaf(t, headerCA, headerKey, "front-proxy-client", nil)
+	client, _ := newLeaf(t, clientCA, clientKey, "alice", []string{"devs"})
+	headerPool, clientPool := x509.NewCertPool(), x509.NewCertPool()
+	headerPool.AddCert(headerCA)
+	clientPool.AddCert(clientCA)
+
+	var got user.Info
+	s := New(Options{
+		Backend: &fakeBackend{}, TrustProxyHeaders: true,
+		Authorizer: authorizer.AuthorizerFunc(func(_ context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
+			got = a.GetUser()
+			return authorizer.DecisionAllow, "", nil
+		}),
+	})
+	s.SetClientAuth(headerPool, clientPool, nil)
+
+	// The proxy certificate authenticates the asserted identity.
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, proxyLogRequest(proxy, "admin"))
+	if rec.Code != http.StatusOK || got == nil || got.GetName() != "admin" {
+		t.Fatalf("proxy: status %d, user %+v: %s", rec.Code, got, rec.Body)
+	}
+
+	// A direct certificate is verified against the client CA. Its forged
+	// identity headers are ignored.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, proxyLogRequest(client, "admin"))
+	if rec.Code != http.StatusOK || got == nil || got.GetName() != "alice" ||
+		!slices.Contains(got.GetGroups(), "devs") {
+		t.Fatalf("client cert: status %d, user %+v: %s", rec.Code, got, rec.Body)
+	}
+}
+
 func newCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
