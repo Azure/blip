@@ -180,6 +180,10 @@ func mcpTools() []map[string]any {
 			"prompt": text("The follow-up prompt."),
 		}, "id", "prompt"),
 		tool("stop_agent", "Stop a child chat's running turn so its workspace is saved.", map[string]any{"id": id}, "id"),
+		tool("ask_user", "Ask the user a question and wait for their answer. Use it when only the user can decide. If they do not answer within the time limit, it returns and their answer arrives as your next message.", map[string]any{
+			"question": text("The question for the user."),
+			"options":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional short choices the user can click."},
+		}, "question"),
 	}
 }
 
@@ -192,11 +196,13 @@ func (s *Server) callTool(ctx context.Context, caller *Caller, req mcpRequest) m
 		return mcpFailure(req.ID, -32602, "invalid tools/call params")
 	}
 	var args struct {
-		Profile     string `json:"profile"`
-		Prompt      string `json:"prompt"`
-		Title       string `json:"title"`
-		ID          string `json:"id"`
-		WaitSeconds int    `json:"waitSeconds"`
+		Profile     string   `json:"profile"`
+		Prompt      string   `json:"prompt"`
+		Title       string   `json:"title"`
+		ID          string   `json:"id"`
+		WaitSeconds int      `json:"waitSeconds"`
+		Question    string   `json:"question"`
+		Options     []string `json:"options"`
 	}
 	if len(params.Arguments) > 0 {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -220,6 +226,8 @@ func (s *Server) callTool(ctx context.Context, caller *Caller, req mcpRequest) m
 		text, err = s.toolSendAgent(ctx, caller, args.ID, args.Prompt)
 	case "stop_agent":
 		text, err = s.toolStopAgent(ctx, caller, args.ID)
+	case "ask_user":
+		text, err = s.toolAskUser(ctx, caller, args.Question, args.Options)
 	default:
 		return mcpFailure(req.ID, -32602, "unknown tool: "+params.Name)
 	}
@@ -357,11 +365,13 @@ func (s *Server) toolListAgents(ctx context.Context, caller *Caller) (string, er
 		return "", err
 	}
 	type info struct {
-		Name    string `json:"id"`
-		Title   string `json:"title,omitempty"`
-		Profile string `json:"profile"`
-		Phase   string `json:"phase"`
-		Running bool   `json:"running"`
+		Name     string    `json:"id"`
+		Title    string    `json:"title,omitempty"`
+		Profile  string    `json:"profile"`
+		Phase    string    `json:"phase"`
+		Running  bool      `json:"running"`
+		Waiting  bool      `json:"waiting,omitempty"`
+		Question *Question `json:"question,omitempty"`
 	}
 	out := make([]info, 0, len(children))
 	for i := range children {
@@ -371,12 +381,16 @@ func (s *Server) toolListAgents(ctx context.Context, caller *Caller) (string, er
 		}
 		summary := summarize(&children[i], blips)
 		phase, running := summary.Phase, summary.Running
+		question := summary.Question
 		// Use the driver, when available, as the authority for whether the
 		// child still has work. The control-plane Blip can lag a reconcile and
 		// report Running after the reply already arrived, which would make
 		// list_agents disagree with get_agent.
 		if d, derr := s.driverFor(ctx, children[i].Name); derr == nil {
 			running = d.Busy()
+			if q := d.Question(); q != nil {
+				question = q
+			}
 			if running && phase != string(v1.BlipRunning) {
 				phase = string(v1.BlipPending)
 			}
@@ -384,7 +398,10 @@ func (s *Server) toolListAgents(ctx context.Context, caller *Caller) (string, er
 				phase = string(v1.BlipSaving)
 			}
 		}
-		out = append(out, info{Name: summary.Name, Title: summary.Title, Profile: summary.Profile, Phase: phase, Running: running})
+		out = append(out, info{
+			Name: summary.Name, Title: summary.Title, Profile: summary.Profile, Phase: phase,
+			Running: running, Waiting: question != nil, Question: question,
+		})
 	}
 	return jsonText(map[string]any{"agents": out}), nil
 }
@@ -402,7 +419,8 @@ func (s *Server) toolGetAgent(ctx context.Context, caller *Caller, id string, wa
 	if wait > maxAgentWait {
 		wait = maxAgentWait
 	}
-	if wait > 0 && d.Busy() {
+	question := d.Question()
+	if wait > 0 && question == nil && d.Busy() {
 		d.WaitIdle(ctx, wait)
 	}
 	blips, err := s.cluster.ListStateBlips(ctx, caller.Namespace, id)
@@ -432,10 +450,36 @@ func (s *Server) toolGetAgent(ctx context.Context, caller *Caller, id string, wa
 		"idle":    !running,
 		"reply":   d.Reply(),
 	}
-	if running {
+	if q := d.Question(); q != nil {
+		out["question"] = q
+		out["note"] = "the child is waiting for the user's answer; send_agent answers it"
+	} else if running {
 		out["note"] = "the child is still working; call get_agent again with waitSeconds"
 	}
 	return jsonText(out), nil
+}
+
+// toolAskUser asks the user a question and waits for the answer. A timeout is
+// reported as normal text that tells the agent to end its turn; the answer is
+// then delivered as the chat's next prompt.
+func (s *Server) toolAskUser(ctx context.Context, caller *Caller, question string, options []string) (string, error) {
+	d, err := s.driverFor(ctx, caller.Session.Name)
+	if err != nil {
+		return "", err
+	}
+	answer, err := d.Ask(ctx, question, options)
+	switch {
+	case err == nil:
+		return answer, nil
+	case errors.Is(err, errQuestionPending):
+		return "The user hasn't answered yet. End your turn now; their answer will arrive as your next message.", nil
+	case errors.Is(err, errQuestionCancelled):
+		return "The user cancelled the question.", nil
+	case errors.Is(err, errQuestionOpen):
+		return "", errors.New("another question is already waiting for an answer")
+	default:
+		return "", err
+	}
 }
 
 func (s *Server) toolSendAgent(ctx context.Context, caller *Caller, id, prompt string) (string, error) {
@@ -452,6 +496,12 @@ func (s *Server) toolSendAgent(ctx context.Context, caller *Caller, id, prompt s
 	d, err := s.driverFor(ctx, id)
 	if err != nil {
 		return "", err
+	}
+	if d.Question() != nil {
+		if err := d.Answer(agentSender(caller), prompt); err != nil {
+			return "", fmt.Errorf("could not answer the question: %w", err)
+		}
+		return jsonText(map[string]any{"id": id, "answered": true}), nil
 	}
 	if err := d.SubmitAs(agentSender(caller), prompt); err != nil {
 		return "", fmt.Errorf("could not send the prompt: %w", err)

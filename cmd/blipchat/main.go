@@ -43,6 +43,7 @@ func main() {
 		mcpKey       string
 		mcpAudience  string
 		mcpURL       string
+		questionWait time.Duration
 	)
 	flag.StringVar(&listen, "listen", ":8080", "HTTP listen address")
 	flag.StringVar(&basePath, "base-path", "", "URL path prefix for a reverse proxy, e.g. /blipchat (the root stays available)")
@@ -57,6 +58,7 @@ func main() {
 	flag.StringVar(&mcpKey, "mcp-key", "", "TLS key for --mcp-listen")
 	flag.StringVar(&mcpAudience, "mcp-audience", "blipchat", "audience of the projected token agents use for MCP")
 	flag.StringVar(&mcpURL, "mcp-url", "", "URL agents use to reach MCP; the guest-facing pool endpoint URL plus /mcp")
+	flag.DurationVar(&questionWait, "question-timeout", 30*time.Second, "how long ask_user waits for an answer before the agent ends its turn")
 	flag.Parse()
 
 	level, err := parseLevel(logLevel)
@@ -67,7 +69,7 @@ func main() {
 	opts := runOptions{
 		listen: listen, basePath: basePath, namespace: namespace, profilesCM: profilesCM, profilesFile: profilesFile,
 		autoApprove: autoApprove, defaultPool: defaultPool, mcpListen: mcpListen, mcpCert: mcpCert,
-		mcpKey: mcpKey, mcpAudience: mcpAudience, mcpURL: mcpURL,
+		mcpKey: mcpKey, mcpAudience: mcpAudience, mcpURL: mcpURL, questionWait: questionWait,
 	}
 	if err := run(opts); err != nil {
 		fail(err.Error())
@@ -102,6 +104,7 @@ type runOptions struct {
 	mcpKey       string
 	mcpAudience  string
 	mcpURL       string
+	questionWait time.Duration
 }
 
 func run(o runOptions) error {
@@ -135,16 +138,20 @@ func run(o runOptions) error {
 		return err
 	}
 	cluster := blipchat.NewKube(kc)
+	if o.questionWait <= 0 {
+		return errors.New("--question-timeout must be positive")
+	}
 	opts := blipchat.Options{
-		Namespace:   o.namespace,
-		BasePath:    o.basePath,
-		Profiles:    profiles,
-		DefaultPool: o.defaultPool,
-		AutoApprove: o.autoApprove,
-		Cluster:     cluster,
-		Wire:        wire,
-		Log:         slog.Default(),
-		MCPURL:      o.mcpURL,
+		Namespace:       o.namespace,
+		BasePath:        o.basePath,
+		Profiles:        profiles,
+		DefaultPool:     o.defaultPool,
+		AutoApprove:     o.autoApprove,
+		Cluster:         cluster,
+		Wire:            wire,
+		Log:             slog.Default(),
+		MCPURL:          o.mcpURL,
+		QuestionTimeout: o.questionWait,
 	}
 	if o.mcpListen != "" {
 		opts.Callers, err = blipchat.NewTokenReviewCallers(cfg, cluster, o.mcpAudience)

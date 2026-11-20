@@ -274,6 +274,9 @@ spec:
             - --mcp-cert=/etc/blipchat-mcp/tls.crt
             - --mcp-key=/etc/blipchat-mcp/tls.key
             - --mcp-url=http://blipchat-mcp/mcp
+            # ask_user waits this long for an answer before the agent ends its
+            # turn; a later answer arrives as the chat's next message.
+            # - --question-timeout=30s
             - --log-level=info
           ports:
             - name: http

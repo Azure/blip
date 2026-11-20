@@ -23,6 +23,8 @@ type Status struct {
 	Phase   string `json:"phase,omitempty"`
 	Running bool   `json:"running"`
 	Detail  string `json:"detail,omitempty"`
+	// Question is set while the agent waits for the user's answer.
+	Question *Question `json:"question,omitempty"`
 }
 
 const (

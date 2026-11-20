@@ -53,6 +53,9 @@ type Options struct {
 	// MCPURL is the URL an agent uses to reach the MCP endpoint. An empty
 	// URL offers no MCP server to agents.
 	MCPURL string
+	// QuestionTimeout bounds how long ask_user waits for an answer. Zero uses
+	// 30 seconds.
+	QuestionTimeout time.Duration
 }
 
 // Server is the HTTP front end and the owner of the per-session drivers.
@@ -68,6 +71,7 @@ type Server struct {
 	log         *slog.Logger
 	callers     Callers
 	mcpURL      string
+	questionTTL time.Duration
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -92,6 +96,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.DefaultPool == "" {
 		opts.DefaultPool = "default"
+	}
+	if opts.QuestionTimeout <= 0 {
+		opts.QuestionTimeout = defaultQuestionTimeout
 	}
 	if opts.Profiles == nil {
 		opts.Profiles = Profiles{}
@@ -136,6 +143,7 @@ func New(opts Options) (*Server, error) {
 		log:         opts.Log,
 		callers:     opts.Callers,
 		mcpURL:      opts.MCPURL,
+		questionTTL: opts.QuestionTimeout,
 		ctx:         ctx,
 		cancel:      cancel,
 		drivers:     make(map[string]*driver),
@@ -469,6 +477,8 @@ type sessionSummary struct {
 	Root          string      `json:"root,omitempty"`
 	Depth         int         `json:"depth"`
 	Created       metav1.Time `json:"created"`
+	// Question is set while the agent waits for the user's answer.
+	Question *Question `json:"question,omitempty"`
 }
 
 type sessionDetail struct {
@@ -494,6 +504,7 @@ func summarize(st *v1.BlipState, blips []v1.Blip) sessionSummary {
 		Parent:       st.Annotations[AnnotationParent],
 		Root:         st.Annotations[AnnotationRoot],
 		Created:      st.CreationTimestamp,
+		Question:     questionFromAnnotation(st),
 	}
 	out.Depth = sessionDepth(st)
 	if latest := latestBlip(blips); latest != nil {
@@ -515,6 +526,20 @@ func summarize(st *v1.BlipState, blips []v1.Blip) sessionSummary {
 		}
 	}
 	return out
+}
+
+// questionFromAnnotation reads the durable open question. A malformed value is
+// treated as no question; the driver is the authority when it is live.
+func questionFromAnnotation(st *v1.BlipState) *Question {
+	raw := st.Annotations[AnnotationQuestion]
+	if raw == "" {
+		return nil
+	}
+	var q Question
+	if err := json.Unmarshal([]byte(raw), &q); err != nil || q.ID == "" {
+		return nil
+	}
+	return &q
 }
 
 // sessionDepth returns the distance from the root chat. A missing or invalid
@@ -865,6 +890,9 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	var idle bool
 	detail.Transcript, detail.Offset, idle = d.Snapshot()
 	detail.TranscriptTruncated = d.TranscriptTruncated()
+	// The live driver is the authority: the annotation can lag while it is
+	// being cleared, and a just-restarted driver loads it before serving.
+	detail.Question = d.Question()
 	if detail.Transcript == nil {
 		detail.Transcript = []json.RawMessage{}
 	}
@@ -1070,6 +1098,8 @@ func (s *Server) driverFor(ctx context.Context, name string) (*driver, error) {
 		TranscriptTruncated: transcriptTruncated,
 		Pending:             s.pending,
 		PendingPrompts:      pending,
+		Question:            questionFromAnnotation(st),
+		QuestionTimeout:     s.questionTTL,
 	})
 
 	s.mu.Lock()
@@ -1119,6 +1149,26 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeClusterError(w, err)
 		return
+	}
+	// While a question is open, a message from the composer is its answer.
+	// A message that arrives after the question was already answered is
+	// handled as an ordinary prompt below.
+	if d.Question() != nil {
+		err := d.Answer(forwardedUser(r), text)
+		if err == nil {
+			writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+			return
+		}
+		if !errors.Is(err, errNoQuestion) {
+			switch {
+			case errors.Is(err, errSessionBusy):
+				writeError(w, http.StatusServiceUnavailable, "session is busy")
+			default:
+				s.log.Error("answer question", "namespace", s.namespace, "session", name, "err", err)
+				writeError(w, http.StatusInternalServerError, "could not deliver the answer")
+			}
+			return
+		}
 	}
 	if err := d.SubmitAs(forwardedUser(r), text); err != nil {
 		switch {

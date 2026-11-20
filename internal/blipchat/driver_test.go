@@ -1595,3 +1595,271 @@ func TestDriverPendingStoreExcludesInFlightPrompt(t *testing.T) {
 		t.Fatalf("pending store = %+v, want only p2", got)
 	}
 }
+
+func newQuestionTestDriver(t *testing.T, timeout, stopDelay time.Duration) (*fakeCluster, *fakeWire, *driver) {
+	t.Helper()
+	ctx := context.Background()
+	fc := newFakeCluster()
+	state := &v1.BlipState{ObjectMeta: metav1.ObjectMeta{
+		Name:        "chat-q",
+		Namespace:   "team",
+		Labels:      map[string]string{LabelSession: "true"},
+		Annotations: map[string]string{AnnotationProfile: DefaultProfileName},
+	}}
+	if err := fc.CreateSession(ctx, "team", state); err != nil {
+		t.Fatal(err)
+	}
+	fw := newFakeWire()
+	d := newDriver(driverOptions{
+		Cluster:           fc,
+		Wire:              fw,
+		Hub:               NewHub(),
+		Log:               testLogger(),
+		Namespace:         "team",
+		State:             "chat-q",
+		ProfileName:       DefaultProfileName,
+		Profile:           Profiles{DefaultProfileName: {}}.get(DefaultProfileName, "default"),
+		AutoApprove:       "always",
+		QuestionTimeout:   timeout,
+		QuestionStopDelay: stopDelay,
+	})
+	d.start(ctx)
+	t.Cleanup(func() {
+		fw.closeLog()
+		d.Close()
+	})
+	return fc, fw, d
+}
+
+func questionAnnotation(t *testing.T, fc *fakeCluster) string {
+	t.Helper()
+	st, err := fc.GetSession(context.Background(), "team", "chat-q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.Annotations[AnnotationQuestion]
+}
+
+func TestDriverQuestionAnsweredInTurn(t *testing.T) {
+	ctx := context.Background()
+	fc, _, d := newQuestionTestDriver(t, time.Second, time.Hour)
+
+	var (
+		answer  string
+		askErr  error
+		askDone = make(chan struct{})
+	)
+	go func() {
+		answer, askErr = d.Ask(ctx, "Ship it?", []string{"Yes", "No"})
+		close(askDone)
+	}()
+	waitFor(t, "open question", func() bool { return d.Question() != nil })
+	q := d.Question()
+	if q.Text != "Ship it?" || len(q.Options) != 2 || q.Options[0] != "Yes" || q.ID == "" {
+		t.Fatalf("question = %+v", q)
+	}
+	if questionAnnotation(t, fc) == "" {
+		t.Fatal("question was not persisted")
+	}
+
+	if err := d.Answer("alice", "Yes"); err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	select {
+	case <-askDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask_user did not return after the answer")
+	}
+	if askErr != nil || answer != "Yes" {
+		t.Fatalf("ask_user = %q, %v", answer, askErr)
+	}
+	waitFor(t, "question cleared", func() bool {
+		return d.Question() == nil && questionAnnotation(t, fc) == ""
+	})
+	d.mu.Lock()
+	transcript := ""
+	for _, raw := range d.transcript {
+		transcript += string(raw)
+	}
+	d.mu.Unlock()
+	if !strings.Contains(transcript, `"text":"Yes"`) {
+		t.Fatalf("transcript does not contain the answer: %s", transcript)
+	}
+}
+
+func TestDriverQuestionTimeoutQueuesTaggedAnswer(t *testing.T) {
+	ctx := context.Background()
+	fc, fw, d := newQuestionTestDriver(t, 25*time.Millisecond, time.Hour)
+
+	if _, err := d.Ask(ctx, "Which colour?", []string{"Red", "Blue"}); !errors.Is(err, errQuestionPending) {
+		t.Fatalf("ask_user after timeout = %v", err)
+	}
+	q := d.Question()
+	if q == nil {
+		t.Fatal("question was cleared on timeout")
+	}
+	if questionAnnotation(t, fc) == "" {
+		t.Fatal("question annotation was cleared on timeout")
+	}
+
+	if err := d.Answer("alice", "Blue"); err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	waitFor(t, "tagged answer prompt", func() bool { return len(fw.promptIDs()) >= 1 })
+	text := lastPromptText(t, fw)
+	if !strings.Contains(text, "Which colour?") || !strings.Contains(text, "Blue") {
+		t.Fatalf("answer prompt = %q", text)
+	}
+	var tagged bool
+	for _, m := range fw.messages() {
+		if m.method != "session/prompt" {
+			continue
+		}
+		var msg struct {
+			Params struct {
+				Meta map[string]any `json:"_meta"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal(m.raw, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Params.Meta["blip.dev/answer"] == "true" {
+			tagged = true
+			if msg.Params.Meta["blip.dev/questionID"] != q.ID {
+				t.Fatalf("questionID = %v, want %s", msg.Params.Meta["blip.dev/questionID"], q.ID)
+			}
+		}
+	}
+	if !tagged {
+		t.Fatal("answer prompt is missing blip.dev/answer metadata")
+	}
+	if questionAnnotation(t, fc) != "" {
+		t.Fatal("question annotation was not cleared by the answer")
+	}
+}
+
+func TestDriverCancelAnswersBlockedQuestion(t *testing.T) {
+	ctx := context.Background()
+	fc, _, d := newQuestionTestDriver(t, time.Second, time.Hour)
+
+	var askErr error
+	done := make(chan struct{})
+	go func() {
+		_, askErr = d.Ask(ctx, "Continue?", nil)
+		close(done)
+	}()
+	waitFor(t, "open question", func() bool { return d.Question() != nil })
+	if !d.Cancel() {
+		t.Fatal("cancel was not accepted")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel did not unblock ask_user")
+	}
+	if !errors.Is(askErr, errQuestionCancelled) {
+		t.Fatalf("ask_user = %v, want cancelled", askErr)
+	}
+	if d.Question() != nil || questionAnnotation(t, fc) != "" {
+		t.Fatal("cancel did not clear the question")
+	}
+}
+
+func TestDriverRejectsSecondQuestion(t *testing.T) {
+	_, _, d := newQuestionTestDriver(t, time.Second, time.Hour)
+
+	q, ch, err := d.startQuestion("first", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := d.startQuestion("second", nil); !errors.Is(err, errQuestionOpen) {
+		t.Fatalf("second question = %v", err)
+	}
+	if err := d.Answer("alice", "one"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case a := <-ch:
+		if a.text != "one" || a.cancelled {
+			t.Fatalf("answer = %+v", a)
+		}
+	default:
+		t.Fatal("blocked ask_user was not answered")
+	}
+	if d.Question() != nil {
+		t.Fatal("question still open after answer")
+	}
+	if _, _, err := d.startQuestion("third", nil); err != nil {
+		t.Fatalf("third question after answer: %v (first was %s)", err, q.ID)
+	}
+	if err := d.Answer("alice", "two"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDriverForceStopsAfterQuestionTimeout(t *testing.T) {
+	ctx := context.Background()
+	fc, _, d := newQuestionTestDriver(t, 20*time.Millisecond, 40*time.Millisecond)
+
+	if err := d.Submit("work"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "turn in flight", func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.inflight
+	})
+	started := make(chan struct{})
+	fc.mu.Lock()
+	fc.stopBlipStarted = started
+	fc.mu.Unlock()
+
+	if _, err := d.Ask(ctx, "Still there?", nil); !errors.Is(err, errQuestionPending) {
+		t.Fatalf("ask_user = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("question timeout did not stop the blip")
+	}
+	waitFor(t, "driver marked ended", func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.ended
+	})
+	if d.Question() == nil {
+		t.Fatal("force stop cleared the open question")
+	}
+}
+
+func TestDriverRestoresQuestionFromAnnotation(t *testing.T) {
+	_, fw, d := newQuestionTestDriver(t, time.Second, time.Hour)
+	d.Close()
+
+	fc := newFakeCluster()
+	state := &v1.BlipState{ObjectMeta: metav1.ObjectMeta{
+		Name:        "chat-q",
+		Namespace:   "team",
+		Labels:      map[string]string{LabelSession: "true"},
+		Annotations: map[string]string{AnnotationProfile: DefaultProfileName},
+	}}
+	_ = fc.CreateSession(context.Background(), "team", state)
+	q := &Question{ID: "chat-q-q1", Text: "Restored?", Options: []string{"Yes"}, AskedAt: time.Now().UTC()}
+	r := newDriver(driverOptions{
+		Cluster: fc, Wire: fw, Hub: NewHub(), Log: testLogger(), Namespace: "team", State: "chat-q",
+		ProfileName: DefaultProfileName, Profile: Profiles{DefaultProfileName: {}}.get(DefaultProfileName, "default"),
+		AutoApprove: "always", Question: q, QuestionTimeout: time.Second,
+	})
+	r.start(context.Background())
+	defer r.Close()
+	if got := r.Question(); got == nil || got.ID != q.ID || got.Text != q.Text {
+		t.Fatalf("restored question = %+v", got)
+	}
+	if err := r.Answer("alice", "Yes"); err != nil {
+		t.Fatalf("answer restored question: %v", err)
+	}
+	waitFor(t, "restored answer prompt", func() bool { return len(fw.promptIDs()) >= 1 })
+	if text := lastPromptText(t, fw); !strings.Contains(text, "Restored?") || !strings.Contains(text, "Yes") {
+		t.Fatalf("restored answer prompt = %q", text)
+	}
+}

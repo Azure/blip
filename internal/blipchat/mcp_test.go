@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -189,7 +190,7 @@ func TestMCPInitializeAndTools(t *testing.T) {
 	for _, tool := range tools.Tools {
 		names = append(names, tool.Name)
 	}
-	for _, want := range []string{"list_profiles", "spawn_agent", "list_agents", "get_agent", "send_agent", "stop_agent"} {
+	for _, want := range []string{"list_profiles", "spawn_agent", "list_agents", "get_agent", "send_agent", "stop_agent", "ask_user"} {
 		if !strings.Contains(strings.Join(names, ","), want) {
 			t.Fatalf("tools %v do not contain %q", names, want)
 		}
@@ -413,5 +414,139 @@ func TestMCPRejectsForeignChat(t *testing.T) {
 	text, isErr := callTool(t, ts.URL, "token-root", "get_agent", map[string]any{"id": "chat-other"})
 	if !isErr || !strings.Contains(text, "not started by this chat") {
 		t.Fatalf("foreign chat = %s/%t", text, isErr)
+	}
+}
+
+func TestMCPAskUserAnsweredInTurn(t *testing.T) {
+	s, _, _, ts, caller := testMCP(t, agentProfiles())
+	ctx := context.Background()
+	d, err := s.driverFor(ctx, caller.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answerErr := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && d.Question() == nil {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if d.Question() == nil {
+			answerErr <- errors.New("ask_user did not open a question")
+			return
+		}
+		answerErr <- d.Answer("browser", "Yes")
+	}()
+	text, isErr := callTool(t, ts.URL, "token-root", "ask_user", map[string]any{
+		"question": "Ship it?",
+		"options":  []string{"Yes", "No"},
+	})
+	if err := <-answerErr; err != nil {
+		t.Fatal(err)
+	}
+	if isErr || text != "Yes" {
+		t.Fatalf("ask_user = %q, isError=%v", text, isErr)
+	}
+	if d.Question() != nil {
+		t.Fatal("question still open after the answer")
+	}
+}
+
+func TestMCPAskUserTimesOut(t *testing.T) {
+	s, fc, _, ts, caller := testMCP(t, agentProfiles())
+	s.questionTTL = 25 * time.Millisecond
+	text, isErr := callTool(t, ts.URL, "token-root", "ask_user", map[string]any{"question": "Still there?"})
+	if isErr {
+		t.Fatalf("timeout returned an error: %s", text)
+	}
+	if !strings.Contains(text, "hasn't answered") || !strings.Contains(text, "End your turn") {
+		t.Fatalf("timeout text = %q", text)
+	}
+	d, err := s.driverFor(context.Background(), caller.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Question() == nil {
+		t.Fatal("question was cleared on timeout")
+	}
+	st, err := fc.GetSession(context.Background(), "team", caller.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Annotations[AnnotationQuestion] == "" {
+		t.Fatal("question annotation was not persisted on timeout")
+	}
+	if err := d.Answer("browser", "Yes"); err != nil {
+		t.Fatalf("late answer: %v", err)
+	}
+}
+
+func TestMCPAskUserRejectsSecondQuestion(t *testing.T) {
+	s, _, _, ts, caller := testMCP(t, agentProfiles())
+	d, err := s.driverFor(context.Background(), caller.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := d.startQuestion("first", nil); err != nil {
+		t.Fatal(err)
+	}
+	text, isErr := callTool(t, ts.URL, "token-root", "ask_user", map[string]any{"question": "second"})
+	if !isErr || !strings.Contains(text, "another question") {
+		t.Fatalf("second question = %q, isError=%v", text, isErr)
+	}
+	if err := d.Answer("browser", "one"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMCPChildQuestionIsVisibleAndAnswerable(t *testing.T) {
+	s, _, _, ts, _ := testMCP(t, agentProfiles())
+	ctx := context.Background()
+
+	text, isErr := callTool(t, ts.URL, "token-root", "spawn_agent", map[string]any{
+		"profile": "worker",
+		"prompt":  "review the change",
+	})
+	if isErr {
+		t.Fatal(text)
+	}
+	var spawned struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(text), &spawned); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.driverFor(ctx, spawned.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := d.startQuestion("Approve the change?", []string{"Approve", "Reject"}); err != nil {
+		t.Fatal(err)
+	}
+
+	list, isErr := callTool(t, ts.URL, "token-root", "list_agents", map[string]any{})
+	if isErr {
+		t.Fatal(list)
+	}
+	if !strings.Contains(list, `"waiting": true`) || !strings.Contains(list, "Approve the change?") {
+		t.Fatalf("list_agents = %s", list)
+	}
+
+	reply, isErr := callTool(t, ts.URL, "token-root", "get_agent", map[string]any{"id": spawned.ID, "waitSeconds": 5})
+	if isErr {
+		t.Fatal(reply)
+	}
+	if !strings.Contains(reply, "Approve the change?") || !strings.Contains(reply, "send_agent") {
+		t.Fatalf("get_agent = %s", reply)
+	}
+
+	sent, isErr := callTool(t, ts.URL, "token-root", "send_agent", map[string]any{"id": spawned.ID, "prompt": "Approve"})
+	if isErr {
+		t.Fatal(sent)
+	}
+	if !strings.Contains(sent, `"answered": true`) {
+		t.Fatalf("send_agent = %s", sent)
+	}
+	if d.Question() != nil {
+		t.Fatal("send_agent did not answer the child's question")
 	}
 }

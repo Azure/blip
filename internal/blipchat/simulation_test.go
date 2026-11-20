@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -64,15 +65,54 @@ const (
 func hashEvents(events []Event) string {
 	h := sha256.New()
 	for _, ev := range events {
-		fmt.Fprintf(h, "%d,%s,%d,", ev.Offset, ev.Type, len(ev.Message))
-		_, _ = h.Write(ev.Message)
+		msg := normalizePromptIDs(ev.Message)
+		fmt.Fprintf(h, "%d,%s,%d,", ev.Offset, ev.Type, len(msg))
+		_, _ = h.Write(msg)
 		if ev.Status == nil {
-			_, _ = h.Write([]byte("-,-;"))
+			_, _ = h.Write([]byte("-,-,-;"))
 			continue
 		}
-		fmt.Fprintf(h, "%s,%t,%s;", ev.Status.Phase, ev.Status.Running, ev.Status.Detail)
+		fmt.Fprintf(h, "%s,%t,%s,%s;", ev.Status.Phase, ev.Status.Running, ev.Status.Detail, questionID(ev.Status.Question))
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// normalizePromptIDs replaces the driver's time-based prompt IDs with a stable
+// placeholder. The driver allocates those IDs from time.Now, so a model key
+// that hashed them directly would differ between a run and its replay.
+func normalizePromptIDs(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || !bytes.Contains(raw, []byte(`"promptID"`)) {
+		return raw
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var value any
+	if err := dec.Decode(&value); err != nil {
+		return raw
+	}
+	clearPromptIDs(value)
+	out, err := json.Marshal(value)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func clearPromptIDs(value any) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			if key == "promptID" {
+				v[key] = "prompt"
+				continue
+			}
+			clearPromptIDs(child)
+		}
+	case []any:
+		for _, child := range v {
+			clearPromptIDs(child)
+		}
+	}
 }
 
 func equalEvents(a, b []Event) bool { return reflect.DeepEqual(a, b) }
@@ -665,6 +705,28 @@ type driverSimulation struct {
 
 	closed     bool
 	seqAtClose uint64
+
+	// questionCh is the channel returned by the most recent startQuestion, so
+	// a script can observe an in-turn answer or a cancellation. The driver
+	// itself remains the authority on whether the question is open.
+	questionCh chan questionAnswer
+}
+
+func driverSimOptions(fc *fakeCluster, wire Wire) driverOptions {
+	return driverOptions{
+		Cluster:     fc,
+		Wire:        wire,
+		Hub:         NewHub(),
+		Log:         testLogger(),
+		Namespace:   driverSimNamespace,
+		State:       driverSimState,
+		Profile:     Profiles{DefaultProfileName: {}}.get(DefaultProfileName, "default"),
+		AutoApprove: "always",
+		// Ask is driven directly by the simulation, but a restored driver must
+		// never wait on the production default in a test.
+		QuestionTimeout:   time.Millisecond,
+		QuestionStopDelay: time.Hour,
+	}
 }
 
 func buildDriverSimulation(actions []string, budget int) *driverSimulation {
@@ -685,17 +747,7 @@ func buildDriverSimulation(actions []string, budget int) *driverSimulation {
 		panic(err)
 	}
 	wire := newSimDriverWire()
-	profile := Profiles{DefaultProfileName: {}}.get(DefaultProfileName, "default")
-	d := newDriver(driverOptions{
-		Cluster:     fc,
-		Wire:        wire,
-		Hub:         NewHub(),
-		Log:         testLogger(),
-		Namespace:   driverSimNamespace,
-		State:       driverSimState,
-		Profile:     profile,
-		AutoApprove: "always",
-	})
+	d := newDriver(driverSimOptions(fc, wire))
 	// ACP request ids are the only random input in the driver path. Pinning the
 	// prefix makes transcripts and hence model keys reproducible.
 	d.agent.idPrefix = "sim"
@@ -723,15 +775,44 @@ func (m *driverSimulation) driverLocked() (gen uint64, offset uint64, haveOffset
 	defer d.mu.Unlock()
 	queue = make([]string, len(d.queue))
 	for i, p := range d.queue {
-		queue[i] = p.text
+		// Include the answer tag so a late answer's queued prompt is visible
+		// to the model without the driver's time-based prompt id.
+		queue[i] = p.text + "\x1e" + p.answer
 	}
 	return d.generation, d.offset, d.haveOffset, d.initialized, d.ended, d.inflight,
 		queue, d.persisted, d.havePersist, d.lastStatus, d.haveStatus, hashRaw(d.transcript)
 }
 
+// questionState returns the open question, whether a blocked Ask is still
+// attached to it, and the sequence that names the next question. AskedAt is
+// deliberately excluded from model keys.
+func (m *driverSimulation) questionState() (*Question, bool, uint64) {
+	d := m.d
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.question.clone(), d.questionCh != nil, d.questionSeq
+}
+
+// parseQuestionAnnotation reads the durable question the same way the server
+// does, but rejects a present-but-malformed value instead of hiding it.
+func parseQuestionAnnotation(raw string) (*Question, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var q Question
+	if err := json.Unmarshal([]byte(raw), &q); err != nil {
+		return nil, fmt.Errorf("question annotation: %w", err)
+	}
+	if q.ID == "" {
+		return nil, errors.New("question annotation has no id")
+	}
+	return &q, nil
+}
+
 func hashRaw(messages []json.RawMessage) string {
 	h := sha256.New()
 	for _, raw := range messages {
+		raw = normalizePromptIDs(raw)
 		fmt.Fprintf(h, "%d,", len(raw))
 		_, _ = h.Write(raw)
 	}
@@ -778,15 +859,23 @@ func (m *driverSimulation) Key() string {
 		panic(err)
 	}
 	hub := hubReplay(d.hub)
+	question, questionWaiting, questionSeq := m.questionState()
+	questionText, questionOptions := "", ""
+	if question != nil {
+		questionText = question.Text
+		questionOptions = strings.Join(question.Options, "\x1f")
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "gen=%d;off=%d/%t;init=%t;ended=%t;inflight=%t;queue=%s;persist=%d/%t;",
 		gen, offset, haveOffset, initialized, ended, inflight, strings.Join(queue, "\x1f"), persisted, havePersist)
 	if haveStatus {
-		fmt.Fprintf(&b, "status=%s/%t/%s;", status.Phase, status.Running, status.Detail)
+		fmt.Fprintf(&b, "status=%s/%t/%s/q=%s;", status.Phase, status.Running, status.Detail, questionID(status.Question))
 	} else {
 		b.WriteString("status=none;")
 	}
+	fmt.Fprintf(&b, "q=%s/%s/%s/%t/%d;",
+		questionID(question), questionText, questionOptions, questionWaiting, questionSeq)
 	fmt.Fprintf(&b, "tx=%s;hub=%s;seq=%d;", txHash, hashEvents(hub), d.hub.Seq())
 	fmt.Fprintf(&b, "agent=%d/%s/%t/%t/%t/%d/%d;", idSeq, sessionID, replaying, loadSession, resumeSession, pending, bufLen)
 	fmt.Fprintf(&b, "wire=%s/%s/%d/%s;", strings.Join(methods, ","), strings.Join(prompts, "\x1f"), eofs, lastPrompt)
@@ -833,6 +922,8 @@ func (m *driverSimulation) Enabled() []string {
 	initialized := d.initialized
 	queueLen := len(d.queue)
 	haveOffset := d.haveOffset
+	questionOpen := d.question != nil
+	questionWaiting := d.questionCh != nil
 	d.mu.Unlock()
 	pending := d.agent.Pending()
 
@@ -844,6 +935,14 @@ func (m *driverSimulation) Enabled() []string {
 		if queueLen == 0 {
 			set["crash"] = true
 		}
+	}
+	if questionOpen {
+		set["answer"] = true
+		if questionWaiting {
+			set["question-timeout"] = true
+		}
+	} else if initialized {
+		set["ask"] = true
 	}
 	if pending > 0 {
 		set["respond"] = true
@@ -932,6 +1031,57 @@ func (m *driverSimulation) applyCrash() error {
 	return nil
 }
 
+func (m *driverSimulation) applyAsk() error {
+	_, ch, err := m.d.startQuestion("question", []string{"opt1", "opt2"})
+	if err != nil {
+		return err
+	}
+	m.questionCh = ch
+	return nil
+}
+
+func (m *driverSimulation) applyAnswer() error {
+	d := m.d
+	d.mu.Lock()
+	detached := d.question != nil && d.questionCh == nil
+	d.mu.Unlock()
+	if err := d.Answer("user", "yes"); err != nil {
+		return err
+	}
+	if detached {
+		// After a timeout the answer is a normal prompt. The run loop would
+		// consume the queued opPrompt; do it here so the model stays
+		// synchronous.
+		m.questionCh = nil
+		m.drainOps()
+	}
+	return nil
+}
+
+func (m *driverSimulation) applyQuestionTimeout() error {
+	question := m.d.Question()
+	if question == nil {
+		return errNoQuestion
+	}
+	// A real timeout leaves the question open but detaches the blocked Ask so
+	// a later answer becomes the next prompt. It also arms a wall-clock stop;
+	// the model deliberately omits that timer.
+	m.d.detachQuestion(question.ID)
+	m.questionCh = nil
+	return nil
+}
+
+func (m *driverSimulation) drainOps() {
+	for {
+		select {
+		case op := <-m.d.ops:
+			m.d.handleOp(op)
+		default:
+			return
+		}
+	}
+}
+
 func (m *driverSimulation) apply(action string) error {
 	switch action {
 	case "prompt":
@@ -945,10 +1095,20 @@ func (m *driverSimulation) apply(action string) error {
 		return m.wire.respond()
 	case "crash":
 		return m.applyCrash()
+	case "ask":
+		return m.applyAsk()
+	case "answer":
+		return m.applyAnswer()
+	case "question-timeout":
+		return m.applyQuestionTimeout()
 	case "cancel":
+		// Cancel and Stop both abandon the open question in production. Keep
+		// the returned channel so a script can observe the cancellation.
+		m.d.cancelQuestion()
 		m.d.handleOp(operation{kind: opCancel})
 		return nil
 	case "stop":
+		m.d.cancelQuestion()
 		m.d.handleOp(operation{kind: opStop})
 		return nil
 	case "persist":
@@ -981,7 +1141,7 @@ func (m *driverSimulation) Step(action string) error {
 
 func (m *driverSimulation) Check() error {
 	d := m.d
-	gen, offset, haveOffset, _, _, _, _, persisted, havePersist, _, _, transcriptHash := m.driverLocked()
+	gen, offset, haveOffset, _, _, _, _, persisted, havePersist, status, haveStatus, transcriptHash := m.driverLocked()
 	_ = transcriptHash
 
 	hub := hubReplay(d.hub)
@@ -1038,6 +1198,34 @@ func (m *driverSimulation) Check() error {
 	}
 	if sessionID != "" && st.Annotations[AnnotationACPSession] != sessionID {
 		return fmt.Errorf("acp session annotation %q, driver has %q", st.Annotations[AnnotationACPSession], sessionID)
+	}
+
+	question, questionWaiting, _ := m.questionState()
+	if question == nil && questionWaiting {
+		return errors.New("driver has an answer channel but no open question")
+	}
+	annotation, err := parseQuestionAnnotation(st.Annotations[AnnotationQuestion])
+	if err != nil {
+		return err
+	}
+	switch {
+	case annotation == nil && question != nil:
+		return fmt.Errorf("driver has open question %q but the annotation is empty", question.ID)
+	case annotation != nil && question == nil:
+		return fmt.Errorf("annotation has question %q but the driver has none", annotation.ID)
+	case annotation != nil && question != nil:
+		if annotation.ID != question.ID {
+			return fmt.Errorf("question annotation id %q, driver has %q", annotation.ID, question.ID)
+		}
+		if annotation.Text != question.Text {
+			return fmt.Errorf("question annotation text %q, driver has %q", annotation.Text, question.Text)
+		}
+		if !slices.Equal(annotation.Options, question.Options) {
+			return fmt.Errorf("question annotation options %v, driver has %v", annotation.Options, question.Options)
+		}
+	}
+	if haveStatus && questionID(status.Question) != questionID(question) {
+		return fmt.Errorf("status question %q, driver has %q", questionID(status.Question), questionID(question))
 	}
 	if havePersist {
 		raw := st.Annotations[AnnotationOffset]
@@ -1101,6 +1289,223 @@ func TestDriverSimulation(t *testing.T) {
 	t.Logf("driver: %d states, %d transitions", report.States, report.Transitions)
 
 	simtest.Run(t, initial, simtest.Seeds(0, 16), driverSimBudget)
+}
+
+func stepDriver(t *testing.T, model *driverSimulation, actions ...string) {
+	t.Helper()
+	for _, action := range actions {
+		if err := model.Step(action); err != nil {
+			t.Fatalf("%s: %v", action, err)
+		}
+		if err := model.Check(); err != nil {
+			t.Fatalf("%s: %v", action, err)
+		}
+	}
+}
+
+func assertNoQuestion(t *testing.T, fc *fakeCluster) {
+	t.Helper()
+	st, err := fc.GetSession(context.Background(), driverSimNamespace, driverSimState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw := st.Annotations[AnnotationQuestion]; raw != "" {
+		t.Fatalf("question annotation = %q, want empty", raw)
+	}
+}
+
+// TestDriverSimulationQuestionScripts names the three ways an open question
+// ends: answered while the agent is still blocked, answered after the Ask call
+// timed out (the answer becomes a tagged prompt), and cancelled by the user.
+func TestDriverSimulationQuestionScripts(t *testing.T) {
+	t.Run("answer-in-turn", func(t *testing.T) {
+		model := buildDriverSimulation(nil, 4)
+		defer model.d.Close()
+		stepDriver(t, model, "prompt", "ask")
+
+		question := model.d.Question()
+		if question == nil || question.ID != driverSimState+"-q1" {
+			t.Fatalf("question = %+v", question)
+		}
+		if !slices.Equal(question.Options, []string{"opt1", "opt2"}) {
+			t.Fatalf("question options = %v", question.Options)
+		}
+
+		stepDriver(t, model, "answer")
+		select {
+		case answer := <-model.questionCh:
+			if answer.cancelled || answer.text != "yes" {
+				t.Fatalf("answer = %+v", answer)
+			}
+		default:
+			t.Fatal("in-turn answer did not reach the blocked ask_user call")
+		}
+		if got := model.d.Question(); got != nil {
+			t.Fatalf("question still open after answer: %+v", got)
+		}
+		model.d.mu.Lock()
+		generation, queued := model.d.generation, len(model.d.queue)
+		model.d.mu.Unlock()
+		if generation != 1 || queued != 0 {
+			t.Fatalf("in-turn answer changed generation/queue: %d/%d", generation, queued)
+		}
+		assertNoQuestion(t, model.fc)
+	})
+
+	t.Run("answer-after-timeout", func(t *testing.T) {
+		model := buildDriverSimulation(nil, 6)
+		defer model.d.Close()
+		stepDriver(t, model, "prompt", "ask", "question-timeout")
+
+		question := model.d.Question()
+		if question == nil {
+			t.Fatal("timeout closed the question")
+		}
+		model.d.mu.Lock()
+		waiting := model.d.questionCh
+		model.d.mu.Unlock()
+		if waiting != nil {
+			t.Fatal("timeout did not detach the blocked ask_user call")
+		}
+
+		// End the turn, then answer. With no blocked Ask, the answer is a
+		// normal prompt tagged with the question it answers.
+		stepDriver(t, model, "respond", "answer")
+		if got := model.d.Question(); got != nil {
+			t.Fatalf("question still open after answer: %+v", got)
+		}
+		model.d.mu.Lock()
+		current, generation, queued := model.d.current, model.d.generation, len(model.d.queue)
+		model.d.mu.Unlock()
+		if current == nil || current.answer != question.ID {
+			t.Fatalf("late answer prompt = %+v, want answer tag %q", current, question.ID)
+		}
+		if !strings.Contains(current.text, "Answer to your question") {
+			t.Fatalf("late answer prompt text = %q", current.text)
+		}
+		if generation != 2 || queued != 0 {
+			t.Fatalf("late answer generation/queue = %d/%d", generation, queued)
+		}
+		assertNoQuestion(t, model.fc)
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		model := buildDriverSimulation(nil, 4)
+		defer model.d.Close()
+		stepDriver(t, model, "prompt", "ask")
+
+		stepDriver(t, model, "cancel")
+		select {
+		case answer := <-model.questionCh:
+			if !answer.cancelled {
+				t.Fatalf("cancel delivered %+v, want cancelled", answer)
+			}
+		default:
+			t.Fatal("cancel did not unblock the ask_user call")
+		}
+		if got := model.d.Question(); got != nil {
+			t.Fatalf("question still open after cancel: %+v", got)
+		}
+		assertNoQuestion(t, model.fc)
+	})
+
+	t.Run("survives-restart", func(t *testing.T) {
+		model := buildDriverSimulation(nil, 6)
+		defer model.d.Close()
+		stepDriver(t, model, "prompt", "ask", "crash", "prompt", "respond")
+
+		if !model.restartedAfterCrash || model.d.generation != 2 {
+			t.Fatalf("restart = %t, generation %d", model.restartedAfterCrash, model.d.generation)
+		}
+		question := model.d.Question()
+		if question == nil || question.ID != driverSimState+"-q1" {
+			t.Fatalf("question after restart = %+v", question)
+		}
+		st, err := model.fc.GetSession(context.Background(), driverSimNamespace, driverSimState)
+		if err != nil {
+			t.Fatal(err)
+		}
+		persisted := questionFromAnnotation(st)
+		if persisted == nil || persisted.ID != question.ID {
+			t.Fatalf("persisted question = %+v, driver has %+v", persisted, question)
+		}
+	})
+}
+
+// TestDriverSimulationQuestionRestore exercises the newDriver path the server
+// uses after a blipchat restart: the open question is rebuilt from the chat's
+// annotation, and an answer is queued as a tagged prompt because the original
+// blocked Ask call no longer exists.
+func TestDriverSimulationQuestionRestore(t *testing.T) {
+	model := buildDriverSimulation(nil, 4)
+	defer model.d.Close()
+	stepDriver(t, model, "prompt", "ask")
+
+	saved := model.d.Question()
+	if saved == nil {
+		t.Fatal("ask did not leave a question open")
+	}
+	st, err := model.fc.GetSession(context.Background(), driverSimNamespace, driverSimState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredWire := newSimDriverWire()
+	opts := driverSimOptions(model.fc, restoredWire)
+	opts.Question = questionFromAnnotation(st)
+	restored := newDriver(opts)
+	defer restored.Close()
+	restored.agent.idPrefix = "sim"
+	restoredWire.agent = restored.agent
+
+	got := restored.Question()
+	if got == nil || got.ID != saved.ID || got.Text != saved.Text || !slices.Equal(got.Options, saved.Options) {
+		t.Fatalf("restored question = %+v, want %+v", got, saved)
+	}
+
+	if err := restored.Answer("user", "yes"); err != nil {
+		t.Fatal(err)
+	}
+	if got := restored.Question(); got != nil {
+		t.Fatalf("restored driver kept question after answer: %+v", got)
+	}
+	st, err = model.fc.GetSession(context.Background(), driverSimNamespace, driverSimState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw := st.Annotations[AnnotationQuestion]; raw != "" {
+		t.Fatalf("question annotation after answer = %q, want empty", raw)
+	}
+	restored.mu.Lock()
+	queue := slices.Clone(restored.queue)
+	restored.mu.Unlock()
+	if len(queue) != 1 {
+		t.Fatalf("restored answer queued %d prompts", len(queue))
+	}
+	if queue[0].answer != saved.ID {
+		t.Fatalf("restored answer tag = %q, want %q", queue[0].answer, saved.ID)
+	}
+}
+
+// TestDriverSimulationQuestionNegativeControl proves Check notices a durable
+// question that no longer matches the live driver.
+func TestDriverSimulationQuestionNegativeControl(t *testing.T) {
+	model := buildDriverSimulation(nil, 4)
+	defer model.d.Close()
+	stepDriver(t, model, "prompt", "ask")
+
+	broken := model.Clone().(*driverSimulation)
+	defer broken.d.Close()
+	if err := broken.fc.PatchSession(context.Background(), driverSimNamespace, driverSimState, nil, map[string]string{
+		AnnotationQuestion: `{"id":"different","question":"different","askedAt":"2026-01-01T00:00:00Z"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := broken.Check(); err == nil || !strings.Contains(err.Error(), "question") {
+		t.Fatalf("Check accepted a mismatched question annotation: %v", err)
+	}
+	if err := model.Check(); err != nil {
+		t.Fatalf("negative control mutated the original: %v", err)
+	}
 }
 
 // TestDriverCrashRestartScript follows one path past the exploration depth. It

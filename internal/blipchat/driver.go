@@ -36,6 +36,9 @@ const (
 	AnnotationACPSession = "chat.blip.dev/acp-session"
 	AnnotationOffset     = "chat.blip.dev/offset"
 	AnnotationGeneration = "chat.blip.dev/generation"
+	// AnnotationQuestion holds the question the agent is waiting on, so a
+	// restarted blipchat still knows the chat needs an answer.
+	AnnotationQuestion = "chat.blip.dev/question"
 
 	// LabelParent names the chat state that spawned this one. The tree in the
 	// UI and the admission policies both use it.
@@ -57,6 +60,21 @@ var (
 	errMessageTooLong     = errors.New("message is too long")
 	errProfileUnavailable = errors.New("profile is not configured")
 	errStopRequested      = errors.New("stop requested while starting")
+	errQuestionOpen       = errors.New("a question is already waiting for an answer")
+	errQuestionPending    = errors.New("the user has not answered yet")
+	errQuestionCancelled  = errors.New("the user cancelled the question")
+	errNoQuestion         = errors.New("no question is waiting for an answer")
+)
+
+const (
+	// defaultQuestionTimeout is how long ask_user waits for the user before
+	// the tool returns and the agent finishes its turn.
+	defaultQuestionTimeout = 30 * time.Second
+	// defaultQuestionStopDelay is the fallback after a question times out: if
+	// the agent has still not ended its turn, stop the blip so it saves state.
+	defaultQuestionStopDelay = 15 * time.Second
+	maxQuestionBytes         = 4000
+	maxQuestionOptions       = 8
 )
 
 const (
@@ -93,6 +111,9 @@ type queuedPrompt struct {
 	recorded   bool
 	attempts   int
 	acceptedAt time.Time
+	// answer is the ID of the question this prompt answers. A late answer is
+	// delivered as a normal prompt, tagged so the trajectory shows it was one.
+	answer string
 	// keepOnStop marks a prompt accepted after the stop request. Stop drops
 	// prompts queued for the agent being stopped, but a prompt the user sent
 	// during the stop window was accepted with HTTP 202 and must still run.
@@ -148,6 +169,40 @@ type driverOptions struct {
 	// persisted outside the process so a blipchat restart can resume them.
 	Pending        PendingStore
 	PendingPrompts []PendingPrompt
+
+	// Question is the open question restored from the chat's annotation.
+	Question *Question
+	// QuestionTimeout bounds how long ask_user waits. Zero uses the default.
+	QuestionTimeout time.Duration
+	// QuestionStopDelay is the fallback after a timeout. Zero uses the
+	// default; tests shorten it.
+	QuestionStopDelay time.Duration
+}
+
+// Question is a question the agent asked the user. It is persisted as JSON in
+// a BlipState annotation and survives a blipchat restart.
+type Question struct {
+	ID      string    `json:"id"`
+	Text    string    `json:"question"`
+	Options []string  `json:"options,omitempty"`
+	AskedAt time.Time `json:"askedAt"`
+}
+
+func (q *Question) clone() *Question {
+	if q == nil {
+		return nil
+	}
+	out := *q
+	if q.Options != nil {
+		out.Options = append([]string(nil), q.Options...)
+	}
+	return &out
+}
+
+// questionAnswer is what a blocked ask_user receives.
+type questionAnswer struct {
+	text      string
+	cancelled bool
 }
 
 // PendingPrompt is one accepted prompt that has not reached the agent yet.
@@ -233,6 +288,15 @@ type driver struct {
 	cancelStart   bool
 	cancelledTurn bool
 	cancelSeq     uint64
+
+	// question is the open question, if any. questionCh is non-nil while an
+	// ask_user call is still blocked on it; after a timeout the question stays
+	// open but its answer becomes the next prompt instead.
+	question        *Question
+	questionCh      chan questionAnswer
+	questionSeq     uint64
+	questionTimeout time.Duration
+	questionStop    time.Duration
 }
 
 func newDriver(opts driverOptions) *driver {
@@ -265,6 +329,15 @@ func newDriver(opts driverOptions) *driver {
 		pendingStore: opts.Pending,
 		pending:      make(map[string]queuedPrompt),
 		unavailable:  opts.Unavailable,
+		question:     opts.Question.clone(),
+	}
+	d.questionTimeout = opts.QuestionTimeout
+	if d.questionTimeout <= 0 {
+		d.questionTimeout = defaultQuestionTimeout
+	}
+	d.questionStop = opts.QuestionStopDelay
+	if d.questionStop <= 0 {
+		d.questionStop = defaultQuestionStopDelay
 	}
 	for _, raw := range d.transcript {
 		d.txBytes += len(raw)
@@ -321,7 +394,9 @@ func (d *driver) Submit(text string) error { return d.SubmitAs("", text) }
 // SubmitAs queues a prompt and remembers who sent it so the transcript can
 // show a sender on each user message. The profile's message template is
 // applied to the prompt but not to the transcript.
-func (d *driver) SubmitAs(user, text string) error {
+func (d *driver) SubmitAs(user, text string) error { return d.submit(user, text, "") }
+
+func (d *driver) submit(user, text, answer string) error {
 	if d.unavailable != nil {
 		return d.unavailable
 	}
@@ -361,6 +436,7 @@ func (d *driver) SubmitAs(user, text string) error {
 		recorded:   true,
 		acceptedAt: time.Now(),
 		keepOnStop: d.stopRequested,
+		answer:     answer,
 	}
 	d.queue = append(d.queue, q)
 	d.pending[id] = q
@@ -490,6 +566,7 @@ func (d *driver) resume() {
 }
 
 func (d *driver) Cancel() bool {
+	d.cancelQuestion()
 	d.mu.Lock()
 	cancel := d.startCancel
 	if cancel != nil {
@@ -513,6 +590,7 @@ func (d *driver) Cancel() bool {
 
 func (d *driver) Stop() bool {
 	at := time.Now()
+	d.cancelQuestion()
 	d.mu.Lock()
 	d.stopRequested = true
 	cancel := d.startCancel
@@ -565,6 +643,242 @@ func (d *driver) WaitIdle(ctx context.Context, timeout time.Duration) bool {
 		}
 	}
 }
+
+// Question returns the open question, if any.
+func (d *driver) Question() *Question {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.question.clone()
+}
+
+// Ask records a question and waits up to the question timeout for an answer.
+// A timeout is not an error: the question stays open and a later answer is
+// queued as the chat's next prompt.
+func (d *driver) Ask(ctx context.Context, text string, options []string) (string, error) {
+	q, ch, err := d.startQuestion(text, options)
+	if err != nil {
+		return "", err
+	}
+	timer := time.NewTimer(d.questionTimeout)
+	defer timer.Stop()
+	select {
+	case a := <-ch:
+		if a.cancelled {
+			return "", errQuestionCancelled
+		}
+		return a.text, nil
+	case <-ctx.Done():
+		// The agent's request went away, for example because its blip was
+		// stopped. Leave the question open so the user can still answer.
+		d.detachQuestion(q.ID)
+		return "", ctx.Err()
+	case <-timer.C:
+		d.detachQuestion(q.ID)
+		// An answer can land exactly as the timer fires. Deliver it instead
+		// of losing it; otherwise the question stays open for a later turn.
+		select {
+		case a := <-ch:
+			if a.cancelled {
+				return "", errQuestionCancelled
+			}
+			return a.text, nil
+		default:
+		}
+		d.armQuestionStop(q.ID)
+		return "", errQuestionPending
+	}
+}
+
+// Answer resolves the open question. While the agent is blocked on ask_user
+// the answer goes back to that call. After a timeout the answer is queued as
+// the next prompt, which resumes the agent in a new generation.
+func (d *driver) Answer(user, text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return errors.New("answer is required")
+	}
+	d.mu.Lock()
+	q := d.question
+	if q == nil {
+		d.mu.Unlock()
+		return errNoQuestion
+	}
+	ch := d.questionCh
+	if ch == nil && len(d.queue) >= maxQueue {
+		d.mu.Unlock()
+		return errSessionBusy
+	}
+	d.question, d.questionCh = nil, nil
+	if ch != nil {
+		// Send under the lock so a timed-out Ask cannot detach this channel
+		// and drop the answer between the two steps.
+		ch <- questionAnswer{text: text}
+	}
+	d.mu.Unlock()
+
+	if err := d.saveQuestion(nil); err != nil {
+		d.log.Warn("clear question", "err", err)
+	}
+	d.publishQuestion()
+	if ch != nil {
+		// The agent continues in the same turn, so this user turn only exists
+		// in the live transcript; there is no prompt frame to replay.
+		d.recordUser(user, text, "")
+		return nil
+	}
+	label := fmt.Sprintf("Answer to your question %q: %s", shorten(q.Text, 200), text)
+	return d.submit(user, label, q.ID)
+}
+
+func (d *driver) startQuestion(text string, options []string) (*Question, chan questionAnswer, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, nil, errors.New("question is required")
+	}
+	if len(text) > maxQuestionBytes {
+		return nil, nil, errors.New("question is too long")
+	}
+	options = cleanOptions(options)
+	d.mu.Lock()
+	if d.question != nil {
+		d.mu.Unlock()
+		return nil, nil, errQuestionOpen
+	}
+	d.questionSeq++
+	q := &Question{
+		ID:      fmt.Sprintf("%s-q%d", d.state, d.questionSeq),
+		Text:    text,
+		Options: options,
+		AskedAt: time.Now().UTC(),
+	}
+	ch := make(chan questionAnswer, 1)
+	d.question, d.questionCh = q, ch
+	d.mu.Unlock()
+	if err := d.saveQuestion(q); err != nil {
+		d.mu.Lock()
+		if d.question == q {
+			d.question, d.questionCh = nil, nil
+		}
+		d.mu.Unlock()
+		return nil, nil, err
+	}
+	// The user can answer or stop the chat while the annotation write is in
+	// flight. If the question is already gone, do not let that late write
+	// leave a stale annotation behind.
+	d.mu.Lock()
+	stale := d.question == nil
+	d.mu.Unlock()
+	if stale {
+		if err := d.saveQuestion(nil); err != nil {
+			d.log.Warn("clear answered question", "err", err)
+		}
+	}
+	d.publishQuestion()
+	return q, ch, nil
+}
+
+// detachQuestion stops routing answers to a blocked ask_user call without
+// closing the question itself.
+func (d *driver) detachQuestion(id string) {
+	d.mu.Lock()
+	if d.question != nil && d.question.ID == id {
+		d.questionCh = nil
+	}
+	d.mu.Unlock()
+}
+
+// cancelQuestion ends an open question because the user cancelled or stopped
+// the chat. A blocked ask_user returns "cancelled" instead of waiting longer.
+func (d *driver) cancelQuestion() {
+	d.mu.Lock()
+	q, ch := d.question, d.questionCh
+	d.question, d.questionCh = nil, nil
+	d.mu.Unlock()
+	if q == nil {
+		return
+	}
+	if ch != nil {
+		select {
+		case ch <- questionAnswer{cancelled: true}:
+		default:
+		}
+	}
+	if err := d.saveQuestion(nil); err != nil {
+		d.log.Warn("clear question", "err", err)
+	}
+	d.publishQuestion()
+}
+
+// armQuestionStop force-stops the blip when the agent does not end its turn
+// after a question timed out. The question stays open either way.
+func (d *driver) armQuestionStop(id string) {
+	time.AfterFunc(d.questionStop, func() {
+		if d.ctx.Err() != nil {
+			return
+		}
+		d.mu.Lock()
+		open := d.question != nil && d.question.ID == id
+		busy := !d.ended || d.inflight || len(d.queue) > 0
+		d.mu.Unlock()
+		if !open || !busy {
+			return
+		}
+		if err := d.stopBlip(d.ctx); err != nil {
+			d.log.Warn("stop after question timeout", "err", err)
+			return
+		}
+		d.markEnded()
+		d.setStatus("Stopped", false, "agent did not end its turn after a question")
+	})
+}
+
+func (d *driver) saveQuestion(q *Question) error {
+	value := ""
+	if q != nil {
+		data, err := json.Marshal(q)
+		if err != nil {
+			return err
+		}
+		value = string(data)
+	}
+	return d.patchAnnotations(map[string]string{AnnotationQuestion: value})
+}
+
+// publishQuestion re-publishes the current status with the open question so
+// every connected client can show or hide the answer prompt.
+func (d *driver) publishQuestion() {
+	d.mu.Lock()
+	st := d.lastStatus
+	have := d.haveStatus
+	d.mu.Unlock()
+	if have {
+		d.setStatus(st.Phase, st.Running, st.Detail)
+	}
+}
+
+func cleanOptions(options []string) []string {
+	var out []string
+	for _, opt := range options {
+		opt = strings.TrimSpace(opt)
+		if opt == "" {
+			continue
+		}
+		out = append(out, shorten(opt, 200))
+		if len(out) == maxQuestionOptions {
+			break
+		}
+	}
+	return out
+}
+
+func shorten(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit-1]) + "\u2026"
+}
+
 func (d *driver) Snapshot() ([]json.RawMessage, uint64, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1069,7 +1383,7 @@ func (d *driver) advance() {
 		q.recorded = true
 	}
 
-	if err := d.sendPrompt(d.ctx, q.text, q.original, q.user, q.id); err != nil {
+	if err := d.sendPrompt(d.ctx, q.text, q.original, q.user, q.id, q.answer); err != nil {
 		d.mu.Lock()
 		d.inflight = false
 		d.current = nil
@@ -1216,7 +1530,7 @@ func (d *driver) scheduleRetry(attempt int) {
 	})
 }
 
-func (d *driver) sendPrompt(ctx context.Context, text, original, sender, id string) error {
+func (d *driver) sendPrompt(ctx context.Context, text, original, sender, id, answer string) error {
 	meta := map[string]any{}
 	if sender != "" {
 		meta["blip.dev/sender"] = sender
@@ -1228,6 +1542,10 @@ func (d *driver) sendPrompt(ctx context.Context, text, original, sender, id stri
 	}
 	if id != "" {
 		meta["blip.dev/promptID"] = id
+	}
+	if answer != "" {
+		meta["blip.dev/answer"] = "true"
+		meta["blip.dev/questionID"] = answer
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		d.mu.Lock()
@@ -1651,9 +1969,10 @@ func (d *driver) emitOutput(stream string, data []byte) {
 }
 
 func (d *driver) setStatus(phase string, running bool, detail string) {
-	st := Status{Phase: phase, Running: running, Detail: detail}
 	d.mu.Lock()
-	if d.haveStatus && d.lastStatus == st {
+	st := Status{Phase: phase, Running: running, Detail: detail, Question: d.question.clone()}
+	if d.haveStatus && d.lastStatus.Phase == st.Phase && d.lastStatus.Running == st.Running &&
+		d.lastStatus.Detail == st.Detail && questionID(d.lastStatus.Question) == questionID(st.Question) {
 		d.mu.Unlock()
 		return
 	}
@@ -1661,6 +1980,13 @@ func (d *driver) setStatus(phase string, running bool, detail string) {
 	d.haveStatus = true
 	d.mu.Unlock()
 	d.hub.Publish(Event{Type: "status", Status: &st})
+}
+
+func questionID(q *Question) string {
+	if q == nil {
+		return ""
+	}
+	return q.ID
 }
 
 func (d *driver) patchAnnotations(annotations map[string]string) error {

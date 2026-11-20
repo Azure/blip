@@ -1514,3 +1514,68 @@ func TestServerPrivateCreateRequiresOwner(t *testing.T) {
 		t.Fatal("a private chat was created without an owner")
 	}
 }
+
+func TestServerSessionIncludesOpenQuestion(t *testing.T) {
+	s, fc, ts := testServerWithProfiles(t, Profiles{DefaultProfileName: {}})
+	resp := do(t, "POST", ts.URL+"/api/sessions", map[string]any{"profile": DefaultProfileName}, "alice")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: status %d", resp.StatusCode)
+	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	decodeBody(t, resp, &created)
+	q := Question{ID: created.Name + "-q1", Text: "Ship it?", Options: []string{"Yes", "No"}, AskedAt: time.Now().UTC()}
+	data, _ := json.Marshal(q)
+	if err := fc.PatchSession(context.Background(), "team", created.Name, nil,
+		map[string]string{AnnotationQuestion: string(data)}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp = do(t, "GET", ts.URL+"/api/sessions/"+created.Name, nil, "alice")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("detail: status %d", resp.StatusCode)
+	}
+	var detail sessionDetail
+	decodeBody(t, resp, &detail)
+	if detail.Question == nil || detail.Question.Text != "Ship it?" || len(detail.Question.Options) != 2 {
+		t.Fatalf("detail question = %+v", detail.Question)
+	}
+
+	resp = do(t, "GET", ts.URL+"/api/sessions", nil, "alice")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list: status %d", resp.StatusCode)
+	}
+	var list []sessionSummary
+	decodeBody(t, resp, &list)
+	var found bool
+	for _, s := range list {
+		if s.Name == created.Name {
+			found = s.Question != nil && s.Question.ID == q.ID
+		}
+	}
+	if !found {
+		t.Fatalf("list does not include the question: %+v", list)
+	}
+
+	// A message while the question is open is the answer, not a new prompt.
+	resp = do(t, "POST", ts.URL+"/api/sessions/"+created.Name+"/message", map[string]string{"text": "Yes"}, "alice")
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("answer: status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	d, err := s.driverFor(context.Background(), created.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Question() != nil {
+		t.Fatal("message did not answer the question")
+	}
+	st, err := fc.GetSession(context.Background(), "team", created.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Annotations[AnnotationQuestion] != "" {
+		t.Fatalf("question annotation = %q", st.Annotations[AnnotationQuestion])
+	}
+}
