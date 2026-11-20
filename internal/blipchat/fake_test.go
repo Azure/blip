@@ -465,7 +465,11 @@ func (f *fakeWire) end(gen uint64) {
 }
 
 func (f *fakeWire) note(note noteRecord) uint64 {
-	return f.appendRecord(f.gen, recordNote, mustJSON(note))
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	off := f.appendLocked(f.gen, recordNote, mustJSON(note))
+	f.lastSeq = off
+	return off
 }
 
 // MarshalJSON encodes a ring record in the same {o,g,t,d} shape UnmarshalJSON

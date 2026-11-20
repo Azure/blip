@@ -156,6 +156,7 @@ type chatView struct {
 	QuestionGens map[string]uint64
 	Question     *Question
 	QuestionGen  uint64
+	QuestionSeq  uint64
 	Permission   *permissionRef
 
 	CancelSeq    uint64
@@ -520,6 +521,7 @@ func (v *chatView) observeNote(rec streamLogRecord) {
 		v.Questions[q.ID] = q
 		v.Question = q
 		v.QuestionGen = rec.Gen
+		v.QuestionSeq = rec.Offset
 		v.Expired[q.ID] = false
 	case noteConsumed:
 		v.Consumed[note.QID] = true
@@ -585,6 +587,9 @@ func (v *chatView) applyStopBefore(before uint64) {
 		v.StopSeq = v.stopBefore
 	}
 	v.dropPrompts(func(ref promptRef) bool { return ref.Offset < v.stopBefore })
+	if v.Question != nil && v.QuestionSeq < v.stopBefore {
+		v.retireQuestion(v.QuestionGen)
+	}
 	kept := v.Answers[:0]
 	for _, answer := range v.Answers {
 		if answer.Offset >= v.stopBefore {

@@ -1087,37 +1087,11 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
-	view := s.readView(r.Context(), st)
 	// Once accepted, the write must outlive the client connection: starting a
 	// VM can take longer than the browser waits.
 	writeCtx, cancel := messageContext(r)
 	defer cancel()
-	// While a question is open, a message from the composer is its answer.
-	if view.Question != nil {
-		note := noteRecord{Type: noteAnswer, QID: view.Question.ID, Text: text, Sender: user, Gen: view.questionGen(view.Question.ID)}
-		if err := s.appendNote(writeCtx, st, profile, note); err != nil {
-			s.writeNoteError(w, "answer question", name, err)
-			return
-		}
-		s.ensureEngine(name)
-		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
-		return
-	}
-	if len(view.Queued) >= maxQueue {
-		writeError(w, http.StatusServiceUnavailable, "session is busy")
-		return
-	}
-	note, err := s.promptNote(st, profile, user, text)
-	if err != nil {
-		if errors.Is(err, errMessageTooLong) {
-			writeError(w, http.StatusBadRequest, "text is too long")
-			return
-		}
-		s.log.Error("render message", "namespace", s.namespace, "session", name, "err", err)
-		writeError(w, http.StatusInternalServerError, "could not prepare message")
-		return
-	}
-	if err := s.appendNote(writeCtx, st, profile, note); err != nil {
+	if err := s.appendMessage(writeCtx, st, profile, user, text); err != nil {
 		s.writeNoteError(w, "submit message", name, err)
 		return
 	}
