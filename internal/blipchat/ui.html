@@ -128,6 +128,8 @@ Licensed under the MIT License. -->
   .btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-ink); }
   .btn.ghost { border-color: transparent; }
   .btn.ghost:hover:not(:disabled) { background: var(--surface); border-color: transparent; }
+  .btn.danger { color: var(--danger); }
+  .btn.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); background: var(--danger-bg); }
   .btn.wide { width: 100%; }
 
   .new { position: relative; }
@@ -599,6 +601,7 @@ Licensed under the MIT License. -->
       <div id="actions" class="actions" hidden>
         <button id="cancel" class="btn" hidden disabled aria-label="Cancel turn" title="Ask the agent to stop this turn">Cancel</button>
         <button id="stop" class="btn" hidden disabled aria-label="Stop agent" title="Stop the running agent process">Stop</button>
+        <button id="delete" class="btn danger" hidden disabled aria-label="Delete chat" title="Delete this chat and its workspace">Delete</button>
       </div>
     </header>
     <div id="origin" class="origin" hidden></div>
@@ -879,6 +882,7 @@ function setStatus(phase, running, detail) {
   if (!running && /^(succeeded|stopped|ready|saving|inuse)$/.test(text)) text = "idle";
   const canCancel = active && Boolean(running);
   const canStop = active && (Boolean(running) || /^(starting|pending)$/.test(text));
+  const canDelete = active && !running;
   $("status").textContent = text;
   const dot = $("status-dot");
   const failed = /error|failed/.test(text);
@@ -896,13 +900,16 @@ function setStatus(phase, running, detail) {
   state.running = Boolean(running);
   state.phase = text;
   updateSessionStatus();
-  $("actions").hidden = !(canCancel || canStop);
+  $("actions").hidden = !(canCancel || canStop || canDelete);
   $("cancel").hidden = !canCancel;
   $("stop").hidden = !canStop;
+  $("delete").hidden = !canDelete;
   $("cancel").disabled = !canCancel;
   $("stop").disabled = !canStop;
+  $("delete").disabled = !canDelete;
   if ((document.activeElement === $("cancel") && !canCancel) ||
-      (document.activeElement === $("stop") && !canStop)) {
+      (document.activeElement === $("stop") && !canStop) ||
+      (document.activeElement === $("delete") && !canDelete)) {
     $("transcript").focus();
   }
 }
@@ -2065,6 +2072,56 @@ $("stop").onclick = async () => {
   if (!state.current) return;
   try { await api("/api/sessions/" + encodeURIComponent(state.current) + "/stop", { method: "POST", body: {} }); }
   catch (err) { toast(err.message); }
+};
+$("delete").onclick = async () => {
+  const name = state.current;
+  if (!name) return;
+  const known = state.sessions.find((s) => s && s.name === name);
+  const title = (known && known.title) || "New chat";
+  const warning = "Delete \"" + title + "\"? This permanently deletes the chat's workspace and history, including any child chats.";
+  if (!window.confirm(warning)) return;
+  const button = $("delete");
+  button.disabled = true;
+  try {
+    await api("/api/sessions/" + encodeURIComponent(name), { method: "DELETE" });
+  } catch (err) {
+    // A 404 means the chat is already gone, so finish the delete below.
+    if (!err || err.status !== 404) {
+      toast(err && err.message ? err.message : "Could not delete chat.");
+      // The chat stays open. A 409 means the agent started running; the next
+      // status update will hide Delete, but re-enable it now so this click is
+      // not left stuck.
+      if (state.current === name) button.disabled = false;
+      return;
+    }
+  }
+  if (state.current === name) {
+    // Invalidate any in-flight open or resync so a late response cannot
+    // restore the chat we just deleted.
+    openSeq++;
+    state.current = null;
+    state.sessionReady = false;
+    state.pendingDeepLink = "";
+    state.offset = 0;
+    delete state.drafts[name];
+    closeEvents();
+    clearTranscript();
+    showEmpty("No chat open", "Pick a chat from the list, or start a new one.");
+    setOrigin("");
+    setTitle("Blip Chat");
+    $("text").value = "";
+    updateLimit();
+    $("text").disabled = true;
+    $("send").disabled = true;
+    $("profile").hidden = true;
+    $("scope-badge").hidden = true;
+    setQuestion(null);
+    setStatus("no chat", false, "");
+    markActive();
+    setDeepLink("", true);
+  }
+  await loadSessions();
+  toast("Chat deleted.");
 };
 
 const narrowViewport = window.matchMedia("(max-width: 820px)");

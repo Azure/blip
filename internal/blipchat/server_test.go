@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
@@ -376,6 +377,115 @@ func TestServerListHidesPrivateChats(t *testing.T) {
 	}
 }
 
+func TestServerDeleteSession(t *testing.T) {
+	t.Run("idle chat", func(t *testing.T) {
+		g := newGateway(t, Options{})
+		name := g.createChat(t, map[string]any{"profile": DefaultProfileName}, "alice")
+
+		resp := g.request(t, "DELETE", "/api/sessions/"+name, nil, "alice", nil)
+		if resp.StatusCode != http.StatusOK {
+			defer resp.Body.Close()
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("delete: status %d: %s", resp.StatusCode, raw)
+		}
+		if deleted := decodeBody[map[string]bool](t, resp); !deleted["deleted"] {
+			t.Fatalf("delete response = %v", deleted)
+		}
+		if _, err := g.cluster.GetSession(context.Background(), "team", name); !apierrors.IsNotFound(err) {
+			t.Fatalf("state exists after delete: err = %v", err)
+		}
+
+		resp = g.request(t, "GET", "/api/sessions", nil, "alice", nil)
+		if resp.StatusCode != http.StatusOK {
+			defer resp.Body.Close()
+			t.Fatalf("list: status %d", resp.StatusCode)
+		}
+		for _, s := range decodeBody[[]sessionSummary](t, resp) {
+			if s.Name == name {
+				t.Fatalf("deleted chat %s is still listed", name)
+			}
+		}
+	})
+
+	t.Run("running chat", func(t *testing.T) {
+		g := newGateway(t, Options{})
+		name := g.createChat(t, map[string]any{"profile": DefaultProfileName}, "alice")
+		g.addRunningBlip(t, name)
+
+		resp := g.request(t, "DELETE", "/api/sessions/"+name, nil, "alice", nil)
+		if resp.StatusCode != http.StatusConflict {
+			defer resp.Body.Close()
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("delete running chat: status %d: %s", resp.StatusCode, raw)
+		}
+		body := decodeBody[map[string]string](t, resp)
+		if !strings.Contains(body["error"], "stop the agent") {
+			t.Fatalf("delete running chat error = %v", body)
+		}
+		if _, err := g.cluster.GetSession(context.Background(), "team", name); err != nil {
+			t.Fatalf("running chat was deleted: %v", err)
+		}
+	})
+
+	t.Run("private chat", func(t *testing.T) {
+		g := newGateway(t, Options{})
+		name := g.createChat(t, map[string]any{"profile": DefaultProfileName, "scope": "user"}, "alice")
+
+		resp := g.request(t, "DELETE", "/api/sessions/"+name, nil, "bob", nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("delete another user's chat: status %d, want 404", resp.StatusCode)
+		}
+		if _, err := g.cluster.GetSession(context.Background(), "team", name); err != nil {
+			t.Fatalf("private chat was deleted: %v", err)
+		}
+	})
+
+	t.Run("fork mount copy", func(t *testing.T) {
+		g := newGateway(t, Options{})
+		copied := &v1.BlipState{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "team",
+			Name:      "chat-copy",
+			Labels:    map[string]string{LabelSession: "true"},
+		}}
+		if err := g.cluster.CreateSession(context.Background(), "team", copied); err != nil {
+			t.Fatal(err)
+		}
+
+		resp := g.request(t, "DELETE", "/api/sessions/"+copied.Name, nil, "alice", nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("delete fork mount copy: status %d, want 404", resp.StatusCode)
+		}
+		if _, err := g.cluster.GetSession(context.Background(), "team", copied.Name); err != nil {
+			t.Fatalf("fork mount copy was deleted: %v", err)
+		}
+	})
+
+	t.Run("deleting chat", func(t *testing.T) {
+		g := newGateway(t, Options{})
+		name := g.createChat(t, map[string]any{"profile": DefaultProfileName}, "alice")
+		g.cluster.markDeleting(t, "team", name)
+
+		resp := g.request(t, "GET", "/api/sessions/"+name, nil, "alice", nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("get deleting chat: status %d, want 404", resp.StatusCode)
+		}
+
+		resp = g.request(t, "GET", "/api/sessions", nil, "alice", nil)
+		if resp.StatusCode != http.StatusOK {
+			defer resp.Body.Close()
+			t.Fatalf("list: status %d", resp.StatusCode)
+		}
+		for _, s := range decodeBody[[]sessionSummary](t, resp) {
+			if s.Name == name {
+				t.Fatalf("deleting chat %s is still listed", name)
+			}
+		}
+	})
+}
+
 func TestServerCreateSessionMetadata(t *testing.T) {
 	g := newGateway(t, Options{Profiles: Profiles{
 		DefaultProfileName: {},
@@ -685,7 +795,9 @@ func TestServerMethodsNotFoundAndProbes(t *testing.T) {
 
 	for _, tc := range []struct{ method, path, allow string }{
 		{"DELETE", "/api/sessions", "GET, POST, HEAD"},
+		{"PUT", "/api/sessions/chat-any", "GET, DELETE, HEAD"},
 		{"GET", "/api/sessions/chat-any/message", "POST"},
+		{"DELETE", "/api/sessions/chat-any/message", "POST"},
 		{"POST", "/api/sessions/chat-any/events", "GET, HEAD"},
 		{"PUT", "/api/me", "GET, HEAD"},
 		{"POST", "/healthz", "GET, HEAD"},

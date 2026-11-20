@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -55,6 +57,9 @@ func (f *fakeCluster) ListSessions(_ context.Context, ns string) ([]v1.BlipState
 	defer f.mu.Unlock()
 	var out []v1.BlipState
 	for _, s := range f.states {
+		if s.DeletionTimestamp != nil {
+			continue
+		}
 		if s.Namespace == ns && s.Labels[LabelSession] == "true" && isChatState(s) {
 			out = append(out, *copyState(s))
 		}
@@ -82,6 +87,21 @@ func (f *fakeCluster) GetSession(_ context.Context, ns, name string) (*v1.BlipSt
 		return nil, apierrors.NewNotFound(schema.GroupResource{Group: "blip.dev", Resource: "blipstates"}, name)
 	}
 	return copyState(s), nil
+}
+
+func (f *fakeCluster) DeleteSession(_ context.Context, ns, name string, uid types.UID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.states[key(ns, name)]
+	if !ok {
+		return apierrors.NewNotFound(schema.GroupResource{Group: "blip.dev", Resource: "blipstates"}, name)
+	}
+	if uid != "" && st.UID != "" && st.UID != uid {
+		return apierrors.NewConflict(schema.GroupResource{Group: "blip.dev", Resource: "blipstates"}, name,
+			fmt.Errorf("the UID in the precondition (%s) does not match the UID in record (%s)", uid, st.UID))
+	}
+	delete(f.states, key(ns, name))
+	return nil
 }
 
 func (f *fakeCluster) CreateSession(_ context.Context, ns string, s *v1.BlipState) error {
@@ -659,6 +679,21 @@ func newChat(cluster *fakeCluster, name, profile string) *v1.BlipState {
 	cluster.states[key(st.Namespace, name)] = st
 	cluster.mu.Unlock()
 	return st
+}
+
+// markDeleting persists a deletion timestamp on a stored state, as the API
+// server does once a delete request has been accepted.
+func (f *fakeCluster) markDeleting(t *testing.T, ns, name string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.states[key(ns, name)]
+	if !ok {
+		t.Fatalf("state %s/%s not found", ns, name)
+	}
+	now := metav1.Now()
+	st.DeletionTimestamp = &now
+	st.Finalizers = append(st.Finalizers, "blip.dev/test")
 }
 
 func waitFor(t *testing.T, what string, fn func() bool) {

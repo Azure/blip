@@ -208,6 +208,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	api.HandleFunc("GET /api/profiles", s.handleProfiles)
 	api.HandleFunc("GET /api/sessions/{name}", s.handleGetSession)
+	api.HandleFunc("DELETE /api/sessions/{name}", s.handleDeleteSession)
 	api.HandleFunc("GET /api/sessions/{name}/events", s.handleEvents)
 	api.HandleFunc("POST /api/sessions/{name}/message", s.handleMessage)
 	api.HandleFunc("POST /api/sessions/{name}/cancel", s.handleCancel)
@@ -218,7 +219,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("/api/me", methodNotAllowed("GET"))
 	api.HandleFunc("/api/sessions", methodNotAllowed("GET, POST"))
 	api.HandleFunc("/api/profiles", methodNotAllowed("GET"))
-	api.HandleFunc("/api/sessions/{name}", methodNotAllowed("GET"))
+	api.HandleFunc("/api/sessions/{name}", methodNotAllowed("GET, DELETE"))
 	api.HandleFunc("/api/sessions/{name}/events", methodNotAllowed("GET"))
 	api.HandleFunc("/api/sessions/{name}/message", methodNotAllowed("POST"))
 	api.HandleFunc("/api/sessions/{name}/cancel", methodNotAllowed("POST"))
@@ -990,6 +991,11 @@ func (s *Server) chatState(ctx context.Context, ns, name string) (*v1.BlipState,
 	if st.Labels[LabelSession] != "true" || !isChatState(st) {
 		return nil, apierrors.NewNotFound(v1.GroupVersion.WithResource("blipstates").GroupResource(), name)
 	}
+	// A chat that is being deleted is gone as far as the API is concerned, so
+	// the UI stops reading it instead of racing the finalizer.
+	if st.DeletionTimestamp != nil {
+		return nil, apierrors.NewNotFound(v1.GroupVersion.WithResource("blipstates").GroupResource(), name)
+	}
 	return st, nil
 }
 
@@ -1175,6 +1181,38 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+}
+
+// handleDeleteSession deletes a chat and its owned child chats. It refuses
+// while the agent is still running so the user stops it explicitly first.
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.sessionArgs(w, r)
+	if !ok {
+		return
+	}
+	st, err := s.authorizedChat(r.Context(), forwardedUser(r), name)
+	if err != nil {
+		writeClusterError(w, err)
+		return
+	}
+	blips, err := s.cluster.ListStateBlips(r.Context(), s.namespace, name)
+	if err != nil {
+		writeClusterError(w, err)
+		return
+	}
+	if summarize(st, blips).Running {
+		writeError(w, http.StatusConflict, "stop the agent before deleting this chat")
+		return
+	}
+	if err := s.cluster.DeleteSession(r.Context(), s.namespace, name, st.UID); err != nil && !apierrors.IsNotFound(err) {
+		writeClusterError(w, err)
+		return
+	}
+	if e := s.lookupEngine(name); e != nil {
+		s.finishEngine(e)
+	}
+	s.invalidateView(name)
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
 // handleEvents follows the ring and converts each record to the same SSE event

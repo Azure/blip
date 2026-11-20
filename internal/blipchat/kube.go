@@ -27,6 +27,7 @@ type Cluster interface {
 	ListSessions(ctx context.Context, namespace string) ([]v1.BlipState, error)
 	ListStates(ctx context.Context, namespace string, selector labels.Selector) ([]v1.BlipState, error)
 	GetSession(ctx context.Context, namespace, name string) (*v1.BlipState, error)
+	DeleteSession(ctx context.Context, namespace, name string, uid types.UID) error
 	CreateSession(ctx context.Context, namespace string, state *v1.BlipState) error
 	ForkSession(ctx context.Context, namespace string, source, dest *v1.BlipState, owner *metav1.OwnerReference) error
 	ListChildSessions(ctx context.Context, namespace, parent string) ([]v1.BlipState, error)
@@ -65,6 +66,9 @@ func (k *kubeCluster) ListSessions(ctx context.Context, namespace string) ([]v1.
 	}
 	out := list.Items[:0]
 	for i := range list.Items {
+		if list.Items[i].DeletionTimestamp != nil {
+			continue
+		}
 		if isChatState(&list.Items[i]) {
 			out = append(out, list.Items[i])
 		}
@@ -86,6 +90,11 @@ func (k *kubeCluster) GetSession(ctx context.Context, namespace, name string) (*
 		return nil, err
 	}
 	return &state, nil
+}
+
+func (k *kubeCluster) DeleteSession(ctx context.Context, namespace, name string, uid types.UID) error {
+	obj := &v1.BlipState{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
+	return k.c.Delete(ctx, obj, client.Preconditions{UID: &uid})
 }
 
 func (k *kubeCluster) CreateSession(ctx context.Context, namespace string, state *v1.BlipState) error {

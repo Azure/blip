@@ -10,6 +10,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -177,5 +178,26 @@ func TestKubePatchSession(t *testing.T) {
 	}
 	if st.Labels[LabelSession] != "true" || st.Annotations[AnnotationStart] != "42" {
 		t.Fatalf("state = %+v", st.ObjectMeta)
+	}
+}
+
+func TestKubeDeleteSession(t *testing.T) {
+	ctx := context.Background()
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
+		&v1.BlipState{ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "chat-1", UID: "uid-1"}},
+	).Build()
+	k := &kubeCluster{c: c}
+
+	// The fake client ignores UID preconditions, so the mismatch case is
+	// covered by the API handler tests instead.
+	if err := k.DeleteSession(ctx, "team", "chat-1", "uid-1"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if _, err := k.GetSession(ctx, "team", "chat-1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("state exists after delete: %v", err)
+	}
+
+	if err := k.DeleteSession(ctx, "team", "chat-missing", "uid-any"); !apierrors.IsNotFound(err) {
+		t.Fatalf("DeleteSession missing = %v, want NotFound", err)
 	}
 }
