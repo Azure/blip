@@ -1226,6 +1226,59 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer heartbeat.Stop()
 	next := after
 	last := after
+	// The guest stops writing before Kubernetes finishes saving the state.
+	// Refresh lifecycle independently of log traffic, including while the log
+	// endpoint is unavailable. These snapshots retain the delivered ring cursor;
+	// reading a newer snapshot must not acknowledge unread transcript records.
+	poll := time.NewTicker(statusPoll)
+	defer poll.Stop()
+	var lastStatus string
+	var statusNewest uint64
+	publishStatus := func() bool {
+		readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		current, err := s.authorizedChat(readCtx, forwardedUser(r), name)
+		if err != nil {
+			if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) || ctx.Err() != nil {
+				return false
+			}
+			s.log.Debug("read event status", "session", name, "err", err)
+			return true
+		}
+		blips, err := s.cluster.ListStateBlips(readCtx, s.namespace, name)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
+			s.log.Debug("list event blips", "session", name, "err", err)
+			return true
+		}
+		snapshot := s.readView(readCtx, current)
+		if readCtx.Err() != nil {
+			return ctx.Err() == nil
+		}
+		statusNewest = snapshot.Newest
+		summary := reconcileSessionSummary(summarize(current, blips), snapshot)
+		status := &Status{
+			Phase: summary.Phase, Running: summary.Running,
+			Detail: summary.StatusMessage, Question: snapshot.Question,
+		}
+		data, err := json.Marshal(status)
+		if err != nil {
+			return false
+		}
+		if string(data) == lastStatus {
+			return true
+		}
+		if !writeSSE(w, flusher, Event{Offset: last, Type: "status", Status: status}) {
+			return false
+		}
+		lastStatus = string(data)
+		return true
+	}
+	if !publishStatus() {
+		return
+	}
 	for {
 		rc, err := s.wire.OpenLog(ctx, s.namespace, name, next)
 		if err != nil {
@@ -1236,6 +1289,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-poll.C:
+				if !publishStatus() {
+					return
+				}
 			case <-heartbeat.C:
 				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 					return
@@ -1250,6 +1307,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-poll.C:
+				if !publishStatus() {
+					return
+				}
 			case <-heartbeat.C:
 				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 					return
@@ -1268,20 +1329,35 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				view.observe(res.rec)
+				seen = true
+				last = res.rec.Offset
+				next = res.rec.Offset
 				for _, ev := range eventsFor(res.rec, view) {
+					if ev.Type == "status" {
+						// Ring events wake lifecycle publication, but their
+						// historical status must not replace the current one.
+						if res.rec.Offset > statusNewest {
+							s.invalidateView(name)
+						}
+						if !publishStatus() {
+							return
+						}
+						continue
+					}
 					if !writeSSE(w, flusher, ev) {
 						return
 					}
 				}
-				seen = true
-				last = res.rec.Offset
-				next = res.rec.Offset
 			}
 		}
 	reconnect:
 		select {
 		case <-ctx.Done():
 			return
+		case <-poll.C:
+			if !publishStatus() {
+				return
+			}
 		case <-time.After(readRetry):
 		}
 	}

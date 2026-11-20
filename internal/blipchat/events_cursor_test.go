@@ -27,6 +27,10 @@ type cursorTestWire struct {
 	offsets []uint64
 }
 
+func (w *cursorTestWire) ReadLog(context.Context, string, string, uint64) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
 func (w *cursorTestWire) OpenLog(ctx context.Context, _, _ string, offset uint64) (io.ReadCloser, error) {
 	w.offsets = append(w.offsets, offset)
 	if len(w.offsets) == 1 {
@@ -47,22 +51,24 @@ func TestServerEventsCursorNeverMovesBackward(t *testing.T) {
 		{
 			name: "one past newest waits", after: 26,
 			lines:      "{\"t\":\"gap\",\"o\":25}\n{\"t\":\"start\",\"o\":25}\n",
+			wantIDs:    []string{"id: 26"},
 			wantCursor: 26,
 		},
 		{
 			name: "maximum cursor waits", after: ^uint64(0),
 			lines:      "{\"t\":\"gap\",\"o\":25}\n{\"t\":\"start\",\"o\":25}\n",
+			wantIDs:    []string{fmt.Sprintf("id: %d", ^uint64(0))},
 			wantCursor: ^uint64(0),
 		},
 		{
 			name: "future record resumes strictly after cursor", after: 26,
 			lines:   "{\"t\":\"gap\",\"o\":25}\n{\"t\":\"start\",\"o\":26}\n{\"t\":\"end\",\"o\":27}\n",
-			wantIDs: []string{"id: 27"}, wantCursor: 27,
+			wantIDs: []string{"id: 26"}, wantCursor: 27,
 		},
 		{
 			name: "real ring loss still resynchronizes", after: 1,
 			lines:   "{\"t\":\"gap\",\"o\":25}\n{\"t\":\"end\",\"o\":27}\n",
-			wantIDs: []string{"id: 25", "id: 27"}, wantCursor: 27,
+			wantIDs: []string{"id: 1", "id: 25"}, wantCursor: 27,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -75,7 +81,7 @@ func TestServerEventsCursorNeverMovesBackward(t *testing.T) {
 				Labels:      map[string]string{LabelSession: "true", v1.LabelOwner: "alice"},
 				Annotations: map[string]string{AnnotationProfile: DefaultProfileName},
 			}}
-			s := &Server{namespace: "team", cluster: cluster, wire: wire, log: testLogger()}
+			s := &Server{namespace: "team", cluster: cluster, wire: wire, log: testLogger(), views: make(map[string]cachedChatView)}
 			req := httptest.NewRequest("GET", fmt.Sprintf("/api/sessions/chat-test/events?offset=%d", tt.after), nil).WithContext(ctx)
 			req.SetPathValue("name", "chat-test")
 			req.Header.Set("X-Forwarded-User", "alice")
@@ -85,6 +91,8 @@ func TestServerEventsCursorNeverMovesBackward(t *testing.T) {
 				t.Fatalf("OpenLog cursors = %v, want [%d %d]; response: %s", wire.offsets, tt.after, tt.wantCursor, recorder.Body.String())
 			}
 			var ids []string
+			// The initial canonical status keeps the requested cursor. End
+			// records need not emit another identical lifecycle snapshot.
 			for _, line := range strings.Split(recorder.Body.String(), "\n") {
 				if strings.HasPrefix(line, "id: ") {
 					ids = append(ids, line)
