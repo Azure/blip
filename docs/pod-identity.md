@@ -82,7 +82,9 @@ Front-proxy identity headers require a client certificate verified against the
 kube-apiserver's published front-proxy CA. The node agent reads
 `requestheader-client-ca-file`, `requestheader-allowed-names`, and
 `client-ca-file` from the `kube-system/extension-apiserver-authentication`
-ConfigMap, so every node can verify the API server without a host path. When
+ConfigMap, so every node can verify the API server without a host path. The
+API server publishes `requestheader-allowed-names` as a JSON array; an empty
+array accepts any name the front-proxy CA issued. When
 that ConfigMap has no request-header CA, the node agent rejects proxy headers
 entirely and falls back to direct certificate or bearer-token authentication.
 `--stream-client-ca` can name a CA file to override both CAs on clusters that do

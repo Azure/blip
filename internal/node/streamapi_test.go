@@ -155,7 +155,7 @@ func TestParseClientAuth(t *testing.T) {
 	clientCA := newTestCA(t)
 	auth, err := parseClientAuth(map[string]string{
 		"requestheader-client-ca-file": string(headerCA.pem),
-		"requestheader-allowed-names":  "front-proxy-client, system:master, ",
+		"requestheader-allowed-names":  `["front-proxy-client", "system:master"]`,
 		"client-ca-file":               string(clientCA.pem),
 	})
 	if err != nil {
@@ -182,6 +182,24 @@ func TestParseClientAuth(t *testing.T) {
 	}
 	if auth.requestHeaderCA != nil || auth.clientCA == nil || len(auth.allowedNames) != 0 {
 		t.Fatalf("missing request-header CA = %+v", auth)
+	}
+
+	// An empty JSON array, as AKS publishes, accepts any name the CA issued.
+	auth, err = parseClientAuth(map[string]string{
+		"requestheader-allowed-names": "[]",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(auth.allowedNames) != 0 {
+		t.Fatalf("empty allowed names = %q", auth.allowedNames)
+	}
+
+	// Malformed JSON is an error so a reload keeps the previous credentials.
+	if _, err := parseClientAuth(map[string]string{
+		"requestheader-allowed-names": "front-proxy-client",
+	}); err == nil {
+		t.Fatal("invalid allowed names was accepted")
 	}
 
 	// An unparseable bundle is an error so the previous credentials stay.
@@ -224,7 +242,7 @@ func TestReloadClientAuthSwapsCA(t *testing.T) {
 	cm.ResourceVersion = "2"
 	cm.Data = map[string]string{
 		"requestheader-client-ca-file": string(second.pem),
-		"requestheader-allowed-names":  "front-proxy-client",
+		"requestheader-allowed-names":  `["front-proxy-client"]`,
 	}
 	if _, err := client.CoreV1().ConfigMaps(authConfigMapNamespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
@@ -307,7 +325,7 @@ func TestStreamAuthFromConfigMap(t *testing.T) {
 	}
 	cm.ResourceVersion = "2"
 	cm.Data["requestheader-client-ca-file"] = string(headerCA.pem)
-	cm.Data["requestheader-allowed-names"] = "front-proxy-client"
+	cm.Data["requestheader-allowed-names"] = `["front-proxy-client"]`
 	if _, err := clientSet.CoreV1().ConfigMaps(authConfigMapNamespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -319,5 +337,24 @@ func TestStreamAuthFromConfigMap(t *testing.T) {
 	}
 	if rec := srv.do(t, other, "admin"); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("disallowed proxy CN: status %d: %s", rec.Code, rec.Body)
+	}
+
+	// An empty JSON array, as AKS publishes, accepts any name the
+	// request-header CA issued, including the aggregator's certificate.
+	aggregator := headerCA.issue(t, "kube-aggregator")
+	cm, err = clientSet.CoreV1().ConfigMaps(authConfigMapNamespace).Get(ctx, authConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm.ResourceVersion = "3"
+	cm.Data["requestheader-allowed-names"] = "[]"
+	if _, err := clientSet.CoreV1().ConfigMaps(authConfigMapNamespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reloadClientAuth(ctx, clientSet, srv.server, "2", log); err != nil {
+		t.Fatal(err)
+	}
+	if rec := srv.do(t, aggregator, "admin"); rec.Code != http.StatusOK || srv.user.GetName() != "admin" {
+		t.Fatalf("aggregator proxy: status %d, user %+v: %s", rec.Code, srv.user, rec.Body)
 	}
 }

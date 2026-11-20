@@ -6,6 +6,7 @@ package node
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -92,7 +93,9 @@ type clientAuthSettings struct {
 
 // parseClientAuth reads the ConfigMap keys that configure front-proxy
 // authentication. A missing request-header CA is not an error: it disables
-// proxy identity headers.
+// proxy identity headers. The API server publishes requestheader-allowed-names
+// as a JSON array of common names; an empty array accepts any name the
+// request-header CA issued.
 func parseClientAuth(data map[string]string) (clientAuthSettings, error) {
 	var auth clientAuthSettings
 	var err error
@@ -106,9 +109,9 @@ func parseClientAuth(data map[string]string) (clientAuthSettings, error) {
 			return clientAuthSettings{}, fmt.Errorf("client-ca-file: %w", err)
 		}
 	}
-	for _, name := range strings.Split(data["requestheader-allowed-names"], ",") {
-		if name = strings.TrimSpace(name); name != "" {
-			auth.allowedNames = append(auth.allowedNames, name)
+	if names := strings.TrimSpace(data["requestheader-allowed-names"]); names != "" {
+		if err := json.Unmarshal([]byte(names), &auth.allowedNames); err != nil {
+			return clientAuthSettings{}, fmt.Errorf("requestheader-allowed-names: %w", err)
 		}
 	}
 	return auth, nil
