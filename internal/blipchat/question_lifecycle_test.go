@@ -245,7 +245,8 @@ func TestQuestionLifecycleCancelledMCPExpiresOnlyOwnQuestion(t *testing.T) {
 				t.Errorf("cancelled ask_user did not durably expire its question: %+v", fw.notes())
 			}
 			s.invalidateView(st.Name)
-			q := s.readView(context.Background(), st).Question
+			view, _ := s.readView(context.Background(), st)
+			q := view.Question
 			if fresh {
 				if q == nil || q.ID != "q-fresh" {
 					t.Errorf("old MCP cleanup changed the fresh question: %+v", q)

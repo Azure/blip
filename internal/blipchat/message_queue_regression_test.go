@@ -148,7 +148,7 @@ func TestServerMessageConcurrentQueueBound(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.invalidateView(st.Name)
-			view := s.readView(context.Background(), st)
+			view, _ := s.readView(context.Background(), st)
 			wantAccepted := min(tc.requests, maxQueue-tc.queued)
 			if accepted != wantAccepted || busy != tc.requests-wantAccepted || len(view.Queued) > maxQueue {
 				t.Fatalf("accepted=%d busy=%d queued=%d inflight=%v; want accepted=%d busy=%d queued<=%d", accepted, busy, len(view.Queued), view.Inflight != nil, wantAccepted, tc.requests-wantAccepted, maxQueue)
@@ -215,7 +215,7 @@ func TestServerMessageQueueIgnoresStaleDisplayCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stale := s.readView(context.Background(), st)
+	stale, _ := s.readView(context.Background(), st)
 	wire.note(noteRecord{Type: notePrompt, ID: "last-slot", Text: "waiting"})
 	if got := postQueueMessage(handler); got != http.StatusServiceUnavailable {
 		t.Fatalf("full queue with cached spare slot status=%d, want 503", got)

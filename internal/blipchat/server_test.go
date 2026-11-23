@@ -307,7 +307,8 @@ func (g *testGateway) waitReply(t *testing.T, name, substr string) {
 		if err != nil {
 			return false
 		}
-		return strings.Contains(g.srv.readView(context.Background(), st).Reply, substr)
+		view, _ := g.srv.readView(context.Background(), st)
+		return strings.Contains(view.Reply, substr)
 	})
 }
 
@@ -1047,7 +1048,7 @@ func TestCreateChatForkStartsAfterParent(t *testing.T) {
 	if start != tail {
 		t.Fatalf("start = %d, want parent tail %d", start, tail)
 	}
-	view := g.srv.readView(ctx, created)
+	view, _ := g.srv.readView(ctx, created)
 	if len(view.Transcript) != 0 || view.Newest != 0 {
 		t.Fatalf("fork replayed parent history: transcript=%d newest=%d", len(view.Transcript), view.Newest)
 	}

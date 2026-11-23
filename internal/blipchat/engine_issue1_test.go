@@ -112,7 +112,8 @@ func TestIssue1EnsureRunningTimeoutReusesLateGeneration(t *testing.T) {
 		f.wire.emitACP(1, map[string]any{"jsonrpc": "2.0", "id": "p-n1", "result": map[string]any{"stopReason": "end_turn"}})
 		f.wire.end(1)
 		f.cluster.setActive("default", f.name, string(v1.BlipSucceeded))
-		e := &chatEngine{s: f.srv, name: f.name, view: f.srv.readView(ctx, st)}
+		view, _ := f.srv.readView(ctx, st)
+		e := &chatEngine{s: f.srv, name: f.name, view: view}
 		if err := e.converge(ctx); err != errEngineIdle {
 			t.Fatalf("completed g1 converge = %v, want idle", err)
 		}
@@ -213,7 +214,7 @@ func TestIssue1StopPendingGenerationDoesNotWaitForStartup(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				stale := f.srv.readView(context.Background(), oldST)
+				stale, _ := f.srv.readView(context.Background(), oldST)
 				req := httptest.NewRequest(http.MethodPost, "/api/sessions/"+f.name+"/stop", nil)
 				req.Header.Set("X-Forwarded-User", "alice")
 				resp := httptest.NewRecorder()
@@ -240,7 +241,7 @@ func TestIssue1StopPendingGenerationDoesNotWaitForStartup(t *testing.T) {
 				// Model a second replica whose cached view predates the stop. Fresh
 				// state metadata must invalidate that view even before its TTL ends.
 				f.srv.views[f.name] = cachedChatView{view: stale, at: time.Now()}
-				view := f.srv.readView(context.Background(), st)
+				view, _ := f.srv.readView(context.Background(), st)
 				if view.hasWork() || stopBefore(st) == 0 {
 					t.Fatalf("pending queue was not durably cancelled: work=%v boundary=%d", view.hasWork(), stopBefore(st))
 				}

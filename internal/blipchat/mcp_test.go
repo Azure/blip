@@ -397,7 +397,7 @@ func TestMCPAskUser(t *testing.T) {
 			ctx := context.Background()
 			deadline := time.Now().Add(5 * time.Second)
 			for time.Now().Before(deadline) {
-				view := gw.srv.readView(ctx, caller)
+				view, _ := gw.srv.readView(ctx, caller)
 				if q := view.Question; q != nil {
 					_, err := gw.srv.writeNote(ctx, caller.Name, noteRecord{
 						Type: noteAnswer, QID: q.ID, Text: "Yes", Sender: "browser", Gen: view.Gen,

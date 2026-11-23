@@ -582,7 +582,7 @@ func withQuestion(ctx context.Context, s *Server, st *v1.BlipState, summary sess
 	if !summary.Running {
 		return summary
 	}
-	view := s.readView(ctx, st)
+	view, _ := s.readView(ctx, st)
 	summary.Question = view.Question
 	return reconcileSessionSummary(summary, view)
 }
@@ -1005,7 +1005,16 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	// The ring is the durable transcript and event log; there is no per-pod
 	// driver state to lose. Offset is the newest record so a client can open
 	// the event stream exactly where this snapshot ends.
-	view := s.readView(r.Context(), st)
+	view, ok := s.displayView(r.Context(), st)
+	if !ok {
+		// A failed, partial, or empty-despite-history replay must never be
+		// presented as the conversation. The UI treats 5xx as transient and
+		// retries; serving an empty transcript would instead claim the chat
+		// has no messages and enable the composer against it.
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "the chat transcript is temporarily unavailable")
+		return
+	}
 	detail.Transcript = view.Transcript
 	if detail.Transcript == nil {
 		detail.Transcript = []json.RawMessage{}
@@ -1373,9 +1382,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			s.log.Debug("list event blips", "session", name, "err", err)
 			return true
 		}
-		snapshot := s.readView(readCtx, current)
+		snapshot, ok := s.displayView(readCtx, current)
 		if readCtx.Err() != nil {
 			return ctx.Err() == nil
+		}
+		if !ok {
+			// Keep the last published lifecycle snapshot instead of deriving
+			// a phase, question, or cursor from an untrustworthy replay.
+			s.log.Debug("event status snapshot unavailable", "session", name)
+			return true
 		}
 		statusNewest = snapshot.Newest
 		summary := reconcileSessionSummary(summarize(current, blips), snapshot)

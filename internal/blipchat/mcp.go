@@ -392,7 +392,7 @@ func (s *Server) toolListAgents(ctx context.Context, caller *Caller) (string, er
 			return "", err
 		}
 		summary := summarize(&children[i], blips)
-		view := s.readView(ctx, &children[i])
+		view, _ := s.readView(ctx, &children[i])
 		phase, running := summary.Phase, view.busy()
 		if running && phase != string(v1.BlipRunning) {
 			phase = string(v1.BlipPending)
@@ -419,7 +419,7 @@ func (s *Server) toolGetAgent(ctx context.Context, caller *Caller, id string, wa
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		view := s.readView(ctx, st)
+		view, _ := s.readView(ctx, st)
 		// A prompt can be queued before the engine has sent it, so "busy"
 		// alone reports a child idle while it still has work to do.
 		if !view.hasWork() || view.Question != nil || wait == 0 || time.Now().After(deadline) {
@@ -435,7 +435,7 @@ func (s *Server) toolGetAgent(ctx context.Context, caller *Caller, id string, wa
 	if err != nil {
 		return "", err
 	}
-	view := s.readView(ctx, st)
+	view, _ := s.readView(ctx, st)
 	summary := summarize(st, blips)
 	running := view.busy()
 	phase := summary.Phase
@@ -475,7 +475,7 @@ func (s *Server) toolAskUser(ctx context.Context, caller *Caller, question strin
 	if err != nil {
 		return "", err
 	}
-	view := s.readView(ctx, st)
+	view, _ := s.readView(ctx, st)
 	if view.Question != nil {
 		return "", errors.New("another question is already waiting for an answer")
 	}
@@ -502,7 +502,7 @@ func (s *Server) toolAskUser(ctx context.Context, caller *Caller, question strin
 			return "", ctx.Err()
 		case <-time.After(statusPoll):
 		}
-		view = s.readView(ctx, st)
+		view, _ = s.readView(ctx, st)
 		for _, answer := range view.Answers {
 			if answer.QID == q.ID {
 				// Tell the driver this answer was delivered in-band so it is
@@ -534,7 +534,7 @@ func (s *Server) toolSendAgent(ctx context.Context, caller *Caller, id, prompt s
 	if err != nil {
 		return "", err
 	}
-	view := s.readView(ctx, st)
+	view, _ := s.readView(ctx, st)
 	if view.Question != nil {
 		note := noteRecord{Type: noteAnswer, QID: view.Question.ID, Text: prompt, Sender: agentSender(caller), Gen: view.questionGen(view.Question.ID)}
 		if err := s.appendNote(ctx, st, profile, note); err != nil {

@@ -831,22 +831,35 @@ func (s *Server) invalidateView(name string) {
 	s.viewsMu.Unlock()
 }
 
-func (s *Server) readView(ctx context.Context, st *v1.BlipState) *chatView {
+// readView replays a chat's whole ring. ok reports whether the replay reached
+// the end of the log: a read error or a decoder that stops before EOF leaves a
+// partial view that must never be served as the conversation or cached as the
+// chat's latest state.
+func (s *Server) readView(ctx context.Context, st *v1.BlipState) (*chatView, bool) {
 	if v := s.cachedView(st.Name); v != nil && v.stopBefore >= stopBefore(st) {
-		return v
+		return v, true
 	}
 	v := newChatView(st.Annotations[AnnotationACPSession])
 	rc, err := s.wire.ReadLog(ctx, s.namespace, st.Name, chatStart(st))
 	if err != nil {
+		if apierrors.IsNotFound(err) || errors.Is(err, ErrNotRunning) {
+			// A chat that has not run yet has no trajectory, which is a
+			// genuinely empty view rather than a failed read.
+			v.applyStopBefore(stopBefore(st))
+			return v, true
+		}
 		s.log.Debug("read chat log", "session", st.Name, "err", err)
-		return v
+		return v, false
 	}
 	defer rc.Close()
 	dec := json.NewDecoder(rc)
+	complete := false
 	for {
 		var rec streamLogRecord
 		if err := dec.Decode(&rec); err != nil {
-			if !errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) {
+				complete = true
+			} else {
 				s.log.Debug("read chat log", "session", st.Name, "err", err)
 			}
 			break
@@ -854,19 +867,65 @@ func (s *Server) readView(ctx context.Context, st *v1.BlipState) *chatView {
 		v.observe(rec)
 	}
 	v.applyStopBefore(stopBefore(st))
+	if !complete || emptyDespiteHistory(st, v) {
+		// Never cache a view a handler must not serve: the next read should
+		// see records appended since, including the just-saved turn.
+		return v, false
+	}
 	s.viewsMu.Lock()
 	if len(s.views) > 512 {
 		clear(s.views)
 	}
 	s.views[st.Name] = cachedChatView{view: v, at: time.Now()}
 	s.viewsMu.Unlock()
-	return v
+	return v, true
+}
+
+// displayView returns a view a handler can present as the chat's transcript.
+// A failed or partial replay falls back to the last complete view read for the
+// chat. Rings are append-only, so an older snapshot is safe: a client resumes
+// the event stream at the snapshot's offset and catches up from there. ok is
+// false when no trustworthy view exists, including a complete read that is
+// empty for a chat whose committed history says it cannot be.
+func (s *Server) displayView(ctx context.Context, st *v1.BlipState) (*chatView, bool) {
+	view, ok := s.readView(ctx, st)
+	if ok && !emptyDespiteHistory(st, view) {
+		return view, true
+	}
+	if cached := s.cachedViewAnyAge(st.Name); cached != nil && !emptyDespiteHistory(st, cached) {
+		return cached, true
+	}
+	return view, false
+}
+
+// emptyDespiteHistory reports a replay that cannot be the whole conversation.
+// A chat with a committed generation and no ring offset has messages: every
+// turn writes at least the user's prompt. A forked chat inherits history before
+// its start offset, and a chat with an attached writer can be read before its
+// first record lands, so both are expected to be empty.
+func emptyDespiteHistory(st *v1.BlipState, view *chatView) bool {
+	if st.Status.Writer != nil || chatStart(st) != 0 || len(view.Transcript) != 0 || view.Newest != 0 {
+		return false
+	}
+	c := st.Status.Committed
+	return c != nil && c.Generation > 0
 }
 
 func (s *Server) cachedView(name string) *chatView {
 	s.viewsMu.Lock()
 	defer s.viewsMu.Unlock()
 	if c, ok := s.views[name]; ok && time.Since(c.at) < viewCacheTTL {
+		return c.view
+	}
+	return nil
+}
+
+// cachedViewAnyAge returns the last complete view read for a chat. It ignores
+// viewCacheTTL so a handler can fall back to it while the ring is unreadable.
+func (s *Server) cachedViewAnyAge(name string) *chatView {
+	s.viewsMu.Lock()
+	defer s.viewsMu.Unlock()
+	if c, ok := s.views[name]; ok {
 		return c.view
 	}
 	return nil
