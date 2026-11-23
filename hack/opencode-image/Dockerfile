@@ -1,8 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# Reusable opencode image for Blip chat pools. It bundles the opencode binary,
-# the Blip configuration under /etc/opencode, and the blipchat Code Mode plugin.
+# Reusable opencode image for Blip chat pools. It bundles the opencode binary
+# and the blipchat Code Mode plugin under /etc/opencode/plugins.
 # Build from the repository root:
 #   docker build -t localhost:5001/blip/opencode:dev hack/opencode-image
 FROM ubuntu:24.04
@@ -71,7 +71,6 @@ RUN set -eux; \
     install -m 0755 /tmp/opencode-extract/opencode /usr/local/bin/opencode; \
     rm -rf /tmp/opencode-extract /tmp/opencode.tar.gz
 
-COPY config/opencode.json /etc/opencode/opencode.json
 COPY config/plugins/blipchat-codemode /etc/opencode/plugins/blipchat-codemode
 
 # Replace the image's default "ubuntu" user so dev gets UID 1000.

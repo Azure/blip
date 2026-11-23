@@ -27,27 +27,26 @@ to the Ubuntu archive and the opencode GitHub release.
 - Common tooling: `git`, `curl`, `wget`, `ripgrep`, `fd` (from `fd-find`), `jq`,
   Python 3 with `pip` and `venv`, Node.js and `npm`, `build-essential`, and
   basic editors.
-- `/etc/opencode/opencode.json` with the GitHub MCP configuration.
 - `/etc/opencode/plugins/blipchat-codemode`, a local opencode plugin.
 
 ## Configuration
 
-`/etc/opencode/opencode.json` configures a remote MCP server named `github` at
-`http://github` with `oauth` disabled. The `blipchat` MCP server is not listed
-here: ACP supplies it at session start, and the plugin below adjusts it.
+`/etc/opencode/plugins/` is loaded automatically for every user. The image does
+not ship an opencode configuration file and defines no MCP servers of its own.
+A chat profile or deployment supplies MCP servers through its own opencode
+configuration, for example `OPENCODE_CONFIG_CONTENT` or a config file in the
+base state at `/opencode.json` or `$XDG_CONFIG_HOME/opencode/opencode.json`. If
+a deployment adds `/etc/opencode/opencode.json`, that managed configuration has
+higher precedence than global and project config. A deployment that relied on
+the image's former `github` server must now declare it in its profile's opencode
+configuration.
 
-Both `/etc/opencode/opencode.json` and `/etc/opencode/plugins/` are loaded
-automatically for every user. A chat profile does not need to set
-`OPENCODE_CONFIG`. Because `/etc/opencode` is managed configuration, it has
-higher precedence than global and project config; a deployment that needs a
-different GitHub server must change the image.
+The `blipchat` MCP server is not part of the image's configuration: ACP supplies
+it at session start, and the plugin below adjusts it.
 
-GitHub tools use opencode's default Code Mode. Only the blipchat server is
-switched to direct tools, because ACP delivers it after startup and the agent
-needs `spawn_agent` as a first-class tool.
-
-If the pool has no `github` endpoint, the connection fails and opencode logs a
-warning but continues.
+MCP servers delivered by ACP use opencode's default Code Mode. Only the blipchat
+server is switched to direct tools, because the agent needs `spawn_agent` as a
+first-class tool.
 
 ## blipchat-codemode plugin
 
@@ -61,17 +60,12 @@ available to the agent.
 The plugin does not add or remove servers. It only changes the Code Mode flag
 on a server that ACP already provided.
 
-## GitHub MCP endpoint
+## MCP endpoints
 
 Blip pool endpoint URLs are origin-only: the configured URL cannot contain a
 path. The api-proxy still forwards the guest's request path and query to the
-upstream, so the path opencode uses matters.
+upstream, so the path a profile configures for an MCP server matters.
 
-The image points at `http://github`, which assumes a proxy that maps the root to
-the real GitHub MCP endpoint. If the pool endpoint points directly at
-`https://api.githubcopilot.com`, configure opencode with
-`http://github/mcp/` instead.
-
-In both cases the proxy must supply GitHub authentication. The sidecar strips
-caller `Authorization` and identity headers; a Blip projected token is a
-Kubernetes service-account token, not a GitHub credential.
+The proxy must supply any upstream authentication. The sidecar strips caller
+`Authorization` and identity headers, and a Blip projected token is a Kubernetes
+service-account token, not a third-party credential.
