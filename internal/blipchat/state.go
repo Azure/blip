@@ -295,7 +295,10 @@ func (v *chatView) observeIn(rec streamLogRecord) {
 				for i := range v.Answers {
 					if fmt.Sprintf("answer-%d", v.Answers[i].Offset) == promptID {
 						a := v.Answers[i]
-						v.Inflight = &promptRef{ID: promptID, Text: a.Text, Original: a.Text, Sender: a.Sender, Offset: a.Offset}
+						// The session/prompt record proves the answer turn was
+						// sent, so a cancel can target it exactly like an
+						// ordinary prompt.
+						v.Inflight = &promptRef{ID: promptID, Text: a.Text, Original: a.Text, Sender: a.Sender, Offset: a.Offset, Sent: rec.Offset}
 						break
 					}
 				}

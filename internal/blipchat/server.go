@@ -1225,13 +1225,45 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	// chat. A chat that is not running has nothing to cancel.
 	writeCtx, cancel := messageContext(r)
 	defer cancel()
-	if _, err := s.writeNote(writeCtx, name, noteRecord{Type: noteCancel}); err != nil && !errors.Is(err, ErrNotRunning) {
-		s.log.Error("cancel turn", "namespace", s.namespace, "session", name, "err", err)
-		writeError(w, http.StatusInternalServerError, "could not cancel the turn")
+	if _, err := s.writeNote(writeCtx, name, noteRecord{Type: noteCancel}); err != nil {
+		if !errors.Is(err, ErrNotRunning) {
+			s.log.Error("cancel turn", "namespace", s.namespace, "session", name, "err", err)
+			writeError(w, http.StatusInternalServerError, "could not cancel the turn")
+			return
+		}
+		// No writer accepted the note because the message is still Pending.
+		// Record the ring boundary a stop uses so the prompt submitted before
+		// this cancel is dropped when the generation attaches, and stop that
+		// generation instead of letting it run the turn.
+		recordErr := s.recordOfflineStop(writeCtx, name)
+		if stopErr := s.stopBlip(writeCtx, name); stopErr != nil {
+			recordErr = errors.Join(recordErr, stopErr)
+		}
+		if recordErr != nil {
+			s.log.Error("cancel pending turn", "namespace", s.namespace, "session", name, "err", recordErr)
+			writeClusterError(w, recordErr)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 		return
 	}
 	s.ensureEngine(name)
 	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+}
+
+// recordOfflineStop persists the ring boundary that drops queued work accepted
+// before it. It is the stop and cancel fallback while no writer is attached to
+// accept a note.
+func (s *Server) recordOfflineStop(ctx context.Context, name string) error {
+	before, err := s.wire.LogEnd(ctx, s.namespace, name)
+	if err != nil {
+		return err
+	}
+	if err := s.cluster.RecordStop(ctx, s.namespace, name, before); err != nil {
+		return err
+	}
+	s.invalidateView(name)
+	return nil
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
