@@ -40,7 +40,7 @@ data:
         "OPENCODE_DISABLE_MODELS_FETCH": "1",
         "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
         "OPENCODE_DISABLE_FILEWATCHER": "1",
-        "OPENCODE_CONFIG_CONTENT": "{\"providers\":{\"unbounded\":{\"name\":\"Unbounded DeepSeek\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{\"baseURL\":\"http://unbounded/dsv41/v1\",\"apiKey\":\"local-e2e\"},\"models\":{\"deepseek-v4.1-flash\":{\"name\":\"DeepSeek V4.1 Flash\"}}}},\"model\":\"unbounded/deepseek-v4.1-flash\"}"
+        "OPENCODE_CONFIG_CONTENT": "{\"providers\":{\"unbounded\":{\"name\":\"Unbounded DeepSeek\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{\"baseURL\":\"http://unbounded/dsv41/v1\",\"apiKey\":\"local-e2e\"},\"models\":{\"deepseek-v4.1-flash\":{\"name\":\"DeepSeek V4.1 Flash\"}}}},\"model\":\"unbounded/deepseek-v4.1-flash\",\"agents\":{\"title\":{\"model\":\"unbounded/deepseek-v4.1-flash#low\"}}}"
       },
       "idleTimeoutSeconds": 3600,
       "title": "OpenCode (DeepSeek)",
@@ -67,7 +67,7 @@ data:
         "OPENCODE_DISABLE_MODELS_FETCH": "1",
         "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
         "OPENCODE_DISABLE_FILEWATCHER": "1",
-        "OPENCODE_CONFIG_CONTENT": "{\"providers\":{\"unbounded\":{\"name\":\"Unbounded DeepSeek\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{\"baseURL\":\"http://unbounded/dsv41/v1\",\"apiKey\":\"local-e2e\"},\"models\":{\"deepseek-v4.1-flash\":{\"name\":\"DeepSeek V4.1 Flash\"}}}},\"model\":\"unbounded/deepseek-v4.1-flash\"}"
+        "OPENCODE_CONFIG_CONTENT": "{\"providers\":{\"unbounded\":{\"name\":\"Unbounded DeepSeek\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{\"baseURL\":\"http://unbounded/dsv41/v1\",\"apiKey\":\"local-e2e\"},\"models\":{\"deepseek-v4.1-flash\":{\"name\":\"DeepSeek V4.1 Flash\"}}}},\"model\":\"unbounded/deepseek-v4.1-flash\",\"agents\":{\"title\":{\"model\":\"unbounded/deepseek-v4.1-flash#low\"}}}"
       },
       "idleTimeoutSeconds": 3600,
       "title": "DeepSeek (default)",
