@@ -400,6 +400,18 @@ Licensed under the MIT License. -->
   .event-body { white-space: pre-wrap; overflow-wrap: anywhere; }
   .event.error { color: var(--danger); }
   .event.error .event-kind { color: var(--danger); opacity: .8; }
+  .plan-entries { margin: 0; padding-left: 16px; display: grid; gap: 2px; }
+  .plan-entry { display: flex; gap: 7px; align-items: baseline; }
+  .plan-content { min-width: 0; overflow-wrap: anywhere; }
+  .plan-status {
+    flex: none;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+  }
+  .plan-status[data-status="in_progress"] { color: var(--text); }
+  .plan-status[data-status="completed"] { color: var(--accent); }
+  .plan-status[data-status="failed"] { color: var(--danger); }
 
   .jump {
     position: absolute;
@@ -649,6 +661,7 @@ const collapsedSessions = new Set();
 const $ = (id) => document.getElementById(id);
 const transcript = $("transcript");
 const toolEvents = new Map();
+let planEvent = null;
 const renderedPromptIDs = new Set();
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const BASE_PATH = document.querySelector('meta[name="blipchat-base-path"]').content;
@@ -752,6 +765,7 @@ function followOutput() {
 function clearTranscript() {
   transcript.innerHTML = "";
   toolEvents.clear();
+  planEvent = null;
   renderedPromptIDs.clear();
   state.atBottom = true;
   $("jump").hidden = true;
@@ -1040,6 +1054,59 @@ function closeOpenTools(label) {
   });
 }
 
+// ACP sends the complete plan on every plan update, so keep one plan block per
+// transcript and replace its entries in place. Appending per frame would
+// duplicate every step in history and on replay.
+function renderPlan(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (!list.length) {
+    // An empty plan means the agent cleared it.
+    if (planEvent) planEvent.remove();
+    planEvent = null;
+    return;
+  }
+  if (!planEvent) {
+    planEvent = createMessage("tool", "");
+    planEvent.classList.add("plan");
+    const kind = planEvent.querySelector(".event-kind");
+    if (kind) kind.textContent = "plan";
+    const body = planEvent.querySelector(".event-body");
+    if (body) {
+      body.replaceChildren();
+      const items = document.createElement("ol");
+      items.className = "plan-entries";
+      body.appendChild(items);
+    }
+  }
+  const items = planEvent.querySelector(".plan-entries");
+  if (!items) return;
+  items.replaceChildren();
+  list.forEach((entry, index) => {
+    const step = entry || {};
+    const item = document.createElement("li");
+    item.className = "plan-entry";
+    // The plan has no stable step IDs and may legitimately repeat text, so
+    // the array position is the key.
+    item.dataset.index = String(index);
+    const status = step.status || "pending";
+    item.dataset.status = status;
+    if (step.priority) {
+      item.dataset.priority = step.priority;
+      item.title = step.priority + " priority";
+    }
+    const content = document.createElement("span");
+    content.className = "plan-content";
+    content.textContent = step.content || step.status || "";
+    const badge = document.createElement("span");
+    badge.className = "plan-status";
+    badge.dataset.status = status;
+    badge.textContent = status;
+    item.append(content, badge);
+    items.appendChild(item);
+  });
+  followOutput();
+}
+
 function renderACP(msg) {
   if (!msg || typeof msg !== "object") return;
   if (msg.method === "session/update") {
@@ -1095,7 +1162,7 @@ function renderACP(msg) {
         return;
       }
       case "plan":
-        (u.entries || []).forEach((e) => createMessage("tool", "plan: " + (e.content || e.status || "")));
+        renderPlan(u.entries);
         return;
       case "available_commands_update": return;
       case "session_info_update":
