@@ -19,6 +19,10 @@ const (
 	LabelEnrolled         = "blip.dev/enrolled"
 	LabelHypervisorPrefix = "blip.dev/hypervisor-"
 	LabelOwner            = "blip.dev/owner"
+	// LabelShared marks an ownerless state that every blip in the namespace
+	// may read or copy, like an imported image. A pre-populated git cache is
+	// published this way so consumers can fork it instead of fetching history.
+	LabelShared = "blip.dev/shared"
 	// LabelParent scopes "blip gather" with no arguments to the forks of the
 	// blip it runs in. Label values are limited to 63 characters, so a long
 	// short name is hashed under a prefix that cannot be a legal Blip name;
@@ -58,6 +62,17 @@ const (
 	Finalizer = "blip.dev/finalizer"
 )
 
+// Git cache fields. A warm job publishes each refreshed clone as an ownerless
+// shared state labelled LabelGitRepo, so consumers select the newest one and
+// fork its filesystem instead of fetching history from the remote.
+const (
+	LabelGitRepo        = "git.blip.dev/repo"
+	AnnotationGitURL    = "git.blip.dev/url"
+	AnnotationGitBranch = "git.blip.dev/branch"
+	// AnnotationGitSource records the cache state a claim was copied from.
+	AnnotationGitSource = "git.blip.dev/source"
+)
+
 // parentLabelHash is the reserved prefix of a hashed ParentLabel. An
 // underscore is legal in a Kubernetes label value but not in a DNS-1123 Blip
 // name, so a hashed label can never equal a literal parent name. Without that
@@ -84,6 +99,16 @@ func OwnerPrefix(owner string) string { return owner + "." }
 
 // OwnedBy reports whether name is scoped to owner.
 func OwnedBy(name, owner string) bool { return strings.HasPrefix(name, OwnerPrefix(owner)) }
+
+// Shared reports whether st is shared with every blip in its namespace: an
+// imported image template or an ownerless state labelled LabelShared. An owned
+// state is never shared, so an owner cannot publish its own data.
+func Shared(st *BlipState) bool {
+	if st.Labels[LabelOwner] != "" {
+		return false
+	}
+	return st.Spec.Image != "" || st.Labels[LabelShared] == "true"
+}
 
 // Finished reports whether a blip has stopped and will not run again.
 func Finished(b *Blip) bool {

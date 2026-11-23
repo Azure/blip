@@ -45,18 +45,22 @@ func mountStateError(b *v1.Blip, st *v1.BlipState, writable bool) string {
 		return immutableStateMessage(st.Name)
 	}
 	owner := b.Labels[v1.LabelOwner]
+	if writable && owner != "" && v1.Shared(st) {
+		return fmt.Sprintf("state %q is shared read-only; copy it into a new state instead", st.Name)
+	}
 	if !readableBy(owner, st) && !(b.Labels[v1.LabelChatSession] != "" && chatStateOwnedBy(owner, st)) {
-		return fmt.Sprintf("mount %q is not owned by %s or a shared read-only image template", st.Name, owner)
+		return fmt.Sprintf("mount %q is not owned by %s or a shared read-only state", st.Name, owner)
 	}
 	return ""
 }
 
-// readableBy reports whether owner may use st: it owns st, or st is a shared
-// read-only image template.
+// readableBy reports whether owner may use st: it owns st, or st is shared
+// read-only. Only ownerless blips may write a shared state; mountStateError
+// enforces that separately.
 func readableBy(owner string, st *v1.BlipState) bool {
 	return owner == "" ||
 		(v1.OwnedBy(st.Name, owner) && st.Labels[v1.LabelOwner] == owner) ||
-		(st.Spec.Image != "" && st.Labels[v1.LabelOwner] == "")
+		v1.Shared(st)
 }
 
 // chatStateOwnedBy reports whether a chat state belongs to owner. Chat tree
@@ -105,7 +109,7 @@ func (r *BlipReconciler) rootIntent(ctx context.Context, b *v1.Blip) (*v1.BlipSt
 				// A missing state may be created again; check only the name
 				// prefix, since there is no object to read a label from.
 				if owner != "" && !v1.OwnedBy(m.State, owner) {
-					return root, nil, ReasonInvalidSpec, fmt.Sprintf("mount %q is not owned by %s or a shared read-only image template", m.State, owner), nil
+					return root, nil, ReasonInvalidSpec, fmt.Sprintf("mount %q is not owned by %s or a shared read-only state", m.State, owner), nil
 				}
 				continue
 			}

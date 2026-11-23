@@ -32,6 +32,9 @@ type Cluster interface {
 	ForkSession(ctx context.Context, namespace string, source, dest *v1.BlipState, owner *metav1.OwnerReference) error
 	ListChildSessions(ctx context.Context, namespace, parent string) ([]v1.BlipState, error)
 	PatchSession(ctx context.Context, namespace, name string, labels, annotations map[string]string) error
+	// UpdateStateMounts adds a mount to a root state and returns the resulting
+	// mount list. Adding the same mount twice is a no-op.
+	UpdateStateMounts(ctx context.Context, namespace, name string, add v1.Mount) ([]v1.Mount, error)
 	// RecordStop advances the durable, exclusive queue cancellation boundary.
 	RecordStop(ctx context.Context, namespace, name string, before uint64) error
 	ListSessionBlips(ctx context.Context, namespace string) ([]v1.Blip, error)
@@ -144,6 +147,40 @@ func (k *kubeCluster) PatchSession(ctx context.Context, namespace, name string, 
 	}
 	obj := &v1.BlipState{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 	return k.c.Patch(ctx, obj, client.RawPatch(types.MergePatchType, data))
+}
+
+// UpdateStateMounts appends a mount to a root state's spec. Retrying on
+// conflict keeps a concurrent mount change from being overwritten. An
+// existing mount at the same path with the same state is already what the
+// caller asked for, so it succeeds without an update.
+func (k *kubeCluster) UpdateStateMounts(ctx context.Context, namespace, name string, add v1.Mount) ([]v1.Mount, error) {
+	var mounts []v1.Mount
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var st v1.BlipState
+		if err := k.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &st); err != nil {
+			return err
+		}
+		for _, m := range st.Spec.Mounts {
+			if m.Path != add.Path {
+				continue
+			}
+			if m.State != add.State {
+				return fmt.Errorf("path %q is already mounted from %q", add.Path, m.State)
+			}
+			mounts = append([]v1.Mount(nil), st.Spec.Mounts...)
+			return nil
+		}
+		st.Spec.Mounts = append(st.Spec.Mounts, add)
+		if err := k.c.Update(ctx, &st); err != nil {
+			return err
+		}
+		mounts = append([]v1.Mount(nil), st.Spec.Mounts...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return mounts, nil
 }
 
 func (k *kubeCluster) ListSessionBlips(ctx context.Context, namespace string) ([]v1.Blip, error) {

@@ -185,6 +185,10 @@ func mcpTools() []map[string]any {
 			"question": text("The question for the user."),
 			"options":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional short choices the user can click."},
 		}, "question"),
+		tool("claim_repo", "Clone a pre-warmed shared git cache into a writable private workspace copy mounted at an absolute path. Returns the path and the command to catch up with origin. Calling it twice for the same repo is safe.", map[string]any{
+			"repo": text("Repository name; the error lists the available ones."),
+			"path": text("Optional absolute mount path, default /src/<repo>."),
+		}, "repo"),
 	}
 }
 
@@ -204,6 +208,8 @@ func (s *Server) callTool(ctx context.Context, caller *Caller, req mcpRequest) m
 		WaitSeconds int      `json:"waitSeconds"`
 		Question    string   `json:"question"`
 		Options     []string `json:"options"`
+		Repo        string   `json:"repo"`
+		Path        string   `json:"path"`
 	}
 	if len(params.Arguments) > 0 {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -229,6 +235,8 @@ func (s *Server) callTool(ctx context.Context, caller *Caller, req mcpRequest) m
 		text, err = s.toolStopAgent(ctx, caller, args.ID)
 	case "ask_user":
 		text, err = s.toolAskUser(ctx, caller, args.Question, args.Options)
+	case "claim_repo":
+		text, err = s.toolClaimRepo(ctx, caller, args.Repo, args.Path)
 	default:
 		return mcpFailure(req.ID, -32602, "unknown tool: "+params.Name)
 	}

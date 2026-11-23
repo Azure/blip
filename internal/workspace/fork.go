@@ -79,9 +79,22 @@ func Fork(ctx context.Context, c client.Client, source *v1alpha1.BlipState, dest
 			return nil, err
 		}
 		if mount.Writable {
+			labels := maps.Clone(root.Labels)
+			if src.Labels[v1alpha1.LabelGitRepo] != "" {
+				// A copy of a git cache claim is still a copy of that
+				// repository, so a forked chat can keep using the mount
+				// without claiming the repository again.
+				if labels == nil {
+					labels = map[string]string{}
+				}
+				labels[v1alpha1.LabelGitRepo] = src.Labels[v1alpha1.LabelGitRepo]
+			}
 			child := &v1alpha1.BlipState{
-				ObjectMeta: metav1.ObjectMeta{Name: childName(root, mount), Namespace: root.Namespace, Labels: maps.Clone(root.Labels)},
+				ObjectMeta: metav1.ObjectMeta{Name: childName(root, mount), Namespace: root.Namespace, Labels: labels},
 				Spec:       v1alpha1.BlipStateSpec{CopyFrom: mount.State, Replicas: root.Spec.Replicas, NodeSelector: maps.Clone(root.Spec.NodeSelector)},
+			}
+			if origin := src.Annotations[v1alpha1.AnnotationGitSource]; origin != "" {
+				child.Annotations = map[string]string{v1alpha1.AnnotationGitSource: origin}
 			}
 			if opts.Owner != nil {
 				child.OwnerReferences = []metav1.OwnerReference{*opts.Owner}

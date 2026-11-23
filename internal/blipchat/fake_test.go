@@ -203,6 +203,36 @@ func (f *fakeCluster) PatchSession(_ context.Context, ns, name string, labels, a
 	return nil
 }
 
+func (f *fakeCluster) UpdateStateMounts(_ context.Context, ns, name string, add v1.Mount) ([]v1.Mount, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.states[key(ns, name)]
+	if !ok {
+		return nil, apierrors.NewNotFound(schema.GroupResource{Group: "blip.dev", Resource: "blipstates"}, name)
+	}
+	for _, m := range s.Spec.Mounts {
+		if m.Path != add.Path {
+			continue
+		}
+		if m.State != add.State {
+			return nil, fmt.Errorf("path %q is already mounted from %q", add.Path, m.State)
+		}
+		return append([]v1.Mount(nil), s.Spec.Mounts...), nil
+	}
+	s.Spec.Mounts = append(s.Spec.Mounts, add)
+	// The controller copies a root mount into the running blip's status. The
+	// fake does the same so a test does not have to wait for a reconcile.
+	for _, b := range f.blips {
+		if b.Namespace != ns || b.Spec.State != name {
+			continue
+		}
+		b.Status.Mounts = append(b.Status.Mounts, v1.MountStatus{
+			State: add.State, Path: add.Path, Writable: add.Writable, Phase: v1.MountMounted,
+		})
+	}
+	return append([]v1.Mount(nil), s.Spec.Mounts...), nil
+}
+
 func (f *fakeCluster) ListSessionBlips(_ context.Context, ns string) ([]v1.Blip, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -565,7 +565,7 @@ func (r *StateReconciler) initialize(ctx context.Context, st *v1.BlipState, cl *
 			if owner := st.Labels[v1.LabelOwner]; !readableBy(owner, src) &&
 				!(st.Labels[v1.LabelChatSession] != "" && chatStateOwnedBy(owner, src)) {
 				s.Phase = v1.StateFailed
-				return fmt.Sprintf("copy source %q is not owned by %s or a shared image template", src.Name, owner), false, nil
+				return fmt.Sprintf("copy source %q is not owned by %s or a shared state", src.Name, owner), false, nil
 			}
 			switch {
 			case src.DeletionTimestamp != nil && src.Status.Committed == nil:
