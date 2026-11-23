@@ -633,7 +633,7 @@ Licensed under the MIT License. -->
 </div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
-const state = { scope: "team", current: null, source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", running: false, phase: "no chat", question: null, sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, breakAgent: false };
+const state = { scope: "team", current: null, parent: "", source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", running: false, phase: "no chat", question: null, sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, breakAgent: false };
 let openSeq = 0;
 let listSeq = 0;
 let titleEpoch = 0;
@@ -1233,8 +1233,9 @@ async function openSession(name, fromHistory) {
     const known = state.sessions.find((s) => s.name === name);
     const chatScope = scopeOf(d.scope ? d : known);
     if (adoptScope(chatScope)) reflowSessions();
+    state.parent = (known && known.parent) || d.parent || "";
+    setOrigin(state.parent);
     setTitle(d.title, true);
-    setOrigin((known && known.parent) || d.parent || "");
     const profile = d.profile ? "profile: " + d.profile : "";
     $("profile").textContent = profile;
     $("profile").title = profile;
@@ -1280,6 +1281,7 @@ async function openSession(name, fromHistory) {
     if (token !== openSeq) return;
     toast(err.message);
     state.current = null;
+    state.parent = "";
     state.sessionReady = false;
     state.offset = 0;
     closeEvents();
@@ -1373,6 +1375,7 @@ function resetChat() {
   openSeq++;
   closeEvents();
   state.current = null;
+  state.parent = "";
   state.sessionReady = false;
   state.pendingDeepLink = "";
   setQuestion(null);
@@ -1393,21 +1396,41 @@ function resetChat() {
 
 function setOrigin(parent) {
   const el = $("origin");
+  if (!parent) {
+    el.textContent = "";
+    el.hidden = true;
+    delete el.dataset.parent;
+    return;
+  }
+  const known = state.sessions.find((s) => s.name === parent);
+  // If the parent is temporarily missing (a partial list, or the parent was
+  // deleted), hide the link but remember it so a later poll can restore it.
+  // Never leave a link that opens a 404 and unloads the still-usable child.
+  if (!known) {
+    el.textContent = "";
+    el.hidden = true;
+    el.dataset.parent = parent;
+    return;
+  }
+  const text = known.title || "New chat";
+  const href = "#" + encodeURIComponent(parent);
+  const a = el.querySelector("a");
+  // The list poll runs every couple of seconds. Keep an unchanged link in the
+  // DOM so it does not drop keyboard focus or a click that straddles a poll.
+  if (el.dataset.parent === parent && !el.hidden && a) {
+    if (a.textContent !== text) a.textContent = text;
+    if (a.getAttribute("href") !== href) a.href = href;
+    return;
+  }
   el.textContent = "";
   el.hidden = true;
-  delete el.dataset.parent;
-  if (!parent) return;
-  const known = state.sessions.find((s) => s.name === parent);
-  // If the parent is gone (deleted or orphaned child), do not render a link
-  // that opens a 404 and unloads the still-usable child.
-  if (!known) return;
   el.dataset.parent = parent;
   el.textContent = "started by ";
-  const a = document.createElement("a");
-  a.href = "#" + encodeURIComponent(parent);
-  a.textContent = known.title || "New chat";
-  a.onclick = (e) => { e.preventDefault(); openSession(parent); };
-  el.appendChild(a);
+  const link = document.createElement("a");
+  link.href = href;
+  link.textContent = text;
+  link.onclick = (e) => { e.preventDefault(); openSession(parent); };
+  el.appendChild(link);
   el.hidden = false;
 }
 
@@ -1633,16 +1656,10 @@ async function loadSessions(opts) {
       // Skip a list snapshot that started before a live/detail title arrived:
       // it can still carry the pre-rename title and would revert the header.
       if (current && titleEpoch === epochAtStart) setTitle(current.title);
-      // A child has no SSE stream for its parent. If the parent disappears
-      // (deleted, or garbage-collected), do not leave a live link that opens
-      // a 404 and unloads the still-usable child.
-      const origin = $("origin");
-      if (!origin.hidden && origin.dataset.parent &&
-          !state.sessions.some((s) => s && s.name === origin.dataset.parent)) {
-        origin.hidden = true;
-        delete origin.dataset.parent;
-      }
     }
+    // Re-evaluate the origin link on every poll: a list snapshot that lacked
+    // the parent when the chat opened may now include it.
+    setOrigin(state.parent);
     // A poll that started before the last status event can carry an older
     // phase. Reapply the active chat's live status after every list render.
     updateSessionStatus();
@@ -2155,6 +2172,7 @@ $("delete").onclick = async () => {
     // restore the chat we just deleted.
     openSeq++;
     state.current = null;
+    state.parent = "";
     state.sessionReady = false;
     state.pendingDeepLink = "";
     state.offset = 0;
