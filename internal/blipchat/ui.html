@@ -798,10 +798,11 @@ transcript.addEventListener("touchstart", cancelJump, { passive: true });
 transcript.addEventListener("keydown", (e) => {
   if (/^(PageUp|PageDown|Home|End|ArrowUp|ArrowDown| )$/.test(e.key)) cancelJump();
 }, { passive: true });
-transcript.addEventListener("pointerdown", (e) => {
-  // A click on the vertical scrollbar targets the transcript and lands to the
-  // right of its client box.
-  if (e.target === transcript && e.clientX >= transcript.getBoundingClientRect().left + transcript.clientWidth) cancelJump();
+transcript.addEventListener("pointerdown", () => {
+  // Any pointer gesture is the reader taking over, including a drag on an
+  // overlay scrollbar that has no layout gutter. Do not let an in-flight jump
+  // keep animating underneath it.
+  if (jumpTarget) cancelJump();
 }, { passive: true });
 
 function endJump() {
@@ -2552,6 +2553,9 @@ $("delete").onclick = async () => {
   const button = $("delete");
   const hadFocus = document.activeElement === button;
   button.disabled = true;
+  // Disabling a focused button blurs it asynchronously; move focus before the
+  // DELETE round-trip so it never falls to <body> while waiting.
+  if (hadFocus) $("transcript").focus();
   try {
     await api("/api/sessions/" + encodeURIComponent(name), { method: "DELETE" });
   } catch (err) {
