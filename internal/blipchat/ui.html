@@ -656,7 +656,11 @@ let sessionPollTimer = 0;
 let resyncing = false;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
+let resyncRetryTimer = null;
+let resyncRetryDelay = 1000;
+let streamNotice = null;
 const SESSION_POLL_MS = 2000;
+const RESYNC_MAX_DELAY_MS = 15000;
 const MAX_MESSAGE_BYTES = 32000;
 const collapsedSessions = new Set();
 const $ = (id) => document.getElementById(id);
@@ -814,6 +818,7 @@ function followOutput() {
 
 function clearTranscript() {
   transcript.innerHTML = "";
+  streamNotice = null;
   toolEvents.clear();
   planEvent = null;
   renderedPromptIDs.clear();
@@ -840,6 +845,23 @@ function showTranscriptNotice(text) {
   note.className = "transcript-note";
   note.textContent = text;
   transcript.prepend(note);
+}
+
+// setStreamNotice keeps one persistent notice at the top of the transcript for
+// as long as the view is known to be incomplete. Passing "" removes it.
+function setStreamNotice(text) {
+  if (!text) {
+    if (streamNotice) streamNotice.remove();
+    streamNotice = null;
+    return;
+  }
+  if (!streamNotice || !streamNotice.isConnected) {
+    streamNotice = document.createElement("div");
+    streamNotice.className = "transcript-note";
+    streamNotice.setAttribute("role", "status");
+    transcript.prepend(streamNotice);
+  }
+  streamNotice.textContent = text;
 }
 
 function createMessage(role, text, sender, chunk) {
@@ -1298,6 +1320,9 @@ function renderACP(msg) {
 }
 
 function handleEvent(ev) {
+  // Heartbeats keep the stream watchdog alive but carry no transcript or
+  // cursor, so they must not move state.offset.
+  if (ev.type === "hb") return;
   // cursor identifies the exact frame, so a reconnect can resume inside a
   // record that produced several events. offset remains for older servers.
   if (typeof ev.cursor === "string" && ev.cursor) state.offset = ev.cursor;
@@ -1310,9 +1335,29 @@ function handleEvent(ev) {
   else if (ev.type === "gap") resyncSession();
 }
 
+function stopResyncRetry() {
+  if (resyncRetryTimer) clearTimeout(resyncRetryTimer);
+  resyncRetryTimer = null;
+}
+
+// scheduleResyncRetry re-fetches the authoritative snapshot after a failed
+// gap resync. The event stream stays closed until it succeeds: resuming at the
+// gap cursor would keep the hole the gap reported.
+function scheduleResyncRetry(name) {
+  if (resyncRetryTimer) return;
+  const delay = resyncRetryDelay;
+  resyncRetryDelay = Math.min(resyncRetryDelay * 2, RESYNC_MAX_DELAY_MS);
+  resyncRetryTimer = setTimeout(() => {
+    resyncRetryTimer = null;
+    if (!state.current || state.current !== name) return;
+    resyncSession();
+  }, delay);
+}
+
 function closeEvents() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  stopResyncRetry();
   if (state.source) state.source.close();
   state.source = null;
 }
@@ -1397,6 +1442,7 @@ async function openSession(name, fromHistory) {
   resizeText();
   updateLimit();
   closeEvents();
+  resyncRetryDelay = 1000;
   // Do not leave the previous chat's transcript, running status, or Cancel /
   // Stop buttons visible while this chat is loading. state.current already
   // points at the new chat, so those actions would target the wrong chat.
@@ -1894,6 +1940,8 @@ async function resyncSession() {
       showTranscriptNotice("Earlier messages are not loaded. Showing the most recent history.");
     }
     state.offset = d.offset || 0;
+    resyncRetryDelay = 1000;
+    setStreamNotice("");
     openEvents();
     state.atBottom = wasAtBottom;
     if (wasAtBottom) scrollToBottom(false);
@@ -1905,7 +1953,11 @@ async function resyncSession() {
   } catch (err) {
     if (token === openSeq && state.current === name) {
       setStatus("reconnecting", state.running, "event stream");
-      openEvents();
+      // Do not reopen at the gap cursor: that would skip the records the gap
+      // reported and leave the transcript silently incomplete. Keep the
+      // stream closed and retry the snapshot with bounded backoff.
+      setStreamNotice("Reconnecting and reloading history\u2026");
+      scheduleResyncRetry(name);
     }
   } finally {
     resyncing = false;
