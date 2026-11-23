@@ -465,6 +465,446 @@ async function stopTracing(context, tracePath) {
 	}
 }
 
+// verifyToolLabels drives the tool-row renderer with synthetic ACP frames and
+// checks the verb badge and subject text on the newest row after each frame.
+// The frames mirror the shapes agents send: pending calls carry a title, and
+// updates may omit it once the row already has one.
+async function verifyToolLabels(page) {
+	const failures = await page.evaluate(() => {
+		const problems = [];
+		// No chat is open yet. Clear the placeholder so the scan below sees
+		// only the synthetic rows built by this assertion.
+		clearTranscript();
+		const frame = (update) => ({
+			method: "session/update",
+			params: { update },
+		});
+		const check = (label, update, wantBadge, wantBody, wantError) => {
+			renderACP(frame(update));
+			const rows = document.querySelectorAll("#transcript .event.tool");
+			const row = rows[rows.length - 1];
+			if (!row) {
+				problems.push(label + ": no tool row rendered");
+				return;
+			}
+			const badge = row.querySelector(".event-kind");
+			const body = row.querySelector(".event-body");
+			const badgeText = badge ? badge.textContent : "";
+			const bodyText = body ? body.textContent : "";
+			if (badgeText !== wantBadge) {
+				problems.push(
+					label +
+						": badge = " +
+						JSON.stringify(badgeText) +
+						", want " +
+						JSON.stringify(wantBadge),
+				);
+			}
+			if (bodyText !== wantBody) {
+				problems.push(
+					label +
+						": body = " +
+						JSON.stringify(bodyText) +
+						", want " +
+						JSON.stringify(wantBody),
+				);
+			}
+			if (
+				wantError !== undefined &&
+				row.classList.contains("error") !== wantError
+			) {
+				problems.push(
+					label +
+						": error class = " +
+						row.classList.contains("error") +
+						", want " +
+						wantError,
+				);
+			}
+		};
+
+		check(
+			"shell pending",
+			{
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-shell",
+				name: "shell",
+				title: "shell",
+				kind: "execute",
+				status: "pending",
+				locations: [{ path: "/src/unbounded" }],
+				rawInput: { cwd: "/src/unbounded" },
+			},
+			"run",
+			"",
+		);
+		check(
+			"shell in_progress",
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e2e-label-shell",
+				status: "in_progress",
+				kind: "execute",
+				title: "sh -c \"echo hi\"",
+				rawInput: { command: "sh -c \"echo hi\"" },
+			},
+			"run",
+			"sh -c \"echo hi\" · running",
+		);
+		check(
+			"shell completed",
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e2e-label-shell",
+				status: "completed",
+				locations: [{ path: "/src/unbounded" }],
+				rawOutput: { metadata: { status: "completed", exit: 0 } },
+			},
+			"run",
+			"sh -c \"echo hi\"",
+			false,
+		);
+
+		// The row tooltip keeps the raw name, title, and status.
+		const shellRows = document.querySelectorAll("#transcript .event.tool");
+		const shellRow = shellRows[shellRows.length - 1];
+		if (
+			!shellRow ||
+			!shellRow.title.includes("shell") ||
+			!shellRow.title.includes("sh -c \"echo hi\"") ||
+			!shellRow.title.includes("completed")
+		) {
+			problems.push(
+				"shell row title = " +
+					JSON.stringify(shellRow ? shellRow.title : "") +
+					", want name, title, and status",
+			);
+		}
+
+		// A command that arrives after a descriptive title must win, and a
+		// later completed update must not fall back to the title.
+		check(
+			"title before command",
+			{
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-title-command",
+				name: "bash",
+				title: "Run the tests",
+				kind: "execute",
+				status: "pending",
+				rawInput: {},
+			},
+			"run",
+			"Run the tests",
+		);
+		check(
+			"command replaces title",
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e2e-label-title-command",
+				status: "in_progress",
+				kind: "execute",
+				rawInput: { command: "go test ./..." },
+			},
+			"run",
+			"go test ./... · running",
+		);
+		check(
+			"completed keeps command",
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e2e-label-title-command",
+				status: "completed",
+				title: "Run the tests",
+				rawOutput: { metadata: { exit: 0 } },
+			},
+			"run",
+			"go test ./...",
+			false,
+		);
+
+		// A sparse update with an empty rawInput must not erase a verb or
+		// subject that was derived from an earlier rawInput.
+		check(
+			"anonymous script in_progress",
+			{
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-sparse",
+				title: "execute",
+				kind: "other",
+				status: "in_progress",
+				rawInput: { code: "await fetch(\"http://x\");" },
+			},
+			"script",
+			"fetch · running",
+		);
+		check(
+			"anonymous script sparse update",
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e2e-label-sparse",
+				status: "in_progress",
+				rawInput: {},
+			},
+			"script",
+			"fetch · running",
+		);
+
+		// The call summary also arrives directly on rawOutput.
+		check(
+			"script rawOutput toolCalls",
+			{
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-raw-calls",
+				name: "execute",
+				title: "execute",
+				kind: "other",
+				status: "failed",
+				rawInput: {},
+				rawOutput: {
+					toolCalls: [{ tool: "read", status: "error" }],
+				},
+			},
+			"script",
+			"read · failed",
+			true,
+		);
+
+		check(
+			"cancelled",
+			{
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-cancelled",
+				name: "shell",
+				title: "shell",
+				kind: "execute",
+				status: "cancelled",
+				rawInput: { command: "echo x" },
+			},
+			"run",
+			"echo x · cancelled",
+			true,
+		);
+
+		check(
+			"script pending",
+			{
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-script",
+				name: "execute",
+				title: "execute",
+				kind: "other",
+				status: "pending",
+				rawInput: {},
+			},
+			"script",
+			"",
+		);
+		check(
+			"script in_progress",
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e2e-label-script",
+				status: "in_progress",
+				kind: "other",
+				title: "execute",
+				rawInput: {
+					code: "const [a,b,c] = await Promise.all([search({query:\"a\"}), search({query:\"b\"}), search({query:\"c\"})]);",
+				},
+			},
+			"script",
+			"search ×3 · running",
+		);
+		check(
+			"script failed",
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e2e-label-script",
+				status: "failed",
+				kind: "other",
+				title: "execute",
+				rawInput: { code: "await fetch(\"http://x\");" },
+				content: [
+					{
+						type: "content",
+						content: {
+							type: "text",
+							text: "Tool execution interrupted",
+						},
+					},
+				],
+				rawOutput: {
+					metadata: {
+						toolCalls: [
+							{ tool: "fetch", status: "completed" },
+							{ tool: "fetch", status: "error" },
+						],
+					},
+				},
+			},
+			"script",
+			"fetch ×2 · failed",
+			true,
+		);
+
+		check(
+			"read pending",
+			{
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-read",
+				name: "read",
+				title: "read",
+				kind: "read",
+				status: "pending",
+				rawInput: {},
+			},
+			"read",
+			"",
+		);
+		check(
+			"read in_progress",
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e2e-label-read",
+				status: "in_progress",
+				kind: "read",
+				title: "read",
+				rawInput: {
+					path: "/src/unbounded/cmd/racer-object/src/main.rs",
+				},
+				locations: [
+					{ path: "/src/unbounded/cmd/racer-object/src/main.rs" },
+				],
+			},
+			"read",
+			"/src/unbounded/cmd/racer-object/src/main.rs · running",
+		);
+
+		check(
+			"question pending",
+			{
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-question",
+				name: "question",
+				title: "question",
+				kind: "other",
+				status: "pending",
+				rawInput: {},
+			},
+			"ask",
+			"",
+		);
+		check(
+			"question in_progress",
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e2e-label-question",
+				status: "in_progress",
+				kind: "other",
+				title: "question",
+				rawInput: {
+					questions: [
+						{
+							header: "CI log access",
+							question: "How should I proceed?",
+						},
+					],
+				},
+			},
+			"ask",
+			"CI log access · running",
+		);
+
+		check(
+			"descriptive title",
+			{
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-title",
+				name: "task",
+				title: "Review the diff",
+				kind: "other",
+				status: "pending",
+				rawInput: {},
+			},
+			"tool",
+			"Review the diff",
+		);
+
+		renderACP(
+			frame({
+				sessionUpdate: "tool_call",
+				toolCallId: "e2e-label-interrupted",
+				name: "shell",
+				title: "shell",
+				kind: "execute",
+				status: "in_progress",
+				rawInput: { command: "sleep 100" },
+			}),
+		);
+		closeOpenTools("interrupted");
+		const interruptedRows = document.querySelectorAll(
+			"#transcript .event.tool",
+		);
+		const interrupted =
+			interruptedRows[interruptedRows.length - 1];
+		const interruptedBadge =
+			interrupted &&
+			interrupted.querySelector(".event-kind");
+		const interruptedBody =
+			interrupted && interrupted.querySelector(".event-body");
+		if (
+			!interrupted ||
+			!interruptedBadge ||
+			interruptedBadge.textContent !== "run" ||
+			!interruptedBody ||
+			interruptedBody.textContent !==
+				"sleep 100 · interrupted" ||
+			!interrupted.classList.contains("error")
+		) {
+			problems.push(
+				"interrupted row = " +
+					JSON.stringify({
+						badge: interruptedBadge
+							? interruptedBadge.textContent
+							: "",
+						body: interruptedBody
+							? interruptedBody.textContent
+							: "",
+						error: interrupted
+							? interrupted.classList.contains("error")
+							: false,
+					}) +
+					", want badge run and body sleep 100 · interrupted with error class",
+			);
+		}
+
+		document
+			.querySelectorAll("#transcript .event.tool .event-body")
+			.forEach((body) => {
+				const text = body.textContent || "";
+				["(completed)", "(pending)", "(in_progress)"].forEach(
+					(suffix) => {
+						if (text.includes(suffix)) {
+							problems.push(
+								"tool body still shows a status suffix: " +
+									JSON.stringify(text),
+							);
+						}
+					},
+				);
+			});
+		// The synthetic rows are only for this assertion. Drop them so the
+		// real transcript starts clean when the chat opens.
+		clearTranscript();
+		return problems;
+	});
+	if (failures.length) {
+		throw new Error(
+			"tool label rendering failed:\n  " + failures.join("\n  "),
+		);
+	}
+}
+
 async function main() {
 	const cfg = {
 		url: env("BLIP_E2E_URL", "http://127.0.0.1:18080"),
@@ -517,6 +957,7 @@ async function main() {
 		// Let the initial session load settle before switching tabs,
 		// otherwise its response could race the new one.
 		await page.waitForLoadState("networkidle");
+		await verifyToolLabels(page);
 		await selectScope(page, cfg.scope);
 
 		const sessionName = await createSession(page, cfg);

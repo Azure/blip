@@ -1148,7 +1148,121 @@ function toolFailed(u) {
   return false;
 }
 
-const TERMINAL_TOOL_STATUSES = new Set(["completed", "done", "failed", "error", "interrupted"]);
+// Tool rows read as "<verb>  <subject>" instead of echoing the ACP title and
+// raw status. Updates after the first frame often omit name, kind, rawInput,
+// and title, so applyToolState caches the derived verb and subject on the row.
+const GENERIC_TOOL_TITLES = new Set([
+  "tool", "call", "execute", "bash", "run", "command", "read", "edit", "write",
+  "shell", "glob", "grep", "search", "fetch", "task", "question", "delete",
+  "move", "think", "webfetch", "switch_mode",
+]);
+
+function oneLine(value, limit) {
+  if (typeof value !== "string") return "";
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length > limit ? text.slice(0, limit - 1) + "…" : text;
+}
+
+function toolTitleText(name, title, status) {
+  return [name, title, status]
+    .filter((value, index, values) => value && values.indexOf(value) === index)
+    .join(" · ");
+}
+
+function toolVerb(u) {
+  const raw = u.rawInput && typeof u.rawInput === "object" ? u.rawInput : {};
+  const name = typeof u.name === "string" ? u.name.toLowerCase() : "";
+  const kind = typeof u.kind === "string" ? u.kind.toLowerCase() : "";
+  if (name === "execute" || name === "code" || name === "script" || typeof raw.code === "string") return "script";
+  if (name === "question" || name === "ask_user" || Array.isArray(raw.questions)) return "ask";
+  switch (kind) {
+    case "execute": return "run";
+    case "read": return "read";
+    case "edit": return "edit";
+    case "delete": return "delete";
+    case "move": return "move";
+    case "search": return "search";
+    case "fetch": return "fetch";
+    case "think": return "think";
+    case "switch_mode": return "mode";
+  }
+  if (typeof raw.command === "string") return "run";
+  return "tool";
+}
+
+function toolPath(u) {
+  const raw = u.rawInput && typeof u.rawInput === "object" ? u.rawInput : {};
+  const locations = Array.isArray(u.locations) ? u.locations : [];
+  const path = raw.filePath || raw.path || (locations[0] && locations[0].path);
+  return typeof path === "string" ? path : "";
+}
+
+function scriptSubject(u) {
+  const raw = u.rawInput && typeof u.rawInput === "object" ? u.rawInput : {};
+  const code = typeof raw.code === "string" ? raw.code : "";
+  const output = u.rawOutput && typeof u.rawOutput === "object" ? u.rawOutput : {};
+  const meta = output.metadata || u.metadata || {};
+  const calls = Array.isArray(meta.toolCalls) ? meta.toolCalls
+    : (Array.isArray(output.toolCalls) ? output.toolCalls : []);
+  const counts = new Map();
+  for (const call of calls) {
+    const name = call && typeof call.tool === "string" ? call.tool.trim() : "";
+    if (name) counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  if (!counts.size && code) {
+    const add = (name) => counts.set(name, (counts.get(name) || 0) + 1);
+    const toolPattern = /\btools\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)/g;
+    let match;
+    while ((match = toolPattern.exec(code))) add(match[1] + "." + match[2]);
+    // A bare call, but not a method call such as file.read().
+    const callPattern = /(^|[^.\w])(fetch|search|shell|read|grep|glob|edit|write|bash|webfetch)\s*\(/g;
+    while ((match = callPattern.exec(code))) add(match[2]);
+  }
+  if (counts.size) {
+    const summary = Array.from(counts, ([name, count]) => count > 1 ? name + " ×" + count : name).join(", ");
+    return oneLine(summary, 120);
+  }
+  const first = code.split("\n").map((line) => line.trim()).find(Boolean);
+  return first ? oneLine(first, 120) : "";
+}
+
+function toolSubject(u, verb, cached) {
+  const raw = u.rawInput && typeof u.rawInput === "object" ? u.rawInput : {};
+  if (verb === "run" && typeof raw.command === "string") {
+    const line = raw.command.split("\n").find((part) => part.trim());
+    const command = line ? oneLine(line, 120) : "";
+    if (command) return command;
+  }
+  if (verb === "script") {
+    const script = scriptSubject(u);
+    if (script) return script;
+  }
+  if (verb === "ask") {
+    const questions = Array.isArray(raw.questions) ? raw.questions : [];
+    const question = questions[0] || {};
+    const text = question.header || question.question;
+    if (typeof text === "string" && text.trim()) return oneLine(text, 120);
+  }
+  if (verb === "search") {
+    const query = raw.query || raw.pattern;
+    if (typeof query === "string" && query.trim()) return '"' + oneLine(query, 80) + '"';
+  }
+  if (verb === "fetch" && typeof raw.url === "string" && raw.url.trim()) return oneLine(raw.url, 120);
+  const path = toolPath(u);
+  if (path && ["read", "edit", "delete", "move", "write"].includes(verb)) return oneLine(path, 120);
+  const title = typeof u.title === "string" ? u.title.trim() : "";
+  const name = typeof u.name === "string" ? u.name.trim() : "";
+  const generic = !title || GENERIC_TOOL_TITLES.has(title.toLowerCase()) || title.toLowerCase() === name.toLowerCase();
+  const keep = cached || "";
+  if (!generic) return keep || oneLine(title, 120);
+  // For run/script/ask, a location is usually the working directory rather
+  // than the thing being acted on.
+  if (path && verb !== "run" && verb !== "script" && verb !== "ask") return keep || oneLine(path, 120);
+  if (name && !GENERIC_TOOL_TITLES.has(name.toLowerCase())) return keep || oneLine(name.replace(/[_-]+/g, " "), 120);
+  return keep;
+}
+
+const TERMINAL_TOOL_STATUSES = new Set(["completed", "done", "failed", "error", "cancelled", "canceled", "interrupted"]);
 
 function isTerminalToolStatus(status) {
   return TERMINAL_TOOL_STATUSES.has(status);
@@ -1176,19 +1290,45 @@ function toolRowFor(u) {
 }
 
 // Keep title, status label, and error styling in one place so tool_call,
-// tool_call_update, and orphan updates cannot drift. A freshly created pending
-// row stays unlabeled, which is the existing look for in-flight calls.
-function applyToolState(el, u, quiet) {
+// tool_call_update, and orphan updates cannot drift. Quiet statuses are
+// dropped: the badge and subject already say what the call is doing.
+function applyToolState(el, u) {
   if (!el) return;
   const failed = toolFailed(u);
-  const title = u.title || el.dataset.toolTitle || "tool";
+  const rawTitle = u.title || el.dataset.toolTitle || "tool";
   const status = failed ? "failed" : (u.status || el.dataset.toolStatus || "pending");
-  el.dataset.toolTitle = title;
+  el.dataset.toolTitle = rawTitle;
   el.dataset.toolStatus = status;
-  const label = failed || (u.status && !(quiet && status === "pending"));
+  if (typeof u.name === "string" && u.name) el.dataset.toolName = u.name;
+  if (typeof u.kind === "string" && u.kind) el.dataset.toolKind = u.kind;
+  const merged = {
+    name: u.name || el.dataset.toolName || "",
+    kind: u.kind || el.dataset.toolKind || "",
+    title: rawTitle,
+    rawInput: u.rawInput,
+    rawOutput: u.rawOutput,
+    locations: u.locations,
+    metadata: u.metadata,
+  };
+  const hasSignal = Boolean(u.name || u.kind || (u.rawInput && typeof u.rawInput === "object"));
+  const cachedVerb = el.dataset.toolVerb || "";
+  const derivedVerb = hasSignal ? toolVerb(merged) : "";
+  const verb = derivedVerb && (derivedVerb !== "tool" || !cachedVerb) ? derivedVerb : (cachedVerb || "tool");
+  el.dataset.toolVerb = verb;
+  const subject = toolSubject(merged, verb, el.dataset.toolSubject || "");
+  if (subject) el.dataset.toolSubject = subject;
+  const suffix = failed ? "failed"
+    : status === "in_progress" ? "running"
+    : (status === "cancelled" || status === "canceled" || status === "interrupted") ? status
+    : "";
+  const text = subject + (suffix ? (subject ? " · " : "") + suffix : "");
+  const badge = el.querySelector(".event-kind");
   const body = el.querySelector(".event-body");
-  if (body) body.textContent = title + (label ? " (" + status + ")" : "");
-  el.classList.toggle("error", failed);
+  if (badge && badge.textContent !== verb) badge.textContent = verb;
+  if (body && body.textContent !== text) body.textContent = text;
+  const titleText = toolTitleText(el.dataset.toolName, rawTitle, status);
+  if (el.title !== titleText) el.title = titleText;
+  el.classList.toggle("error", failed || status === "cancelled" || status === "canceled");
 }
 
 // A turn can end without a terminal tool_call_update (the agent process may
@@ -1198,9 +1338,12 @@ function closeOpenTools(label) {
     rows.forEach((el) => {
       const status = el.dataset.toolStatus || "pending";
       if (isTerminalToolStatus(status)) return;
+      const subject = el.dataset.toolSubject || "";
+      const text = subject + (subject ? " · " : "") + label;
       const body = el.querySelector(".event-body");
-      const title = el.dataset.toolTitle || "tool";
-      if (body) body.textContent = title + " (" + label + ")";
+      if (body && body.textContent !== text) body.textContent = text;
+      const titleText = toolTitleText(el.dataset.toolName, el.dataset.toolTitle || "tool", label);
+      if (el.title !== titleText) el.title = titleText;
       el.classList.add("error");
       el.dataset.toolStatus = "interrupted";
     });
@@ -1279,12 +1422,12 @@ function renderACP(msg) {
       case "tool_call": {
         const title = u.title || u.toolCallId || "call";
         const el = createMessage("tool", title);
-        el.dataset.toolTitle = title;
+        el.dataset.toolTitle = u.title || "";
         if (u.toolCallId) {
           el.dataset.toolCallId = u.toolCallId;
           addToolRow(u.toolCallId, el);
         }
-        applyToolState(el, u, true);
+        applyToolState(el, u);
         return;
       }
       case "tool_call_update": {
@@ -1333,7 +1476,10 @@ function renderACP(msg) {
     return;
   }
   if (msg.method === "session/request_permission") {
-    createMessage("tool", "permission requested: " + ((msg.params && msg.params.toolCall && msg.params.toolCall.title) || "tool"));
+    const request = (msg.params && msg.params.toolCall) || {};
+    const el = createMessage("tool", "permission requested: " + (request.title || "tool"));
+    const badge = el.querySelector(".event-kind");
+    if (badge) badge.textContent = "ask";
     return;
   }
   if (msg.error) {
