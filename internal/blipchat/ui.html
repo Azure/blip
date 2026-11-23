@@ -1616,7 +1616,10 @@ function syncTabs() {
 }
 
 function saveScope() {
-  try { localStorage.setItem("blip.scope", state.scope); } catch (_) {}
+  // sessionStorage keeps the preference per tab: it survives a reload, but one
+  // tab opening a chat in another scope can no longer rewrite what a different
+  // tab opens next time (the old localStorage key was shared by every tab).
+  try { sessionStorage.setItem("blip.scope", state.scope); } catch (_) {}
 }
 
 // reflowSessions re-renders the sidebar for the active scope from the cached
@@ -2633,7 +2636,17 @@ window.addEventListener("popstate", () => {
 
 async function boot() {
   let saved = "";
-  try { saved = localStorage.getItem("blip.scope") || ""; } catch (_) {}
+  try { saved = sessionStorage.getItem("blip.scope") || ""; } catch (_) {}
+  if (saved !== "team" && saved !== "user") {
+    // One-time read of the old shared preference so an existing browser keeps
+    // its last choice. It is not deleted: other open tabs may still need it.
+    let legacy = "";
+    try { legacy = localStorage.getItem("blip.scope") || ""; } catch (_) {}
+    if (legacy === "team" || legacy === "user") {
+      saved = legacy;
+      try { sessionStorage.setItem("blip.scope", legacy); } catch (_) {}
+    }
+  }
   if (saved === "team" || saved === "user") state.scope = saved;
   syncTabs();
   await loadMe();
