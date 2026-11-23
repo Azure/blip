@@ -145,8 +145,10 @@ Licensed under the MIT License. -->
     border-radius: 8px;
     box-shadow: var(--shadow);
     /* A long profile list must scroll inside the menu instead of growing past
-       the viewport, where later entries cannot be reached with a mouse. */
+       the viewport, where later entries cannot be reached with a mouse. Account
+       for the space above the menu as well as its own share of the viewport. */
     max-height: min(60dvh, 420px);
+    max-height: min(420px, calc(100dvh - 200px));
     overflow-y: auto;
     overscroll-behavior: contain;
   }
@@ -875,7 +877,10 @@ function setStreamNotice(text) {
     streamNotice.setAttribute("role", "status");
     transcript.prepend(streamNotice);
   }
-  streamNotice.textContent = text;
+  // The retry loop calls this with the same text every few seconds. Do not
+  // rewrite the live region when nothing changed, or screen readers announce
+  // the same recovery notice on every attempt.
+  if (streamNotice.textContent !== text) streamNotice.textContent = text;
 }
 
 function createMessage(role, text, sender, chunk) {
@@ -949,6 +954,7 @@ function appendChunk(role, text, sender) {
 }
 
 function setQuestion(q) {
+  const hadQuestionFocus = $("question").contains(document.activeElement);
   state.question = q || null;
   const show = Boolean(state.current) && Boolean(state.question);
   $("question").hidden = !show;
@@ -958,6 +964,8 @@ function setQuestion(q) {
     $("question-options").replaceChildren();
     resizeText();
     updateJump();
+    // Removing the focused option would otherwise drop focus to <body>.
+    if (hadQuestionFocus) ($("text").disabled ? $("transcript") : $("text")).focus();
     return;
   }
   $("question-text").textContent = state.question.question || "";
@@ -1013,7 +1021,7 @@ function setStatus(phase, running, detail) {
   // Succeeded/Stopped describe the VM's lifecycle, not the chat. Once a turn is
   // over the chat is idle even though its last blip has terminated.
   if (!running && /^(succeeded|stopped|ready|saving|inuse)$/.test(text)) text = "idle";
-  $("status").textContent = text;
+  if ($("status").textContent !== text) $("status").textContent = text;
   const dot = $("status-dot");
   const failed = /error|failed/.test(text);
   dot.dataset.state = running ? "running" : (failed ? "error" : "idle");
@@ -1683,6 +1691,10 @@ function stopDeepLinkRetry(hint) {
 
 function resetChat(mode) {
   saveDraft();
+  // Back/delete can run while the composer or an action has focus. Those
+  // controls are about to be disabled or hidden, so remember to land somewhere
+  // useful instead of letting the browser blur to <body>.
+  const hadMainFocus = document.querySelector("main").contains(document.activeElement);
   // mode selects how the no-chat view relates to history:
   //   undefined/"replace": the current entry already is (or becomes) the
   //     no-chat URL, so rewrite it and never add a duplicate entry.
@@ -1713,6 +1725,7 @@ function resetChat(mode) {
   $("scope-badge").hidden = true;
   setStatus("no chat", false, "");
   markActive();
+  if (hadMainFocus) $("transcript").focus();
 }
 
 function setOrigin(parent) {
@@ -2099,6 +2112,10 @@ function closeNewMenu(restoreFocus) {
 function setNewButtonBusy(busy, busyLabel) {
   const button = $("new-btn");
   button.textContent = busy ? busyLabel : "New chat";
+  // Keep a stable accessible name while the visible text reports progress;
+  // changing the name to "Loading…" makes "New chat" unfindable to AT.
+  if (busy) button.setAttribute("aria-label", "New chat");
+  else button.removeAttribute("aria-label");
   button.setAttribute("aria-disabled", busy ? "true" : "false");
   if (busy) button.setAttribute("aria-busy", "true");
   else button.removeAttribute("aria-busy");
@@ -2344,7 +2361,12 @@ function closeSidebar(restoreFocus) {
 }
 
 transcript.addEventListener("scroll", updateJump, { passive: true });
-$("jump").onclick = () => scrollToBottom(true);
+$("jump").onclick = () => {
+  // The button hides as soon as the jump starts. Keep keyboard focus in the
+  // transcript, where PageUp/Home/arrows can still interrupt the scroll.
+  transcript.focus();
+  scrollToBottom(true);
+};
 document.querySelector(".skip-link").addEventListener("click", (e) => {
   e.preventDefault();
   transcript.focus();
@@ -2477,9 +2499,12 @@ $("new").addEventListener("focusout", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     const wasMenu = !$("new-menu").hidden;
+    const drawerWasOpen = document.body.classList.contains("sidebar-open");
     closeNewMenu();
     closeSidebar();
-    if (wasMenu) $("new-btn").focus();
+    // In drawer mode the menu lives inside the closed aside, so New chat is
+    // no longer visible. Put focus on the visible Chats toggle instead.
+    if (wasMenu) (drawerWasOpen ? $("sidebar-btn") : $("new-btn")).focus();
   }
 });
 $("sidebar-btn").onclick = () => {
@@ -2552,10 +2577,11 @@ $("delete").onclick = async () => {
   if (!window.confirm(warning)) return;
   const button = $("delete");
   const hadFocus = document.activeElement === button;
+  const hadMainFocus = document.querySelector("main").contains(document.activeElement);
   button.disabled = true;
   // Disabling a focused button blurs it asynchronously; move focus before the
   // DELETE round-trip so it never falls to <body> while waiting.
-  if (hadFocus) $("transcript").focus();
+  if (hadFocus || hadMainFocus) $("transcript").focus();
   try {
     await api("/api/sessions/" + encodeURIComponent(name), { method: "DELETE" });
   } catch (err) {
@@ -2600,7 +2626,7 @@ $("delete").onclick = async () => {
     setDeepLink("", true);
   }
   await loadSessions();
-  if (hadFocus && !state.current) $("transcript").focus();
+  if ((hadFocus || hadMainFocus) && !state.current) $("transcript").focus();
   toast("Chat deleted.");
 };
 
