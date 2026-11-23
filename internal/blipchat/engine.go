@@ -406,11 +406,11 @@ func (e *chatEngine) converge(ctx context.Context) error {
 		}
 		var frame []byte
 		if !e.view.SessionFailed && sessionID != "" && e.view.CanResume {
-			frame = sessionSetupFrame(e.view.Gen, "session/resume", sessionID, e.s.mcpServers())
+			frame = sessionSetupFrame(e.view.Gen, "session/resume", sessionID, profile.sessionCwd(), e.s.mcpServers())
 		} else if !e.view.SessionFailed && sessionID != "" {
-			frame = sessionSetupFrame(e.view.Gen, "session/load", sessionID, e.s.mcpServers())
+			frame = sessionSetupFrame(e.view.Gen, "session/load", sessionID, profile.sessionCwd(), e.s.mcpServers())
 		} else {
-			frame = newSessionFrame(e.view.Gen, e.s.mcpServers())
+			frame = newSessionFrame(e.view.Gen, profile.sessionCwd(), e.s.mcpServers())
 		}
 		ok, err := e.send(ctx, frame, e.appendSeq())
 		if err != nil {

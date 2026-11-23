@@ -78,6 +78,7 @@ data:
       "idleTimeoutSeconds": 3600,
       "title": "OpenCode coding",
       "description": "Edits code in a mounted copy of the Blip repository",
+      "workingDir": "/src/blip",
       "baseSelector": {
         "matchLabels": {
           "chat.blip.dev/base": "opencode"

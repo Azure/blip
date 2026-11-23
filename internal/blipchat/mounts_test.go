@@ -204,7 +204,7 @@ func TestCreateChatAttachesProfileMount(t *testing.T) {
 	ctx := context.Background()
 	fc := newFakeCluster()
 	cache := addMountSource(t, fc, "gitcache-demo-1", committedState(time.Now()), false)
-	profile := Profile{Command: []string{"agent"}, Mounts: []ProfileMount{{
+	profile := Profile{Command: []string{"agent"}, WorkingDir: "/src/demo", Mounts: []ProfileMount{{
 		Path: "/src/demo", Selector: demoMountSelector(),
 	}}}
 	g := newGatewayWithCluster(t, fc, Options{Profiles: Profiles{DefaultProfileName: profile}})
@@ -258,6 +258,9 @@ func TestCreateChatAttachesProfileMount(t *testing.T) {
 	}
 	if !strings.Contains(text, "/src/demo") {
 		t.Fatalf("list_profiles does not report the mount: %s", text)
+	}
+	if !strings.Contains(text, `"workingDir": "/src/demo"`) {
+		t.Fatalf("list_profiles does not report the working directory: %s", text)
 	}
 }
 

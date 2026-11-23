@@ -336,6 +336,7 @@ next to the command:
 {
   "command": ["npx", "-y", "@zed-industries/claude-code-acp"],
   "description": "Works on the Blip repository",
+  "workingDir": "/src/blip",
   "mounts": [
     {
       "path": "/src/blip",
@@ -354,7 +355,11 @@ next to the command:
 `path` must be absolute, clean, not `/`, not under a reserved guest path
 (`/proc`, `/sys`, `/dev`, `/run/blip`, or `/run/blip-collect`), and unique
 within the profile. The selector is an ordinary Kubernetes label selector, and
-chat states are excluded from the match automatically.
+chat states are excluded from the match automatically. `workingDir` is optional;
+when set it must be absolute and clean, must not be at or under a reserved guest
+path, and must already exist in the guest — blipchat does not create it. The
+example points it at `/src/blip`, so the ACP session starts in the mounted
+repository.
 
 blipchat picks the newest matching state once, when the chat is created. A
 candidate must be Ready, have `status.committed` set, and not be terminating.
@@ -376,8 +381,9 @@ same response as a missing base state, and no chat is left behind.
 
 A child chat started with the fork workspace mode inherits its parent's mounts.
 A profile mount at a path the fork already has is skipped, and a mount at a
-path the fork lacks is added. `list_profiles` reports the `mounts` paths of each
-profile, so an agent can see the repository paths a child will start with.
+path the fork lacks is added. `list_profiles` reports the `mounts` paths and
+`workingDir` of each profile, so an agent can see the repository paths and
+working directory a child will start with.
 
 ## Verify a cache
 

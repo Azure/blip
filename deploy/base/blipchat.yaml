@@ -129,6 +129,21 @@
 #     "messageTemplate": "You are chat {{.Session}} in {{.Namespace}} running profile {{.Profile}}.\n\nUser message:\n{{.Text}}"
 #   }
 #
+# "workingDir" is an optional absolute, clean path sent as the ACP session cwd
+# in session/new, session/load, and session/resume. When unset or empty it is
+# "/". It sets only the ACP session cwd, not the agent process working
+# directory, and the directory must already exist in the base state or a
+# mounted state; blipchat does not create it. It must not be at or under a
+# reserved guest path (/proc, /sys, /dev, /run/blip, or /run/blip-collect). It
+# may name a mount path; combined with the mounts example above:
+#
+#   {
+#     "title": "Code",
+#     "workingDir": "/src/blip"
+#   }
+#
+# Changing workingDir for a profile affects existing chats when they resume.
+#
 # Base path
 #
 # --base-path=<path> serves the UI and API under a subroute, such as

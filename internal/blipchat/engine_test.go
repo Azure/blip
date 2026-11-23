@@ -177,6 +177,38 @@ func TestEnginePromptFlow(t *testing.T) {
 	}
 }
 
+func TestEngineUsesProfileWorkingDir(t *testing.T) {
+	f := newEngineFixture(t)
+	f.srv.profiles[DefaultProfileName] = Profile{WorkingDir: "/src/blip"}.normalized("default")
+	f.startGeneration(t, 1)
+	f.wire.note(noteRecord{Type: notePrompt, ID: "n1", Text: "hello", Original: "hello"})
+	f.start(t)
+
+	waitFor(t, "session/new g1-session", func() bool {
+		_, ok := engineSent(f.wire, "g1-session")
+		return ok
+	})
+	msg, ok := engineSent(f.wire, "g1-session")
+	if !ok {
+		t.Fatal("session/new was not sent")
+	}
+	var frame struct {
+		Method string `json:"method"`
+		Params struct {
+			Cwd string `json:"cwd"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(msg.raw, &frame); err != nil {
+		t.Fatal(err)
+	}
+	if frame.Method != "session/new" {
+		t.Fatalf("method = %q, want session/new", frame.Method)
+	}
+	if frame.Params.Cwd != "/src/blip" {
+		t.Fatalf("cwd = %q, want /src/blip", frame.Params.Cwd)
+	}
+}
+
 func TestEngineFramesEndWithNewline(t *testing.T) {
 	f := newEngineFixture(t)
 	f.startGeneration(t, 1)

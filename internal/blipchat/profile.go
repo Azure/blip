@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"text/template"
@@ -33,6 +34,10 @@ const DefaultIdleSeconds int64 = 3600
 
 // maxPromptBytes caps a message after MessageTemplate is applied.
 const maxPromptBytes = 64 << 10
+
+// defaultSessionCwd is the ACP session cwd used when a profile sets no
+// WorkingDir.
+const defaultSessionCwd = "/"
 
 // DefaultCommand is the documented example agent. It is not installed in the
 // blip by this program: a deployment that uses it needs a base state whose
@@ -66,6 +71,10 @@ type Profile struct {
 	// Mounts attaches states selected when the chat is created. Each mount is
 	// a private writable copy, so one chat cannot change what another sees.
 	Mounts []ProfileMount `json:"mounts,omitempty"`
+	// WorkingDir is an optional absolute working directory sent as the ACP
+	// session cwd. Empty means "/". It does not change the agent process
+	// working directory.
+	WorkingDir string `json:"workingDir,omitempty"`
 }
 
 // ProfileMount selects a state and mounts a copy of it at Path for the life of
@@ -198,6 +207,7 @@ func (p *Profile) UnmarshalJSON(data []byte) error {
 		MessageTemplate    string                `json:"messageTemplate"`
 		Workspace          string                `json:"workspace"`
 		Mounts             []ProfileMount        `json:"mounts"`
+		WorkingDir         string                `json:"workingDir"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -211,6 +221,7 @@ func (p *Profile) UnmarshalJSON(data []byte) error {
 	p.MessageTemplate = raw.MessageTemplate
 	p.Workspace = raw.Workspace
 	p.Mounts = raw.Mounts
+	p.WorkingDir = raw.WorkingDir
 	p.Env = nil
 	if len(raw.Env) != 0 && string(raw.Env) != "null" {
 		env, err := parseEnv(raw.Env)
@@ -269,7 +280,40 @@ func (p Profile) normalized(defaultPool string) Profile {
 	return p
 }
 
+// sessionCwd returns the ACP session working directory, defaulting to the
+// guest root.
+func (p Profile) sessionCwd() string {
+	if p.WorkingDir == "" {
+		return defaultSessionCwd
+	}
+	return p.WorkingDir
+}
+
+// validateWorkingDir requires an absolute, already-clean working directory
+// outside the guest's reserved directories. An empty value means the guest
+// root, which is allowed.
+func validateWorkingDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if !path.IsAbs(dir) {
+		return fmt.Errorf("workingDir %q must be absolute", dir)
+	}
+	if clean := path.Clean(dir); clean != dir {
+		return fmt.Errorf("workingDir %q is not clean; use %q", dir, clean)
+	}
+	for _, reserved := range reservedMounts {
+		if dir == reserved || strings.HasPrefix(dir, reserved+"/") {
+			return fmt.Errorf("workingDir %q is reserved by the guest", dir)
+		}
+	}
+	return nil
+}
+
 func (p Profile) validate() error {
+	if err := validateWorkingDir(p.WorkingDir); err != nil {
+		return err
+	}
 	switch p.Workspace {
 	case WorkspaceBase, WorkspaceFork:
 	default:

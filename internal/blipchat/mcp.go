@@ -165,7 +165,7 @@ func mcpTools() []map[string]any {
 	}
 	id := text("The child chat name returned by spawn_agent or list_agents.")
 	return []map[string]any{
-		tool("list_profiles", "List the available agent profiles, with their descriptions, workspace mode, and mounted paths.", map[string]any{}),
+		tool("list_profiles", "List the available agent profiles, with their descriptions, workspace mode, working directory, and mounted paths.", map[string]any{}),
 		tool("spawn_agent", "Start a child chat and send it a prompt. It runs in its own blip workspace. Returns the child's chat name; use get_agent to read its answer.", map[string]any{
 			"profile": text("One of the profiles list_profiles returns."),
 			"prompt":  text("The task for the child agent."),
@@ -268,6 +268,7 @@ func (s *Server) toolListProfiles() (string, error) {
 		Description string   `json:"description,omitempty"`
 		Workspace   string   `json:"workspace"`
 		Mounts      []string `json:"mounts,omitempty"`
+		WorkingDir  string   `json:"workingDir"`
 	}
 	names := make([]string, 0, len(s.profiles))
 	for name := range s.profiles {
@@ -277,7 +278,7 @@ func (s *Server) toolListProfiles() (string, error) {
 	out := make([]info, 0, len(names))
 	for _, name := range names {
 		p := s.profiles[name]
-		out = append(out, info{Name: name, Title: p.Title, Description: p.Description, Workspace: p.Workspace, Mounts: p.mountPaths()})
+		out = append(out, info{Name: name, Title: p.Title, Description: p.Description, Workspace: p.Workspace, Mounts: p.mountPaths(), WorkingDir: p.sessionCwd()})
 	}
 	return jsonText(map[string]any{"profiles": out}), nil
 }

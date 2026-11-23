@@ -564,7 +564,7 @@ func TestStateCanWriteGenerations(t *testing.T) {
 	}
 
 	// Build up per-generation state to prove a new start resets it.
-	r.in(1, json.RawMessage(newSessionFrame(1, nil)))
+	r.in(1, json.RawMessage(newSessionFrame(1, "/", nil)))
 	r.out(1, map[string]any{"jsonrpc": "2.0", "id": "g1-session", "result": map[string]any{"sessionId": "s1"}})
 	r.in(1, json.RawMessage(promptFrame("n1", "s1", "hi", "hi", "")))
 	if !v.InitSent || !v.SessionSent || !v.SessionReady || v.Inflight == nil {

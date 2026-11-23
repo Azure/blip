@@ -83,21 +83,21 @@ func initializeFrame(gen uint64) json.RawMessage {
 	})
 }
 
-func sessionSetupFrame(gen uint64, method, sessionID string, mcpServers []any) json.RawMessage {
+func sessionSetupFrame(gen uint64, method, sessionID, cwd string, mcpServers []any) json.RawMessage {
 	return acpFrame(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      sessionRequestID(gen),
 		"method":  method,
-		"params":  map[string]any{"sessionId": sessionID, "cwd": "/", "mcpServers": mcpServers},
+		"params":  map[string]any{"sessionId": sessionID, "cwd": cwd, "mcpServers": mcpServers},
 	})
 }
 
-func newSessionFrame(gen uint64, mcpServers []any) json.RawMessage {
+func newSessionFrame(gen uint64, cwd string, mcpServers []any) json.RawMessage {
 	return acpFrame(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      sessionRequestID(gen),
 		"method":  "session/new",
-		"params":  map[string]any{"cwd": "/", "mcpServers": mcpServers},
+		"params":  map[string]any{"cwd": cwd, "mcpServers": mcpServers},
 	})
 }
 

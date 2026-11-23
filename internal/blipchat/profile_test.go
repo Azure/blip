@@ -91,6 +91,64 @@ func TestProfileValidate(t *testing.T) {
 	}
 }
 
+func TestProfileParsesWorkingDir(t *testing.T) {
+	var p Profile
+	raw := `{"command":["agent"],"workingDir":"/src/blip"}`
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.WorkingDir != "/src/blip" {
+		t.Fatalf("workingDir = %q", p.WorkingDir)
+	}
+	if got := p.sessionCwd(); got != "/src/blip" {
+		t.Fatalf("sessionCwd = %q, want /src/blip", got)
+	}
+
+	var empty Profile
+	if err := json.Unmarshal([]byte(`{"command":["agent"]}`), &empty); err != nil {
+		t.Fatal(err)
+	}
+	if got := empty.sessionCwd(); got != "/" {
+		t.Fatalf("empty sessionCwd = %q, want /", got)
+	}
+}
+
+func TestProfileValidateWorkingDir(t *testing.T) {
+	tests := []struct {
+		name    string
+		dir     string
+		wantErr string
+	}{
+		{name: "empty defaults to root", dir: ""},
+		{name: "root", dir: "/"},
+		{name: "nested", dir: "/src/blip"},
+		{name: "home config", dir: "/home/dev/.config"},
+		{name: "relative", dir: "src/blip", wantErr: "must be absolute"},
+		{name: "unclean parent", dir: "/src/../etc", wantErr: "is not clean"},
+		{name: "trailing slash", dir: "/src/", wantErr: "is not clean"},
+		{name: "reserved proc", dir: "/proc", wantErr: "is reserved"},
+		{name: "reserved proc child", dir: "/proc/1", wantErr: "is reserved"},
+		{name: "reserved run blip child", dir: "/run/blip/x", wantErr: "is reserved"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := (Profile{Workspace: WorkspaceBase, WorkingDir: tc.dir}).validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validate(%q) = %v, want nil", tc.dir, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validate(%q) = nil, want error containing %q", tc.dir, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validate(%q) = %v, want error containing %q", tc.dir, err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestProfileMessageTemplateKeepsLegacyAgentsField(t *testing.T) {
 	if err := (Profile{Workspace: WorkspaceBase, MessageTemplate: "{{.Agents}} {{.Text}}"}).validate(); err != nil {
 		t.Fatalf("legacy .Agents template rejected: %v", err)
