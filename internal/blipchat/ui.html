@@ -723,6 +723,15 @@ function scrollToBottom(smooth) {
   const distance = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
   const behavior = smooth && !reduceMotion && distance < transcript.clientHeight * 4 ? "smooth" : "auto";
   jumpTarget = behavior === "smooth";
+  clearTimeout(jumpEndTimer);
+  jumpEndTimer = 0;
+  clearTimeout(jumpIdleTimer);
+  jumpIdleTimer = 0;
+  if (jumpTarget) {
+    // The scroll-idle check in updateJump normally settles the jump; this
+    // deadline is the last resort so it can never stay in flight forever.
+    jumpEndTimer = setTimeout(endJump, 1500);
+  }
   transcript.scrollTo({ top: transcript.scrollHeight, behavior });
   state.atBottom = true;
   $("jump").hidden = true;
@@ -730,22 +739,57 @@ function scrollToBottom(smooth) {
 
 function updateJump() {
   const bottom = nearBottom();
-  if (jumpTarget && !bottom) {
-    // Smooth scrolling fires scroll events on the way down. Keep the button
-    // hidden until the programmatic scroll finishes.
-    state.atBottom = true;
-    $("jump").hidden = true;
-    return;
-  }
   if (bottom) jumpTarget = false;
-  state.atBottom = bottom;
+  // While an animated jump is in flight the scroll events it emits must not
+  // flash the button; anywhere else derive state from the real position.
+  state.atBottom = jumpTarget ? true : bottom;
   const hasContent = transcript.querySelector(".msg, .event");
-  $("jump").hidden = state.atBottom || !hasContent;
+  // Keep the button clear of the question card's answer buttons.
+  $("jump").hidden = state.atBottom || !hasContent || !$("question").hidden;
+  if (jumpTarget) {
+    // Re-arm on every scroll frame. If the animation stops somewhere short of
+    // the bottom (the reader interrupted it), this settles the jump and lets
+    // the button return instead of leaving the view flagged at the bottom.
+    clearTimeout(jumpIdleTimer);
+    jumpIdleTimer = setTimeout(endJump, 300);
+  }
 }
 
 let jumpTarget = false;
-transcript.addEventListener("wheel", () => { jumpTarget = false; }, { passive: true });
-transcript.addEventListener("touchstart", () => { jumpTarget = false; }, { passive: true });
+let jumpEndTimer = 0;
+let jumpIdleTimer = 0;
+
+// Any direct scroll gesture means the reader has taken over: stop forcing
+// atBottom so a streaming chunk cannot yank them back to the bottom. Wheel and
+// touch are not the only paths; keyboard scrolling and scrollbar drags matter.
+function cancelJump() {
+  jumpTarget = false;
+  clearTimeout(jumpEndTimer);
+  jumpEndTimer = 0;
+  clearTimeout(jumpIdleTimer);
+  jumpIdleTimer = 0;
+  if (!nearBottom()) state.atBottom = false;
+}
+transcript.addEventListener("wheel", cancelJump, { passive: true });
+transcript.addEventListener("touchstart", cancelJump, { passive: true });
+transcript.addEventListener("keydown", (e) => {
+  if (/^(PageUp|PageDown|Home|End|ArrowUp|ArrowDown| )$/.test(e.key)) cancelJump();
+}, { passive: true });
+transcript.addEventListener("pointerdown", (e) => {
+  // A click on the vertical scrollbar targets the transcript and lands to the
+  // right of its client box.
+  if (e.target === transcript && e.clientX >= transcript.getBoundingClientRect().left + transcript.clientWidth) cancelJump();
+}, { passive: true });
+
+function endJump() {
+  if (!jumpTarget) return;
+  jumpTarget = false;
+  clearTimeout(jumpEndTimer);
+  jumpEndTimer = 0;
+  clearTimeout(jumpIdleTimer);
+  jumpIdleTimer = 0;
+  updateJump();
+}
 
 let followFrame = 0;
 function followOutput() {
@@ -767,6 +811,7 @@ function clearTranscript() {
   toolEvents.clear();
   planEvent = null;
   renderedPromptIDs.clear();
+  jumpTarget = false;
   state.atBottom = true;
   $("jump").hidden = true;
 }
@@ -870,6 +915,7 @@ function setQuestion(q) {
     $("question-text").textContent = "";
     $("question-options").replaceChildren();
     resizeText();
+    updateJump();
     return;
   }
   $("question-text").textContent = state.question.question || "";
@@ -884,6 +930,7 @@ function setQuestion(q) {
     options.appendChild(b);
   });
   resizeText();
+  updateJump();
 }
 
 function answerQuestion(text) {
