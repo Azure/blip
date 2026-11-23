@@ -1407,22 +1407,21 @@ function openEvents() {
   };
   source.onerror = () => {
     if (state.source !== source) return;
-    if (source.readyState === EventSource.CLOSED) {
-      // Some proxies end an EventSource permanently with a non-200. The
-      // browser will not reconnect that object, so open a fresh one with
-      // bounded backoff.
-      state.source = null;
-      stopEventWatch();
-      if (state.phase !== "reconnecting") setStatus("reconnecting", state.running, "event stream");
-      const delay = reconnectDelay;
-      reconnectDelay = Math.min(reconnectDelay * 2, 15000);
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        if (state.current) openEvents();
-      }, delay);
-      return;
-    }
+    // Always replace the EventSource ourselves instead of letting the browser
+    // retry it. A browser retry reuses the original URL and relies on the
+    // Last-Event-ID header; a proxy that strips that header would replay from
+    // the stale offset and duplicate transcript frames. A fresh object starts
+    // at the exact cursor this tab has applied.
+    source.close();
+    state.source = null;
+    stopEventWatch();
     if (state.phase !== "reconnecting") setStatus("reconnecting", state.running, "event stream");
+    const delay = reconnectDelay;
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (state.current) openEvents();
+    }, delay);
   };
   source.onopen = () => {
     if (state.source !== source) return;
