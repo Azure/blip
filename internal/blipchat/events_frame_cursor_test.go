@@ -164,6 +164,20 @@ func TestServerEventsResumeInsideRecord(t *testing.T) {
 		t.Fatalf("frames of one record share an id: %q %q %q", first[0].id, first[1].id, first[2].id)
 	}
 
+	// The status frame sent before a mid-record resume must acknowledge only
+	// the frames already delivered. A numeric cursor here would let a second
+	// disconnect skip the rest of the record.
+	resume := openEventFrames(t, g, name, "?offset="+first[0].id, "")
+	var status sseFrame
+	select {
+	case status = <-resume:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the initial status frame")
+	}
+	if status.ev.Type != "status" || status.id != first[0].id || status.ev.Cursor != first[0].id {
+		t.Fatalf("resume status id=%q cursor=%q, want %q", status.id, status.ev.Cursor, first[0].id)
+	}
+
 	for _, tc := range []struct {
 		name        string
 		query       string

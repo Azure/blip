@@ -1354,6 +1354,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	after, skip := cursor.offset, cursor.skip
 	lastID := strconv.FormatUint(after, 10)
+	if seen && skip > 0 {
+		// The client stopped inside this record. The status frame we publish
+		// before replaying the rest must not acknowledge the whole record, or
+		// a second disconnect before the next frame would skip what remains.
+		lastID = eventID(after, skip-1)
+	}
 	if !seen {
 		// A client with no cursor starts at this chat's first record, not at
 		// the base's records a fork inherited.
