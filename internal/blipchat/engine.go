@@ -903,8 +903,16 @@ func (s *Server) displayView(ctx context.Context, st *v1.BlipState) (*chatView, 
 // turn writes at least the user's prompt. A forked chat inherits history before
 // its start offset, and a chat with an attached writer can be read before its
 // first record lands, so both are expected to be empty.
+//
+// A copied base state can also carry a committed generation with no history of
+// its own. Until the chat has started an ACP session it has never accepted a
+// prompt, so an empty replay is honest; the session annotation is written on
+// the first turn.
 func emptyDespiteHistory(st *v1.BlipState, view *chatView) bool {
 	if st.Status.Writer != nil || chatStart(st) != 0 || len(view.Transcript) != 0 || view.Newest != 0 {
+		return false
+	}
+	if st.Annotations[AnnotationACPSession] == "" {
 		return false
 	}
 	c := st.Status.Committed

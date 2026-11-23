@@ -176,6 +176,7 @@ func TestServerDetailUnavailableInsteadOfEmpty(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := newFakeCluster()
 			st := newChat(fc, "chat-detail", DefaultProfileName)
+			st.Annotations[AnnotationACPSession] = "session-1"
 			st.Status.Committed = &v1.Commit{ID: "commit-1", Generation: 1}
 			fw := newFakeWire()
 			fw.note(noteRecord{Type: notePrompt, ID: "n1", Text: "hello", Original: "hello"})
@@ -208,6 +209,26 @@ func TestServerDetailUnavailableInsteadOfEmpty(t *testing.T) {
 				t.Fatalf("completed detail: status=%d transcript=%d, want 200 with 2 frames", status, len(detail.Transcript))
 			}
 		})
+	}
+}
+
+// A chat copied from a base state can inherit the base's committed generation
+// before it has any history of its own. It has never started an ACP session, so
+// an empty replay is honest and must not be reported as unavailable.
+func TestServerDetailFreshChatMayBeEmpty(t *testing.T) {
+	fc := newFakeCluster()
+	st := newChat(fc, "chat-fresh", DefaultProfileName)
+	st.Status.Committed = &v1.Commit{ID: "base-commit", Generation: 1}
+	wire := &detailReadWire{Wire: newFakeWire()}
+	wire.empty.Store(true)
+	_, ts := newDetailGateway(t, wire, fc)
+
+	status, detail := getSessionDetail(t, ts, "chat-fresh")
+	if status != http.StatusOK {
+		t.Fatalf("fresh chat detail status=%d, want 200", status)
+	}
+	if len(detail.Transcript) != 0 || detail.Offset != 0 {
+		t.Fatalf("fresh chat transcript=%d offset=%d, want an empty view", len(detail.Transcript), detail.Offset)
 	}
 }
 
