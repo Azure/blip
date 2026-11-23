@@ -1485,6 +1485,19 @@ async function openSession(name, fromHistory, retrying) {
   clearTranscript();
   showEmpty("Loading chat\u2026", "Fetching the conversation.");
   setStatus("loading", false, "opening chat");
+  // Move the scope chrome, heading, and origin to the chat being loaded now,
+  // not after the detail GET: the loading state must not keep claiming the
+  // previous chat's identity or badge. The sidebar entry already carries the
+  // title, parent, and scope for a chat the user picked or deep-linked to.
+  const listed = state.sessions.find((s) => s && s.name === name);
+  if (listed && adoptScope(scopeOf(listed))) reflowSessions();
+  state.parent = (listed && listed.parent) || "";
+  setOrigin(state.parent);
+  setTitle(listed ? listed.title : "");
+  $("profile").textContent = "";
+  $("profile").title = "";
+  $("profile").hidden = true;
+  $("scope-badge").hidden = !listed || scopeOf(listed) !== "user";
   try {
     const d = await api("/api/sessions/" + encodeURIComponent(name));
     if (token !== openSeq) return;
