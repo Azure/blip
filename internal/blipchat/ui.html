@@ -349,7 +349,7 @@ Licensed under the MIT License. -->
     margin-bottom: 4px;
     font-size: 11.5px;
   }
-  .msg-sender { color: var(--dim); font-weight: 600; }
+  .msg-sender { color: var(--dim); font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
   .msg-you { color: var(--accent); font-size: 10.5px; }
   .msg.user .msg-head { padding-left: 12px; }
   .msg-body {
@@ -512,7 +512,8 @@ Licensed under the MIT License. -->
   .toast {
     position: fixed;
     left: 50%;
-    bottom: calc(var(--composer-h, 22px) + 64px);
+    /* Clear both the question card and the composer, which grow with content. */
+    bottom: calc(var(--composer-h, 22px) + var(--question-h, 0px) + 64px);
     z-index: 50;
     max-width: min(88vw, 560px);
     padding: 9px 13px;
@@ -2025,6 +2026,11 @@ function syncComposerHeight() {
   document.documentElement.style.setProperty("--composer-h", $("composer").offsetHeight + "px");
 }
 
+function syncQuestionHeight() {
+  const h = $("question").hidden ? 0 : $("question").offsetHeight;
+  document.documentElement.style.setProperty("--question-h", h + "px");
+}
+
 function resizeText() {
   const el = $("text");
   el.style.height = "auto";
@@ -2043,6 +2049,7 @@ function resizeText() {
   const cap = Math.max(25, Math.min(160, budget));
   el.style.height = Math.min(el.scrollHeight, cap) + "px";
   syncComposerHeight();
+  syncQuestionHeight();
 }
 
 // The server trims before its 32000-byte check, so the composer counts the
@@ -2122,7 +2129,11 @@ function openSidebar() {
   requestAnimationFrame(() => {
     const rows = [...document.querySelectorAll("#sessions li")].filter((li) => !li.hidden);
     const target = rows.find((li) => li.classList.contains("active")) || rows[0];
-    const focus = target ? target.querySelector(".session-open") : document.querySelector('.tabs [role="tab"]');
+    // With an empty list, focus the selected tab rather than whichever tab
+    // happens to be first in the DOM (Team).
+    const fallback = document.querySelector('.tabs [role="tab"][aria-selected="true"]') ||
+      document.querySelector('.tabs [role="tab"]');
+    const focus = target ? target.querySelector(".session-open") : fallback;
     if (focus) focus.focus();
   });
 }
