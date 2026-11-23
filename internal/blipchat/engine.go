@@ -357,6 +357,14 @@ func (e *chatEngine) converge(ctx context.Context) error {
 	case active.Status.Phase != v1.BlipRunning:
 		return nil
 	}
+	// Agents can emit a title in their final update before exiting. Save it
+	// before the run-end gate below drops it.
+	if e.view.HasTitle && e.view.TitleSeq > e.savedTitle {
+		if err := e.s.cluster.PatchSession(ctx, e.s.namespace, e.name, nil, map[string]string{AnnotationTitle: e.view.Title}); err != nil {
+			return err
+		}
+		e.savedTitle = e.view.TitleSeq
+	}
 	if e.view.Ended || !e.view.Started || e.view.Gen == 0 {
 		return nil
 	}
@@ -431,12 +439,6 @@ func (e *chatEngine) converge(ctx context.Context) error {
 		}
 		e.savedACP = e.view.SessionID
 		e.sessionID = e.view.SessionID
-	}
-	if e.view.HasTitle && e.view.TitleSeq > e.savedTitle {
-		if err := e.s.cluster.PatchSession(ctx, e.s.namespace, e.name, nil, map[string]string{AnnotationTitle: e.view.Title}); err != nil {
-			return err
-		}
-		e.savedTitle = e.view.TitleSeq
 	}
 	if e.view.Permission != nil && rawID(e.view.Permission.ID) != e.permissionID {
 		frame := permissionReply(e.view.Permission.ID, e.view.Permission.Method, e.view.Permission.Params, e.s.autoApprove)

@@ -128,10 +128,9 @@ async function sessionTitle(page, name) {
 	return found ? found.title : "";
 }
 
-// waitForAgentTitle returns the name the agent gave the chat, or "" when the
-// agent never set one. ACP makes titles optional, so callers must not require
-// them; this only checks that a title the agent does send reaches the UI.
-async function waitForAgentTitle(page, timeoutMs) {
+// waitForTitle returns any title the header shows once it stops being a
+// placeholder, whether the server fallback or an agent-supplied title.
+async function waitForTitle(page, timeoutMs) {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const title = ((await page.locator("#title").textContent()) || "").trim();
@@ -203,6 +202,7 @@ async function runTurn(page, nonce, name, namespace, timeoutMs) {
 	// itself instead: the driver closes the agent's stdin at the end of a
 	// turn, and ACP agents exit on EOF, which stops the Blip.
 	await waitForNotRunning(page, name, namespace, timeoutMs);
+	return prompt;
 }
 
 async function postMessage(page, name, namespace, text) {
@@ -534,7 +534,7 @@ async function main() {
 		}
 
 		await waitForComposer(page, cfg.timeoutMs);
-		await runTurn(
+		const firstPrompt = await runTurn(
 			page,
 			nonce1,
 			sessionName,
@@ -542,28 +542,29 @@ async function main() {
 			cfg.timeoutMs,
 		);
 
-		const agentTitle = await waitForAgentTitle(page, cfg.titleWaitMs);
-		if (agentTitle) {
-			await verifySessionTitle(page, sessionName, agentTitle, cfg.scope);
-			const header = ((await page.locator("#title").textContent()) || "").trim();
-			if (header !== agentTitle) {
-				throw new Error(
-					`header = ${JSON.stringify(header)}, want ${JSON.stringify(agentTitle)}`,
-				);
-			}
-			const listed = await sessionTitle(page, sessionName);
-			if (listed !== agentTitle) {
-				throw new Error(
-					`sidebar title = ${JSON.stringify(listed)}, want ${JSON.stringify(agentTitle)}`,
-				);
-			}
-		} else {
-			const listed = await sessionTitle(page, sessionName);
-			if (listed !== "New chat") {
-				throw new Error(
-					`sidebar title = ${JSON.stringify(listed)}, want "New chat"`,
-				);
-			}
+		const title = await waitForTitle(page, cfg.titleWaitMs);
+		if (!title) {
+			throw new Error("chat has no title after the first turn");
+		}
+		await verifySessionTitle(page, sessionName, title, cfg.scope);
+		const header = ((await page.locator("#title").textContent()) || "").trim();
+		if (header !== title) {
+			throw new Error(
+				`header = ${JSON.stringify(header)}, want ${JSON.stringify(title)}`,
+			);
+		}
+		const listed = await sessionTitle(page, sessionName);
+		if (listed !== title) {
+			throw new Error(
+				`sidebar title = ${JSON.stringify(listed)}, want ${JSON.stringify(title)}`,
+			);
+		}
+		if (title !== firstPrompt) {
+			// The server names a chat from its first message, so a different
+			// title can only come from an agent-supplied rename.
+			console.log(
+				`chat title ${JSON.stringify(title)} differs from the first prompt; treating it as an agent-supplied rename`,
+			);
 		}
 		const firstSession = await getSession(
 			page,
@@ -705,7 +706,7 @@ async function main() {
 
 		const result = {
 			sessionName,
-			title: agentTitle,
+			title,
 			scope: cfg.scope,
 			profile: cfg.profile,
 			nonce1,

@@ -606,3 +606,26 @@ func TestEnginePermission(t *testing.T) {
 		return ok
 	})
 }
+
+func TestEngineSavesTitleAfterRunEnds(t *testing.T) {
+	f := newEngineFixture(t)
+	f.startGeneration(t, 1)
+	f.wire.emitACP(1, map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]any{
+			"sessionId": "acp-session-1",
+			"update": map[string]any{
+				"sessionUpdate": "session_info_update",
+				"title":         "Agent title",
+			},
+		},
+	})
+	// The run ends before any prompt or session setup, so the engine never
+	// reaches SessionReady.
+	f.wire.end(1)
+	f.start(t)
+	waitFor(t, "title annotation", func() bool {
+		return f.annotation(AnnotationTitle) == "Agent title"
+	})
+}

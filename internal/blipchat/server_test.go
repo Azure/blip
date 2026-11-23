@@ -591,6 +591,62 @@ func TestServerMessageStartsAgentAndWritesNote(t *testing.T) {
 	g.waitPrompt(t, "hello")
 }
 
+func TestServerMessageSetsFallbackTitle(t *testing.T) {
+	g := newGateway(t, Options{})
+	name := g.createChat(t, map[string]any{"profile": DefaultProfileName}, "alice")
+
+	resp := g.request(t, "POST", "/api/sessions/"+name+"/message", map[string]string{"text": "Fix the build\nand run tests"}, "alice", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("message: status %d", resp.StatusCode)
+	}
+	if title := g.chatState(t, name).Annotations[AnnotationTitle]; title != "Fix the build" {
+		t.Fatalf("title = %q, want %q", title, "Fix the build")
+	}
+
+	resp = g.request(t, "POST", "/api/sessions/"+name+"/message", map[string]string{"text": "second"}, "alice", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("second message: status %d", resp.StatusCode)
+	}
+	if title := g.chatState(t, name).Annotations[AnnotationTitle]; title != "Fix the build" {
+		t.Fatalf("title after second message = %q, want %q", title, "Fix the build")
+	}
+}
+
+func TestServerMessageKeepsExistingTitle(t *testing.T) {
+	g := newGateway(t, Options{})
+	name := g.createChat(t, map[string]any{"profile": DefaultProfileName, "title": "Keep me"}, "alice")
+
+	resp := g.request(t, "POST", "/api/sessions/"+name+"/message", map[string]string{"text": "hello"}, "alice", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("message: status %d", resp.StatusCode)
+	}
+	if title := g.chatState(t, name).Annotations[AnnotationTitle]; title != "Keep me" {
+		t.Fatalf("title = %q, want %q", title, "Keep me")
+	}
+}
+
+func TestFallbackTitle(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+		want string
+	}{
+		{"trims", "  hello  ", "hello"},
+		{"first non-empty line", "\n\nfirst\nsecond", "first"},
+		{"empty", "   ", ""},
+		{"shortens", strings.Repeat("a", 100), strings.Repeat("a", 79) + "…"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fallbackTitle(tc.text); got != tc.want {
+				t.Fatalf("fallbackTitle(%q) = %q, want %q", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestServerMessagesKeepOrder(t *testing.T) {
 	g := newGateway(t, Options{})
 	name := g.createChat(t, map[string]any{"profile": DefaultProfileName}, "alice")

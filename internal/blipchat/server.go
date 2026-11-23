@@ -958,7 +958,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // newSessionName returns a unique name that does not depend on a title: the
-// agent names the chat once the conversation has started.
+// chat is named from its first message.
 func newSessionName() string {
 	var b [3]byte
 	_, _ = rand.Read(b[:])
@@ -1118,6 +1118,17 @@ func (s *Server) backfillChat(ctx context.Context, st *v1.BlipState) {
 	}
 }
 
+// fallbackTitle names a chat after the first non-empty line of a message.
+// An agent title, when an agent sends one, replaces it.
+func fallbackTitle(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return shorten(line, 80)
+		}
+	}
+	return ""
+}
+
 func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	name, ok := s.sessionArgs(w, r)
 	if !ok {
@@ -1156,6 +1167,13 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	if err := s.appendMessage(writeCtx, st, profile, user, text); err != nil {
 		s.writeNoteError(w, "submit message", name, err)
 		return
+	}
+	if st.Annotations[AnnotationTitle] == "" {
+		if title := fallbackTitle(text); title != "" {
+			if err := s.cluster.PatchSession(writeCtx, st.Namespace, name, nil, map[string]string{AnnotationTitle: title}); err != nil {
+				s.log.Warn("set chat title", "session", name, "err", err)
+			}
+		}
 	}
 	// The note and its running blip exist; start the driver now instead of
 	// waiting for the next supervisor pass.
