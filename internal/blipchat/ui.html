@@ -764,11 +764,16 @@ let jumpIdleTimer = 0;
 // atBottom so a streaming chunk cannot yank them back to the bottom. Wheel and
 // touch are not the only paths; keyboard scrolling and scrollbar drags matter.
 function cancelJump() {
+  const wasJumping = jumpTarget;
   jumpTarget = false;
   clearTimeout(jumpEndTimer);
   jumpEndTimer = 0;
   clearTimeout(jumpIdleTimer);
   jumpIdleTimer = 0;
+  // Ending the state is not enough: a native smooth scrollTo keeps animating
+  // after a wheel or scrollbar gesture. Re-target the current position to abort
+  // it, then let the gesture move the view.
+  if (wasJumping) transcript.scrollTo({ top: transcript.scrollTop, behavior: "auto" });
   if (!nearBottom()) state.atBottom = false;
 }
 transcript.addEventListener("wheel", cancelJump, { passive: true });
@@ -1583,7 +1588,7 @@ function setOrigin(parent) {
     el.dataset.parent = parent;
     return;
   }
-  const text = known.title || "New chat";
+  const text = displayTitle(known.title);
   const href = "#" + encodeURIComponent(parent);
   const a = el.querySelector("a");
   // The list poll runs every couple of seconds. Keep an unchanged link in the
@@ -1724,12 +1729,13 @@ function renderSessions(sessions) {
       toggle.tabIndex = -1;
       toggle.setAttribute("aria-hidden", "true");
     }
+    const rowTitle = displayTitle(s.title);
     const title = document.createElement("button");
     title.type = "button";
     title.className = "session-title session-open";
-    title.textContent = s.title || "New chat";
-    title.title = s.title || "New chat";
-    title.setAttribute("aria-label", (s.title || "New chat") + " (" + s.name + ")");
+    title.textContent = rowTitle;
+    title.title = rowTitle;
+    title.setAttribute("aria-label", rowTitle + " (" + s.name + ")");
     title.onclick = (e) => {
       e.stopPropagation();
       openSession(s.name);
@@ -1958,13 +1964,11 @@ async function createSession(profile) {
   }
   finally {
     state.creating = false;
-    // A failed POST leaves the old chat current, so keep it usable. But only
-    // restore the composer when the chat on screen is the loaded one this
-    // create started from: a newer openSession may still be fetching, and
-    // enabling the box then would let a send (and unseen typing) target
-    // "Loading chat…". A successful create leaves the composer enabled by
-    // openSession, which this condition deliberately does not touch.
-    if (state.current && state.sessionReady && openSeq === seqAtStart) {
+    // A failed POST leaves the old chat current, so keep it usable. Do not
+    // enable anything while a newer openSession is still fetching, but once a
+    // loaded chat is on screen restore its composer even if the user navigated
+    // away and back during the create: updateLimit() sees state.creating=false.
+    if (state.current && state.sessionReady) {
       $("text").disabled = false;
       updateLimit();
     }
