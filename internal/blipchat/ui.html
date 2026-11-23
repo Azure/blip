@@ -1725,10 +1725,13 @@ async function createSession(profile) {
   } catch (err) { toast(err.message); }
   finally {
     state.creating = false;
-    // A failed POST leaves the old chat current, so keep it usable. If
-    // openSession failed it has already disabled the composer and cleared the
-    // current chat; do not re-enable sending into nowhere.
-    if (state.current) {
+    // A failed POST leaves the old chat current, so keep it usable. But only
+    // restore the composer when the chat on screen is the loaded one this
+    // create started from: a newer openSession may still be fetching, and
+    // enabling the box then would let a send (and unseen typing) target
+    // "Loading chat…". A successful create leaves the composer enabled by
+    // openSession, which this condition deliberately does not touch.
+    if (state.current && state.sessionReady && openSeq === seqAtStart) {
       $("text").disabled = false;
       $("send").disabled = false;
     }
@@ -1862,7 +1865,7 @@ function restoreUnsent(name, text) {
 async function send() {
   if (state.creating) return;
   const text = $("text").value.trim();
-  if (!text || !state.current || $("text").disabled) return;
+  if (!text || !state.current || !state.sessionReady || $("text").disabled) return;
   const name = state.current;
   const prior = countDomUserText(text);
   $("text").value = "";
