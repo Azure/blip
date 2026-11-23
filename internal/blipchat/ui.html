@@ -646,7 +646,7 @@ Licensed under the MIT License. -->
 </div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
-const state = { scope: "team", current: null, parent: "", source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", running: false, phase: "no chat", question: null, sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, breakAgent: false };
+const state = { scope: "team", current: null, parent: "", source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", pendingAttempts: 0, running: false, phase: "no chat", question: null, sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, breakAgent: false };
 let openSeq = 0;
 let listSeq = 0;
 let titleEpoch = 0;
@@ -665,6 +665,10 @@ const SESSION_POLL_MS = 2000;
 const EVENT_WATCH_MS = 10000;
 const EVENT_STALL_MS = 50000;
 const RESYNC_MAX_DELAY_MS = 15000;
+// A deep link whose detail request keeps failing is retried on the list poll.
+// Stop after a few tries so a permanently broken or deleted link does not
+// flash the loading state and re-toast forever.
+const MAX_DEEP_LINK_ATTEMPTS = 5;
 const MAX_MESSAGE_BYTES = 32000;
 const collapsedSessions = new Set();
 const $ = (id) => document.getElementById(id);
@@ -1440,18 +1444,25 @@ function restoreDraft(name) {
 
 function setDeepLink(name, replace) {
   const hash = name ? "#" + encodeURIComponent(name) : "";
-  if (location.hash === hash) return;
+  if (location.hash === hash) return false;
   const target = location.pathname + location.search + hash;
   if (replace) history.replaceState(null, "", target);
   else history.pushState(null, "", target);
+  return true;
 }
 
-async function openSession(name, fromHistory) {
+async function openSession(name, fromHistory, retrying) {
   saveDraft();
   if (state.current) {
     state.scrollPositions[state.current] = { top: transcript.scrollTop, atBottom: state.atBottom };
   }
   const token = ++openSeq;
+  // Make the URL name the chat as soon as the user picks it. Back during the
+  // detail load then targets the previous entry, and a reload reopens the chat
+  // the click intended. fromHistory means the URL already names it.
+  const pushed = !fromHistory && setDeepLink(name, false);
+  // A retry counts toward the cap; every other open starts a fresh count.
+  if (!retrying) state.pendingAttempts = 0;
   state.pendingDeepLink = "";
   state.current = name;
   state.sessionReady = false;
@@ -1523,7 +1534,6 @@ async function openSession(name, fromHistory) {
       if (window.matchMedia("(max-width: 820px)").matches) $("transcript").focus();
       else $("text").focus();
     }
-    if (!fromHistory) setDeepLink(name, false);
   } catch (err) {
     if (token !== openSeq) return;
     toast(err.message);
@@ -1542,10 +1552,21 @@ async function openSession(name, fromHistory) {
     setStatus("no chat", false, "");
     markActive();
     const transient = !err.status || err.status >= 500;
+    // A definite failure (404/403 for a deleted or foreign chat, 400 for a bad
+    // name) must not consume the history entry the click pushed. Rewind to the
+    // entry the user came from; its popstate handler restores that view, so
+    // the previous chat (or the no-chat view) survives and Back still works.
+    // A transient failure is retried, so its URL is kept and replaced below.
+    if (!transient && pushed) {
+      showEmpty("Could not open chat", err.message);
+      history.back();
+      return;
+    }
     if (transient) {
       // Do not throw away a deep link just because the API was briefly down.
       // loadSessions will retry it once the server is reachable again.
       state.pendingDeepLink = name;
+      state.pendingAttempts += 1;
       setDeepLink(name, true);
       showEmpty("Could not open chat", "The server is unreachable. Retrying when it returns.");
     } else {
@@ -1599,10 +1620,19 @@ function setScope(scope) {
   const next = scope === "user" ? "user" : "team";
   if (next !== state.scope) {
     state.scope = next;
+    // Switching tabs is an explicit "I no longer want that chat" signal: a
+    // failed deep link must not retry and yank the user back to the other scope.
+    const abandoned = state.pendingDeepLink;
+    stopDeepLinkRetry("Open the chat again to retry.");
+    if (!state.current && abandoned && hashName() === abandoned) {
+      setDeepLink("", true);
+      clearTranscript();
+      showEmpty("No chat open", "Pick a chat from the list, or start a new one.");
+    }
     saveScope();
     reflowSessions();
     const known = state.current ? state.sessions.find((s) => s.name === state.current) : null;
-    if (state.current && (!known || scopeOf(known) !== state.scope)) resetChat();
+    if (state.current && (!known || scopeOf(known) !== state.scope)) resetChat("push");
   }
   syncTabs();
 }
@@ -1616,15 +1646,38 @@ function adoptScope(scope) {
   return true;
 }
 
-function resetChat() {
+// Abandon a deep link that loadSessions is retrying. Used when the user moves
+// on (a scope switch or the New chat menu): the old notice must not keep
+// claiming the link is still being retried.
+function stopDeepLinkRetry(hint) {
+  if (!state.pendingDeepLink) return;
+  state.pendingDeepLink = "";
+  state.pendingAttempts = 0;
+  const title = transcript.querySelector(".empty .empty-title");
+  if (title && title.textContent === "Could not open chat") {
+    clearTranscript();
+    showEmpty("Could not open chat", hint);
+  }
+}
+
+function resetChat(mode) {
   saveDraft();
-  setDeepLink("", true);
+  // mode selects how the no-chat view relates to history:
+  //   undefined/"replace": the current entry already is (or becomes) the
+  //     no-chat URL, so rewrite it and never add a duplicate entry.
+  //   "push": the user switched scope with a chat open. Push a no-chat entry
+  //     instead of overwriting the open chat's entry, so Back restores it.
+  //   "keep": the URL already points at the no-chat view (a #transcript
+  //     popstate); leave the fragment alone.
+  if (mode === "push") setDeepLink("", false);
+  else if (mode !== "keep") setDeepLink("", true);
   openSeq++;
   closeEvents();
   state.current = null;
   state.parent = "";
   state.sessionReady = false;
   state.pendingDeepLink = "";
+  state.pendingAttempts = 0;
   setQuestion(null);
   $("text").value = "";
   updateLimit();
@@ -1914,9 +1967,25 @@ async function loadSessions(opts) {
     if (!state.me && !state.meLoading) loadMe();
     if (!state.current && state.pendingDeepLink) {
       const target = state.pendingDeepLink;
-      if (state.sessions.some((s) => s && s.name === target)) {
+      if (hashName() !== target) {
+        // The user navigated elsewhere; do not yank them back with a retry.
         state.pendingDeepLink = "";
-        openSession(target, true);
+        state.pendingAttempts = 0;
+      } else if (!state.sessions.some((s) => s && s.name === target)) {
+        // The chat was deleted (or never existed) while we were retrying.
+        state.pendingDeepLink = "";
+        state.pendingAttempts = 0;
+        setDeepLink("", true);
+        clearTranscript();
+        showEmpty("Could not open chat", "That chat is no longer available.");
+      } else if (state.pendingAttempts >= MAX_DEEP_LINK_ATTEMPTS) {
+        // A permanently failing link stops flashing and re-toasting.
+        state.pendingDeepLink = "";
+        state.pendingAttempts = 0;
+        clearTranscript();
+        showEmpty("Could not open chat", "Giving up after repeated failures. Reload to try again.");
+      } else {
+        openSession(target, true, true);
       }
     }
   } catch (err) {
@@ -2317,6 +2386,8 @@ $("new-btn").onclick = async (e) => {
     closeNewMenu();
     return;
   }
+  // The user is moving on to a new chat; stop retrying a failed deep link.
+  stopDeepLinkRetry("Open the chat again to retry.");
   const menuSeq = ++newMenuSeq;
   if (!(await loadProfiles(menuSeq))) return;
   if (menuSeq !== newMenuSeq) return;
@@ -2450,6 +2521,7 @@ $("delete").onclick = async () => {
     state.parent = "";
     state.sessionReady = false;
     state.pendingDeepLink = "";
+    state.pendingAttempts = 0;
     state.offset = 0;
     delete state.drafts[name];
     closeEvents();
@@ -2536,9 +2608,10 @@ window.addEventListener("popstate", () => {
   const name = hashName();
   // "transcript" is the skip-link fragment, not a chat name. Returning to it
   // from a chat must also return the visible view to the no-chat state so the
-  // URL and the rendered chat cannot disagree after a reload.
+  // URL and the rendered chat cannot disagree after a reload, but the
+  // fragment itself belongs to that history entry and must be kept.
   if (name === "transcript") {
-    if (state.current) resetChat();
+    if (state.current || state.pendingDeepLink) resetChat("keep");
     return;
   }
   if (name) openSession(name, true);
