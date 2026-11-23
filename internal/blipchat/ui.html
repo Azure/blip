@@ -643,6 +643,7 @@ let resyncing = false;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
 const SESSION_POLL_MS = 2000;
+const MAX_MESSAGE_BYTES = 32000;
 const collapsedSessions = new Set();
 const $ = (id) => document.getElementById(id);
 const transcript = $("transcript");
@@ -1230,7 +1231,6 @@ async function openSession(name, fromHistory) {
     state.sessionReady = true;
     refreshActions();
     $("text").disabled = false;
-    $("send").disabled = false;
     restoreDraft(name);
     openEvents();
     markActive();
@@ -1745,7 +1745,7 @@ async function createSession(profile) {
     // openSession, which this condition deliberately does not touch.
     if (state.current && state.sessionReady && openSeq === seqAtStart) {
       $("text").disabled = false;
-      $("send").disabled = false;
+      updateLimit();
     }
   }
 }
@@ -1815,12 +1815,21 @@ function resizeText() {
   syncComposerHeight();
 }
 
+// The server trims before its 32000-byte check, so the composer counts the
+// trimmed value too: whitespace must not make a valid message look over limit.
+function trimmedBytes(text) {
+  return new TextEncoder().encode(String(text == null ? "" : text).trim()).length;
+}
+
 function updateLimit() {
-  const bytes = new TextEncoder().encode($("text").value).length;
+  const bytes = trimmedBytes($("text").value);
   const el = $("limit");
+  const over = bytes > MAX_MESSAGE_BYTES;
   el.hidden = bytes < 28000;
-  el.textContent = bytes ? bytes + " / 32000 bytes" : "";
-  el.dataset.over = bytes > 32000 ? "true" : "false";
+  el.textContent = bytes ? bytes + " / " + MAX_MESSAGE_BYTES + " bytes" : "";
+  el.dataset.over = over ? "true" : "false";
+  $("text").setAttribute("aria-invalid", over ? "true" : "false");
+  $("send").disabled = over || state.creating || !state.current || $("text").disabled;
 }
 
 function restoreUnsent(name, text) {
@@ -1846,6 +1855,7 @@ async function send() {
   if (state.creating) return;
   const text = $("text").value.trim();
   if (!text || !state.current || !state.sessionReady || $("text").disabled) return;
+  if (trimmedBytes(text) > MAX_MESSAGE_BYTES) return;
   const name = state.current;
   $("text").value = "";
   resizeText();
