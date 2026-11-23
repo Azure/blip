@@ -62,6 +62,91 @@ spec:
               filesystem or an auxiliary mount. Provisioning fields are immutable;
               mounts and runtime defaults can be updated for subsequent or running blips.
             properties:
+              build:
+                description: |-
+                  Build turns this state into a recipe that periodically builds new
+                  states from a command. The recipe itself holds no data and is never
+                  committed; each build produces an output state that is labelled with
+                  this state's labels once the build succeeds. Consumers select outputs
+                  by label like any other state.
+                properties:
+                  builder:
+                    description: |-
+                      Builder is a state to boot the build in, with the new output mounted
+                      writable at Path. Without it the build runs in the output itself.
+                      A build state here means its newest successful output.
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                    type: string
+                  command:
+                    description: Command runs the build.
+                    items:
+                      type: string
+                    minItems: 1
+                    type: array
+                  env:
+                    description: Env is the build's environment.
+                    items:
+                      properties:
+                        name:
+                          type: string
+                        value:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  from:
+                    description: |-
+                      From is the state each build starts from, such as an image state.
+                      Empty starts from an empty filesystem, which needs Builder because
+                      there is no operating system to run in the output. A build state here
+                      means its newest successful output.
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                    type: string
+                  incremental:
+                    description: |-
+                      Incremental starts each build from the newest output instead of From.
+                      The first build starts from From. Use this for caches that are
+                      refreshed in place, such as a git mirror.
+                    type: boolean
+                  intervalSeconds:
+                    description: |-
+                      IntervalSeconds is the time between build starts. It is also the
+                      deadline for one build: a build still running when the next one is due
+                      is stopped and fails. Changing this state starts a build immediately,
+                      which is the manual "build now".
+                    format: int64
+                    maximum: 9223372036
+                    minimum: 60
+                    type: integer
+                  path:
+                    description: Path is where Builder mounts the output. Must be
+                      absolute.
+                    maxLength: 4096
+                    pattern: ^/.*$
+                    type: string
+                  pool:
+                    description: Pool runs the build. Default "default".
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                    type: string
+                  user:
+                    description: User runs the command. Default "root".
+                    type: string
+                  workingDir:
+                    description: WorkingDir is the build's working directory. Default
+                      "/".
+                    type: string
+                required:
+                - command
+                - intervalSeconds
+                type: object
+                x-kubernetes-validations:
+                - message: builder and path must be set together
+                  rule: (has(self.builder) && size(self.builder) > 0) == (has(self.path)
+                    && size(self.path) > 0)
               copyFrom:
                 description: |-
                   CopyFrom names a state in the same namespace. A copy either pins the
@@ -91,10 +176,12 @@ spec:
               image:
                 description: |-
                   Image initializes the filesystem from a container image, which each
-                  node converts to ext4 itself. Every eligible node (matching
-                  nodeSelector) holds an image state. Without image or copyFrom the
-                  state starts as an empty ext4 filesystem. Image states may only be
-                  attached read-only; copy one to create a writable root.
+                  node converts to ext4 itself. Image states are replicated like any
+                  other state: the controller places replicas copies (default 3) and
+                  other nodes fetch on demand. A node that holds a commit may serve it
+                  as a delta base. Without image or copyFrom the state starts as an
+                  empty ext4 filesystem. Image states may only be attached read-only;
+                  copy one to create a writable root.
                 type: string
               imagePullSecrets:
                 description: ImagePullSecrets authenticate the image pull when Image
@@ -246,7 +333,7 @@ spec:
               replicas:
                 description: |-
                   Replicas is the number of nodes that hold every committed version.
-                  Default 3. Must not be set for image states.
+                  Default 3.
                 format: int32
                 maximum: 3
                 minimum: 1
@@ -414,9 +501,6 @@ spec:
             - message: set at most one of image and copyFrom
               rule: '!(has(self.image) && size(self.image) > 0 && has(self.copyFrom)
                 && size(self.copyFrom) > 0)'
-            - message: replicas cannot be set for image states; they are held by every
-                eligible node
-              rule: '!(has(self.image) && size(self.image) > 0 && has(self.replicas))'
             - message: image is immutable
               rule: (has(self.image) && size(self.image) > 0) == (has(oldSelf.image)
                 && size(oldSelf.image) > 0) && (!has(self.image) || size(self.image)
@@ -426,22 +510,65 @@ spec:
                 && size(oldSelf.copyFrom) > 0) && (!has(self.copyFrom) || size(self.copyFrom)
                 == 0 || self.copyFrom == oldSelf.copyFrom)
             - message: size is immutable
-              rule: has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size
-                == oldSelf.size)
+              rule: has(self.build) || (has(self.size) == has(oldSelf.size) && (!has(self.size)
+                || self.size == oldSelf.size))
             - message: replicas is immutable
-              rule: has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas)
-                || self.replicas == oldSelf.replicas)
+              rule: has(self.build) || (has(self.replicas) == has(oldSelf.replicas)
+                && (!has(self.replicas) || self.replicas == oldSelf.replicas))
             - message: nodeSelector is immutable
-              rule: (has(self.nodeSelector) && size(self.nodeSelector) > 0) == (has(oldSelf.nodeSelector)
-                && size(oldSelf.nodeSelector) > 0) && (!has(self.nodeSelector) ||
-                size(self.nodeSelector) == 0 || self.nodeSelector == oldSelf.nodeSelector)
+              rule: has(self.build) || (has(self.nodeSelector) && size(self.nodeSelector)
+                > 0) == (has(oldSelf.nodeSelector) && size(oldSelf.nodeSelector) >
+                0) && (!has(self.nodeSelector) || size(self.nodeSelector) == 0 ||
+                self.nodeSelector == oldSelf.nodeSelector)
             - message: imagePullSecrets is immutable
               rule: (has(self.imagePullSecrets) && size(self.imagePullSecrets) > 0)
                 == (has(oldSelf.imagePullSecrets) && size(oldSelf.imagePullSecrets)
                 > 0) && (!has(self.imagePullSecrets) || size(self.imagePullSecrets)
                 == 0 || self.imagePullSecrets == oldSelf.imagePullSecrets)
+            - message: build cannot be combined with image, copyFrom, or mounts
+              rule: '!has(self.build) || ((!has(self.image) || size(self.image) ==
+                0) && (!has(self.copyFrom) || size(self.copyFrom) == 0) && (!has(self.mounts)
+                || size(self.mounts) == 0))'
+            - message: build is immutable
+              rule: has(self.build) == has(oldSelf.build)
+            - message: historyLimit is required with build
+              rule: '!has(self.build) || (has(self.historyLimit) && self.historyLimit
+                > 0)'
+            - message: 'build needs from or builder: an empty filesystem has no operating
+                system'
+              rule: '!has(self.build) || (has(self.build.builder) && size(self.build.builder)
+                > 0) || (has(self.build.from) && size(self.build.from) > 0)'
           status:
             properties:
+              build:
+                description: Build reports the progress of a build recipe.
+                properties:
+                  blip:
+                    description: Blip is the Blip running the last attempt.
+                    type: string
+                  builder:
+                    description: Builder is the builder copy used by the last attempt.
+                    type: string
+                  lastBuild:
+                    description: LastBuild is when the last attempt started.
+                    format: date-time
+                    type: string
+                  latest:
+                    description: Latest is the newest output whose build succeeded.
+                    type: string
+                  message:
+                    description: Message explains the current state.
+                    type: string
+                  observedGeneration:
+                    description: ObservedGeneration is the spec generation the last
+                      attempt started.
+                    format: int64
+                    type: integer
+                  output:
+                    description: Output is the output of the build in progress, or
+                      of the last attempt.
+                    type: string
+                type: object
               committed:
                 description: Commit identifies one immutable, committed version of
                   a state.

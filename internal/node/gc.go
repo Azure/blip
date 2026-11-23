@@ -4,6 +4,7 @@
 package node
 
 import (
+	"cmp"
 	"slices"
 
 	"github.com/Azure/blip/api/v1alpha1"
@@ -35,6 +36,7 @@ func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
 			owners[id] = append(owners[id], name)
 		}
 	}
+	var cache []storage.Volume
 	for _, id := range sortedKeys(v.volumes) {
 		if pending[id] {
 			continue
@@ -45,17 +47,38 @@ func planGC(v *view, p *plan, sealed map[string][]v1alpha1.SealResult) {
 		}
 		switch vol.Kind {
 		case storage.KindWorking:
-			if v.workingUnneeded(vol, owners[id], p.needed) {
-				p.deletes = append(p.deletes, id)
+			if !v.workingUnneeded(vol, owners[id], p.needed) {
+				continue
 			}
+			// Keep the hydrated data of a read-only attachment as a cached
+			// commit instead of deleting it. The next pass deletes the
+			// working volume once the commit exists.
+			if commitID := v.adoptable(vol); commitID != "" {
+				p.adopts = append(p.adopts, adopt{attachmentID: vol.ID, commitID: commitID})
+				continue
+			}
+			p.deletes = append(p.deletes, id)
 		case storage.KindCommit:
 			if !v.keepCommit(vol, sealed) {
-				p.deletes = append(p.deletes, id)
+				cache = append(cache, vol)
 			}
 		case storage.KindImage:
 			if v.idleImages[id] {
 				p.deletes = append(p.deletes, id)
 			}
+		}
+	}
+	// Unneeded commits are a local cache of whole versions (not page data):
+	// keep them while the pool has room; under pressure evict the least
+	// recently used first, ties broken by ID for a deterministic plan. Only an
+	// explicit keepCommit rejection is a candidate, so commits of states not
+	// confirmed gone are never evicted.
+	if v.cacheFull() {
+		slices.SortFunc(cache, func(a, b storage.Volume) int {
+			return cmp.Or(a.LastUsed.Compare(b.LastUsed), cmp.Compare(a.ID, b.ID))
+		})
+		for _, vol := range cache {
+			p.deletes = append(p.deletes, vol.ID)
 		}
 	}
 
@@ -97,6 +120,21 @@ func (v *view) workingUnneeded(vol storage.Volume, ownerPods []string, needed ma
 		return true
 	}
 	return !needed[vol.ID]
+}
+
+// adoptable returns the commit a read-only working volume can be cached as, or
+// "" when it must be deleted. Only fully hydrated, healthy volumes whose Blip
+// still records the mounted commit qualify; a still-hydrating volume is not
+// cached because its data is incomplete.
+func (v *view) adoptable(vol storage.Volume) string {
+	if !vol.ReadOnly || vol.StateUID == "" || vol.Failed != "" || vol.Hydrating {
+		return ""
+	}
+	id := v.readOnlyCommit(vol)
+	if id == "" || v.holds(id) || v.busy[id] {
+		return ""
+	}
+	return id
 }
 
 // keepCommit is the GC rule: a commit stays while it is the state's pending

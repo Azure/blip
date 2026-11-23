@@ -35,6 +35,8 @@ type fakeStore struct {
 	volumes     map[string]storage.Volume
 	pending     map[string]bool
 	deleted     []string
+	adopts      []adopt
+	adoptErr    error
 	imports     map[string]int64
 	createErr   error
 	activations int
@@ -46,6 +48,7 @@ func newFakeStore() *fakeStore {
 
 func (f *fakeStore) Incarnation() string { return "inc-n1" }
 func (f *fakeStore) FreeBytes() int64    { return 1 << 40 }
+func (f *fakeStore) Capacity() int64     { return 1 << 40 }
 
 func (f *fakeStore) List() []storage.Volume {
 	f.mu.Lock()
@@ -140,6 +143,17 @@ func (f *fakeStore) Seal(ctx context.Context, attachmentID, commitID string) (in
 func (f *fakeStore) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID string) (int64, error) {
 	f.add(storage.Volume{ID: commitID, Kind: storage.KindCommit, StateUID: stateUID, SizeBytes: 1 << 30})
 	return 1 << 30, nil
+}
+
+func (f *fakeStore) Adopt(ctx context.Context, attachmentID, commitID string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adopts = append(f.adopts, adopt{attachmentID: attachmentID, commitID: commitID})
+	if f.adoptErr != nil {
+		return 0, f.adoptErr
+	}
+	f.volumes[commitID] = storage.Volume{ID: commitID, Kind: storage.KindCommit}
+	return 1, nil
 }
 
 func (f *fakeStore) Digest(ctx context.Context, id string) (string, error) {

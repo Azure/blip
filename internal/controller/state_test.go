@@ -1313,13 +1313,17 @@ func (e *env) label(key, value string, nodes ...string) {
 	}
 }
 
-func TestImageStateOnEveryEligibleNode(t *testing.T) {
+// TestImageStateUsesReplicas: an image state is replicated like any other
+// state. Generation 1 is placed on spec.replicas nodes (default 3), each
+// building it from the image locally, and a new eligible node only joins
+// through repair when a placement is missing.
+func TestImageStateUsesReplicas(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2", "n3", "n4")
 	e.label("zone", "a", "n1", "n2", "n3")
 	e.newState("s", func(st *v1.BlipState) {
 		st.Spec.Image = "reg/img:v1"
-		st.Spec.Replicas = 1
+		st.Spec.Replicas = 0
 		st.Spec.NodeSelector = map[string]string{"zone": "a"}
 	})
 	e.run(e.state, ns, "s")
@@ -1330,7 +1334,7 @@ func TestImageStateOnEveryEligibleNode(t *testing.T) {
 	e.hold("s", p.CommitID, "n2", "n3")
 	e.run(e.state, ns, "s")
 	if st := e.getState("s"); st.Status.Committed != nil || !strings.Contains(st.Status.Message, "waiting for n1") {
-		t.Fatalf("committed before every eligible node built the image: %+v", st.Status)
+		t.Fatalf("committed before every replica built the image: %+v", st.Status)
 	}
 	e.hold("s", p.CommitID, "n1")
 	e.run(e.state, ns, "s")
@@ -1339,25 +1343,23 @@ func TestImageStateOnEveryEligibleNode(t *testing.T) {
 		t.Fatalf("commit %+v", st.Status)
 	}
 
-	// A new eligible node joins the placements; nothing changes once it holds.
+	// A new eligible node does not join placements beyond the replica count.
 	e.addNodes("n5")
 	e.label("zone", "a", "n5")
 	e.run(e.state, ns, "s")
 	st = e.getState("s")
-	if !slices.Equal(st.Status.Placements, []string{"n1", "n2", "n3", "n5"}) || st.Status.Message != "replicating to n5" {
-		t.Fatalf("after join %+v", st.Status)
-	}
-	e.hold("s", p.CommitID, "n5")
-	e.run(e.state, ns, "s")
-	st = e.getState("s")
-	e.run(e.state, ns, "s")
-	if again := e.getState("s"); again.ResourceVersion != st.ResourceVersion || st.Status.Message != "" {
-		t.Fatalf("status churn: %+v -> %+v", st.Status, again.Status)
+	if !slices.Equal(st.Status.Placements, []string{"n1", "n2", "n3"}) || st.Status.Message != "" {
+		t.Fatalf("new eligible node changed placements %+v", st.Status)
 	}
 
-	// A drained node leaves the placements and is not added back.
+	// A drained placement leaves and repair tops the missing replica up on
+	// the new eligible node.
 	e.setDrain("n2")
 	e.run(e.state, ns, "s")
+	if st = e.getState("s"); !strings.Contains(st.Status.Message, "replicating to n5") {
+		t.Fatalf("repair did not add the new eligible node %+v", st.Status)
+	}
+	e.hold("s", p.CommitID, "n5")
 	e.run(e.state, ns, "s")
 	if st = e.getState("s"); !slices.Equal(st.Status.Placements, []string{"n1", "n3", "n5"}) || st.Status.Message != "" {
 		t.Fatalf("after drain %+v", st.Status)

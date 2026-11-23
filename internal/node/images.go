@@ -65,33 +65,11 @@ func (v *view) imageRefs() []imageSource {
 }
 
 // stateImageRelevant reports whether this node may hold s, and therefore needs
-// its image: a placement, a pending replica, or an unplaced state whose
-// nodeSelector matches this node.
+// its image: a placement or a pending replica.
 func (v *view) stateImageRelevant(s *v1alpha1.BlipState) bool {
 	st := s.Status
 	if slices.Contains(st.Placements, v.node) {
 		return true
 	}
-	if st.Pending != nil && slices.Contains(st.Pending.Replicas, v.node) {
-		return true
-	}
-	return len(st.Placements) == 0 && v.nodeMatches(s.Spec.NodeSelector)
-}
-
-// nodeMatches reports whether this node's labels satisfy selector. Without a
-// known Kubernetes Node only an empty selector matches.
-func (v *view) nodeMatches(selector map[string]string) bool {
-	if len(selector) == 0 {
-		return true
-	}
-	n := v.kubeNodes[v.node]
-	if n == nil {
-		return false
-	}
-	for k, want := range selector {
-		if n.Labels[k] != want {
-			return false
-		}
-	}
-	return true
+	return st.Pending != nil && slices.Contains(st.Pending.Replicas, v.node)
 }

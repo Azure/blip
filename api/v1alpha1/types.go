@@ -171,19 +171,24 @@ type BlipPoolList struct {
 // mounts and runtime defaults can be updated for subsequent or running blips.
 //
 // +kubebuilder:validation:XValidation:rule="!(has(self.image) && size(self.image) > 0 && has(self.copyFrom) && size(self.copyFrom) > 0)",message="set at most one of image and copyFrom"
-// +kubebuilder:validation:XValidation:rule="!(has(self.image) && size(self.image) > 0 && has(self.replicas))",message="replicas cannot be set for image states; they are held by every eligible node"
 // +kubebuilder:validation:XValidation:rule="(has(self.image) && size(self.image) > 0) == (has(oldSelf.image) && size(oldSelf.image) > 0) && (!has(self.image) || size(self.image) == 0 || self.image == oldSelf.image)",message="image is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.copyFrom) && size(self.copyFrom) > 0) == (has(oldSelf.copyFrom) && size(oldSelf.copyFrom) > 0) && (!has(self.copyFrom) || size(self.copyFrom) == 0 || self.copyFrom == oldSelf.copyFrom)",message="copyFrom is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size == oldSelf.size)",message="size is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas) || self.replicas == oldSelf.replicas)",message="replicas is immutable"
-// +kubebuilder:validation:XValidation:rule="(has(self.nodeSelector) && size(self.nodeSelector) > 0) == (has(oldSelf.nodeSelector) && size(oldSelf.nodeSelector) > 0) && (!has(self.nodeSelector) || size(self.nodeSelector) == 0 || self.nodeSelector == oldSelf.nodeSelector)",message="nodeSelector is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.build) || (has(self.size) == has(oldSelf.size) && (!has(self.size) || self.size == oldSelf.size))",message="size is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.build) || (has(self.replicas) == has(oldSelf.replicas) && (!has(self.replicas) || self.replicas == oldSelf.replicas))",message="replicas is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.build) || (has(self.nodeSelector) && size(self.nodeSelector) > 0) == (has(oldSelf.nodeSelector) && size(oldSelf.nodeSelector) > 0) && (!has(self.nodeSelector) || size(self.nodeSelector) == 0 || self.nodeSelector == oldSelf.nodeSelector)",message="nodeSelector is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.imagePullSecrets) && size(self.imagePullSecrets) > 0) == (has(oldSelf.imagePullSecrets) && size(oldSelf.imagePullSecrets) > 0) && (!has(self.imagePullSecrets) || size(self.imagePullSecrets) == 0 || self.imagePullSecrets == oldSelf.imagePullSecrets)",message="imagePullSecrets is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.build) || ((!has(self.image) || size(self.image) == 0) && (!has(self.copyFrom) || size(self.copyFrom) == 0) && (!has(self.mounts) || size(self.mounts) == 0))",message="build cannot be combined with image, copyFrom, or mounts"
+// +kubebuilder:validation:XValidation:rule="has(self.build) == has(oldSelf.build)",message="build is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.build) || (has(self.historyLimit) && self.historyLimit > 0)",message="historyLimit is required with build"
+// +kubebuilder:validation:XValidation:rule="!has(self.build) || (has(self.build.builder) && size(self.build.builder) > 0) || (has(self.build.from) && size(self.build.from) > 0)",message="build needs from or builder: an empty filesystem has no operating system"
 type BlipStateSpec struct {
 	// Image initializes the filesystem from a container image, which each
-	// node converts to ext4 itself. Every eligible node (matching
-	// nodeSelector) holds an image state. Without image or copyFrom the
-	// state starts as an empty ext4 filesystem. Image states may only be
-	// attached read-only; copy one to create a writable root.
+	// node converts to ext4 itself. Image states are replicated like any
+	// other state: the controller places replicas copies (default 3) and
+	// other nodes fetch on demand. A node that holds a commit may serve it
+	// as a delta base. Without image or copyFrom the state starts as an
+	// empty ext4 filesystem. Image states may only be attached read-only;
+	// copy one to create a writable root.
 	Image string `json:"image,omitempty"`
 	// CopyFrom names a state in the same namespace. A copy either pins the
 	// source's committed version or, if the source has an active writer,
@@ -226,7 +231,7 @@ type BlipStateSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="streamSize is immutable"
 	StreamSize *resource.Quantity `json:"streamSize,omitempty"`
 	// Replicas is the number of nodes that hold every committed version.
-	// Default 3. Must not be set for image states.
+	// Default 3.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=3
 	Replicas int32 `json:"replicas,omitempty"`
@@ -252,6 +257,62 @@ type BlipStateSpec struct {
 	// Runtime supplies execution defaults over the imported image metadata.
 	// Blip execution overrides take precedence.
 	Runtime *RuntimeDefaults `json:"runtime,omitempty"`
+	// Build turns this state into a recipe that periodically builds new
+	// states from a command. The recipe itself holds no data and is never
+	// committed; each build produces an output state that is labelled with
+	// this state's labels once the build succeeds. Consumers select outputs
+	// by label like any other state.
+	Build *BlipStateBuild `json:"build,omitempty"`
+}
+
+// BlipStateBuild periodically runs a command to produce a new state from this
+// recipe. The output of a build is an ordinary BlipState owned by the recipe;
+// it is labelled with the recipe's labels only after the build command
+// succeeds, so a label selector never sees a failed or incomplete build.
+//
+// +kubebuilder:validation:XValidation:rule="(has(self.builder) && size(self.builder) > 0) == (has(self.path) && size(self.path) > 0)",message="builder and path must be set together"
+type BlipStateBuild struct {
+	// From is the state each build starts from, such as an image state.
+	// Empty starts from an empty filesystem, which needs Builder because
+	// there is no operating system to run in the output. A build state here
+	// means its newest successful output.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=253
+	From string `json:"from,omitempty"`
+	// Incremental starts each build from the newest output instead of From.
+	// The first build starts from From. Use this for caches that are
+	// refreshed in place, such as a git mirror.
+	Incremental bool `json:"incremental,omitempty"`
+	// Builder is a state to boot the build in, with the new output mounted
+	// writable at Path. Without it the build runs in the output itself.
+	// A build state here means its newest successful output.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=253
+	Builder string `json:"builder,omitempty"`
+	// Path is where Builder mounts the output. Must be absolute.
+	// +kubebuilder:validation:Pattern=`^/.*$`
+	// +kubebuilder:validation:MaxLength=4096
+	Path string `json:"path,omitempty"`
+	// IntervalSeconds is the time between build starts. It is also the
+	// deadline for one build: a build still running when the next one is due
+	// is stopped and fails. Changing this state starts a build immediately,
+	// which is the manual "build now".
+	// +kubebuilder:validation:Minimum=60
+	// +kubebuilder:validation:Maximum=9223372036
+	IntervalSeconds int64 `json:"intervalSeconds"`
+	// Pool runs the build. Default "default".
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	Pool string `json:"pool,omitempty"`
+	// Command runs the build.
+	// +kubebuilder:validation:MinItems=1
+	Command []string `json:"command"`
+	// Env is the build's environment.
+	Env []EnvVar `json:"env,omitempty"`
+	// User runs the command. Default "root".
+	User string `json:"user,omitempty"`
+	// WorkingDir is the build's working directory. Default "/".
+	WorkingDir string `json:"workingDir,omitempty"`
 }
 
 // DefaultStreamSize is the default trajectory ring size.
@@ -411,6 +472,26 @@ type BlipStateStatus struct {
 	// +listType=map
 	// +listMapKey=node
 	Nodes []NodeObservation `json:"nodes,omitempty"`
+	// Build reports the progress of a build recipe.
+	Build *BlipStateBuildStatus `json:"build,omitempty"`
+}
+
+// BlipStateBuildStatus reports a build recipe's latest attempt.
+type BlipStateBuildStatus struct {
+	// Latest is the newest output whose build succeeded.
+	Latest string `json:"latest,omitempty"`
+	// Output is the output of the build in progress, or of the last attempt.
+	Output string `json:"output,omitempty"`
+	// Blip is the Blip running the last attempt.
+	Blip string `json:"blip,omitempty"`
+	// Builder is the builder copy used by the last attempt.
+	Builder string `json:"builder,omitempty"`
+	// LastBuild is when the last attempt started.
+	LastBuild *metav1.Time `json:"lastBuild,omitempty"`
+	// ObservedGeneration is the spec generation the last attempt started.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// Message explains the current state.
+	Message string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true

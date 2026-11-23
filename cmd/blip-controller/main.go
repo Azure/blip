@@ -33,7 +33,8 @@ import (
 // +kubebuilder:rbac:groups=apiregistration.k8s.io,resources=apiservices,verbs=get;list;watch;create;update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update
 // +kubebuilder:rbac:groups=blip.dev,resources=blips;blipstates;blippools;blipnodes,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=blip.dev,resources=blips,verbs=delete
+// +kubebuilder:rbac:groups=blip.dev,resources=blips;blipstates,verbs=create
+// +kubebuilder:rbac:groups=blip.dev,resources=blips;blipstates,verbs=delete
 // +kubebuilder:rbac:groups=blip.dev,resources=blips/status;blipstates/status;blippools/status;blipnodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=blip.dev,resources=blips/finalizers;blipstates/finalizers;blippools/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete

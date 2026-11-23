@@ -275,20 +275,27 @@ func TestPendingSourceFailover(t *testing.T) {
 	}
 }
 
-func TestImagePendingSourceFailover(t *testing.T) {
+// TestImagePendingSourceReplans: generation 1 of an image state is built from
+// the image by every replica, so losing its source replans the whole pending
+// version like any other initial state.
+func TestImagePendingSourceReplans(t *testing.T) {
 	e := newEnv(t)
 	e.addNodes("n1", "n2", "n3")
-	e.newState("s", func(st *v1.BlipState) { st.Spec.Image = "reg/img:v1" })
+	e.newState("s", func(st *v1.BlipState) { st.Spec.Image = "reg/img:v1"; st.Spec.Replicas = 0 })
 	e.run(e.state, ns, "s")
 	p := e.getState("s").Status.Pending
-	if p == nil || p.SourceNode != "n1" {
+	if p == nil || p.SourceNode != "n1" || !slices.Equal(p.Replicas, []string{"n1", "n2", "n3"}) {
 		t.Fatalf("initial pending %+v", p)
 	}
 	e.must(e.c.Delete(e.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}))
 	e.run(e.state, ns, "s")
+	if p = e.getState("s").Status.Pending; p != nil {
+		t.Fatalf("lost source kept pending instead of replanning: %+v", p)
+	}
+	e.run(e.state, ns, "s")
 	p = e.getState("s").Status.Pending
 	if p == nil || p.SourceNode == "n1" || slices.Contains(p.Replicas, "n1") {
-		t.Fatalf("source failover %+v", p)
+		t.Fatalf("replanned pending %+v", p)
 	}
 }
 

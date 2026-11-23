@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
@@ -66,6 +67,7 @@ type record struct {
 	Clone      *cloneInfo `json:"clone,omitempty"`   // remote data still hydrating
 	Failed     string     `json:"failed,omitempty"`
 	Digest     string     `json:"digest,omitempty"` // content digest, computed on first use (see Digest)
+	LastUsed   time.Time  `json:"lastUsed"`         // cache eviction order (see Touch)
 
 	// TeardownMetaThin keeps the clone metadata thin ID of an abandoned
 	// hydration. Clone is cleared when a failed delete gives up on the clone,
@@ -537,6 +539,9 @@ func (s *Store) changeLocked(r *record, change func(*record)) error {
 	if r.Digest != next.Digest {
 		r.Digest = next.Digest
 	}
+	if r.LastUsed != next.LastUsed {
+		r.LastUsed = next.LastUsed
+	}
 	if (r.Clone == nil) != (next.Clone == nil) || (r.Clone != nil && next.Clone != nil && *r.Clone != *next.Clone) {
 		r.Clone = next.Clone
 	}
@@ -653,6 +658,9 @@ func (s *Store) begin(r *record, n int) ([]uint32, error) {
 			return err
 		}
 		candidate.Phase = phaseCreating
+		if candidate.LastUsed.IsZero() {
+			candidate.LastUsed = time.Now()
+		}
 		if len(ids) > 0 {
 			candidate.Thin = ids[0]
 		}
@@ -813,6 +821,7 @@ func (s *Store) volume(r *record, names map[string]bool) Volume {
 		Pins:      slices.Clone(r.Pins),
 		Failed:    r.Failed,
 		Digest:    r.Digest,
+		LastUsed:  r.LastUsed,
 	}
 	name := s.topName(r)
 	if r.Kind == KindWorking {
@@ -860,30 +869,74 @@ func (s *Store) FreeBytes() int64 {
 // thinFree reports unallocated thin-pool data bytes and whether the pool
 // status could be read.
 func (s *Store) thinFree() (int64, bool) {
+	free, _, ok := s.thinPool()
+	return free, ok
+}
+
+// Capacity reports the total data bytes of the thin pool. It falls back to the
+// configured pool size when the status cannot be read, and returns 0 when
+// neither is known.
+func (s *Store) Capacity() int64 {
+	if _, total, ok := s.thinPool(); ok {
+		return total
+	}
+	return s.cfg.PoolBytes
+}
+
+// thinPool reads the pool status once and reports its free and total data
+// bytes.
+func (s *Store) thinPool() (free, total int64, ok bool) {
 	st, err := dmStatus(s.poolName())
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
-	return thinFree(st)
+	return thinUsage(st)
 }
 
 // thinFree parses a dm thin-pool status line and returns its unallocated data
 // bytes. It never underflows.
 func thinFree(st string) (int64, bool) {
+	free, _, ok := thinUsage(st)
+	return free, ok
+}
+
+// thinUsage parses a dm thin-pool status line and returns its free and total
+// data bytes. Free space never underflows.
+func thinUsage(st string) (free, total int64, ok bool) {
 	// 0 <len> thin-pool <transaction> <meta used>/<total> <data used>/<total> ...
 	f := strings.Fields(st)
 	if len(f) < 6 {
-		return 0, false
+		return 0, 0, false
 	}
-	var used, total int64
+	var used int64
 	if _, err := fmt.Sscanf(f[5], "%d/%d", &used, &total); err != nil {
-		return 0, false
+		return 0, 0, false
 	}
-	free := (total - used) * blockSize
+	free = (total - used) * blockSize
 	if free < 0 {
 		free = 0
 	}
-	return free, true
+	return free, total * blockSize, true
+}
+
+// touchInterval bounds how often Touch rewrites a record. LRU ordering needs
+// only coarse accuracy, and build, fetch, and export sources are read
+// repeatedly.
+const touchInterval = time.Minute
+
+// Touch records that a ready volume was used. It orders cache eviction of
+// commits: the least recently used goes first. A missing volume is ignored.
+func (s *Store) Touch(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.vols[id]
+	if !ok || r.Phase != phaseReady {
+		return nil
+	}
+	if time.Since(r.LastUsed) < touchInterval {
+		return nil // already recently used
+	}
+	return s.changeLocked(r, func(next *record) { next.LastUsed = time.Now() })
 }
 
 // Pin marks id as held by holder; pinned volumes cannot be deleted.

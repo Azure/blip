@@ -160,6 +160,25 @@ func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
 			slog.Error("delete volume", "id", id, "err", err)
 		}
 	}
+	adopted := false
+	for _, x := range p.adopts {
+		if _, err := a.store.Adopt(ctx, x.attachmentID, x.commitID); err != nil {
+			slog.Error("adopt commit", "attachment", x.attachmentID, "commit", x.commitID, "err", err)
+			// The volume is unneeded either way; drop it so a failed adoption
+			// cannot retry forever.
+			err := a.store.Delete(ctx, x.attachmentID)
+			switch {
+			case err == nil:
+				adopted = true
+			case errors.Is(err, storage.ErrPinned), errors.Is(err, storage.ErrInUse), errors.Is(err, storage.ErrNotFound):
+			default:
+				slog.Error("delete volume", "id", x.attachmentID, "err", err)
+			}
+			continue
+		}
+		slog.Info("adopted commit", "attachment", x.attachmentID, "commit", x.commitID)
+		adopted = true
+	}
 	for _, d := range p.rmDevs {
 		if err := os.Remove(filepath.Join(a.podDirFor(d.pod), podapi.DevDir, d.id)); err != nil && !os.IsNotExist(err) {
 			slog.Error("remove device node", "pod", d.pod, "id", d.id, "err", err)
@@ -177,7 +196,7 @@ func (a *Agent) execute(ctx context.Context, v *view, p *plan) {
 		}
 	}
 	a.pruneErrors(v, p)
-	if deleted || len(p.rmDevs) > 0 {
+	if deleted || adopted || len(p.rmDevs) > 0 {
 		a.kick()
 	}
 }

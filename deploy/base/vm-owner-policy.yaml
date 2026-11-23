@@ -229,6 +229,12 @@ spec:
         'owner ' + variables.owner + ' may not set imagePullSecrets'
       reason: Forbidden
     - expression: >-
+        !variables.restricted || !variables.writes || !has(object.spec) ||
+        !has(object.spec.build)
+      messageExpression: >-
+        'owner ' + variables.owner + ' may not set spec.build'
+      reason: Forbidden
+    - expression: >-
         !variables.restricted || request.operation != 'CREATE' || request.resource.resource != 'blips' ||
         (has(object.spec) && has(object.spec.pool) && object.spec.pool != '' ? object.spec.pool : 'default') in variables.pools
       messageExpression: >-

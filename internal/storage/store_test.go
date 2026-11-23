@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"context"
 	"math"
 	"reflect"
 	"testing"
@@ -91,5 +92,43 @@ func TestFreeBytesUsesFilesystem(t *testing.T) {
 	total := int64(st.Blocks) * int64(st.Bsize)
 	if free := s.FreeBytes(); free <= 0 || free > total {
 		t.Fatalf("FreeBytes = %d, want 1..%d", free, total)
+	}
+}
+
+// TestCapacityFallsBackToConfig: without a readable thin pool, Capacity must
+// report the configured size instead of the parse failure's zero.
+func TestCapacityFallsBackToConfig(t *testing.T) {
+	s := &Store{cfg: Config{DataDir: t.TempDir(), NodeName: "cap-test", PoolBytes: 4 << 30}, prefix: DMPrefix("cap-test")}
+	if got := s.Capacity(); got != 4<<30 {
+		t.Fatalf("Capacity = %d, want %d", got, int64(4<<30))
+	}
+}
+
+// TestAdoptCachesReadOnlyWorking: adopting a read-only working volume keeps
+// its hydrated data as a whole commit whose Base is empty, so the commit can
+// later serve as a delta base even when the attachment came from that commit.
+func TestAdoptCachesReadOnlyWorking(t *testing.T) {
+	x := newStorageSimulation(t)
+	x.image()
+	ctx := context.Background()
+	if _, err := x.s.CreateWorking(ctx, CreateWorking{
+		AttachmentID: "attach", StateUID: "uid", FromImage: "image", ReadOnly: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	size, err := x.s.Adopt(ctx, "attach", "cached")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := x.s.vols["cached"]
+	if rec == nil || rec.Kind != KindCommit || rec.Base != "" || rec.StateUID != "uid" || rec.Phase != phaseReady {
+		t.Fatalf("adopted record = %+v", rec)
+	}
+	if size != rec.Size || size != x.s.vols["attach"].Size {
+		t.Fatalf("Adopt = %d, record size %d", size, rec.Size)
+	}
+	// Idempotent: an existing commit is returned without another snapshot.
+	if n, err := x.s.Adopt(ctx, "attach", "cached"); err != nil || n != size {
+		t.Fatalf("second Adopt = %d, %v", n, err)
 	}
 }

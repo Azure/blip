@@ -245,6 +245,7 @@ func TestSnapshotCapturesExportPins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	v.freeBytes, v.poolBytes = 0, 1<<40 // cache pressure: keep no unneeded commit
 	if calls != 1 || !v.pinned["exported"] {
 		t.Fatal("snapshot did not capture export pins")
 	}
@@ -258,6 +259,7 @@ func TestSnapshotCapturesExportPins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fresh.freeBytes, fresh.poolBytes = 0, 1<<40
 	if p := compute(fresh); !hasDelete(p, "exported") {
 		t.Fatal("fresh snapshot did not observe released pin")
 	}

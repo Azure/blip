@@ -29,6 +29,13 @@ const (
 	// AnnotationParent keeps the full name.
 	LabelParent = "blip.dev/parent"
 
+	// LabelBuild is the build recipe's name on every output state and build
+	// Blip.
+	LabelBuild = "blip.dev/build"
+	// AnnotationBuildStatus is "running", "succeeded", or "failed" on an
+	// output state.
+	AnnotationBuildStatus = "blip.dev/build-status"
+
 	// Chat sessions are BlipStates owned by one blipchat conversation. The
 	// admission policies use these fields to scope chat agents to their own
 	// tree and to authorize child profiles.

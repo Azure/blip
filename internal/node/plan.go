@@ -21,6 +21,7 @@ type plan struct {
 	podErrs    []podErr
 	prepares   []prepare
 	seals      []seal
+	adopts     []adopt
 	deletes    []string // volume IDs
 	rmDevs     []devRef
 	rmDirs     []string // podKeys
@@ -57,6 +58,12 @@ type prepare struct {
 
 type seal struct {
 	stateUID, attachmentID, commitID string
+}
+
+// adopt snapshots an unneeded read-only working volume as a local cache of the
+// commit its attachment was mounted from.
+type adopt struct {
+	attachmentID, commitID string
 }
 
 type devRef struct {

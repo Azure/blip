@@ -812,6 +812,96 @@ func TestBlipStateHistoryLimitBounds(t *testing.T) {
 	}
 }
 
+// TestBlipStateBuildAdmission guards the build recipe rules. A recipe holds no
+// data of its own and is a template for future outputs: it cannot combine with
+// provisioning fields, cannot appear or disappear once set, and requires a
+// history limit. Its size, replicas, and nodeSelector stay mutable because each
+// build copies them into an output. Also guards that image states replicate
+// like any other state, which used to be rejected.
+func TestBlipStateBuildAdmission(t *testing.T) {
+	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blipstates.yaml")
+	build := schemaAt(t, crdSchema{Properties: map[string]crdSchema{"spec": spec}}, "spec", "build")
+	ruleFor(t, build.XValidations, "builder and path must be set together")
+	if !slices.Contains(build.Required, "command") || !slices.Contains(build.Required, "intervalSeconds") {
+		t.Errorf("spec.build required = %v, want command and intervalSeconds", build.Required)
+	}
+	if got := build.Properties["command"].MinItems; got != 1 {
+		t.Errorf("spec.build.command minItems = %d, want 1", got)
+	}
+	interval := build.Properties["intervalSeconds"]
+	if interval.Minimum != 60 || interval.Maximum != 9223372036 {
+		t.Errorf("spec.build.intervalSeconds bounds = %d..%d, want 60..9223372036", interval.Minimum, interval.Maximum)
+	}
+	if got := build.Properties["path"].MaxLength; got != 4096 {
+		t.Errorf("spec.build.path maxLength = %d, want 4096", got)
+	}
+
+	const recipe = `"build":{"intervalSeconds":60,"command":["true"],"from":"base"}`
+	validate := admissionValidator(t, "blipstates")
+	for _, tc := range []struct {
+		name   string
+		object string
+		ok     bool
+	}{
+		{"minimal recipe", `{"spec":{"historyLimit":1,` + recipe + `}}`, true},
+		{"recipe with builder and path", `{"spec":{"historyLimit":1,"build":{"intervalSeconds":60,"command":["true"],"builder":"toolbox","path":"/out"}}}`, true},
+		{"recipe with empty image", `{"spec":{"historyLimit":1,` + recipe + `,"image":""}}`, true},
+		{"image state with replicas", `{"spec":{"image":"busybox:1","replicas":2}}`, true},
+		{"build with image", `{"spec":{"historyLimit":1,` + recipe + `,"image":"busybox:1"}}`, false},
+		{"build with copyFrom", `{"spec":{"historyLimit":1,` + recipe + `,"copyFrom":"source"}}`, false},
+		{"build with mounts", `{"spec":{"historyLimit":1,` + recipe + `,"mounts":[{"state":"data","path":"/data"}]}}`, false},
+		{"build without historyLimit", `{"spec":{` + recipe + `}}`, false},
+		{"build with zero historyLimit", `{"spec":{"historyLimit":0,` + recipe + `}}`, false},
+		{"build without intervalSeconds", `{"spec":{"historyLimit":1,"build":{"command":["true"]}}}`, false},
+		{"build without command", `{"spec":{"historyLimit":1,"build":{"intervalSeconds":60}}}`, false},
+		{"build with empty command", `{"spec":{"historyLimit":1,"build":{"intervalSeconds":60,"command":[]}}}`, false},
+		{"build with short interval", `{"spec":{"historyLimit":1,"build":{"intervalSeconds":59,"command":["true"]}}}`, false},
+		{"build with overflowing interval", `{"spec":{"historyLimit":1,"build":{"intervalSeconds":9223372037,"command":["true"]}}}`, false},
+		{"build with builder only", `{"spec":{"historyLimit":1,"build":{"intervalSeconds":60,"command":["true"],"builder":"toolbox"}}}`, false},
+		{"build with path only", `{"spec":{"historyLimit":1,"build":{"intervalSeconds":60,"command":["true"],"path":"/out"}}}`, false},
+		{"build with relative path", `{"spec":{"historyLimit":1,"build":{"intervalSeconds":60,"command":["true"],"builder":"toolbox","path":"out"}}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validate(tc.object, "")
+			if tc.ok && len(errs) != 0 {
+				t.Errorf("rejected %s: %v", tc.object, errs.ToAggregate())
+			}
+			if !tc.ok && len(errs) == 0 {
+				t.Errorf("admitted %s", tc.object)
+			}
+		})
+	}
+
+	// Presence is immutable, but a recipe's template fields stay mutable so a
+	// future output can be reshaped without deleting the recipe.
+	for _, tc := range []struct {
+		name          string
+		before, after string
+		ok            bool
+	}{
+		{"build added", `{"spec":{"historyLimit":1}}`, `{"spec":{"historyLimit":1,` + recipe + `}}`, false},
+		{"build removed", `{"spec":{"historyLimit":1,` + recipe + `}}`, `{"spec":{"historyLimit":1}}`, false},
+		{"build unchanged", `{"spec":{"historyLimit":1,` + recipe + `}}`, `{"spec":{"historyLimit":1,` + recipe + `}}`, true},
+		{"build command changed", `{"spec":{"historyLimit":1,` + recipe + `}}`, `{"spec":{"historyLimit":1,"build":{"intervalSeconds":60,"command":["false"],"from":"base"}}}`, true},
+		{"build size changed", `{"spec":{"historyLimit":1,` + recipe + `,"size":"1Gi"}}`, `{"spec":{"historyLimit":1,` + recipe + `,"size":"2Gi"}}`, true},
+		{"build replicas changed", `{"spec":{"historyLimit":1,` + recipe + `,"replicas":1}}`, `{"spec":{"historyLimit":1,` + recipe + `,"replicas":2}}`, true},
+		{"build nodeSelector changed", `{"spec":{"historyLimit":1,` + recipe + `,"nodeSelector":{"a":"b"}}}`, `{"spec":{"historyLimit":1,` + recipe + `,"nodeSelector":{"a":"c"}}}`, true},
+		{"non-build size changed", `{"spec":{"size":"1Gi"}}`, `{"spec":{"size":"2Gi"}}`, false},
+		{"non-build replicas changed", `{"spec":{"replicas":1}}`, `{"spec":{"replicas":2}}`, false},
+		{"non-build nodeSelector changed", `{"spec":{"nodeSelector":{"a":"b"}}}`, `{"spec":{"nodeSelector":{"a":"c"}}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validate(tc.after, tc.before)
+			if tc.ok && len(errs) != 0 {
+				t.Errorf("rejected %s -> %s: %v", tc.before, tc.after, errs.ToAggregate())
+			}
+			if !tc.ok && len(errs) == 0 {
+				t.Errorf("admitted %s -> %s", tc.before, tc.after)
+			}
+		})
+	}
+}
+
 // TestActiveDeadlineOverflowRejected guards the seconds-to-duration bound.
 // The controller multiplies activeDeadlineSeconds by time.Second; a value
 // above 9223372036 overflows int64 nanoseconds, wrapped negative, and stopped
@@ -983,10 +1073,9 @@ func TestBlipStateEmptyImageIsUnset(t *testing.T) {
 		}
 	}
 
-	// A real image is still exclusive with copyFrom and replicas.
+	// A real image is still exclusive with copyFrom.
 	for _, object := range []string{
 		`{"spec":{"image":"busybox:1","copyFrom":"source"}}`,
-		`{"spec":{"image":"busybox:1","replicas":2}}`,
 	} {
 		if errs := validate(object, ""); len(errs) == 0 {
 			t.Errorf("admitted %s", object)

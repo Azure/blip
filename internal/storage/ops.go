@@ -101,18 +101,26 @@ func (s *Store) buildCommit(ctx context.Context, rec, src *record) error {
 // operation; release it with unhold.
 func (s *Store) source(id string, kind Kind) (*record, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	r, ok := s.vols[id]
 	if !ok || r.Phase != phaseReady {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 	if kind != "" && r.Kind != kind {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("storage: %s is a %s, not a %s", id, r.Kind, kind)
 	}
 	if r.Kind == KindWorking || r.Kind == kindExport {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("storage: %s is not immutable", id)
 	}
 	s.tmpPins[id]++
+	s.mu.Unlock()
+	// Mark the source recently used so cache eviction prefers colder commits.
+	// A failed metadata write only costs eviction order, never the operation.
+	if err := s.Touch(id); err != nil {
+		logf("touch source %s: %v", id, err)
+	}
 	return r, nil
 }
 
@@ -271,6 +279,70 @@ func (s *Store) Seal(ctx context.Context, attachmentID, commitID string) (int64,
 		// rollback fails, the next Seal retries it before beginning.
 		if rerr := s.rollback(rec); rerr != nil {
 			logf("rollback seal %s after phase write: %v", rec.ID, rerr)
+		}
+		return 0, err
+	}
+	return rec.Size, nil
+}
+
+// Adopt keeps the fully hydrated data of a ready, read-only working volume
+// whose owner is gone as commit commitID, a local cache of a whole version.
+//
+// Base is intentionally empty, not the working volume's base: a read-only
+// attachment is often created from a local commit, so its base would equal
+// commitID and the commit could never serve as a delta base. No ext4-clean
+// check is needed either: the volume was mounted read-only, so its filesystem
+// cannot have been dirtied.
+func (s *Store) Adopt(ctx context.Context, attachmentID, commitID string) (int64, error) {
+	if attachmentID == "" || commitID == "" || attachmentID == commitID {
+		return 0, errors.New("storage: invalid adopt IDs")
+	}
+	unlock := s.locks.lockPair(attachmentID, commitID)
+	defer unlock()
+	if c, err := s.lookup(commitID); err == nil {
+		if c.Kind != KindCommit {
+			return 0, fmt.Errorf("%w: %s is a %s", ErrInUse, c.ID, c.Kind)
+		}
+		return c.Size, nil
+	}
+	// Retry a snapshot whose own cleanup failed after begin, as Seal does.
+	if err := s.retryUnfinished(commitID); err != nil {
+		return 0, err
+	}
+	w, err := s.lookup(attachmentID)
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case w.Kind != KindWorking:
+		err = fmt.Errorf("storage: %s is not a working volume", w.ID)
+	case w.Failed != "":
+		err = fmt.Errorf("storage: %s failed: %s", w.ID, w.Failed)
+	case w.Clone != nil:
+		err = fmt.Errorf("storage: %s is still hydrating", w.ID)
+	case !w.ReadOnly:
+		err = fmt.Errorf("storage: %s is not read-only", w.ID)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if err := s.runOperation([]deviceEffect{{Kind: eCheckClosed, Name: s.plainName(w)}}, nil); err != nil {
+		return 0, err
+	}
+	rec := &record{ID: commitID, Kind: KindCommit, StateUID: w.StateUID,
+		Size: w.Size, StreamSize: w.StreamSize, FSBytes: w.fsBytes()}
+	if _, err := s.begin(rec, 1); err != nil {
+		return 0, err
+	}
+	if err := s.snapshotActive(w, rec); err != nil {
+		if rerr := s.rollback(rec); rerr != nil {
+			logf("rollback adopt %s: %v", rec.ID, rerr)
+		}
+		return 0, err
+	}
+	if err := s.setPhase(rec, phaseReady); err != nil {
+		if rerr := s.rollback(rec); rerr != nil {
+			logf("rollback adopt %s after phase write: %v", rec.ID, rerr)
 		}
 		return 0, err
 	}

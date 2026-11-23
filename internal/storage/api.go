@@ -7,7 +7,10 @@
 // See the README's implementation outline.
 package storage
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // KeySize is the size of the cluster disk key (AES-256-XTS).
 const KeySize = 64
@@ -55,6 +58,9 @@ type Volume struct {
 	Pins      []string
 	Failed    string // non-empty if the volume is unusable (e.g. remote clone lost in a restart)
 	Digest    string // content digest of an immutable volume; "" until computed (see Digest)
+	// LastUsed orders cache eviction of commits. It is the last time the
+	// volume was created or used as a build, fetch, or export source.
+	LastUsed time.Time
 }
 
 // Region is a byte range, aligned to the 64 KiB pool block size.

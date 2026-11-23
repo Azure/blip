@@ -20,7 +20,9 @@ func digestRef(c string) string {
 }
 
 // TestImageRefsFiltering proves a node only imports images for state placements
-// and merges their state pull secrets, excluding infrastructure credentials.
+// and pending replicas, merges their state pull secrets, and excludes
+// infrastructure credentials. An unplaced state is not imported even when its
+// nodeSelector matches this node.
 func TestImageRefsFiltering(t *testing.T) {
 	v := newView()
 	placed := state("placed")
@@ -68,7 +70,7 @@ func TestImageRefsFiltering(t *testing.T) {
 	for _, r := range v.imageRefs() {
 		got[r.Ref] = r.Secrets
 	}
-	want := []string{digestRef("a"), digestRef("b"), digestRef("d")}
+	want := []string{digestRef("a"), digestRef("b")}
 	var have []string
 	for ref := range got {
 		have = append(have, ref)

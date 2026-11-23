@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"slices"
 	"strings"
 	"time"
@@ -250,6 +249,10 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 		if err := patchObject(ctx, r.Client, st, base); err != nil {
 			return reconcile.Result{}, err
 		}
+	}
+	// A build recipe holds no data; it only creates and publishes outputs.
+	if st.Spec.Build != nil {
+		return r.buildState(ctx, st)
 	}
 	cl, err := loadCluster(ctx, r.Client, r.now())
 	if err != nil {
@@ -808,13 +811,9 @@ func (r *StateReconciler) liveCopyStale(ctx context.Context, st *v1.BlipState, c
 	return false, nil
 }
 
-// replicas is how many nodes should hold the state. Every eligible node
-// holds an image state, and each builds generation 1 from the image itself.
+// replicas is how many nodes should hold the state.
 func replicas(st *v1.BlipState) int {
-	switch {
-	case st.Spec.Image != "":
-		return math.MaxInt
-	case st.Spec.Replicas <= 0:
+	if st.Spec.Replicas <= 0 {
 		return 3
 	}
 	return int(st.Spec.Replicas)
@@ -856,25 +855,12 @@ func (r *StateReconciler) pending(ctx context.Context, st *v1.BlipState, cl *clu
 		}
 	}
 	switch {
-	case st.Spec.Image != "":
-		// Every eligible node is already a replica of an image state, so a
-		// failed one has no stand-in: drop it. Generation 1 is built from
-		// the image on each node, so its source is not special.
-		p.Replicas = slices.DeleteFunc(p.Replicas, func(n string) bool {
-			return (n != p.SourceNode || p.Generation == 1) && cl.bad(n) && !cl.holds(st, n, p.CommitID)
-		})
-		if p.Generation == 1 && !slices.Contains(p.Replicas, p.SourceNode) {
-			if len(p.Replicas) == 0 {
-				s.Pending = nil
-				return "no eligible node can build generation 1; replanning", nil
-			}
-			p.SourceNode = p.Replicas[0]
-		}
 	case p.Generation == 1:
-		// Generation 1 is built from empty (or the copy source) by the
-		// surviving source node, so a failed replica with no replacement
-		// only delays the build. Drop it and commit with the survivors;
-		// repair adds replicas back when a node is available again.
+		// Generation 1 is built from empty (or the copy source) or from the
+		// image by the surviving source node, so a failed replica with no
+		// replacement only delays the build. Drop it and commit with the
+		// survivors; repair adds replicas back when a node is available
+		// again. pendingSource replans the version when its source is gone.
 		p.Replicas = slices.DeleteFunc(p.Replicas, func(n string) bool {
 			return n != p.SourceNode && cl.bad(n) && !cl.holds(st, n, p.CommitID)
 		})
@@ -1073,16 +1059,8 @@ func (r *StateReconciler) pendingSource(ctx context.Context, st *v1.BlipState, c
 			p.SourceNode = n
 			return false, "", nil
 		}
-		if st.Spec.Image == "" {
-			s.Pending = nil
-			return true, fmt.Sprintf("initial source node %s failed; replanning", p.SourceNode), nil
-		}
-		if n := firstUsable(st, cl, p.Replicas); n != "" {
-			p.SourceNode = n
-		}
-		// Without an eligible replica the image branch below drops the
-		// failed ones and replans when none remains.
-		return false, "", nil
+		s.Pending = nil
+		return true, fmt.Sprintf("initial source node %s failed; replanning", p.SourceNode), nil
 	}
 	// A draining writer still serves its sealed disk to replacement replicas.
 	// Draining forbids new placements, not completing an existing save.
@@ -1175,16 +1153,6 @@ func usableHolder(st *v1.BlipState, cl *cluster, p *v1.PendingCommit, replicas [
 func healthyHolder(st *v1.BlipState, cl *cluster, p *v1.PendingCommit, replicas []string) string {
 	for _, n := range replicas {
 		if cl.healthyNode(n) && cl.holds(st, n, p.CommitID) {
-			return n
-		}
-	}
-	return ""
-}
-
-// firstUsable returns the first usable node in names.
-func firstUsable(st *v1.BlipState, cl *cluster, names []string) string {
-	for _, n := range names {
-		if cl.usable(n, st.Spec.NodeSelector) {
 			return n
 		}
 	}
@@ -1433,7 +1401,7 @@ func (r *StateReconciler) repair(st *v1.BlipState, cl *cluster) string {
 	if len(waiting) > 0 {
 		return "replicating to " + strings.Join(waiting, ", ")
 	}
-	if len(good) < replicas(st) && st.Spec.Image == "" {
+	if len(good) < replicas(st) {
 		msg := fmt.Sprintf("%d of %d replicas; no other node can take one", len(good), replicas(st))
 		if len(bad) > 0 {
 			msg += " (" + strings.Join(bad, ", ") + " is draining or unhealthy)"

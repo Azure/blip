@@ -40,15 +40,19 @@ func newView() *view {
 		pods:        map[string]*corev1.Pod{},
 		dirs:        map[string]*podDir{},
 		volumes:     map[string]storage.Volume{},
-		devices:     map[string]uint64{},
-		configs:     map[string]*image.Config{},
-		busy:        map[string]bool{},
-		sealErrs:    map[string]string{},
-		stateErrs:   map[string]string{},
-		progress:    map[string]*v1alpha1.Transfer{},
-		podsGone:    map[string]bool{},
-		statesGone:  map[string]bool{},
-		blipsGone:   map[string]bool{},
+		// A full pool by default keeps commit GC's historical behavior of
+		// deleting unneeded commits; cache-retention tests set their own space.
+		freeBytes:  0,
+		poolBytes:  1 << 30,
+		devices:    map[string]uint64{},
+		configs:    map[string]*image.Config{},
+		busy:       map[string]bool{},
+		sealErrs:   map[string]string{},
+		stateErrs:  map[string]string{},
+		progress:   map[string]*v1alpha1.Transfer{},
+		podsGone:   map[string]bool{},
+		statesGone: map[string]bool{},
+		blipsGone:  map[string]bool{},
 	}
 	v.pools[ns+"/default"] = &v1alpha1.BlipPool{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "default"}}
 	now := metav1.NewTime(testNow)

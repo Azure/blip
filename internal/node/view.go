@@ -55,6 +55,7 @@ func (a *Agent) podDirFor(key string) string { return podDirFor(a.cfg.DataDir, k
 type Store interface {
 	Incarnation() string
 	FreeBytes() int64
+	Capacity() int64
 	List() []storage.Volume
 	PendingDeletes() []string
 	CreateImage(ctx context.Context, id string, sizeBytes int64, fill func(dev string) error) error
@@ -64,6 +65,8 @@ type Store interface {
 	Activate(id string) (string, error)
 	Seal(ctx context.Context, attachmentID, commitID string) (int64, error)
 	LiveCopy(ctx context.Context, attachmentID, commitID, stateUID string) (int64, error)
+	// Adopt snapshots a read-only working volume as a cached commit.
+	Adopt(ctx context.Context, attachmentID, commitID string) (int64, error)
 	Delete(ctx context.Context, id string) error
 	Digest(ctx context.Context, id string) (string, error)
 	// Device returns the plaintext device path of a working volume.
@@ -94,6 +97,8 @@ type view struct {
 	dirs        map[string]*podDir     // pod directories by podKey
 	volumes     map[string]storage.Volume
 	pending     []string                 // volume IDs whose teardown failed and must be retried
+	freeBytes   int64                    // usable free pool bytes at snapshot time
+	poolBytes   int64                    // total thin-pool data bytes, 0 = unknown
 	devices     map[string]uint64        // volume ID -> rdev of its active device
 	configs     map[string]*image.Config // image ID -> artifact config
 	pinned      map[string]bool          // export pins captured before planning
@@ -150,6 +155,39 @@ func (v *view) holds(commitID string) bool {
 func (v *view) hasImage(id string) bool {
 	vol, ok := v.volumes[id]
 	return ok && vol.Kind == storage.KindImage
+}
+
+// cacheFull reports whether the pool is short of free space, so cached commits
+// may be evicted. An unknown pool size never counts as full.
+func (v *view) cacheFull() bool {
+	return v.poolBytes > 0 && v.freeBytes < v.poolBytes/4
+}
+
+// readOnlyCommit returns the commit a Blip attached read-only as vol, whose
+// fully hydrated data can be kept locally as a delta base. It prefers a
+// finished Blip; any match is fine because GC only asks for unneeded volumes.
+func (v *view) readOnlyCommit(vol storage.Volume) string {
+	match := func(b *v1alpha1.Blip) string {
+		for _, m := range b.Status.Mounts {
+			if m.AttachmentID == vol.ID && m.CommitID != "" && m.StateUID == vol.StateUID {
+				return m.CommitID
+			}
+		}
+		return ""
+	}
+	for _, b := range v.blips {
+		if v1alpha1.Finished(b) {
+			if id := match(b); id != "" {
+				return id
+			}
+		}
+	}
+	for _, b := range v.blips {
+		if id := match(b); id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 // held returns the sorted commit IDs this node holds for a state.
