@@ -1245,8 +1245,13 @@ async function openSession(name, fromHistory) {
       scrollToBottom(false);
     }
     closeSidebar(false);
-    if (window.matchMedia("(max-width: 820px)").matches) $("transcript").focus();
-    else $("text").focus();
+    // Do not steal focus from an open New chat menu: the focus move would fire
+    // #new's focusout and dismiss a menu the user opened while this chat was
+    // still loading. Create already closes the menu when it starts.
+    if ($("new-menu").hidden) {
+      if (window.matchMedia("(max-width: 820px)").matches) $("transcript").focus();
+      else $("text").focus();
+    }
     if (!fromHistory) setDeepLink(name, false);
   } catch (err) {
     if (token !== openSeq) return;
@@ -1700,6 +1705,7 @@ async function createSession(profile) {
   // background must not pull them away from a chat they navigate to while the
   // POST and the list refresh are in flight.
   const seqAtStart = openSeq;
+  const menuHadFocus = $("new-menu").contains(document.activeElement);
   closeNewMenu();
   // The previous chat stays current until openSession finishes. Disable the
   // composer now so a fast send cannot post to the old chat while the new one
@@ -1722,7 +1728,13 @@ async function createSession(profile) {
     } else {
       await openSession(created.name);
     }
-  } catch (err) { toast(err.message); }
+  } catch (err) {
+    toast(err.message);
+    // A failed keyboard-initiated create blurs the menu item with the menu, so
+    // focus is left on <body>. Return it to New chat instead of making the
+    // next Tab restart at the skip link.
+    if (menuHadFocus && document.activeElement === document.body) $("new-btn").focus();
+  }
   finally {
     state.creating = false;
     // A failed POST leaves the old chat current, so keep it usable. But only
