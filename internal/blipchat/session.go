@@ -62,8 +62,13 @@ const maxQueue = 32
 const defaultQuestionTimeout = 30 * time.Second
 
 // Event is one server-sent event. The shape is part of the UI contract.
+// Offset is the ring offset of the record the event came from. Cursor is the
+// record's resume position when it carried more than one frame; clients should
+// send it back (as Last-Event-ID or ?offset=) instead of Offset so a reconnect
+// lands between frames rather than after the whole record.
 type Event struct {
 	Offset  uint64          `json:"offset"`
+	Cursor  string          `json:"cursor,omitempty"`
 	Type    string          `json:"type"`
 	Message json.RawMessage `json:"message,omitempty"`
 	Status  *Status         `json:"status,omitempty"`

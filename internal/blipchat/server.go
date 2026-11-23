@@ -1311,16 +1311,19 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeClusterError(w, err)
 		return
 	}
-	after, err := eventOffset(r)
+	cursor, seen, err := eventOffset(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	seen := after != 0
+	after, skip := cursor.offset, cursor.skip
+	lastID := strconv.FormatUint(after, 10)
 	if !seen {
 		// A client with no cursor starts at this chat's first record, not at
 		// the base's records a fork inherited.
 		after = chatStart(st)
+		skip = 0
+		lastID = strconv.FormatUint(after, 10)
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1354,7 +1357,6 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	heartbeat := time.NewTicker(20 * time.Second)
 	defer heartbeat.Stop()
 	next := after
-	last := after
 	// The guest stops writing before Kubernetes finishes saving the state.
 	// Refresh lifecycle independently of log traffic, including while the log
 	// endpoint is unavailable. These snapshots retain the delivered ring cursor;
@@ -1363,7 +1365,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer poll.Stop()
 	var lastStatus string
 	var statusNewest uint64
-	publishStatus := func() bool {
+	// publishStatus writes the current lifecycle at id, the resume cursor the
+	// client should present if this frame is the last one it receives.
+	publishStatus := func(id string) bool {
 		readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 		current, err := s.authorizedChat(readCtx, forwardedUser(r), name)
@@ -1405,13 +1409,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		if string(data) == lastStatus {
 			return true
 		}
-		if !writeSSE(w, flusher, Event{Offset: last, Type: "status", Status: status}) {
+		if !writeSSE(w, flusher, Event{Offset: after, Cursor: id, Type: "status", Status: status}) {
 			return false
 		}
 		lastStatus = string(data)
+		lastID = id
 		return true
 	}
-	if !publishStatus() {
+	if !publishStatus(lastID) {
 		return
 	}
 	for {
@@ -1425,7 +1430,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			case <-ctx.Done():
 				return
 			case <-poll.C:
-				if !publishStatus() {
+				if !publishStatus(lastID) {
 					return
 				}
 			case <-heartbeat.C:
@@ -1443,7 +1448,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			case <-ctx.Done():
 				return
 			case <-poll.C:
-				if !publishStatus() {
+				if !publishStatus(lastID) {
 					return
 				}
 			case <-heartbeat.C:
@@ -1458,31 +1463,52 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				if res.err != nil {
 					continue
 				}
-				if seen && res.rec.Offset <= last {
-					// The follow stream is inclusive: skip the event the
-					// client already received.
+				// The follow stream is inclusive of the resume record. A
+				// numeric cursor means the client has the whole record; a
+				// frame cursor means it stopped part way through one and the
+				// remaining frames must still be delivered.
+				if seen && res.rec.Offset < after {
+					continue
+				}
+				if seen && res.rec.Offset == after && skip < 0 {
+					next = res.rec.Offset
 					continue
 				}
 				view.observe(res.rec)
+				events := eventsFor(res.rec, view)
+				start := 0
+				if seen && res.rec.Offset == after {
+					if skip >= len(events) {
+						next = res.rec.Offset
+						continue
+					}
+					start = skip
+				}
 				seen = true
-				last = res.rec.Offset
+				after = res.rec.Offset
 				next = res.rec.Offset
-				for _, ev := range eventsFor(res.rec, view) {
+				for i := start; i < len(events); i++ {
+					ev := events[i]
 					if ev.Type == "status" {
 						// Ring events wake lifecycle publication, but their
 						// historical status must not replace the current one.
 						if res.rec.Offset > statusNewest {
 							s.invalidateView(name)
 						}
-						if !publishStatus() {
+						// Every transcript frame before this status is now
+						// delivered, so the record offset acknowledges it.
+						if !publishStatus(strconv.FormatUint(res.rec.Offset, 10)) {
 							return
 						}
 						continue
 					}
+					ev.Cursor = eventID(res.rec.Offset, i)
 					if !writeSSE(w, flusher, ev) {
 						return
 					}
+					lastID = ev.Cursor
 				}
+				skip = len(events)
 			}
 		}
 	reconnect:
@@ -1490,7 +1516,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-poll.C:
-			if !publishStatus() {
+			if !publishStatus(lastID) {
 				return
 			}
 		case <-time.After(readRetry):
@@ -1562,19 +1588,55 @@ func eventsFor(rec streamLogRecord, view *chatView) []Event {
 	return nil
 }
 
-func eventOffset(r *http.Request) (uint64, error) {
+// eventCursor is a resume position in the event stream: the ring record and
+// how many of its frames the client already received. A negative skip means
+// the whole record was delivered, which is what a plain numeric offset has
+// always meant.
+type eventCursor struct {
+	offset uint64
+	skip   int
+}
+
+// eventID is the SSE id of one frame of a record. Frames of a record share a
+// ring offset, so the record offset alone cannot resume between them.
+func eventID(offset uint64, frame int) string {
+	return strconv.FormatUint(offset, 10) + "." + strconv.Itoa(frame)
+}
+
+// parseEventCursor accepts "<offset>" and "<offset>.<frame>". The frame form
+// is emitted as an SSE id and also works in the UI's ?offset= reconnect URL.
+func parseEventCursor(raw string) (eventCursor, error) {
+	offset, frame, hasFrame := strings.Cut(raw, ".")
+	n, err := strconv.ParseUint(offset, 10, 64)
+	if err != nil {
+		return eventCursor{}, fmt.Errorf("offset must be a non-negative record offset")
+	}
+	if !hasFrame {
+		return eventCursor{offset: n, skip: -1}, nil
+	}
+	idx, err := strconv.ParseUint(frame, 10, 31)
+	if err != nil {
+		return eventCursor{}, fmt.Errorf("offset frame must be a non-negative integer")
+	}
+	return eventCursor{offset: n, skip: int(idx) + 1}, nil
+}
+
+// eventOffset returns the client's resume position. seen is false when the
+// client supplied no cursor, or the historical "0" that means "from the
+// beginning of this chat".
+func eventOffset(r *http.Request) (eventCursor, bool, error) {
 	raw := r.URL.Query().Get("offset")
 	if last := r.Header.Get("Last-Event-ID"); last != "" {
 		raw = last
 	}
 	if raw == "" {
-		return 0, nil
+		return eventCursor{}, false, nil
 	}
-	n, err := strconv.ParseUint(raw, 10, 64)
+	cur, err := parseEventCursor(raw)
 	if err != nil {
-		return 0, fmt.Errorf("offset must be a non-negative integer")
+		return eventCursor{}, false, err
 	}
-	return n, nil
+	return cur, cur.offset != 0 || cur.skip >= 0, nil
 }
 
 func writeSSE(w http.ResponseWriter, flusher http.Flusher, ev Event) bool {
@@ -1582,7 +1644,11 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, ev Event) bool {
 	if err != nil {
 		return false
 	}
-	if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", ev.Offset, data); err != nil {
+	id := ev.Cursor
+	if id == "" {
+		id = strconv.FormatUint(ev.Offset, 10)
+	}
+	if _, err := fmt.Fprintf(w, "id: %s\ndata: %s\n\n", id, data); err != nil {
 		return false
 	}
 	flusher.Flush()

@@ -1293,7 +1293,10 @@ function renderACP(msg) {
 }
 
 function handleEvent(ev) {
-  if (typeof ev.offset === "number") state.offset = ev.offset;
+  // cursor identifies the exact frame, so a reconnect can resume inside a
+  // record that produced several events. offset remains for older servers.
+  if (typeof ev.cursor === "string" && ev.cursor) state.offset = ev.cursor;
+  else if (typeof ev.offset === "number") state.offset = ev.offset;
   if (ev.type === "acp") renderACP(ev.message);
   else if (ev.type === "status" && ev.status) {
     setQuestion(ev.status.question);

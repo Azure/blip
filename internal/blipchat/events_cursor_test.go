@@ -68,7 +68,7 @@ func TestServerEventsCursorNeverMovesBackward(t *testing.T) {
 		{
 			name: "real ring loss still resynchronizes", after: 1,
 			lines:   "{\"t\":\"gap\",\"o\":25}\n{\"t\":\"end\",\"o\":27}\n",
-			wantIDs: []string{"id: 1", "id: 25"}, wantCursor: 27,
+			wantIDs: []string{"id: 1", "id: 25.0"}, wantCursor: 27,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
