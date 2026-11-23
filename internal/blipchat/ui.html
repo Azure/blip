@@ -636,6 +636,7 @@ Licensed under the MIT License. -->
 const state = { scope: "team", current: null, source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", running: false, phase: "no chat", question: null, sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, breakAgent: false };
 let openSeq = 0;
 let listSeq = 0;
+let titleEpoch = 0;
 let newMenuSeq = 0;
 let sessionsFingerprint = "";
 let sessionPollTimer = 0;
@@ -965,19 +966,41 @@ function updateSessionStatus() {
   }
 }
 
-function setTitle(title) {
-  const text = title || "New chat";
+// displayTitle normalizes any title for display: the server trims whitespace
+// and caps titles at 200 runes, but format-only titles (zero-width characters)
+// and over-long live ACP titles otherwise reach the header and sidebar raw.
+function displayTitle(title) {
+  const raw = String(title == null ? "" : title).replace(/\p{Cf}/gu, "").trim();
+  if (!raw) return "New chat";
+  const runes = Array.from(raw);
+  return runes.length > 200 ? runes.slice(0, 199).join("") + "\u2026" : raw;
+}
+
+// A live or detail title is newer than any session-list snapshot already in
+// flight, so setTitle bumps titleEpoch to let loadSessions reject stale lists.
+function setTitle(title, live) {
+  if (live) titleEpoch++;
+  const text = displayTitle(title);
   $("title").textContent = text;
   $("title").title = text;
   document.querySelectorAll("#sessions li").forEach((li) => {
     if (li.dataset.name !== state.current) return;
     const b = li.querySelector(".session-title");
-    if (b) { b.textContent = text; b.title = text; }
+    if (b) {
+      b.textContent = text;
+      b.title = text;
+      b.setAttribute("aria-label", text + " (" + state.current + ")");
+    }
+    const toggle = li.querySelector(".session-toggle:not(.placeholder)");
+    if (toggle) {
+      toggle.setAttribute("aria-label",
+        (collapsedSessions.has(state.current) ? "Expand" : "Collapse") + " child chats of " + text);
+    }
   });
   const known = state.sessions.find((s) => s.name === state.current);
-  if (known) known.title = title || "";
+  if (known) known.title = text;
   const origin = $("origin");
-  if (!origin.hidden && origin.dataset.parent) setOrigin(origin.dataset.parent);
+  if (origin.dataset.parent) setOrigin(origin.dataset.parent);
 }
 
 function textOf(content) {
@@ -1076,7 +1099,7 @@ function renderACP(msg) {
         return;
       case "available_commands_update": return;
       case "session_info_update":
-        if ("title" in u) setTitle(u.title);
+        if ("title" in u) setTitle(u.title, true);
         return;
     }
   }
@@ -1210,7 +1233,7 @@ async function openSession(name, fromHistory) {
     const known = state.sessions.find((s) => s.name === name);
     const chatScope = scopeOf(d.scope ? d : known);
     if (adoptScope(chatScope)) reflowSessions();
-    setTitle(d.title);
+    setTitle(d.title, true);
     setOrigin((known && known.parent) || d.parent || "");
     const profile = d.profile ? "profile: " + d.profile : "";
     $("profile").textContent = profile;
@@ -1577,10 +1600,18 @@ async function loadSessions(opts) {
   opts = opts || {};
   const quiet = !!opts.quiet;
   const token = ++listSeq;
+  const epochAtStart = titleEpoch;
   try {
     const sessions = await api("/api/sessions");
     if (token !== listSeq) return;
     state.sessions = Array.isArray(sessions) ? sessions : [];
+    // A list response that started before a live/detail title arrived can
+    // still carry the old title. Reapply the live title to the active row's
+    // cached entry before rendering so the row does not revert either.
+    if (state.current && titleEpoch !== epochAtStart) {
+      const current = state.sessions.find((s) => s && s.name === state.current);
+      if (current) current.title = $("title").textContent;
+    }
     if (state.current && !state.sessions.some((s) => s && s.name === state.current)) {
       resetChat();
       toast("That chat is no longer available.");
@@ -1599,7 +1630,9 @@ async function loadSessions(opts) {
     // the only place it can learn that the parent (or this chat) was renamed.
     if (state.current) {
       const current = state.sessions.find((s) => s && s.name === state.current);
-      if (current) setTitle(current.title);
+      // Skip a list snapshot that started before a live/detail title arrived:
+      // it can still carry the pre-rename title and would revert the header.
+      if (current && titleEpoch === epochAtStart) setTitle(current.title);
       // A child has no SSE stream for its parent. If the parent disappears
       // (deleted, or garbage-collected), do not leave a live link that opens
       // a 404 and unloads the still-usable child.
@@ -1654,7 +1687,7 @@ async function resyncSession() {
   try {
     const d = await api("/api/sessions/" + encodeURIComponent(name));
     if (token !== openSeq || state.current !== name) return;
-    setTitle(d.title);
+    setTitle(d.title, true);
     $("scope-badge").hidden = scopeOf(d) !== "user";
     setStatus(d.phase, d.running, d.statusMessage || "generation " + (d.generation || 0));
     setQuestion(d.question);
