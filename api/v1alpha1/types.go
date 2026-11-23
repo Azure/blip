@@ -195,6 +195,17 @@ type BlipStateSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:MaxLength=253
 	CopyFrom string `json:"copyFrom,omitempty"`
+	// HistoryLimit compacts a chain of copies, such as periodically
+	// refreshed caches. Once this state is ready, the controller keeps its
+	// nearest historyLimit copyFrom ancestors and deletes older ones. It
+	// deletes only an ancestor that also sets historyLimit, has the same
+	// owner label, has no owner references, and is not a chat-session
+	// state; the walk stops at the first ancestor that does not qualify.
+	// An ancestor that is still in use is retried later. Every ready state
+	// in the chain applies its own limit, so the smallest limit wins.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=32
+	HistoryLimit int32 `json:"historyLimit,omitempty"`
 	// Size is the filesystem size. Defaults to the source state's size for
 	// copies and to 10Gi otherwise. An image state fails if the converted
 	// image does not fit.

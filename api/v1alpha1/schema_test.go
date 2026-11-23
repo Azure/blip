@@ -777,6 +777,41 @@ func TestInt32AdmissionBoundaries(t *testing.T) {
 	}
 }
 
+// TestBlipStateHistoryLimitBounds guards historyLimit admission: omitted means
+// no compaction, values are bounded to 1..32, and the field stays mutable so
+// an existing chain can opt in.
+func TestBlipStateHistoryLimitBounds(t *testing.T) {
+	validate := admissionValidator(t, "blipstates")
+	for _, tc := range []struct {
+		object string
+		ok     bool
+	}{
+		{`{"spec":{}}`, true},
+		{`{"spec":{"historyLimit":1}}`, true},
+		{`{"spec":{"historyLimit":32}}`, true},
+		{`{"spec":{"historyLimit":0}}`, false},
+		{`{"spec":{"historyLimit":-1}}`, false},
+		{`{"spec":{"historyLimit":33}}`, false},
+	} {
+		errs := validate(tc.object, "")
+		if tc.ok && len(errs) != 0 {
+			t.Errorf("rejected %s: %v", tc.object, errs.ToAggregate())
+		}
+		if !tc.ok && len(errs) == 0 {
+			t.Errorf("admitted %s", tc.object)
+		}
+	}
+	for _, pair := range [][2]string{
+		{`{"spec":{"historyLimit":2}}`, `{"spec":{}}`},
+		{`{"spec":{"historyLimit":2}}`, `{"spec":{"historyLimit":1}}`},
+		{`{"spec":{}}`, `{"spec":{"historyLimit":2}}`},
+	} {
+		if errs := validate(pair[0], pair[1]); len(errs) != 0 {
+			t.Errorf("rejected historyLimit update %s -> %s: %v", pair[1], pair[0], errs.ToAggregate())
+		}
+	}
+}
+
 // TestActiveDeadlineOverflowRejected guards the seconds-to-duration bound.
 // The controller multiplies activeDeadlineSeconds by time.Second; a value
 // above 9223372036 overflows int64 nanoseconds, wrapped negative, and stopped

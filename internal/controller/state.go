@@ -386,6 +386,13 @@ func (r *StateReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (
 			return reconcile.Result{}, err
 		}
 	}
+	blocked, err := r.compactHistory(ctx, st)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if blocked && (result.RequeueAfter == 0 || historyRetry < result.RequeueAfter) {
+		result.RequeueAfter = historyRetry
+	}
 
 	nodes := slices.Clone(st.Status.Placements)
 	if p := st.Status.Pending; p != nil {

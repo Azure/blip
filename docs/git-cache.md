@@ -204,6 +204,7 @@ metadata:
   namespace: dev
 spec:
   copyFrom: gitcache-blip-20261122t0300  # omit on the first run
+  historyLimit: 2
 ---
 apiVersion: blip.dev/v1alpha1
 kind: Blip
@@ -263,18 +264,26 @@ kubectl -n dev annotate blipstate gitcache-blip-20261123t0300 \
   git.blip.dev/branch=main --overwrite
 ```
 
-Keep the two newest generations and delete the rest:
+### Retire old generations
 
-```sh
-kubectl -n dev get blipstate -l git.blip.dev/repo=blip,blip.dev/shared=true \
-  --sort-by=.status.committed.time -o name |
-  head -n -2 | xargs -r kubectl -n dev delete
-```
+`historyLimit: 2` lets the controller remove old generations. Once a
+generation is ready, the controller keeps its two nearest `copyFrom` ancestors
+and deletes older ones. It deletes only ancestors that also set
+`historyLimit`, carry the same `blip.dev/owner` label, and have no owner
+references, so a user's copy of a shared generation never deletes the cache's
+history. Each ready generation applies its own limit, so use the same value on
+every generation.
 
-The controller blocks deletion of a state that a root state mounts
-persistently. The warm job points `git-warmer` at the new generation before it
-starts the blip, so the generations this command deletes are no longer
-mounted.
+A new generation is ready as soon as its copy commits, before the warm blip
+fetches. Copy each new generation from the newest *published* generation, or
+delete it when its warm blip fails, so failed runs cannot retire the
+generations consumers use.
+
+Committed claims do not depend on their source. The controller skips a
+generation that is still in use, such as one a root state mounts
+persistently, a Blip is running on, or an uncommitted claim is copying from,
+and retries it later. The warm job points `git-warmer` at the new generation
+before it starts the blip, so old generations are no longer mounted.
 
 ### Claim the cache
 

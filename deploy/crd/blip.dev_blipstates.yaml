@@ -74,6 +74,20 @@ spec:
                 maxLength: 253
                 pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
                 type: string
+              historyLimit:
+                description: |-
+                  HistoryLimit compacts a chain of copies, such as periodically
+                  refreshed caches. Once this state is ready, the controller keeps its
+                  nearest historyLimit copyFrom ancestors and deletes older ones. It
+                  deletes only an ancestor that also sets historyLimit, has the same
+                  owner label, has no owner references, and is not a chat-session
+                  state; the walk stops at the first ancestor that does not qualify.
+                  An ancestor that is still in use is retried later. Every ready state
+                  in the chain applies its own limit, so the smallest limit wins.
+                format: int32
+                maximum: 32
+                minimum: 1
+                type: integer
               image:
                 description: |-
                   Image initializes the filesystem from a container image, which each
