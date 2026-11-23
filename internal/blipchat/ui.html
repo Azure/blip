@@ -876,15 +876,36 @@ function answerQuestion(text) {
   send();
 }
 
+function refreshActions() {
+  // Only offer actions for a chat whose content is actually rendered. While a
+  // chat is loading state.current already points at it, but Cancel, Stop, and
+  // Delete would target a chat the header and transcript do not show yet.
+  const ready = Boolean(state.current) && state.sessionReady;
+  const text = $("status").textContent;
+  const canCancel = ready && state.running;
+  const canStop = ready && (state.running || /^(starting|pending)$/.test(text));
+  const canDelete = ready && !state.running;
+  // Capture the focused button before hiding or disabling anything: hiding a
+  // focused button moves focus to <body> synchronously, so a check afterwards
+  // can never repair it.
+  const buttons = ["cancel", "stop", "delete"].map((id) => $(id));
+  const focused = buttons.find((b) => b === document.activeElement) || null;
+  $("actions").hidden = !(canCancel || canStop || canDelete);
+  $("cancel").hidden = !canCancel;
+  $("stop").hidden = !canStop;
+  $("delete").hidden = !canDelete;
+  $("cancel").disabled = !canCancel;
+  $("stop").disabled = !canStop;
+  $("delete").disabled = !canDelete;
+  if (focused && (focused.hidden || focused.disabled)) $("transcript").focus();
+}
+
 function setStatus(phase, running, detail) {
   const active = Boolean(state.current);
   let text = active ? (phase || (running ? "running" : "idle")).toLowerCase() : "no chat";
   // Succeeded/Stopped describe the VM's lifecycle, not the chat. Once a turn is
   // over the chat is idle even though its last blip has terminated.
   if (!running && /^(succeeded|stopped|ready|saving|inuse)$/.test(text)) text = "idle";
-  const canCancel = active && Boolean(running);
-  const canStop = active && (Boolean(running) || /^(starting|pending)$/.test(text));
-  const canDelete = active && !running;
   $("status").textContent = text;
   const dot = $("status-dot");
   const failed = /error|failed/.test(text);
@@ -902,18 +923,7 @@ function setStatus(phase, running, detail) {
   state.running = Boolean(running);
   state.phase = text;
   updateSessionStatus();
-  $("actions").hidden = !(canCancel || canStop || canDelete);
-  $("cancel").hidden = !canCancel;
-  $("stop").hidden = !canStop;
-  $("delete").hidden = !canDelete;
-  $("cancel").disabled = !canCancel;
-  $("stop").disabled = !canStop;
-  $("delete").disabled = !canDelete;
-  if ((document.activeElement === $("cancel") && !canCancel) ||
-      (document.activeElement === $("stop") && !canStop) ||
-      (document.activeElement === $("delete") && !canDelete)) {
-    $("transcript").focus();
-  }
+  refreshActions();
 }
 
 function updateSessionStatus() {
@@ -1218,6 +1228,7 @@ async function openSession(name, fromHistory) {
     }
     state.offset = d.offset || 0;
     state.sessionReady = true;
+    refreshActions();
     $("text").disabled = false;
     $("send").disabled = false;
     restoreDraft(name);
@@ -2070,23 +2081,24 @@ $("text").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $("cancel").onclick = async () => {
-  if (!state.current) return;
+  if (!state.current || !state.sessionReady) return;
   try { await api("/api/sessions/" + encodeURIComponent(state.current) + "/cancel", { method: "POST", body: {} }); }
   catch (err) { toast(err.message); }
 };
 $("stop").onclick = async () => {
-  if (!state.current) return;
+  if (!state.current || !state.sessionReady) return;
   try { await api("/api/sessions/" + encodeURIComponent(state.current) + "/stop", { method: "POST", body: {} }); }
   catch (err) { toast(err.message); }
 };
 $("delete").onclick = async () => {
   const name = state.current;
-  if (!name) return;
+  if (!name || !state.sessionReady) return;
   const known = state.sessions.find((s) => s && s.name === name);
   const title = (known && known.title) || "New chat";
   const warning = "Delete \"" + title + "\"? This permanently deletes the chat's workspace and history, including any child chats.";
   if (!window.confirm(warning)) return;
   const button = $("delete");
+  const hadFocus = document.activeElement === button;
   button.disabled = true;
   try {
     await api("/api/sessions/" + encodeURIComponent(name), { method: "DELETE" });
@@ -2097,7 +2109,10 @@ $("delete").onclick = async () => {
       // The chat stays open. A 409 means the agent started running; the next
       // status update will hide Delete, but re-enable it now so this click is
       // not left stuck.
-      if (state.current === name) button.disabled = false;
+      if (state.current === name) {
+        button.disabled = false;
+        if (hadFocus) (button.hidden ? $("transcript") : button).focus();
+      }
       return;
     }
   }
@@ -2127,6 +2142,7 @@ $("delete").onclick = async () => {
     setDeepLink("", true);
   }
   await loadSessions();
+  if (hadFocus && !state.current) $("transcript").focus();
   toast("Chat deleted.");
 };
 
