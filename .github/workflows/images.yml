@@ -104,6 +104,27 @@ jobs:
               '{component: $component, arch: $arch, digest: $digest}' \
               >> "build/digests/${arch}.jsonl"
           done
+
+          # The opencode image is a workload image, not a server component, so
+          # it lives outside deploy/images. Publish it through the same
+          # per-arch digest flow so the manifest job tags it with everything
+          # else.
+          metadata="build/digests/opencode-${arch}.json"
+          docker buildx build \
+            --platform "linux/${arch}" \
+            --file hack/opencode-image/Dockerfile \
+            --metadata-file "${metadata}" \
+            --provenance=false \
+            --sbom=false \
+            --output "type=image,name=${IMAGE_REPO}/blip-opencode,push-by-digest=true,name-canonical=true,push=true" \
+            hack/opencode-image
+          digest="$(jq -r '."containerimage.digest"' "${metadata}")"
+          jq -n \
+            --arg component opencode \
+            --arg arch "${arch}" \
+            --arg digest "${digest}" \
+            '{component: $component, arch: $arch, digest: $digest}' \
+            >> "build/digests/${arch}.jsonl"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-${{ matrix.arch }}

@@ -1,0 +1,118 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Deterministic stand-in for the Unbounded inference gateway. Applied by
+# setup.sh to the local kind cluster only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unbounded-proxy
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: unbounded-proxy
+    app.kubernetes.io/part-of: blip
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: unbounded-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: unbounded-proxy
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: proxy
+          image: blip-registry:5000/blip/dev:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - /opt/mock-model/mock_model.py
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: script
+              mountPath: /opt/mock-model
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: unbounded-proxy-tls
+            defaultMode: 0440
+        - name: script
+          configMap:
+            name: unbounded-proxy-script
+            defaultMode: 0440
+            items:
+              - key: mock_model.py
+                path: mock_model.py
+---
+# ClusterIP Service with the same name and port the pool endpoint dials.
+apiVersion: v1
+kind: Service
+metadata:
+  name: unbounded-proxy
+  namespace: blip-system
+  labels:
+    app.kubernetes.io/name: unbounded-proxy
+    app.kubernetes.io/part-of: blip
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: unbounded-proxy
+  ports:
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 8443

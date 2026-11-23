@@ -26,6 +26,7 @@ T=${BLIP_E2E_TIMEOUT:-300}
 SKIP_BUILD=${SKIP_BUILD:-0}
 SKIP_BASE=${SKIP_BASE:-0}
 SKIP_INFERENCE_PROXY=${SKIP_INFERENCE_PROXY:-0}
+MOCK_MODEL=${BLIP_E2E_MOCK_MODEL:-0}
 KEEP=${KEEP:-0}
 REBUILD_BASE=${REBUILD_BASE:-0}
 BASE_SIZE=${BLIP_E2E_BASE_SIZE:-2Gi}
@@ -165,9 +166,12 @@ if [ "$KEEP" != 1 ]; then
 	cleanup_stale_sessions
 fi
 
-for tool in kubectl kind docker az openssl python3 node curl; do
+for tool in kubectl kind docker openssl python3 node curl; do
 	command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
+if [ "$MOCK_MODEL" != 1 ]; then
+	command -v az >/dev/null || die "missing tool: az"
+fi
 
 if [ ! -x bin/kubectl-blip ]; then
 	step "building the blip CLI"
@@ -175,7 +179,10 @@ if [ ! -x bin/kubectl-blip ]; then
 fi
 
 if [ -z "${NODE_PATH:-}" ]; then
-	for dir in "$HOME/code/cade/node_modules" "$HOME/verify-cade/node_modules"; do
+	for dir in \
+		"$ROOT/hack/e2e/opencode/browser/node_modules" \
+		"$HOME/code/cade/node_modules" \
+		"$HOME/verify-cade/node_modules"; do
 		if [ -d "$dir/playwright" ]; then
 			export NODE_PATH="$dir"
 			break
@@ -185,8 +192,8 @@ fi
 node -e "require('playwright')" >/dev/null 2>&1 || die \
 	"playwright is not installed; run npm install in hack/e2e/opencode/browser or set NODE_PATH"
 
-step "checking the local inference proxy"
-# The inference proxy runs as a normal pod, so the kubelet needs the dev image
+step "checking the local model endpoint"
+# The model endpoint runs as a normal pod, so the kubelet needs the dev image
 # in the node image store. kind-up pushes it; load it locally too.
 proxy_image=blip-registry:5000/blip/dev:latest
 if ! docker image inspect "$proxy_image" >/dev/null 2>&1; then
@@ -197,7 +204,9 @@ kind load docker-image --name blip-dev "$proxy_image" >/dev/null 2>&1 || \
 	echo "warning: could not load $proxy_image into kind" >&2
 
 if [ "$SKIP_INFERENCE_PROXY" != 1 ]; then
-	if [ -x inference-proxy/setup.sh ]; then
+	if [ "$MOCK_MODEL" = 1 ]; then
+		hack/e2e/opencode/mock-model/setup.sh
+	elif [ -x inference-proxy/setup.sh ]; then
 		inference-proxy/setup.sh
 	elif k -n blip-system get service/unbounded-proxy >/dev/null 2>&1; then
 		echo "using the existing unbounded-proxy service"

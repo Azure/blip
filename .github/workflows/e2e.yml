@@ -85,6 +85,19 @@ jobs:
       - name: Start kind cluster
         run: ./hack/kind-up.sh
 
+      - name: Build OpenCode image
+        run: |
+          set -euo pipefail
+          docker build -t localhost:5001/blip/opencode:e2e hack/opencode-image
+          docker push localhost:5001/blip/opencode:e2e
+
+      - name: Install Playwright
+        working-directory: hack/e2e/opencode/browser
+        run: |
+          set -euo pipefail
+          npm install
+          npx playwright install --with-deps chromium
+
       - name: Run e2e tests
         env:
           BLIP_E2E_TIMEOUT: 300
@@ -94,6 +107,17 @@ jobs:
           set -euo pipefail
           mkdir -p e2e-logs
           ./hack/e2e.sh 2>&1 | tee e2e-logs/e2e.log
+
+      - name: Run OpenCode e2e
+        timeout-minutes: 30
+        env:
+          BLIP_E2E_MOCK_MODEL: "1"
+          SKIP_BUILD: "1"
+          BLIP_E2E_TIMEOUT: 600
+        run: |
+          set -euo pipefail
+          mkdir -p e2e-logs
+          ./hack/e2e/opencode/run.sh 2>&1 | tee e2e-logs/opencode.log
 
       - name: Collect diagnostics
         if: failure()
@@ -122,6 +146,7 @@ jobs:
           df -h >e2e-logs/df.txt 2>&1 || true
           free -m >e2e-logs/free.txt 2>&1 || true
           cp build/kind/kustomization.yaml e2e-logs/ 2>/dev/null || true
+          cp -r build/e2e-opencode e2e-logs/ 2>/dev/null || true
 
       - name: Upload diagnostics
         if: failure()

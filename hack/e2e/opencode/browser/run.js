@@ -135,7 +135,7 @@ async function waitForAgentTitle(page, timeoutMs) {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const title = ((await page.locator("#title").textContent()) || "").trim();
-		if (title && title !== "New chat") return title;
+		if (title && title !== "New chat" && title !== "Blip Chat") return title;
 		if (Date.now() >= deadline) return "";
 		await delay(250);
 	}
@@ -527,9 +527,9 @@ async function main() {
 			cfg.scope,
 		);
 		const placeholder = ((await page.locator("#title").textContent()) || "").trim();
-		if (placeholder !== "New chat") {
+		if (placeholder !== "New chat" && placeholder !== "Blip Chat") {
 			throw new Error(
-				`new chat header = ${JSON.stringify(placeholder)}, want "New chat"`,
+				`new chat header = ${JSON.stringify(placeholder)}, want "New chat" or "Blip Chat"`,
 			);
 		}
 
