@@ -1330,6 +1330,10 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
+// eventHeartbeatInterval is how often an open event stream emits a heartbeat
+// frame. It is a variable so tests do not have to wait the production cadence.
+var eventHeartbeatInterval = 20 * time.Second
+
 // handleEvents follows the ring and converts each record to the same SSE event
 // shape the UI has always received. Offsets are ring offsets, so a client can
 // reconnect to any replica with its Last-Event-ID.
@@ -1368,8 +1372,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	// SSE outlives the server's normal write timeout. The heartbeat below
-	// detects a dead client instead.
+	// SSE outlives the server's normal write timeout. The heartbeat below is
+	// both a write probe for a dead client and the client's liveness signal.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 	if _, err := fmt.Fprint(w, "retry: 3000\n\n"); err != nil {
 		return
@@ -1386,7 +1390,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		s.seedEventView(seedCtx, st, view, after)
 		cancel()
 	}
-	heartbeat := time.NewTicker(20 * time.Second)
+	heartbeat := time.NewTicker(eventHeartbeatInterval)
 	defer heartbeat.Stop()
 	next := after
 	// The guest stops writing before Kubernetes finishes saving the state.
@@ -1466,10 +1470,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case <-heartbeat.C:
-				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				if !writeHeartbeat(w, flusher) {
 					return
 				}
-				flusher.Flush()
 			case <-time.After(readRetry):
 			}
 			continue
@@ -1484,10 +1487,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case <-heartbeat.C:
-				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				if !writeHeartbeat(w, flusher) {
 					return
 				}
-				flusher.Flush()
 			case res, open := <-records:
 				if !open {
 					goto reconnect
@@ -1681,6 +1683,18 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, ev Event) bool {
 		id = strconv.FormatUint(ev.Offset, 10)
 	}
 	if _, err := fmt.Fprintf(w, "id: %s\ndata: %s\n\n", id, data); err != nil {
+		return false
+	}
+	flusher.Flush()
+	return true
+}
+
+// writeHeartbeat emits a data-only frame. EventSource delivers it to the
+// default onmessage handler, which lets the UI distinguish a live stream from
+// a half-open one that keeps sitting in OPEN. It deliberately has no id: line
+// so it cannot move Last-Event-ID off the transcript cursor.
+func writeHeartbeat(w http.ResponseWriter, flusher http.Flusher) bool {
+	if _, err := fmt.Fprint(w, "data: {\"type\":\"hb\"}\n\n"); err != nil {
 		return false
 	}
 	flusher.Flush()
