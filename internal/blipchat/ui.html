@@ -1823,38 +1823,6 @@ function updateLimit() {
   el.dataset.over = bytes > 32000 ? "true" : "false";
 }
 
-function countDomUserText(text) {
-  return [...document.querySelectorAll("#transcript .msg.user .msg-body")]
-    .filter((el) => el.textContent === text).length;
-}
-
-function countRecordUserText(records, text) {
-  let count = 0;
-  (records || []).forEach((msg) => {
-    if (!msg || msg.method !== "session/update") return;
-    const u = (msg.params && (msg.params.update || msg.params)) || {};
-    if (u.sessionUpdate !== "user_message_chunk") return;
-    if (u.blipUser !== true && !u.sender) return;
-    if (textOf(u.content) === text) count++;
-  });
-  return count;
-}
-
-async function promptWasAccepted(name, text, prior) {
-  // A response can be lost after the server has already accepted the prompt.
-  // Poll briefly for the authoritative user record before treating it as a
-  // failed send and restoring the text for a duplicate resend.
-  for (let i = 0; i < 6; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    try {
-      const d = await api("/api/sessions/" + encodeURIComponent(name));
-      if (countRecordUserText(d.transcript, text) > prior) return true;
-    } catch (_) {}
-    if (state.current === name && countDomUserText(text) > prior) return true;
-  }
-  return false;
-}
-
 function restoreUnsent(name, text) {
   const merge = (existing) => {
     if (!existing) return text;
@@ -1879,7 +1847,6 @@ async function send() {
   const text = $("text").value.trim();
   if (!text || !state.current || !state.sessionReady || $("text").disabled) return;
   const name = state.current;
-  const prior = countDomUserText(text);
   $("text").value = "";
   resizeText();
   updateLimit();
@@ -1896,13 +1863,13 @@ async function send() {
     // they show up in the sidebar without waiting for the next interval.
     scheduleSessionPoll(300);
   } catch (err) {
-    if (await promptWasAccepted(name, text, prior)) {
-      if (state.drafts[name] === text) delete state.drafts[name];
-      toast("Message delivered.");
-    } else {
-      restoreUnsent(name, text);
-      toast(err.message);
-    }
+    // A failed POST is never proof of delivery: comparing transcript counts
+    // cannot tell another client's copy or a stale record from this send. The
+    // text may therefore not have been accepted, so restore it and show the
+    // real error rather than reporting success and dropping the prompt.
+    restoreUnsent(name, text);
+    const ambiguous = !err.status || err.status >= 500;
+    toast(ambiguous ? err.message + " Delivery could not be confirmed." : err.message);
   }
   if (state.current === name && !$("text").disabled) $("text").focus();
 }
