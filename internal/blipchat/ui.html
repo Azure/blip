@@ -117,15 +117,15 @@ Licensed under the MIT License. -->
     border-radius: 6px;
     transition: background-color .12s, border-color .12s, color .12s;
   }
-  .btn:hover:not(:disabled) { color: var(--text); border-color: var(--line-strong); background: var(--surface); }
-  .btn:disabled { opacity: .4; }
+  .btn:hover:not(:disabled):not([aria-disabled="true"]) { color: var(--text); border-color: var(--line-strong); background: var(--surface); }
+  .btn:disabled, .btn[aria-disabled="true"] { opacity: .4; cursor: default; }
   .btn.primary {
     color: var(--accent-ink);
     background: var(--accent);
     border-color: var(--accent);
     font-weight: 600;
   }
-  .btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-ink); }
+  .btn.primary:hover:not(:disabled):not([aria-disabled="true"]) { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-ink); }
   .btn.ghost { border-color: transparent; }
   .btn.ghost:hover:not(:disabled) { background: var(--surface); border-color: transparent; }
   .btn.danger { color: var(--danger); }
@@ -144,6 +144,11 @@ Licensed under the MIT License. -->
     border: 1px solid var(--line-strong);
     border-radius: 8px;
     box-shadow: var(--shadow);
+    /* A long profile list must scroll inside the menu instead of growing past
+       the viewport, where later entries cannot be reached with a mouse. */
+    max-height: min(60dvh, 420px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
   .menu-item {
     display: flex;
@@ -646,7 +651,7 @@ Licensed under the MIT License. -->
 </div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
-const state = { scope: "team", current: null, parent: "", source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", pendingAttempts: 0, running: false, phase: "no chat", question: null, sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, breakAgent: false };
+const state = { scope: "team", current: null, parent: "", source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", pendingAttempts: 0, running: false, phase: "no chat", question: null, sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, profilesLoading: false, breakAgent: false };
 let openSeq = 0;
 let listSeq = 0;
 let titleEpoch = 0;
@@ -2086,6 +2091,19 @@ function closeNewMenu(restoreFocus) {
   else if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
 }
 
+// New chat doubles as the progress indicator for the operations it starts.
+// aria-disabled (rather than the native disabled attribute) keeps the button
+// focusable: a native disable blurs it, and that blur fires #new's focusout,
+// which would discard the menu this handler is about to open. The click
+// handlers guard on state.profilesLoading / state.creating instead.
+function setNewButtonBusy(busy, busyLabel) {
+  const button = $("new-btn");
+  button.textContent = busy ? busyLabel : "New chat";
+  button.setAttribute("aria-disabled", busy ? "true" : "false");
+  if (busy) button.setAttribute("aria-busy", "true");
+  else button.removeAttribute("aria-busy");
+}
+
 async function createSession(profile) {
   if (state.creating) return;
   state.creating = true;
@@ -2096,11 +2114,13 @@ async function createSession(profile) {
   const seqAtStart = openSeq;
   const menuHadFocus = $("new-menu").contains(document.activeElement);
   closeNewMenu();
+  setNewButtonBusy(true, "Creating\u2026");
   // The previous chat stays current until openSession finishes. Disable the
   // composer now so a fast send cannot post to the old chat while the new one
   // is still being created.
   $("text").disabled = true;
   $("send").disabled = true;
+  let failed = false;
   try {
     const created = await api("/api/sessions", {
       method: "POST",
@@ -2118,14 +2138,11 @@ async function createSession(profile) {
       await openSession(created.name);
     }
   } catch (err) {
+    failed = true;
     toast(err.message);
-    // A failed keyboard-initiated create blurs the menu item with the menu, so
-    // focus is left on <body>. Return it to New chat instead of making the
-    // next Tab restart at the skip link.
-    if (menuHadFocus && document.activeElement === document.body) $("new-btn").focus();
-  }
-  finally {
+  } finally {
     state.creating = false;
+    setNewButtonBusy(false);
     // A failed POST leaves the old chat current, so keep it usable. Do not
     // enable anything while a newer openSession is still fetching, but once a
     // loaded chat is on screen restore its composer even if the user navigated
@@ -2134,6 +2151,10 @@ async function createSession(profile) {
       $("text").disabled = false;
       updateLimit();
     }
+    // A failed keyboard-initiated create blurs the menu item with the menu, so
+    // focus is left on <body>. Return it to New chat (now re-enabled) instead
+    // of making the next Tab restart at the skip link.
+    if (failed && menuHadFocus && document.activeElement === document.body) $("new-btn").focus();
   }
 }
 
@@ -2402,15 +2423,28 @@ $("new-btn").onclick = async (e) => {
     closeNewMenu();
     return;
   }
-  // The user is moving on to a new chat; stop retrying a failed deep link.
-  stopDeepLinkRetry("Open the chat again to retry.");
-  const menuSeq = ++newMenuSeq;
-  if (!(await loadProfiles(menuSeq))) return;
-  if (menuSeq !== newMenuSeq) return;
-  $("new-menu").hidden = false;
-  $("new-btn").setAttribute("aria-expanded", "true");
-  const first = $("new-menu").querySelector(".menu-item");
-  if (first) first.focus();
+  // One request at a time: a slow /api/profiles must not turn repeated clicks
+  // into duplicate requests, and the button must show it is busy instead of
+  // looking dead.
+  if (state.profilesLoading) return;
+  state.profilesLoading = true;
+  setNewButtonBusy(true, "Loading\u2026");
+  try {
+    // The user is moving on to a new chat; stop retrying a failed deep link.
+    stopDeepLinkRetry("Open the chat again to retry.");
+    const menuSeq = ++newMenuSeq;
+    // closeNewMenu (an outside click or Escape) invalidates menuSeq; the
+    // finally below still restores the button label.
+    if (!(await loadProfiles(menuSeq))) return;
+    if (menuSeq !== newMenuSeq) return;
+    $("new-menu").hidden = false;
+    $("new-btn").setAttribute("aria-expanded", "true");
+    const first = $("new-menu").querySelector(".menu-item");
+    if (first) first.focus();
+  } finally {
+    state.profilesLoading = false;
+    setNewButtonBusy(false);
+  }
 };
 
 $("new-menu").addEventListener("keydown", (e) => {
