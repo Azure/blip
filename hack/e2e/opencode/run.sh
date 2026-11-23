@@ -157,8 +157,11 @@ trap on_error ERR
 
 step "checking local-only context"
 current=$(kubectl config current-context 2>/dev/null || true)
-[ "$current" = "$EXPECTED_CONTEXT" ] || die \
-	"refusing to run in context '$current'; expected '$EXPECTED_CONTEXT' (local kind only)"
+if [ -n "$current" ] && [ "$current" != "$EXPECTED_CONTEXT" ]; then
+	die "refusing to run in context '$current'; expected '$EXPECTED_CONTEXT' (local kind only)"
+fi
+kubectl config get-contexts -o name | grep -qx "$EXPECTED_CONTEXT" || die \
+	"missing kubectl context '$EXPECTED_CONTEXT' (local kind only)"
 k get nodes >/dev/null
 k -n blip-system get deployment/blipchat >/dev/null
 
