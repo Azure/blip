@@ -1026,31 +1026,85 @@ function textOf(content) {
 
 // Some ACP agents report a failed command as a completed tool call and put the
 // failure in rawOutput metadata instead of status. Treat both shapes as errors.
+// Agent metadata is untyped JSON, so normalize the values it can carry.
 function toolFailed(u) {
   const raw = u && u.rawOutput ? u.rawOutput : {};
   const meta = (raw && raw.metadata) || (u && u.metadata) || {};
-  if (u && u.status === "failed") return true;
-  if (meta.error === true) return true;
+  if (u && (u.status === "failed" || u.status === "error")) return true;
+  const err = meta.error;
+  if (err === true) return true;
+  if (typeof err === "string" && err.trim() !== "") return true;
+  if (err && typeof err === "object" && Object.keys(err).length) return true;
   // The OpenCode execute tool batches child calls and keeps their failure in
   // metadata.toolCalls while the outer call still reports "completed".
   const calls = Array.isArray(meta.toolCalls) ? meta.toolCalls
     : (Array.isArray(raw.toolCalls) ? raw.toolCalls : []);
   if (calls.some((call) => call && (call.status === "error" || call.status === "failed"))) return true;
-  const exit = typeof meta.exit === "number" ? meta.exit : (typeof raw.exit === "number" ? raw.exit : undefined);
-  return exit !== undefined && exit !== 0;
+  // Exit codes arrive as numbers or numeric strings; "0" is success.
+  for (const value of [meta.exit, raw.exit]) {
+    if (value === undefined || value === null || value === "") continue;
+    const code = Number(value);
+    if (Number.isFinite(code) && code !== 0) return true;
+  }
+  return false;
+}
+
+const TERMINAL_TOOL_STATUSES = new Set(["completed", "done", "failed", "error", "interrupted"]);
+
+function isTerminalToolStatus(status) {
+  return TERMINAL_TOOL_STATUSES.has(status);
+}
+
+function addToolRow(id, el) {
+  if (!id) return;
+  const rows = toolEvents.get(id);
+  if (rows) rows.push(el);
+  else toolEvents.set(id, [el]);
+}
+
+// A tool call ID is supposed to be unique, but an agent that reuses one must
+// not shadow the earlier rows. Target the newest row for the ID that is still
+// open; if every row is terminal, only accept an update that matches the
+// latest row's title so a stale update cannot rewrite a later call.
+function toolRowFor(u) {
+  const rows = u.toolCallId ? toolEvents.get(u.toolCallId) : null;
+  if (!rows || !rows.length) return null;
+  const open = rows.filter((el) => !isTerminalToolStatus(el.dataset.toolStatus || "pending"));
+  if (open.length) return open[open.length - 1];
+  const last = rows[rows.length - 1];
+  if (u.title && last.dataset.toolTitle && u.title !== last.dataset.toolTitle) return null;
+  return last;
+}
+
+// Keep title, status label, and error styling in one place so tool_call,
+// tool_call_update, and orphan updates cannot drift. A freshly created pending
+// row stays unlabeled, which is the existing look for in-flight calls.
+function applyToolState(el, u, quiet) {
+  if (!el) return;
+  const failed = toolFailed(u);
+  const title = u.title || el.dataset.toolTitle || "tool";
+  const status = failed ? "failed" : (u.status || el.dataset.toolStatus || "pending");
+  el.dataset.toolTitle = title;
+  el.dataset.toolStatus = status;
+  const label = failed || (u.status && !(quiet && status === "pending"));
+  const body = el.querySelector(".event-body");
+  if (body) body.textContent = title + (label ? " (" + status + ")" : "");
+  el.classList.toggle("error", failed);
 }
 
 // A turn can end without a terminal tool_call_update (the agent process may
 // be killed). Do not leave those rows showing in_progress forever.
 function closeOpenTools(label) {
-  toolEvents.forEach((el) => {
-    const status = el.dataset.toolStatus || "pending";
-    if (status === "completed" || status === "done" || status === "failed" || status === "error" || status === "interrupted") return;
-    const body = el.querySelector(".event-body");
-    const title = el.dataset.toolTitle || "tool";
-    if (body) body.textContent = title + " (" + label + ")";
-    el.classList.add("error");
-    el.dataset.toolStatus = "interrupted";
+  toolEvents.forEach((rows) => {
+    rows.forEach((el) => {
+      const status = el.dataset.toolStatus || "pending";
+      if (isTerminalToolStatus(status)) return;
+      const body = el.querySelector(".event-body");
+      const title = el.dataset.toolTitle || "tool";
+      if (body) body.textContent = title + " (" + label + ")";
+      el.classList.add("error");
+      el.dataset.toolStatus = "interrupted";
+    });
   });
 }
 
@@ -1124,40 +1178,37 @@ function renderACP(msg) {
         appendChunk("user", textOf(u.content), u.sender || "unknown");
         return;
       case "tool_call": {
-        const el = createMessage("tool", u.title || u.toolCallId || "call");
+        const title = u.title || u.toolCallId || "call";
+        const el = createMessage("tool", title);
+        el.dataset.toolTitle = title;
         if (u.toolCallId) {
           el.dataset.toolCallId = u.toolCallId;
-          el.dataset.toolTitle = u.title || "";
-          el.dataset.toolStatus = u.status || "pending";
-          toolEvents.set(u.toolCallId, el);
+          addToolRow(u.toolCallId, el);
         }
+        applyToolState(el, u, true);
         return;
       }
       case "tool_call_update": {
-        const el = u.toolCallId ? toolEvents.get(u.toolCallId) : null;
+        const known = Boolean(u.toolCallId && toolEvents.has(u.toolCallId));
+        const el = toolRowFor(u);
         if (el) {
-          const title = u.title || el.dataset.toolTitle || "tool";
-          el.dataset.toolTitle = title;
-          const body = el.querySelector(".event-body");
-          const failed = toolFailed(u);
-          if (u.status) el.dataset.toolStatus = failed ? "failed" : u.status;
-          else if (failed) el.dataset.toolStatus = "failed";
-          if (body) body.textContent = title + (u.status ? " (" + (failed ? "failed" : u.status) + ")" : "");
-          el.classList.toggle("error", failed);
+          applyToolState(el, u);
           followOutput();
           return;
         }
+        // The ID exists but every row is terminal and the update's title does
+        // not match the latest one: it is stale, not a new call.
+        if (known) return;
         if (u.title || (u.status && u.status !== "completed") || toolFailed(u)) {
-          const failed = toolFailed(u);
-          const label = failed ? "failed" : u.status;
-          const created = createMessage("tool", (u.title || "tool") + (label ? " (" + label + ")" : ""));
+          const created = createMessage("tool", u.title || "tool");
+          // An orphan update without a status was previously treated as a
+          // finished call, so keep it out of closeOpenTools.
+          if (!u.status && !toolFailed(u)) created.dataset.toolStatus = "done";
           if (u.toolCallId) {
             created.dataset.toolCallId = u.toolCallId;
-            created.dataset.toolTitle = u.title || "";
-            created.dataset.toolStatus = failed ? "failed" : (u.status || "done");
-            toolEvents.set(u.toolCallId, created);
+            addToolRow(u.toolCallId, created);
           }
-          if (failed) created.classList.add("error");
+          applyToolState(created, u);
         }
         return;
       }
