@@ -647,6 +647,7 @@ const collapsedSessions = new Set();
 const $ = (id) => document.getElementById(id);
 const transcript = $("transcript");
 const toolEvents = new Map();
+const renderedPromptIDs = new Set();
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const BASE_PATH = document.querySelector('meta[name="blipchat-base-path"]').content;
 
@@ -749,6 +750,7 @@ function followOutput() {
 function clearTranscript() {
   transcript.innerHTML = "";
   toolEvents.clear();
+  renderedPromptIDs.clear();
   state.atBottom = true;
   $("jump").hidden = true;
 }
@@ -1013,6 +1015,10 @@ function renderACP(msg) {
       case "agent_thought_chunk": appendChunk("thought", textOf(u.content)); return;
       case "user_message_chunk":
         if (u.blipUser !== true && !u.sender) return;
+        if (u.promptID) {
+          if (renderedPromptIDs.has(u.promptID)) return;
+          renderedPromptIDs.add(u.promptID);
+        }
         state.breakAgent = true;
         appendChunk("user", textOf(u.content), u.sender || "unknown");
         return;

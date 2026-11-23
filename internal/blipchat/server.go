@@ -1283,6 +1283,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	view := newChatView(st.Annotations[AnnotationACPSession])
+	if seen {
+		// Bound the backfill so an unavailable log cannot hold up the first
+		// status frame. The UI also dedupes user messages by prompt ID, so a
+		// failed seed degrades to a duplicate it will not render.
+		seedCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		s.seedEventView(seedCtx, st, view, after)
+		cancel()
+	}
 	heartbeat := time.NewTicker(20 * time.Second)
 	defer heartbeat.Stop()
 	next := after
@@ -1420,6 +1428,36 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-time.After(readRetry):
+		}
+	}
+}
+
+// seedEventView folds the records the client's snapshot already contains into
+// the event view before following new records. The stream view must know about
+// earlier notes; otherwise a session/prompt whose note predates the cursor
+// looks like a legacy prompt and re-emits the user message.
+func (s *Server) seedEventView(ctx context.Context, st *v1.BlipState, view *chatView, cursor uint64) {
+	rc, err := s.wire.ReadLog(ctx, s.namespace, st.Name, chatStart(st))
+	if err != nil {
+		s.log.Debug("seed chat event view", "session", st.Name, "err", err)
+		return
+	}
+	defer rc.Close()
+	dec := json.NewDecoder(rc)
+	for {
+		var rec streamLogRecord
+		if err := dec.Decode(&rec); err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.log.Debug("seed chat event view", "session", st.Name, "err", err)
+			}
+			return
+		}
+		if rec.Offset > cursor {
+			return
+		}
+		view.observe(rec)
+		if rec.Offset == cursor {
+			return
 		}
 	}
 }
