@@ -633,7 +633,7 @@ Licensed under the MIT License. -->
 </div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
-const state = { scope: "team", current: null, source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", running: false, phase: "no chat", question: null, sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, clickShieldUntil: 0, breakAgent: false };
+const state = { scope: "team", current: null, source: null, offset: 0, me: "", meLoading: false, sessionReady: false, pendingDeepLink: "", running: false, phase: "no chat", question: null, sessions: [], atBottom: true, drafts: Object.create(null), scrollPositions: Object.create(null), creating: false, breakAgent: false };
 let openSeq = 0;
 let listSeq = 0;
 let newMenuSeq = 0;
@@ -1510,7 +1510,6 @@ function renderSessions(sessions) {
     title.setAttribute("aria-label", (s.title || "New chat") + " (" + s.name + ")");
     title.onclick = (e) => {
       e.stopPropagation();
-      if (performance.now() < state.clickShieldUntil) return;
       openSession(s.name);
     };
     head.append(toggle, title);
@@ -1545,7 +1544,6 @@ function renderSessions(sessions) {
     li.append(head, meta);
     li.onclick = (e) => {
       if (e.target.closest(".session-toggle")) return;
-      if (performance.now() < state.clickShieldUntil) return;
       openSession(s.name);
     };
     items.push(item);
@@ -1697,8 +1695,11 @@ function closeNewMenu(restoreFocus) {
 async function createSession(profile) {
   if (state.creating) return;
   state.creating = true;
-  state.clickShieldUntil = performance.now() + 800;
   const scope = state.scope;
+  // Remember where the user was when they asked for this chat. Creating in the
+  // background must not pull them away from a chat they navigate to while the
+  // POST and the list refresh are in flight.
+  const seqAtStart = openSeq;
   closeNewMenu();
   // The previous chat stays current until openSession finishes. Disable the
   // composer now so a fast send cannot post to the old chat while the new one
@@ -1711,8 +1712,16 @@ async function createSession(profile) {
       body: { profile, scope }
     });
     await loadSessions();
-    if (state.scope === scope) await openSession(created.name);
-    else toast("Chat created in " + (scope === "user" ? "Private" : "Team") + ".");
+    if (state.scope !== scope) {
+      toast("Chat created in " + (scope === "user" ? "Private" : "Team") + ".");
+    } else if (openSeq !== seqAtStart) {
+      // The user opened another chat (or navigated away and back) while the
+      // create was running. Keep the new chat in the sidebar and announce it,
+      // but leave their current view, draft, and URL alone.
+      toast("Chat created.");
+    } else {
+      await openSession(created.name);
+    }
   } catch (err) { toast(err.message); }
   finally {
     state.creating = false;
