@@ -13,20 +13,22 @@ Playwright -> blipchat-auth -> blipchat -> Blip -> opencode acp
 `X-Forwarded-User: e2e`; it is not a production authentication design.
 
 The test uses the `opencode` BlipPool and a base state named
-`e2e-opencode-base` containing the `opencode` binary. The VM reaches the
-inference endpoint through the logical Blip endpoint named `unbounded`, which
-is supplied by the local, git-ignored `inference-proxy/` directory. That
-directory owns the upstream URL, Azure token, TLS material, and bearer-token
-injection. Nothing in this tracked directory contains those details.
+`e2e-opencode-base` created from the image built by `hack/opencode-image`. The
+VM reaches the inference endpoint through the logical Blip endpoint named
+`unbounded`, which is supplied by the local, git-ignored `inference-proxy/`
+directory. That directory owns the upstream URL, Azure token, TLS material, and
+bearer-token injection. Nothing in this tracked directory contains those
+details.
 
 ## Prerequisites
 
 - A local kind cluster from `hack/kind-up.sh`, context `kind-blip-dev`.
 - The ignored `inference-proxy/` directory with `setup.sh`.
-- `opencode` on the host at `$OPENCODE_BIN` or on `PATH`.
 - Playwright 1.65.1 and the cached chromium-1255 browser. If Playwright is not
   installed in this directory, set `NODE_PATH` or set `PLAYWRIGHT_MODULE` to a
   module that resolves `playwright`.
+- Docker access to the Ubuntu archive and the opencode GitHub release, which the
+  image build downloads.
 - The local registry at `127.0.0.1:5001` (`blip-registry`).
 
 The script refuses to run unless the current kubectl context is exactly
@@ -46,8 +48,10 @@ Useful environment variables:
 - `SKIP_INFERENCE_PROXY=1` — use an already-running `unbounded-proxy`.
 - `REBUILD_BASE=1` — delete and re-import the base state.
 - `BLIP_E2E_TIMEOUT=600` — per-wait timeout in seconds.
-- `BLIP_E2E_CHAT_PORT=28080` — local auth-shim port.
-- `OPENCODE_BIN=/path/to/opencode` — host binary to place in the VM image.
+- `BLIP_E2E_CHAT_PORT=18080` — local auth-shim port.
+
+The VM image is built from `hack/opencode-image`; no host `opencode` binary is
+needed.
 
 ## What the test asserts
 
@@ -61,7 +65,10 @@ Useful environment variables:
    annotation.
 5. After the first turn ends, a second prompt creates `<session>-g2` and
    resumes the same ACP session.
-6. No inference credential appears in the Blip spec.
+6. A third prompt asks the agent to spawn two children through the blipchat
+   MCP tools, and the test verifies both child sessions and their parent/root/
+   depth annotations.
+7. No inference credential appears in the Blip spec.
 
 On success the test deletes only its session state and Blips. It keeps the
 base state, pool, and auth shim for faster reruns, plus

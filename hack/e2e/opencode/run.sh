@@ -126,9 +126,6 @@ cleanup() {
 				delete_session "$state"
 			done
 		fi
-		# Keep the result and browser artifacts; only the staged 211 MB
-		# opencode build context is disposable.
-		rm -rf "$WORK/image"
 	fi
 	echo "artifacts kept in $WORK" >&2
 	exit "$status"
@@ -171,16 +168,11 @@ fi
 for tool in kubectl kind docker az openssl python3 node curl; do
 	command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
-command -v base64 >/dev/null || true
 
 if [ ! -x bin/kubectl-blip ]; then
 	step "building the blip CLI"
 	make build
 fi
-
-OPENCODE_BIN=${OPENCODE_BIN:-$(command -v opencode || true)}
-[ -n "$OPENCODE_BIN" ] && [ -x "$OPENCODE_BIN" ] || die \
-	"opencode binary not found; set OPENCODE_BIN"
 
 if [ -z "${NODE_PATH:-}" ]; then
 	for dir in "$HOME/code/cade/node_modules" "$HOME/verify-cade/node_modules"; do
@@ -216,12 +208,7 @@ fi
 
 if [ "$SKIP_BUILD" != 1 ]; then
 	step "building the opencode VM image"
-	imgctx="$WORK/image"
-	mkdir -p "$imgctx"
-	cp hack/e2e/opencode/image/Dockerfile "$imgctx/Dockerfile"
-	cp "$OPENCODE_BIN" "$imgctx/opencode"
-	chmod 0755 "$imgctx/opencode"
-	docker build -t "$HOST_IMAGE" "$imgctx"
+	docker build -t "$HOST_IMAGE" hack/opencode-image
 	docker push "$HOST_IMAGE"
 fi
 
