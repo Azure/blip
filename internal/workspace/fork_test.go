@@ -583,28 +583,3 @@ func TestForkReturnsEveryCreatedState(t *testing.T) {
 		}
 	}
 }
-
-func TestForkCarriesGitRepoIdentity(t *testing.T) {
-	ctx := context.Background()
-	src := testState("chat-abc")
-	src.Spec.Mounts = []v1alpha1.Mount{{State: "chat-abc-r-demo", Path: "/src/demo", Writable: true}}
-	claim := testState("chat-abc-r-demo")
-	claim.Labels = map[string]string{v1alpha1.LabelOwner: "chat-abc", v1alpha1.LabelGitRepo: "demo"}
-	claim.Annotations = map[string]string{v1alpha1.AnnotationGitSource: "gitcache-demo-1"}
-	c := testClient(t, src, claim)
-	dest := testState("chat-def")
-	dest.Labels = map[string]string{v1alpha1.LabelOwner: "chat-abc"}
-	if _, err := Fork(ctx, c, src, dest, nil); err != nil {
-		t.Fatal(err)
-	}
-	var child v1alpha1.BlipState
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: dest.Spec.Mounts[0].State}, &child); err != nil {
-		t.Fatal(err)
-	}
-	if child.Labels[v1alpha1.LabelGitRepo] != "demo" || child.Labels[v1alpha1.LabelOwner] != "chat-abc" {
-		t.Fatalf("child labels = %v, want the owner and git repo labels", child.Labels)
-	}
-	if child.Annotations[v1alpha1.AnnotationGitSource] != "gitcache-demo-1" {
-		t.Fatalf("child annotations = %v, want the cache source", child.Annotations)
-	}
-}

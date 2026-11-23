@@ -15,6 +15,12 @@
 # baseSelector finds the state a new chat copies: the newest Ready state with
 # this label. Replacing the image new chats start from only needs a state with
 # the label; the profile and blipchat stay as they are.
+#
+# A profile may also declare "mounts". Each entry copies the newest matching
+# shared git cache into a private writable state for the chat and mounts it at
+# "path". The coding profile below mounts the Blip repository at /src/blip. A
+# selector that matches no state fails chat creation, so the cluster needs a
+# gitcache-blip-* state with the labels in that selector before using it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -49,6 +55,45 @@ data:
           "chat.blip.dev/base": "opencode"
         }
       }
+    }
+
+  coding: |
+    {
+      "pool": "opencode",
+      "command": [
+        "/usr/local/bin/opencode",
+        "acp"
+      ],
+      "env": {
+        "HOME": "/home/dev",
+        "XDG_CONFIG_HOME": "/home/dev/.config",
+        "XDG_DATA_HOME": "/home/dev/.local/share",
+        "XDG_CACHE_HOME": "/home/dev/.cache",
+        "OPENCODE_DISABLE_AUTOUPDATE": "1",
+        "OPENCODE_DISABLE_MODELS_FETCH": "1",
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        "OPENCODE_DISABLE_FILEWATCHER": "1",
+        "OPENCODE_CONFIG_CONTENT": "{\"providers\":{\"unbounded\":{\"name\":\"Unbounded DeepSeek\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{\"baseURL\":\"http://unbounded/dsv41/v1\",\"apiKey\":\"local-e2e\"},\"models\":{\"deepseek-v4.1-flash\":{\"name\":\"DeepSeek V4.1 Flash\"}}}},\"model\":\"unbounded/deepseek-v4.1-flash\",\"agents\":{\"title\":{\"model\":\"unbounded/deepseek-v4.1-flash#low\"}}}"
+      },
+      "idleTimeoutSeconds": 3600,
+      "title": "OpenCode coding",
+      "description": "Edits code in a mounted copy of the Blip repository",
+      "baseSelector": {
+        "matchLabels": {
+          "chat.blip.dev/base": "opencode"
+        }
+      },
+      "mounts": [
+        {
+          "path": "/src/blip",
+          "selector": {
+            "matchLabels": {
+              "blip.dev/shared": "true",
+              "git.blip.dev/repo": "blip"
+            }
+          }
+        }
+      ]
     }
 
   default: |

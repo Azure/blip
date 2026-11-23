@@ -717,6 +717,30 @@ func (s *Server) createChat(ctx context.Context, req chatRequest) (*v1.BlipState
 	if len(profile.Command) == 0 {
 		return nil, badRequest("profile %s has no command", profileName)
 	}
+	// Resolve every declared mount before creating anything, so a missing
+	// source fails the request cleanly instead of leaving a half-built chat.
+	// A fork already inherits its parent's mounts at the same paths, so those
+	// profile mounts need no source and are left to the fork.
+	fork := req.Parent != nil && profile.Workspace == WorkspaceFork
+	mountProfile := profile
+	if fork {
+		inherited := map[string]bool{}
+		for _, m := range req.Parent.Spec.Mounts {
+			if m.BlipUID == "" {
+				inherited[m.Path] = true
+			}
+		}
+		mountProfile.Mounts = nil
+		for _, m := range profile.Mounts {
+			if !inherited[m.Path] {
+				mountProfile.Mounts = append(mountProfile.Mounts, m)
+			}
+		}
+	}
+	mounts, err := s.resolveProfileMounts(ctx, profileName, mountProfile)
+	if err != nil {
+		return nil, err
+	}
 
 	// Admission policy authorizes a chat from its tree annotations, so they
 	// come from the reviewed parent state, never from tool arguments. A child
@@ -789,7 +813,6 @@ func (s *Server) createChat(ctx context.Context, req chatRequest) (*v1.BlipState
 			UID:        req.Parent.UID,
 		}
 	}
-	fork := req.Parent != nil && profile.Workspace == WorkspaceFork
 	base := ""
 	var runtime *v1.RuntimeDefaults
 	if !fork {
@@ -849,6 +872,16 @@ func (s *Server) createChat(ctx context.Context, req chatRequest) (*v1.BlipState
 	}
 	if created == nil {
 		return nil, httpError{code: http.StatusInternalServerError, message: "could not allocate a session name"}
+	}
+	if err := s.attachProfileMounts(ctx, created, mounts); err != nil {
+		// The chat cannot provide the workspace its profile promises, and its
+		// mount copies are owned by it, so remove it before returning.
+		deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		if delErr := s.cluster.DeleteSession(deleteCtx, s.namespace, created.Name, created.UID); delErr != nil && !apierrors.IsNotFound(delErr) {
+			err = errors.Join(err, delErr)
+		}
+		cancel()
+		return nil, err
 	}
 	// A fork or a copy inherits the source's trajectory. Record where that
 	// history ends, before the chat can accept a message, so the engine never

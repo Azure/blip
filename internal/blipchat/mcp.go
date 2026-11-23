@@ -165,7 +165,7 @@ func mcpTools() []map[string]any {
 	}
 	id := text("The child chat name returned by spawn_agent or list_agents.")
 	return []map[string]any{
-		tool("list_profiles", "List the available agent profiles, with their descriptions and workspace mode.", map[string]any{}),
+		tool("list_profiles", "List the available agent profiles, with their descriptions, workspace mode, and mounted paths.", map[string]any{}),
 		tool("spawn_agent", "Start a child chat and send it a prompt. It runs in its own blip workspace. Returns the child's chat name; use get_agent to read its answer.", map[string]any{
 			"profile": text("One of the profiles list_profiles returns."),
 			"prompt":  text("The task for the child agent."),
@@ -185,10 +185,6 @@ func mcpTools() []map[string]any {
 			"question": text("The question for the user."),
 			"options":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional short choices the user can click."},
 		}, "question"),
-		tool("claim_repo", "Clone a pre-warmed shared git cache into a writable private workspace copy mounted at an absolute path. Returns the path and the command to catch up with origin. Calling it twice for the same repo is safe.", map[string]any{
-			"repo": text("Repository name; the error lists the available ones."),
-			"path": text("Optional absolute mount path, default /src/<repo>."),
-		}, "repo"),
 	}
 }
 
@@ -208,8 +204,6 @@ func (s *Server) callTool(ctx context.Context, caller *Caller, req mcpRequest) m
 		WaitSeconds int      `json:"waitSeconds"`
 		Question    string   `json:"question"`
 		Options     []string `json:"options"`
-		Repo        string   `json:"repo"`
-		Path        string   `json:"path"`
 	}
 	if len(params.Arguments) > 0 {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -235,8 +229,6 @@ func (s *Server) callTool(ctx context.Context, caller *Caller, req mcpRequest) m
 		text, err = s.toolStopAgent(ctx, caller, args.ID)
 	case "ask_user":
 		text, err = s.toolAskUser(ctx, caller, args.Question, args.Options)
-	case "claim_repo":
-		text, err = s.toolClaimRepo(ctx, caller, args.Repo, args.Path)
 	default:
 		return mcpFailure(req.ID, -32602, "unknown tool: "+params.Name)
 	}
@@ -271,10 +263,11 @@ func jsonText(v any) string {
 // decide which of them this chat is allowed to spawn.
 func (s *Server) toolListProfiles() (string, error) {
 	type info struct {
-		Name        string `json:"name"`
-		Title       string `json:"title"`
-		Description string `json:"description,omitempty"`
-		Workspace   string `json:"workspace"`
+		Name        string   `json:"name"`
+		Title       string   `json:"title"`
+		Description string   `json:"description,omitempty"`
+		Workspace   string   `json:"workspace"`
+		Mounts      []string `json:"mounts,omitempty"`
 	}
 	names := make([]string, 0, len(s.profiles))
 	for name := range s.profiles {
@@ -284,7 +277,7 @@ func (s *Server) toolListProfiles() (string, error) {
 	out := make([]info, 0, len(names))
 	for _, name := range names {
 		p := s.profiles[name]
-		out = append(out, info{Name: name, Title: p.Title, Description: p.Description, Workspace: p.Workspace})
+		out = append(out, info{Name: name, Title: p.Title, Description: p.Description, Workspace: p.Workspace, Mounts: p.mountPaths()})
 	}
 	return jsonText(map[string]any{"profiles": out}), nil
 }

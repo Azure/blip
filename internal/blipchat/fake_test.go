@@ -125,6 +125,9 @@ func (f *fakeCluster) CreateSession(_ context.Context, ns string, s *v1.BlipStat
 	}
 	c := copyState(s)
 	c.Namespace = ns
+	if c.UID == "" {
+		c.UID = types.UID(c.Name + "-uid")
+	}
 	if c.Status.Phase == "" {
 		c.Status.Phase = v1.StateReady
 	}
@@ -203,32 +206,42 @@ func (f *fakeCluster) PatchSession(_ context.Context, ns, name string, labels, a
 	return nil
 }
 
-func (f *fakeCluster) UpdateStateMounts(_ context.Context, ns, name string, add v1.Mount) ([]v1.Mount, error) {
+func (f *fakeCluster) UpdateStateMounts(_ context.Context, ns, name string, add ...v1.Mount) ([]v1.Mount, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s, ok := f.states[key(ns, name)]
 	if !ok {
 		return nil, apierrors.NewNotFound(schema.GroupResource{Group: "blip.dev", Resource: "blipstates"}, name)
 	}
-	for _, m := range s.Spec.Mounts {
-		if m.Path != add.Path {
-			continue
+	var added []v1.Mount
+	for _, want := range add {
+		found := false
+		for _, m := range s.Spec.Mounts {
+			if m.Path != want.Path {
+				continue
+			}
+			if m.State != want.State {
+				return nil, fmt.Errorf("path %q is already mounted from %q", want.Path, m.State)
+			}
+			found = true
+			break
 		}
-		if m.State != add.State {
-			return nil, fmt.Errorf("path %q is already mounted from %q", add.Path, m.State)
+		if !found {
+			s.Spec.Mounts = append(s.Spec.Mounts, want)
+			added = append(added, want)
 		}
-		return append([]v1.Mount(nil), s.Spec.Mounts...), nil
 	}
-	s.Spec.Mounts = append(s.Spec.Mounts, add)
 	// The controller copies a root mount into the running blip's status. The
 	// fake does the same so a test does not have to wait for a reconcile.
-	for _, b := range f.blips {
-		if b.Namespace != ns || b.Spec.State != name {
-			continue
+	for _, want := range added {
+		for _, b := range f.blips {
+			if b.Namespace != ns || b.Spec.State != name {
+				continue
+			}
+			b.Status.Mounts = append(b.Status.Mounts, v1.MountStatus{
+				State: want.State, Path: want.Path, Writable: want.Writable, Phase: v1.MountMounted,
+			})
 		}
-		b.Status.Mounts = append(b.Status.Mounts, v1.MountStatus{
-			State: add.State, Path: add.Path, Writable: add.Writable, Phase: v1.MountMounted,
-		})
 	}
 	return append([]v1.Mount(nil), s.Spec.Mounts...), nil
 }

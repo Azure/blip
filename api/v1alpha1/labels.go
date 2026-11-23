@@ -69,8 +69,6 @@ const (
 	LabelGitRepo        = "git.blip.dev/repo"
 	AnnotationGitURL    = "git.blip.dev/url"
 	AnnotationGitBranch = "git.blip.dev/branch"
-	// AnnotationGitSource records the cache state a claim was copied from.
-	AnnotationGitSource = "git.blip.dev/source"
 )
 
 // parentLabelHash is the reserved prefix of a hashed ParentLabel. An

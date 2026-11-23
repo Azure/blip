@@ -54,7 +54,7 @@ is a legal DNS label.
 | `git.blip.dev/branch` annotation | branch checked out in the cache |
 
 Publish only a state that is Ready, has a committed version, and has no
-writer. `claim_repo` selects the newest Ready generation by
+writer. A blipchat profile mount selects the newest Ready generation by
 `status.committed.time`, so the labels go on after the warm blip finishes and
 the state saves. A published generation is never written again, which keeps a
 consumer from copying a half-finished fetch and keeps the controller from
@@ -312,9 +312,8 @@ blip mount --new alice.repo:/src/blip:rw --from gitcache-blip-20261123t0300
 The copy is writable, saves with alice's workspace, replicates like any other
 state, and is deleted with its owner. Inside the blip, run
 `git -C /src/blip fetch --prune origin` to pick up commits newer than the
-cache. A forked workspace copies the writable mount into the fork and keeps the
-`git.blip.dev/repo` label and the `git.blip.dev/source` annotation. The fork
-keeps using the repository without claiming it again.
+cache. A forked workspace copies the writable mount into the fork, so the fork
+keeps using the repository without a new claim.
 
 `blip gather --collect git:` still works on the claim:
 
@@ -328,57 +327,57 @@ reason the cache must hold a self-contained clone.
 
 ## Repositories in blipchat
 
-blipchat exposes `claim_repo` as an MCP tool. A call names a repository and an
-optional path:
-
-```json
-{"repo": "blip", "path": "/src/blip"}
-```
-
-The path defaults to `/src/<repo>`. The tool returns the claim as JSON:
+A blipchat agent profile may mount shared git caches. Each mount names a
+destination path and a label selector, and blipchat resolves it when it creates
+the chat. The profile in the `blip-chat-profiles` ConfigMap carries the mounts
+next to the command:
 
 ```json
 {
-  "repo": "blip",
-  "path": "/src/blip",
-  "state": "chat-7f3a-r-blip",
-  "url": "https://github.com/Azure/blip.git",
-  "branch": "main",
-  "cachedAt": "2026-11-23T03:00:12Z",
-  "mounted": true,
-  "next": "git -C /src/blip fetch --prune origin; git -C /src/blip merge --ff-only origin/main"
+  "command": ["npx", "-y", "@zed-industries/claude-code-acp"],
+  "description": "Works on the Blip repository",
+  "mounts": [
+    {
+      "path": "/src/blip",
+      "selector": {
+        "matchLabels": {
+          "blip.dev/shared": "true",
+          "git.blip.dev/repo": "blip"
+        }
+      }
+    }
+  ]
 }
 ```
 
-`cachedAt` is the commit time of the generation the claim was copied from, so a
-reused claim reports its own snapshot and not a newer generation. `next` is the
-catch-up command; a cache without a branch annotation returns only the
-`fetch --prune` half. When the copy is ready but has not attached to the running
-blip yet, `mounted` is `false` and a `note` says so. The mount is already
-desired intent on the chat root and attaches when the controller next
-reconciles.
+`mounts` is optional. Each entry needs a `path` and a non-empty `selector`.
+`path` must be absolute, clean, not `/`, not under a reserved guest path
+(`/proc`, `/sys`, `/dev`, `/run/blip`, or `/run/blip-collect`), and unique
+within the profile. The selector is an ordinary Kubernetes label selector, and
+chat states are excluded from the match automatically.
 
-The tool picks the newest Ready cache for the repository. A cache that is still
-copying or has failed is ignored, so a newer complete generation wins. It then
-creates a claim state named `<session>-r-<repo>`, or a hashed name when that
-would exceed 63 characters, copies the cache into it, and mounts it writable on
-the chat's root state. The tool waits up to a minute for the mount to attach and
-reports the result. Repeated calls are idempotent: an existing mount at the
-requested path is reused if it holds the same repository, otherwise any mount
-of that repository is reused. A path already mounted from another repository
-is an error.
+blipchat picks the newest matching state once, when the chat is created. A
+candidate must be Ready, have `status.committed` set, and not be terminating.
+The newest commit time wins, with the state name breaking a tie. A generation
+published later does not change an existing chat: the mounted content is a
+snapshot for the life of the chat. Run
+`git -C /src/blip fetch --prune origin` to catch up with the remote, then reset
+or merge the branch as needed.
 
-A claim carries `chat.blip.dev/session: "true"`, `blip.dev/owner`, and
-`git.blip.dev/repo`, plus an owner reference to the chat state. It is an owned
-state, not a shared one. It has none of the chat annotations
-(`chat.blip.dev/profile`, `chat.blip.dev/parent`, `chat.blip.dev/root`,
-`chat.blip.dev/title`), so blipchat does not list it as a chat. Deleting the
-chat deletes its claims.
+The chosen generation is copied into a private writable state named
+`<chat>-m-<hash of path>`, labelled `chat.blip.dev/session=true` and
+`blip.dev/owner=<tree root>`, and owned by the chat state. Deleting the chat
+deletes the copy. The copy is mounted read-write at `path`. Blip copies rather
+than mounting the generation directly because shared caches are read-only to
+their owners, while a chat writes to its working tree.
 
-A child chat started with the fork workspace mode inherits the parent's claims:
-the fork copies each writable mount, including the repository claim. The child
-can use the repository without calling `claim_repo`, and a call there reuses
-the inherited mount.
+If no state matches a mount selector, chat creation fails with HTTP 409, the
+same response as a missing base state, and no chat is left behind.
+
+A child chat started with the fork workspace mode inherits its parent's mounts.
+A profile mount at a path the fork already has is skipped, and a mount at a
+path the fork lacks is added. `list_profiles` reports the `mounts` paths of each
+profile, so an agent can see the repository paths a child will start with.
 
 ## Verify a cache
 
@@ -403,6 +402,5 @@ kubectl -n dev get blipstate gitcache-blip-20261123t0300 \
   -o jsonpath='{.status.committed.time}{"\n"}'
 ```
 
-That timestamp is the same value `claim_repo` returns as `cachedAt` for a claim
-copied from this generation, and it is what the newest-generation selection
-compares.
+That timestamp is the commit time a blipchat profile mount compares when it
+selects the newest generation for a chat.

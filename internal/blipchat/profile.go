@@ -63,6 +63,30 @@ type Profile struct {
 	// Workspace is "base" (the default) or "fork". A forked chat starts with
 	// a copy of its parent's workspace.
 	Workspace string `json:"workspace,omitempty"`
+	// Mounts attaches states selected when the chat is created. Each mount is
+	// a private writable copy, so one chat cannot change what another sees.
+	Mounts []ProfileMount `json:"mounts,omitempty"`
+}
+
+// ProfileMount selects a state and mounts a copy of it at Path for the life of
+// the chat.
+type ProfileMount struct {
+	Path     string               `json:"path"`
+	Selector metav1.LabelSelector `json:"selector"`
+}
+
+// selector returns the selector that finds the mount's source. Chat states are
+// excluded so a broad selector never mounts another conversation's workspace.
+func (m ProfileMount) selector() (labels.Selector, error) {
+	sel, err := metav1.LabelSelectorAsSelector(&m.Selector)
+	if err != nil {
+		return nil, err
+	}
+	notChat, err := labels.NewRequirement(LabelSession, selection.DoesNotExist, nil)
+	if err != nil {
+		return nil, err
+	}
+	return sel.Add(*notChat), nil
 }
 
 // validProfileName reports whether name is a usable profile name. Admission
@@ -173,6 +197,7 @@ func (p *Profile) UnmarshalJSON(data []byte) error {
 		Description        string                `json:"description"`
 		MessageTemplate    string                `json:"messageTemplate"`
 		Workspace          string                `json:"workspace"`
+		Mounts             []ProfileMount        `json:"mounts"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -185,6 +210,7 @@ func (p *Profile) UnmarshalJSON(data []byte) error {
 	p.Description = raw.Description
 	p.MessageTemplate = raw.MessageTemplate
 	p.Workspace = raw.Workspace
+	p.Mounts = raw.Mounts
 	p.Env = nil
 	if len(raw.Env) != 0 && string(raw.Env) != "null" {
 		env, err := parseEnv(raw.Env)
@@ -248,6 +274,22 @@ func (p Profile) validate() error {
 	case WorkspaceBase, WorkspaceFork:
 	default:
 		return fmt.Errorf("workspace must be %q or %q, got %q", WorkspaceBase, WorkspaceFork, p.Workspace)
+	}
+	seen := map[string]bool{}
+	for _, m := range p.Mounts {
+		if err := validateMountPath(m.Path); err != nil {
+			return err
+		}
+		if seen[m.Path] {
+			return fmt.Errorf("mount path %q is used more than once", m.Path)
+		}
+		seen[m.Path] = true
+		if len(m.Selector.MatchLabels)+len(m.Selector.MatchExpressions) == 0 {
+			return fmt.Errorf("mount %q needs a selector", m.Path)
+		}
+		if _, err := m.selector(); err != nil {
+			return fmt.Errorf("mount %q: %w", m.Path, err)
+		}
 	}
 	if p.MessageTemplate == "" {
 		return nil

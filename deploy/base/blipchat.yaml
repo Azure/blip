@@ -41,6 +41,27 @@
 # --default-pool. Profile names may contain letters, digits, ".", "-", and "_",
 # but not spaces or "*".
 #
+# A profile may also mount shared git caches with "mounts". Each entry has an
+# absolute "path" and a label "selector". blipchat picks the newest Ready,
+# committed state that matches the selector, copies it into a private writable
+# state owned by the chat, and mounts the copy read-write at "path". For
+# example:
+#
+#   "mounts": [
+#     {
+#       "path": "/src/blip",
+#       "selector": {
+#         "matchLabels": {
+#           "blip.dev/shared": "true",
+#           "git.blip.dev/repo": "blip"
+#         }
+#       }
+#     }
+#   ]
+#
+# A selector that matches no state fails chat creation with HTTP 409. A fork
+# workspace inherits its parent's mounts and skips paths it already has.
+#
 # Spawning is not configured per profile. The cluster-wide blip-chat-policy
 # ConfigMap in blip-system holds space-separated profile lists and limits:
 #
