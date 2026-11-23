@@ -2308,7 +2308,13 @@ async function send() {
     const ambiguous = !err.status || err.status >= 500;
     toast(ambiguous ? err.message + " Delivery could not be confirmed." : err.message);
   }
-  if (state.current === name && !$("text").disabled) $("text").focus();
+  // Only take focus back if the user is still in the composer. A slow POST
+  // must not pull focus out of the transcript or another control (which would
+  // reopen the mobile keyboard) while the user reads or navigates.
+  const active = document.activeElement;
+  const inComposer = !active || active === document.body || active === document.documentElement ||
+    $("composer").contains(active);
+  if (state.current === name && !$("text").disabled && inComposer) $("text").focus();
 }
 
 function openSidebar() {
