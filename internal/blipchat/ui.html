@@ -1465,6 +1465,10 @@ function setDeepLink(name, replace) {
 }
 
 async function openSession(name, fromHistory, retrying) {
+  // Remember the tab's scope before any adoptScope for the target chat: a
+  // failed open must leave the tab where the user was, not in the target's
+  // scope (see the catch below).
+  const scopeBefore = state.scope;
   saveDraft();
   if (state.current) {
     state.scrollPositions[state.current] = { top: transcript.scrollTop, atBottom: state.atBottom };
@@ -1578,6 +1582,15 @@ async function openSession(name, fromHistory, retrying) {
     setStatus("no chat", false, "");
     markActive();
     const transient = !err.status || err.status >= 500;
+    // The loading chrome above adopted the target chat's scope. A definitive
+    // failure means that chat will not open, so put the tab, list, and badge
+    // back in the scope the user was in; otherwise a failed cross-scope deep
+    // link would switch and persist a scope the user never chose. A transient
+    // failure is retried and keeps the target scope.
+    if (!transient) {
+      adoptScope(scopeBefore);
+      reflowSessions();
+    }
     // A definite failure (404/403 for a deleted or foreign chat, 400 for a bad
     // name) must not consume the history entry the click pushed. Rewind to the
     // entry the user came from; its popstate handler restores that view, so
