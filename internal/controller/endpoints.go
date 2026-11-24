@@ -69,6 +69,9 @@ func validateEndpoint(pool *v1.BlipPool, e *v1.PoolEndpoint, clusterAudiences []
 			return errors.New("audience must not be a Kubernetes API server audience; the endpoint token would authenticate to the API server")
 		}
 	}
+	if e.PodBound && e.Audience == "" {
+		return errors.New("podBound requires an audience")
+	}
 	if e.CAConfigMap != "" {
 		if errs := validation.IsDNS1123Subdomain(e.CAConfigMap); len(errs) > 0 {
 			return fmt.Errorf("caConfigMap %q must be a DNS subdomain", e.CAConfigMap)

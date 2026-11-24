@@ -47,20 +47,33 @@ const (
 )
 
 // credUpstream is one endpoint the sidecar authenticates to and the audience
-// of its token. An empty audience means the API server's default.
+// of its token. An empty audience means the API server's default. podBound
+// binds the token to the pod, for endpoints that verify the pod claim.
 type credUpstream struct {
 	name     string
 	audience string
+	podBound bool
 }
 
-// podCreds is the token set minted for one pod. sa, podUID, and audiences
-// identify the request a cached set answers; any change invalidates it.
+// credKey identifies one token request. Upstreams that share a key share a
+// token.
+type credKey struct {
+	audience string
+	podBound bool
+}
+
+func (u credUpstream) key() credKey {
+	return credKey{audience: u.audience, podBound: u.podBound}
+}
+
+// podCreds is the token set minted for one pod. sa, podUID, and keys identify
+// the request a cached set answers; any change invalidates it.
 type podCreds struct {
-	sa        string
-	podUID    string
-	audiences []string
-	tokens    map[string]string // audience -> token
-	expires   time.Time
+	sa      string
+	podUID  string
+	keys    []credKey
+	tokens  map[credKey]string
+	expires time.Time
 }
 
 func (a *Agent) clock() time.Time {
@@ -135,16 +148,16 @@ func (a *Agent) ensurePodCreds(ctx context.Context, v *view, key string, pod *co
 	if sa == "" || sa == noIdentity {
 		return writePlaceholders(dir, upstreams)
 	}
-	audiences := credsAudiences(upstreams)
+	keys := credsKeys(upstreams)
 	now := a.clock()
 	a.mu.Lock()
 	cached := a.creds[key]
 	a.mu.Unlock()
 	if cached != nil && cached.sa == sa && cached.podUID == string(pod.UID) &&
-		slices.Equal(cached.audiences, audiences) && cached.expires.Sub(now) > credsRefreshWindow {
+		slices.Equal(cached.keys, keys) && cached.expires.Sub(now) > credsRefreshWindow {
 		return writeTokens(dir, upstreams, cached.tokens)
 	}
-	tokens, expires, err := a.mintCreds(ctx, pod, sa, audiences)
+	tokens, expires, err := a.mintCreds(ctx, pod, sa, keys)
 	if err != nil {
 		return err
 	}
@@ -152,7 +165,7 @@ func (a *Agent) ensurePodCreds(ctx context.Context, v *view, key string, pod *co
 	if a.creds == nil {
 		a.creds = map[string]*podCreds{}
 	}
-	a.creds[key] = &podCreds{sa: sa, podUID: string(pod.UID), audiences: audiences, tokens: tokens, expires: expires}
+	a.creds[key] = &podCreds{sa: sa, podUID: string(pod.UID), keys: keys, tokens: tokens, expires: expires}
 	a.mu.Unlock()
 	return writeTokens(dir, upstreams, tokens)
 }
@@ -184,55 +197,78 @@ func credsUpstreams(pool *v1alpha1.BlipPool) []credUpstream {
 		if e.Audience == "" {
 			continue
 		}
-		ups = append(ups, credUpstream{name: e.Name, audience: e.Audience})
+		ups = append(ups, credUpstream{name: e.Name, audience: e.Audience, podBound: e.PodBound})
 	}
 	return ups
 }
 
-// credsAudiences returns the distinct audiences to request, in a stable order
-// so a cached set can be compared with the current requirement.
-func credsAudiences(upstreams []credUpstream) []string {
-	set := map[string]bool{}
+// credsKeys returns the distinct token requests, in a stable order so a
+// cached set can be compared with the current requirement.
+func credsKeys(upstreams []credUpstream) []credKey {
+	set := map[credKey]bool{}
 	for _, u := range upstreams {
-		set[u.audience] = true
+		set[u.key()] = true
 	}
-	audiences := make([]string, 0, len(set))
-	for aud := range set {
-		audiences = append(audiences, aud)
+	keys := make([]credKey, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
 	}
-	slices.Sort(audiences)
-	return audiences
+	slices.SortFunc(keys, func(a, b credKey) int {
+		if c := strings.Compare(a.audience, b.audience); c != 0 {
+			return c
+		}
+		switch {
+		case a.podBound == b.podBound:
+			return 0
+		case !a.podBound:
+			return -1
+		default:
+			return 1
+		}
+	})
+	return keys
 }
 
-// mintCreds requests one bound token per audience. Several upstreams that
-// share an audience share the token.
-func (a *Agent) mintCreds(ctx context.Context, pod *corev1.Pod, sa string, audiences []string) (map[string]string, time.Time, error) {
+// mintCreds requests one token per distinct key. Several upstreams that share
+// a key share the token.
+//
+// A pod-bound token is issued to the pod's own service account and bound to
+// the pod, because Kubernetes rejects a bound token for any other account.
+// Every other token is unbound and issued to the Blip's service account.
+func (a *Agent) mintCreds(ctx context.Context, pod *corev1.Pod, sa string, keys []credKey) (map[credKey]string, time.Time, error) {
 	seconds := credsExpirationSeconds
-	tokens := make(map[string]string, len(audiences))
+	tokens := make(map[credKey]string, len(keys))
 	var expires time.Time
-	for _, aud := range audiences {
+	for _, k := range keys {
+		account := sa
 		req := &authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{
 			ExpirationSeconds: &seconds,
-			BoundObjectRef: &authenticationv1.BoundObjectReference{
+		}}
+		if k.podBound {
+			account = pod.Spec.ServiceAccountName
+			if account == "" {
+				account = "default"
+			}
+			req.Spec.BoundObjectRef = &authenticationv1.BoundObjectReference{
 				Kind:       "Pod",
 				APIVersion: "v1",
 				Name:       pod.Name,
 				UID:        pod.UID,
-			},
-		}}
-		if aud != "" {
-			req.Spec.Audiences = []string{aud}
+			}
 		}
-		tr, err := a.kube.CoreV1().ServiceAccounts(pod.Namespace).CreateToken(ctx, sa, req, metav1.CreateOptions{})
+		if k.audience != "" {
+			req.Spec.Audiences = []string{k.audience}
+		}
+		tr, err := a.kube.CoreV1().ServiceAccounts(pod.Namespace).CreateToken(ctx, account, req, metav1.CreateOptions{})
 		if err != nil {
 			// A pod deleted while its token is minted fails here. The error is
 			// reported on the pod, not fatal to the agent.
-			return nil, time.Time{}, fmt.Errorf("token for %s: %w", sa, err)
+			return nil, time.Time{}, fmt.Errorf("token for %s: %w", account, err)
 		}
 		if tr.Status.Token == "" {
-			return nil, time.Time{}, fmt.Errorf("token for %s: empty token", sa)
+			return nil, time.Time{}, fmt.Errorf("token for %s: empty token", account)
 		}
-		tokens[aud] = tr.Status.Token
+		tokens[k] = tr.Status.Token
 		if t := tr.Status.ExpirationTimestamp; !t.IsZero() && (expires.IsZero() || t.Time.Before(expires)) {
 			expires = t.Time
 		}
@@ -276,9 +312,9 @@ func writePlaceholders(dir string, upstreams []credUpstream) error {
 }
 
 // writeTokens writes one file per upstream from a minted token set.
-func writeTokens(dir string, upstreams []credUpstream, tokens map[string]string) error {
+func writeTokens(dir string, upstreams []credUpstream, tokens map[credKey]string) error {
 	for _, u := range upstreams {
-		token, ok := tokens[u.audience]
+		token, ok := tokens[u.key()]
 		if !ok {
 			return fmt.Errorf("no token for audience %q", u.audience)
 		}

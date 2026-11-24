@@ -136,12 +136,18 @@ expect_ok_grep "top-level blip lists blips" "$P-top" \
 step "watch the API through the Envoy sidecar"
 # The guest kubeconfig has no credential. The runtime redirects the TAP
 # gateway to the pod-local Envoy sidecar on loopback 15080, which adds the
-# Blip's pod-bound service-account token. A watch is a long-lived chunked
-# response, so this also checks that the sidecar streams rather than buffers.
-expect_ok_grep "in-guest API watch" "watch-ok" blip_exec "$P-top" '
+# Blip's service-account token. A watch is a long-lived chunked response, so
+# this also checks that the sidecar streams rather than buffers: the annotate
+# below must arrive over the same watch connection.
+expect_ok_grep "in-guest API watch" "watch-ok" blip_exec "$P-top" "WATCH_BLIP=$P-top
+"'
 	set -eu
-	kubectl get --raw "/api/v1/namespaces/default/pods?watch=true&resourceVersion=0&timeoutSeconds=1" |
-		grep -q "\"type\":\"ADDED\""
+	kubectl get --raw "/apis/blip.dev/v1alpha1/namespaces/default/blips?watch=true&timeoutSeconds=10" > /tmp/watch.out &
+	watch_pid=$!
+	sleep 3
+	kubectl annotate blip "$WATCH_BLIP" e2e.blip.dev/watch=1 --overwrite >/dev/null
+	wait $watch_pid
+	grep -m1 "\"type\":\"MODIFIED\"" /tmp/watch.out
 	echo watch-ok
 '
 
@@ -181,6 +187,7 @@ expect_ok_grep "in-guest exec stream" "exec-ok" blip_exec "$P-top" "
 		fi
 		sleep 1
 	done
+	echo exec-ok
 "
 
 step "delete the child and its parent"

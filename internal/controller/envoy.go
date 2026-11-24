@@ -182,16 +182,17 @@ func writeEnvoyConnectionManager(b *strings.Builder, upstreams []envoyUpstream) 
 		b.WriteString("              routes:\n")
 		b.WriteString("              - match:\n")
 		b.WriteString("                  prefix: /\n")
+		if !u.auth {
+			// Nothing is injected, and a guest-supplied identity must not
+			// reach an unauthenticated upstream. This is a Route field, not
+			// part of the RouteAction below.
+			b.WriteString("                request_headers_to_remove:\n")
+			b.WriteString("                - authorization\n")
+		}
 		b.WriteString("                route:\n")
 		fmt.Fprintf(b, "                  cluster: %s\n", name)
 		b.WriteString("                  timeout: 0s\n")
 		fmt.Fprintf(b, "                  host_rewrite_literal: %s\n", yamlQuote(u.host))
-		if !u.auth {
-			// Nothing is injected, and a guest-supplied identity must not
-			// reach an unauthenticated upstream.
-			b.WriteString("                  request_headers_to_remove:\n")
-			b.WriteString("                  - authorization\n")
-		}
 		b.WriteString("                  upgrade_configs:\n")
 		b.WriteString("                  - upgrade_type: websocket\n")
 		b.WriteString("                  - upgrade_type: spdy/3.1\n")

@@ -23,7 +23,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1296,7 +1295,6 @@ func envoyContainer(image, bootstrap string) corev1.Container {
 		Image:         image,
 		RestartPolicy: &restart,
 		Args: []string{
-			"-c", "/dev/null",
 			"--config-yaml", bootstrap,
 			"--concurrency", "1",
 			"--disable-hot-restart",
@@ -1323,15 +1321,9 @@ func envoyContainer(image, bootstrap string) corev1.Container {
 			{Name: credsVolume, MountPath: credsMountPath, ReadOnly: true},
 			{Name: kubeCAVolume, MountPath: kubeCAMountPath, ReadOnly: true},
 		},
-		// A warm pod is only claimable once the sidecar listens, so the guest
-		// never gets a connection refused during its first API call.
-		ReadinessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{
-				Host: "127.0.0.1",
-				Port: intstr.FromInt32(int32(podapi.ProxyPort)),
-			}},
-			PeriodSeconds: 2,
-		},
+		// No readiness probe: kubelet dials the pod IP, but the listener is
+		// deliberately loopback-only. The sidecar starts before the runtime
+		// container, and a warm pod waits far longer than Envoy takes to bind.
 	}
 }
 

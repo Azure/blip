@@ -265,10 +265,55 @@ func TestEnsureCredsWritesPerUpstreamFiles(t *testing.T) {
 		if r.expiration != credsExpirationSeconds {
 			t.Errorf("%s expiration = %d, want %d", aud, r.expiration, credsExpirationSeconds)
 		}
-		if r.bound == nil || r.bound.Kind != "Pod" || r.bound.APIVersion != "v1" ||
-			r.bound.Name != "p" || r.bound.UID != pod.UID {
-			t.Errorf("%s bound object = %+v", aud, r.bound)
+		if r.bound != nil {
+			t.Errorf("%s token is bound to %+v, want an unbound token", aud, r.bound)
 		}
+	}
+}
+
+// TestEnsureCredsPodBoundEndpoint checks that a podBound endpoint gets a token
+// issued to the pod's own service account and bound to the pod, while every
+// other upstream keeps an unbound token for the Blip's account.
+func TestEnsureCredsPodBoundEndpoint(t *testing.T) {
+	m := &tokenMinter{expiry: testNow.Add(time.Hour)}
+	a := newCredsAgent(t, m.client(), func() time.Time { return testNow })
+	pod := vmPod("p", "blipuid-b")
+	pod.Spec.ServiceAccountName = "vm"
+	pool := testPool()
+	pool.Spec.Endpoints = append(pool.Spec.Endpoints,
+		v1alpha1.PoolEndpoint{Name: "chat", URL: "https://chat.example.com", Audience: "blipchat", PodBound: true})
+	v := credsView(pool, pod)
+
+	a.ensureCreds(context.Background(), v)
+	dir := filepath.Join(a.podDirFor(pkey("p")), podapi.CredsDir)
+	doc := readCred(t, filepath.Join(dir, "chat.yaml"))
+	if got, want := doc.Resources[0].GenericSecret.Secret.InlineString, bearerPrefix+m.token(ns, "vm", "blipchat"); got != want {
+		t.Errorf("pod-bound token = %q, want %q", got, want)
+	}
+
+	var podBound, unbound int
+	for _, r := range m.snapshot() {
+		aud := audience(r.audiences)
+		if aud == "blipchat" {
+			podBound++
+			if r.sa != "vm" {
+				t.Errorf("pod-bound token service account = %q, want vm", r.sa)
+			}
+			if r.bound == nil || r.bound.Kind != "Pod" || r.bound.Name != pod.Name || r.bound.UID != pod.UID {
+				t.Errorf("pod-bound token bound object = %+v", r.bound)
+			}
+			continue
+		}
+		unbound++
+		if r.sa != "pool-sa" {
+			t.Errorf("%q token service account = %q, want pool-sa", aud, r.sa)
+		}
+		if r.bound != nil {
+			t.Errorf("%q token is bound to %+v", aud, r.bound)
+		}
+	}
+	if podBound != 1 || unbound != 2 {
+		t.Errorf("requests: %d pod-bound, %d unbound; want 1 and 2", podBound, unbound)
 	}
 }
 

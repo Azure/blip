@@ -125,11 +125,18 @@ this permission to VM service accounts.
 
 A Blip's guest reaches the Kubernetes API as the Blip's service account:
 `spec.serviceAccountName` when set, otherwise its pool's. The node agent mints
-a short-lived, pod-bound token for that account. The pod's Envoy sidecar,
-bound to loopback port 15080, adds the token to guest requests; the guest
-kubeconfig itself holds no credential. The runtime redirects the guest's TAP
-gateway to that loopback port, so `kube-apiserver` resolves through the
-sidecar, which also proxies the pool's fixed HTTPS endpoints.
+a short-lived, unbound token for that account and refreshes it before it
+expires. The pod's Envoy sidecar, bound to loopback port 15080, adds the token
+to guest requests; the guest kubeconfig itself holds no credential. The
+runtime redirects the guest's TAP gateway to that loopback port, so
+`kube-apiserver` resolves through the sidecar, which also proxies the pool's
+fixed HTTPS endpoints.
+
+An endpoint with `podBound: true` instead gets a token issued to the pod's own
+service account (usually `default`) and bound to the pod. Kubernetes rejects
+bound tokens for any other account, and the pod is deliberately identity-free
+so a warm VM can serve any Blip. Only services that verify the
+`authentication.kubernetes.io/pod-name` claim, such as blipchat, need this.
 
 Isolation is now RBAC on that service account. **Breaking change:** the
 `blip-vm-owner` admission policy and its `blip-vm-owners` table are gone, so an

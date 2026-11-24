@@ -81,6 +81,12 @@ func TestValidateEndpoints(t *testing.T) {
 		{name: "audience without pool service account", endpoints: []v1.PoolEndpoint{
 			{Name: "whoami", URL: "https://whoami.example.com", Audience: "blip-gateway"},
 		}},
+		{name: "pod bound endpoint", account: "vm", endpoints: []v1.PoolEndpoint{
+			{Name: "whoami", URL: "https://whoami.example.com", Audience: "blipchat", PodBound: true},
+		}},
+		{name: "pod bound without audience", account: "vm", endpoints: []v1.PoolEndpoint{
+			{Name: "whoami", URL: "https://whoami.example.com", PodBound: true},
+		}, wantErr: "podBound requires an audience"},
 		{name: "api server audience", account: "vm", endpoints: []v1.PoolEndpoint{
 			{Name: "whoami", URL: "https://whoami.example.com", Audience: "kubernetes.default.svc"},
 		}, wantErr: "must not be a Kubernetes API server audience"},

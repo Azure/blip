@@ -179,7 +179,7 @@ func TestEnvoyBootstrapUnauthenticatedEndpoint(t *testing.T) {
 	if n := strings.Count(got, "name: envoy.transport_sockets.tls\n"); n != 2 {
 		t.Errorf("%d TLS transport sockets, want 2\n%s", n, got)
 	}
-	if !strings.Contains(got, "request_headers_to_remove:\n                  - authorization") {
+	if !strings.Contains(got, "request_headers_to_remove:\n                - authorization") {
 		t.Errorf("guest authorization is not stripped\n%s", got)
 	}
 }

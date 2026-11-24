@@ -121,6 +121,13 @@ type PoolEndpoint struct {
 	// uses system roots.
 	// +optional
 	CAConfigMap string `json:"caConfigMap,omitempty"`
+	// PodBound makes the token a Kubernetes pod-bound token: it is bound to
+	// the claiming VM's pod and issued to that pod's service account, so a
+	// TokenReview carries the authentication.kubernetes.io/pod-name claim.
+	// The guest still acts as the Blip's service account everywhere else.
+	// Only endpoints that verify the pod claim need this.
+	// +optional
+	PodBound bool `json:"podBound,omitempty"`
 }
 
 type BlipPoolStatus struct {

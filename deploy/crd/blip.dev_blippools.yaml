@@ -106,6 +106,14 @@ spec:
                       maxLength: 63
                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
+                    podBound:
+                      description: |-
+                        PodBound makes the token a Kubernetes pod-bound token: it is bound to
+                        the claiming VM's pod and issued to that pod's service account, so a
+                        TokenReview carries the authentication.kubernetes.io/pod-name claim.
+                        The guest still acts as the Blip's service account everywhere else.
+                        Only endpoints that verify the pod claim need this.
+                      type: boolean
                     url:
                       description: |-
                         URL is the HTTPS URL. Its host is dialed, used for TLS SNI and the

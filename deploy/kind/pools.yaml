@@ -71,6 +71,8 @@ spec:
     - name: blipchat-mcp
       url: https://blipchat-mcp.blip-system.svc
       audience: blipchat
+      # blipchat authenticates the caller by the pod claim in the token.
+      podBound: true
       caConfigMap: blipchat-mcp-ca
   # Resource defaults match the default pool above.
   network:

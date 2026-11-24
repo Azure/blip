@@ -167,10 +167,13 @@
 #       - name: blipchat-mcp
 #         url: https://blipchat-mcp.blip-system.svc
 #         audience: blipchat
+#         podBound: true
 #         caConfigMap: blipchat-mcp-ca
 #
 # The endpoint name is the in-guest hostname, so it must match --mcp-url above;
 # an audience also requires the blip (or its pool) to have a service account.
+# podBound makes the token pod-bound: it is issued to the pod's own service
+# account and bound to the pod, which is what blipchat verifies.
 #
 # The operator provisions the blipchat-mcp-tls Secret in blip-system
 # (tls.crt/tls.key for that Service) and a blipchat-mcp-ca ConfigMap holding
