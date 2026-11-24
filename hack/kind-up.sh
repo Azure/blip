@@ -105,7 +105,12 @@ make build guest
 hack/build-images.sh
 # shellcheck source=/dev/null
 source build/images.env
-load_images "${CONTROLLER_IMAGE}" "${NODE_IMAGE}" "${RUNTIME_IMAGE}" "${BLIPCHAT_IMAGE}"
+# The controller's default proxy image (deploy/base/controller.yaml). Preload
+# it too: a node pulling an Envoy sidecar over the network can miss a Blip's
+# local-start window on that node.
+PROXY_IMAGE="${PROXY_IMAGE:-envoyproxy/envoy:distroless-v1.35.0}"
+docker pull -q "${PROXY_IMAGE}" >/dev/null
+load_images "${CONTROLLER_IMAGE}" "${NODE_IMAGE}" "${RUNTIME_IMAGE}" "${BLIPCHAT_IMAGE}" "${PROXY_IMAGE}"
 
 # The dev sandbox image (blip-registry:5000/blip/dev:latest inside the cluster),
 # with bin/kubectl-blip from `make build` above.

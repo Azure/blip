@@ -123,8 +123,12 @@ churn_ready() {
 }
 
 churn_pods() {
+	# A deleted warm pod keeps its name until it exits, and the pool must not
+	# create a replacement before then. Exclude those terminating pods so the
+	# count reflects capacity the pool can actually use.
 	k get pods -l "blip.dev/pool=$P-churn" \
-		-o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+		-o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null |
+		awk '$2 == "" { print $1 }'
 }
 
 churn_gone() {
