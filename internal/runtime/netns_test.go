@@ -328,8 +328,8 @@ func testNetworkNamespace(t *testing.T) {
 		denied(receive)
 		denied(c)
 	}
-	// An explicit deny-all revokes the sidecar API path too.
-	denied(apiRequest)
+	// Egress policy never gates the sidecar API path, which is local input.
+	allowed(apiRequest)
 	checkSidecar(request.Address, p.podIP)
 	// Egress rules never admit new inbound connections: the policy is
 	// egress-only, so a peer cannot reach a guest listener even when its

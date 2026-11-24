@@ -75,22 +75,15 @@ func relatedMatch(r netpolicy.Rule, podIP string) []string {
 // every layer; omitting the whole path keeps deny-all scripts free of ICMP
 // accept rules.
 func relatedICMPAllowed(policy *netpolicy.Policy) bool {
-	return !policyDeniesAll(policy)
-}
-
-// policyDeniesAll reports whether the policy admits no traffic. A missing
-// policy, no layers, or any empty layer is default deny: every layer must
-// return for a flow to pass, so one empty layer closes the gate.
-func policyDeniesAll(policy *netpolicy.Policy) bool {
 	if policy == nil || len(policy.Layers) == 0 {
-		return true
+		return false
 	}
 	for _, layer := range policy.Layers {
 		if len(layer) == 0 {
-			return true
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, error) {
@@ -193,10 +186,10 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 	b.WriteString("  counter drop\n }\n")
 	// Guest traffic to the API proxy is local input, not forwarded egress: the
 	// guest sends it to the TAP gateway on port 80 and the prerouting DNAT
-	// rewrites it to the sidecar's loopback listener. It needs no egress
-	// permission, but a deny-all policy or a disabled TAP must still block it,
-	// so only active, non-deny-all policies open these rules.
-	api := active && !policyDeniesAll(policy)
+	// rewrites it to the sidecar's loopback listener. Egress policy therefore
+	// does not apply, and a claimed VM keeps API access even under deny-all.
+	// A warm VM has no claim and keeps both rules closed.
+	api := active
 	fmt.Fprintf(&b, ` chain input {
   type filter hook input priority -10; policy accept;
 `)

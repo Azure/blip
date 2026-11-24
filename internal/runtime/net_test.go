@@ -504,8 +504,8 @@ func TestPolicyHasNoInboundAdmission(t *testing.T) {
 // TestPolicyAllowsSidecarAPIFailClosed covers the guest's path to the Envoy
 // sidecar: the guest sends HTTP to the TAP gateway, prerouting DNATs it to the
 // sidecar's loopback listener, and local input accepts exactly that flow. The
-// rules do not require egress permission, but a warm, deny-all, or explicit
-// empty-layer policy must not open them.
+// flow is local input, so egress policy never gates it, not even deny-all; a
+// warm VM has no claim and keeps the rules closed.
 func TestPolicyAllowsSidecarAPIFailClosed(t *testing.T) {
 	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
 		{{CIDR: "0.0.0.0/0", Protocol: "TCP", Port: 443}},
@@ -535,9 +535,7 @@ func TestPolicyAllowsSidecarAPIFailClosed(t *testing.T) {
 		active bool
 	}{
 		{"warm policy", policy, false},
-		{"missing policy", nil, true},
-		{"no layers", &netpolicy.Policy{Revision: "deny"}, true},
-		{"empty layer", &netpolicy.Policy{Revision: "deny", Layers: [][]netpolicy.Rule{{}}}, true},
+		{"warm deny-all", &netpolicy.Policy{Revision: "deny", Layers: [][]netpolicy.Rule{{}}}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			script, err := testPodNet(nil).policyScript(tt.policy, tt.active)
