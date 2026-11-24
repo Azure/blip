@@ -714,8 +714,9 @@ func (s *Server) waitRunning(ctx context.Context, name string) (*v1.Blip, error)
 	}
 }
 
-// chatStart is the first ring offset that belongs to this chat. A fork begins
-// after its base's records.
+// chatStart is the first ring offset that belongs to this chat. New copies
+// start with an empty ring, so a nonzero start only appears on legacy states
+// that recorded where an inherited trajectory ended.
 func chatStart(st *v1.BlipState) uint64 {
 	if raw := st.Annotations[AnnotationStart]; raw != "" {
 		if n, err := strconv.ParseUint(raw, 10, 64); err == nil {
@@ -900,9 +901,9 @@ func (s *Server) displayView(ctx context.Context, st *v1.BlipState) (*chatView, 
 
 // emptyDespiteHistory reports a replay that cannot be the whole conversation.
 // A chat with a committed generation and no ring offset has messages: every
-// turn writes at least the user's prompt. A forked chat inherits history before
-// its start offset, and a chat with an attached writer can be read before its
-// first record lands, so both are expected to be empty.
+// turn writes at least the user's prompt. A legacy chat may have history before
+// its recorded start offset, and a chat with an attached writer can be read
+// before its first record lands, so both are expected to be empty.
 //
 // A copied base state can also carry a committed generation with no history of
 // its own. Until the chat has started an ACP session it has never accepted a

@@ -232,8 +232,8 @@ func TestServerDetailFreshChatMayBeEmpty(t *testing.T) {
 	}
 }
 
-// A fork inherits history before its start offset, so an empty transcript is
-// its honest state and must not be reported as unavailable.
+// A legacy fork may have history before its recorded start offset, so an empty
+// transcript is its honest state and must not be reported as unavailable.
 func TestServerDetailForkMayBeEmpty(t *testing.T) {
 	fc := newFakeCluster()
 	st := newChat(fc, "chat-fork", DefaultProfileName)

@@ -196,7 +196,8 @@ type BlipStateSpec struct {
 	// waits for that save and pins its new version. A committed copy is not
 	// affected by later source changes or deletion. A live snapshot is
 	// replanned onto the source's post-save commit if that writer stops or
-	// starts saving before the copy commits.
+	// starts saving before the copy commits. A copy starts with an empty
+	// trajectory ring, so it never replays the source's conversation.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:MaxLength=253
 	CopyFrom string `json:"copyFrom,omitempty"`
@@ -224,8 +225,8 @@ type BlipStateSpec struct {
 	Size *resource.Quantity `json:"size,omitempty"`
 	// StreamSize is the size of the trajectory ring that stores the blip's
 	// input and output after its filesystem. It defaults to 64Mi and is
-	// immutable. Copies inherit the source's ring size, so forked blips see
-	// the parent's conversation.
+	// immutable. Copies inherit the source's ring size but start with an
+	// empty trajectory.
 	// +kubebuilder:validation:XValidation:rule="type(self) == string ? quantity(self).isGreaterThan(quantity('0')) : self > 0",message="streamSize must be greater than 0"
 	// +kubebuilder:validation:XValidation:rule="type(self) == string ? !quantity(self).isGreaterThan(quantity('1Gi')) : self <= 1073741824",message="streamSize must be at most 1Gi"
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="streamSize is immutable"

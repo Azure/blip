@@ -15,7 +15,7 @@ import (
 
 // Labels and annotations blipchat keeps on a chat's BlipState. They are
 // low-churn metadata: the title the agent reports, the ACP session to resume,
-// the ring offsets the chat starts and stops at, and the tree position.
+// the legacy ring start and current stop offsets, and the tree position.
 // Everything else, including every message, prompt, note, and question, lives
 // in the trajectory ring.
 const (

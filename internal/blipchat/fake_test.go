@@ -434,6 +434,7 @@ type fakeWire struct {
 	failInitialize error
 	autoRespond    bool
 	closed         bool
+	logEndCalls    int
 	// onPrompt, when set, runs after a prompt is recorded and may append
 	// records (for example a permission request) before the auto reply.
 	onPrompt func(gen uint64, text string)
@@ -621,12 +622,19 @@ func (f *fakeWire) ReadLog(ctx context.Context, namespace, state string, offset 
 func (f *fakeWire) LogEnd(context.Context, string, string) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.logEndCalls++
 	if len(f.records) == 0 {
 		return 0, nil
 	}
 	// Like the real ring, LogEnd returns a cursor just past the newest
 	// record, not the record's own start offset.
 	return f.offset, nil
+}
+
+func (f *fakeWire) logEndCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.logEndCalls
 }
 
 func (f *fakeWire) closeLog() {

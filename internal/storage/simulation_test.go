@@ -18,6 +18,8 @@ import (
 	"testing"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/Azure/blip/internal/stream"
 )
 
 // storageSimulation executes the production Store, bbolt transactions and
@@ -257,6 +259,10 @@ func (x *storageSimulation) Apply(e deviceEffect) error {
 		case eCheckClean:
 			if x.read(e.Name, 0) == "dirty" {
 				return ErrUnclean
+			}
+		case eResetStream:
+			for off := int64(0); off < e.Size; off += blockSize {
+				x.write(e.Name, int((stream.Offset+off)/blockSize), "")
 			}
 		case eDiscard:
 			dev := x.dm[e.Name]
@@ -604,6 +610,71 @@ func TestStorageSimulationCrashMatrix(t *testing.T) {
 			_, err := x.s.LiveCopy(ctx, "working", "new", "state")
 			return err
 		}, check: assertNoPending},
+		"live-copy-copy": {setup: func(x *storageSimulation) {
+			const streamSize = 64 << 20
+			x.image()
+			if _, err := x.s.CreateWorking(ctx, CreateWorking{AttachmentID: "working", FromImage: "image",
+				StateUID: "src", SizeBytes: 8 * blockSize, StreamSize: streamSize}); err != nil {
+				x.t.Fatal(err)
+			}
+			x.write(x.s.plainName(x.s.vols["working"]), int(stream.Offset/blockSize), "marker")
+		}, run: func(x *storageSimulation) error {
+			_, err := x.s.LiveCopy(ctx, "working", "new", "dst")
+			return err
+		}, check: func(x *storageSimulation) {
+			assertNoPending(x)
+			header := int(stream.Offset / blockSize)
+			if r := x.s.vols["new"]; r != nil {
+				if _, err := x.s.Activate("new"); err != nil {
+					x.t.Fatal(err)
+				}
+				if got := x.read(x.s.thinName(r), header); got != "" {
+					x.t.Fatalf("live copy inherited ring header %q", got)
+				}
+			}
+			if r := x.s.vols["working"]; r != nil {
+				if got := x.read(x.s.plainName(r), header); got != "marker" {
+					x.t.Fatalf("live copy source lost ring header %q", got)
+				}
+			}
+		}},
+		"copy-commit": {setup: func(x *storageSimulation) {
+			const streamSize = 64 << 20
+			if err := x.s.CreateCommit(ctx, CreateCommit{CommitID: "base", StateUID: "src",
+				SizeBytes: 8 * blockSize, StreamSize: streamSize}); err != nil {
+				x.t.Fatal(err)
+			}
+			if _, err := x.s.CreateWorking(ctx, CreateWorking{AttachmentID: "working", FromCommit: "base",
+				StateUID: "src", SizeBytes: 8 * blockSize, StreamSize: streamSize}); err != nil {
+				x.t.Fatal(err)
+			}
+			x.write(x.s.plainName(x.s.vols["working"]), int(stream.Offset/blockSize), "marker")
+			if _, err := x.s.Seal(ctx, "working", "src"); err != nil {
+				x.t.Fatal(err)
+			}
+		}, run: func(x *storageSimulation) error {
+			return x.s.CreateCommit(ctx, CreateCommit{CommitID: "new", FromCommit: "src",
+				StateUID: "dst", StreamSize: 64 << 20})
+		}, check: func(x *storageSimulation) {
+			assertNoPending(x)
+			header := int(stream.Offset / blockSize)
+			if r := x.s.vols["new"]; r != nil {
+				if _, err := x.s.Activate("new"); err != nil {
+					x.t.Fatal(err)
+				}
+				if got := x.read(x.s.thinName(r), header); got != "" {
+					x.t.Fatalf("copied commit inherited ring header %q", got)
+				}
+			}
+			if r := x.s.vols["src"]; r != nil {
+				if _, err := x.s.Activate("src"); err != nil {
+					x.t.Fatal(err)
+				}
+				if got := x.read(x.s.thinName(r), header); got != "marker" {
+					x.t.Fatalf("source commit lost ring header %q", got)
+				}
+			}
+		}},
 	}
 	for name, test := range scenarios {
 		t.Run(name, func(t *testing.T) {

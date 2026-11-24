@@ -345,8 +345,8 @@ func (s *Server) toolSpawnAgent(ctx context.Context, caller *Caller, profileName
 	return jsonText(map[string]any{"id": created.Name, "profile": profileName, "workspace": s.profiles[profileName].Workspace}), nil
 }
 
-// waitStateReady waits for a copied chat to finish its copy so its inherited
-// log offset is final and its first turn can start.
+// waitStateReady waits for a copied chat to finish its copy so it can accept
+// its first turn.
 func (s *Server) waitStateReady(ctx context.Context, ns, name string) error {
 	deadline := time.Now().Add(startTimeout)
 	for {

@@ -372,7 +372,10 @@ func (s *Store) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID s
 	}
 	err = s.snapshotActive(w, rec)
 	if err == nil {
-		err = s.checkClean(rec)
+		// A live copy into a different state must not inherit this state's
+		// trajectory. Same-state live copies keep the ring.
+		reset := stateUID != w.StateUID && w.StreamSize > 0
+		err = s.checkClean(rec, reset)
 	}
 	if err != nil {
 		if rerr := s.rollback(rec); rerr != nil {
@@ -390,14 +393,19 @@ func (s *Store) LiveCopy(ctx context.Context, attachmentID, commitID, stateUID s
 }
 
 // checkClean reports ErrUnclean unless the ext4 filesystem of an inactive
-// commit has needs_recovery clear.
-func (s *Store) checkClean(rec *record) error {
+// commit has needs_recovery clear. With reset it also empties the commit's
+// trajectory ring, which requires writable mappings.
+func (s *Store) checkClean(rec *record, reset bool) error {
 	name := s.thinName(rec)
-	if err := s.deviceCreate(name, thinTable(s.poolName(), rec.Thin, rec.Size), true); err != nil {
+	if err := s.deviceCreate(name, thinTable(s.poolName(), rec.Thin, rec.Size), !reset); err != nil {
 		return err
 	}
-	err := s.withPlain(rec, true, func(string) error {
-		return s.runOperation([]deviceEffect{{Kind: eCheckClean, Name: s.plainName(rec)}}, nil)
+	err := s.withPlain(rec, !reset, func(string) error {
+		steps := []deviceEffect{{Kind: eCheckClean, Name: s.plainName(rec)}}
+		if reset {
+			steps = append(steps, deviceEffect{Kind: eResetStream, Name: s.plainName(rec), Size: rec.StreamSize})
+		}
+		return s.runOperation(steps, nil)
 	})
 	if rerr := s.deviceRemove(name); err == nil {
 		err = rerr

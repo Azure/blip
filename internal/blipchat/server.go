@@ -883,42 +883,6 @@ func (s *Server) createChat(ctx context.Context, req chatRequest) (*v1.BlipState
 		cancel()
 		return nil, err
 	}
-	// A fork or a copy inherits the source's trajectory. Record where that
-	// history ends, before the chat can accept a message, so the engine never
-	// mistakes the source's prompts for this chat's work. The copy is
-	// asynchronous, so wait for the state to be ready first: LogEnd fails
-	// until the node has committed the copied volume.
-	if fork || base != "" {
-		if err := s.waitStateReady(ctx, s.namespace, created.Name); err != nil {
-			return nil, err
-		}
-		var end uint64
-		var err error
-		for attempt := 0; attempt < 20; attempt++ {
-			end, err = s.wire.LogEnd(ctx, s.namespace, created.Name)
-			if err == nil {
-				break
-			}
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		if err != nil {
-			// Starting the engine at zero would replay the source's prompts.
-			return nil, fmt.Errorf("read inherited trajectory for %s: %w", created.Name, err)
-		}
-		if end > 0 {
-			start := strconv.FormatUint(end, 10)
-			if err := s.cluster.PatchSession(ctx, s.namespace, created.Name, nil, map[string]string{AnnotationStart: start}); err != nil {
-				return nil, err
-			}
-			if created.Annotations == nil {
-				created.Annotations = map[string]string{}
-			}
-			created.Annotations[AnnotationStart] = start
-		}
-	}
 	return created, nil
 }
 
@@ -1361,8 +1325,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		lastID = eventID(after, skip-1)
 	}
 	if !seen {
-		// A client with no cursor starts at this chat's first record, not at
-		// the base's records a fork inherited.
+		// A client with no cursor starts at this chat's first record. The
+		// start offset is only nonzero for legacy states that recorded where
+		// an inherited trajectory ended.
 		after = chatStart(st)
 		skip = 0
 		lastID = strconv.FormatUint(after, 10)

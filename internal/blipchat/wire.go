@@ -118,10 +118,10 @@ func (w *restWire) openLog(ctx context.Context, namespace, state string, offset 
 	return body, nil
 }
 
-// LogEnd returns the offset of the newest record the state's ring holds. A
-// chat that copies its parent's workspace inherits the parent's records, so
-// its own engine starts reading after this offset instead of replaying them.
-// A state with no records, or no running or saved writer, has no end.
+// LogEnd returns the offset of the newest record the state's ring holds. It is
+// a cursor for stop and message boundaries, not a way to find inherited
+// history: a copied state starts with an empty trajectory ring. A state with no
+// records, or no running or saved writer, has no end.
 func (w *restWire) LogEnd(ctx context.Context, namespace, state string) (uint64, error) {
 	body, err := w.rc.Get().AbsPath(w.path(namespace, state, "log")).
 		Param("follow", "false").

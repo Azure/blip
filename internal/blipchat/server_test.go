@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -977,6 +976,11 @@ func TestCreateChatBaseRuntime(t *testing.T) {
 			if created.Annotations[AnnotationBase] != want.CopyFrom {
 				t.Fatalf("base annotation = %q, want %q", created.Annotations[AnnotationBase], want.CopyFrom)
 			}
+			// The base copy starts with an empty trajectory ring, so it needs
+			// no legacy start offset.
+			if _, ok := created.Annotations[AnnotationStart]; ok {
+				t.Fatalf("base copy recorded start annotation %q", created.Annotations[AnnotationStart])
+			}
 			if runtime := created.Spec.Runtime; runtime != nil {
 				runtime.WorkingDir = "/changed"
 				runtime.User = "changed"
@@ -991,7 +995,7 @@ func TestCreateChatBaseRuntime(t *testing.T) {
 	}
 }
 
-func TestCreateChatForkStartsAfterParent(t *testing.T) {
+func TestCreateChatForkCopiesParent(t *testing.T) {
 	fc := newFakeCluster()
 	profiles := Profiles{
 		DefaultProfileName: {Command: []string{"agent"}},
@@ -1020,12 +1024,6 @@ func TestCreateChatForkStartsAfterParent(t *testing.T) {
 	if err := fc.CreateSession(ctx, "team", parent); err != nil {
 		t.Fatal(err)
 	}
-	// The parent's ring already contains a turn. A fork inherits these
-	// records, but must not treat them as its own work.
-	g.wire.start(1)
-	g.wire.note(noteRecord{Type: notePrompt, ID: "old", Text: "old", Original: "old"})
-	g.wire.end(1)
-	tail := g.wire.offset
 
 	created, err := g.srv.createChat(ctx, chatRequest{Profile: "forked", Parent: parent})
 	if err != nil {
@@ -1041,15 +1039,12 @@ func TestCreateChatForkStartsAfterParent(t *testing.T) {
 	if forked.Spec.CopyFrom != parent.Name {
 		t.Fatalf("fork source = %q, want parent %q", forked.Spec.CopyFrom, parent.Name)
 	}
-	start, err := strconv.ParseUint(created.Annotations[AnnotationStart], 10, 64)
-	if err != nil {
-		t.Fatalf("start annotation = %q: %v", created.Annotations[AnnotationStart], err)
+	// A new copy starts with an empty trajectory, so creation must not read
+	// the parent's log end or record a start offset.
+	if _, ok := forked.Annotations[AnnotationStart]; ok {
+		t.Fatalf("fork recorded start annotation %q", forked.Annotations[AnnotationStart])
 	}
-	if start != tail {
-		t.Fatalf("start = %d, want parent tail %d", start, tail)
-	}
-	view, _ := g.srv.readView(ctx, created)
-	if len(view.Transcript) != 0 || view.Newest != 0 {
-		t.Fatalf("fork replayed parent history: transcript=%d newest=%d", len(view.Transcript), view.Newest)
+	if n := g.wire.logEndCount(); n != 0 {
+		t.Fatalf("creating a fork called LogEnd %d times, want 0", n)
 	}
 }

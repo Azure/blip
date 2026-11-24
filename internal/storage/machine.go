@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+
+	"github.com/Azure/blip/internal/stream"
 )
 
 // deviceEffect is one externally observable storage action. Plans contain no
@@ -34,6 +36,7 @@ const (
 	eFlush       effectKind = "flush"
 	eCheckClosed effectKind = "check-closed"
 	eCheckClean  effectKind = "check-clean"
+	eResetStream effectKind = "reset-stream"
 )
 
 type deviceEffect struct {
@@ -175,6 +178,8 @@ func applyDeviceEffect(ctx context.Context, e deviceEffect) error {
 			err = ErrUnclean
 		}
 		return err
+	case eResetStream:
+		return resetStream(mapperPath(e.Name), e.Size)
 	default:
 		return fmt.Errorf("storage: unknown device effect %q", e.Kind)
 	}
@@ -231,8 +236,33 @@ func createPlan(l layout, r, src *record, image bool) []deviceEffect {
 	steps := []deviceEffect{e}
 	working := r.Kind == KindWorking
 	grow := src != nil && r.fsBytes() > src.fsBytes()
+	// A trajectory ring describes one state's executions, so a commit copied
+	// from another state's commit starts with an empty ring. Sealing and
+	// same-state copies keep it, and images or working volumes never carry a
+	// foreign ring. The source's StreamSize may be unknown on a fetched
+	// replica, so fall back to the ring implied by its volume size.
+	var resetSize int64
+	if !image && r.Kind == KindCommit && src != nil && src.Kind == KindCommit && src.StateUID != r.StateUID {
+		resetSize = r.StreamSize
+		if resetSize == 0 {
+			resetSize = src.StreamSize
+		}
+		if resetSize == 0 && src.Size > stream.Offset {
+			resetSize = src.Size - stream.Offset
+		}
+	}
+	reset := resetSize > 0
 	if !image && !working && src != nil && !grow {
-		return steps
+		if !reset {
+			return steps
+		}
+		return append(steps,
+			deviceEffect{Kind: eCreate, Name: l.thin, Table: thinTable(l.pool, r.Thin, r.Size)},
+			deviceEffect{Kind: eCreate, Name: l.plain, Table: l.crypt},
+			deviceEffect{Kind: eResetStream, Name: l.plain, Size: resetSize},
+			deviceEffect{Kind: eRemove, Name: l.plain, Always: true},
+			deviceEffect{Kind: eRemove, Name: l.thin, Always: true},
+		)
 	}
 	table := thinTable(l.pool, r.Thin, r.Size)
 	steps = append(steps, deviceEffect{Kind: eCreate, Name: l.thin, Table: table, ReadOnly: working && !grow && r.ReadOnly})
@@ -246,7 +276,11 @@ func createPlan(l layout, r, src *record, image bool) []deviceEffect {
 	} else if grow {
 		body.Kind, body.Reproducible = eGrow, !working && src.Kind == KindImage
 	}
-	steps = append(steps, body, deviceEffect{Kind: eRemove, Name: l.plain, Always: true})
+	steps = append(steps, body)
+	if reset {
+		steps = append(steps, deviceEffect{Kind: eResetStream, Name: l.plain, Size: resetSize})
+	}
+	steps = append(steps, deviceEffect{Kind: eRemove, Name: l.plain, Always: true})
 	if !working {
 		return append(steps, deviceEffect{Kind: eRemove, Name: l.thin, Always: true})
 	}
