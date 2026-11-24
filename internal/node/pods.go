@@ -166,6 +166,15 @@ func desiredFor(v *view, p *plan, pod *corev1.Pod, dir *podDir) (podapi.Desired,
 			}
 		}
 	}
+	if claim != nil && prev.Claim == nil && !v.credsOK(key) {
+		// Withhold a new claim until the sidecar's credential files exist.
+		// An existing claim is never revoked for credentials.
+		perr = "credentials: pending"
+		if e := v.credsErr[key]; e != "" {
+			perr = e
+		}
+		claim = nil
+	}
 	if claim != nil && (claim == prev.Claim || allReady) {
 		d.Claim = claim
 		d.Freeze = slices.Clone(v.freezes[key])

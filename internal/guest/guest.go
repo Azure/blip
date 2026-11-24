@@ -42,8 +42,8 @@ type Guest struct {
 	cgroupFD      int
 	reaper        *reaper
 	kubeNamespace string
+	gateway       string
 	endpoints     []string
-	proxy         *apiForwarder
 	stdio         *stdio
 
 	// startProcess replaces startProc in tests, which run outside the guest
@@ -113,20 +113,12 @@ func Main() {
 	}
 	if err := setupNetwork(cfg); err != nil {
 		log.Printf("network: %v", err)
-		if cfg.KubeNamespace != "" {
-			powerOff()
-		}
+		powerOff()
 	}
 	g := newGuest(rootDir, workCgroup)
 	g.kubeNamespace = cfg.KubeNamespace
+	g.gateway = cfg.Gateway
 	g.endpoints = cfg.Endpoints
-	if g.kubeNamespace != "" || len(g.endpoints) > 0 {
-		g.proxy, err = startForwarder("guest proxy", "127.0.2.2:80", dialHost(wire.EndpointPort))
-		if err != nil {
-			log.Printf("listen guest proxy: %v", err)
-			powerOff()
-		}
-	}
 	ctl, err := listenVsock(wire.ControlPort)
 	if err != nil {
 		log.Printf("listen control port: %v", err)
@@ -319,9 +311,6 @@ func (g *Guest) doClaim(m wire.Claim) error {
 	if g.stopping {
 		return errors.New("guest is stopping")
 	}
-	if (g.kubeNamespace != "" || len(g.endpoints) > 0) && (g.proxy == nil || !g.proxy.ready()) {
-		return errors.New("guest proxy forwarding is unavailable")
-	}
 	if !isInit() {
 		return errNotInit
 	}
@@ -406,35 +395,32 @@ func guestHostname(name string) string {
 
 // hostsFile is the /etc/hosts content for a claimed blip. The host entry uses
 // 127.0.1.1 (the Debian convention) so name lookups resolve without a DNS
-// round trip.
-func hostsFile(hostname, kubeNamespace string, endpoints []string) string {
+// round trip. The Kubernetes API and the configured endpoints resolve to the
+// TAP gateway, where the runtime redirects them to the pod's Envoy sidecar.
+func hostsFile(hostname, gateway string, endpoints []string) string {
 	var b strings.Builder
 	b.WriteString("127.0.0.1 localhost\n")
 	if hostname != "" && !strings.ContainsAny(hostname, " \t\r\n") {
 		fmt.Fprintf(&b, "127.0.1.1 %s\n", hostname)
 	}
 	b.WriteString("::1 localhost ip6-localhost ip6-loopback\n")
-	b.WriteString(blipHosts(kubeNamespace, endpoints))
+	b.WriteString(blipHosts(gateway, endpoints))
 	return b.String()
 }
 
-// blipHosts resolves the guest's fixed HTTP names, when there is anything for
-// the sidecar to route, through the proxy on 127.0.2.2.
-func blipHosts(kubeNamespace string, endpoints []string) string {
-	var b strings.Builder
-	names := endpoints
-	if kubeNamespace != "" {
-		names = append([]string{"kube-apiserver"}, endpoints...)
+// blipHosts resolves the guest's fixed HTTP names through the TAP gateway. The
+// Kubernetes API is always configured; endpoint names are added when present.
+func blipHosts(gateway string, endpoints []string) string {
+	if gateway == "" {
+		return ""
 	}
-	if len(names) > 0 {
-		fmt.Fprintf(&b, "127.0.2.2 %s\n", strings.Join(names, " "))
-	}
-	return b.String()
+	names := append([]string{"kube-apiserver"}, endpoints...)
+	return fmt.Sprintf("%s %s\n", gateway, strings.Join(names, " "))
 }
 
 // writeHostsLocked replaces the guest's /etc/hosts (a bind mount of the
 // initramfs file) with content that resolves the blip's host name and the
-// guest-local HTTP names.
+// gateway-routed HTTP names.
 func (g *Guest) writeHostsLocked(hostname string) error {
 	fd, err := openFileInRootWritable(g.root, "/etc/hosts")
 	if err != nil {
@@ -445,7 +431,7 @@ func (g *Guest) writeHostsLocked(hostname string) error {
 	if err := f.Truncate(0); err != nil {
 		return err
 	}
-	_, err = f.WriteAt([]byte(hostsFile(hostname, g.kubeNamespace, g.endpoints)), 0)
+	_, err = f.WriteAt([]byte(hostsFile(hostname, g.gateway, g.endpoints)), 0)
 	return err
 }
 
@@ -605,9 +591,6 @@ func (g *Guest) shutdown() {
 	// write, must not keep stopWork waiting.
 	g.stdio.close()
 	stopWork(g.cgroup, stopGrace)
-	if g.proxy != nil {
-		g.proxy.Close()
-	}
 	g.mu.Lock()
 	err := g.unmountAllLocked()
 	gone := g.ctlGone

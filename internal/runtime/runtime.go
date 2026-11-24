@@ -400,10 +400,10 @@ func (r *runtime) boot() (*podNet, error) {
 	if err := podapi.EnsureDir(r.o.Dir); err != nil {
 		return nil, err
 	}
-	// The socket directory is bind-mounted into the non-root API-proxy sidecar,
-	// which binds vsock.sock_<port> there. It must be writable by that user;
-	// the enclosing pod directory stays root-only.
-	if err := os.MkdirAll(filepath.Dir(r.o.path(podapi.VsockSocket)), 0o777); err != nil {
+	// The socket directory holds the hypervisor's vsock and API sockets. Only
+	// this privileged container uses it; the enclosing pod directory stays
+	// root-only and no unprivileged process mounts it.
+	if err := os.MkdirAll(filepath.Dir(r.o.path(podapi.VsockSocket)), 0o750); err != nil {
 		return nil, err
 	}
 	for _, s := range []string{podapi.APISocket, podapi.VsockSocket} {

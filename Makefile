@@ -30,7 +30,7 @@ test:
 # adapters. Ordinary `make test` also runs these tests; this target adds the
 # race detector.
 test-sim:
-	go test -race -count=1 ./internal/sim ./internal/simtest ./internal/simlive ./internal/simapp ./internal/atomicfile ./internal/storage ./internal/peer ./internal/nvme ./internal/node ./internal/controller ./internal/runtime ./internal/guest ./internal/wire ./internal/podapi ./internal/stream ./internal/streamapi ./internal/workspace ./internal/apiproxy ./internal/blipchat
+	go test -race -count=1 ./internal/sim ./internal/simtest ./internal/simlive ./internal/simapp ./internal/atomicfile ./internal/storage ./internal/peer ./internal/nvme ./internal/node ./internal/controller ./internal/runtime ./internal/guest ./internal/wire ./internal/podapi ./internal/stream ./internal/streamapi ./internal/workspace ./internal/blipchat
 
 # Browser tests for the chat UI: real server and Chromium, in-memory backends.
 # Needs node; run `npx playwright install chromium` once.

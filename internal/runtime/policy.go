@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Azure/blip/internal/netpolicy"
+	"github.com/Azure/blip/internal/podapi"
 )
 
 // addrMatch renders the address, exceptions, and protocol part of a rule. It
@@ -74,15 +75,22 @@ func relatedMatch(r netpolicy.Rule, podIP string) []string {
 // every layer; omitting the whole path keeps deny-all scripts free of ICMP
 // accept rules.
 func relatedICMPAllowed(policy *netpolicy.Policy) bool {
+	return !policyDeniesAll(policy)
+}
+
+// policyDeniesAll reports whether the policy admits no traffic. A missing
+// policy, no layers, or any empty layer is default deny: every layer must
+// return for a flow to pass, so one empty layer closes the gate.
+func policyDeniesAll(policy *netpolicy.Policy) bool {
 	if policy == nil || len(policy.Layers) == 0 {
-		return false
+		return true
 	}
 	for _, layer := range policy.Layers {
 		if len(layer) == 0 {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, error) {
@@ -183,9 +191,20 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
 		b.WriteString("  ct direction reply ct state established jump reply\n")
 	}
 	b.WriteString("  counter drop\n }\n")
+	// Guest traffic to the API proxy is local input, not forwarded egress: the
+	// guest sends it to the TAP gateway on port 80 and the prerouting DNAT
+	// rewrites it to the sidecar's loopback listener. It needs no egress
+	// permission, but a deny-all policy or a disabled TAP must still block it,
+	// so only active, non-deny-all policies open these rules.
+	api := active && !policyDeniesAll(policy)
 	fmt.Fprintf(&b, ` chain input {
   type filter hook input priority -10; policy accept;
-  iifname %s counter drop
+`)
+	if api {
+		fmt.Fprintf(&b, "  iifname %s ip saddr %s ip daddr 127.0.0.1 tcp dport %d counter accept\n",
+			tap, p.guestIP, podapi.ProxyPort)
+	}
+	fmt.Fprintf(&b, `  iifname %s counter drop
  }
  chain output {
   type filter hook output priority -10; policy accept;
@@ -198,13 +217,18 @@ func (p *podNet) policyScript(policy *netpolicy.Policy, active bool) (string, er
  }
  chain prerouting {
   type nat hook prerouting priority dstnat; policy accept;
-  iifname %s ip daddr %s dnat ip to %s
+`, tap, tap, tap, tap)
+	if api {
+		fmt.Fprintf(&b, "  iifname %s ip saddr %s ip daddr %s tcp dport 80 dnat ip to 127.0.0.1:%d\n",
+			tap, p.guestIP, p.gateway, podapi.ProxyPort)
+	}
+	fmt.Fprintf(&b, `  iifname %s ip daddr %s dnat ip to %s
  }
  chain postrouting {
   type nat hook postrouting priority srcnat; policy accept;
   iifname %s oifname %s ip saddr %s snat ip to %s
  }
 }
-`, tap, tap, tap, tap, iface, p.podIP, p.guestIP, tap, iface, p.guestIP, p.podIP)
+`, tap, p.gateway, p.guestIP, tap, iface, p.guestIP, p.podIP)
 	return b.String(), nil
 }

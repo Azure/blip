@@ -107,7 +107,7 @@ func TestTightenDirRejectsSymlink(t *testing.T) {
 	assertMode(t, target, 0o755)
 }
 
-func TestEnsureSocketDirIsProxyWritable(t *testing.T) {
+func TestEnsureSocketDirIsRootOnly(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ns", "pod")
 	if err := EnsurePodDir(dir); err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestEnsureSocketDirIsProxyWritable(t *testing.T) {
 	if err := EnsureSocketDir(dir); err != nil {
 		t.Fatal(err)
 	}
-	assertMode(t, sock, 0o777)
+	assertMode(t, sock, 0o750)
 	assertMode(t, dir, DirMode)
 }
 

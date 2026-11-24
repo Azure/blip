@@ -35,6 +35,7 @@ const (
 
 type runFlags struct {
 	workdir, user, pool, name string
+	serviceAccount            string
 	from, state               string
 	env, labels               []string
 	timeout, ttl              time.Duration
@@ -94,6 +95,7 @@ they finish, so an abandoned fork cannot leak its workspace.`,
 	fl.StringVar(&f.from, "from", "", "copy workspace SRC into a new one (inside a blip, / is the caller's root)")
 	fl.StringVar(&f.state, "state", "", "run in existing workspace WS")
 	fl.StringVar(&f.pool, "pool", "", "VM pool (default \"default\"; inside a blip, the caller's pool)")
+	fl.StringVar(&f.serviceAccount, "service-account", "", "service account the blip's guests act as (default: the pool's)")
 	fl.StringVarP(&f.workdir, "workdir", "w", "", "working directory (inside a blip, the current directory)")
 	fl.StringVarP(&f.user, "user", "u", "", "user name or uid")
 	fl.StringArrayVarP(&f.env, "env", "e", nil, "environment variable KEY=VALUE (repeatable)")
@@ -325,11 +327,12 @@ func (a *app) run(ctx context.Context, command []string, f *runFlags) error {
 	b := &v1alpha1.Blip{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace},
 		Spec: v1alpha1.BlipSpec{
-			Pool:       f.pool,
-			Command:    command,
-			Env:        env,
-			WorkingDir: workdir,
-			User:       f.user,
+			Pool:               f.pool,
+			ServiceAccountName: f.serviceAccount,
+			Command:            command,
+			Env:                env,
+			WorkingDir:         workdir,
+			User:               f.user,
 		},
 	}
 	a.label(b)

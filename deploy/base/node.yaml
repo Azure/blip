@@ -46,6 +46,13 @@ rules:
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, list]
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [get, list, watch]
+  # The node agent mints the guest's pod-bound service-account token.
+  - apiGroups: [""]
+    resources: [serviceaccounts/token]
+    verbs: [create]
   - apiGroups: ["", events.k8s.io]
     resources: [events]
     verbs: [create, patch]

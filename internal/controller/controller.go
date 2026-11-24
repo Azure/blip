@@ -31,7 +31,14 @@ const (
 // Config configures the controllers.
 type Config struct {
 	RuntimeImage string
-	Registry     Registry
+	// ProxyImage runs the Envoy sidecar that fronts guest API traffic. Empty
+	// defaults to DefaultProxyImage.
+	ProxyImage string
+	// APIServer is the Kubernetes API server host:port the sidecar proxies.
+	// Empty defaults to DefaultAPIServer, so tests and out-of-cluster runs
+	// need no environment.
+	APIServer string
+	Registry  Registry
 	// Now defaults to time.Now.
 	Now func() time.Time
 	// NewID generates attachment and commit IDs: 16 lowercase hex characters.
@@ -64,6 +71,22 @@ func (c *Config) newPodName(pool string) string {
 		return c.NewPodName(pool)
 	}
 	return pool + "-" + utilrand.String(5)
+}
+
+// proxyImage is the configured Envoy image, or the default.
+func (c *Config) proxyImage() string {
+	if c.ProxyImage != "" {
+		return c.ProxyImage
+	}
+	return DefaultProxyImage
+}
+
+// apiServer is the configured API server host:port, or the default.
+func (c *Config) apiServer() string {
+	if c.APIServer != "" {
+		return c.APIServer
+	}
+	return DefaultAPIServer
 }
 
 // Indexes lists the field indexes the reconcilers rely on.

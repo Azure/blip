@@ -29,10 +29,13 @@ rules:
   - apiGroups: [apiregistration.k8s.io]
     resources: [apiservices]
     verbs: [get, list, watch, create, update]
-  # The blip-vm-owners table of the blip-vm-owner admission policy.
+  # Endpoint CA ConfigMaps are read by name in the pool's namespace.
   - apiGroups: [""]
     resources: [configmaps]
-    verbs: [get, list, watch, create, patch]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [get, list, watch]
   - apiGroups: ["", events.k8s.io]
     resources: [events]
     verbs: [create, patch]
@@ -127,6 +130,7 @@ spec:
           args:
             - --leader-elect
             - --runtime-image=$(RUNTIME_IMAGE)
+            - --proxy-image=$(PROXY_IMAGE)
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -135,6 +139,9 @@ spec:
             # The image of every VM pod's vm container.
             - name: RUNTIME_IMAGE
               value: ghcr.io/azure/blip-runtime:latest
+            # The image of every VM pod's Envoy sidecar.
+            - name: PROXY_IMAGE
+              value: envoyproxy/envoy:distroless-v1.35.0
           resources:
             requests:
               cpu: 100m

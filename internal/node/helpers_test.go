@@ -93,11 +93,14 @@ func holding(node string, commits ...string) v1alpha1.NodeObservation {
 
 func vmPod(name string, blipUID string) *corev1.Pod {
 	labels := map[string]string{v1alpha1.LabelPool: "default"}
+	var annotations map[string]string
 	if blipUID != "" {
 		labels[v1alpha1.LabelBlipUID] = blipUID
+		// The controller writes the resolved identity when it claims the pod.
+		annotations = map[string]string{v1alpha1.AnnotationServiceAccount: "pool-sa"}
 	}
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID("poduid-" + name), Labels: labels},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID("poduid-" + name), Labels: labels, Annotations: annotations},
 		Spec:       corev1.PodSpec{NodeName: self},
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
 	}

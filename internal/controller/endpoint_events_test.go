@@ -142,10 +142,10 @@ func TestPoolEndpointCAValidation(t *testing.T) {
 		}
 	})
 
-	// The manager cache watches only blip-vm-owners, so a cache-backed Get
-	// reports every other ConfigMap as missing. Pool reconciliation must read
-	// CA ConfigMaps through the uncached API reader instead of freezing the
-	// pool with a false "not found".
+	// A cache that has not observed a just-created ConfigMap reports it as
+	// missing. Pool reconciliation must read CA ConfigMaps through the
+	// uncached API reader instead of freezing the pool with a false
+	// "not found".
 	t.Run("CA ConfigMap outside the cache is read through the API reader", func(t *testing.T) {
 		e := newEnv(t)
 		e.addNodes("n1")
@@ -157,7 +157,7 @@ func TestPoolEndpointCAValidation(t *testing.T) {
 		e.updatePool("default", func(p *v1.BlipPool) {
 			p.Spec.Endpoints = []v1.PoolEndpoint{{Name: "whoami", URL: "https://whoami.example.com", CAConfigMap: "good-ca"}}
 		})
-		e.pool.Client = vmOwnersOnlyCache{e.c}
+		e.pool.Client = blindConfigMapCache{e.c}
 		e.pool.APIReader = e.c
 		if _, err := e.pool.Reconcile(e.ctx, req(ns, "default")); err != nil {
 			t.Fatalf("valid CA through the API reader rejected: %v", err)
@@ -193,12 +193,12 @@ func TestPoolEndpointCAValidation(t *testing.T) {
 	})
 }
 
-// vmOwnersOnlyCache mimics the manager cache's ConfigMap field selector: only
-// the admission policy's parameter table is visible.
-type vmOwnersOnlyCache struct{ client.Client }
+// blindConfigMapCache hides ConfigMaps from the cached client, like a cache
+// that has not yet observed one.
+type blindConfigMapCache struct{ client.Client }
 
-func (c vmOwnersOnlyCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	if _, ok := obj.(*corev1.ConfigMap); ok && key.Name != VMOwnersConfigMap {
+func (c blindConfigMapCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.ConfigMap); ok {
 		return apierrors.NewNotFound(corev1.Resource("configmaps"), key.Name)
 	}
 	return c.Client.Get(ctx, key, obj, opts...)

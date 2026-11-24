@@ -9,7 +9,8 @@ metadata:
 spec:
   serviceAccountName: blip-agent
   # Fixed HTTPS endpoints are exposed to workloads at http://<name>/. The
-  # sidecar adds the projected token and CA, so the guest never holds them.
+  # Envoy sidecar adds the service-account token and CA, so the guest never
+  # holds them.
   # endpoints:
   #   - name: whoami
   #     url: https://whoami.example.com

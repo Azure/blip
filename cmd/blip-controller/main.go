@@ -9,11 +9,11 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
@@ -39,14 +39,16 @@ import (
 // +kubebuilder:rbac:groups=blip.dev,resources=blips/finalizers;blipstates/finalizers;blippools/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch
 
 func main() {
-	var runtimeImage, insecure, namespace string
+	var runtimeImage, proxyImage, insecure, namespace string
 	var leaderElect bool
 	var gcThreshold int
 	flag.StringVar(&namespace, "namespace", os.Getenv("POD_NAMESPACE"), "namespace of the controller and the disk key secret")
 	flag.StringVar(&runtimeImage, "runtime-image", "", "image of the VM pod's vm container (blip-runtime)")
+	flag.StringVar(&proxyImage, "proxy-image", controller.DefaultProxyImage, "image of the VM pod's Envoy sidecar")
 	flag.StringVar(&insecure, "insecure-registry", "", "comma-separated registry hosts reached over plain HTTP")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
 	flag.IntVar(&gcThreshold, "terminated-blip-gc-threshold", controller.DefaultTerminatedBlipGCThreshold, "delete the oldest finished blips beyond this many per namespace (0 disables)")
@@ -55,15 +57,19 @@ func main() {
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	if err := run(runtimeImage, insecure, namespace, leaderElect, gcThreshold); err != nil {
+	if err := run(runtimeImage, proxyImage, insecure, namespace, leaderElect, gcThreshold); err != nil {
 		fmt.Fprintln(os.Stderr, "blip-controller:", err)
 		os.Exit(1)
 	}
 }
 
-func run(runtimeImage, insecure, namespace string, leaderElect bool, gcThreshold int) error {
+func run(runtimeImage, proxyImage, insecure, namespace string, leaderElect bool, gcThreshold int) error {
 	if runtimeImage == "" || namespace == "" {
 		return fmt.Errorf("--runtime-image and --namespace are required")
+	}
+	apiServer := apiServerAddress()
+	if _, _, err := net.SplitHostPort(apiServer); err != nil {
+		return fmt.Errorf("KUBERNETES_SERVICE_HOST/PORT: %w", err)
 	}
 	var registries []string
 	for _, h := range strings.Split(insecure, ",") {
@@ -93,10 +99,6 @@ func run(runtimeImage, insecure, namespace string, leaderElect bool, gcThreshold
 		Metrics:                       metricsserver.Options{BindAddress: "0"},
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.Pod{}: {Label: labels.NewSelector().Add(*vmPods)},
-			// Only the admission policy's parameter table is cached. Endpoint
-			// CA ConfigMaps are read uncached via mgr.GetAPIReader(), so this
-			// field selector does not hide them from pool validation.
-			&corev1.ConfigMap{}: {Field: fields.OneTermEqualSelector("metadata.name", controller.VMOwnersConfigMap)},
 		}},
 	})
 	if err != nil {
@@ -118,6 +120,8 @@ func run(runtimeImage, insecure, namespace string, leaderElect bool, gcThreshold
 	}
 	cfg := controller.Config{
 		RuntimeImage:    runtimeImage,
+		ProxyImage:      proxyImage,
+		APIServer:       apiServer,
 		Registry:        controller.RemoteRegistry{Insecure: registries, Reader: mgr.GetAPIReader()},
 		StreamNamespace: namespace,
 	}
@@ -130,4 +134,19 @@ func run(runtimeImage, insecure, namespace string, leaderElect bool, gcThreshold
 		return err
 	}
 	return mgr.Start(ctx)
+}
+
+// apiServerAddress is the in-cluster API server the Envoy sidecar proxies.
+// KUBERNETES_SERVICE_HOST/PORT are set for every pod; the default keeps
+// out-of-cluster runs and tests working.
+func apiServerAddress() string {
+	host := os.Getenv("KUBERNETES_SERVICE_HOST")
+	if host == "" {
+		return controller.DefaultAPIServer
+	}
+	port := os.Getenv("KUBERNETES_SERVICE_PORT")
+	if port == "" {
+		port = "443"
+	}
+	return net.JoinHostPort(host, port)
 }

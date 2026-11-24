@@ -205,6 +205,18 @@ spec:
                 x-kubernetes-validations:
                 - message: pool is immutable
                   rule: self == oldSelf
+              serviceAccountName:
+                description: |-
+                  ServiceAccountName is the identity of the blip's guest. It defaults to
+                  the pool's service account. Any service account in the blip's namespace
+                  may be named, the same rule as for pods. Omitted with no pool default
+                  leaves the guest unauthenticated.
+                maxLength: 253
+                pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                type: string
+                x-kubernetes-validations:
+                - message: serviceAccountName is immutable
+                  rule: self == oldSelf
               state:
                 description: |-
                   State gives the blip a durable root filesystem. A new version is

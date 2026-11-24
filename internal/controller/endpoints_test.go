@@ -78,9 +78,9 @@ func TestValidateEndpoints(t *testing.T) {
 		{name: "non-numeric port", endpoints: []v1.PoolEndpoint{
 			{Name: "whoami", URL: "https://whoami.example.com:nope"},
 		}, wantErr: "must be a valid HTTPS URL"},
-		{name: "audience without service account", endpoints: []v1.PoolEndpoint{
+		{name: "audience without pool service account", endpoints: []v1.PoolEndpoint{
 			{Name: "whoami", URL: "https://whoami.example.com", Audience: "blip-gateway"},
-		}, wantErr: "audience requires spec.serviceAccountName"},
+		}},
 		{name: "api server audience", account: "vm", endpoints: []v1.PoolEndpoint{
 			{Name: "whoami", URL: "https://whoami.example.com", Audience: "kubernetes.default.svc"},
 		}, wantErr: "must not be a Kubernetes API server audience"},

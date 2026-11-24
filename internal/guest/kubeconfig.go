@@ -24,9 +24,6 @@ const (
 // blipName lets commands inside the guest find their own Blip even when the
 // name is too long to be a hostname.
 func (g *Guest) installKubeConfigLocked(blipName string) error {
-	if g.kubeNamespace == "" {
-		return nil
-	}
 	if !isInit() {
 		return errNotInit
 	}

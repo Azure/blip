@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -99,21 +100,22 @@ const warmTimeout = 5 * time.Minute
 const (
 	// Bump when pod topology changes without a pool spec change, so warm
 	// pods cannot retain the old credential or socket layout.
-	podTopologyVersion = "api-proxy-v3"
+	podTopologyVersion = "envoy-v1"
 
-	apiProxyName             = "api-proxy"
-	apiTokenVolume           = "api-token"
-	serviceAccountPath       = "/var/run/secrets/kubernetes.io/serviceaccount"
-	vsockMountPath           = podapi.MountPath + "/sock"
-	apiProxyUID        int64 = 65532
+	vsockMountPath = podapi.MountPath + "/sock"
 
-	endpointMountRoot       = "/var/run/blip/endpoints"
-	endpointsEnv            = "BLIP_ENDPOINTS"
-	endpointNamesEnv        = "BLIP_ENDPOINT_NAMES"
-	kubeAPIEnv              = "BLIP_KUBE_API"
-	endpointTokenFile       = "token"
-	endpointCAFile          = "ca.crt"
-	endpointTokenExpiration = int64(3600)
+	// Names of the VM pod's sidecar containers.
+	proxyInitName = "proxy-init"
+	envoyName     = "envoy"
+
+	// Volume names and mounts shared by the sidecars.
+	credsVolume  = "creds"
+	kubeCAVolume = "kube-ca"
+
+	endpointNamesEnv = "BLIP_ENDPOINT_NAMES"
+	namespaceEnv     = "BLIP_KUBE_NAMESPACE"
+	proxyInitUID     = int64(0)
+	envoyUID         = int64(65532)
 
 	// terminationGracePeriod covers the runtime's 60s guest shutdown
 	// budget, so the kubelet does not SIGKILL the VMM mid-shutdown.
@@ -153,10 +155,9 @@ type PoolReconciler struct {
 	// discovered at startup. validateEndpoints rejects an endpoint token
 	// projected for any of them.
 	APIAudiences []string
-	// APIReader reads objects uncached. The manager cache only watches the
-	// blip-vm-owners ConfigMap, so CA ConfigMaps must bypass it or every CA
-	// reference looks missing. SetupWithManager sets it; direct callers that
-	// leave it nil fall back to Client.
+	// APIReader reads objects uncached, so a CA ConfigMap created just before
+	// a pool update is not missed by a stale cache. SetupWithManager sets it;
+	// direct callers that leave it nil fall back to Client.
 	APIReader client.Reader
 
 	mu sync.Mutex
@@ -212,16 +213,6 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1.BlipNode{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
 			return r.poolRequests(ctx, "")
 		})).
-		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
-			if o.GetName() != VMOwnersConfigMap {
-				return nil
-			}
-			var pools v1.BlipPoolList
-			if err := r.List(ctx, &pools, client.InNamespace(o.GetNamespace())); err != nil || len(pools.Items) == 0 {
-				return nil
-			}
-			return []reconcile.Request{req(o.GetNamespace(), pools.Items[0].Name)}
-		})).
 		Named("blippool").
 		WithOptions(controller.Options{MaxConcurrentReconciles: 2}).
 		Complete(r)
@@ -236,8 +227,8 @@ func (r *PoolReconciler) caReader() client.Reader {
 	return r.Client
 }
 
-// State imports and deletions refresh the authorization table even when no
-// Blip currently waits for a VM.
+// namespacePools enqueues the namespace's pools when a state they may place
+// data on changes.
 func (r *PoolReconciler) namespacePools(ctx context.Context, o client.Object) []reconcile.Request {
 	return r.poolRequests(ctx, o.GetNamespace())
 }
@@ -261,9 +252,6 @@ func (r *PoolReconciler) poolRequests(ctx context.Context, namespace string) []r
 }
 
 func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (reconcile.Result, error) {
-	if err := syncVMOwners(ctx, r.Client, rq.Namespace, r.Recorder); err != nil {
-		return reconcile.Result{}, err
-	}
 	pool := &v1.BlipPool{}
 	if err := r.Get(ctx, rq.NamespacedName, pool); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -293,7 +281,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	if err := validatePoolNetwork(pool); err != nil {
 		return reconcile.Result{}, r.invalidPoolSpec(ctx, pool, "InvalidConfiguration", err)
 	}
-	// Refuse to create pods whose api-proxy sidecar would exit at startup.
+	// Refuse to create pods whose Envoy sidecar would exit at startup.
 	// The failure is recorded in pool status and as an Event on the pool, so
 	// an operator can see why no VM becomes ready instead of only finding it
 	// in the controller log.
@@ -302,15 +290,21 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 	}
 	// The API checks the ConfigMap reference's shape; its contents must also
 	// be a usable CA bundle or the sidecar crash-loops before the pod is ready.
-	// Read through the API reader: the manager cache only watches
-	// blip-vm-owners, so a cached Get would report every other ConfigMap as
-	// missing. A transient read failure is retried, not pinned in status.
+	// Read through the API reader so a CA created just before the pool update
+	// is not reported missing. A transient read failure is retried, not pinned
+	// in status.
 	if err := validateEndpointCAs(ctx, r.caReader(), pool); err != nil {
 		var invalid invalidEndpointCAError
 		if !errors.As(err, &invalid) {
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, r.invalidPool(ctx, pool, "InvalidEndpointCA", err)
+	}
+	// The bootstrap is built from the same spec and API server address as the
+	// pod template; an address that cannot be rendered must fail the pool, not
+	// start an Envoy that cannot parse its config.
+	if _, err := envoyBootstrap(pool, r.apiServer()); err != nil {
+		return reconcile.Result{}, r.invalidPool(ctx, pool, "InvalidProxyConfig", err)
 	}
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels{v1.LabelPool: pool.Name}); err != nil {
@@ -460,7 +454,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 		}
 	}
 
-	hash := templateHash(pool, r.RuntimeImage)
+	hash := templateHash(pool, r.Config)
 	created, createdOn, deleted := r.expectations(rq.NamespacedName, pods.Items)
 	// del records pods deleted in this pass. The cached list still shows
 	// them (and the deletion expectation hides them only on the next
@@ -835,7 +829,7 @@ func sortForRemoval(pods []*corev1.Pod) {
 }
 
 // ready reports whether a warm pod can accept a claim. A warm pod is only
-// usable when every container is ready: the api-proxy native sidecar can
+// usable when every container is ready: the Envoy native sidecar can
 // crash-loop (for example on an invalid endpoint CA) while the privileged vm
 // container keeps the pod phase Running, and claiming such a pod gives the
 // guest a dead API/endpoint path. The kubelet's Ready condition covers the
@@ -1136,22 +1130,36 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 	limit.Add(vmLimitOverhead)
 	selector := poolSelector(pool)
 	privileged := true
-	// Only the API proxy gets a token, through an explicit projection. The
-	// privileged runtime and guest never receive service account credentials.
+	// Warm pods have no service-account identity of their own. A claim names
+	// the identity on the pod annotation and the node agent mints its tokens.
 	automount := false
 	grace := terminationGracePeriod
 	hostPathType := corev1.HostPathDirectoryOrCreate
+	podDir := podapi.PodDir(pool.Namespace, name)
+
+	names := make([]string, len(pool.Spec.Endpoints))
+	for i := range pool.Spec.Endpoints {
+		names[i] = pool.Spec.Endpoints[i].Name
+	}
+	credentials := append([]string{apiUpstream}, names...)
+
+	bootstrap, err := envoyBootstrap(pool, r.apiServer())
+	if err != nil {
+		// Pool validation rejects malformed endpoints before a pod is built,
+		// and main validates the API server address at startup.
+		bootstrap = ""
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
 			Namespace:       pool.Namespace,
 			Labels:          map[string]string{v1.LabelPool: pool.Name},
-			Annotations:     map[string]string{v1.AnnotationTemplateHash: templateHash(pool, r.RuntimeImage)},
+			Annotations:     map[string]string{v1.AnnotationTemplateHash: templateHash(pool, r.Config)},
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(pool, v1.GroupVersion.WithKind("BlipPool"))},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                 corev1.RestartPolicyNever,
-			ServiceAccountName:            pool.Spec.ServiceAccountName,
 			AutomountServiceAccountToken:  &automount,
 			TerminationGracePeriodSeconds: &grace,
 			NodeSelector:                  selector,
@@ -1165,6 +1173,8 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 					{Name: "BLIP_CPUS", Value: strconv.Itoa(int(cpus))},
 					{Name: "BLIP_MEMORY_MB", Value: strconv.FormatInt(memory.Value()>>20, 10)},
 					{Name: podapi.NameserversEnv, Value: strings.Join(poolNameservers(pool), ",")},
+					fieldEnv(namespaceEnv, "metadata.namespace"),
+					{Name: endpointNamesEnv, Value: strings.Join(names, ",")},
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
@@ -1184,33 +1194,54 @@ func (r *PoolReconciler) podFor(pool *v1.BlipPool, name string) *corev1.Pod {
 			Volumes: []corev1.Volume{{
 				Name: "pod-dir",
 				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-					Path: podapi.PodDir(pool.Namespace, name),
+					Path: podDir,
 					Type: &hostPathType,
 				}},
 			}, {
 				Name: "vsock",
 				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-					Path: podapi.PodDir(pool.Namespace, name) + "/sock",
+					Path: podDir + "/sock",
 					Type: &hostPathType,
 				}},
+			}, {
+				Name: credsVolume,
+				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+					Path: podDir + "/" + podapi.CredsDir,
+					Type: &hostPathType,
+				}},
+			}, {
+				Name: kubeCAVolume,
+				VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+					Sources: []corev1.VolumeProjection{{ConfigMap: &corev1.ConfigMapProjection{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
+						Items:                []corev1.KeyToPath{{Key: endpointCAFile, Path: endpointCAFile}},
+					}}},
+				}},
 			}},
+			InitContainers: []corev1.Container{
+				proxyInitContainer(r.RuntimeImage, credentials),
+				envoyContainer(r.proxyImage(), bootstrap),
+			},
 		},
 	}
-	if len(pool.Spec.Endpoints) > 0 {
-		names := make([]string, len(pool.Spec.Endpoints))
-		for i, e := range pool.Spec.Endpoints {
-			names[i] = e.Name
+
+	for i := range pool.Spec.Endpoints {
+		e := &pool.Spec.Endpoints[i]
+		if e.CAConfigMap == "" {
+			continue
 		}
-		// The guest only needs the hostnames. Credentials and CA bundles stay
-		// in the sidecar.
-		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
-			corev1.EnvVar{Name: endpointNamesEnv, Value: strings.Join(names, ",")})
-	}
-	if pool.Spec.ServiceAccountName != "" || len(pool.Spec.Endpoints) > 0 {
-		if pool.Spec.ServiceAccountName != "" {
-			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, fieldEnv("BLIP_KUBE_NAMESPACE", "metadata.namespace"))
-		}
-		addAPIProxy(pod, pool, r.RuntimeImage)
+		vol := fmt.Sprintf("endpoint-%d", i)
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: vol,
+			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{{ConfigMap: &corev1.ConfigMapProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: e.CAConfigMap},
+					Items:                []corev1.KeyToPath{{Key: endpointCAFile, Path: endpointCAFile}},
+				}}},
+			}},
+		})
+		pod.Spec.InitContainers[1].VolumeMounts = append(pod.Spec.InitContainers[1].VolumeMounts,
+			corev1.VolumeMount{Name: vol, MountPath: fmt.Sprintf("%s/%d", endpointCAMountRoot, i), ReadOnly: true})
 	}
 	return pod
 }
@@ -1219,36 +1250,56 @@ func fieldEnv(name, path string) corev1.EnvVar {
 	return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: path}}}
 }
 
-// proxyEndpoint is the sidecar's view of one configured endpoint. A file path
-// is present only when the matching credential was projected.
-type proxyEndpoint struct {
-	Name      string `json:"name"`
-	URL       string `json:"url"`
-	TokenFile string `json:"tokenFile,omitempty"`
-	CAFile    string `json:"caFile,omitempty"`
+// proxyInitContainer seeds the sidecar's credential directory before Envoy
+// starts, so file SDS has a document for every upstream even before the node
+// agent mints a token for the claimed Blip.
+func proxyInitContainer(image string, credentials []string) corev1.Container {
+	uid := proxyInitUID
+	enabled, disabled := true, false
+	return corev1.Container{
+		Name:    proxyInitName,
+		Image:   image,
+		Command: []string{"blip-runtime", "proxy-init"},
+		Args: []string{
+			"--dir=" + credsMountPath,
+			"--credentials=" + strings.Join(credentials, ","),
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                &uid,
+			RunAsGroup:               &uid,
+			RunAsNonRoot:             &disabled,
+			Privileged:               &disabled,
+			AllowPrivilegeEscalation: &disabled,
+			ReadOnlyRootFilesystem:   &enabled,
+			// Hand the credential directory to the sidecar's user; that is
+			// the only privileged operation this container performs.
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN"},
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: credsVolume, MountPath: credsMountPath},
+		},
+	}
 }
 
-func addAPIProxy(pod *corev1.Pod, pool *v1.BlipPool, image string) {
-	uid := apiProxyUID
+// envoyContainer is the native sidecar that fronts guest API traffic. One
+// connection manager routes by host, and each upstream cluster injects that
+// upstream's credential, so every guest hostname is authenticated separately.
+func envoyContainer(image, bootstrap string) corev1.Container {
+	uid := envoyUID
 	enabled, disabled := true, false
 	restart := corev1.ContainerRestartPolicyAlways
-	mode := int32(0644)
-	// Kubelet does not apply FSGroup to the hostPath vsock volume; the
-	// privileged runtime creates the socket directory for the non-root proxy.
-	// The pod FSGroup remains for the projected credential volumes.
-	pod.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: &uid}
-	// A native sidecar starts before the VM and stops after it exits, without
-	// keeping the pod alive. Guest API connections retry until it is listening.
-	proxy := corev1.Container{
-		Name:          apiProxyName,
+	return corev1.Container{
+		Name:          envoyName,
 		Image:         image,
-		Command:       []string{"blip-runtime", "api-proxy"},
 		RestartPolicy: &restart,
-		Env: []corev1.EnvVar{
-			// Trusted identity for owner-scoped reads. The guest cannot set
-			// these; they come from the pod's own metadata.
-			fieldEnv("POD_NAME", "metadata.name"),
-			fieldEnv("POD_NAMESPACE", "metadata.namespace"),
+		Args: []string{
+			"-c", "/dev/null",
+			"--config-yaml", bootstrap,
+			"--concurrency", "1",
+			"--disable-hot-restart",
 		},
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                &uid,
@@ -1261,90 +1312,27 @@ func addAPIProxy(pod *corev1.Pod, pool *v1.BlipPool, image string) {
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("10m"),
-				corev1.ResourceMemory: resource.MustParse("16Mi"),
+				corev1.ResourceCPU:    resource.MustParse("20m"),
+				corev1.ResourceMemory: resource.MustParse("32Mi"),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceMemory: resource.MustParse("64Mi"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: "vsock", MountPath: vsockMountPath},
+			{Name: credsVolume, MountPath: credsMountPath, ReadOnly: true},
+			{Name: kubeCAVolume, MountPath: kubeCAMountPath, ReadOnly: true},
+		},
+		// A warm pod is only claimable once the sidecar listens, so the guest
+		// never gets a connection refused during its first API call.
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{
+				Host: "127.0.0.1",
+				Port: intstr.FromInt32(int32(podapi.ProxyPort)),
+			}},
+			PeriodSeconds: 2,
 		},
 	}
-	if pool.Spec.ServiceAccountName != "" {
-		expiration := endpointTokenExpiration
-		proxy.Env = append(proxy.Env, corev1.EnvVar{Name: kubeAPIEnv, Value: "1"})
-		proxy.VolumeMounts = append(proxy.VolumeMounts,
-			corev1.VolumeMount{Name: apiTokenVolume, MountPath: serviceAccountPath, ReadOnly: true})
-		// With no audience override, kubelet requests an API-server token
-		// bound to this pod and refreshes it before expiry. Mount the whole
-		// projection (not a subPath) so the proxy can read the rotated token
-		// on each request.
-		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-			Name: apiTokenVolume,
-			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-				DefaultMode: &mode,
-				Sources: []corev1.VolumeProjection{
-					{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token", ExpirationSeconds: &expiration}},
-					{ConfigMap: &corev1.ConfigMapProjection{
-						LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
-						Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
-					}},
-					{DownwardAPI: &corev1.DownwardAPIProjection{Items: []corev1.DownwardAPIVolumeFile{{
-						Path:     "namespace",
-						FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"},
-					}}}},
-				},
-			}},
-		})
-	}
-	if len(pool.Spec.Endpoints) > 0 {
-		endpoints := make([]proxyEndpoint, 0, len(pool.Spec.Endpoints))
-		for i := range pool.Spec.Endpoints {
-			e := &pool.Spec.Endpoints[i]
-			dir := fmt.Sprintf("%s/%d", endpointMountRoot, i)
-			pe := proxyEndpoint{Name: e.Name, URL: e.URL}
-			var sources []corev1.VolumeProjection
-			if e.Audience != "" {
-				expiration := endpointTokenExpiration
-				sources = append(sources, corev1.VolumeProjection{
-					ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-						Path:              endpointTokenFile,
-						Audience:          e.Audience,
-						ExpirationSeconds: &expiration,
-					},
-				})
-				pe.TokenFile = dir + "/" + endpointTokenFile
-			}
-			if e.CAConfigMap != "" {
-				sources = append(sources, corev1.VolumeProjection{
-					ConfigMap: &corev1.ConfigMapProjection{
-						LocalObjectReference: corev1.LocalObjectReference{Name: e.CAConfigMap},
-						Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: endpointCAFile}},
-					},
-				})
-				pe.CAFile = dir + "/" + endpointCAFile
-			}
-			endpoints = append(endpoints, pe)
-			if len(sources) == 0 {
-				continue
-			}
-			name := fmt.Sprintf("endpoint-%d", i)
-			pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-				Name: name,
-				VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-					DefaultMode: &mode,
-					Sources:     sources,
-				}},
-			})
-			proxy.VolumeMounts = append(proxy.VolumeMounts,
-				corev1.VolumeMount{Name: name, MountPath: dir, ReadOnly: true})
-		}
-		data, _ := json.Marshal(endpoints)
-		proxy.Env = append(proxy.Env, corev1.EnvVar{Name: endpointsEnv, Value: string(data)})
-	}
-	pod.Spec.InitContainers = []corev1.Container{proxy}
 }
 
 // validatePoolNetwork rejects a spec.network that network.Compile cannot turn
@@ -1397,35 +1385,42 @@ func poolShape(pool *v1.BlipPool) (cpus int32, memory resource.Quantity, hypervi
 // templateHash identifies the VM shape a controller builds for a pool. Warm
 // pods keep the shape they were built with, so a change to any of these
 // fields must retire them: reconcile deletes vacant pods whose hash no longer
-// matches. The runtime image is controller configuration rather than pool
-// spec, but it determines the guest version, so a controller rollout with a
-// new image must not leave warm VMs booted by the old one.
-func templateHash(pool *v1.BlipPool, runtimeImage string) string {
+// matches. The runtime and proxy images are controller configuration rather
+// than pool spec, but they determine the guest and sidecar versions, so a
+// controller rollout with a new image must not leave warm VMs booted by the
+// old one.
+//
+// The pool service account is deliberately absent: warm pods carry no
+// identity, and a claim records the Blip's account on the pod. Changing it
+// must not retire identity-free spares.
+func templateHash(pool *v1.BlipPool, cfg Config) string {
 	cpus, memory, hypervisor := poolShape(pool)
 	shape := struct {
-		TopologyVersion    string
-		RuntimeImage       string
-		CPUs               int32
-		Memory             resource.Quantity
-		Hypervisor         string
-		ServiceAccountName string
-		Nameservers        []string
-		Endpoints          []v1.PoolEndpoint `json:",omitempty"`
-		NodeSelector       map[string]string
-		Tolerations        []corev1.Toleration
-		ImagePullSecrets   []corev1.LocalObjectReference `json:",omitempty"`
+		TopologyVersion  string
+		RuntimeImage     string
+		ProxyImage       string
+		APIServer        string
+		CPUs             int32
+		Memory           resource.Quantity
+		Hypervisor       string
+		Nameservers      []string
+		Endpoints        []v1.PoolEndpoint `json:",omitempty"`
+		NodeSelector     map[string]string
+		Tolerations      []corev1.Toleration
+		ImagePullSecrets []corev1.LocalObjectReference `json:",omitempty"`
 	}{
-		TopologyVersion:    podTopologyVersion,
-		RuntimeImage:       runtimeImage,
-		CPUs:               cpus,
-		Memory:             memory,
-		Hypervisor:         hypervisor,
-		ServiceAccountName: pool.Spec.ServiceAccountName,
-		Nameservers:        poolNameservers(pool),
-		Endpoints:          pool.Spec.Endpoints,
-		NodeSelector:       pool.Spec.NodeSelector,
-		Tolerations:        pool.Spec.Tolerations,
-		ImagePullSecrets:   pool.Spec.ImagePullSecrets,
+		TopologyVersion:  podTopologyVersion,
+		RuntimeImage:     cfg.RuntimeImage,
+		ProxyImage:       cfg.proxyImage(),
+		APIServer:        cfg.apiServer(),
+		CPUs:             cpus,
+		Memory:           memory,
+		Hypervisor:       hypervisor,
+		Nameservers:      poolNameservers(pool),
+		Endpoints:        pool.Spec.Endpoints,
+		NodeSelector:     pool.Spec.NodeSelector,
+		Tolerations:      pool.Spec.Tolerations,
+		ImagePullSecrets: pool.Spec.ImagePullSecrets,
 	}
 	// encoding/json sorts map keys, so the same shape always hashes the same.
 	data, _ := json.Marshal(shape)

@@ -93,8 +93,8 @@ spec:
                   properties:
                     audience:
                       description: |-
-                        Audience is the projected service account token audience. It requires
-                        spec.serviceAccountName.
+                        Audience is the projected service account token audience. It needs the
+                        blip (or its pool) to have a service account.
                       type: string
                     caConfigMap:
                       description: |-
@@ -277,10 +277,10 @@ spec:
                 type: object
               serviceAccountName:
                 description: |-
-                  ServiceAccountName is the identity of VMs in this pool. It is capped
-                  below the generic 253-character DNS limit so the "sa.<name>" key in the
-                  VM owner ConfigMap fits the 253-character key limit.
-                maxLength: 250
+                  ServiceAccountName is the default identity of VMs in this pool. A blip
+                  may name its own service account instead. Omitted leaves a blip
+                  unauthenticated unless it sets one.
+                maxLength: 253
                 type: string
               tolerations:
                 items:

@@ -29,6 +29,15 @@ func (a *Agent) sync(ctx context.Context) error {
 	}
 	a.cancelGoneBuilds(v)
 	peerErr := a.syncPeers(v)
+	a.ensureCreds(ctx, v)
+	if a.kube != nil {
+		// Copy the credential state like the other agent maps, so planning
+		// sees one coherent pass.
+		a.mu.Lock()
+		v.credsReady = clone(a.credsReady)
+		v.credsErr = clone(a.credsErr)
+		a.mu.Unlock()
+	}
 	p := compute(v)
 	a.execute(ctx, v, p)
 	return peerErr

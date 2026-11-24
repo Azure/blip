@@ -18,7 +18,7 @@ import (
 )
 
 func testPodNet(run commandRunner) *podNet {
-	return &podNet{iface: "eth0", podIP: "192.0.2.2", guestIP: "169.254.10.2", mac: "02:62:a9:fe:0a:02", run: run}
+	return &podNet{iface: "eth0", podIP: "192.0.2.2", guestIP: "169.254.10.2", gateway: "169.254.10.1", mac: "02:62:a9:fe:0a:02", run: run}
 }
 
 func TestPrivateLinkAvoidsRoutes(t *testing.T) {
@@ -498,6 +498,62 @@ func TestPolicyHasNoInboundAdmission(t *testing.T) {
 		if !strings.Contains(fromGuest, want) {
 			t.Errorf("from_guest lacks %q:\n%s", want, fromGuest)
 		}
+	}
+}
+
+// TestPolicyAllowsSidecarAPIFailClosed covers the guest's path to the Envoy
+// sidecar: the guest sends HTTP to the TAP gateway, prerouting DNATs it to the
+// sidecar's loopback listener, and local input accepts exactly that flow. The
+// rules do not require egress permission, but a warm, deny-all, or explicit
+// empty-layer policy must not open them.
+func TestPolicyAllowsSidecarAPIFailClosed(t *testing.T) {
+	policy := &netpolicy.Policy{Revision: "allow", Layers: [][]netpolicy.Rule{
+		{{CIDR: "0.0.0.0/0", Protocol: "TCP", Port: 443}},
+	}}
+	script, err := testPodNet(nil).policyScript(policy, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accept := `iifname "blip-tap0" ip saddr 169.254.10.2 ip daddr 127.0.0.1 tcp dport 15080 counter accept`
+	drop := `iifname "blip-tap0" counter drop`
+	input := scriptChain(t, script, "input")
+	at, dropAt := strings.Index(input, accept), strings.Index(input, drop)
+	if at < 0 || dropAt < 0 || at > dropAt {
+		t.Fatalf("input does not accept the sidecar flow before the TAP drop:\n%s", input)
+	}
+	dnat := `iifname "blip-tap0" ip saddr 169.254.10.2 ip daddr 169.254.10.1 tcp dport 80 dnat ip to 127.0.0.1:15080`
+	redirect := `iifname "blip-tap0" ip daddr 169.254.10.1 dnat ip to 169.254.10.2`
+	prerouting := scriptChain(t, script, "prerouting")
+	at, redirectAt := strings.Index(prerouting, dnat), strings.Index(prerouting, redirect)
+	if at < 0 || redirectAt < 0 || at > redirectAt {
+		t.Fatalf("prerouting does not DNAT the sidecar flow before the general redirect:\n%s", prerouting)
+	}
+
+	for _, tt := range []struct {
+		name   string
+		policy *netpolicy.Policy
+		active bool
+	}{
+		{"warm policy", policy, false},
+		{"missing policy", nil, true},
+		{"no layers", &netpolicy.Policy{Revision: "deny"}, true},
+		{"empty layer", &netpolicy.Policy{Revision: "deny", Layers: [][]netpolicy.Rule{{}}}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			script, err := testPodNet(nil).policyScript(tt.policy, tt.active)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if at := strings.Index(script, "127.0.0.1 tcp dport 15080"); at >= 0 {
+				t.Errorf("closed policy still admits the sidecar flow:\n%s", script)
+			}
+			if at := strings.Index(script, "tcp dport 80 dnat"); at >= 0 {
+				t.Errorf("closed policy still DNATs the sidecar flow:\n%s", script)
+			}
+			if input := scriptChain(t, script, "input"); !strings.Contains(input, drop) {
+				t.Errorf("closed policy does not drop TAP input:\n%s", input)
+			}
+		})
 	}
 }
 

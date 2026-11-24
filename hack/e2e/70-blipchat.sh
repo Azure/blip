@@ -8,8 +8,8 @@
 # lifecycle (create, get, SSE events, cancel/stop while idle, delete and its
 # BlipState cleanup), private-chat isolation between users, and the sameOrigin
 # guard. The deployed profiles need a real model, so agent turns and
-# authenticated MCP calls (which need a VM's pod-bound projected token) are
-# covered by hack/e2e/opencode with a mock model instead.
+# authenticated MCP calls (which need a VM's pod-bound service-account token)
+# are covered by hack/e2e/opencode with a mock model instead.
 
 pf_pid_70=
 pf_mcp_pid_70=

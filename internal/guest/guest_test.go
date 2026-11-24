@@ -100,33 +100,35 @@ func TestGuestHostnameFitsKernelLimit(t *testing.T) {
 }
 
 func TestHostsFile(t *testing.T) {
-	got := hostsFile("alice.default", "", nil)
+	const gateway = "169.254.10.1"
+	got := hostsFile("alice.default", gateway, nil)
 	for _, want := range []string{
 		"127.0.0.1 localhost\n",
 		"127.0.1.1 alice.default\n",
 		"::1 localhost",
+		gateway + " kube-apiserver\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("hostsFile = %q, want %q", got, want)
 		}
 	}
 	if strings.Contains(got, "127.0.2.2") {
-		t.Fatalf("hostsFile without names wrote a proxy line: %q", got)
+		t.Fatalf("hostsFile kept the removed loopback proxy mapping: %q", got)
 	}
 	if strings.Contains(got, "blip") {
 		t.Fatalf("hostsFile kept a removed guest-local name: %q", got)
 	}
-	if got := hostsFile("alice.default", "sandbox", nil); !strings.Contains(got, "127.0.2.2 kube-apiserver\n") {
-		t.Fatalf("hostsFile with Kubernetes = %q", got)
-	}
-	if got := hostsFile("alice.default", "", []string{"api.default", "db.default"}); !strings.Contains(got, "127.0.2.2 api.default db.default\n") {
+	if got := hostsFile("alice.default", gateway, []string{"api.default", "db.default"}); !strings.Contains(got, gateway+" kube-apiserver api.default db.default\n") {
 		t.Fatalf("hostsFile with endpoints = %q", got)
 	}
-	if got := hostsFile("alice.default", "sandbox", []string{"api.default"}); !strings.Contains(got, "127.0.2.2 kube-apiserver api.default\n") {
-		t.Fatalf("hostsFile with Kubernetes and endpoints = %q", got)
+	if got := hostsFile("alice.default", gateway, []string{"api.default"}); !strings.Contains(got, gateway+" kube-apiserver api.default\n") {
+		t.Fatalf("hostsFile with one endpoint = %q", got)
 	}
-	if got := hostsFile("bad\nname", "", nil); strings.Contains(got, "bad") {
+	if got := hostsFile("bad\nname", gateway, nil); strings.Contains(got, "bad") {
 		t.Fatalf("hostsFile accepted a host name with whitespace: %q", got)
+	}
+	if got := hostsFile("alice.default", "", nil); strings.Contains(got, "kube-apiserver") {
+		t.Fatalf("hostsFile without a gateway wrote an unresolvable name: %q", got)
 	}
 }
 

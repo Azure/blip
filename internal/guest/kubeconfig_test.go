@@ -91,10 +91,6 @@ func TestKubeConfigInstallOutsidePID1(t *testing.T) {
 	if err := g.installKubeConfigLocked("alice.default"); err != errNotInit {
 		t.Fatalf("install = %v, want %v", err, errNotInit)
 	}
-	g.kubeNamespace = ""
-	if err := g.installKubeConfigLocked("alice.default"); err != nil {
-		t.Fatalf("disabled install = %v", err)
-	}
 	if entries, err := os.ReadDir(g.root); err != nil || len(entries) != 0 {
 		t.Fatalf("guest root changed outside PID 1: %v, %v", entries, err)
 	}
@@ -155,9 +151,13 @@ func TestPrimaryKubeconfigEnvironment(t *testing.T) {
 		}
 	}
 	g := &Guest{}
+	var kubeconfigs []string
 	for _, entry := range g.procEnv(&account{}, nil) {
 		if strings.HasPrefix(entry, "KUBECONFIG=") {
-			t.Fatalf("disabled API exported %q", entry)
+			kubeconfigs = append(kubeconfigs, entry)
 		}
+	}
+	if !reflect.DeepEqual(kubeconfigs, []string{"KUBECONFIG=" + kubeconfigPath}) {
+		t.Fatalf("default environment = %v", kubeconfigs)
 	}
 }

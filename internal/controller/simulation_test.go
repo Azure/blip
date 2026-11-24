@@ -194,7 +194,7 @@ func (s *controllerSimulation) restart() {
 func (s *controllerSimulation) deliver() {
 	s.t.Helper()
 	var objects []client.Object
-	for _, list := range []client.ObjectList{&v1.BlipList{}, &v1.BlipStateList{}, &v1.BlipPoolList{}, &v1.BlipNodeList{}, &corev1.PodList{}, &corev1.NodeList{}, &corev1.ConfigMapList{}} {
+	for _, list := range []client.ObjectList{&v1.BlipList{}, &v1.BlipStateList{}, &v1.BlipPoolList{}, &v1.BlipNodeList{}, &corev1.PodList{}, &corev1.NodeList{}, &corev1.ConfigMapList{}, &corev1.ServiceAccountList{}} {
 		s.must(s.c.List(s.ctx, list))
 		s.must(meta.EachListItem(list, func(obj runtime.Object) error {
 			objects = append(objects, obj.(client.Object).DeepCopyObject().(client.Object))
@@ -485,7 +485,6 @@ func TestSimulationPoolDeleteLosesToClaim(t *testing.T) {
 	s.newPool("default", 0, 0)
 	s.readyState("root", "n1", "n2")
 	s.warm("warm-a", "n1")
-	s.must(syncVMOwners(s.ctx, s.c, ns, nil))
 	s.deliver()
 	interleaved := false
 	s.api.before = func(verb string, obj client.Object) {
@@ -593,8 +592,8 @@ func TestSimulationContendedAllocation(t *testing.T) {
 				t.Fatalf("winner lost pod ownership: %+v", got.ObjectMeta)
 			}
 			if !shared {
-				if owner := s.owners()[winner.Status.Pod]; owner != "right" {
-					t.Fatalf("losing claim left wrong authorization: %q", owner)
+				if owner := s.getPod(winner.Status.Pod).Labels[v1.LabelOwner]; owner != "right" {
+					t.Fatalf("losing claim left wrong owner label: %q", owner)
 				}
 			} else if w := s.getState("shared").Status.Writer; w == nil || w.BlipUID != string(winner.UID) {
 				t.Fatalf("losing rollback changed winner's writer: %+v", w)
@@ -606,8 +605,6 @@ func TestSimulationContendedAllocation(t *testing.T) {
 func TestSimulationPoolClockAndListOrder(t *testing.T) {
 	s := newControllerSimulation(t)
 	s.newPool("default", 1, 0)
-	// Establish the owner table before freezing the cache.
-	s.must(syncVMOwners(s.ctx, s.c, ns, nil))
 	s.deliver()
 	s.step("pool", "default")
 	if pods := s.pods(); len(pods) != 1 || pods[0].Name != "default-00001" {

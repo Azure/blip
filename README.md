@@ -23,11 +23,11 @@ Blip provides a Kubernetes-native platform for running workloads in isolated vir
 - Attach multiple durable data volumes (read-only or writable) to a running workload.
 - Control Blips from `kubectl` via a `kubectl blip` plugin to run commands, gather results, logs, stdin, stop executions, mount volumes, and import container images.
 - Record stdin, stdout, stderr, and exit status for each execution, readable while running and after the VM is gone, with timeouts, idle timeouts, and TTL-based cleanup.
-- Use controlled network egress policies and in-guest access to the Kubernetes API with scoped credentials and proxied HTTPS endpoints.
+- Use controlled network egress policies and in-guest access to the Kubernetes API as the Blip's own service account, through a pod-local Envoy sidecar that also proxies fixed HTTPS endpoints.
 
 ## Architecture
 
-Blip runs on Kubernetes and uses a controller to manage pools, states, and executions. A per-node agent provides encrypted replicated storage and VM lifecycle management. Workloads run in Cloud Hypervisor VMs inside ordinary Pods. Users interact with Blip through the Kubernetes API and the CLI.
+Blip runs on Kubernetes and uses a controller to manage pools, states, and executions. A per-node agent provides encrypted replicated storage and VM lifecycle management. Workloads run in Cloud Hypervisor VMs inside ordinary Pods. Each VM Pod's Envoy sidecar injects the Blip's pod-bound service-account token and proxies its fixed HTTPS endpoints. Users interact with Blip through the Kubernetes API and the CLI.
 
 ## Status
 

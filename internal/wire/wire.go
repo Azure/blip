@@ -12,10 +12,6 @@
 //   - ControlPort: the in-pod runtime only (claim, mounts, shutdown).
 //   - StdioPort: the node agent, which owns the command's stdin and output.
 //
-// EndpointPort is a host listener for the guest's loopback HTTP proxy. The
-// guest forwards raw bytes to it; the sidecar routes each request by Host to
-// the Kubernetes API or a configured endpoint and adds credentials.
-//
 // The guest accepts connections only from the host CID (2). Anyone who can
 // reach the Cloud Hypervisor vsock socket already controls the VM, so there
 // is no further authentication.
@@ -36,10 +32,9 @@ import (
 )
 
 const (
-	Version             = 1
-	ControlPort         = 1024
-	StdioPort           = 1026
-	EndpointPort uint32 = 1027
+	Version     = 1
+	ControlPort = 1024
+	StdioPort   = 1026
 	// MaxFrame bounds one frame payload.
 	MaxFrame = 1 << 20
 )

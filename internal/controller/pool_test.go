@@ -4,7 +4,6 @@
 package controller
 
 import (
-	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -357,11 +356,11 @@ func TestPoolPodSpec(t *testing.T) {
 		t.Errorf("owner %+v", ref)
 	}
 	pool := e.getPool("big")
-	if got := p.Annotations[v1.AnnotationTemplateHash]; got == "" || got != templateHash(pool, e.pool.RuntimeImage) {
-		t.Errorf("template hash %q, want %q", got, templateHash(pool, e.pool.RuntimeImage))
+	if got := p.Annotations[v1.AnnotationTemplateHash]; got == "" || got != templateHash(pool, e.pool.Config) {
+		t.Errorf("template hash %q, want %q", got, templateHash(pool, e.pool.Config))
 	}
 	s := p.Spec
-	if s.RestartPolicy != corev1.RestartPolicyNever || s.ServiceAccountName != "agent" || len(s.Tolerations) != 1 {
+	if s.RestartPolicy != corev1.RestartPolicyNever || s.ServiceAccountName != "" || len(s.Tolerations) != 1 {
 		t.Errorf("spec %+v", s)
 	}
 	if s.AutomountServiceAccountToken == nil || *s.AutomountServiceAccountToken {
@@ -388,7 +387,10 @@ func TestPoolPodSpec(t *testing.T) {
 			env[v.Name] = v.ValueFrom.FieldRef.FieldPath
 		}
 	}
-	want := map[string]string{"BLIP_CPUS": "4", "BLIP_MEMORY_MB": "8192", "BLIP_KUBE_NAMESPACE": "metadata.namespace"}
+	want := map[string]string{
+		"BLIP_CPUS": "4", "BLIP_MEMORY_MB": "8192",
+		"BLIP_KUBE_NAMESPACE": "metadata.namespace", "BLIP_ENDPOINT_NAMES": "",
+	}
 	for k, v := range want {
 		if env[k] != v {
 			t.Errorf("env %s=%q, want %q", k, env[k], v)
@@ -409,14 +411,41 @@ func TestPoolPodSpec(t *testing.T) {
 	if hp := s.Volumes[0].HostPath; hp.Path != podapi.PodDir(ns, p.Name) || *hp.Type != corev1.HostPathDirectoryOrCreate || c.VolumeMounts[0].MountPath != "/run/blip" {
 		t.Errorf("volume %+v %+v", hp, c.VolumeMounts)
 	}
+	if len(s.InitContainers) != 2 || s.InitContainers[0].Name != proxyInitName || s.InitContainers[1].Name != envoyName {
+		t.Fatalf("sidecars %+v", s.InitContainers)
+	}
+	init, envoy := s.InitContainers[0], s.InitContainers[1]
+	if init.Image != c.Image || !slices.Equal(init.Command, []string{"blip-runtime", "proxy-init"}) {
+		t.Errorf("proxy-init %+v", init)
+	}
+	if wantArgs := []string{"--dir=" + credsMountPath, "--credentials=kube-apiserver"}; !slices.Equal(init.Args, wantArgs) {
+		t.Errorf("proxy-init args %v, want %v", init.Args, wantArgs)
+	}
+	if envoy.Image != DefaultProxyImage || !hasArg(envoy.Args, "--config-yaml") || !hasArg(envoy.Args, "--disable-hot-restart") {
+		t.Errorf("envoy invocation %+v", envoy.Args)
+	}
+	if !mounted(envoy, credsVolume, credsMountPath, true) || !mounted(envoy, kubeCAVolume, kubeCAMountPath, true) {
+		t.Errorf("envoy mounts %+v", envoy.VolumeMounts)
+	}
 }
 
+// hasArg reports whether args contains want.
+func hasArg(args []string, want string) bool {
+	return slices.Contains(args, want)
+}
+
+// TestPoolPodCredentials checks that neither the runtime nor the guest can
+// read cluster credentials: warm pods carry no service-account token, and the
+// Envoy sidecar reads only the file-SDS directory the node agent fills.
 func TestPoolPodCredentials(t *testing.T) {
 	for _, account := range []string{"", "agent", "default"} {
 		t.Run("account="+account, func(t *testing.T) {
 			e := newEnv(t)
-			pool := &v1.BlipPool{ObjectMeta: metadata("p"), Spec: v1.BlipPoolSpec{ServiceAccountName: account}}
+			pool := &v1.BlipPool{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: ns}, Spec: v1.BlipPoolSpec{ServiceAccountName: account}}
 			p := e.pool.podFor(pool, "p-vm")
+			if p.Spec.ServiceAccountName != "" {
+				t.Errorf("warm pod carries service account %q", p.Spec.ServiceAccountName)
+			}
 			if p.Spec.AutomountServiceAccountToken == nil || *p.Spec.AutomountServiceAccountToken {
 				t.Fatal("VM pod must disable token automount")
 			}
@@ -431,116 +460,85 @@ func TestPoolPodCredentials(t *testing.T) {
 			shared := ""
 			for _, m := range vm.VolumeMounts {
 				v := volumes[m.Name]
-				if v.Projected != nil || v.Secret != nil || m.MountPath == serviceAccountPath {
+				if v.Projected != nil || v.Secret != nil {
 					t.Errorf("runtime has a credential mount: %+v", m)
 				}
-				if m.MountPath == "/run/blip/sock" && !m.ReadOnly && v.HostPath != nil {
+				if m.MountPath == vsockMountPath && !m.ReadOnly && v.HostPath != nil {
 					shared = m.Name
 				}
 			}
 			if shared == "" {
 				t.Fatal("runtime has no shared socket directory")
 			}
-			namespaceEnv := false
+			hasNamespace := false
 			for _, env := range vm.Env {
-				if env.Name == "BLIP_KUBE_NAMESPACE" {
-					namespaceEnv = true
+				if env.Name == namespaceEnv {
+					hasNamespace = true
 					if env.Value != "" || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
 						t.Errorf("namespace must come from DownwardAPI: %+v", env)
 					}
 				}
 			}
-			if namespaceEnv != (account != "") {
-				t.Errorf("namespace env present = %t for account %q", namespaceEnv, account)
+			if !hasNamespace {
+				t.Error("runtime has no namespace env")
 			}
-			if account == "" {
-				if len(p.Spec.InitContainers) != 0 || len(p.Spec.Volumes) != 2 {
-					t.Errorf("tokenless pool has a proxy or credential volume: %+v", p.Spec)
-				}
-				return
+			if len(p.Spec.InitContainers) != 2 {
+				t.Fatalf("want proxy-init and envoy, got %+v", p.Spec.InitContainers)
 			}
-			if len(p.Spec.InitContainers) != 1 {
-				t.Fatalf("want one native sidecar, got %+v", p.Spec.InitContainers)
+			init, envoy := p.Spec.InitContainers[0], p.Spec.InitContainers[1]
+			if init.Name != proxyInitName || init.Image != vm.Image || !slices.Equal(init.Command, []string{"blip-runtime", "proxy-init"}) {
+				t.Errorf("proxy-init invocation: %+v", init)
 			}
-			proxy := p.Spec.InitContainers[0]
-			if proxy.Name != "api-proxy" || proxy.Image != vm.Image || !slices.Equal(proxy.Command, []string{"blip-runtime", "api-proxy"}) {
-				t.Errorf("API proxy invocation: %+v", proxy)
+			if init.RestartPolicy != nil {
+				t.Error("proxy-init must not be a native sidecar")
 			}
-			if proxy.RestartPolicy == nil || *proxy.RestartPolicy != corev1.ContainerRestartPolicyAlways || vm.RestartPolicy != nil {
-				t.Error("API proxy must restart independently and terminate with the VM")
+			if sc := init.SecurityContext; sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 0 ||
+				sc.RunAsNonRoot == nil || *sc.RunAsNonRoot || sc.Privileged == nil || *sc.Privileged ||
+				sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation ||
+				sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem ||
+				sc.Capabilities == nil || !slices.Equal(sc.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+				t.Errorf("proxy-init is not confined: %+v", sc)
 			}
-			sc := proxy.SecurityContext
+			if envoy.Name != envoyName || envoy.Image != DefaultProxyImage {
+				t.Errorf("envoy invocation: %+v", envoy)
+			}
+			if envoy.RestartPolicy == nil || *envoy.RestartPolicy != corev1.ContainerRestartPolicyAlways || vm.RestartPolicy != nil {
+				t.Error("envoy must restart independently and terminate with the VM")
+			}
+			sc := envoy.SecurityContext
 			if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 65532 || sc.RunAsGroup == nil || *sc.RunAsGroup != 65532 || sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
-				t.Fatalf("API proxy must run as non-root uid/gid 65532: %+v", sc)
+				t.Fatalf("envoy must run as non-root uid/gid 65532: %+v", sc)
 			}
 			if sc.Privileged == nil || *sc.Privileged || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation || sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem || sc.Capabilities == nil || len(sc.Capabilities.Add) != 0 || !slices.Equal(sc.Capabilities.Drop, []corev1.Capability{"ALL"}) {
-				t.Errorf("API proxy is not confined: %+v", sc)
+				t.Errorf("envoy is not confined: %+v", sc)
 			}
-			if sc := p.Spec.SecurityContext; sc == nil || sc.FSGroup == nil || *sc.FSGroup != 65532 || sc.RunAsUser != nil {
-				t.Errorf("pod must grant socket access without changing runtime uid: %+v", sc)
+			if p.Spec.SecurityContext != nil && p.Spec.SecurityContext.FSGroup != nil {
+				t.Errorf("pod needs no FSGroup: %+v", p.Spec.SecurityContext)
 			}
-			if cpu := proxy.Resources.Requests.Cpu(); cpu.Sign() <= 0 || cpu.MilliValue() > 100 {
-				t.Errorf("proxy CPU request = %s", cpu.String())
+			if cpu := envoy.Resources.Requests.Cpu(); cpu.MilliValue() != 20 {
+				t.Errorf("envoy CPU request = %s", cpu.String())
 			}
-			if memory := proxy.Resources.Limits.Memory(); memory.Sign() <= 0 || memory.Value() > 128<<20 {
-				t.Errorf("proxy memory limit = %s", memory.String())
+			if memory := envoy.Resources.Requests.Memory(); memory.Value() != 32<<20 {
+				t.Errorf("envoy memory request = %s", memory.String())
 			}
-			if len(proxy.Env) != 3 {
-				t.Fatalf("proxy should carry its trusted identity and API mode: %+v", proxy.Env)
+			if memory := envoy.Resources.Limits.Memory(); memory.Value() != 128<<20 {
+				t.Errorf("envoy memory limit = %s", memory.String())
 			}
-			wantProxyEnv := map[string]string{"POD_NAME": "metadata.name", "POD_NAMESPACE": "metadata.namespace"}
-			kubeAPI := ""
-			for _, env := range proxy.Env {
-				if env.Name == kubeAPIEnv {
-					kubeAPI = env.Value
-					continue
+			if !mounted(envoy, credsVolume, credsMountPath, true) || !mounted(envoy, kubeCAVolume, kubeCAMountPath, true) {
+				t.Errorf("envoy mounts %+v", envoy.VolumeMounts)
+			}
+			if v := volumes[credsVolume]; v.HostPath == nil || v.HostPath.Path != podapi.PodDir(ns, "p-vm")+"/"+podapi.CredsDir || *v.HostPath.Type != corev1.HostPathDirectoryOrCreate {
+				t.Errorf("creds volume %+v", v)
+			}
+			if v := volumes[kubeCAVolume].Projected; v == nil || len(v.Sources) != 1 ||
+				v.Sources[0].ConfigMap == nil || v.Sources[0].ConfigMap.Name != "kube-root-ca.crt" ||
+				len(v.Sources[0].ConfigMap.Items) != 1 || v.Sources[0].ConfigMap.Items[0].Key != "ca.crt" {
+				t.Errorf("kube CA volume %+v", v)
+			}
+			for _, v := range p.Spec.Volumes {
+				if v.Name == "api-token" || v.Secret != nil {
+					t.Errorf("unexpected credential volume %+v", v)
 				}
-				if env.Value != "" || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil ||
-					env.ValueFrom.FieldRef.FieldPath != wantProxyEnv[env.Name] {
-					t.Errorf("proxy identity must come from the DownwardAPI: %+v", env)
-				}
-				delete(wantProxyEnv, env.Name)
-			}
-			if len(wantProxyEnv) != 0 {
-				t.Errorf("missing proxy identity env: %v", wantProxyEnv)
-			}
-			if kubeAPI != "1" {
-				t.Errorf("proxy API mode = %q, want 1", kubeAPI)
-			}
-			if len(proxy.VolumeMounts) != 2 {
-				t.Fatalf("proxy should mount only sockets and credentials: %+v", proxy.VolumeMounts)
-			}
-			var token *corev1.ProjectedVolumeSource
-			for _, m := range proxy.VolumeMounts {
-				v := volumes[m.Name]
-				switch m.MountPath {
-				case "/run/blip/sock":
-					if m.Name != shared || m.ReadOnly || v.HostPath == nil || !strings.HasSuffix(v.HostPath.Path, "/sock") {
-						t.Errorf("proxy socket mount is not shared: %+v", m)
-					}
-				case serviceAccountPath:
-					if !m.ReadOnly || m.SubPath != "" || m.SubPathExpr != "" {
-						t.Errorf("credential mount must support read-only rotation: %+v", m)
-					}
-					token = v.Projected
-				default:
-					t.Errorf("unexpected proxy mount: %+v", m)
-				}
-				if v.HostPath != nil && m.MountPath != "/run/blip/sock" {
-					t.Errorf("proxy can access the host pod directory: %+v", m)
-				}
-			}
-			if token == nil || len(token.Sources) != 3 {
-				t.Fatalf("missing projected API credentials: %+v", token)
-			}
-			if s := token.Sources[0].ServiceAccountToken; s == nil || s.Path != "token" || s.Audience != "" || s.ExpirationSeconds == nil || *s.ExpirationSeconds != 3600 {
-				t.Errorf("want rotating pod-bound API token: %+v", s)
-			}
-			if s := token.Sources[1].ConfigMap; s == nil || s.Name != "kube-root-ca.crt" || len(s.Items) != 1 || s.Items[0].Key != "ca.crt" || s.Items[0].Path != "ca.crt" {
-				t.Errorf("missing API CA projection: %+v", s)
-			}
-			if s := token.Sources[2].DownwardAPI; s == nil || len(s.Items) != 1 || s.Items[0].Path != "namespace" || s.Items[0].FieldRef == nil || s.Items[0].FieldRef.FieldPath != "metadata.namespace" {
-				t.Errorf("missing namespace projection: %+v", s)
 			}
 		})
 	}
@@ -555,9 +553,9 @@ func envValue(c corev1.Container, name string) string {
 	return ""
 }
 
-// TestPoolPodEndpoints checks the sidecar an endpoint-only pool gets: no API
-// credentials, a projection per endpoint that needs one, and only hostnames in
-// the guest.
+// TestPoolPodEndpoints checks the pods an endpoint-only pool gets: endpoint
+// hostnames in the guest, credential-free guests, per-endpoint CA volumes, and
+// one Envoy chain per endpoint.
 func TestPoolPodEndpoints(t *testing.T) {
 	e := newEnv(t)
 	pool := &v1.BlipPool{ObjectMeta: metadata("p"), Spec: v1.BlipPoolSpec{Endpoints: []v1.PoolEndpoint{
@@ -567,80 +565,57 @@ func TestPoolPodEndpoints(t *testing.T) {
 	}}}
 	p := e.pool.podFor(pool, "p-vm")
 	vm := p.Spec.Containers[0]
-	if len(p.Spec.InitContainers) != 1 {
-		t.Fatalf("want one native sidecar, got %+v", p.Spec.InitContainers)
-	}
-	proxy := p.Spec.InitContainers[0]
-	if proxy.Name != apiProxyName || !slices.Equal(proxy.Command, []string{"blip-runtime", "api-proxy"}) {
-		t.Errorf("API proxy invocation: %+v", proxy)
-	}
 	if got := envValue(vm, endpointNamesEnv); got != "whoami,metrics,ca-only" {
 		t.Errorf("%s = %q, want whoami,metrics,ca-only", endpointNamesEnv, got)
 	}
-	if got := envValue(vm, endpointsEnv); got != "" {
-		t.Errorf("guest received sidecar endpoint config: %q", got)
-	}
-	if got := envValue(proxy, kubeAPIEnv); got != "" {
-		t.Errorf("endpoint-only pool enabled the Kubernetes API: %q", got)
-	}
 	for _, m := range vm.VolumeMounts {
-		if strings.HasPrefix(m.Name, "endpoint-") {
-			t.Errorf("guest mounts endpoint credentials: %+v", m)
+		if strings.HasPrefix(m.Name, "endpoint-") || m.Name == credsVolume || m.Name == kubeCAVolume {
+			t.Errorf("guest mounts sidecar credentials: %+v", m)
 		}
 	}
-
-	var got []proxyEndpoint
-	if err := json.Unmarshal([]byte(envValue(proxy, endpointsEnv)), &got); err != nil {
-		t.Fatalf("%s is not JSON: %v", endpointsEnv, err)
+	if len(p.Spec.InitContainers) != 2 {
+		t.Fatalf("want proxy-init and envoy, got %+v", p.Spec.InitContainers)
 	}
-	want := []proxyEndpoint{
-		{Name: "whoami", URL: "https://whoami.example.com", TokenFile: endpointMountRoot + "/0/token", CAFile: endpointMountRoot + "/0/ca.crt"},
-		{Name: "metrics", URL: "https://metrics.example.com:8443"},
-		{Name: "ca-only", URL: "https://ca.example.com", CAFile: endpointMountRoot + "/2/ca.crt"},
+	init, envoy := p.Spec.InitContainers[0], p.Spec.InitContainers[1]
+	if want := "--credentials=kube-apiserver,whoami,metrics,ca-only"; !slices.Contains(init.Args, want) {
+		t.Errorf("proxy-init args %v, want %s", init.Args, want)
 	}
-	if !slices.Equal(got, want) {
-		t.Errorf("%s = %+v, want %+v", endpointsEnv, got, want)
-	}
-
 	volumes := map[string]corev1.Volume{}
 	for _, v := range p.Spec.Volumes {
 		volumes[v.Name] = v
 	}
-	if _, ok := volumes[apiTokenVolume]; ok {
-		t.Error("endpoint-only pool has an API token volume")
-	}
 	if _, ok := volumes["endpoint-1"]; ok {
-		t.Error("metrics endpoint without credentials has a volume")
+		t.Error("metrics endpoint without a CA has a volume")
 	}
-	tokenAndCA := volumes["endpoint-0"].Projected
-	if tokenAndCA == nil || len(tokenAndCA.Sources) != 2 {
-		t.Fatalf("whoami projection: %+v", tokenAndCA)
+	for i, cm := range map[int]string{0: "whoami-ca", 2: "ca-only-ca"} {
+		v := volumes[fmt.Sprintf("endpoint-%d", i)].Projected
+		if v == nil || len(v.Sources) != 1 || v.Sources[0].ConfigMap == nil ||
+			v.Sources[0].ConfigMap.Name != cm || len(v.Sources[0].ConfigMap.Items) != 1 ||
+			v.Sources[0].ConfigMap.Items[0].Key != "ca.crt" {
+			t.Errorf("endpoint %d CA volume %+v", i, v)
+		}
+		if !mounted(envoy, fmt.Sprintf("endpoint-%d", i), fmt.Sprintf("%s/%d", endpointCAMountRoot, i), true) {
+			t.Errorf("envoy does not mount endpoint %d CA: %+v", i, envoy.VolumeMounts)
+		}
 	}
-	if s := tokenAndCA.Sources[0].ServiceAccountToken; s == nil || s.Path != "token" ||
-		s.Audience != "blip-gateway" || s.ExpirationSeconds == nil || *s.ExpirationSeconds != 3600 {
-		t.Errorf("whoami token projection: %+v", s)
+	if mounted(envoy, "endpoint-1", endpointCAMountRoot+"/1") {
+		t.Errorf("envoy mounts credential-free endpoint 1: %+v", envoy.VolumeMounts)
 	}
-	if s := tokenAndCA.Sources[1].ConfigMap; s == nil || s.Name != "whoami-ca" ||
-		len(s.Items) != 1 || s.Items[0].Key != "ca.crt" || s.Items[0].Path != "ca.crt" {
-		t.Errorf("whoami CA projection: %+v", s)
+	args := envoy.Args
+	found := false
+	for i := range args {
+		if args[i] == "--config-yaml" && i+1 < len(args) {
+			found = strings.Contains(args[i+1], "whoami") && strings.Contains(args[i+1], "ca-only")
+		}
 	}
-	if ca := volumes["endpoint-2"].Projected; ca == nil || len(ca.Sources) != 1 ||
-		ca.Sources[0].ConfigMap == nil || ca.Sources[0].ConfigMap.Name != "ca-only-ca" {
-		t.Errorf("ca-only projection: %+v", ca)
-	}
-	if !mounted(proxy, "endpoint-0", endpointMountRoot+"/0", true) {
-		t.Errorf("sidecar does not mount endpoint 0: %+v", proxy.VolumeMounts)
-	}
-	if !mounted(proxy, "endpoint-2", endpointMountRoot+"/2", true) {
-		t.Errorf("sidecar does not mount endpoint 2: %+v", proxy.VolumeMounts)
-	}
-	if mounted(proxy, "endpoint-1", endpointMountRoot+"/1") {
-		t.Errorf("sidecar mounts credential-free endpoint 1: %+v", proxy.VolumeMounts)
+	if !found {
+		t.Errorf("envoy has no endpoint bootstrap: %v", args)
 	}
 }
 
-// TestPoolPodEndpointsWithServiceAccount keeps the API credential alongside
-// endpoint credentials.
+// TestPoolPodEndpointsWithServiceAccount keeps API and endpoint credentials
+// in the same sidecar: the API chain always exists, even for endpoint-only
+// pools.
 func TestPoolPodEndpointsWithServiceAccount(t *testing.T) {
 	e := newEnv(t)
 	pool := &v1.BlipPool{ObjectMeta: metadata("p"), Spec: v1.BlipPoolSpec{
@@ -648,21 +623,21 @@ func TestPoolPodEndpointsWithServiceAccount(t *testing.T) {
 		Endpoints:          []v1.PoolEndpoint{{Name: "whoami", URL: "https://whoami.example.com"}},
 	}}
 	p := e.pool.podFor(pool, "p-vm")
-	vm, proxy := p.Spec.Containers[0], p.Spec.InitContainers[0]
-	if got := envValue(proxy, kubeAPIEnv); got != "1" {
-		t.Errorf("%s = %q, want 1", kubeAPIEnv, got)
-	}
-	if !mounted(proxy, apiTokenVolume, serviceAccountPath, true) {
-		t.Errorf("sidecar does not mount the API token: %+v", proxy.VolumeMounts)
+	vm, init, envoy := p.Spec.Containers[0], p.Spec.InitContainers[0], p.Spec.InitContainers[1]
+	if want := "--credentials=kube-apiserver,whoami"; !slices.Contains(init.Args, want) {
+		t.Errorf("proxy-init args %v, want %s", init.Args, want)
 	}
 	if !slices.ContainsFunc(vm.Env, func(env corev1.EnvVar) bool {
-		return env.Name == "BLIP_KUBE_NAMESPACE" && env.ValueFrom != nil &&
+		return env.Name == namespaceEnv && env.ValueFrom != nil &&
 			env.ValueFrom.FieldRef != nil && env.ValueFrom.FieldRef.FieldPath == "metadata.namespace"
 	}) {
 		t.Errorf("runtime has no namespace env: %+v", vm.Env)
 	}
-	if got := envValue(proxy, endpointsEnv); got == "" {
-		t.Error("sidecar has no endpoint config")
+	if !mounted(envoy, credsVolume, credsMountPath, true) || !mounted(envoy, kubeCAVolume, kubeCAMountPath, true) {
+		t.Errorf("envoy mounts %+v", envoy.VolumeMounts)
+	}
+	if p.Spec.ServiceAccountName != "" {
+		t.Errorf("warm pod carries service account %q", p.Spec.ServiceAccountName)
 	}
 }
 
@@ -814,14 +789,14 @@ func TestTemplateHashTracksNameservers(t *testing.T) {
 		}
 		return p
 	}
-	ref := templateHash(pool(), runtimeImage)
-	if got := templateHash(pool(), runtimeImage); got != ref {
+	ref := templateHash(pool(), Config{RuntimeImage: runtimeImage})
+	if got := templateHash(pool(), Config{RuntimeImage: runtimeImage}); got != ref {
 		t.Fatalf("hash is not stable: %q != %q", got, ref)
 	}
-	if got := templateHash(pool("9.9.9.9"), runtimeImage); got == ref {
+	if got := templateHash(pool("9.9.9.9"), Config{RuntimeImage: runtimeImage}); got == ref {
 		t.Error("configured nameservers do not change the template hash")
 	}
-	if templateHash(pool("9.9.9.9", "8.8.8.8"), runtimeImage) == templateHash(pool("8.8.8.8", "9.9.9.9"), runtimeImage) {
+	if templateHash(pool("9.9.9.9", "8.8.8.8"), Config{RuntimeImage: runtimeImage}) == templateHash(pool("8.8.8.8", "9.9.9.9"), Config{RuntimeImage: runtimeImage}) {
 		t.Error("nameserver order does not change the template hash")
 	}
 }
@@ -831,8 +806,8 @@ func TestTemplateHashTracksEndpoints(t *testing.T) {
 		return &v1.BlipPool{Spec: v1.BlipPoolSpec{Endpoints: endpoints}}
 	}
 	whoami := v1.PoolEndpoint{Name: "whoami", URL: "https://whoami.example.com"}
-	ref := templateHash(pool(whoami), runtimeImage)
-	if got := templateHash(pool(whoami), runtimeImage); got != ref {
+	ref := templateHash(pool(whoami), Config{RuntimeImage: runtimeImage})
+	if got := templateHash(pool(whoami), Config{RuntimeImage: runtimeImage}); got != ref {
 		t.Fatalf("hash is not stable: %q != %q", got, ref)
 	}
 	mutations := []struct {
@@ -846,7 +821,7 @@ func TestTemplateHashTracksEndpoints(t *testing.T) {
 		{"added endpoint", pool(whoami, v1.PoolEndpoint{Name: "metrics", URL: "https://metrics.example.com"})},
 	}
 	for _, m := range mutations {
-		if templateHash(m.pool, runtimeImage) == ref {
+		if templateHash(m.pool, Config{RuntimeImage: runtimeImage}) == ref {
 			t.Errorf("%s does not change the template hash", m.name)
 		}
 	}
@@ -915,14 +890,26 @@ func TestTemplateHashTracksPoolShape(t *testing.T) {
 			ServiceAccountName: "vm", NodeSelector: map[string]string{"zone": "a", "rack": "r1"},
 		}}
 	}
-	ref := templateHash(base(), runtimeImage)
-	if got := templateHash(base(), runtimeImage); got != ref {
+	ref := templateHash(base(), Config{RuntimeImage: runtimeImage})
+	if got := templateHash(base(), Config{RuntimeImage: runtimeImage}); got != ref {
 		t.Fatalf("hash is not stable: %q != %q", got, ref)
 	}
-	// The runtime image comes from the controller, not the pool spec, but it
-	// decides which guest binaries boot in a warm VM.
-	if got := templateHash(base(), "reg/blip-runtime:other"); got == ref {
+	// The runtime and proxy images come from the controller, not the pool
+	// spec, but they decide which binaries boot in a warm VM.
+	if got := templateHash(base(), Config{RuntimeImage: "reg/blip-runtime:other"}); got == ref {
 		t.Error("runtime image does not change the template hash")
+	}
+	if got := templateHash(base(), Config{RuntimeImage: runtimeImage, ProxyImage: "envoyproxy/envoy:other"}); got == ref {
+		t.Error("proxy image does not change the template hash")
+	}
+	if got := templateHash(base(), Config{RuntimeImage: runtimeImage, APIServer: "other.example.com:6443"}); got == ref {
+		t.Error("API server address does not change the template hash")
+	}
+	// Warm pods carry no identity: the pool account must not retire them.
+	other := base()
+	other.Spec.ServiceAccountName = "other"
+	if got := templateHash(other, Config{RuntimeImage: runtimeImage}); got != ref {
+		t.Error("pool service account changes the template hash")
 	}
 	mutations := []struct {
 		name   string
@@ -931,7 +918,6 @@ func TestTemplateHashTracksPoolShape(t *testing.T) {
 		{"cpus", func(p *v1.BlipPool) { p.Spec.CPUs = 4 }},
 		{"memory", func(p *v1.BlipPool) { p.Spec.Memory = resource.MustParse("4Gi") }},
 		{"hypervisor", func(p *v1.BlipPool) { p.Spec.Hypervisor = "other" }},
-		{"service account", func(p *v1.BlipPool) { p.Spec.ServiceAccountName = "other" }},
 		{"node selector", func(p *v1.BlipPool) { p.Spec.NodeSelector["zone"] = "b" }},
 		{"tolerations", func(p *v1.BlipPool) {
 			p.Spec.Tolerations = []corev1.Toleration{{Key: "blip", Operator: corev1.TolerationOpExists}}
@@ -943,7 +929,7 @@ func TestTemplateHashTracksPoolShape(t *testing.T) {
 	for _, m := range mutations {
 		p := base()
 		m.mutate(p)
-		if templateHash(p, runtimeImage) == ref {
+		if templateHash(p, Config{RuntimeImage: runtimeImage}) == ref {
 			t.Errorf("%s does not change the template hash", m.name)
 		}
 	}
@@ -951,9 +937,9 @@ func TestTemplateHashTracksPoolShape(t *testing.T) {
 
 func TestTemplateHashIgnoresMutableNetwork(t *testing.T) {
 	pool := &v1.BlipPool{}
-	before := templateHash(pool, runtimeImage)
+	before := templateHash(pool, Config{RuntimeImage: runtimeImage})
 	pool.Spec.Network = &v1.NetworkPolicy{Egress: []v1.NetworkEgressRule{{}}}
-	if templateHash(pool, runtimeImage) != before {
+	if templateHash(pool, Config{RuntimeImage: runtimeImage}) != before {
 		t.Error("network changes must be reconciled in place, not replace warm VMs")
 	}
 }
@@ -964,7 +950,7 @@ func TestPoolReplacesLegacyTopology(t *testing.T) {
 	pool := e.getPool("default")
 	// Hash generated by the pre-sidecar template for this unchanged pool.
 	const legacyHash = "35baaef82aa3b469"
-	if templateHash(pool, e.pool.RuntimeImage) == legacyHash {
+	if templateHash(pool, e.pool.Config) == legacyHash {
 		t.Fatal("template hash does not version the new pod topology")
 	}
 	old := e.pool.podFor(pool, "default-old")
@@ -989,7 +975,8 @@ func TestPoolReplacesLegacyTopology(t *testing.T) {
 				t.Error("claimed legacy pod was changed")
 			}
 		default:
-			if p.Annotations[v1.AnnotationTemplateHash] != templateHash(pool, e.pool.RuntimeImage) || !hasAPIProxyToken(&p) {
+			if p.Annotations[v1.AnnotationTemplateHash] != templateHash(pool, e.pool.Config) ||
+				!slices.ContainsFunc(p.Spec.InitContainers, func(c corev1.Container) bool { return c.Name == envoyName }) {
 				t.Errorf("replacement is missing the new topology: %+v", p)
 			}
 		}
@@ -1019,7 +1006,7 @@ func TestPoolReplacesStaleVacantPods(t *testing.T) {
 	e.run(e.pool, ns, "default")
 
 	pods := e.pods()
-	wantHash := templateHash(e.getPool("default"), e.pool.RuntimeImage)
+	wantHash := templateHash(e.getPool("default"), e.pool.Config)
 	vacant := 0
 	for _, p := range pods {
 		if p.Name == "default-old" {
@@ -1062,7 +1049,7 @@ func TestPoolReplacesStaleRuntimeImage(t *testing.T) {
 	claimed.Labels[v1.LabelBlipUID] = "uid-claimed"
 	e.create(stale, claimed)
 
-	wantHash := templateHash(pool, e.pool.RuntimeImage)
+	wantHash := templateHash(pool, e.pool.Config)
 	if got := stale.Annotations[v1.AnnotationTemplateHash]; got == wantHash {
 		t.Fatalf("old and new runtime images share hash %q", got)
 	}

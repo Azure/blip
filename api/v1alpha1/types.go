@@ -61,10 +61,11 @@ type BlipPoolSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=2147483647
 	MaxCount int32 `json:"maxCount,omitempty"`
-	// ServiceAccountName is the identity of VMs in this pool. It is capped
-	// below the generic 253-character DNS limit so the "sa.<name>" key in the
-	// VM owner ConfigMap fits the 253-character key limit.
-	// +kubebuilder:validation:MaxLength=250
+	// ServiceAccountName is the default identity of VMs in this pool. A blip
+	// may name its own service account instead. Omitted leaves a blip
+	// unauthenticated unless it sets one.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Endpoints exposes fixed HTTPS endpoints to workloads at http://<name>/.
 	// +optional
@@ -112,8 +113,8 @@ type PoolEndpoint struct {
 	// outbound Host header.
 	// +kubebuilder:validation:Pattern=`^https://[a-z0-9]([-.a-z0-9]*[a-z0-9])?(:[0-9]{1,5})?$`
 	URL string `json:"url"`
-	// Audience is the projected service account token audience. It requires
-	// spec.serviceAccountName.
+	// Audience is the projected service account token audience. It needs the
+	// blip (or its pool) to have a service account.
 	// +optional
 	Audience string `json:"audience,omitempty"`
 	// CAConfigMap holds a ca.crt key that verifies the endpoint. Omitted
@@ -653,6 +654,15 @@ type BlipSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="pool is immutable"
 	Pool string `json:"pool,omitempty"`
+	// ServiceAccountName is the identity of the blip's guest. It defaults to
+	// the pool's service account. Any service account in the blip's namespace
+	// may be named, the same rule as for pods. Omitted with no pool default
+	// leaves the guest unauthenticated.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="serviceAccountName is immutable"
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// State gives the blip a durable root filesystem. A new version is
 	// saved when the blip stops. Mounts and runtime defaults come from this
 	// state in the blip's namespace.

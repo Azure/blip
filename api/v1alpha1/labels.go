@@ -49,13 +49,17 @@ const (
 
 	// AnnotationParent is the full short name of the blip a fork was started
 	// from, including names too long for LabelParent's hash.
-	AnnotationParent          = "blip.dev/parent-name"
-	AnnotationBlip            = "blip.dev/blip"
-	AnnotationObserved        = "blip.dev/observed"
-	AnnotationPrepareError    = "blip.dev/prepare-error"
-	AnnotationForceRecover    = "blip.dev/force-recover-writer"
-	AnnotationCollectMounts   = "blip.dev/collect-mounts"
-	AnnotationTemplateHash    = "blip.dev/template-hash"
+	AnnotationParent        = "blip.dev/parent-name"
+	AnnotationBlip          = "blip.dev/blip"
+	AnnotationObserved      = "blip.dev/observed"
+	AnnotationPrepareError  = "blip.dev/prepare-error"
+	AnnotationForceRecover  = "blip.dev/force-recover-writer"
+	AnnotationCollectMounts = "blip.dev/collect-mounts"
+	AnnotationTemplateHash  = "blip.dev/template-hash"
+	// AnnotationServiceAccount is the service account a claimed warm pod's
+	// guest acts as. "-" means the guest has no identity. The controller sets
+	// it at claim; the node agent mints tokens for it.
+	AnnotationServiceAccount  = "blip.dev/service-account"
 	AnnotationEnrollmentDrain = "blip.dev/enrollment-drain"
 	AnnotationPinnedNode      = "blip.dev/pinned-node"
 	// AnnotationRelocated marks a warm pod the pool created by moving a spare

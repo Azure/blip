@@ -138,6 +138,10 @@ func newWorld() *world {
 		return metav1.ObjectMeta{Name: n, Namespace: ns, UID: types.UID("uid-" + n), ResourceVersion: "1", Generation: 1, CreationTimestamp: metav1.NewTime(epoch)}
 	}
 	w.Actual.Pools.Items = []v1.BlipPool{{ObjectMeta: meta("default"), Spec: v1.BlipPoolSpec{Hypervisor: "kvm", CPUs: 2, Memory: resource.MustParse("2Gi"), WarmCount: 2, MaxCount: 2, ServiceAccountName: "vm"}}}
+	// The pool's identity must exist: claims resolve it before taking a pod.
+	sa := corev1.ServiceAccount{ObjectMeta: meta("vm")}
+	w.Actual.ServiceAccounts.Items = []corev1.ServiceAccount{sa}
+	w.Cache.ServiceAccounts.Items = []corev1.ServiceAccount{sa}
 	w.Actual.Blips.Items = []v1.Blip{{ObjectMeta: meta("first"), Spec: v1.BlipSpec{Pool: "default", State: "root"}}}
 	for i, name := range []string{"n1", "n2"} {
 		m := meta(name)
@@ -365,7 +369,13 @@ func (w *world) progress(lose bool) error {
 				continue
 			}
 			x := p.DeepCopy()
-			x.Spec.NodeName = fmt.Sprintf("n%d", i+1)
+			dest := fmt.Sprintf("n%d", i+1)
+			// A cold cache can briefly over-create a warm pod. Leave the
+			// surplus unscheduled; the pool retires it as a spare.
+			if w.Directories[dest] == nil {
+				continue
+			}
+			x.Spec.NodeName = dest
 			must(c.Update(ctx, x))
 			x.Status.Phase = corev1.PodRunning
 			must(c.Status().Update(ctx, x))
@@ -377,6 +387,11 @@ func (w *world) progress(lose bool) error {
 			w.publishPods(w.nodePlan(name))
 		}
 		for _, p := range w.Actual.Pods.Items {
+			// A cold cache can over-create a spare before the pool retires
+			// it; an unscheduled pod is not boot capacity.
+			if p.Spec.NodeName == "" {
+				continue
+			}
 			next = next && p.Labels[v1.LabelWarm] == "true"
 		}
 	case 2, 32:

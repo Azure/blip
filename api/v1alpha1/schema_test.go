@@ -735,19 +735,6 @@ func TestInt32FieldsBounded(t *testing.T) {
 	}
 }
 
-// ownerTableDNSName returns a valid DNS-subdomain name of exactly n
-// characters, as a service account name would be.
-func ownerTableDNSName(n int) string {
-	var s string
-	for len(s) < n {
-		if s != "" {
-			s += "."
-		}
-		s += strings.Repeat("a", min(63, n-len(s)))
-	}
-	return s
-}
-
 // TestInt32AdmissionBoundaries proves admission rejects one past int32 max and
 // still accepts the exact maximum.
 func TestInt32AdmissionBoundaries(t *testing.T) {
@@ -1024,34 +1011,6 @@ func TestStateReferenceNameLimits(t *testing.T) {
 	}
 	if got := stateSpec.Properties["mounts"].Items.Properties["state"].MaxLength; got != 253 {
 		t.Errorf("BlipState.spec.mounts[].state maxLength = %d, want 253", got)
-	}
-}
-
-// TestBlipPoolServiceAccountNameFitsOwnerTable guards the same limit on the
-// "sa.<name>" key. The field has no DNS pattern, so without a cap a 251-byte
-// name was accepted and wedged the owner table.
-func TestBlipPoolServiceAccountNameFitsOwnerTable(t *testing.T) {
-	spec := loadCRDSpec(t, "../../deploy/crd/blip.dev_blippools.yaml")
-	sa, ok := spec.Properties["serviceAccountName"]
-	if !ok {
-		t.Fatal("generated CRD has no spec.serviceAccountName property")
-	}
-	if sa.MaxLength != 250 {
-		t.Errorf("spec.serviceAccountName maxLength = %d, want 250", sa.MaxLength)
-	}
-
-	validate := admissionValidator(t, "blippools")
-	for _, n := range []int{0, 63, 250} {
-		name := ownerTableDNSName(n)
-		object := fmt.Sprintf(`{"spec":{"nodeSelector":{"a":"b"},"serviceAccountName":%q}}`, name)
-		if errs := validate(object, ""); len(errs) != 0 {
-			t.Errorf("rejected %d-character service account name: %v", n, errs.ToAggregate())
-		}
-	}
-	name := ownerTableDNSName(251)
-	object := fmt.Sprintf(`{"spec":{"nodeSelector":{"a":"b"},"serviceAccountName":%q}}`, name)
-	if errs := validate(object, ""); len(errs) == 0 {
-		t.Errorf("admitted 251-character service account name %q", name)
 	}
 }
 

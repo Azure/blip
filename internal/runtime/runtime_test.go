@@ -470,10 +470,9 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	o := Options{Dir: dir, SkipNetwork: true, KubeNamespace: "tenant", CH: "/bin/true"}
-	// The API sidecar can bind its suffix socket before the VMM starts.
-	suffix := podapi.VsockListenerPath(dir, wire.EndpointPort)
-	vsockDir := filepath.Dir(suffix)
-	if err := os.MkdirAll(vsockDir, 0o770); err != nil { // kubelet fsGroup mode
+	// The vsock emptyDir may already exist with kubelet's fsGroup mode.
+	vsockDir := filepath.Dir(o.path(podapi.VsockSocket))
+	if err := os.MkdirAll(vsockDir, 0o770); err != nil {
 		t.Fatal(err)
 	}
 	// MkdirAll is subject to the process umask; kubelet's emptyDir handling
@@ -481,11 +480,6 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 	if err := os.Chmod(vsockDir, 0o770); err != nil {
 		t.Fatal(err)
 	}
-	listener, err := net.Listen("unix", suffix)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
 	// /bin/true never binds CH's sockets; secureCHSockets is covered by its
 	// own test.
 	r := &runtime{o: o, vmDone: make(chan struct{}), secureSockets: func() error { return nil }}
@@ -501,13 +495,10 @@ func TestBootNamespaceAndVsockDirectory(t *testing.T) {
 	if err != nil || cfg.KubeNamespace != "tenant" {
 		t.Fatalf("config %+v: %v", cfg, err)
 	}
-	if _, err := os.Stat(suffix); err != nil {
-		t.Fatalf("sidecar socket removed: %v", err)
-	}
 	if got := modeOf(t, dir); got != 0o700 {
 		t.Fatalf("pod directory mode %#o, want 0700", got)
 	}
-	// The vsock emptyDir is shared with the non-root API proxy (fsGroup).
+	// The vsock emptyDir is shared with kubelet's fsGroup.
 	if got := modeOf(t, vsockDir); got != 0o770 {
 		t.Fatalf("vsock directory mode %#o, want 0770 preserved", got)
 	}

@@ -63,9 +63,9 @@ on a server that ACP already provided.
 ## MCP endpoints
 
 Blip pool endpoint URLs are origin-only: the configured URL cannot contain a
-path. The api-proxy still forwards the guest's request path and query to the
-upstream, so the path a profile configures for an MCP server matters.
+path. The Envoy sidecar still forwards the guest's request path and query to
+the upstream, so the path a profile configures for an MCP server matters.
 
-The proxy must supply any upstream authentication. The sidecar strips caller
-`Authorization` and identity headers, and a Blip projected token is a Kubernetes
-service-account token, not a third-party credential.
+The sidecar supplies the upstream authentication it is configured for. It
+strips caller `Authorization` and identity headers, and a Blip token is a
+Kubernetes service-account token, not a third-party credential.

@@ -20,6 +20,7 @@ import (
 
 	"github.com/Azure/blip/internal/bootconfig"
 	"github.com/Azure/blip/internal/netpolicy"
+	"github.com/Azure/blip/internal/podapi"
 )
 
 // TestNetworkNamespace is opt-in and ALL network mutations run in child
@@ -162,6 +163,11 @@ func testNetworkNamespace(t *testing.T) {
 			}
 		}
 	}
+	// The sidecar DNAT targets loopback, which the kernel otherwise refuses
+	// from a non-loopback interface.
+	if value, err := os.ReadFile("/proc/sys/net/ipv4/conf/" + tapName + "/route_localnet"); err != nil || strings.TrimSpace(string(value)) != "1" {
+		t.Fatalf("%s/route_localnet not enabled: %s %v", tapName, value, err)
+	}
 	// Substitute a veth peer for the VMM/TAP endpoint to exercise real kernel
 	// forwarding, conntrack and NAT without KVM or a guest image.
 	ip("link", "del", tapName)
@@ -176,6 +182,9 @@ func testNetworkNamespace(t *testing.T) {
 		if err := p.setSysctl("ipv4/conf/"+tapName+"/"+key, "0", false); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := p.setSysctl("ipv4/conf/"+tapName+"/route_localnet", "1", false); err != nil {
+		t.Fatal(err)
 	}
 	peerIP(vm, "link", "set", "lo", "up")
 	peerIP(vm, "link", "set", "vm", "up")
@@ -231,6 +240,35 @@ func testNetworkNamespace(t *testing.T) {
 	allowed(request)
 	udp := nsCommand{Op: "exchange", Network: "udp", Address: "198.51.100.10:5353"}
 	allowed(udp)
+	// The guest reaches the sidecar at the TAP gateway on port 80. The
+	// prerouting DNAT rewrites it to the sidecar's loopback listener, which
+	// accepts it as local input without an egress rule.
+	apiListener, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(int(podapi.ProxyPort)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer apiListener.Close()
+	go func() {
+		for {
+			c, err := apiListener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				msg, err := bufio.NewReader(c).ReadString('\n')
+				if err != nil {
+					return
+				}
+				host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+				_, _ = io.WriteString(c, host+"|"+msg)
+			}()
+		}
+	}()
+	apiRequest := nsCommand{Op: "exchange", Network: "tcp", Address: cfg.Gateway + ":80"}
+	if got := vm.must(t, apiRequest); got != cfg.IP+"|hello\n" {
+		t.Fatalf("sidecar DNAT source = %q", got)
+	}
 	denied(nsCommand{Op: "exchange", Network: "tcp", Address: "198.51.100.10:8081"}) // AND layers
 	denied(nsCommand{Op: "exchange", Network: "tcp", Address: "198.51.100.11:8080"}) // Except
 	spoof := request
@@ -290,6 +328,8 @@ func testNetworkNamespace(t *testing.T) {
 		denied(receive)
 		denied(c)
 	}
+	// An explicit deny-all revokes the sidecar API path too.
+	denied(apiRequest)
 	checkSidecar(request.Address, p.podIP)
 	// Egress rules never admit new inbound connections: the policy is
 	// egress-only, so a peer cannot reach a guest listener even when its

@@ -121,6 +121,22 @@ roleRef:
 The `gateway/envoy` service account must exist. Do **not** automatically grant
 this permission to VM service accounts.
 
+## Guest API identity
+
+A Blip's guest reaches the Kubernetes API as the Blip's service account:
+`spec.serviceAccountName` when set, otherwise its pool's. The node agent mints
+a short-lived, pod-bound token for that account. The pod's Envoy sidecar,
+bound to loopback port 15080, adds the token to guest requests; the guest
+kubeconfig itself holds no credential. The runtime redirects the guest's TAP
+gateway to that loopback port, so `kube-apiserver` resolves through the
+sidecar, which also proxies the pool's fixed HTTPS endpoints.
+
+Isolation is now RBAC on that service account. **Breaking change:** the
+`blip-vm-owner` admission policy and its `blip-vm-owners` table are gone, so an
+owner label no longer confines a restricted Blip by name. Blips that share a
+pool service account share its permissions; give each trust boundary its own
+service account and RBAC.
+
 ## Envoy ordering and trust boundaries
 
 1. Run Envoy `jwt_authn` **first**, requiring successful validation of the VM

@@ -3,14 +3,14 @@
 
 # shellcheck shell=bash
 # shellcheck disable=SC2016
-# Endpoint proxy, in-guest Kubernetes access with owner scoping, and the
-# default egress policy.
+# Guest access to the Kubernetes API through the Envoy sidecar, fixed pool
+# endpoints, service-account identity, and the default egress policy.
 
 cleanup_30() {
 	k delete blip --ignore-not-found --wait=false \
-		"$P-ep" "$P-netpol" "$P-top" "$P-owner.child" "$P-top.evil" >/dev/null 2>&1 || true
+		"$P-ep" "$P-netpol" "$P-top" "$P-child" >/dev/null 2>&1 || true
 	k delete blipstate --ignore-not-found --wait=false \
-		"$P-ep" "$P-netpol" "$P-top" "$P-owner.child" "$P-owner.evil" >/dev/null 2>&1 || true
+		"$P-ep" "$P-netpol" "$P-top" "$P-child" >/dev/null 2>&1 || true
 	k delete blippool --ignore-not-found --wait=false \
 		"$P-endpoint" >/dev/null 2>&1 || true
 }
@@ -22,10 +22,6 @@ is_30_pool_gone() {
 
 is_30_pool_pods_gone() {
 	[ -z "$(k get pods -l "blip.dev/pool=$1" -o name 2>/dev/null || true)" ]
-}
-
-is_30_owner() {
-	[ "$(k get configmap blip-vm-owners -o jsonpath="{.data['$1']}" 2>/dev/null)" = "$2" ]
 }
 
 is_30_identity() {
@@ -84,27 +80,15 @@ spec:
       caConfigMap: kube-root-ca.crt
 EOF
 
-step "probe the endpoint proxy from inside a blip"
+step "probe a fixed pool endpoint from inside a blip"
 blip_shell "$P-ep" --pool "$P-endpoint" --from "$P-base"
 expect_ok_grep "endpoint proxy" "endpoint-ok" blip_exec "$P-ep" '
 	set -eu
-	# The guest name resolves through 127.0.2.2; the sidecar adds the CA and
+	# The guest name resolves through the TAP gateway, where the runtime
+	# redirects to the pod-local Envoy sidecar. The sidecar adds the CA and
 	# forwards /version to the unauthenticated API server route.
 	version=$(curl -fsS --max-time 15 http://e2e-api/version)
 	printf "%s" "$version" | grep -q gitVersion
-	# Unknown hosts never reach an upstream.
-	code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 -H "Host: no-such-endpoint" http://127.0.2.2/)
-	test "$code" = 421
-	# A CONNECT through the loopback listener is rejected before dialing.
-	# curl reports the proxy status in its error, not as an HTTP code.
-	err=$(curl -sS -o /dev/null --max-time 10 -x http://127.0.2.2:80 https://example.invalid/ 2>&1 || true)
-	case "$err" in
-	*"response 405"*) ;;
-	*)
-		echo "CONNECT was not rejected with 405: $err"
-		exit 1
-		;;
-	esac
 	echo endpoint-ok
 '
 
@@ -144,72 +128,62 @@ k delete blippool "$P-endpoint" --ignore-not-found --wait=false >/dev/null
 wait_for 120 "pool $P-endpoint to be removed" is_30_pool_gone "$P-endpoint"
 wait_for 120 "pool $P-endpoint pods to be removed" is_30_pool_pods_gone "$P-endpoint"
 
-step "run a top-level blip and check unrestricted in-guest Kubernetes access"
+step "run a top-level blip and check in-guest Kubernetes API access"
 blip_shell "$P-top" --from "$P-base"
 expect_ok_grep "top-level blip lists blips" "$P-top" \
 	blip_exec "$P-top" 'kubectl get blips -o name'
 
-step "create a child inside the parent and give it a restricted owner"
-# A top-level blip has no owner label, so a child started from it is
-# unrestricted too. Name the child under an owner prefix and label both it
-# and its root state after the fork has committed; the controller then
-# records that owner for the child's VM token and keeps the state usable.
-child=$(blip_exec "$P-top" "blip run --name '$P-owner.child' --interactive --from / -- bash")
-test "$child" = "$P-owner.child"
-wait_blip_phase "$child" Running
-pod=$(blip_pod "$child")
-test -n "$pod"
-k patch blipstate "$child" --type merge -p "$(cat <<EOF
-{"metadata":{"labels":{"blip.dev/owner":"$P-owner"}}}
-EOF
-)" >/dev/null
-k patch blip "$child" --type merge -p "$(cat <<EOF
-{"metadata":{"labels":{"blip.dev/owner":"$P-owner"}}}
-EOF
-)" >/dev/null
-wait_for 120 "owner table entry for $pod" is_30_owner "$pod" "$P-owner"
-# Let the admission policy's ConfigMap informer observe the same table entry.
-sleep 2
-
-step "verify the child's owner-scoped reads and writes"
-expect_ok_grep "owner-scoped child" "child-scope-ok" blip_exec "$child" \
-	"CHILD=$child BASE=$P-base ROOT=$P-top OWNER=$P-owner
-"'
+step "watch the API through the Envoy sidecar"
+# The guest kubeconfig has no credential. The runtime redirects the TAP
+# gateway to the pod-local Envoy sidecar on loopback 15080, which adds the
+# Blip's pod-bound service-account token. A watch is a long-lived chunked
+# response, so this also checks that the sidecar streams rather than buffers.
+expect_ok_grep "in-guest API watch" "watch-ok" blip_exec "$P-top" '
 	set -eu
-	ns=$(cat /run/blip/namespace)
-	api=http://kube-apiserver
-	# Own blip and the shared base are readable by name.
-	code=$(curl -sS -o /dev/null -w "%{http_code}" "$api/apis/blip.dev/v1alpha1/namespaces/$ns/blips/$CHILD")
-	test "$code" = 200
-	code=$(curl -sS -o /dev/null -w "%{http_code}" "$api/apis/blip.dev/v1alpha1/namespaces/$ns/blipstates/$BASE")
-	test "$code" = 200
-	# The unlabelled parent is administrator-private and must look absent.
-	code=$(curl -sS -o /dev/null -w "%{http_code}" "$api/apis/blip.dev/v1alpha1/namespaces/$ns/blips/$ROOT")
-	test "$code" = 404
-	# Admission must stop a name outside the owner prefix before it is stored.
-	err=$(mktemp)
-	if kubectl create -f - >"$err" 2>&1 <<-EOF
-	apiVersion: blip.dev/v1alpha1
-	kind: Blip
-	metadata:
-	  name: $ROOT.evil
-	  labels:
-	    blip.dev/owner: $OWNER
-	spec:
-	  pool: default
-	  state: $OWNER.evil
-	  command: ["true"]
-	EOF
-	then
-		echo "creating $ROOT.evil was accepted"
-		cat "$err"
-		exit 1
-	fi
-	grep -q "may only write objects named $OWNER." "$err"
-	echo child-scope-ok
+	kubectl get --raw "/api/v1/namespaces/default/pods?watch=true&resourceVersion=0&timeoutSeconds=1" |
+		grep -q "\"type\":\"ADDED\""
+	echo watch-ok
 '
 
-step "delete the owner-scoped child and its parent"
+step "create a child from inside the parent"
+# The blip-vm-owner admission policy and its owner table are gone. Isolation
+# is now the Blip's own service-account RBAC: this child runs as the pool's
+# service account and can do exactly what that account may do. Blips that
+# share a pool service account share its permissions.
+child=$(blip_exec "$P-top" "blip run --name '$P-child' --interactive --from / --service-account blip-agent -- bash")
+test "$child" = "$P-child"
+wait_blip_phase "$child" Running
+
+step "verify the child's pod-bound service-account identity"
+expect_ok_grep "child service account" "child-sa-ok" blip_exec "$child" '
+	set -eu
+	user=$(kubectl auth whoami -o jsonpath="{.status.userInfo.username}")
+	test "$user" = system:serviceaccount:default:blip-agent
+	# The account can create blips but has no broad read of Secrets.
+	kubectl get blips -o name >/dev/null
+	if kubectl get secrets >/dev/null 2>&1; then
+		echo "service account can read secrets"
+		exit 1
+	fi
+	echo child-sa-ok
+'
+
+step "feed the child's stdin and read its output through the guest API"
+expect_ok_grep "in-guest exec stream" "exec-ok" blip_exec "$P-top" "
+	set -eu
+	printf 'echo exec-ok\n' | blip send '$P-child' - >/dev/null
+	i=0
+	until blip logs '$P-child' --raw 2>/dev/null | grep -q exec-ok; do
+		i=\$((i + 1))
+		if [ \"\$i\" -ge 30 ]; then
+			echo 'no exec output through the stream API'
+			exit 1
+		fi
+		sleep 1
+	done
+"
+
+step "delete the child and its parent"
 k delete blip "$child" "$P-top" --ignore-not-found --wait=false >/dev/null
 wait_blip_gone "$child"
 wait_blip_gone "$P-top"

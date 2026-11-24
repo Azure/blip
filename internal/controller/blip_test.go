@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -304,7 +305,7 @@ func TestBlipRejectsStaleWarmPodsBeforePoolCleanup(t *testing.T) {
 				delete(old.Annotations, v1.AnnotationTemplateHash)
 			case "old pool shape":
 				previous := pool.DeepCopy()
-				previous.Spec.ServiceAccountName = "previous"
+				previous.Spec.CPUs++
 				old = e.pool.podFor(previous, old.Name)
 			case "old runtime image":
 				previous := &PoolReconciler{Client: e.c, Config: e.pool.Config}
@@ -356,9 +357,13 @@ func TestClaimRechecksLivePool(t *testing.T) {
 			e.must(e.c.Update(e.ctx, p))
 		}, false},
 		{"service account changed", func(e *env, p *v1.BlipPool) {
+			// Warm pods carry no identity: the claim records the Blip's, so
+			// a pool account change does not invalidate them. The new account
+			// must exist or the claim is gated.
+			e.create(&corev1.ServiceAccount{ObjectMeta: metadata("replacement")})
 			p.Spec.ServiceAccountName = "replacement"
 			e.must(e.c.Update(e.ctx, p))
-		}, false},
+		}, true},
 		{"deleted", func(e *env, p *v1.BlipPool) { e.must(e.c.Delete(e.ctx, p)) }, false},
 		{"deleting", func(e *env, p *v1.BlipPool) {
 			p.Finalizers = []string{"test"}
@@ -403,8 +408,8 @@ func TestClaimRechecksLivePool(t *testing.T) {
 				t.Fatalf("pod claim was not persisted correctly: %+v", p.Labels)
 			}
 			if !tt.wantClaim {
-				if _, ok := e.owners()[candidates[0].Name]; ok {
-					t.Error("ineligible pod received an owner entry")
+				if got := e.getPod(candidates[0].Name).Annotations[v1.AnnotationServiceAccount]; got != "" {
+					t.Errorf("ineligible pod received a service-account annotation: %q", got)
 				}
 			}
 		})
@@ -430,8 +435,8 @@ func TestClaimRejectsConcurrentTemplateChange(t *testing.T) {
 	if pod != nil || !isVacant(e.getPod(candidates[0].Name)) {
 		t.Fatal("claim ignored a concurrent pod template change")
 	}
-	if _, ok := e.owners()[candidates[0].Name]; ok {
-		t.Error("failed claim left an owner entry")
+	if got := e.getPod(candidates[0].Name).Annotations[v1.AnnotationServiceAccount]; got != "" {
+		t.Errorf("failed claim left a service-account annotation: %q", got)
 	}
 }
 
@@ -685,5 +690,90 @@ func TestFailedCommandReportsError(t *testing.T) {
 	expectPhase(t, b, v1.BlipFailed, ReasonError)
 	if b.Status.ExitCode == nil || *b.Status.ExitCode != 1 || b.Status.Message != "boom" {
 		t.Errorf("status %+v", b.Status)
+	}
+}
+
+// A claimed pod always records the identity the guest acts as. The node agent
+// mints tokens from this annotation, so it must be written with the claim.
+func TestClaimAnnotatesServiceAccount(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		blipSA string
+		poolSA string
+		want   string
+	}{
+		{name: "pool account", poolSA: "vm", want: "vm"},
+		{name: "blip account", blipSA: "agent", poolSA: "vm", want: "agent"},
+		{name: "no identity", want: "-"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.addNodes("n1")
+			poolName := "open"
+			e.create(&v1.BlipPool{
+				ObjectMeta: metadata(poolName),
+				Spec:       v1.BlipPoolSpec{Hypervisor: "kvm", WarmCount: 1, ServiceAccountName: tt.poolSA},
+			})
+			if tt.poolSA != "" {
+				e.create(&corev1.ServiceAccount{ObjectMeta: metadata(tt.poolSA)})
+			}
+			if tt.blipSA != "" {
+				e.create(&corev1.ServiceAccount{ObjectMeta: metadata(tt.blipSA)})
+			}
+			e.run(e.pool, ns, poolName)
+			e.warmOn("n1")
+			e.newBlip("b", e.withImage("reg/img:v1"), func(b *v1.Blip) {
+				b.Spec.Pool = poolName
+				b.Spec.ServiceAccountName = tt.blipSA
+			})
+			e.run(e.blip, ns, "b")
+			b := e.getBlip("b")
+			expectPhase(t, b, v1.BlipRunning, "")
+			pod := e.getPod(b.Status.Pod)
+			if got := pod.Annotations[v1.AnnotationServiceAccount]; got != tt.want {
+				t.Errorf("annotation %q, want %q", got, tt.want)
+			}
+			if pod.Spec.ServiceAccountName != "" {
+				t.Errorf("claimed pod still carries pod service account %q", pod.Spec.ServiceAccountName)
+			}
+		})
+	}
+}
+
+// A missing identity must not consume a warm VM: token minting for it would
+// fail, so the Blip waits until the account exists.
+func TestClaimWaitsForMissingServiceAccount(t *testing.T) {
+	e := newEnv(t)
+	e.addNodes("n1")
+	e.create(&v1.BlipPool{
+		ObjectMeta: metadata("open"),
+		Spec:       v1.BlipPoolSpec{Hypervisor: "kvm", WarmCount: 1, ServiceAccountName: "missing"},
+	})
+	e.run(e.pool, ns, "open")
+	e.warmOn("n1")
+	e.newBlip("b", e.withImage("reg/img:v1"), func(b *v1.Blip) { b.Spec.Pool = "open" })
+
+	res := e.run(e.blip, ns, "b")
+	b := e.getBlip("b")
+	expectPhase(t, b, v1.BlipPending, ReasonServiceAccountNotFound)
+	if b.Status.Pod != "" {
+		t.Fatalf("claimed a pod without the identity: %+v", b.Status)
+	}
+	if res.RequeueAfter <= 0 || res.RequeueAfter > time.Minute {
+		t.Errorf("RequeueAfter = %v, want a short retry", res.RequeueAfter)
+	}
+	for _, p := range e.pods() {
+		if !isVacant(&p) {
+			t.Errorf("pod %s was claimed", p.Name)
+		}
+	}
+
+	// Creating the account lets the next reconcile claim the same warm pod.
+	e.create(&corev1.ServiceAccount{ObjectMeta: metadata("missing")})
+	e.run(e.blip, ns, "b")
+	b = e.getBlip("b")
+	expectPhase(t, b, v1.BlipRunning, "")
+	if got := e.getPod(b.Status.Pod).Annotations[v1.AnnotationServiceAccount]; got != "missing" {
+		t.Errorf("annotation %q, want missing", got)
 	}
 }

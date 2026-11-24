@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -50,6 +51,10 @@ const (
 	ReasonNetworkFailed = "NetworkFailed"
 	ReasonSaveFailed    = "SaveFailed"
 	ReasonInvalidStatus = "InvalidStatus"
+	// ReasonServiceAccountNotFound gates a claim on an identity the pool or
+	// Blip names but the namespace does not have. Minting tokens for a
+	// missing account fails, so no warm pod is claimed until it exists.
+	ReasonServiceAccountNotFound = "ServiceAccountNotFound"
 )
 
 // exitAnnotationGrace lets a pod that reported Succeeded still publish its
@@ -69,6 +74,10 @@ const (
 	// pendingTimeout bounds how long a Blip may wait for a VM before it is
 	// claimed. Image builds and state copies happen in this window.
 	pendingTimeout = 30 * time.Minute
+	// serviceAccountRetry paces reconciliation while a named identity does
+	// not exist. It is short because creating the account is the fix, not a
+	// configuration change the pool watch would deliver.
+	serviceAccountRetry = 5 * time.Second
 )
 
 // BlipReconciler runs the Blip lifecycle.
@@ -700,6 +709,13 @@ func (r *BlipReconciler) pending(ctx context.Context, b, base *v1.Blip) (reconci
 	}
 	if pod == nil {
 		if pod, err = r.claim(ctx, b, candidates); err != nil {
+			var missing *serviceAccountNotFoundError
+			if errors.As(err, &missing) {
+				// No identity, no claim: minting tokens would fail, so wait
+				// for the account instead of consuming a warm VM.
+				wait(b, ReasonServiceAccountNotFound, missing.Error())
+				return reconcile.Result{RequeueAfter: serviceAccountRetry}, r.unclaim(ctx, b)
+			}
 			return reconcile.Result{}, err
 		}
 	}
@@ -929,7 +945,7 @@ func (r *BlipReconciler) warmPods(b *v1.Blip, pool *v1.BlipPool, states map[stri
 	for _, p := range pods {
 		// Never claim a VM on a node that is not a usable BlipNode: missing
 		// Kubernetes Node, draining, stale heartbeat, or no incarnation.
-		if claimableForPool(&p, pool, r.RuntimeImage) && cl.usable(p.Spec.NodeName, nil) {
+		if claimableForPool(&p, pool, r.Config) && cl.usable(p.Spec.NodeName, nil) {
 			out = append(out, p)
 		}
 	}
@@ -953,10 +969,36 @@ func (r *BlipReconciler) warmPods(b *v1.Blip, pool *v1.BlipPool, states map[stri
 // claimableForPool excludes stale warm VMs before the pool reconciler has
 // deleted them. Claiming one would let it keep its old topology or guest
 // image indefinitely.
-func claimableForPool(p *corev1.Pod, pool *v1.BlipPool, runtimeImage string) bool {
+func claimableForPool(p *corev1.Pod, pool *v1.BlipPool, cfg Config) bool {
 	return pool.DeletionTimestamp == nil && p.Namespace == pool.Namespace &&
-		p.Labels[v1.LabelPool] == pool.Name && p.Annotations[v1.AnnotationTemplateHash] == templateHash(pool, runtimeImage) &&
+		p.Labels[v1.LabelPool] == pool.Name && p.Annotations[v1.AnnotationTemplateHash] == templateHash(pool, cfg) &&
 		isVacant(p) && ready(p)
+}
+
+// blipServiceAccount is the identity a Blip's guest acts as: its own
+// spec.serviceAccountName, else its pool's. Empty means no identity.
+func blipServiceAccount(b *v1.Blip, pool *v1.BlipPool) string {
+	if b.Spec.ServiceAccountName != "" {
+		return b.Spec.ServiceAccountName
+	}
+	return pool.Spec.ServiceAccountName
+}
+
+// serviceAccountAnnotation is the pod annotation value for an identity. "-"
+// means the claimed guest has none, matching a vacant pod's absence.
+func serviceAccountAnnotation(sa string) string {
+	if sa == "" {
+		return "-"
+	}
+	return sa
+}
+
+// serviceAccountNotFoundError reports a claim gated on an identity the
+// namespace does not have. Minting tokens for it would fail.
+type serviceAccountNotFoundError struct{ name string }
+
+func (e *serviceAccountNotFoundError) Error() string {
+	return fmt.Sprintf("service account %q not found", e.name)
 }
 
 // claim takes the first candidate that nobody changed since the cache saw
@@ -972,15 +1014,36 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 		if err := r.Live.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: poolName(b)}, pool); err != nil {
 			return nil, client.IgnoreNotFound(err)
 		}
-		if !claimableForPool(base, pool, r.RuntimeImage) {
+		if !claimableForPool(base, pool, r.Config) {
 			continue
+		}
+		// The identity is resolved from the live pool used for this attempt,
+		// then checked through the live reader. A missing account must not
+		// consume a VM: token minting for it would fail. The cache can lag an
+		// account that already exists, and waiting on it would stall a claim.
+		sa := blipServiceAccount(b, pool)
+		if sa != "" {
+			var account corev1.ServiceAccount
+			reader := client.Reader(r.Client)
+			if r.Live != nil {
+				reader = r.Live
+			}
+			if err := reader.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: sa}, &account); err != nil {
+				if apierrors.IsNotFound(err) {
+					return nil, &serviceAccountNotFoundError{name: sa}
+				}
+				return nil, err
+			}
 		}
 		p := base.DeepCopy()
 		if p.Labels == nil {
 			p.Labels = map[string]string{}
 		}
 		p.Labels[v1.LabelBlipUID] = string(b.UID)
-		if owner := blipOwner(b); owner != "" {
+		// The owner label is plain metadata for clients and policies. It no
+		// longer gates an API proxy; the guest's identity is the annotation
+		// below.
+		if owner := b.Labels[v1.LabelOwner]; owner != "" {
 			p.Labels[v1.LabelOwner] = owner
 		} else {
 			delete(p.Labels, v1.LabelOwner)
@@ -989,17 +1052,14 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 			p.Annotations = map[string]string{}
 		}
 		p.Annotations[v1.AnnotationBlip] = b.Name
+		// The node agent mints this identity's tokens as soon as it sees the
+		// claim. Write it in the same patch, so a claimed pod never lacks it.
+		p.Annotations[v1.AnnotationServiceAccount] = serviceAccountAnnotation(sa)
 		p.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(b, v1.GroupVersion.WithKind("Blip"))}
-		if err := setVMOwner(ctx, r.Client, p, b); err != nil {
-			return nil, err
-		}
 		// The claim patch is atomic: a lost race leaves the live pod, including
-		// its owner label, unchanged. Only the admission table needs restoring.
+		// its annotations and owner label, unchanged.
 		err := patchObject(ctx, r.Client, p, base)
 		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
-			if err := restoreVMOwner(ctx, r.Client, r.Live, p.Namespace, p.Name); err != nil {
-				return nil, err
-			}
 			continue
 		}
 		if err != nil {
@@ -1009,28 +1069,6 @@ func (r *BlipReconciler) claim(ctx context.Context, b *v1.Blip, candidates []cor
 		return p, nil
 	}
 	return nil, nil
-}
-
-// syncPodOwner keeps a claimed pod's owner label equal to its Blip's. The
-// label is written at claim time, but an owner added or changed afterwards
-// must propagate: the api-proxy authorizes pod reads by the pod label, so a
-// stale label hides the guest's own pod (or leaves it visible to the previous
-// owner).
-func (r *BlipReconciler) syncPodOwner(ctx context.Context, b *v1.Blip, pod *corev1.Pod) error {
-	owner := blipOwner(b)
-	if pod.Labels[v1.LabelOwner] == owner {
-		return nil
-	}
-	base := pod.DeepCopy()
-	if pod.Labels == nil {
-		pod.Labels = map[string]string{}
-	}
-	if owner == "" {
-		delete(pod.Labels, v1.LabelOwner)
-	} else {
-		pod.Labels[v1.LabelOwner] = owner
-	}
-	return client.IgnoreNotFound(patchObject(ctx, r.Client, pod, base))
 }
 
 func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *corev1.Pod) error {
@@ -1049,9 +1087,6 @@ func (r *BlipReconciler) startRunning(ctx context.Context, b *v1.Blip, pod *core
 	fresh := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: pod.Name}, fresh); err == nil && string(fresh.UID) == b.Status.PodUID {
 		pod = fresh
-	}
-	if err := r.syncPodOwner(ctx, b, pod); err != nil {
-		return err
 	}
 	if err := r.ensureWriterPods(ctx, b); err != nil {
 		return err
@@ -1112,11 +1147,6 @@ func (r *BlipReconciler) running(ctx context.Context, b *v1.Blip, base *v1.Blip)
 		pod = nil
 	} else if err != nil {
 		return reconcile.Result{}, err
-	}
-	if pod != nil {
-		if err := r.syncPodOwner(ctx, b, pod); err != nil {
-			return reconcile.Result{}, err
-		}
 	}
 	var obs podapi.Observed
 	if pod != nil {

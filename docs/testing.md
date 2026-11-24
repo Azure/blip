@@ -32,7 +32,7 @@ After each scenario the harness also checks that no running blips leaked.
 | `15-cli` | run labels and preflight, interrupted runs, stop, send `--eof` and stdin, logs offsets/state/follow, gather `--wait`, pull flags, mount replicas |
 | `20-runtime` | env, workdir, user, image defaults, stdout/stderr, exit codes, stdin |
 | `25-pool` | pool CPUs, memory, DNS, tolerations, pull secrets; idle timeout; locality |
-| `30-network` | endpoints, pod identity, owner scoping, egress policy |
+| `30-network` | endpoints, pod identity, guest service-account access, egress policy |
 | `40-mounts` | auxiliary mounts, read-only enforcement, mount removal and copies |
 | `50-state` | single writer, conflicts, state deletion, gather options, TTL, stop |
 | `55-build` | build recipes, incremental builds, history limit, git cache labels |

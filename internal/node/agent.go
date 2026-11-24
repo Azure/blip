@@ -85,6 +85,8 @@ type Agent struct {
 	cfg     Config
 	client  client.Client // reads come from the informer cache
 	live    client.Reader // uncached reads
+	kube    kubernetes.Interface
+	now     func() time.Time
 	store   Store
 	open    func(ctx context.Context, node string, req peer.ExportRequest) (storage.Remote, error)
 	pull    func(ctx context.Context, ref string, secrets []registryauth.PullSecret, dir string) (image.Config, string, error)
@@ -104,6 +106,9 @@ type Agent struct {
 	stateErrs    map[string]string
 	progress     map[string]*v1alpha1.Transfer
 	configs      map[string]*image.Config
+	creds        map[string]*podCreds // podKey -> minted token set
+	credsReady   map[string]bool      // podKey -> credential files usable
+	credsErr     map[string]string    // podKey -> why credentials are missing
 	podsGone     map[string]bool
 	statesGone   map[string]bool
 	blipsGone    map[string]bool
@@ -119,6 +124,7 @@ func newAgent(cfg Config, c client.Client, live client.Reader, st Store) *Agent 
 		cfg:        cfg,
 		client:     c,
 		live:       live,
+		now:        time.Now,
 		store:      st,
 		mknod:      mknodDevice,
 		pinned:     func(string) bool { return false },
@@ -132,6 +138,9 @@ func newAgent(cfg Config, c client.Client, live client.Reader, st Store) *Agent 
 		stateErrs:  map[string]string{},
 		progress:   map[string]*v1alpha1.Transfer{},
 		configs:    map[string]*image.Config{},
+		creds:      map[string]*podCreds{},
+		credsReady: map[string]bool{},
+		credsErr:   map[string]string{},
 		podsGone:   map[string]bool{},
 		statesGone: map[string]bool{},
 		blipsGone:  map[string]bool{},
@@ -193,16 +202,20 @@ func Run(ctx context.Context, cfg Config, restCfg *rest.Config, st *storage.Stor
 	if err != nil {
 		return err
 	}
+	// Credentials for the per-pod sidecar are minted through the typed API,
+	// so the agent always needs a clientset, not only when the stream API is
+	// enabled.
+	cs, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return fmt.Errorf("kubernetes client: %w", err)
+	}
 	a := newAgent(cfg, c, live, st)
+	a.kube = cs
 	defer func() {
 		cancel()
 		a.workers.Wait()
 	}()
 	if cfg.Stream.Listen != "" {
-		cs, err := kubernetes.NewForConfig(restCfg)
-		if err != nil {
-			return fmt.Errorf("stream api client: %w", err)
-		}
 		go a.serveStreamAPI(ctx, live, cs, cfg)
 	}
 	if err := a.registerNode(ctx); err != nil {

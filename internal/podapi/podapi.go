@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/Azure/blip/internal/atomicfile"
 	"github.com/Azure/blip/internal/netpolicy"
@@ -52,11 +51,18 @@ const (
 	// agent and the runtime both run as root on the node.
 	FileMode os.FileMode = 0o600
 	// VsockSocket is the Cloud Hypervisor vsock unix socket, below the pod
-	// directory. The directory is bind-mounted into the API-proxy sidecar so
-	// both the hypervisor and the sidecar can create sockets in it. Clients
-	// connect and write "CONNECT <port>\n" to reach a guest port.
+	// directory. The runtime container creates it and clients connect and
+	// write "CONNECT <port>\n" to reach a guest port.
 	VsockSocket = "sock/vsock.sock"
 	APISocket   = "ch-api.sock"
+
+	// ProxyPort is the loopback port of the pod's Envoy sidecar. The guest
+	// reaches it through the TAP gateway, which the runtime redirects to this
+	// port; the port is bound on loopback so the cluster cannot reach it.
+	ProxyPort uint16 = 15080
+	// CredsDir holds the sidecar's per-upstream credentials below the pod
+	// directory. The node agent writes one Envoy SDS file per upstream.
+	CredsDir = "creds"
 )
 
 // Desired is written by the node agent.
@@ -169,13 +175,6 @@ func PodDir(namespace, name string) string {
 	return filepath.Join(PodsDir, namespace, name)
 }
 
-// VsockListenerPath returns the sidecar Unix socket that forwards to the
-// guest's vsock port. It sits next to the Cloud Hypervisor vsock socket in the
-// emptyDir shared by the runtime and the API-proxy sidecar.
-func VsockListenerPath(dir string, port uint32) string {
-	return filepath.Join(dir, VsockSocket) + "_" + strconv.FormatUint(uint64(port), 10)
-}
-
 // EnsurePodDir creates a pod directory with DirMode and tightens it and its
 // namespace parent to DirMode if they already exist with broader permissions.
 // The node agent calls it before writing Desired, so a directory left at the
@@ -188,18 +187,16 @@ func EnsurePodDir(dir string) error {
 	return tightenDir(filepath.Dir(dir))
 }
 
-// EnsureSocketDir creates the shared vsock directory below the pod directory
-// and makes sure it is writable by the non-root API-proxy sidecar. Kubelet
-// creates a hostPath DirectoryOrCreate with root-only permissions, so the node
-// agent must widen it before the sidecar binds its listener. The directory is
-// below the root-only pod directory, so 0777 does not expose it to other
-// users.
+// EnsureSocketDir creates the vsock directory below the pod directory. Kubelet
+// creates a hostPath DirectoryOrCreate with its default mode, so the node agent
+// normalizes it before the runtime binds its sockets. Only root processes use
+// it; the enclosing pod directory stays root-only.
 func EnsureSocketDir(podDir string) error {
 	dir := filepath.Join(podDir, "sock")
-	if err := os.MkdirAll(dir, 0o777); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	return os.Chmod(dir, 0o777)
+	return os.Chmod(dir, 0o750)
 }
 
 // EnsureDir creates dir with DirMode and tightens it if it already exists

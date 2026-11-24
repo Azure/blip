@@ -25,17 +25,18 @@ var lostReply = errors.New("simapp: operation applied; acknowledgement lost")
 // writes go to the former; only an explicit watch delivery changes the latter.
 // Business decisions, including optimistic patches, are the real reconcilers'.
 type apiSnapshot struct {
-	Blips      v1.BlipList
-	States     v1.BlipStateList
-	Pools      v1.BlipPoolList
-	Nodes      v1.BlipNodeList
-	Pods       corev1.PodList
-	KubeNodes  corev1.NodeList
-	ConfigMaps corev1.ConfigMapList
+	Blips           v1.BlipList
+	States          v1.BlipStateList
+	Pools           v1.BlipPoolList
+	Nodes           v1.BlipNodeList
+	Pods            corev1.PodList
+	KubeNodes       corev1.NodeList
+	ConfigMaps      corev1.ConfigMapList
+	ServiceAccounts corev1.ServiceAccountList
 }
 
 func (s *apiSnapshot) lists() []client.ObjectList {
-	return []client.ObjectList{&s.Blips, &s.States, &s.Pools, &s.Nodes, &s.Pods, &s.KubeNodes, &s.ConfigMaps}
+	return []client.ObjectList{&s.Blips, &s.States, &s.Pools, &s.Nodes, &s.Pods, &s.KubeNodes, &s.ConfigMaps, &s.ServiceAccounts}
 }
 
 func (s apiSnapshot) client() client.Client {

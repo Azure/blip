@@ -65,9 +65,6 @@ func validateEndpoint(pool *v1.BlipPool, e *v1.PoolEndpoint, clusterAudiences []
 		return fmt.Errorf("url %q: %w", e.URL, err)
 	}
 	if e.Audience != "" {
-		if pool.Spec.ServiceAccountName == "" {
-			return errors.New("audience requires spec.serviceAccountName")
-		}
 		if isAPIServerAudience(e.Audience, clusterAudiences...) {
 			return errors.New("audience must not be a Kubernetes API server audience; the endpoint token would authenticate to the API server")
 		}

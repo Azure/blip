@@ -208,6 +208,14 @@ func (e *env) newPool(name string, warm, max int32) {
 			NodeSelector: map[string]string{"blip.dev/node-pool": "default"},
 		},
 	})
+	// Claims are gated on the identity existing, so every test pool's account
+	// exists the way a cluster's would.
+	sa := &corev1.ServiceAccount{}
+	if err := e.c.Get(e.ctx, types.NamespacedName{Namespace: ns, Name: "vm"}, sa); apierrors.IsNotFound(err) {
+		e.create(&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "vm"}})
+	} else {
+		e.must(err)
+	}
 }
 
 func (e *env) newState(name string, mutate ...func(*v1.BlipState)) {

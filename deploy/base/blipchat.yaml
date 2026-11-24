@@ -158,8 +158,8 @@
 # change. MCP agents still use --mcp-url, which may itself include a prefix.
 #
 # The MCP endpoint is https://blipchat-mcp.blip-system.svc. A pool whose chats
-# may spawn children must expose it to the guest; the api-proxy sidecar adds
-# the projected token and the CA:
+# may spawn children must expose it to the guest; the pod's Envoy sidecar adds
+# the service-account token and the CA:
 #
 #   spec:
 #     serviceAccountName: blip-chat
@@ -170,7 +170,7 @@
 #         caConfigMap: blipchat-mcp-ca
 #
 # The endpoint name is the in-guest hostname, so it must match --mcp-url above;
-# an audience also requires the pool's spec.serviceAccountName.
+# an audience also requires the blip (or its pool) to have a service account.
 #
 # The operator provisions the blipchat-mcp-tls Secret in blip-system
 # (tls.crt/tls.key for that Service) and a blipchat-mcp-ca ConfigMap holding
@@ -194,10 +194,10 @@ kind: ClusterRole
 metadata:
   name: blipchat
 rules:
-  # The MCP endpoint authenticates an agent's pod-bound projected token with a
-  # TokenReview, then reads the caller pod (through the namespaced Role) to map
-  # that token back to its chat Blip. TokenReview is cluster-scoped, so it
-  # stays here. The agent's pool grants the token through its endpoints.
+  # The MCP endpoint authenticates an agent's pod-bound service-account token
+  # with a TokenReview, then reads the caller pod (through the namespaced Role)
+  # to map that token back to its chat Blip. TokenReview is cluster-scoped, so
+  # it stays here. The agent's pool grants the token through its endpoints.
   - apiGroups: [authentication.k8s.io]
     resources: [tokenreviews]
     verbs: [create]
@@ -421,7 +421,7 @@ spec:
 ---
 # The guest-facing name for the MCP endpoint. --mcp-url is the in-guest URL
 # this Service gives a pool endpoint (http://blipchat-mcp/mcp), while the pool
-# dials https://blipchat-mcp.blip-system.svc through its api-proxy sidecar.
+# dials https://blipchat-mcp.blip-system.svc through its Envoy sidecar.
 apiVersion: v1
 kind: Service
 metadata:

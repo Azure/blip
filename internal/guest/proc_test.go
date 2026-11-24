@@ -273,9 +273,9 @@ func TestProcEnvNoProxy(t *testing.T) {
 		base []string
 		want [2]string // NO_PROXY, no_proxy
 	}{
-		{"no names", &Guest{}, nil, [2]string{"blip", "blip"}},
+		{"no endpoint names", &Guest{}, nil, [2]string{"blip,kube-apiserver", "blip,kube-apiserver"}},
 		{"kubernetes", &Guest{kubeNamespace: "sandbox"}, nil, [2]string{"blip,kube-apiserver", "blip,kube-apiserver"}},
-		{"endpoints", &Guest{endpoints: []string{"api.default", "db.default"}}, nil, [2]string{"blip,api.default,db.default", "blip,api.default,db.default"}},
+		{"endpoints", &Guest{endpoints: []string{"api.default", "db.default"}}, nil, [2]string{"blip,kube-apiserver,api.default,db.default", "blip,kube-apiserver,api.default,db.default"}},
 		{"all", &Guest{kubeNamespace: "sandbox", endpoints: []string{"api.default"}}, nil, [2]string{"blip,kube-apiserver,api.default", "blip,kube-apiserver,api.default"}},
 		{"claim override", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=corp.example"}, [2]string{"blip,kube-apiserver,corp.example", "blip,kube-apiserver,corp.example"}},
 		{"both spellings merge", &Guest{kubeNamespace: "sandbox"}, []string{"NO_PROXY=claim.example", "no_proxy=extra.example"}, [2]string{"blip,kube-apiserver,claim.example,extra.example", "blip,kube-apiserver,claim.example,extra.example"}},

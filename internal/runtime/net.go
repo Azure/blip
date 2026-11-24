@@ -31,11 +31,11 @@ const (
 // podNet owns only its TAP, its nftables table, and interface forwarding
 // settings in the pod network namespace. The pod keeps its IP and MAC.
 type podNet struct {
-	iface, podIP, guestIP, mac string
-	run                        commandRunner
-	tapCreated, tableCreated   bool
-	disabled, unsafe           bool
-	sysctls                    map[string][]byte
+	iface, podIP, guestIP, gateway, mac string
+	run                                 commandRunner
+	tapCreated, tableCreated            bool
+	disabled, unsafe                    bool
+	sysctls                             map[string][]byte
 }
 
 type commandRunner func(input, name string, args ...string) ([]byte, error)
@@ -139,7 +139,7 @@ func setupNetwork(cfg *bootconfig.Config) (*podNet, error) {
 	cfg.IP, cfg.Prefix = link.Addr().Next().Next().String(), 30
 	cfg.MTU = ifi.MTU
 	cfg.MAC = guestMAC(netip.MustParseAddr(cfg.IP), ifi.HardwareAddr.String())
-	p := &podNet{iface: iface, podIP: podIP, guestIP: cfg.IP, mac: cfg.MAC, run: networkCommand, sysctls: map[string][]byte{}}
+	p := &podNet{iface: iface, podIP: podIP, guestIP: cfg.IP, gateway: cfg.Gateway, mac: cfg.MAC, run: networkCommand, sysctls: map[string][]byte{}}
 	complete := false
 	defer func() {
 		if !complete {
@@ -184,6 +184,14 @@ func setupNetwork(cfg *bootconfig.Config) (*podNet, error) {
 			return nil, err
 		}
 	}
+	// The guest reaches the Envoy sidecar through the TAP gateway address. The
+	// prerouting DNAT rewrites that flow to the sidecar's loopback listener,
+	// which the kernel only accepts from a non-loopback interface when
+	// route_localnet is enabled. Recording the old value restores it on
+	// teardown.
+	if err := p.setSysctl("ipv4/conf/"+tapName+"/route_localnet", "1", true); err != nil {
+		return nil, err
+	}
 	// IPv6 is unsupported for the guest; inet filtering also blocks it if
 	// someone subsequently reenables the interface's IPv6 stack.
 	if _, err := os.Stat("/proc/sys/net/ipv6/conf/" + tapName + "/disable_ipv6"); err == nil {
@@ -212,7 +220,8 @@ func (p *podNet) teardown() {
 		}
 	}
 	for path, value := range p.sysctls {
-		if err := os.WriteFile(path, value, 0o644); err != nil {
+		// A deleted interface takes its per-interface sysctls with it.
+		if err := os.WriteFile(path, value, 0o644); err != nil && !os.IsNotExist(err) {
 			log.Printf("network cleanup: %v", err)
 		}
 	}

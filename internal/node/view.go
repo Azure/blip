@@ -107,6 +107,8 @@ type view struct {
 	sealErrs    map[string]string
 	stateErrs   map[string]string
 	progress    map[string]*v1alpha1.Transfer // state UID -> running fetch
+	credsReady  map[string]bool               // podKey -> credential files usable
+	credsErr    map[string]string             // podKey -> why credentials are missing
 	podsGone    map[string]bool               // podKeys confirmed absent by a live read
 	statesGone  map[string]bool               // state UIDs confirmed absent by a live read
 	blipsGone   map[string]bool               // blip UIDs confirmed absent by a live read

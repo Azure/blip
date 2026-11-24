@@ -379,15 +379,10 @@ func (g *Guest) procEnv(acct *account, base []string) []string {
 		"LOGNAME=" + acct.name,
 		"SHELL=" + acct.shell,
 	}
-	if g.kubeNamespace != "" {
-		env = append(env, "KUBECONFIG="+kubeconfigPath)
-	}
+	env = append(env, "KUBECONFIG="+kubeconfigPath)
 	// Guest-local names are resolved through /etc/hosts and must not go
 	// through a workload's HTTP proxy.
-	noProxy := []string{"blip"}
-	if g.kubeNamespace != "" {
-		noProxy = append(noProxy, "kube-apiserver")
-	}
+	noProxy := []string{"blip", "kube-apiserver"}
 	noProxy = append(noProxy, g.endpoints...)
 	// The proxy bypass is applied after every caller-supplied list, so a
 	// workload proxy setting can add names but can never proxy a
@@ -433,18 +428,6 @@ func (p *proc) close() {
 			f.Close()
 		}
 	}
-}
-
-func withFD(f *os.File, fn func(fd int) error) error {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var ferr error
-	if err := rc.Control(func(fd uintptr) { ferr = fn(int(fd)) }); err != nil {
-		return err
-	}
-	return ferr
 }
 
 // exitOf converts a wait status into a wire exit.

@@ -16,6 +16,7 @@ spec:
           args:
             - --leader-elect
             - --runtime-image=$(RUNTIME_IMAGE)
+            - --proxy-image=$(PROXY_IMAGE)
             - --insecure-registry=blip-registry:5000
 ---
 apiVersion: apps/v1
