@@ -26,6 +26,36 @@ jobs:
         run: python3 hack/headers.py check
       - name: Check GitHub Actions are SHA-pinned
         run: python3 hack/actions.py check
+  privileged-storage:
+    name: privileged storage tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Load kernel modules
+        id: modules
+        run: |
+          sudo modprobe dm_mod || true
+          sudo modprobe loop || true
+          suites="storage peer"
+          # nvme needs the NVMe/TCP target and initiator; skip it if the
+          # runner kernel does not ship them.
+          if sudo modprobe nvmet && sudo modprobe nvmet-tcp && sudo modprobe nvme-tcp; then
+            suites="storage nvme peer"
+          else
+            echo "::warning::nvmet/nvme-tcp modules unavailable; skipping nvme suite"
+          fi
+          echo "suites=$suites" >>"$GITHUB_OUTPUT"
+      - name: Run privileged tests
+        env:
+          SUITES: ${{ steps.modules.outputs.suites }}
+        run: |
+          # shellcheck disable=SC2086
+          hack/storage-test.sh $SUITES
   test:
     name: go test (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -83,3 +113,22 @@ jobs:
         run: |
           eval "$(hack/guest/fetch-debian-kernel.sh "${{ matrix.arch }}" build/guest/kernel)"
           make guest
+  ui:
+    name: chat UI browser tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The runner image ships node; Playwright is the only dependency.
+      - name: Install Playwright
+        working-directory: hack/e2e/blipchat-ui
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Run browser tests
+        run: make test-ui

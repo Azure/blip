@@ -83,15 +83,18 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Start kind cluster
+        id: cluster
         run: ./hack/kind-up.sh
 
       - name: Build OpenCode image
+        id: opencode_image
         run: |
           set -euo pipefail
           docker build -t localhost:5001/blip/opencode:e2e hack/opencode-image
           docker push localhost:5001/blip/opencode:e2e
 
       - name: Install Playwright
+        id: playwright
         working-directory: hack/e2e/opencode/browser
         run: |
           set -euo pipefail
@@ -99,16 +102,45 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Run e2e tests
+        id: e2e
         env:
+          BLIP_E2E_REPORT: ${{ github.workspace }}/e2e-logs/junit.xml
           BLIP_E2E_TIMEOUT: 300
           BLIP_E2E_FORK_MAX: 120
-          BLIP_E2E_RESILIENCE: ${{ (github.event_name == 'schedule' || inputs.resilience) && '1' || '0' }}
+          BLIP_E2E_RESILIENCE: 1
+          # Pull requests run only the quick pool churn check.
+          BLIP_E2E_RESILIENCE_STEPS: ${{ (github.event_name == 'schedule' || inputs.resilience) && 'drain agent restart churn' || 'churn' }}
         run: |
           set -euo pipefail
           mkdir -p e2e-logs
           ./hack/e2e.sh 2>&1 | tee e2e-logs/e2e.log
 
+      - name: Summarize e2e scenarios
+        if: always() && steps.e2e.outcome != 'skipped'
+        run: |
+          {
+            echo "### E2E scenarios"
+            echo
+            echo "| Scenario | Result | Seconds |"
+            echo "| --- | --- | --- |"
+            awk '/^SCENARIO +RESULT +SECONDS$/ { on = 1; next }
+              on && $2 ~ /^(pass|fail|skip)$/ { printf "| %s | %s | %s |\n", $1, $2, $3 }
+              on && $2 !~ /^(pass|fail|skip)$/ { on = 0 }' e2e-logs/e2e.log 2>/dev/null || true
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload e2e report
+        if: always() && steps.e2e.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-junit
+          path: e2e-logs/junit.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Run OpenCode e2e
+        # Run even when the core suite failed, so one failure does not hide
+        # another, but only if the cluster and image came up.
+        if: (success() || failure()) && steps.cluster.outcome == 'success' && steps.opencode_image.outcome == 'success' && steps.playwright.outcome == 'success'
         timeout-minutes: 30
         env:
           BLIP_E2E_MOCK_MODEL: "1"

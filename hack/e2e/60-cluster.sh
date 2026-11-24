@@ -226,7 +226,7 @@ c60_replacement_ready() {
 	candidate=$(k get pods -l "blip.dev/pool=$P-pool,blip.dev/warm=true" \
 		-o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null) || return 1
 	candidate=$(printf '%s\n' "$candidate" |
-		awk -v old="$temp_warm" 'NF && $0 != old { print; exit }')
+		awk -v old="$temp_warm" 'NF && $0 != old && !done { print; done = 1 }')
 	[ -n "$candidate" ] || return 1
 	[ "$(k get pod "$candidate" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ] || return 1
 	replacement=$candidate

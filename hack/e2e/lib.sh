@@ -59,7 +59,7 @@ is_blip_gone() {
 wait_blip_phase() {
 	local name=$1 phase=$2 timeout=${3:-120}
 	wait_for "$timeout" "blip $name phase $phase" is_blip_phase "$name" "$phase" || {
-		k get blip "$name" -o yaml >&2 || true
+		diagnose blip "$name"
 		return 1
 	}
 }
@@ -67,7 +67,7 @@ wait_blip_phase() {
 wait_blip_gone() {
 	local name=$1 timeout=${2:-120}
 	wait_for "$timeout" "blip $name to be removed" is_blip_gone "$name" || {
-		k get blip "$name" -o yaml >&2 || true
+		diagnose blip "$name"
 		return 1
 	}
 }
@@ -84,7 +84,7 @@ is_state_gone() {
 wait_state() {
 	local name=$1 timeout=${2:-120}
 	wait_for "$timeout" "state $name to become Ready" is_state_phase "$name" Ready || {
-		k get blipstate "$name" -o yaml >&2 || true
+		diagnose blipstate "$name"
 		return 1
 	}
 }
@@ -92,9 +92,66 @@ wait_state() {
 wait_state_gone() {
 	local name=$1 timeout=${2:-120}
 	wait_for "$timeout" "state $name to be removed" is_state_gone "$name" || {
-		k get blipstate "$name" -o yaml >&2 || true
+		diagnose blipstate "$name"
 		return 1
 	}
+}
+
+# diagnose KIND NAME dumps an object, its events, and for blips the pod and
+# the tail of the guest log, to explain a timed-out wait.
+diagnose() {
+	local kind=$1 name=$2 pod
+	{
+		echo "--- diagnose $kind $name"
+		k get "$kind" "$name" -o yaml || true
+		echo "--- events for $name"
+		k get events --field-selector "involvedObject.name=$name" \
+			--sort-by=.lastTimestamp || true
+		if [ "$kind" = blip ]; then
+			pod=$(blip_pod "$name")
+			if [ -n "$pod" ]; then
+				echo "--- pod $pod"
+				k describe pod "$pod" || true
+			fi
+			echo "--- blip logs $name (tail)"
+			blip logs "$name" --raw 2>&1 | tail -50 || true
+		fi
+		echo "--- end diagnose $kind $name"
+	} >&2
+}
+
+# dump_cluster_diagnostics prints a cluster overview once after a scenario
+# fails.
+dump_cluster_diagnostics() {
+	{
+		echo "--- cluster diagnostics"
+		k get blips,blipstates,blippools,pods -o wide || true
+		k get blipnodes -o wide || true
+		echo "--- blip-controller logs"
+		k -n blip-system logs deployment/blip-controller --all-containers --tail=100 || true
+		echo "--- blip-node logs"
+		k -n blip-system logs -l app.kubernetes.io/name=blip-node --all-containers \
+			--prefix --tail=100 --max-log-requests=10 || true
+		echo "--- end cluster diagnostics"
+	} >&2
+}
+
+# check_no_leaks PREFIX fails if a Blip named PREFIX-* is still Running after
+# a scenario's cleanup. Blips that are already deleting only warn.
+check_no_leaks() {
+	local prefix=$1 leaked=0 name phase deleting
+	while read -r name phase deleting; do
+		case $name in "$prefix"-*) ;; *) continue ;; esac
+		[ "$phase" = Running ] || continue
+		if [ -n "$deleting" ] && [ "$deleting" != "<none>" ]; then
+			echo "warning: blip $name is still terminating after cleanup" >&2
+			continue
+		fi
+		echo "leak: blip $name is still Running after cleanup" >&2
+		leaked=1
+	done < <(k get blips --no-headers \
+		-o custom-columns=NAME:.metadata.name,PHASE:.status.phase,DEL:.metadata.deletionTimestamp 2>/dev/null)
+	return "$leaked"
 }
 
 # expect_fail runs a command and succeeds only if it fails. The command's
@@ -180,12 +237,12 @@ echo __blip_end__ $token \$?"
 	done
 	if [ "$started" = false ]; then
 		echo "blip exec: send to $name failed (phase $(blip_field "$name" '{.status.phase}'))" >&2
-		blip logs "$name" --raw 2>/dev/null | tail -30 >&2
+		diagnose blip "$name"
 		return 1
 	fi
 	wait_for "${T:-120}" "command in blip $name" blip_exec_done "$name" "$token" || {
 		echo "blip exec: timed out in $name (phase $(blip_field "$name" '{.status.phase}'))" >&2
-		blip logs "$name" --raw 2>/dev/null | tail -30 >&2
+		diagnose blip "$name"
 		return 1
 	}
 	out=$(blip logs "$name" --raw 2>/dev/null)

@@ -419,6 +419,22 @@ func TestMachineStopWhileReaddedRemovalCompletes(t *testing.T) {
 	}
 }
 
+func TestMachineIdleStopWithoutGuestExitKeepsReason(t *testing.T) {
+	s := newLifecycleSimulation(t)
+	d := simulationDesired()
+	s.claim(d)
+	d.Stop, d.StopReason = true, wire.ReasonIdle
+	s.desired(d)
+	s.take(EffectSend, wire.TShutdown)
+	s.control(wire.TShutdownDone, wire.ShutdownDone{Clean: true})
+	s.take(EffectClose, 0)
+	s.apply(Event{Kind: EventVMExited})
+	s.take(EffectClose, 0)
+	if o := s.m.Observed(); o.Phase != podapi.PhaseExited || o.Exit.Reason != wire.ReasonIdle {
+		t.Fatalf("idle stop: %+v", o)
+	}
+}
+
 func TestMachineFreezeReplyLostReconnectAndGuestReboot(t *testing.T) {
 	s := newLifecycleSimulation(t)
 	d := simulationDesired()

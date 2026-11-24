@@ -4,7 +4,7 @@
 BINARIES := blip-controller blip-node blip-runtime blipchat blip-guest kubectl-blip
 CONTROLLER_GEN ?= $(shell go env GOPATH)/bin/controller-gen
 
-.PHONY: build generate headers verify-headers verify-actions test test-sim guest images kind-up kind-down
+.PHONY: build generate headers verify-headers verify-actions test test-sim test-ui guest images kind-up kind-down
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/ $(addprefix ./cmd/,$(BINARIES))
@@ -31,6 +31,12 @@ test:
 # race detector.
 test-sim:
 	go test -race -count=1 ./internal/sim ./internal/simtest ./internal/simlive ./internal/simapp ./internal/atomicfile ./internal/storage ./internal/peer ./internal/nvme ./internal/node ./internal/controller ./internal/runtime ./internal/guest ./internal/wire ./internal/podapi ./internal/stream ./internal/streamapi ./internal/workspace ./internal/apiproxy ./internal/blipchat
+
+# Browser tests for the chat UI: real server and Chromium, in-memory backends.
+# Needs node; run `npx playwright install chromium` once.
+test-ui:
+	test -d hack/e2e/blipchat-ui/node_modules || (cd hack/e2e/blipchat-ui && npm install --no-audit --no-fund)
+	BLIP_BROWSER_TESTS=1 go test -v -count=1 -run TestBrowser ./internal/blipchat/
 
 guest:
 	hack/guest/build.sh

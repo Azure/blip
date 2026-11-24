@@ -4,13 +4,16 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/Azure/blip/api/v1alpha1"
 )
@@ -129,6 +132,35 @@ func TestBuildSpecChangeStartsImmediately(t *testing.T) {
 	recipe = e.getState("cache")
 	if recipe.Status.Build.Output == first {
 		t.Fatal("spec change did not start a build")
+	}
+}
+
+// staleBlips is a cache that has not seen any Blip yet.
+type staleBlips struct{ client.Client }
+
+func (s staleBlips) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*v1.Blip); ok {
+		return apierrors.NewNotFound(v1.GroupVersion.WithResource("blips").GroupResource(), key.Name)
+	}
+	return s.Client.Get(ctx, key, obj, opts...)
+}
+
+func TestBuildStaleCacheKeepsRunningAttempt(t *testing.T) {
+	e := newEnv(t)
+	e.newBuild("cache")
+	e.run(e.state, ns, "cache")
+	output := e.getState("cache").Status.Build.Output
+
+	e.state.Client = staleBlips{e.c}
+	e.run(e.state, ns, "cache")
+	if got := e.getState(output).Annotations[v1.AnnotationBuildStatus]; got != buildRunning {
+		t.Fatalf("output build status = %q after a stale cache miss, want %q", got, buildRunning)
+	}
+
+	e.state.Live = staleBlips{e.c}
+	e.run(e.state, ns, "cache")
+	if got := e.getState(output).Annotations[v1.AnnotationBuildStatus]; got != buildFailed {
+		t.Fatalf("output build status = %q after its blip is gone, want %q", got, buildFailed)
 	}
 }
 

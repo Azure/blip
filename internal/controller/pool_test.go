@@ -1265,6 +1265,33 @@ func TestPoolMaxCountCapsWarmCount(t *testing.T) {
 			t.Errorf("status %+v, want %+v", got, want)
 		}
 	})
+
+	// A booted spare that is shutting down is still a live VM: it holds its
+	// maxCount slot until it is gone, so no replacement starts beside it.
+	t.Run("terminating booted spare holds its slot", func(t *testing.T) {
+		e := newEnv(t)
+		e.addNodes("n1")
+		e.newPool("default", 2, 2)
+		pool := e.getPool("default")
+		for i := range 2 {
+			p := e.pool.podFor(pool, fmt.Sprintf("default-spare-%d", i))
+			p.Spec.NodeName = "n1"
+			p.Status.Phase = corev1.PodRunning
+			p.Labels[v1.LabelWarm] = "true"
+			if i == 0 {
+				// The node agent drops the warm label once shutdown begins.
+				delete(p.Labels, v1.LabelWarm)
+				p.Finalizers = []string{"test/hold"}
+			}
+			e.create(p)
+		}
+		e.must(e.c.Delete(e.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "default-spare-0"}}))
+
+		e.run(e.pool, ns, "default")
+		if n := len(e.pods()); n != 2 {
+			t.Errorf("%d pods, want 2: a replacement beside the terminating spare exceeds maxCount", n)
+		}
+	})
 }
 
 // TestPoolDemand checks that only Blips that can use this pool create

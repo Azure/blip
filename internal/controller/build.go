@@ -296,13 +296,24 @@ func (r *StateReconciler) nextBuild(st *v1.BlipState, now time.Time, interval ti
 // a diagnostic when the Blip is gone.
 func (r *StateReconciler) buildPhase(ctx context.Context, namespace, name string) (string, string, error) {
 	blip := &v1.Blip{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, blip); err != nil {
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+	err := r.Get(ctx, key, blip)
+	if apierrors.IsNotFound(err) && r.Live != nil {
+		// The cache can lag the Blip this recipe just created. Failing the
+		// attempt on a stale miss would discard a build that is running.
+		err = r.Live.Get(ctx, key, blip)
+	}
+	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return v1.BlipFailed, "build blip is gone", nil
 		}
 		return "", "", err
 	}
 	if !v1.Finished(blip) {
+		if blip.Status.Phase == "" {
+			// Not reconciled yet.
+			return v1.BlipPending, "", nil
+		}
 		return blip.Status.Phase, "", nil
 	}
 	if blip.Status.Phase == v1.BlipSucceeded {

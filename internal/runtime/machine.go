@@ -172,7 +172,11 @@ func (m *Machine) Apply(now time.Time, ev Event) []Effect {
 		m.resetFreeze()
 		if m.exit == nil {
 			if m.stopRequested() {
-				m.exit = &podapi.Exit{Reason: wire.ReasonStopped}
+				reason := wire.ReasonStopped
+				if m.desired.StopReason != "" {
+					reason = m.desired.StopReason
+				}
+				m.exit = &podapi.Exit{Reason: reason}
 			} else {
 				m.exit = &podapi.Exit{Code: 255, Reason: wire.ReasonGuestCrashed}
 				if m.errMsg == "" {

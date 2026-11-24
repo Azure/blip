@@ -540,9 +540,11 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, rq reconcile.Request) (r
 			}
 		case p.DeletionTimestamp != nil || deleted[p.Name]:
 			// Its replacement is already accounted for; do not let a pod
-			// leaving an unusable node, a node the scheduler rejected, or
-			// one that never became ready hold maxCount capacity either.
-			if unusable || !ready(p) {
+			// leaving an unusable node or one that never started hold
+			// maxCount capacity either. A running VM that is shutting down
+			// keeps its slot: the node agent clears the warm label as soon
+			// as shutdown begins, so neither that label nor ready() can tell.
+			if unusable || p.Status.Phase != corev1.PodRunning {
 				total--
 			}
 		case podTerminated(p) || unusable || p.Annotations[v1.AnnotationTemplateHash] != hash:
