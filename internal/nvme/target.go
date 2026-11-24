@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package nvme exports block devices over NVMe/TCP through the kernel nvmet
-// target (configfs) and connects to them with the kernel initiator, without
-// nvme-cli. Every configfs name is derived from the node name because kind
-// nodes share one kernel.
+// Package nvme exports block devices over NVMe/TCP and, when the host supports
+// it, NVMe/RDMA through the kernel nvmet target (configfs) and connects to
+// them with the kernel initiator, without nvme-cli. Every configfs name is
+// derived from the node name because kind nodes share one kernel.
 package nvme
 
 import (
@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +21,21 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// Transport is an NVMe fabric transport.
+type Transport string
+
+const (
+	TCP  Transport = "tcp"
+	RDMA Transport = "rdma"
+)
+
+// Endpoint is one transport address of an exported subsystem.
+type Endpoint struct {
+	Transport Transport
+	Addr      string
+	Port      int
+}
 
 const (
 	configFS = "/sys/kernel/config"
@@ -38,11 +54,12 @@ func NodeHash(node string) string {
 // SubsystemNQN is the NQN of node's export for lease.
 func SubsystemNQN(node, lease string) string { return NQNPrefix + NodeHash(node) + ":" + lease }
 
-// Target manages one node's nvmet port and subsystems.
+// Target manages one node's nvmet ports and subsystems.
 type Target struct {
 	node string
 	addr string
 	port int
+	rdma int // optional RDMA port; zero when disabled
 	key  []byte
 	mu   sync.Mutex
 }
@@ -84,7 +101,79 @@ func (t *Target) portID() string {
 
 func (t *Target) portDir() string { return filepath.Join(nvmetDir, "ports", t.portID()) }
 
+// rdmaPortID is the node's RDMA port, in a range portID cannot produce (see
+// hack/storage-cleanup.sh).
+func (t *Target) rdmaPortID() string {
+	h, _ := strconv.ParseUint(NodeHash(t.node)[:4], 16, 32)
+	return strconv.FormatUint(61000+h%3000, 10)
+}
+
+func (t *Target) rdmaDir() string { return filepath.Join(nvmetDir, "ports", t.rdmaPortID()) }
+
 func subsysDir(nqn string) string { return filepath.Join(nvmetDir, "subsystems", nqn) }
+
+// EnableRDMA adds an RDMA port for every lease and marks the TCP port
+// non-optimized so a multipath host prefers RDMA and falls back to TCP. A zero
+// port removes the extra path. It is idempotent.
+func (t *Target) EnableRDMA(port int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if port <= 0 {
+		t.rdma = 0
+		if err := t.removeRDMAPort(); err != nil {
+			return err
+		}
+		t.ana(t.portDir(), "optimized")
+		return nil
+	}
+	dir := t.rdmaDir()
+	if err := ensurePort(dir, Endpoint{RDMA, t.addr, port}); err != nil {
+		return err
+	}
+	t.rdma = port
+	for _, lease := range t.leases() {
+		if err := linkPort(dir, SubsystemNQN(t.node, lease)); err != nil {
+			slog.Warn("nvme: link RDMA path", "lease", lease, "err", err)
+		}
+	}
+	t.ana(t.portDir(), "non-optimized")
+	return nil
+}
+
+// ana prefers port over the host's other paths. nvmet group names vary by
+// kernel, so use the port's only group; a missing group leaves the default.
+func (t *Target) ana(port, state string) {
+	groups, err := os.ReadDir(filepath.Join(port, "ana_groups"))
+	if err != nil || len(groups) != 1 {
+		return
+	}
+	dir := filepath.Join(port, "ana_groups", groups[0].Name())
+	if readAttr(dir, "ana_state") == state {
+		return
+	}
+	if err := writeAttr(dir, "ana_state", state); err != nil {
+		slog.Warn("nvme: set ANA state", "port", filepath.Base(port), "state", state, "err", err)
+	}
+}
+
+// removeRDMAPort unlinks this node's subsystems from the RDMA port and removes
+// the port once no other subsystem uses it.
+func (t *Target) removeRDMAPort() error {
+	dir := t.rdmaDir()
+	prefix := SubsystemNQN(t.node, "")
+	subs, _ := os.ReadDir(filepath.Join(dir, "subsystems"))
+	for _, s := range subs {
+		if strings.HasPrefix(s.Name(), prefix) {
+			if err := rmLink(filepath.Join(dir, "subsystems", s.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	if links, err := os.ReadDir(filepath.Join(dir, "subsystems")); err == nil && len(links) == 0 {
+		return rmdir(dir)
+	}
+	return nil
+}
 
 // Export publishes device as namespace 1 of the lease's subsystem, readable
 // only by hostNQN. It is idempotent.
@@ -143,23 +232,50 @@ func (t *Target) export(nqn, device, hostNQN string) error {
 		return err
 	}
 	port := t.portDir()
-	if err := mkdir(port); err != nil {
+	if err := ensurePort(port, Endpoint{TCP, t.addr, t.port}); err != nil {
 		return err
 	}
-	links, _ := os.ReadDir(filepath.Join(port, "subsystems"))
-	want := map[string]string{"addr_trtype": "tcp", "addr_adrfam": "ipv4", "addr_traddr": t.addr, "addr_trsvcid": strconv.Itoa(t.port)}
+	if t.rdma != 0 {
+		// The RDMA path is best effort: hosts that cannot use it still have
+		// TCP, and the extra path must not fail the lease.
+		if err := linkPort(t.rdmaDir(), nqn); err != nil {
+			slog.Warn("nvme: link RDMA path", "nqn", nqn, "err", err)
+		}
+		t.ana(port, "non-optimized")
+	}
+	return linkPort(port, nqn)
+}
+
+// ensurePort creates or updates a port's address. Changing the address of a
+// port that already exports subsystems is refused by the kernel.
+func ensurePort(dir string, ep Endpoint) error {
+	if err := mkdir(dir); err != nil {
+		return err
+	}
+	links, _ := os.ReadDir(filepath.Join(dir, "subsystems"))
+	want := map[string]string{
+		"addr_trtype":  string(ep.Transport),
+		"addr_adrfam":  "ipv4",
+		"addr_traddr":  ep.Addr,
+		"addr_trsvcid": strconv.Itoa(ep.Port),
+	}
 	for k, v := range want {
-		if readAttr(port, k) == v {
+		if readAttr(dir, k) == v {
 			continue
 		}
 		if len(links) > 0 {
-			return fmt.Errorf("nvme: port %s is in use with %s=%s", t.portID(), k, readAttr(port, k))
+			return fmt.Errorf("nvme: port %s is in use with %s=%s", filepath.Base(dir), k, readAttr(dir, k))
 		}
-		if err := writeAttr(port, k, v); err != nil {
+		if err := writeAttr(dir, k, v); err != nil {
 			return err
 		}
 	}
-	return symlink(sub, filepath.Join(port, "subsystems", nqn))
+	return nil
+}
+
+// linkPort makes subsystem nqn reachable through port.
+func linkPort(port, nqn string) error {
+	return symlink(subsysDir(nqn), filepath.Join(port, "subsystems", nqn))
 }
 
 // Unexport removes the lease's subsystem (and the port and host entries
@@ -171,9 +287,11 @@ func (t *Target) Unexport(lease string) error {
 }
 
 func (t *Target) unexport(nqn string) error {
-	port := t.portDir()
-	if err := rmLink(filepath.Join(port, "subsystems", nqn)); err != nil {
-		return err
+	ports, _ := filepath.Glob(filepath.Join(nvmetDir, "ports", "*"))
+	for _, port := range ports {
+		if err := rmLink(filepath.Join(port, "subsystems", nqn)); err != nil {
+			return err
+		}
 	}
 	sub := subsysDir(nqn)
 	ns := filepath.Join(sub, "namespaces", "1")
@@ -199,14 +317,49 @@ func (t *Target) unexport(nqn string) error {
 			os.Remove(filepath.Join(nvmetDir, "hosts", h.Name()))
 		}
 	}
-	if links, err := os.ReadDir(filepath.Join(port, "subsystems")); err == nil && len(links) == 0 {
-		os.Remove(port)
+	t.removePortIfEmpty(t.portDir())
+	if t.rdma != 0 {
+		t.removePortIfEmpty(t.rdmaDir())
 	}
 	return nil
 }
 
+// removePortIfEmpty removes port once no subsystem uses it.
+func (t *Target) removePortIfEmpty(port string) {
+	if links, err := os.ReadDir(filepath.Join(port, "subsystems")); err == nil && len(links) == 0 {
+		os.Remove(port)
+	}
+}
+
+// Paths lists the transports the lease's subsystem is exported on.
+func (t *Target) Paths(lease string) []Endpoint {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	nqn := SubsystemNQN(t.node, lease)
+	ports, _ := filepath.Glob(filepath.Join(nvmetDir, "ports", "*"))
+	var out []Endpoint
+	for _, port := range ports {
+		if _, err := os.Stat(filepath.Join(port, "subsystems", nqn)); err != nil {
+			continue
+		}
+		ep := Endpoint{
+			Transport: Transport(readAttr(port, "addr_trtype")),
+			Addr:      readAttr(port, "addr_traddr"),
+		}
+		ep.Port, _ = strconv.Atoi(readAttr(port, "addr_trsvcid"))
+		if ep.Transport != "" && ep.Addr != "" && ep.Port != 0 {
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
 // Leases lists the leases this node currently exports.
 func (t *Target) Leases() []string {
+	return t.leases()
+}
+
+func (t *Target) leases() []string {
 	prefix := SubsystemNQN(t.node, "")
 	entries, _ := os.ReadDir(filepath.Join(nvmetDir, "subsystems"))
 	var out []string

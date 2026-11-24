@@ -42,6 +42,12 @@ type Config struct {
 	DataDir  string
 	Insecure []string
 	DiskKey  []byte // cluster disk key (see internal/diskkey)
+	// NVMeRDMA exports and imports state over NVMe/RDMA in addition to
+	// NVMe/TCP when the host supports it.
+	NVMeRDMA bool
+	// NVMeRDMARequired makes a failure to publish the RDMA path fatal instead
+	// of falling back to NVMe/TCP.
+	NVMeRDMARequired bool
 	// Peer dependencies are prepared before storage opens so recovery can
 	// resume and release remote exports through the same client.
 	Identity   *peer.Identity
@@ -246,15 +252,17 @@ func Run(ctx context.Context, cfg Config, restCfg *rest.Config, st *storage.Stor
 		return err
 	}
 	srv, err := peer.NewServer(peer.ServerConfig{
-		Store:     st,
-		NodeName:  cfg.NodeName,
-		HostIP:    cfg.HostIP,
-		DiskKey:   cfg.DiskKey,
-		Identity:  cfg.Identity,
-		Peers:     cfg.Peers,
-		Authorize: a.authorize,
-		DataDir:   cfg.DataDir,
-		Stream:    a,
+		Store:        st,
+		NodeName:     cfg.NodeName,
+		HostIP:       cfg.HostIP,
+		DiskKey:      cfg.DiskKey,
+		Identity:     cfg.Identity,
+		Peers:        cfg.Peers,
+		Authorize:    a.authorize,
+		DataDir:      cfg.DataDir,
+		Stream:       a,
+		RDMA:         cfg.NVMeRDMA,
+		RDMARequired: cfg.NVMeRDMARequired,
 	})
 	if err != nil {
 		return fmt.Errorf("export server: %w", err)

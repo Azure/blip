@@ -71,11 +71,21 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	t := cfg.Target
 	if t == nil {
-		var err error
-		t, err = nvme.NewTarget(cfg.NodeName, cfg.HostIP, NVMePort, cfg.DiskKey)
+		nt, err := nvme.NewTarget(cfg.NodeName, cfg.HostIP, NVMePort, cfg.DiskKey)
 		if err != nil {
 			return nil, err
 		}
+		if cfg.RDMA {
+			if err := nt.EnableRDMA(NVMeRDMAPort); err != nil {
+				if cfg.RDMARequired {
+					return nil, fmt.Errorf("peer: enable NVMe/RDMA: %w", err)
+				}
+				// Detection can succeed while the target cannot bind an RDMA
+				// address; keep the TCP path rather than refusing to start.
+				logf("NVMe/RDMA unavailable on the target; using NVMe/TCP: %v", err)
+			}
+		}
+		t = nt
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = realClock{}
@@ -358,6 +368,20 @@ func (s *Server) prepare(l *lease) error {
 	return err
 }
 
+// leasePaths lists the transports the target exports lease on. A target that
+// does not report paths leaves clients on the TCP endpoint in the response.
+func (s *Server) leasePaths(lease string) []NVMePath {
+	p, ok := s.target.(interface{ Paths(string) []nvme.Endpoint })
+	if !ok {
+		return nil
+	}
+	var out []NVMePath
+	for _, ep := range p.Paths(lease) {
+		out = append(out, NVMePath{Transport: string(ep.Transport), Address: ep.Addr, Port: ep.Port})
+	}
+	return out
+}
+
 func (s *Server) export(ctx context.Context, l *lease) (ExportResponse, error) {
 	nqn, err := s.activate(l)
 	if err != nil {
@@ -376,7 +400,7 @@ func (s *Server) export(ctx context.Context, l *lease) (ExportResponse, error) {
 	}
 	return ExportResponse{
 		LeaseID: l.ID, NQN: nqn, Address: s.cfg.HostIP, Port: NVMePort,
-		SizeBytes: v.SizeBytes, Base: base, Regions: regions,
+		SizeBytes: v.SizeBytes, Base: base, Regions: regions, Paths: s.leasePaths(l.ID),
 	}, nil
 }
 
@@ -483,11 +507,14 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Paths takes the target lock, so refresh it after releasing s.mu.
+	paths := s.leasePaths(id)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(struct {
-		LeaseID     string    `json:"leaseID"`
-		LastRenewed time.Time `json:"lastRenewed"`
-	}{id, renewed})
+		LeaseID     string     `json:"leaseID"`
+		LastRenewed time.Time  `json:"lastRenewed"`
+		Paths       []NVMePath `json:"paths,omitempty"`
+	}{id, renewed, paths})
 }
 
 // release unexports and unpins a lease. On failure cleanup ownership stays

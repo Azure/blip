@@ -147,6 +147,9 @@ This coverage map is the simulation coverage ledger: each row names the producti
 | `internal/simapp` | Composed allocation, production node planning/admission, runtime, lease sequencing, save/replication, reacquisition and bounded liveness windows for runtime-claim handoff and seal/report progress | See its README for exact simulated services and exploration windows |
 | `internal/sim`, `internal/simlive` | Replay, exploration bounds and fair-cycle witnesses | Checker tests include deliberately broken models; production properties live in component/world tests |
 
+NVMe/RDMA path add, failure, and repair are simulated in `internal/peer` and
+`internal/nvme`; real RDMA needs the privileged suite.
+
 Pure and thin packages use property tests instead of a simulation model. In
 particular, `internal/network` checks that a Blip layer never widens the pool
 layer across an address/protocol/port grid and that every compiled policy

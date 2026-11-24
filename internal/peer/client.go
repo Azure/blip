@@ -27,6 +27,7 @@ const (
 	releaseMaxAttempts = 8
 	releaseMinBackoff  = time.Second
 	releaseMaxBackoff  = time.Minute
+	rdmaRetryInterval  = 10 * time.Minute
 )
 
 // Client owns the node's remote leases. Construct it before storage.Open so
@@ -44,8 +45,15 @@ type Client struct {
 	// Kernel operations are replaceable in unprivileged lifecycle tests.
 	connect    func(context.Context, string, int, string, string, []byte) (string, error)
 	disconnect func(string) error
+	addPath    func(context.Context, nvme.Endpoint, string, string, []byte) error
 	clock      Clock
 	transport  func(*http.Transport) http.RoundTripper
+
+	// Optional NVMe/RDMA. addPath adds a second path to the same subsystem;
+	// rdmaRetry remembers a node whose RDMA path failed until its next
+	// renewal may try again.
+	rdma      bool
+	rdmaRetry map[string]time.Time
 }
 
 // ClientOptions replaces instance boundaries without bypassing discovery,
@@ -57,6 +65,12 @@ type ClientOptions struct {
 	Transport  func(*http.Transport) http.RoundTripper
 	Connect    func(context.Context, string, int, string, string, []byte) (string, error)
 	Disconnect func(string) error
+	// AddPath adds a non-TCP controller path to an already connected
+	// subsystem. The default is nvme.AddPath.
+	AddPath func(context.Context, nvme.Endpoint, string, string, []byte) error
+	// RDMA also connects the peer's NVMe/RDMA path when the export offers
+	// one. Failures leave the lease on TCP and are retried at renewal.
+	RDMA bool
 }
 
 type leaseKey struct{ node, id string }
@@ -77,9 +91,13 @@ func NewClientWithOptions(identity *Identity, peers *Registry, diskKey []byte, o
 	if opts.Disconnect == nil {
 		opts.Disconnect = nvme.Disconnect
 	}
+	if opts.AddPath == nil {
+		opts.AddPath = nvme.AddPath
+	}
 	return &Client{
 		identity: identity, peers: peers, diskKey: bytes.Clone(diskKey), ctx: ctx, cancel: cancel,
 		released: make(map[leaseKey]struct{}), connect: opts.Connect, disconnect: opts.Disconnect,
+		addPath: opts.AddPath, rdma: opts.RDMA, rdmaRetry: make(map[string]time.Time),
 		clock: opts.Clock, transport: opts.Transport,
 	}
 }
@@ -127,7 +145,8 @@ func (c *Client) Open(ctx context.Context, node string, req ExportRequest) (stor
 		c.releaseRemote(id, false)
 		return storage.Remote{}, err
 	}
-	c.startRenewal(node, resp.LeaseID, false)
+	c.addRDMAPath(ctx, node, req.HostNQN, resp.NQN, resp.Paths)
+	c.startRenewal(node, resp.LeaseID, req.HostNQN, false)
 	err = ctx.Err()
 	if err == nil {
 		err = c.ctx.Err()
@@ -141,6 +160,50 @@ func (c *Client) Open(ctx context.Context, node string, req ExportRequest) (stor
 		Device: dev, SizeBytes: resp.SizeBytes, Base: resp.Base, Regions: resp.Regions, ID: id,
 		Release: func() { once.Do(func() { c.releaseRemote(id, false) }) },
 	}, nil
+}
+
+// addRDMAPath adds the peer's RDMA path, if offered and usable. Failures
+// leave the lease on TCP and are retried at lease renewal.
+func (c *Client) addRDMAPath(ctx context.Context, node, hostNQN, nqn string, paths []NVMePath) {
+	if !c.rdma || hostNQN == "" {
+		return
+	}
+	var ep nvme.Endpoint
+	found := false
+	for _, p := range paths {
+		if p.Transport != string(nvme.RDMA) || p.Port != NVMeRDMAPort {
+			continue
+		}
+		ip := net.ParseIP(p.Address)
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		ep = nvme.Endpoint{Transport: nvme.RDMA, Addr: ip.To4().String(), Port: p.Port}
+		found = true
+		break
+	}
+	if !found {
+		return
+	}
+	c.mu.Lock()
+	notBefore, retrying := c.rdmaRetry[node]
+	c.mu.Unlock()
+	if retrying && c.clock.Now().Before(notBefore) {
+		return
+	}
+	addCtx, cancel := c.clock.WithTimeout(ctx, 10*time.Second)
+	err := c.addPath(addCtx, ep, nqn, hostNQN, c.diskKey)
+	cancel()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil {
+		if ctx.Err() == nil {
+			logf("add NVMe/RDMA path %s for %s: %v", ep.Addr, node, err)
+			c.rdmaRetry[node] = c.clock.Now().Add(rdmaRetryInterval)
+		}
+		return
+	}
+	delete(c.rdmaRetry, node)
 }
 
 func validLeaseID(id string) bool {
@@ -169,11 +232,11 @@ func parseRemote(id string) (node, leaseID, nqn string, ok bool) {
 // can release the remote; a release wins even if recovery races with it.
 func (c *Client) ResumeRemote(id string) {
 	if node, leaseID, _, ok := parseRemote(id); ok {
-		c.startRenewal(node, leaseID, true)
+		c.startRenewal(node, leaseID, "", true)
 	}
 }
 
-func (c *Client) startRenewal(node, leaseID string, recovered bool) func() {
+func (c *Client) startRenewal(node, leaseID, hostNQN string, recovered bool) func() {
 	key := leaseKey{node, leaseID}
 	c.mu.Lock()
 	if _, released := c.released[key]; released || c.ctx.Err() != nil {
@@ -200,8 +263,12 @@ func (c *Client) startRenewal(node, leaseID string, recovered bool) func() {
 			if c.clock.Wait(ctx, delay) != nil {
 				return
 			}
+			var resp struct{ Paths []NVMePath }
 			rctx, rcancel := c.clock.WithTimeout(ctx, 30*time.Second)
-			err := c.post(rctx, node, "/v1/leases/"+url.PathEscape(leaseID)+"/renew", struct{}{}, nil)
+			err := c.post(rctx, node, "/v1/leases/"+url.PathEscape(leaseID)+"/renew", struct{}{}, &resp)
+			if err == nil {
+				c.addRDMAPath(rctx, node, hostNQN, nvme.SubsystemNQN(node, leaseID), resp.Paths)
+			}
 			rcancel()
 			if err != nil && ctx.Err() == nil {
 				logf("renew lease %s/%s: %v", node, leaseID, err)

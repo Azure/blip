@@ -51,6 +51,19 @@ func TestFirewallPeerRules(t *testing.T) {
 	}
 }
 
+func TestFirewallAdmitsNVMeRDMA(t *testing.T) {
+	rules := firewall("192.0.2.1")
+	for _, want := range []string{
+		"tcp dport { 7890, 4420, 4421 } ip saddr @nodes accept",
+		"tcp dport { 7890, 4420, 4421 } ct state established accept",
+		"tcp dport { 7890, 4420, 4421 } drop",
+	} {
+		if !strings.Contains(rules, want) {
+			t.Fatalf("firewall rules do not contain %q:\n%s", want, rules)
+		}
+	}
+}
+
 func privileged(t *testing.T) {
 	t.Helper()
 	if os.Getenv("BLIP_PRIVILEGED_TESTS") != "1" {

@@ -57,7 +57,7 @@ func TestNamespaceRequiresReadablePositiveSize(t *testing.T) {
 					return base.ReadFile(p)
 				}}
 				i := NewInitiator(InitiatorOptions{System: sys})
-				dev, err := i.Connect(t.Context(), "192.0.2.5", 4420, base.nqn, "host", bytes.Repeat([]byte{7}, 64))
+				dev, err := i.Connect(t.Context(), Endpoint{TCP, "192.0.2.5", 4420}, base.nqn, "host", bytes.Repeat([]byte{7}, 64))
 				if err != nil || dev != "/dev/nvme7n1" || time.Since(start) != 400*time.Millisecond {
 					t.Fatalf("namespace accepted before size became readable: device=%q err=%v elapsed=%s", dev, err, time.Since(start))
 				}
@@ -72,11 +72,14 @@ func TestNamespaceRequiresReadablePositiveSize(t *testing.T) {
 func TestCancellationReportsFailedControllerCleanup(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	base := &fabricSystem{nqn: SubsystemNQN("exporter", "lease1"), onNamespace: cancel}
+	base := &fabricSystem{nqn: SubsystemNQN("exporter", "lease1"), onNamespace: func() error {
+		cancel()
+		return context.Canceled
+	}}
 	busy := errors.New("controller busy")
 	sys := faultSystem{InitiatorSystem: base, writeFile: func(string, []byte, os.FileMode) error { return busy }}
 	i := NewInitiator(InitiatorOptions{System: sys})
-	dev, err := i.Connect(ctx, "192.0.2.5", 4420, base.nqn, "host", bytes.Repeat([]byte{7}, 64))
+	dev, err := i.Connect(ctx, Endpoint{TCP, "192.0.2.5", 4420}, base.nqn, "host", bytes.Repeat([]byte{7}, 64))
 	if dev != "" || !errors.Is(err, context.Canceled) || !errors.Is(err, busy) {
 		t.Fatalf("cleanup failure hidden behind cancellation: device=%q err=%v", dev, err)
 	}
@@ -108,7 +111,7 @@ func TestControllerDiscoveryFailureIsNotAbsence(t *testing.T) {
 			if err := i.Disconnect(base.nqn); !errors.Is(err, failure) {
 				t.Fatalf("disconnect reported absence on discovery failure: %v", err)
 			}
-			if _, err := i.Connect(t.Context(), "192.0.2.5", 4420, base.nqn, "host", bytes.Repeat([]byte{7}, 64)); !errors.Is(err, failure) {
+			if _, err := i.Connect(t.Context(), Endpoint{TCP, "192.0.2.5", 4420}, base.nqn, "host", bytes.Repeat([]byte{7}, 64)); !errors.Is(err, failure) {
 				t.Fatalf("connect ignored failed discovery: %v", err)
 			}
 			if base.opts != "" || base.deletes != 0 {

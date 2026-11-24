@@ -34,7 +34,23 @@ var kernelModules = []string{
 // for modules that fail to load and returns nothing; startup continues either
 // way.
 func LoadKernelModules(ctx context.Context) {
-	loadKernelModules(ctx, moduleLoaded, func(name string) error {
+	loadModules(ctx, kernelModules, moduleLoaded, func(name string) error {
+		return modprobe(ctx, name)
+	}, slog.Default())
+}
+
+// rdmaKernelModules are the modules that add the NVMe/RDMA transport. They are
+// opt-in so TCP-only hosts never load them.
+var rdmaKernelModules = []string{
+	"nvme_rdma",
+	"nvmet_rdma",
+}
+
+// LoadRDMAKernelModules loads the NVMe/RDMA transport modules. Like
+// LoadKernelModules, it logs warnings for modules that fail to load and
+// returns nothing; callers decide whether RDMA is actually usable.
+func LoadRDMAKernelModules(ctx context.Context) {
+	loadModules(ctx, rdmaKernelModules, moduleLoaded, func(name string) error {
 		return modprobe(ctx, name)
 	}, slog.Default())
 }
@@ -43,7 +59,14 @@ func LoadKernelModules(ctx context.Context) {
 // A failed probe is logged with the kernel release and does not stop later
 // modules.
 func loadKernelModules(ctx context.Context, loaded func(string) bool, probe func(string) error, log *slog.Logger) {
-	for _, name := range kernelModules {
+	loadModules(ctx, kernelModules, loaded, probe, log)
+}
+
+// loadModules probes every named module that loaded does not report as
+// present. A failed probe is logged with the kernel release and does not stop
+// later modules.
+func loadModules(ctx context.Context, names []string, loaded func(string) bool, probe func(string) error, log *slog.Logger) {
+	for _, name := range names {
 		if ctx.Err() != nil {
 			return
 		}

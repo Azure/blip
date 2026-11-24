@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	ExportPort = 7890
-	NVMePort   = 4420
+	ExportPort   = 7890
+	NVMePort     = 4420
+	NVMeRDMAPort = 4421
 )
 
 // Peer is another node.
@@ -42,6 +43,13 @@ type ExportRequest struct {
 	HostNQN     string            `json:"hostNQN"`
 }
 
+// NVMePath is one transport a lease is exported on.
+type NVMePath struct {
+	Transport string `json:"transport"`
+	Address   string `json:"address"`
+	Port      int    `json:"port"`
+}
+
 // ExportResponse describes an exported commit.
 type ExportResponse struct {
 	LeaseID   string           `json:"leaseID"`
@@ -51,6 +59,7 @@ type ExportResponse struct {
 	SizeBytes int64            `json:"sizeBytes"`
 	Base      string           `json:"base"`
 	Regions   []storage.Region `json:"regions"`
+	Paths     []NVMePath       `json:"paths,omitempty"`
 }
 
 // Authorizer decides whether node may read req.CommitID. It must answer from
@@ -96,6 +105,12 @@ type ServerConfig struct {
 	Clock           Clock
 	NewLeaseID      func() string
 	RecheckInterval time.Duration
+	// RDMA also exports every lease over NVMe/RDMA when the target is created
+	// by NewServer. A caller-supplied Target owns its own RDMA setup.
+	RDMA bool
+	// RDMARequired makes a failure to publish the RDMA path fatal instead of
+	// leaving the node on NVMe/TCP.
+	RDMARequired bool
 }
 
 // HostNQN returns this node's NVMe host NQN.

@@ -4,7 +4,7 @@
 
 # Removes kernel objects created by blip storage/nvme/peer tests for the given
 # node names, and nothing else: dm devices named blip-<sha256(node)[:8]>-*,
-# nvmet subsystems nqn.2014-08.dev.blip:<hash>:*, their nvmet port (if left
+# nvmet subsystems nqn.2014-08.dev.blip:<hash>:*, their nvmet ports (if left
 # empty), connected NVMe controllers of those subsystems, and the host
 # entries nqn.2014-08.dev.blip:host:<node> when unreferenced.
 #
@@ -52,10 +52,15 @@ for node in "$@"; do
       rm -f "$s"/allowed_hosts/* 2>/dev/null
       rmdir "$s"
     done
+    # NVMe/TCP and NVMe/RDMA ports; the unlink loop above already removed this
+    # node's subsystems from both because they link the same NQNs.
     port=$(( 0x${h:0:4} % 60000 + 1000 ))
-    if [ -d $NVMET/ports/$port ] && [ -z "$(ls $NVMET/ports/$port/subsystems)" ]; then
-      rmdir $NVMET/ports/$port
-    fi
+    rdma=$(( 0x${h:0:4} % 3000 + 61000 ))
+    for p in $port $rdma; do
+      if [ -d $NVMET/ports/$p ] && [ -z "$(ls $NVMET/ports/$p/subsystems)" ]; then
+        rmdir $NVMET/ports/$p
+      fi
+    done
     host=$NVMET/hosts/$hostnqn
     if [ -d "$host" ] && ! ls -l $NVMET/subsystems/*/allowed_hosts/ 2>/dev/null | grep -q "host:$node\$"; then
       rmdir "$host"

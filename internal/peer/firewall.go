@@ -34,6 +34,10 @@ func NewFirewall(hostIP string) (*Firewall, error) {
 	return f, nil
 }
 
+// firewall admits NVMe/iWARP on NVMeRDMAPort, which shares the TCP port space
+// with NVMe/TCP. RoCEv2 traffic is handled by NIC hardware and bypasses
+// nftables, so the node allowlist does not cover it; peer authentication and
+// ciphertext devices remain the access control.
 func firewall(hostIP string) string {
 	return fmt.Sprintf(`table inet blip
 delete table inet blip
@@ -44,16 +48,16 @@ table inet blip {
 	}
 	chain input {
 		type filter hook input priority filter; policy accept;
-		tcp dport { %d, %d } ip saddr @nodes accept
-		tcp dport { %[2]d, %[3]d } ct state established accept
-		tcp dport { %[2]d, %[3]d } drop
+		tcp dport { %d, %d, %d } ip saddr @nodes accept
+		tcp dport { %[2]d, %[3]d, %[4]d } ct state established accept
+		tcp dport { %[2]d, %[3]d, %[4]d } drop
 	}
 	chain forward {
 		type filter hook forward priority filter; policy accept;
-		tcp dport { %[2]d, %[3]d } drop
+		tcp dport { %[2]d, %[3]d, %[4]d } drop
 	}
 }
-`, hostIP, ExportPort, NVMePort)
+`, hostIP, ExportPort, NVMePort, NVMeRDMAPort)
 }
 
 // SetPeers atomically replaces the endpoint allowlist. Invalid peer records

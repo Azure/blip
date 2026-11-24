@@ -3,10 +3,10 @@
 # Licensed under the MIT License.
 
 # Delete the kind cluster blip-dev and the host kernel state its blip nodes
-# leave behind. kind nodes share the host kernel, so NVMe/TCP connections,
-# nvmet exports, device-mapper devices and loop devices outlive the node
-# containers. The cleanup itself lives in storage-cleanup.sh so the tests and
-# this script cannot drift.
+# leave behind. kind nodes share the host kernel, so NVMe/TCP and NVMe/RDMA
+# connections, nvmet exports, device-mapper devices and loop devices outlive the
+# node containers. The cleanup itself lives in storage-cleanup.sh so the tests
+# and this script cannot drift.
 #
 # Only resources of blip-dev nodes are touched: dm devices named
 # blip-<first 8 hex of sha256(node name)>-*, nvmet and NVMe host entries with

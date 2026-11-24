@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/Azure/blip/internal/diskkey"
 	"github.com/Azure/blip/internal/node"
+	"github.com/Azure/blip/internal/nvme"
 	"github.com/Azure/blip/internal/peer"
 	"github.com/Azure/blip/internal/podapi"
 	"github.com/Azure/blip/internal/storage"
@@ -52,6 +54,7 @@ func rootCmd() *cobra.Command {
 		insecure       []string
 		streamListen   string
 		streamClientCA string
+		nvmeTransport  string
 	)
 	cmd := &cobra.Command{
 		Use:          "blip-node",
@@ -59,6 +62,11 @@ func rootCmd() *cobra.Command {
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			switch nvmeTransport {
+			case "tcp", "auto", "rdma":
+			default:
+				return fmt.Errorf("--nvme-transport: %q is not tcp, auto, or rdma", nvmeTransport)
+			}
 			cfg := node.Config{
 				NodeName: os.Getenv("NODE_NAME"),
 				HostIP:   os.Getenv("HOST_IP"),
@@ -82,6 +90,24 @@ func rootCmd() *cobra.Command {
 				return err
 			}
 			node.LoadKernelModules(ctx)
+			rdma := false
+			if nvmeTransport != "tcp" {
+				node.LoadRDMAKernelModules(ctx)
+				err := nvme.RDMAReady(cfg.HostIP)
+				if err == nil && !nvme.Multipath() {
+					err = errors.New("native multipath is off")
+				}
+				switch {
+				case err == nil:
+					rdma = true
+				case nvmeTransport == "rdma":
+					return fmt.Errorf("--nvme-transport=rdma: %w", err)
+				default:
+					slog.Warn("NVMe/RDMA unavailable; using NVMe/TCP", "err", err)
+				}
+			}
+			cfg.NVMeRDMA = rdma
+			cfg.NVMeRDMARequired = nvmeTransport == "rdma"
 			kc, err := client.New(restCfg, client.Options{})
 			if err != nil {
 				return err
@@ -96,7 +122,7 @@ func rootCmd() *cobra.Command {
 				return fmt.Errorf("load peer identity: %w", err)
 			}
 			cfg.Peers = peer.NewRegistry()
-			cfg.PeerClient = peer.NewClient(cfg.Identity, cfg.Peers, key)
+			cfg.PeerClient = peer.NewClientWithOptions(cfg.Identity, cfg.Peers, key, peer.ClientOptions{RDMA: rdma})
 			cfg.Stream = node.StreamConfig{Listen: streamListen, Namespace: namespace, ClientCA: streamClientCA}
 			defer cfg.PeerClient.Close()
 			st, err := storage.Open(ctx, storage.Config{
@@ -119,5 +145,6 @@ func rootCmd() *cobra.Command {
 	cmd.Flags().StringSliceVar(&insecure, "insecure-registry", nil, "registries to reach over plain HTTP")
 	cmd.Flags().StringVar(&streamListen, "stream-listen", ":7891", "aggregated stream API listen address (empty disables)")
 	cmd.Flags().StringVar(&streamClientCA, "stream-client-ca", "", "optional file with the front-proxy CA; defaults to the kube-apiserver's published ConfigMap")
+	cmd.Flags().StringVar(&nvmeTransport, "nvme-transport", "tcp", "tcp, auto, or rdma; auto/rdma add an NVMe/RDMA path when the host supports it")
 	return cmd
 }

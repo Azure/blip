@@ -83,10 +83,10 @@ func HostID(hostNQN string) string { return uuidFrom("hostid:" + hostNQN) }
 // secrets derived from key (the cluster disk key), and returns the block
 // device of its first namespace.
 func Connect(ctx context.Context, addr string, port int, nqn, hostNQN string, key []byte) (string, error) {
-	return NewInitiator(InitiatorOptions{}).Connect(ctx, addr, port, nqn, hostNQN, key)
+	return NewInitiator(InitiatorOptions{}).Connect(ctx, Endpoint{TCP, addr, port}, nqn, hostNQN, key)
 }
 
-func (i *Initiator) Connect(ctx context.Context, addr string, port int, nqn, hostNQN string, key []byte) (string, error) {
+func (i *Initiator) Connect(ctx context.Context, ep Endpoint, nqn, hostNQN string, key []byte) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -97,22 +97,31 @@ func (i *Initiator) Connect(ctx context.Context, addr string, port int, nqn, hos
 	if err != nil {
 		return "", err
 	}
+	created := false
 	if ctrl == "" {
-		if ctrl, err = i.connect(addr, port, nqn, hostNQN, key); err != nil {
+		created = true
+		if ctrl, err = i.connect(ep, nqn, hostNQN, key); err != nil {
 			// The kernel may have accepted the write before the result read
 			// failed. Discover by NQN and clean up that ambiguous controller.
-			return "", errors.Join(err, i.Disconnect(nqn))
+			return "", errors.Join(err, i.removePath(nqn, ep))
 		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
 		if err := ctx.Err(); err != nil {
-			return "", errors.Join(fmt.Errorf("nvme: namespace of %s did not appear: %w", nqn, err), i.Disconnect(nqn))
+			err := fmt.Errorf("nvme: namespace of %s did not appear: %w", nqn, err)
+			if created {
+				err = errors.Join(err, i.removePath(nqn, ep))
+			}
+			return "", err
 		}
 		if dev, err := i.namespaceDevice(ctrl); err == nil {
 			if err := ctx.Err(); err != nil {
-				return "", errors.Join(err, i.Disconnect(nqn))
+				if created {
+					err = errors.Join(err, i.removePath(nqn, ep))
+				}
+				return "", err
 			}
 			return dev, nil
 		}
@@ -120,7 +129,64 @@ func (i *Initiator) Connect(ctx context.Context, addr string, port int, nqn, hos
 	}
 }
 
-func (i *Initiator) connect(addr string, port int, nqn, hostNQN string, key []byte) (string, error) {
+// AddPath connects an additional transport to an already connected subsystem.
+// Native multipath shares the namespace, so the path only serves I/O. It is
+// idempotent.
+func AddPath(ctx context.Context, ep Endpoint, nqn, hostNQN string, key []byte) error {
+	return NewInitiator(InitiatorOptions{}).AddPath(ctx, ep, nqn, hostNQN, key)
+}
+
+func (i *Initiator) AddPath(ctx context.Context, ep Endpoint, nqn, hostNQN string, key []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := checkKey(key); err != nil {
+		return err
+	}
+	head, err := i.controllerFor(nqn)
+	if err != nil {
+		return err
+	}
+	if head == "" {
+		return fmt.Errorf("nvme: %s is not connected", nqn)
+	}
+	ctrls, err := i.controllersAt(nqn, ep)
+	if err != nil {
+		return err
+	}
+	if len(ctrls) > 0 {
+		return nil
+	}
+	if !i.Multipath() {
+		return errors.New("nvme: native multipath is off (nvme_core.multipath=N)")
+	}
+	ctrl, err := i.connect(ep, nqn, hostNQN, key)
+	if err != nil {
+		return errors.Join(err, i.removePath(nqn, ep))
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for {
+		// A controller on its own device would give hydration no failover.
+		if sub := i.subsystemOf(ctrl); sub != "" && sub == i.subsystemOf(head) {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Join(fmt.Errorf("nvme: %s did not join the subsystem of %s: %w", ctrl, head, err), i.removePath(nqn, ep))
+		}
+		sleep(ctx, 100*time.Millisecond)
+	}
+}
+
+// Multipath reports whether native NVMe multipath is enabled.
+func Multipath() bool { return NewInitiator(InitiatorOptions{}).Multipath() }
+
+func (i *Initiator) Multipath() bool {
+	b, err := i.system.ReadFile("/sys/module/nvme_core/parameters/multipath")
+	return err == nil && strings.TrimSpace(string(b)) == "Y"
+}
+
+func (i *Initiator) connect(ep Endpoint, nqn, hostNQN string, key []byte) (string, error) {
 	if err := i.ensureFabricsDev(); err != nil {
 		return "", err
 	}
@@ -133,13 +199,13 @@ func (i *Initiator) connect(addr string, port int, nqn, hostNQN string, key []by
 	// ten; it also lets the kernel drop controllers whose export is gone.
 	// opts holds the secrets: never log it or put it in an error.
 	hostKey, ctrlKey := secrets(key, hostNQN)
-	opts := fmt.Sprintf("transport=tcp,traddr=%s,trsvcid=%d,nqn=%s,hostnqn=%s,hostid=%s,ctrl_loss_tmo=60,reconnect_delay=2,dhchap_secret=%s,dhchap_ctrl_secret=%s",
-		addr, port, nqn, hostNQN, HostID(hostNQN), hostKey, ctrlKey)
+	opts := fmt.Sprintf("transport=%s,traddr=%s,trsvcid=%d,nqn=%s,hostnqn=%s,hostid=%s,ctrl_loss_tmo=60,reconnect_delay=2,dhchap_secret=%s,dhchap_ctrl_secret=%s",
+		ep.Transport, ep.Addr, ep.Port, nqn, hostNQN, HostID(hostNQN), hostKey, ctrlKey)
 	if n, err := f.Write([]byte(opts)); err != nil || n != len(opts) {
 		if err == nil {
 			err = io.ErrShortWrite
 		}
-		return "", fmt.Errorf("nvme: connect %s at %s:%d: %w", nqn, addr, port, err)
+		return "", fmt.Errorf("nvme: connect %s at %s:%d: %w", nqn, ep.Addr, ep.Port, err)
 	}
 	buf := make([]byte, 256)
 	n, err := f.Read(buf)
@@ -159,7 +225,7 @@ func (i *Initiator) connect(addr string, port int, nqn, hostNQN string, key []by
 func (i *Initiator) ensureFabricsDev() error {
 	b, err := i.system.ReadFile("/sys/class/misc/nvme-fabrics/dev")
 	if err != nil {
-		return errors.New("nvme: nvme-fabrics is not available (load nvme_tcp)")
+		return errors.New("nvme: nvme-fabrics is not available (load nvme_tcp or nvme_rdma)")
 	}
 	return i.system.EnsureNode(fabricsDev, strings.TrimSpace(string(b)), unix.S_IFCHR)
 }
@@ -228,6 +294,75 @@ func (i *Initiator) controllers(nqn string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// controllersAt lists the controllers of nqn that serve ep's address.
+func (i *Initiator) controllersAt(nqn string, ep Endpoint) ([]string, error) {
+	ctrls, err := i.controllers(nqn)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, c := range ctrls {
+		dir := filepath.Join("/sys/class/nvme", c)
+		transport, err := i.system.ReadFile(filepath.Join(dir, "transport"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(transport)) != string(ep.Transport) {
+			continue
+		}
+		// address may include the port depending on the kernel; match the host.
+		address, err := i.system.ReadFile(filepath.Join(dir, "address"))
+		if err != nil {
+			continue
+		}
+		addr := strings.TrimSpace(string(address))
+		if addr != ep.Addr && !strings.HasPrefix(addr, ep.Addr+":") {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// subsystemOf names the native-multipath subsystem of ctrl, or "" when the
+// kernel has none (multipath off, or the namespace has not appeared yet).
+func (i *Initiator) subsystemOf(ctrl string) string {
+	dirs, _ := i.system.Glob("/sys/class/nvme-subsystem/*/" + ctrl)
+	if len(dirs) == 0 {
+		return ""
+	}
+	return filepath.Base(filepath.Dir(dirs[0]))
+}
+
+// removePath deletes only the controllers serving ep, leaving other paths of
+// nqn connected, and waits for them to disappear.
+func (i *Initiator) removePath(nqn string, ep Endpoint) error {
+	ctrls, err := i.controllersAt(nqn, ep)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, c := range ctrls {
+		if err := i.system.WriteFile(filepath.Join("/sys/class/nvme", c, "delete_controller"), []byte("1"), 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("nvme: disconnect %s: %w", c, err))
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	for range 100 {
+		ctrls, err := i.controllersAt(nqn, ep)
+		if err != nil {
+			return err
+		}
+		if len(ctrls) == 0 {
+			return nil
+		}
+		sleep(context.Background(), 100*time.Millisecond)
+	}
+	return fmt.Errorf("nvme: %s at %s:%d still connected", nqn, ep.Addr, ep.Port)
 }
 
 // Disconnect deletes every controller connected to nqn.

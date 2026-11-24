@@ -258,8 +258,8 @@ func TestRecoveredLeaseWorkWaitsForRegistry(t *testing.T) {
 
 func TestClientCloseCancelsDiscoveryAndSeparatesNodeLeases(t *testing.T) {
 	c := NewClient(testIdentity(t), NewRegistry(), nil)
-	one := c.startRenewal("one", "same-id", false)
-	c.startRenewal("two", "same-id", false)
+	one := c.startRenewal("one", "same-id", "", false)
+	c.startRenewal("two", "same-id", "", false)
 	one()
 	if _, ok := c.active.Load(leaseKey{"two", "same-id"}); !ok {
 		t.Fatal("stopping one node's lease stopped another node's same-named lease")
